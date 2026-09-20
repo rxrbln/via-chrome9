@@ -270,15 +270,19 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 
    if (!chrome9_translate_blend(ctx->blend, blend, blend_successor))
       return false;
+   if (ctx->dsa && ctx->dsa->alpha_enabled) {
+      if (!ctx->alpha_test_supported ||
+          ctx->dsa->alpha_func > PIPE_FUNC_ALWAYS)
+         return false;
+      blend->flags |= DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE;
+      blend->alpha_test_func = ctx->dsa->alpha_func;
+      blend->alpha_test_ref = float_to_ubyte(ctx->dsa->alpha_ref_value);
+      *blend_successor = true;
+   }
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       *blend_successor = true;
-   if (*blend_successor &&
-        !(textured ? ctx->draw_textured_triangle_blend :
-                     ctx->draw_triangle_blend))
-      return false;
    if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
                     ctx->dsa->stencil[1].enabled ||
-                    ctx->dsa->alpha_enabled ||
                     ctx->dsa->depth_bounds_test))
       return false;
    if (ctx->dsa && ctx->dsa->depth_enabled) {
@@ -296,9 +300,12 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
           (*depth)->base.height0 != resource->height0)
          return false;
       *depth_active = true;
-      if (*blend_successor)
-         return false;
    }
+   if (*blend_successor &&
+       (*depth_active ? !ctx->draw_triangle_d16_blend :
+        !(textured ? ctx->draw_textured_triangle_blend :
+                     ctx->draw_triangle_blend)))
+      return false;
    if (textured) {
       struct pipe_sampler_view *view;
       struct pipe_resource *source;
@@ -340,6 +347,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct drm_chrome9_draw_triangle args = { 0 };
    struct drm_chrome9_draw_triangle_blend blend_args = { 0 };
    struct drm_chrome9_draw_triangle_d16 depth_args = { 0 };
+   struct drm_chrome9_draw_triangle_d16_blend depth_blend_args = { 0 };
    struct drm_chrome9_draw_textured_triangle texture_args = { 0 };
    struct drm_chrome9_draw_textured_triangle_blend texture_blend_args = { 0 };
    struct drm_chrome9_blend_state blend_state;
@@ -420,6 +428,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             chrome9_coord_16_16(position[1], target->base.height0);
          depth_args.vertices[i].z_16_16 = chrome9_depth_16_16(position[2]);
          depth_args.vertices[i].color = color;
+         depth_blend_args.vertices[i] = depth_args.vertices[i];
       } else {
          args.vertices[i].x_16_16 =
             chrome9_coord_16_16(position[0], target->base.width0);
@@ -484,6 +493,22 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       depth_args.destination_pitch = target->stride;
       depth_args.depth_pitch = depth->stride;
       depth_args.scissor = scissor;
+      if (blend_successor) {
+         depth_blend_args.destination_handle =
+            depth_args.destination_handle;
+         depth_blend_args.depth_handle = depth_args.depth_handle;
+         depth_blend_args.width = depth_args.width;
+         depth_blend_args.height = depth_args.height;
+         depth_blend_args.destination_pitch =
+            depth_args.destination_pitch;
+         depth_blend_args.depth_pitch = depth_args.depth_pitch;
+         depth_blend_args.blend = blend_state;
+         depth_blend_args.scissor = scissor;
+         depth_blend_args.destination_format =
+            target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+            DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+            DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+      }
    } else {
       args.destination_handle = target->bo.handle;
       args.width = target->base.width0;
@@ -508,6 +533,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       chrome9_draw_textured_triangle_blend(fd, &texture_blend_args) :
       crender->textured ?
       chrome9_draw_textured_triangle(fd, &texture_args) :
+      depth_active && blend_successor ?
+      chrome9_draw_triangle_d16_blend(fd, &depth_blend_args) :
       depth_active ? chrome9_draw_triangle_d16(fd, &depth_args) :
       blend_successor ? chrome9_draw_triangle_blend(fd, &blend_args) :
                      chrome9_draw_triangle(fd, &args);

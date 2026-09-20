@@ -52,10 +52,12 @@ struct chrome9_context {
    struct pipe_resource *render_target;
    bool render_target_dirty;
    bool draw_triangle_d16;
+   bool draw_triangle_d16_blend;
    bool draw_textured_triangle;
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;
+   bool alpha_test_supported;
    bool scissor_supported;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;

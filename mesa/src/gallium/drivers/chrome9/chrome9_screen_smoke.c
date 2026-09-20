@@ -247,11 +247,24 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       { {  1, -1, 0, 1 }, { 1, 0, 0, 0.5 } },
       { {  1,  1, 0, 1 }, { 1, 0, 0, 0.5 } },
    };
+   static const struct smoke_vertex alpha_near_kill_vertices[] = {
+      { { -1, -1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
+      { { -1,  1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
+      { {  1, -1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
+      { {  1,  1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
+   };
+   static const struct smoke_vertex alpha_far_pass_vertices[] = {
+      { { -1, -1, 0, 1 }, { 0, 1, 0, 0.25 } },
+      { { -1,  1, 0, 1 }, { 0, 1, 0, 0.25 } },
+      { {  1, -1, 0, 1 }, { 0, 1, 0, 0.25 } },
+      { {  1,  1, 0, 1 }, { 0, 1, 0, 0.25 } },
+   };
    struct pipe_context *context = NULL;
    struct pipe_blend_state blend = { 0 };
    struct pipe_blend_state source_over = { 0 };
    struct pipe_blend_state alpha_only = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
+   struct pipe_depth_stencil_alpha_state alpha_dsa;
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_rasterizer_state scissor_rasterizer;
    struct pipe_vertex_element elements[2] = { 0 };
@@ -304,6 +317,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *source_over_handle = NULL;
    void *alpha_only_handle = NULL;
    void *dsa_handle = NULL;
+   void *alpha_dsa_handle = NULL;
    void *rasterizer_handle = NULL;
    void *scissor_rasterizer_handle = NULL;
    void *elements_handle = NULL;
@@ -344,6 +358,13 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       vertex_buffer.buffer.user = far_vertices;
    }
    dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   alpha_dsa = dsa;
+   alpha_dsa.alpha_enabled = true;
+   alpha_dsa.alpha_func = PIPE_FUNC_LESS;
+   alpha_dsa.alpha_ref_value = 0.5f;
+   if (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST))
+      alpha_dsa_handle =
+         context->create_depth_stencil_alpha_state(context, &alpha_dsa);
    rasterizer.half_pixel_center = true;
    rasterizer.bottom_edge_rule = true;
    rasterizer.depth_clip_near = true;
@@ -377,6 +398,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
         chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_SCISSOR) &&
         !scissor_rasterizer_handle) ||
        !dsa_handle || !rasterizer_handle ||
+       (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST) &&
+        !alpha_dsa_handle) ||
        !elements_handle || !vs || !fs)
       goto out;
 
@@ -472,6 +495,56 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                     pixel);
       }
    }
+   if (passed && alpha_dsa_handle) {
+      struct chrome9_resource *depth_surface = depth_resource ?
+         chrome9_resource(depth_resource) : NULL;
+      uint64_t submitted = chrome9_context(context)->submitted_triangles;
+      uint64_t rejected = chrome9_context(context)->rejected_triangles;
+      uint32_t pixel;
+      uint16_t alpha_depth = 0xffff;
+
+      context->bind_blend_state(context, blend_handle);
+      context->bind_depth_stencil_alpha_state(context, alpha_dsa_handle);
+      context->bind_rasterizer_state(context, rasterizer_handle);
+      context->clear(context, PIPE_CLEAR_COLOR0 |
+                                (depth_resource ? PIPE_CLEAR_DEPTH : 0),
+                     PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 1.0, 0);
+      vertex_buffer.buffer.user = depth_resource ?
+         alpha_near_kill_vertices : alpha_far_pass_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      vertex_buffer.buffer.user = depth_resource ?
+         alpha_far_pass_vertices : alpha_near_kill_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush_resource(context, resource);
+      context->flush(context, NULL, 0);
+      pixel = pixels[32 * (surface->stride / 4) + 192] & 0xffffff;
+      if (depth_surface) {
+         uint16_t *depth_pixels = (uint16_t *)
+            ((uint8_t *)depth_surface->bo.map + depth_surface->data_offset);
+         alpha_depth = depth_pixels[32 * (depth_surface->stride / 2) + 192];
+      }
+      passed = pixel == 0x0000ff00 &&
+               (!depth_resource ||
+                (alpha_depth >= 0x7ffe && alpha_depth <= 0x8001)) &&
+               chrome9_context(context)->submitted_triangles ==
+                  submitted + 4 &&
+               chrome9_context(context)->rejected_triangles == rejected &&
+               smoke_guard_pages_match(draw_surface) &&
+               (!depth_surface || smoke_guard_pages_match(depth_surface));
+      if (passed)
+         printf("Gallium alpha LESS/ref0.5%s passed: sample=%08x/%04x\n",
+                depth_resource ? " before D16" : "", pixel, alpha_depth);
+      else
+         fprintf(stderr,
+                 "Gallium alpha%s mismatch: sample=%08x/%04x "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                 depth_resource ? "/D16" : "", pixel, alpha_depth,
+                 chrome9_context(context)->submitted_triangles - submitted,
+                 chrome9_context(context)->rejected_triangles - rejected);
+      context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   }
    if (passed && scissor_rasterizer_handle) {
       const struct pipe_scissor_state probe = {
          .minx = 64, .miny = 32, .maxx = 128, .maxy = 64,
@@ -538,6 +611,9 @@ out:
                                           scissor_rasterizer_handle);
       if (dsa_handle)
          context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (alpha_dsa_handle)
+         context->delete_depth_stencil_alpha_state(context,
+                                                   alpha_dsa_handle);
       if (blend_handle)
          context->delete_blend_state(context, blend_handle);
       if (source_over_handle)

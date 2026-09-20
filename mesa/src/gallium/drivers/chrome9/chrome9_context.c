@@ -1100,6 +1100,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       goto fail;
    ctx->draw_triangle_d16 =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16);
+   ctx->draw_triangle_d16_blend =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND);
    ctx->draw_textured_triangle =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
    ctx->draw_triangle_blend =
@@ -1108,6 +1110,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND);
    ctx->blend_bgra8888 =
       !!(capabilities & DRM_CHROME9_CAP_BLEND_BGRA8888);
+   ctx->alpha_test_supported =
+      !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =
       !!(capabilities & DRM_CHROME9_CAP_SCISSOR);
 

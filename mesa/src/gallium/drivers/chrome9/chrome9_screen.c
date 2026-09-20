@@ -216,6 +216,12 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    caps->vertex_color_clamped = true;
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
+   caps->alpha_test =
+      (screen->capabilities &
+       (DRM_CHROME9_CAP_ALPHA_TEST |
+        DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND)) ==
+      (DRM_CHROME9_CAP_ALPHA_TEST |
+       DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND);
    caps->shareable_shaders = false;
 
    screen->base.destroy = chrome9_screen_destroy;
