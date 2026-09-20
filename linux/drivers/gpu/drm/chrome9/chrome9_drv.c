@@ -2433,13 +2433,63 @@ static void chrome9_pci_remove(struct pci_dev *pdev)
 	struct drm_device *drm = pci_get_drvdata(pdev);
 	struct chrome9_device *cdev = to_chrome9(drm);
 
-	drm_dev_unplug(drm);
+	if (!drm_dev_is_unplugged(drm))
+		drm_dev_unplug(drm);
 	if (chrome9_kms) {
 		drm_atomic_helper_shutdown(drm);
 		chrome9_kms_fini(cdev);
 	}
 	chrome9_engine_fini(cdev);
 }
+
+static DEFINE_MUTEX(chrome9_quiesce_lock);
+
+/*
+ * The bring-up engine keeps a module reference while its private GART and
+ * ring are live.  Quiesce and restore the hardware before allowing rmmod;
+ * on any timeout chrome9_engine_fini() retains the reference for safety.
+ */
+static ssize_t engine_quiesce_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+	struct chrome9_device *cdev;
+	bool quiesce;
+	ssize_t ret;
+
+	ret = kstrtobool(buf, &quiesce);
+	if (ret)
+		return ret;
+	if (!quiesce)
+		return -EINVAL;
+	if (!drm)
+		return -ENODEV;
+	if (chrome9_kms)
+		return -EOPNOTSUPP;
+	cdev = to_chrome9(drm);
+	mutex_lock(&chrome9_quiesce_lock);
+	if (!drm_dev_is_unplugged(drm))
+		drm_dev_unplug(drm);
+	if (atomic_read(&drm->open_count)) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	chrome9_engine_fini(cdev);
+	ret = cdev->engine ? -EBUSY : count;
+
+out_unlock:
+	mutex_unlock(&chrome9_quiesce_lock);
+
+	return ret;
+}
+static DEVICE_ATTR_WO(engine_quiesce);
+
+static struct attribute *chrome9_device_attrs[] = {
+	&dev_attr_engine_quiesce.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(chrome9_device);
 
 static const struct pci_device_id chrome9_pci_table[] = {
 	{ PCI_DEVICE(CHROME9_PCI_VENDOR_ID, CHROME9_PCI_DEVICE_VX900) },
@@ -2454,6 +2504,7 @@ static struct pci_driver chrome9_pci_driver = {
 	.remove = chrome9_pci_remove,
 	.driver = {
 		.suppress_bind_attrs = true,
+		.dev_groups = chrome9_device_groups,
 	},
 };
 module_pci_driver(chrome9_pci_driver);
