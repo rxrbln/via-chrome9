@@ -289,6 +289,13 @@ main(int argc, char **argv)
       screen->destroy(screen);
       return 1;
    }
+   if (!run_pipe_triangle(screen, shared_resource)) {
+      fputs("Chrome9 imported-shadow Gallium triangle failed\n", stderr);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
    screen->resource_destroy(screen, shared_resource);
    if (!run_pipe_triangle(screen, resource)) {
       fputs("Chrome9 Gallium triangle failed\n", stderr);
