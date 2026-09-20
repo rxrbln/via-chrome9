@@ -7,6 +7,7 @@
 #include "chrome9_drm.h"
 #include "chrome9_resource.h"
 
+#include <math.h>
 #include <stdio.h>
 
 #include "draw/draw_context.h"
@@ -56,6 +57,13 @@ struct chrome9_resource *
 chrome9_context_render_target(struct chrome9_context *ctx)
 {
    return ctx->render_target ? chrome9_resource(ctx->render_target) : NULL;
+}
+
+struct chrome9_resource *
+chrome9_context_depth_target(struct chrome9_context *ctx)
+{
+   return ctx->framebuffer.zsbuf.texture ?
+             chrome9_resource(ctx->framebuffer.zsbuf.texture) : NULL;
 }
 
 void
@@ -617,6 +625,31 @@ chrome9_clear_target(struct chrome9_resource *target,
 }
 
 static void
+chrome9_clear_depth_target(struct chrome9_resource *target, double depth,
+                           unsigned x, unsigned y, unsigned width,
+                           unsigned height)
+{
+   uint16_t value;
+
+   if (!target || target->base.format != PIPE_FORMAT_Z16_UNORM ||
+       x >= target->base.width0 || y >= target->base.height0)
+      return;
+   width = MIN2(width, target->base.width0 - x);
+   height = MIN2(height, target->base.height0 - y);
+   if (!isfinite(depth))
+      depth = 0.0;
+   value = (uint16_t)(CLAMP(depth, 0.0, 1.0) * 65535.0 + 0.5);
+   for (unsigned row = 0; row < height; row++) {
+      uint16_t *pixels = (uint16_t *)
+         ((uint8_t *)target->bo.map + target->data_offset +
+          (uint64_t)(y + row) * target->stride) + x;
+
+      for (unsigned column = 0; column < width; column++)
+         pixels[column] = value;
+   }
+}
+
+static void
 chrome9_clear(struct pipe_context *pipe, unsigned buffers,
               uint32_t color_mask, uint8_t stencil_mask,
               const struct pipe_scissor_state *scissor,
@@ -628,27 +661,53 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    unsigned x = 0, y = 0, width, height;
 
    (void)stencil_mask;
-   (void)depth;
    (void)stencil;
-   if (!(buffers & PIPE_CLEAR_COLOR0) ||
-       !(resource = ctx->render_target))
+   if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH)))
       return;
-   if ((color_mask & 0xf) != 0xf || (buffers & ~PIPE_CLEAR_COLOR0)) {
+   if (((buffers & PIPE_CLEAR_COLOR0) && (color_mask & 0xf) != 0xf) ||
+       (buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH))) {
       chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
-                        "masked or depth/stencil clears are not implemented");
+                        "masked color or stencil clears are not implemented");
       return;
    }
-   width = resource->width0;
-   height = resource->height0;
+   width = ctx->framebuffer.width;
+   height = ctx->framebuffer.height;
    if (scissor) {
-      x = MIN2(scissor->minx, resource->width0);
-      y = MIN2(scissor->miny, resource->height0);
-      width = MIN2(scissor->maxx, resource->width0) - x;
-      height = MIN2(scissor->maxy, resource->height0) - y;
+      x = MIN2(scissor->minx, width);
+      y = MIN2(scissor->miny, height);
+      width = MIN2(scissor->maxx, width) - x;
+      height = MIN2(scissor->maxy, height) - y;
    }
-   chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
-                        height);
-   chrome9_context_render_target_written(ctx);
+   if ((buffers & PIPE_CLEAR_COLOR0) &&
+       (resource = ctx->render_target)) {
+      chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
+                           height);
+      chrome9_context_render_target_written(ctx);
+   }
+   if (buffers & PIPE_CLEAR_DEPTH)
+      chrome9_clear_depth_target(chrome9_context_depth_target(ctx), depth,
+                                 x, y, width, height);
+}
+
+static void
+chrome9_clear_depth_stencil(struct pipe_context *pipe,
+                            struct pipe_surface *surface,
+                            unsigned clear_flags, double depth,
+                            unsigned stencil, unsigned x, unsigned y,
+                            unsigned width, unsigned height,
+                            bool render_condition)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   (void)stencil;
+   (void)render_condition;
+   if (!surface || !surface->texture || clear_flags != PIPE_CLEAR_DEPTH) {
+      chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
+                        "stencil clears are not implemented");
+      return;
+   }
+   chrome9_clear_depth_target(chrome9_resource(surface->texture), depth,
+                              x, y, width, height);
 }
 
 static void
@@ -822,6 +881,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
                           DRM_CHROME9_PARAM_CAPABILITIES, &capabilities) ||
        !(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE))
       goto fail;
+   ctx->draw_triangle_d16 =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16);
 
    ctx->base.screen = screen;
    ctx->base.priv = priv;
@@ -830,6 +891,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.draw_vbo = chrome9_draw_vbo;
    ctx->base.clear = chrome9_clear;
    ctx->base.clear_render_target = chrome9_clear_render_target;
+   ctx->base.clear_depth_stencil = chrome9_clear_depth_stencil;
    ctx->base.create_blend_state = chrome9_create_blend_state;
    ctx->base.bind_blend_state = chrome9_bind_blend_state;
    ctx->base.delete_blend_state = chrome9_delete_state;

@@ -31,6 +31,12 @@ chrome9_screen(struct pipe_screen *screen)
    return (struct chrome9_screen *)screen;
 }
 
+bool
+chrome9_screen_has_capability(struct pipe_screen *screen, uint64_t capability)
+{
+   return (chrome9_screen(screen)->capabilities & capability) == capability;
+}
+
 static int
 chrome9_screen_fd(struct pipe_screen *screen)
 {

@@ -134,12 +134,24 @@ chrome9_coord_16_16(float value, unsigned extent)
                          (int32_t)(scaled + 0.5);
 }
 
+static int32_t
+chrome9_depth_16_16(float value)
+{
+   double scaled = CLAMP((double)value, 0.0, 1.0) * 65536.0;
+
+   return (int32_t)(scaled + 0.5);
+}
+
 static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
-                             struct chrome9_resource **target)
+                             struct chrome9_resource **target,
+                             struct chrome9_resource **depth,
+                             bool *depth_active)
 {
    struct pipe_resource *resource;
 
+   *depth = NULL;
+   *depth_active = false;
    if (!ctx->vs || !ctx->fs || !ctx->fs->supported ||
        !(*target = chrome9_context_render_target(ctx)))
       return false;
@@ -157,11 +169,27 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        (ctx->blend->logicop_enable ||
         ctx->blend->rt[0].colormask != PIPE_MASK_RGBA))
       return false;
-   if (ctx->dsa && (ctx->dsa->depth_enabled ||
-                    ctx->dsa->stencil[0].enabled ||
+   if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
                     ctx->dsa->stencil[1].enabled ||
-                    ctx->dsa->alpha_enabled))
+                    ctx->dsa->alpha_enabled ||
+                    ctx->dsa->depth_bounds_test))
       return false;
+   if (ctx->dsa && ctx->dsa->depth_enabled) {
+      const struct pipe_surface *surface = &ctx->framebuffer.zsbuf;
+
+      *depth = chrome9_context_depth_target(ctx);
+      if (!ctx->draw_triangle_d16 || !ctx->dsa->depth_writemask ||
+          ctx->dsa->depth_func != PIPE_FUNC_LESS || !*depth ||
+          surface->format != PIPE_FORMAT_Z16_UNORM || surface->level ||
+          surface->first_layer || surface->last_layer ||
+          (*depth)->base.target != PIPE_TEXTURE_2D ||
+          (*depth)->base.format != PIPE_FORMAT_Z16_UNORM ||
+          !(*depth)->guarded || !(*depth)->bo.handle ||
+          (*depth)->base.width0 != resource->width0 ||
+          (*depth)->base.height0 != resource->height0)
+         return false;
+      *depth_active = true;
+   }
    if (ctx->rasterizer && ctx->rasterizer->scissor && ctx->scissor_valid &&
        (ctx->scissor.minx || ctx->scissor.miny ||
         ctx->scissor.maxx < resource->width0 ||
@@ -176,14 +204,18 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
 {
    struct chrome9_context *ctx = crender->ctx;
    struct chrome9_resource *target;
+   struct chrome9_resource *depth;
    struct drm_chrome9_draw_triangle args = { 0 };
+   struct drm_chrome9_draw_triangle_d16 depth_args = { 0 };
    const unsigned indices[3] = { ia, ib, ic };
+   bool depth_active;
 
-   if (!crender->layout_valid || !chrome9_draw_state_supported(ctx, &target)) {
+   if (!crender->layout_valid ||
+       !chrome9_draw_state_supported(ctx, &target, &depth, &depth_active)) {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
          fprintf(stderr, "chrome9: triangle rejected by the bounded "
-                         "color-only draw state\n");
+                         "color/D16 draw state\n");
          ctx->warnings |= CHROME9_WARN_DRAW_STATE;
       }
       return;
@@ -201,36 +233,55 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       vertex = crender->vertices + (size_t)indices[i] * crender->vertex_size;
       position = (const float *)vertex;
-      if (!isfinite(position[0]) || !isfinite(position[1])) {
+      if (!isfinite(position[0]) || !isfinite(position[1]) ||
+          (depth_active && !isfinite(position[2]))) {
          ctx->rejected_triangles++;
          return;
       }
       memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
-      args.vertices[i].x_16_16 =
-         chrome9_coord_16_16(position[0], target->base.width0);
-      args.vertices[i].y_16_16 =
-         chrome9_coord_16_16(position[1], target->base.height0);
-      args.vertices[i].color = color;
+      if (depth_active) {
+         depth_args.vertices[i].x_16_16 =
+            chrome9_coord_16_16(position[0], target->base.width0);
+         depth_args.vertices[i].y_16_16 =
+            chrome9_coord_16_16(position[1], target->base.height0);
+         depth_args.vertices[i].z_16_16 = chrome9_depth_16_16(position[2]);
+         depth_args.vertices[i].color = color;
+      } else {
+         args.vertices[i].x_16_16 =
+            chrome9_coord_16_16(position[0], target->base.width0);
+         args.vertices[i].y_16_16 =
+            chrome9_coord_16_16(position[1], target->base.height0);
+         args.vertices[i].color = color;
+      }
    }
 
-   args.destination_handle = target->bo.handle;
-   args.width = target->base.width0;
-   args.height = target->base.height0;
-   args.pitch = target->stride;
-   if (chrome9_draw_triangle(ctx->base.screen->get_screen_fd(ctx->base.screen),
-                             &args)) {
+   if (depth_active) {
+      depth_args.destination_handle = target->bo.handle;
+      depth_args.depth_handle = depth->bo.handle;
+      depth_args.width = target->base.width0;
+      depth_args.height = target->base.height0;
+      depth_args.destination_pitch = target->stride;
+      depth_args.depth_pitch = depth->stride;
+   } else {
+      args.destination_handle = target->bo.handle;
+      args.width = target->base.width0;
+      args.height = target->base.height0;
+      args.pitch = target->stride;
+   }
+   if (depth_active ?
+          chrome9_draw_triangle_d16(
+             ctx->base.screen->get_screen_fd(ctx->base.screen), &depth_args) :
+          chrome9_draw_triangle(
+             ctx->base.screen->get_screen_fd(ctx->base.screen), &args)) {
       ctx->submitted_triangles++;
       chrome9_context_render_target_written(ctx);
    } else {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr,
-                 "chrome9: DRAW_TRIANGLE failed: %s target=%ux%u/%u "
-                 "v=(%d,%d),(%d,%d),(%d,%d)\n",
-                 strerror(errno), args.width, args.height, args.pitch,
-                 args.vertices[0].x_16_16, args.vertices[0].y_16_16,
-                 args.vertices[1].x_16_16, args.vertices[1].y_16_16,
-                 args.vertices[2].x_16_16, args.vertices[2].y_16_16);
+                 "chrome9: DRAW_TRIANGLE%s failed: %s target=%ux%u/%u\n",
+                 depth_active ? "_D16" : "", strerror(errno),
+                 target->base.width0, target->base.height0, target->stride);
          ctx->warnings |= CHROME9_WARN_SUBMIT;
       }
    }

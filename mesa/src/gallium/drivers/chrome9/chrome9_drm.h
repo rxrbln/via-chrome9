@@ -23,5 +23,7 @@ bool chrome9_bo_export_fd(int fd, const struct chrome9_bo *bo, int *prime_fd);
 void chrome9_bo_destroy(int fd, struct chrome9_bo *bo);
 bool chrome9_draw_triangle(int fd,
                            const struct drm_chrome9_draw_triangle *draw);
+bool chrome9_draw_triangle_d16(
+   int fd, const struct drm_chrome9_draw_triangle_d16 *draw);
 
 #endif

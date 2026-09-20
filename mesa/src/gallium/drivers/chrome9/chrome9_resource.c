@@ -3,6 +3,8 @@
 
 #include "chrome9_resource.h"
 
+#include "chrome9_public.h"
+
 #include <limits.h>
 #include <unistd.h>
 
@@ -38,7 +40,8 @@ chrome9_resource_layout(const struct pipe_resource *templ, uint32_t *stride,
    }
 
    if (templ->target != PIPE_TEXTURE_2D ||
-       templ->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        templ->format != PIPE_FORMAT_Z16_UNORM) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
        templ->depth0 != 1 || templ->array_size != 1 || templ->last_level ||
@@ -50,7 +53,9 @@ chrome9_resource_layout(const struct pipe_resource *templ, uint32_t *stride,
        page_size > UINT32_MAX)
       return false;
 
-   *stride = ALIGN_POT(templ->width0 * 4, 32);
+   *stride = ALIGN_POT(templ->width0 *
+                          (templ->format == PIPE_FORMAT_Z16_UNORM ? 2 : 4),
+                       32);
    *data_size = (uint64_t)*stride * templ->height0;
    aligned_size = ALIGN_POT(*data_size, (uint64_t)page_size);
    if (aligned_size > UINT64_MAX - 2 * (uint64_t)page_size)
@@ -76,12 +81,16 @@ chrome9_is_format_supported(struct pipe_screen *screen,
    const unsigned surface_bindings =
       PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
       PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
+   const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR;
 
-   (void)screen;
    if (sample_count > 1 || storage_sample_count > 1)
       return false;
    if (target == PIPE_BUFFER)
       return !(bindings & ~buffer_bindings);
+   if (target == PIPE_TEXTURE_2D && format == PIPE_FORMAT_Z16_UNORM)
+      return chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_D16) &&
+             !(bindings & ~depth_bindings);
    return target == PIPE_TEXTURE_2D &&
           format == PIPE_FORMAT_B8G8R8X8_UNORM &&
           !(bindings & ~surface_bindings);
@@ -97,7 +106,11 @@ chrome9_can_create_resource(struct pipe_screen *screen,
    uint32_t stride;
    bool guarded;
 
-   (void)screen;
+   if (templ->format == PIPE_FORMAT_Z16_UNORM &&
+       !chrome9_is_format_supported(screen, templ->format, templ->target,
+                                    templ->nr_samples,
+                                    templ->nr_storage_samples, templ->bind))
+      return false;
    return chrome9_resource_layout(templ, &stride, &data_offset, &data_size,
                                   &allocation_size, &guarded);
 }
@@ -113,7 +126,8 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource = CALLOC_STRUCT(chrome9_resource);
    if (!resource)
       return NULL;
-   if (!chrome9_resource_layout(templ, &resource->stride,
+   if (!chrome9_can_create_resource(screen, templ) ||
+       !chrome9_resource_layout(templ, &resource->stride,
                                 &resource->data_offset,
                                 &resource->data_size, &allocation_size,
                                 &resource->guarded))
@@ -152,7 +166,9 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
         whandle->modifier != DRM_FORMAT_MOD_INVALID) ||
        !chrome9_resource_layout(templ, &native_stride, &data_offset,
                                 &data_size, &allocation_size, &guarded) ||
-       templ->target == PIPE_BUFFER || whandle->stride < templ->width0 * 4 ||
+       templ->target == PIPE_BUFFER ||
+       templ->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       whandle->stride < templ->width0 * 4 ||
        whandle->stride > 16352 || (whandle->stride & 31))
       return NULL;
 
@@ -264,8 +280,10 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    } else {
       transfer->stride = cresource->stride;
       transfer->layer_stride = (uint64_t)cresource->stride * resource->height0;
+      const unsigned cpp = resource->format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
+
       offset = cresource->data_offset + (uint64_t)box->y * cresource->stride +
-               (uint64_t)box->x * 4;
+               (uint64_t)box->x * cpp;
    }
    *out_transfer = transfer;
    return (uint8_t *)cresource->bo.map + offset;

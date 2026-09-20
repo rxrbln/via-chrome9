@@ -35,6 +35,7 @@ struct chrome9_context {
     * this guarded shadow and are copied back on flush. */
    struct pipe_resource *render_target;
    bool render_target_dirty;
+   bool draw_triangle_d16;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
    struct pipe_constant_buffer vs_constants[PIPE_MAX_CONSTANT_BUFFERS];
@@ -64,6 +65,8 @@ chrome9_context(struct pipe_context *pipe)
 struct chrome9_resource;
 struct chrome9_resource *
 chrome9_context_render_target(struct chrome9_context *ctx);
+struct chrome9_resource *
+chrome9_context_depth_target(struct chrome9_context *ctx);
 void chrome9_context_render_target_written(struct chrome9_context *ctx);
 
 struct pipe_context *
