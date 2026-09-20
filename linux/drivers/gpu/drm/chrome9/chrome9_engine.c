@@ -127,12 +127,17 @@ struct chrome9_draw_request {
 	u32 texture_program;
 	u32 destination_format;
 	u64 texture_object_size;
+	struct drm_chrome9_scissor_state scissor;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_vertex vertices[3];
 	struct drm_chrome9_vertex_d16 depth_vertices[3];
 	struct drm_chrome9_textured_vertex textured_vertices[3];
 };
 
+static_assert(sizeof(struct drm_chrome9_scissor_state) == 12);
+static_assert(sizeof(struct drm_chrome9_draw_triangle) == 88);
+static_assert(sizeof(struct drm_chrome9_draw_triangle_d16) == 96);
+static_assert(sizeof(struct drm_chrome9_draw_textured_triangle) == 176);
 static_assert(sizeof(struct drm_chrome9_blend_state) == 40);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_blend) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_blend) == 216);
@@ -508,6 +513,22 @@ static u32 chrome9_blend_color_mask(u32 mask)
 	return hardware;
 }
 
+static u32 chrome9_scissor_y(const struct chrome9_draw_request *request)
+{
+	if (!(request->scissor.flags & DRM_CHROME9_SCISSOR_ENABLE))
+		return 0x82000000 | request->height;
+	return 0x82000000 | request->scissor.min_y << 12 |
+		request->scissor.max_y;
+}
+
+static u32 chrome9_scissor_x(const struct chrome9_draw_request *request)
+{
+	if (!(request->scissor.flags & DRM_CHROME9_SCISSOR_ENABLE))
+		return 0x83000000 | request->width;
+	return 0x83000000 | request->scissor.min_x << 12 |
+		request->scissor.max_x;
+}
+
 static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
 				struct chrome9_blend_words *words)
 {
@@ -574,8 +595,8 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	body[50 + delta] = 0x24000003;
 	body[100 + delta] = 0x80000000 | request->height;
 	body[101 + delta] = 0x81000000 | request->width;
-	body[102 + delta] = 0x82000000 | request->height;
-	body[103 + delta] = 0x83000000 | request->width;
+	body[102 + delta] = chrome9_scissor_y(request);
+	body[103 + delta] = chrome9_scissor_x(request);
 	for (i = 0; i < ARRAY_SIZE(request->vertices); i++) {
 		u32 *vertex = body + 164 + delta + i * 6;
 
@@ -692,8 +713,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	u32 clip[] = {
 		0x80000000 | request->height,
 		0x81000000 | request->width,
-		0x82000000 | request->height,
-		0x83000000 | request->width,
+		chrome9_scissor_y(request),
+		chrome9_scissor_x(request),
 	};
 	u32 vertices[3 * 8];
 	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
@@ -889,8 +910,8 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	body[54] = 0x24000003;
 	body[104] = 0x80000000 | request->height;
 	body[105] = 0x81000000 | request->width;
-	body[106] = 0x82000000 | request->height;
-	body[107] = 0x83000000 | request->width;
+	body[106] = chrome9_scissor_y(request);
+	body[107] = chrome9_scissor_x(request);
 	for (i = 0; i < ARRAY_SIZE(request->depth_vertices); i++) {
 		u32 *vertex = body + 168 + i * 6;
 
@@ -2158,6 +2179,21 @@ static bool chrome9_coordinate_valid(s32 value, u32 limit)
 	return value >= minimum && value <= maximum;
 }
 
+static int
+chrome9_validate_scissor(const struct drm_chrome9_scissor_state *scissor,
+			 u32 width, u32 height)
+{
+	if (scissor->flags & ~DRM_CHROME9_SCISSOR_ENABLE)
+		return -EINVAL;
+	if (!(scissor->flags & DRM_CHROME9_SCISSOR_ENABLE))
+		return scissor->min_x || scissor->max_x || scissor->min_y ||
+		       scissor->max_y ? -EINVAL : 0;
+	if (scissor->min_x > scissor->max_x || scissor->max_x > width ||
+	    scissor->min_y > scissor->max_y || scissor->max_y > height)
+		return -EINVAL;
+	return 0;
+}
+
 static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *state)
 {
 	if (state->flags & ~DRM_CHROME9_BLEND_ENABLE ||
@@ -2195,15 +2231,21 @@ int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,
 		.width = args->width,
 		.height = args->height,
 		.pitch = args->pitch,
+		.scissor = args->scissor,
 	};
 	u64 surface_size;
 	unsigned int i;
+	int ret;
 
-	if (args->flags || args->pad || args->reserved[0] || args->reserved[1] ||
+	if (args->flags || args->pad || args->reserved ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->pitch != ALIGN(args->width * sizeof(u32), 32))
 		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
 	if (check_mul_overflow((u64)args->pitch, (u64)args->height,
 			       &surface_size) ||
 	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
@@ -2233,20 +2275,24 @@ int chrome9_draw_triangle_blend_ioctl(struct drm_device *drm, void *data,
 		.height = args->height,
 		.pitch = args->pitch,
 		.destination_format = args->destination_format,
+		.scissor = args->scissor,
 		.blend = args->blend,
 	};
 	u64 surface_size;
 	unsigned int i;
 	int ret;
 
-	if (args->flags || args->pad || args->reserved[0] ||
-	    args->reserved[1] || args->reserved[2] ||
+	if (args->flags || args->pad ||
 	    args->destination_format >
 		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->pitch != ALIGN(args->width * sizeof(u32), 32))
 		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
 	ret = chrome9_validate_blend_state(&args->blend);
 	if (ret)
 		return ret;
@@ -2280,17 +2326,23 @@ int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
 		.height = args->height,
 		.pitch = args->destination_pitch,
 		.depth_pitch = args->depth_pitch,
+		.scissor = args->scissor,
 	};
 	u64 surface_size;
 	u64 total_size;
 	unsigned int i;
+	int ret;
 
-	if (args->flags || args->pad || args->reserved[0] ||
-	    args->reserved[1] || !args->width || args->width > 2048 ||
+	if (args->flags || args->pad || args->reserved ||
+	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
 	    args->depth_pitch != ALIGN(args->width * sizeof(u16), 32))
 		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
 	if (check_mul_overflow((u64)args->destination_pitch,
 			       (u64)args->height, &surface_size) ||
 	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
@@ -2349,13 +2401,15 @@ int chrome9_draw_textured_triangle_ioctl(struct drm_device *drm, void *data,
 		.wrap_s = args->wrap_s,
 		.wrap_t = args->wrap_t,
 		.texture_program = args->program,
+		.scissor = args->scissor,
 	};
 	u64 surface_size;
 	u64 total_size;
 	unsigned int i;
+	int ret;
 
-	if (args->flags || args->pad || args->reserved[0] ||
-	    args->reserved[1] || !args->width || args->width > 2048 ||
+	if (args->flags || args->pad || args->reserved ||
+	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
 	    !args->texture_width || args->texture_width > 2048 ||
@@ -2373,6 +2427,10 @@ int chrome9_draw_textured_triangle_ioctl(struct drm_device *drm, void *data,
 	     args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
 	     args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT))
 		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
 	if (check_mul_overflow((u64)args->destination_pitch,
 			       (u64)args->height, &surface_size) ||
 	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
@@ -2426,6 +2484,7 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 		.wrap_t = args->wrap_t,
 		.texture_program = args->program,
 		.destination_format = args->destination_format,
+		.scissor = args->scissor,
 		.blend = args->blend,
 	};
 	u64 surface_size;
@@ -2433,8 +2492,7 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 	unsigned int i;
 	int ret;
 
-	if (args->flags || args->pad || args->reserved[0] ||
-	    args->reserved[1] || args->reserved[2] ||
+	if (args->flags || args->pad ||
 	    args->destination_format >
 		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
 	    !args->width || args->width > 2048 ||
@@ -2455,6 +2513,10 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 	     args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
 	     args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT))
 		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
 	ret = chrome9_validate_blend_state(&args->blend);
 	if (ret)
 		return ret;
