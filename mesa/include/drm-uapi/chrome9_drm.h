@@ -72,6 +72,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND	(1ULL << 8)
 /* Blend successors can select A8R8G8B8 destination storage. */
 #define DRM_CHROME9_CAP_BLEND_BGRA8888	(1ULL << 9)
+/* Every bounded draw ABI accepts an optional half-open raster scissor. */
+#define DRM_CHROME9_CAP_SCISSOR	(1ULL << 11)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -111,6 +113,17 @@ struct drm_chrome9_vertex {
 	__u32 pad;
 };
 
+#define DRM_CHROME9_SCISSOR_ENABLE	(1U << 0)
+
+/* Half-open [min,max) pixel coordinates; zero flags disable scissoring. */
+struct drm_chrome9_scissor_state {
+	__u32 flags;
+	__u16 min_x;
+	__u16 max_x;
+	__u16 min_y;
+	__u16 max_y;
+};
+
 /*
  * Draw one Gouraud-shaded triangle into a guarded X8R8G8B8 surface.
  * The native shmem BO layout is one guard page, page-aligned pixel storage,
@@ -124,7 +137,8 @@ struct drm_chrome9_draw_triangle {
 	__u32 pitch;
 	__u32 pad;
 	struct drm_chrome9_vertex vertices[3];
-	__u64 reserved[2];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 reserved;
 };
 
 /* Screen-space X/Y and normalized depth in signed 16.16 fixed point. */
@@ -153,7 +167,8 @@ struct drm_chrome9_draw_triangle_d16 {
 	__u32 depth_pitch;
 	__u32 pad;
 	struct drm_chrome9_vertex_d16 vertices[3];
-	__u64 reserved[2];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 reserved;
 };
 
 #define DRM_CHROME9_TEXTURE_PROGRAM_REPLACE	0
@@ -206,7 +221,8 @@ struct drm_chrome9_draw_textured_triangle {
 	__u32 wrap_t;
 	__u32 pad;
 	struct drm_chrome9_textured_vertex vertices[3];
-	__u64 reserved[2];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 reserved;
 };
 
 #define DRM_CHROME9_BLEND_ENABLE	(1U << 0)
@@ -252,7 +268,7 @@ struct drm_chrome9_draw_triangle_blend {
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_vertex vertices[3];
 	__u32 destination_format;
-	__u32 reserved[3];
+	struct drm_chrome9_scissor_state scissor;
 };
 
 /*
@@ -279,7 +295,7 @@ struct drm_chrome9_draw_textured_triangle_blend {
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_textured_vertex vertices[3];
 	__u32 destination_format;
-	__u32 reserved[3];
+	struct drm_chrome9_scissor_state scissor;
 };
 
 #if defined(__cplusplus)
