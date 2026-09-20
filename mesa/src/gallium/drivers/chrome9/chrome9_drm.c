@@ -136,3 +136,21 @@ chrome9_draw_textured_triangle(
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE, draw) == 0;
 }
+
+bool
+chrome9_draw_triangle_blend(
+   int fd, const struct drm_chrome9_draw_triangle_blend *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TRIANGLE_BLEND, draw) == 0;
+}
+
+bool
+chrome9_draw_textured_triangle_blend(
+   int fd, const struct drm_chrome9_draw_textured_triangle_blend *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND, draw) == 0;
+}

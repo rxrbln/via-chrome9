@@ -241,8 +241,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       { {  1, -1, 0, 1 }, { 0, 0, 1, 1 } },
       { {  1,  1, 0, 1 }, { 0, 0, 1, 1 } },
    };
+   static const struct smoke_vertex blend_vertices[] = {
+      { { -1, -1, 0, 1 }, { 1, 0, 0, 0.5 } },
+      { { -1,  1, 0, 1 }, { 1, 0, 0, 0.5 } },
+      { {  1, -1, 0, 1 }, { 1, 0, 0, 0.5 } },
+      { {  1,  1, 0, 1 }, { 1, 0, 0, 0.5 } },
+   };
    struct pipe_context *context = NULL;
    struct pipe_blend_state blend = { 0 };
+   struct pipe_blend_state source_over = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_vertex_element elements[2] = { 0 };
@@ -281,11 +288,14 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       .count = 4,
    };
    union pipe_color_union clear_color = { 0 };
+   union pipe_color_union green = { .f = { 0, 1, 0, 0 } };
    struct chrome9_resource *surface = chrome9_resource(resource);
+   struct chrome9_resource *draw_surface;
    uint32_t *pixels;
    size_t changed = 0;
    uint16_t sample_depth = 0;
    void *blend_handle = NULL;
+   void *source_over_handle = NULL;
    void *dsa_handle = NULL;
    void *rasterizer_handle = NULL;
    void *elements_handle = NULL;
@@ -298,6 +308,19 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       goto out;
    blend.rt[0].colormask = PIPE_MASK_RGBA;
    blend_handle = context->create_blend_state(context, &blend);
+   source_over.rt[0].blend_enable = true;
+   source_over.rt[0].rgb_func = PIPE_BLEND_ADD;
+   source_over.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+   source_over.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   source_over.rt[0].alpha_func = PIPE_BLEND_ADD;
+   source_over.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+   source_over.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   source_over.rt[0].colormask = PIPE_MASK_RGBA;
+   if (!depth_resource &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND))
+      source_over_handle =
+         context->create_blend_state(context, &source_over);
    if (depth_resource) {
       dsa.depth_enabled = true;
       dsa.depth_writemask = true;
@@ -322,7 +345,12 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                                                             elements);
    vs = make_ff_vertex_shader(screen, context);
    fs = make_ff_primary_color_fs(screen, context);
-   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+   if (!blend_handle ||
+       (!depth_resource &&
+        chrome9_screen_has_capability(
+           screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND) &&
+        !source_over_handle) ||
+       !dsa_handle || !rasterizer_handle ||
        !elements_handle || !vs || !fs)
       goto out;
 
@@ -334,6 +362,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    context->bind_fs_state(context, fs);
    context->set_vertex_buffers(context, 1, &vertex_buffer);
    context->set_framebuffer_state(context, &framebuffer);
+   draw_surface = chrome9_context_render_target(chrome9_context(context));
+   if (!draw_surface)
+      goto out;
    context->set_viewport_states(context, 0, 1, &viewport);
    context->set_scissor_states(context, 0, 1, &scissor);
    context->clear(context, PIPE_CLEAR_COLOR0 |
@@ -369,6 +400,29 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                (pixels[32 * (surface->stride / 4) + 192] & 0xffffff) ==
                   0xff0000 &&
                sample_depth >= 0x3ffe && sample_depth <= 0x4001;
+   } else if (passed && source_over_handle) {
+      uint32_t pixel;
+      unsigned red, green_channel;
+
+      context->bind_blend_state(context, source_over_handle);
+      vertex_buffer.buffer.user = blend_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &green, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      pixel = pixels[32 * (surface->stride / 4) + 192] & 0xffffff;
+      red = pixel >> 16;
+      green_channel = pixel >> 8 & 0xff;
+      passed = !(pixel & 0xff) && red >= 0x7f && red <= 0x80 &&
+               green_channel >= 0x7f && green_channel <= 0x80 &&
+               smoke_guard_pages_match(draw_surface);
+      if (passed)
+         printf("Gallium source-over blend passed: sample=%08x\n", pixel);
+      else
+         fprintf(stderr,
+                 "Gallium source-over blend mismatch: sample=%08x\n",
+                 pixel);
    }
    if (!passed)
       fprintf(stderr,
@@ -397,6 +451,8 @@ out:
          context->delete_depth_stencil_alpha_state(context, dsa_handle);
       if (blend_handle)
          context->delete_blend_state(context, blend_handle);
+      if (source_over_handle)
+         context->delete_blend_state(context, source_over_handle);
       context->destroy(context);
    }
    return passed;
@@ -435,7 +491,7 @@ run_pipe_texture(struct pipe_screen *screen)
    };
    struct pipe_resource texture_templ = {
       .target = PIPE_TEXTURE_2D,
-      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
       .width0 = 2, .height0 = 2, .depth0 = 1, .array_size = 1,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
    };
@@ -469,6 +525,7 @@ run_pipe_texture(struct pipe_screen *screen)
       .reduction_mode = PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE,
    };
    struct pipe_blend_state blend = { 0 };
+   struct pipe_blend_state source_over = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_vertex_element elements[3] = { 0 };
@@ -493,10 +550,12 @@ run_pipe_texture(struct pipe_screen *screen)
    };
    struct pipe_draw_start_count_bias draw = { .count = 4 };
    union pipe_color_union clear = { 0 };
+   union pipe_color_union green = { .f = { 0, 1, 0, 0 } };
    struct chrome9_resource *ctarget, *ctexture;
    struct chrome9_resource *crhw_target, *crhw_texture;
    struct chrome9_context *ccontext;
    void *blend_handle = NULL, *dsa_handle = NULL, *rasterizer_handle = NULL;
+   void *source_over_handle = NULL;
    void *elements_handle = NULL, *replace_elements_handle = NULL;
    void *sampler_handle = NULL;
    void *replace_vs = NULL, *modulate_vs = NULL;
@@ -530,6 +589,18 @@ run_pipe_texture(struct pipe_screen *screen)
 
    blend.rt[0].colormask = PIPE_MASK_RGBA;
    blend_handle = context->create_blend_state(context, &blend);
+   source_over.rt[0].blend_enable = true;
+   source_over.rt[0].rgb_func = PIPE_BLEND_ADD;
+   source_over.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+   source_over.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   source_over.rt[0].alpha_func = PIPE_BLEND_ADD;
+   source_over.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+   source_over.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   source_over.rt[0].colormask = PIPE_MASK_RGBA;
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND))
+      source_over_handle =
+         context->create_blend_state(context, &source_over);
    dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
    rasterizer.half_pixel_center = true;
    rasterizer.bottom_edge_rule = true;
@@ -562,7 +633,11 @@ run_pipe_texture(struct pipe_screen *screen)
    modulate_vs = make_texture_vertex_shader(screen, context, true);
    replace = make_texture_fragment_shader(screen, context, false);
    modulate = make_texture_fragment_shader(screen, context, true);
-   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+   if (!blend_handle ||
+       (chrome9_screen_has_capability(
+           screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND) &&
+        !source_over_handle) ||
+       !dsa_handle || !rasterizer_handle ||
        !elements_handle || !replace_elements_handle || !sampler_handle ||
        !view || !rhw_view ||
        !replace_vs ||
@@ -674,6 +749,45 @@ run_pipe_texture(struct pipe_screen *screen)
       goto out;
    }
    puts("Gallium texture REPLACE/MODULATE and guards passed");
+
+   if (source_over_handle) {
+      uint64_t submitted = ccontext->submitted_triangles;
+      uint64_t rejected = ccontext->rejected_triangles;
+      uint32_t pixel;
+
+      source[0] = source[1] = source[ctexture->stride / 4] =
+         source[ctexture->stride / 4 + 1] = 0x80ff0000;
+      vertex_buffer.buffer.user = white_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->bind_vertex_elements_state(context, replace_elements_handle);
+      context->bind_vs_state(context, replace_vs);
+      context->bind_fs_state(context, replace);
+      context->bind_blend_state(context, source_over_handle);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &green, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      pixels = (uint32_t *)((uint8_t *)ctarget->bo.map +
+                            ctarget->data_offset);
+      pixel = pixels[8 * (ctarget->stride / 4) + 8] & 0xffffff;
+      if (pixel != 0x00807f00 ||
+          ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected ||
+          source[0] != 0x80ff0000 || source[1] != 0x80ff0000 ||
+          source[ctexture->stride / 4] != 0x80ff0000 ||
+          source[ctexture->stride / 4 + 1] != 0x80ff0000 ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(ctexture)) {
+         fprintf(stderr,
+                 "Gallium textured source-over mismatch: sample=%08x "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                 pixel, ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected);
+         goto out;
+      }
+      puts("Gallium BGRA REPLACE source-over blend passed");
+      context->bind_blend_state(context, blend_handle);
+   }
 
    static const uint32_t rhw_texels[8] = {
       0x00ff0000, 0x0000ff00, 0x000000ff, 0x00ffffff,
@@ -823,6 +937,8 @@ out:
          context->delete_depth_stencil_alpha_state(context, dsa_handle);
       if (blend_handle)
          context->delete_blend_state(context, blend_handle);
+      if (source_over_handle)
+         context->delete_blend_state(context, source_over_handle);
       context->destroy(context);
    }
    if (texture) screen->resource_destroy(screen, texture);

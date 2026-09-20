@@ -17,6 +17,7 @@
 #include "draw/draw_vertex.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_shader_tokens.h"
+#include "util/blend.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
@@ -161,12 +162,88 @@ chrome9_depth_16_16(float value)
 }
 
 static bool
+chrome9_blend_factor(unsigned factor, uint32_t *result)
+{
+   switch (factor) {
+   case PIPE_BLENDFACTOR_ZERO:
+      *result = DRM_CHROME9_BLEND_FACTOR_ZERO;
+      return true;
+   case PIPE_BLENDFACTOR_ONE:
+      *result = DRM_CHROME9_BLEND_FACTOR_ONE;
+      return true;
+   case PIPE_BLENDFACTOR_SRC_ALPHA:
+      *result = DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA;
+      return true;
+   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
+      *result = DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+chrome9_translate_blend(const struct pipe_blend_state *state,
+                        struct drm_chrome9_blend_state *result,
+                        bool *successor)
+{
+   const struct pipe_rt_blend_state *rt;
+
+   memset(result, 0, sizeof(*result));
+   result->rgb_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+   result->rgb_dst_factor = DRM_CHROME9_BLEND_FACTOR_ZERO;
+   result->alpha_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+   result->alpha_dst_factor = DRM_CHROME9_BLEND_FACTOR_ZERO;
+   result->color_mask = DRM_CHROME9_COLOR_MASK_R |
+                        DRM_CHROME9_COLOR_MASK_G |
+                        DRM_CHROME9_COLOR_MASK_B |
+                        DRM_CHROME9_COLOR_MASK_A;
+   *successor = false;
+   if (!state)
+      return true;
+   if (state->independent_blend_enable || state->logicop_enable ||
+       state->alpha_to_coverage ||
+       state->alpha_to_coverage_dither || state->alpha_to_one ||
+       state->max_rt || state->advanced_blend_func ||
+       state->blend_coherent)
+      return false;
+
+   rt = &state->rt[0];
+   result->color_mask = 0;
+   if (rt->colormask & PIPE_MASK_R)
+      result->color_mask |= DRM_CHROME9_COLOR_MASK_R;
+   if (rt->colormask & PIPE_MASK_G)
+      result->color_mask |= DRM_CHROME9_COLOR_MASK_G;
+   if (rt->colormask & PIPE_MASK_B)
+      result->color_mask |= DRM_CHROME9_COLOR_MASK_B;
+   if (rt->colormask & PIPE_MASK_A)
+      result->color_mask |= DRM_CHROME9_COLOR_MASK_A;
+   *successor = rt->blend_enable || rt->colormask != PIPE_MASK_RGBA;
+   if (!rt->blend_enable)
+      return true;
+   if (rt->rgb_func != PIPE_BLEND_ADD || rt->alpha_func != PIPE_BLEND_ADD ||
+       !chrome9_blend_factor(rt->rgb_src_factor,
+                             &result->rgb_src_factor) ||
+       !chrome9_blend_factor(rt->rgb_dst_factor,
+                             &result->rgb_dst_factor) ||
+       !chrome9_blend_factor(rt->alpha_src_factor,
+                             &result->alpha_src_factor) ||
+       !chrome9_blend_factor(rt->alpha_dst_factor,
+                             &result->alpha_dst_factor))
+      return false;
+   result->flags = DRM_CHROME9_BLEND_ENABLE;
+   return true;
+}
+
+static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
                              struct chrome9_resource **depth,
                              struct chrome9_resource **texture,
                              struct chrome9_sampler_state **sampler,
-                             bool textured, bool *depth_active)
+                             bool textured, bool *depth_active,
+                             struct drm_chrome9_blend_state *blend,
+                             bool *blend_successor)
 {
    struct pipe_resource *resource;
 
@@ -183,13 +260,10 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        !(*target)->guarded || !(*target)->bo.handle)
       return false;
 
-   /* These semantics are not fields of DRAW_TRIANGLE.  Refuse rather than
-    * silently producing pixels with different API state. */
-   if (ctx->blend && ctx->blend->rt[0].blend_enable)
-      return false;
-   if (ctx->blend &&
-       (ctx->blend->logicop_enable ||
-        ctx->blend->rt[0].colormask != PIPE_MASK_RGBA))
+   if (!chrome9_translate_blend(ctx->blend, blend, blend_successor) ||
+       (*blend_successor &&
+        !(textured ? ctx->draw_textured_triangle_blend :
+                     ctx->draw_triangle_blend)))
       return false;
    if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
                     ctx->dsa->stencil[1].enabled ||
@@ -211,6 +285,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
           (*depth)->base.height0 != resource->height0)
          return false;
       *depth_active = true;
+      if (*blend_successor)
+         return false;
    }
    if (textured) {
       struct pipe_sampler_view *view;
@@ -251,14 +327,19 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct chrome9_resource *texture;
    struct chrome9_sampler_state *sampler;
    struct drm_chrome9_draw_triangle args = { 0 };
+   struct drm_chrome9_draw_triangle_blend blend_args = { 0 };
    struct drm_chrome9_draw_triangle_d16 depth_args = { 0 };
    struct drm_chrome9_draw_textured_triangle texture_args = { 0 };
+   struct drm_chrome9_draw_textured_triangle_blend texture_blend_args = { 0 };
+   struct drm_chrome9_blend_state blend_state;
    const unsigned indices[3] = { ia, ib, ic };
+   bool blend_successor;
    bool depth_active;
 
    if (!crender->layout_valid ||
        !chrome9_draw_state_supported(ctx, &target, &depth, &texture, &sampler,
-                                     crender->textured, &depth_active)) {
+                                     crender->textured, &depth_active,
+                                     &blend_state, &blend_successor)) {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
          fprintf(stderr, "chrome9: triangle rejected by the bounded "
@@ -312,6 +393,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                 sizeof(texcoord[0]));
          memcpy(&texture_args.vertices[i].t_float, &texcoord[1],
                 sizeof(texcoord[1]));
+         texture_blend_args.vertices[i] = texture_args.vertices[i];
       } else if (depth_active) {
          depth_args.vertices[i].x_16_16 =
             chrome9_coord_16_16(position[0], target->base.width0);
@@ -325,6 +407,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          args.vertices[i].y_16_16 =
             chrome9_coord_16_16(position[1], target->base.height0);
          args.vertices[i].color = color;
+         blend_args.vertices[i] = args.vertices[i];
       }
    }
 
@@ -349,6 +432,25 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       texture_args.mag_filter = sampler->mag_filter;
       texture_args.wrap_s = sampler->wrap_s;
       texture_args.wrap_t = sampler->wrap_t;
+      if (blend_successor) {
+         texture_blend_args.destination_handle =
+            texture_args.destination_handle;
+         texture_blend_args.texture_handle = texture_args.texture_handle;
+         texture_blend_args.program = texture_args.program;
+         texture_blend_args.width = texture_args.width;
+         texture_blend_args.height = texture_args.height;
+         texture_blend_args.destination_pitch =
+            texture_args.destination_pitch;
+         texture_blend_args.texture_width = texture_args.texture_width;
+         texture_blend_args.texture_height = texture_args.texture_height;
+         texture_blend_args.texture_pitch = texture_args.texture_pitch;
+         texture_blend_args.texture_format = texture_args.texture_format;
+         texture_blend_args.min_filter = texture_args.min_filter;
+         texture_blend_args.mag_filter = texture_args.mag_filter;
+         texture_blend_args.wrap_s = texture_args.wrap_s;
+         texture_blend_args.wrap_t = texture_args.wrap_t;
+         texture_blend_args.blend = blend_state;
+      }
    } else if (depth_active) {
       depth_args.destination_handle = target->bo.handle;
       depth_args.depth_handle = depth->bo.handle;
@@ -361,11 +463,21 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       args.width = target->base.width0;
       args.height = target->base.height0;
       args.pitch = target->stride;
+      if (blend_successor) {
+         blend_args.destination_handle = args.destination_handle;
+         blend_args.width = args.width;
+         blend_args.height = args.height;
+         blend_args.pitch = args.pitch;
+         blend_args.blend = blend_state;
+      }
    }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
-   const bool submitted = crender->textured ?
+   const bool submitted = crender->textured && blend_successor ?
+      chrome9_draw_textured_triangle_blend(fd, &texture_blend_args) :
+      crender->textured ?
       chrome9_draw_textured_triangle(fd, &texture_args) :
       depth_active ? chrome9_draw_triangle_d16(fd, &depth_args) :
+      blend_successor ? chrome9_draw_triangle_blend(fd, &blend_args) :
                      chrome9_draw_triangle(fd, &args);
 
    if (submitted) {
