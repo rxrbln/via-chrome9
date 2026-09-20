@@ -601,7 +601,7 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 		0x0d810000,
 	};
 	static const u32 raster_fvf[] = {
-		0x00000206, 0x010000c2, 0x020041d0, 0x030052d0,
+		0x00000206, 0x010000c2, 0x020041d1, 0x030052d0,
 		0x04006342, 0x1200001f, 0x61800000, 0x622081ff,
 		0x201c5c00, 0x23000f02, 0x24000004, 0x25f6cc00,
 		0x28ffcc00,
