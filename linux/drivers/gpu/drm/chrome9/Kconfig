@@ -6,6 +6,7 @@ config DRM_CHROME9
 	select DRM_EXEC
 	select DRM_GEM_DMA_HELPER
 	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER
 	help
 	  Experimental clean-room DRM render driver for the VIA VX900 Chrome9 HD
 	  graphics function (PCI ID 1106:7122).

@@ -6,6 +6,8 @@
 #include <linux/pci.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_simple_kms_helper.h>
 
 #include <drm/chrome9_drm.h>
 
@@ -23,6 +25,59 @@
 #define CHROME9_REG_FE_TRANSPACE		0x0440
 #define CHROME9_REG_CR_STATUS		0x0444
 #define CHROME9_REG_CURRENT_FENCE	0x0494
+
+/*
+ * VX900 direct scanout-base aliases recovered independently from the Windows
+ * KMD (IGA1 0x79683..0x796de, IGA2 0x79d70..0x79de9).  See the full evidence
+ * trail in docs/research/display-flip-vblank.md.  These helpers only pack
+ * values; no KMS path writes them yet.
+ *
+ * IGA1 stores a byte address shifted right by one in bits 28:0 and preserves
+ * bits 31:29.  IGA2 stores an eight-byte-aligned byte address in bits 28:3
+ * and preserves both bits 31:29 and the non-address bits 2:0.
+ */
+#define CHROME9_REG_IGA1_BASE		0x0214
+#define CHROME9_REG_IGA2_BASE		0x0218
+#define CHROME9_IGA1_BASE_KEEP_MASK	GENMASK(31, 29)
+#define CHROME9_IGA1_BASE_ADDR_MASK	GENMASK(28, 0)
+#define CHROME9_IGA2_BASE_KEEP_MASK	(GENMASK(31, 29) | GENMASK(2, 0))
+#define CHROME9_IGA2_BASE_ADDR_MASK	GENMASK(28, 3)
+#define CHROME9_IGA1_BASE_MAX		BIT(30)
+#define CHROME9_IGA2_BASE_MAX		BIT(29)
+
+/* Disable IGA1 T11 automatic swapping before either direct-base update. */
+#define CHROME9_REG_DISPLAY_TRANSSET	0x041c
+#define CHROME9_REG_DISPLAY_TRANSPACE	0x0420
+#define CHROME9_DISPLAY_TRANSSET_A12	0x00110000
+#define CHROME9_DISPLAY_TRANSPACE_T11	0x12000000
+
+/* By-frame (zero) versus by-line (one) direct-flip strategy selectors. */
+#define CHROME9_CR_IGA1_FLIP_MODE	0x32
+#define CHROME9_CR_IGA1_FLIP_BY_LINE	BIT(0)
+#define CHROME9_CR_IGA2_FLIP_MODE	0x88
+#define CHROME9_CR_IGA2_FLIP_BY_LINE	BIT(5)
+
+static inline bool chrome9_iga1_base_valid(u32 byte_address)
+{
+	return !(byte_address & 1) && byte_address < CHROME9_IGA1_BASE_MAX;
+}
+
+static inline bool chrome9_iga2_base_valid(u32 byte_address)
+{
+	return !(byte_address & 7) && byte_address < CHROME9_IGA2_BASE_MAX;
+}
+
+static inline u32 chrome9_iga1_base_pack(u32 old, u32 byte_address)
+{
+	return (old & CHROME9_IGA1_BASE_KEEP_MASK) |
+	       ((byte_address >> 1) & CHROME9_IGA1_BASE_ADDR_MASK);
+}
+
+static inline u32 chrome9_iga2_base_pack(u32 old, u32 byte_address)
+{
+	return (old & CHROME9_IGA2_BASE_KEEP_MASK) |
+	       (byte_address & CHROME9_IGA2_BASE_ADDR_MASK);
+}
 
 #define CHROME9_ENGINE_WAIT_MASK		0x00101ff3
 
@@ -47,6 +102,8 @@ struct chrome9_device {
 	resource_size_t vram_size;
 	u64 sl_base;
 	struct chrome9_engine *engine;
+	struct drm_simple_display_pipe display_pipe;
+	struct drm_connector display_connector;
 };
 
 static inline struct chrome9_device *to_chrome9(struct drm_device *drm)
@@ -56,6 +113,7 @@ static inline struct chrome9_device *to_chrome9(struct drm_device *drm)
 
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
+int chrome9_kms_init(struct chrome9_device *cdev);
 
 /* Live-verified H5S2VP1/H6 sequences shared with the fixed engine path. */
 void chrome9_init_2d_h6(struct chrome9_device *cdev);

@@ -33,6 +33,11 @@ module_param_named(enable, chrome9_enable, bool, 0400);
 MODULE_PARM_DESC(enable,
 		 "Bind the experimental discovery/GEM-only driver (default: false)");
 
+static bool chrome9_kms;
+module_param_named(kms, chrome9_kms, bool, 0400);
+MODULE_PARM_DESC(kms,
+		 "Expose the preparatory disconnected KMS skeleton (default: false)");
+
 static bool chrome9_mmio_probe;
 module_param_named(mmio_probe, chrome9_mmio_probe, bool, 0400);
 MODULE_PARM_DESC(mmio_probe,
@@ -2277,10 +2282,24 @@ static const struct drm_driver chrome9_drm_driver = {
 	.minor = 1,
 };
 
+static const struct drm_driver chrome9_kms_drm_driver = {
+	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
+			   DRIVER_ATOMIC,
+	.fops = &chrome9_fops,
+	.ioctls = chrome9_ioctls,
+	.num_ioctls = ARRAY_SIZE(chrome9_ioctls),
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	.name = CHROME9_DRIVER_NAME,
+	.desc = CHROME9_DRIVER_DESC,
+	.major = 0,
+	.minor = 1,
+};
+
 static int chrome9_pci_probe(struct pci_dev *pdev,
 			     const struct pci_device_id *id)
 {
 	struct chrome9_device *cdev;
+	const struct drm_driver *driver;
 	int ret;
 
 	if (!chrome9_enable)
@@ -2300,7 +2319,8 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 				     "%u-bit DMA is unavailable\n",
 				     chrome9_dma_bits);
 
-	cdev = devm_drm_dev_alloc(&pdev->dev, &chrome9_drm_driver,
+	driver = chrome9_kms ? &chrome9_kms_drm_driver : &chrome9_drm_driver;
+	cdev = devm_drm_dev_alloc(&pdev->dev, driver,
 				  struct chrome9_device, drm);
 	if (IS_ERR(cdev))
 		return PTR_ERR(cdev);
@@ -2328,6 +2348,13 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = chrome9_engine_init(cdev);
 	if (ret)
 		return ret;
+	if (chrome9_kms) {
+		ret = chrome9_kms_init(cdev);
+		if (ret) {
+			chrome9_engine_fini(cdev);
+			return ret;
+		}
+	}
 
 	ret = drm_dev_register(&cdev->drm, 0);
 	if (ret) {
@@ -2336,9 +2363,10 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	}
 
 	pci_set_drvdata(pdev, &cdev->drm);
-	dev_info(&pdev->dev, "VX900 revision %02x: shmem GEM%s\n",
+	dev_info(&pdev->dev, "VX900 revision %02x: shmem GEM%s%s\n",
 		 pdev->revision,
-		 chrome9_engine_ready(cdev) ? ", validated 3D engine ready" : "");
+		 chrome9_engine_ready(cdev) ? ", validated 3D engine ready" : "",
+		 chrome9_kms ? ", disconnected KMS scaffold" : "");
 	return 0;
 }
 
