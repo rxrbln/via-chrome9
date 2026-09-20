@@ -894,6 +894,30 @@ main(int argc, char **argv)
       return 1;
    }
    {
+      const struct pipe_shader_caps *vs =
+         &screen->shader_caps[MESA_SHADER_VERTEX];
+
+      if (vs->max_tex_instructions || vs->max_tex_indirections ||
+          vs->max_texture_samplers || vs->max_sampler_views ||
+          vs->max_shader_buffers || vs->max_shader_images ||
+          vs->max_hw_atomic_counters ||
+          vs->max_hw_atomic_counter_buffers ||
+          screen->caps.texture_transfer_modes !=
+             PIPE_TEXTURE_TRANSFER_DEFAULT ||
+          screen->caps.texture_shadow_map || screen->caps.gl_clamp ||
+          screen->caps.texrect || screen->caps.native_fp32_depth ||
+          screen->caps.buffer_map_persistent_coherent ||
+          screen->caps.dest_surface_srgb_control ||
+          screen->caps.packed_stream_output ||
+          screen->caps.two_sided_color || screen->caps.clip_planes ||
+          screen->caps.dithering ||
+          screen->caps.mixed_colorbuffer_formats) {
+         fprintf(stderr, "bounded Gallium capability contract failed\n");
+         screen->destroy(screen);
+         return 1;
+      }
+   }
+   {
       struct pipe_fence_handle *fence = NULL;
 
       screen->fence_reference(screen, &fence, NULL);
