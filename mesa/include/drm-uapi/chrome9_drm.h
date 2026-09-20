@@ -13,6 +13,7 @@ extern "C" {
 #define DRM_CHROME9_GEM_CREATE	0x01
 #define DRM_CHROME9_FIXED_QUAD	0x02
 #define DRM_CHROME9_DRAW_TRIANGLE	0x03
+#define DRM_CHROME9_DRAW_TRIANGLE_D16	0x04
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -26,6 +27,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TRIANGLE \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE, \
 		struct drm_chrome9_draw_triangle)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16 \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16, \
+		struct drm_chrome9_draw_triangle_d16)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -46,6 +50,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_FIXED_QUAD	(1ULL << 3)
 /* Variable-size, kernel-generated immediate Gouraud triangles are available. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE	(1ULL << 4)
+/* Guarded X8R8G8B8 plus linear D16 LESS/write triangles are available. */
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16	(1ULL << 5)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -98,6 +104,35 @@ struct drm_chrome9_draw_triangle {
 	__u32 pitch;
 	__u32 pad;
 	struct drm_chrome9_vertex vertices[3];
+	__u64 reserved[2];
+};
+
+/* Screen-space X/Y and normalized depth in signed 16.16 fixed point. */
+struct drm_chrome9_vertex_d16 {
+	__s32 x_16_16;
+	__s32 y_16_16;
+	__s32 z_16_16;
+	__u32 color;
+};
+
+/*
+ * Draw one Gouraud-shaded, depth-tested triangle.  Color and depth are
+ * distinct native shmem BOs, each laid out as one guard page, page-aligned
+ * pixel storage, then one guard page.  The color pitch must be
+ * ALIGN(width * 4, 32), and the linear D16 pitch ALIGN(width * 2, 32).
+ * This first depth ABI intentionally exposes only the live-proven LESS
+ * comparison with depth writes enabled.
+ */
+struct drm_chrome9_draw_triangle_d16 {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 pad;
+	struct drm_chrome9_vertex_d16 vertices[3];
 	__u64 reserved[2];
 };
 
