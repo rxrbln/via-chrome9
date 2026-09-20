@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_CHROME9
+	tristate "VIA Chrome9 HD (VX900) experimental render driver"
+	depends on DRM && PCI
+	select DRM_GEM_DMA_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	help
+	  Experimental clean-room DRM render driver for the VIA VX900 Chrome9 HD
+	  graphics function (PCI ID 1106:7122).
+
+	  This initial driver exposes DMA-backed GEM buffer allocation and immutable
+	  device discovery. Rendering remains behind explicit bring-up gates; no raw
+	  userspace command stream is accepted. Loading it also requires the
+	  chrome9_enable=1 module parameter.
+
+	  If M is selected, the module will be called chrome9.
