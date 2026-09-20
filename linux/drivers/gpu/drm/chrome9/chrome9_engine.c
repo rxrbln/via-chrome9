@@ -125,6 +125,7 @@ struct chrome9_draw_request {
 	u32 wrap_s;
 	u32 wrap_t;
 	u32 texture_program;
+	u32 destination_format;
 	u64 texture_object_size;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_vertex vertices[3];
@@ -565,7 +566,10 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 		body[22] = blend_words.a00;
 		delta = 4;
 	}
-	body[6] = 0x52980000 | (request->pitch >> 5);
+	body[6] = 0x52000000 |
+		(request->destination_format ==
+		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
+		 0x00980000) | (request->pitch >> 5);
 	body[49 + delta] = 0x23004f02;
 	body[50 + delta] = 0x24000003;
 	body[100 + delta] = 0x80000000 | request->height;
@@ -703,7 +707,10 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
-	destination_state[2] = 0x52980000 | (request->pitch >> 5);
+	destination_state[2] = 0x52000000 |
+		(request->destination_format ==
+		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
+		 0x00980000) | (request->pitch >> 5);
 	if (blend) {
 		chrome9_lower_blend(&request->blend, &blend_words);
 		for (i = 0; i < 8; i++)
@@ -2225,6 +2232,7 @@ int chrome9_draw_triangle_blend_ioctl(struct drm_device *drm, void *data,
 		.width = args->width,
 		.height = args->height,
 		.pitch = args->pitch,
+		.destination_format = args->destination_format,
 		.blend = args->blend,
 	};
 	u64 surface_size;
@@ -2232,7 +2240,9 @@ int chrome9_draw_triangle_blend_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	if (args->flags || args->pad || args->reserved[0] ||
-	    args->reserved[1] || args->reserved[2] || args->reserved[3] ||
+	    args->reserved[1] || args->reserved[2] ||
+	    args->destination_format >
+		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->pitch != ALIGN(args->width * sizeof(u32), 32))
@@ -2415,6 +2425,7 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 		.wrap_s = args->wrap_s,
 		.wrap_t = args->wrap_t,
 		.texture_program = args->program,
+		.destination_format = args->destination_format,
 		.blend = args->blend,
 	};
 	u64 surface_size;
@@ -2423,7 +2434,9 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 	int ret;
 
 	if (args->flags || args->pad || args->reserved[0] ||
-	    args->reserved[1] || args->reserved[2] || args->reserved[3] ||
+	    args->reserved[1] || args->reserved[2] ||
+	    args->destination_format >
+		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
