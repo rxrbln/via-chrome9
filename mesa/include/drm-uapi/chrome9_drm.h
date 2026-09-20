@@ -14,6 +14,7 @@ extern "C" {
 #define DRM_CHROME9_FIXED_QUAD	0x02
 #define DRM_CHROME9_DRAW_TRIANGLE	0x03
 #define DRM_CHROME9_DRAW_TRIANGLE_D16	0x04
+#define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE	0x05
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -30,6 +31,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16 \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16, \
 		struct drm_chrome9_draw_triangle_d16)
+#define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE, \
+		struct drm_chrome9_draw_textured_triangle)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -52,6 +56,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE	(1ULL << 4)
 /* Guarded X8R8G8B8 plus linear D16 LESS/write triangles are available. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16	(1ULL << 5)
+/* One bounded, level-zero 2D texture and immediate triangle are available. */
+#define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE	(1ULL << 6)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -133,6 +139,59 @@ struct drm_chrome9_draw_triangle_d16 {
 	__u32 depth_pitch;
 	__u32 pad;
 	struct drm_chrome9_vertex_d16 vertices[3];
+	__u64 reserved[2];
+};
+
+#define DRM_CHROME9_TEXTURE_PROGRAM_REPLACE	0
+#define DRM_CHROME9_TEXTURE_PROGRAM_MODULATE	1
+
+#define DRM_CHROME9_TEXTURE_FORMAT_BGRX8888	0
+#define DRM_CHROME9_TEXTURE_FORMAT_BGRA8888	1
+
+#define DRM_CHROME9_TEXTURE_FILTER_NEAREST	0
+#define DRM_CHROME9_TEXTURE_FILTER_LINEAR	1
+
+#define DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE	1
+#define DRM_CHROME9_TEXTURE_WRAP_REPEAT		2
+#define DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT	3
+
+/* IEEE-754 fields are passed as their exact 32-bit representation. */
+struct drm_chrome9_textured_vertex {
+	__s32 x_16_16;
+	__s32 y_16_16;
+	__s32 z_16_16;
+	__u32 rhw_float;
+	__u32 color;
+	__u32 specular;
+	__u32 s_float;
+	__u32 t_float;
+};
+
+/*
+ * Draw one single-textured triangle into a guarded X8R8G8B8 surface.
+ * Both objects use the native one-guard-page, data, one-guard-page layout.
+ * Texture pitch must be the canonical ALIGN(texture_width * 4, 32), and
+ * coordinates are normalized against texture_width.  Level zero and 32-bit
+ * linear textures are the only layouts exposed by this first ABI.
+ */
+struct drm_chrome9_draw_textured_triangle {
+	__u32 destination_handle;
+	__u32 texture_handle;
+	__u32 flags;
+	__u32 program;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 texture_width;
+	__u32 texture_height;
+	__u32 texture_pitch;
+	__u32 texture_format;
+	__u32 min_filter;
+	__u32 mag_filter;
+	__u32 wrap_s;
+	__u32 wrap_t;
+	__u32 pad;
+	struct drm_chrome9_textured_vertex vertices[3];
 	__u64 reserved[2];
 };
 
