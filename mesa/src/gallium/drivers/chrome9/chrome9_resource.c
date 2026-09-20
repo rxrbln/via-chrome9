@@ -226,7 +226,8 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
 
    (void)context;
    (void)usage;
-   if (!whandle || pres->target == PIPE_BUFFER || whandle->plane ||
+   if (!whandle || pres->target == PIPE_BUFFER ||
+       pres->format != PIPE_FORMAT_B8G8R8X8_UNORM || whandle->plane ||
        whandle->layer || whandle->type != WINSYS_HANDLE_TYPE_FD ||
        !chrome9_bo_export_fd(screen->get_screen_fd(screen), &resource->bo,
                              &prime_fd))

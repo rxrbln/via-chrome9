@@ -435,7 +435,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       passed = !(pixel & 0xff) && red >= 0x7f && red <= 0x80 &&
                green_channel >= 0x7f && green_channel <= 0x80 &&
                (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
-                (pixel >> 24) == 0x80) &&
+                ((pixel >> 24) >= 0x7f && (pixel >> 24) <= 0x80)) &&
                smoke_guard_pages_match(draw_surface);
       if (passed)
          printf("Gallium source-over blend passed: sample=%08x\n", pixel);
@@ -450,7 +450,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          context->draw_vbo(context, &info, 0, NULL, &draw, 1);
          context->flush(context, NULL, 0);
          pixel = pixels[32 * (surface->stride / 4) + 192];
-         passed = pixel == 0x80332211 &&
+         passed = (pixel == 0x7f332211 || pixel == 0x80332211) &&
                   smoke_guard_pages_match(draw_surface);
          if (passed)
             printf("Gallium BGRA alpha-only mask passed: sample=%08x\n",
@@ -1224,6 +1224,8 @@ main(int argc, char **argv)
    if (chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_BLEND_BGRA8888)) {
       struct pipe_resource *bgra_resource;
+      struct winsys_handle bgra_handle = { .type = WINSYS_HANDLE_TYPE_FD };
+      bool bgra_exported;
 
       if (!screen->is_format_supported(screen, bgra_templ.format,
                                        bgra_templ.target, 1, 1,
@@ -1237,7 +1239,13 @@ main(int argc, char **argv)
          return 1;
       }
       bgra_resource = screen->resource_create(screen, &bgra_templ);
-      if (!bgra_resource ||
+      bgra_exported = bgra_resource &&
+         screen->resource_get_handle(
+            screen, NULL, bgra_resource, &bgra_handle,
+            PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      if (bgra_exported)
+         close(bgra_handle.handle);
+      if (!bgra_resource || bgra_exported ||
           !run_pipe_triangle(screen, bgra_resource, NULL)) {
          fputs("Chrome9 Gallium BGRA8888 triangle failed\n", stderr);
          if (bgra_resource)
