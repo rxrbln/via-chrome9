@@ -3,6 +3,7 @@
 config DRM_CHROME9
 	tristate "VIA Chrome9 HD (VX900) experimental render driver"
 	depends on DRM && PCI
+	select DRM_EXEC
 	select DRM_GEM_DMA_HELPER
 	select DRM_GEM_SHMEM_HELPER
 	help

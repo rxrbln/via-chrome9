@@ -2232,7 +2232,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			DRM_CHROME9_CAP_GEM_SHMEM_CACHED;
 		if (chrome9_engine_ready(cdev))
 			args->value |= DRM_CHROME9_CAP_FIXED_QUAD |
-				       DRM_CHROME9_CAP_DRAW_TRIANGLE;
+				       DRM_CHROME9_CAP_DRAW_TRIANGLE |
+				       DRM_CHROME9_CAP_DRAW_TRIANGLE_D16;
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
@@ -2258,6 +2259,8 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TRIANGLE, chrome9_draw_triangle_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TRIANGLE_D16,
+			  chrome9_draw_triangle_d16_ioctl, DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(chrome9_fops);

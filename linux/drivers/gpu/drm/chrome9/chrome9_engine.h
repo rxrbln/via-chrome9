@@ -16,5 +16,7 @@ int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
 int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,
 				struct drm_file *file);
+int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
+				    struct drm_file *file);
 
 #endif

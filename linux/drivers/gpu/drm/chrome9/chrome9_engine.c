@@ -17,6 +17,7 @@
 #endif
 
 #include <drm/drm_drv.h>
+#include <drm/drm_exec.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -71,15 +72,21 @@ struct chrome9_fence {
 struct chrome9_job {
 	struct chrome9_fence fence;
 	struct drm_gem_shmem_object *destination;
+	struct drm_gem_shmem_object *depth;
 	struct sg_table *sgt;
+	struct sg_table *depth_sgt;
 	struct iosys_map map;
+	struct iosys_map depth_map;
 	struct drm_mm_node sf_node;
 	struct list_head quarantine_link;
 	u32 *ptes;
 	unsigned int page_count;
+	unsigned int destination_page_count;
+	unsigned int depth_page_count;
 	u32 cookie;
 	u8 slot;
 	bool mapped;
+	bool depth_mapped;
 	bool node_allocated;
 	bool sf_bound;
 	bool fence_attached;
@@ -90,17 +97,22 @@ struct chrome9_job {
 enum chrome9_draw_kind {
 	CHROME9_DRAW_FIXED,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE,
+	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16,
 };
 
 struct chrome9_draw_request {
 	enum chrome9_draw_kind kind;
 	u32 destination_handle;
+	u32 depth_handle;
 	u32 flags;
 	u32 width;
 	u32 height;
 	u32 pitch;
 	u64 object_size;
+	u32 depth_pitch;
+	u64 depth_object_size;
 	struct drm_chrome9_vertex vertices[3];
+	struct drm_chrome9_vertex_d16 depth_vertices[3];
 };
 
 struct chrome9_engine {
@@ -473,6 +485,79 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	return 0;
 }
 
+static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
+		const struct chrome9_draw_request *request,
+		struct chrome9_job *job, u32 target, u32 depth, u32 *pause)
+{
+	static const u32 sync[] = { 0x6c, 0x00800000 };
+	static const u32 status[] = {
+		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
+	};
+	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
+	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *body;
+	u32 *p;
+	unsigned int i;
+
+	memset(base, 0xcc, PAGE_SIZE);
+	p = base;
+	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
+	body = PTR_ALIGN(p, 16);
+	chrome9_emit_3d_quad_h6(&p, target, true);
+	if (p - body != 188 || body[6] != 0x52980004 ||
+	    body[19] != 0x01c01540 || body[24] != 0xfe020440 ||
+	    body[49] != 0x23000f02 || body[50] != 0x24000004 ||
+	    body[160] != 0xfe020440 || body[163] != 0xcc000000)
+		return -EINVAL;
+
+	/* Insert the four live-proven D16 words before the next H6 group. */
+	memmove(body + 28, body + 24, (188 - 24) * sizeof(*body));
+	body[6] = 0x52980000 | (request->pitch >> 5);
+	body[19] = 0x01c0154c;
+	body[22] = 0x10000000 | (depth >> 8);
+	body[23] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
+	body[24] = 0x12380000;
+	body[25] = 0x13010000;
+	body[26] = 0xcc000000;
+	body[27] = 0xcc000000;
+	body[53] = 0x23004f02;
+	body[54] = 0x24000003;
+	body[104] = 0x80000000 | request->height;
+	body[105] = 0x81000000 | request->width;
+	body[106] = 0x82000000 | request->height;
+	body[107] = 0x83000000 | request->width;
+	for (i = 0; i < ARRAY_SIZE(request->depth_vertices); i++) {
+		u32 *vertex = body + 168 + i * 6;
+
+		vertex[0] = chrome9_q16_to_float(request->depth_vertices[i].x_16_16);
+		vertex[1] = chrome9_q16_to_float(request->depth_vertices[i].y_16_16);
+		vertex[2] = chrome9_q16_to_float(request->depth_vertices[i].z_16_16);
+		vertex[3] = 0x3f800000;
+		vertex[4] = request->depth_vertices[i].color;
+		vertex[5] = 0xffffffff;
+	}
+	body[186] = 0xcc000000;
+	body[187] = 0xcc000000;
+	p = body + 188;
+	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+			     status, ARRAY_SIZE(status));
+	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
+	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	if ((u8 *)p - (u8 *)base > PAGE_SIZE - CHROME9_CR_READ_AHEAD)
+		return -E2BIG;
+	do {
+		*p++ = 0xccccccc0;
+		*p++ = 0xddd00000;
+	} while (!IS_ALIGNED((unsigned long)p, 128));
+	*pause = (u8 *)p - (u8 *)base - 16;
+	if (*pause > PAGE_SIZE - CHROME9_CR_READ_AHEAD)
+		return -E2BIG;
+	chrome9_cache_flush(base, PAGE_SIZE);
+	dma_wmb();
+	return 0;
+}
+
 static int chrome9_emit_depth_body(u32 **cursor, u32 target, u32 depth,
 				   u32 solid_color)
 {
@@ -773,16 +858,14 @@ static void chrome9_quarantine_job_locked(struct chrome9_engine *engine,
 	list_add_tail(&job->quarantine_link, &engine->quarantine);
 }
 
-static int chrome9_collect_ptes(struct chrome9_job *job)
+static int chrome9_collect_sgt_ptes(struct sg_table *sgt, u32 *ptes,
+				    unsigned int page_count)
 {
 	struct scatterlist *sg;
 	unsigned int index;
 	unsigned int count = 0;
 
-	job->ptes = kcalloc(job->page_count, sizeof(*job->ptes), GFP_KERNEL);
-	if (!job->ptes)
-		return -ENOMEM;
-	for_each_sgtable_dma_sg(job->sgt, sg, index) {
+	for_each_sgtable_dma_sg(sgt, sg, index) {
 		dma_addr_t address = sg_dma_address(sg);
 		unsigned int length = sg_dma_len(sg);
 
@@ -791,16 +874,25 @@ static int chrome9_collect_ptes(struct chrome9_job *job)
 		    length - 1 > U32_MAX - address)
 			return -ERANGE;
 		while (length) {
-			if (count >= job->page_count)
+			if (count >= page_count)
 				return -E2BIG;
-			job->ptes[count++] =
+			ptes[count++] =
 				(lower_32_bits(address >> PAGE_SHIFT) & 0x3fffffff) |
 				CHROME9_GART_CACHED;
 			address += PAGE_SIZE;
 			length -= PAGE_SIZE;
 		}
 	}
-	return count == job->page_count ? 0 : -EINVAL;
+	return count == page_count ? 0 : -EINVAL;
+}
+
+static int chrome9_collect_ptes(struct chrome9_job *job)
+{
+	job->ptes = kcalloc(job->page_count, sizeof(*job->ptes), GFP_KERNEL);
+	if (!job->ptes)
+		return -ENOMEM;
+	return chrome9_collect_sgt_ptes(job->sgt, job->ptes,
+					job->page_count);
 }
 
 static bool chrome9_verify_target(struct chrome9_job *job, u32 flags)
@@ -868,6 +960,31 @@ static void chrome9_prepare_surface_guards(struct chrome9_job *job)
 		words[i] = CHROME9_GUARD_WORD;
 		last[i] = CHROME9_GUARD_WORD;
 	}
+}
+
+static void chrome9_prepare_map_guards(struct iosys_map *map, u64 size)
+{
+	u32 *words = map->vaddr;
+	u32 *last = words + (size >> 2) - CHROME9_TARGET_WORDS;
+	unsigned int i;
+
+	for (i = 0; i < CHROME9_TARGET_WORDS; i++) {
+		words[i] = CHROME9_GUARD_WORD;
+		last[i] = CHROME9_GUARD_WORD;
+	}
+}
+
+static bool chrome9_verify_map_guards(struct iosys_map *map, u64 size)
+{
+	u32 *words = map->vaddr;
+	u32 *last = words + (size >> 2) - CHROME9_TARGET_WORDS;
+	unsigned int i;
+
+	for (i = 0; i < CHROME9_TARGET_WORDS; i++)
+		if (words[i] != CHROME9_GUARD_WORD ||
+		    last[i] != CHROME9_GUARD_WORD)
+			return false;
+	return true;
 }
 
 static void chrome9_prepare_depth_oracle(struct chrome9_job *job)
@@ -1350,6 +1467,298 @@ out_no_engine:
 	goto out_dev_exit;
 }
 
+static int chrome9_submit_depth_triangle(struct drm_device *drm,
+		struct drm_file *file,
+		const struct chrome9_draw_request *request)
+{
+	struct chrome9_device *cdev = to_chrome9(drm);
+	struct drm_gem_object *depth_obj = NULL;
+	struct drm_gem_object *obj = NULL;
+	struct chrome9_engine *engine;
+	struct chrome9_job *job = NULL;
+	struct drm_exec exec;
+	u32 pause;
+	u32 target;
+	u32 depth_target;
+	long wait;
+	bool exec_initialized = false;
+	bool device_owned = false;
+	bool signal = false;
+	bool quarantine = false;
+	int dev_idx;
+	int ret;
+
+	if (!drm_dev_enter(drm, &dev_idx))
+		return -ENODEV;
+	engine = READ_ONCE(cdev->engine);
+	if (!engine || !chrome9_engine_ready(cdev)) {
+		ret = -EIO;
+		goto out_dev_exit;
+	}
+	obj = drm_gem_object_lookup(file, request->destination_handle);
+	depth_obj = drm_gem_object_lookup(file, request->depth_handle);
+	if (!obj || !depth_obj) {
+		ret = -ENOENT;
+		goto out_put_objects;
+	}
+	if (obj == depth_obj || obj->dev != drm || depth_obj->dev != drm ||
+	    drm_gem_is_imported(obj) || drm_gem_is_imported(depth_obj) ||
+	    obj->size != request->object_size ||
+	    depth_obj->size != request->depth_object_size) {
+		ret = -EINVAL;
+		goto out_put_objects;
+	}
+
+	job = kzalloc_obj(*job);
+	if (!job) {
+		ret = -ENOMEM;
+		goto out_put_objects;
+	}
+	INIT_LIST_HEAD(&job->quarantine_link);
+	job->destination = to_drm_gem_shmem_obj(obj);
+	job->depth = to_drm_gem_shmem_obj(depth_obj);
+	job->destination_page_count = obj->size >> PAGE_SHIFT;
+	job->depth_page_count = depth_obj->size >> PAGE_SHIFT;
+	job->page_count = job->destination_page_count + job->depth_page_count;
+	job->sgt = drm_gem_shmem_get_pages_sgt(job->destination);
+	if (IS_ERR(job->sgt)) {
+		ret = PTR_ERR(job->sgt);
+		goto out_free_job;
+	}
+	job->depth_sgt = drm_gem_shmem_get_pages_sgt(job->depth);
+	if (IS_ERR(job->depth_sgt)) {
+		ret = PTR_ERR(job->depth_sgt);
+		goto out_free_job;
+	}
+	job->ptes = kcalloc(job->page_count, sizeof(*job->ptes), GFP_KERNEL);
+	if (!job->ptes) {
+		ret = -ENOMEM;
+		goto out_free_job;
+	}
+	ret = chrome9_collect_sgt_ptes(job->sgt, job->ptes,
+					 job->destination_page_count);
+	if (ret)
+		goto out_free_job;
+	ret = chrome9_collect_sgt_ptes(job->depth_sgt,
+					 job->ptes + job->destination_page_count,
+					 job->depth_page_count);
+	if (ret)
+		goto out_free_job;
+
+	spin_lock_init(&job->fence.lock);
+	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
+			 &job->fence.lock, engine->fence_context,
+			 atomic64_inc_return(&engine->fence_seqno));
+	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT, 2);
+	exec_initialized = true;
+	drm_exec_until_all_locked(&exec) {
+		ret = drm_exec_prepare_obj(&exec, obj, 1);
+		drm_exec_retry_on_contention(&exec);
+		if (ret)
+			goto out_exec;
+		ret = drm_exec_prepare_obj(&exec, depth_obj, 1);
+		drm_exec_retry_on_contention(&exec);
+		if (ret)
+			goto out_exec;
+	}
+	wait = dma_resv_wait_timeout(obj->resv, DMA_RESV_USAGE_WRITE, true,
+				     CHROME9_DEP_TIMEOUT);
+	if (wait <= 0) {
+		ret = wait < 0 ? wait : -ETIMEDOUT;
+		goto out_exec;
+	}
+	wait = dma_resv_wait_timeout(depth_obj->resv, DMA_RESV_USAGE_WRITE, true,
+				     CHROME9_DEP_TIMEOUT);
+	if (wait <= 0) {
+		ret = wait < 0 ? wait : -ETIMEDOUT;
+		goto out_exec;
+	}
+	ret = drm_gem_shmem_vmap_locked(job->destination, &job->map);
+	if (ret)
+		goto out_exec;
+	job->mapped = true;
+	if (job->map.is_iomem) {
+		ret = -EINVAL;
+		goto out_unmap;
+	}
+	ret = drm_gem_shmem_vmap_locked(job->depth, &job->depth_map);
+	if (ret)
+		goto out_unmap;
+	job->depth_mapped = true;
+	if (job->depth_map.is_iomem) {
+		ret = -EINVAL;
+		goto out_unmap;
+	}
+
+	ret = mutex_lock_interruptible(&engine->submit_lock);
+	if (ret)
+		goto out_unmap;
+	if (engine->stopping || engine->wedged || !engine->ready) {
+		ret = -EIO;
+		goto out_unlock_submit;
+	}
+	job->slot = engine->active_slot ^ 1;
+	job->cookie = engine->last_cookie == 0x00010001 ?
+		      0x00020002 : 0x00010001;
+	mutex_lock(&engine->vm_lock);
+	ret = drm_mm_insert_node_generic(&engine->sf_mm, &job->sf_node,
+					 request->object_size +
+					 request->depth_object_size,
+					 PAGE_SIZE, 0, DRM_MM_INSERT_LOW);
+	if (ret) {
+		mutex_unlock(&engine->vm_lock);
+		goto out_unlock_submit;
+	}
+	job->node_allocated = true;
+	job->sf_bound = true;
+	ret = chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
+			       job->ptes, job->page_count);
+	mutex_unlock(&engine->vm_lock);
+	if (ret)
+		goto out_prepublication;
+
+	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
+				 DMA_BIDIRECTIONAL);
+	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->depth_sgt,
+				 DMA_BIDIRECTIONAL);
+	chrome9_prepare_map_guards(&job->map, request->object_size);
+	chrome9_prepare_map_guards(&job->depth_map,
+				   request->depth_object_size);
+	chrome9_cache_flush(job->map.vaddr, request->object_size);
+	chrome9_cache_flush(job->depth_map.vaddr, request->depth_object_size);
+	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->sgt,
+				    DMA_BIDIRECTIONAL);
+	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->depth_sgt,
+				    DMA_BIDIRECTIONAL);
+	device_owned = true;
+	dma_resv_add_fence(obj->resv, &job->fence.base,
+			   DMA_RESV_USAGE_WRITE);
+	dma_resv_add_fence(depth_obj->resv, &job->fence.base,
+			   DMA_RESV_USAGE_WRITE);
+	job->fence_attached = true;
+	target = job->sf_node.start + PAGE_SIZE;
+	depth_target = job->sf_node.start + request->object_size + PAGE_SIZE;
+	ret = chrome9_build_depth_triangle(engine, request, job, target,
+					   depth_target, &pause);
+	if (ret)
+		goto out_prepublication;
+	job->published = true;
+	chrome9_program_ring(cdev, job->slot * PAGE_SIZE | 1,
+			     (job->slot + 1) * PAGE_SIZE,
+			     job->slot * PAGE_SIZE + pause);
+	ret = chrome9_wait_job(engine, job);
+	if (ret) {
+		dma_fence_set_error(&job->fence.base, -ETIME);
+		chrome9_quarantine_job_locked(engine, job);
+		quarantine = true;
+		signal = true;
+		goto out_unlock_submit;
+	}
+	job->retirement_proven = true;
+	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
+				 DMA_BIDIRECTIONAL);
+	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->depth_sgt,
+				 DMA_BIDIRECTIONAL);
+	chrome9_cache_flush(job->map.vaddr, request->object_size);
+	chrome9_cache_flush(job->depth_map.vaddr, request->depth_object_size);
+	dma_rmb();
+	device_owned = false;
+	if (!chrome9_verify_map_guards(&job->map, request->object_size) ||
+	    !chrome9_verify_map_guards(&job->depth_map,
+				       request->depth_object_size)) {
+		ret = -EIO;
+		dma_fence_set_error(&job->fence.base, ret);
+	}
+	mutex_lock(&engine->vm_lock);
+	if (chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
+			     NULL, job->page_count)) {
+		if (!ret)
+			ret = -EIO;
+		dma_fence_set_error(&job->fence.base, -EIO);
+		chrome9_quarantine_job_locked(engine, job);
+		quarantine = true;
+	} else {
+		job->sf_bound = false;
+		drm_mm_remove_node(&job->sf_node);
+		job->node_allocated = false;
+		engine->active_slot = job->slot;
+		engine->last_cookie = job->cookie;
+	}
+	mutex_unlock(&engine->vm_lock);
+	signal = true;
+	goto out_unlock_submit;
+
+out_prepublication:
+	dma_fence_set_error(&job->fence.base, ret ?: -EIO);
+	if (job->sf_bound) {
+		mutex_lock(&engine->vm_lock);
+		if (chrome9_gart_set(engine,
+				     job->sf_node.start >> PAGE_SHIFT,
+				     NULL, job->page_count)) {
+			ret = -EIO;
+			dma_fence_set_error(&job->fence.base, ret);
+			chrome9_quarantine_job_locked(engine, job);
+			quarantine = true;
+		} else {
+			job->sf_bound = false;
+			drm_mm_remove_node(&job->sf_node);
+			job->node_allocated = false;
+		}
+		mutex_unlock(&engine->vm_lock);
+	}
+	signal = true;
+out_unlock_submit:
+	mutex_unlock(&engine->submit_lock);
+	if (quarantine) {
+		drm_exec_fini(&exec);
+		if (signal)
+			dma_fence_signal(&job->fence.base);
+		ret = ret ?: -EIO;
+		goto out_dev_exit;
+	}
+out_unmap:
+	if (device_owned) {
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
+					 DMA_BIDIRECTIONAL);
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->depth_sgt,
+					 DMA_BIDIRECTIONAL);
+		chrome9_cache_flush(job->map.vaddr, request->object_size);
+		chrome9_cache_flush(job->depth_map.vaddr,
+				    request->depth_object_size);
+	}
+	if (job->depth_mapped) {
+		drm_gem_shmem_vunmap_locked(job->depth, &job->depth_map);
+		job->depth_mapped = false;
+	}
+	if (job->mapped) {
+		drm_gem_shmem_vunmap_locked(job->destination, &job->map);
+		job->mapped = false;
+	}
+out_exec:
+	if (exec_initialized)
+		drm_exec_fini(&exec);
+	if (signal)
+		dma_fence_signal(&job->fence.base);
+	job->destination = NULL;
+	job->depth = NULL;
+	drm_gem_object_put(depth_obj);
+	drm_gem_object_put(obj);
+	dma_fence_put(&job->fence.base);
+	goto out_dev_exit;
+
+out_free_job:
+	kfree(job->ptes);
+	kfree(job);
+out_put_objects:
+	if (depth_obj)
+		drm_gem_object_put(depth_obj);
+	if (obj)
+		drm_gem_object_put(obj);
+out_dev_exit:
+	drm_dev_exit(dev_idx);
+	return ret;
+}
+
 int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file)
 {
@@ -1415,6 +1824,55 @@ int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,
 		request.vertices[i] = args->vertices[i];
 	}
 	return chrome9_submit_draw(drm, file, &request);
+}
+
+int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
+				    struct drm_file *file)
+{
+	struct drm_chrome9_draw_triangle_d16 *args = data;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16,
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->depth_handle,
+		.width = args->width,
+		.height = args->height,
+		.pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+	};
+	u64 surface_size;
+	u64 total_size;
+	unsigned int i;
+
+	if (args->flags || args->pad || args->reserved[0] ||
+	    args->reserved[1] || !args->width || args->width > 2048 ||
+	    !args->height || args->height > 2048 ||
+	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
+	    args->depth_pitch != ALIGN(args->width * sizeof(u16), 32))
+		return -EINVAL;
+	if (check_mul_overflow((u64)args->destination_pitch,
+			       (u64)args->height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.object_size))
+		return -E2BIG;
+	if (check_mul_overflow((u64)args->depth_pitch, (u64)args->height,
+			       &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.depth_object_size) ||
+	    check_add_overflow(request.object_size, request.depth_object_size,
+			       &total_size) ||
+	    total_size > SZ_64M - CHROME9_RING_SIZE)
+		return -E2BIG;
+	for (i = 0; i < ARRAY_SIZE(args->vertices); i++) {
+		if (!chrome9_coordinate_valid(args->vertices[i].x_16_16,
+					      args->width) ||
+		    !chrome9_coordinate_valid(args->vertices[i].y_16_16,
+					      args->height) ||
+		    args->vertices[i].z_16_16 < 0 ||
+		    args->vertices[i].z_16_16 > 0x10000)
+			return -EINVAL;
+		request.depth_vertices[i] = args->vertices[i];
+	}
+	return chrome9_submit_depth_triangle(drm, file, &request);
 }
 
 void chrome9_engine_fini(struct chrome9_device *cdev)
