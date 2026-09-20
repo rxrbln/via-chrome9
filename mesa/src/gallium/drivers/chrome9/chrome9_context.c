@@ -814,7 +814,9 @@ chrome9_clear_target(struct chrome9_resource *target,
 {
    union util_color packed;
 
-   if (!target || target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+   if (!target ||
+       (target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        target->base.format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
        x >= target->base.width0 || y >= target->base.height0)
       return;
    width = MIN2(width, target->base.width0 - x);
@@ -1102,6 +1104,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND);
    ctx->draw_textured_triangle_blend =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND);
+   ctx->blend_bgra8888 =
+      !!(capabilities & DRM_CHROME9_CAP_BLEND_BGRA8888);
 
    ctx->base.screen = screen;
    ctx->base.priv = priv;

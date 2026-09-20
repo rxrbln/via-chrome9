@@ -256,14 +256,20 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
       return false;
    resource = &(*target)->base;
    if (resource->target != PIPE_TEXTURE_2D ||
-       resource->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       (resource->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        resource->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+       (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+        !ctx->blend_bgra8888) ||
        !(*target)->guarded || !(*target)->bo.handle)
       return false;
 
-   if (!chrome9_translate_blend(ctx->blend, blend, blend_successor) ||
-       (*blend_successor &&
+   if (!chrome9_translate_blend(ctx->blend, blend, blend_successor))
+      return false;
+   if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
+      *blend_successor = true;
+   if (*blend_successor &&
         !(textured ? ctx->draw_textured_triangle_blend :
-                     ctx->draw_triangle_blend)))
+                     ctx->draw_triangle_blend))
       return false;
    if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
                     ctx->dsa->stencil[1].enabled ||
@@ -450,6 +456,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          texture_blend_args.wrap_s = texture_args.wrap_s;
          texture_blend_args.wrap_t = texture_args.wrap_t;
          texture_blend_args.blend = blend_state;
+         texture_blend_args.destination_format =
+            target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+            DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+            DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    } else if (depth_active) {
       depth_args.destination_handle = target->bo.handle;
@@ -469,6 +479,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          blend_args.height = args.height;
          blend_args.pitch = args.pitch;
          blend_args.blend = blend_state;
+         blend_args.destination_format =
+            target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+            DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+            DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);

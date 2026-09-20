@@ -82,8 +82,8 @@ chrome9_is_format_supported(struct pipe_screen *screen,
    const unsigned surface_bindings =
       PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
       PIPE_BIND_SCANOUT | PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW;
-   const unsigned texture_bindings = PIPE_BIND_LINEAR | PIPE_BIND_SAMPLER_VIEW;
    const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR;
+   unsigned bgra_bindings = PIPE_BIND_LINEAR;
 
    if (sample_count > 1 || storage_sample_count > 1)
       return false;
@@ -101,10 +101,15 @@ chrome9_is_format_supported(struct pipe_screen *screen,
       return false;
    if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
       return !(bindings & ~surface_bindings);
-   return chrome9_screen_has_capability(
-             screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) &&
-          format == PIPE_FORMAT_B8G8R8A8_UNORM &&
-          !(bindings & ~texture_bindings);
+   if (format != PIPE_FORMAT_B8G8R8A8_UNORM)
+      return false;
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE))
+      bgra_bindings |= PIPE_BIND_SAMPLER_VIEW;
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_BLEND_BGRA8888))
+      bgra_bindings |= PIPE_BIND_RENDER_TARGET;
+   return !(bindings & ~bgra_bindings);
 }
 
 bool

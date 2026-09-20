@@ -250,6 +250,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    struct pipe_context *context = NULL;
    struct pipe_blend_state blend = { 0 };
    struct pipe_blend_state source_over = { 0 };
+   struct pipe_blend_state alpha_only = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_vertex_element elements[2] = { 0 };
@@ -289,6 +290,10 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    };
    union pipe_color_union clear_color = { 0 };
    union pipe_color_union green = { .f = { 0, 1, 0, 0 } };
+   union pipe_color_union alpha_mask_base = {
+      .f = { 0x33 / 255.0f, 0x22 / 255.0f,
+             0x11 / 255.0f, 0x44 / 255.0f },
+   };
    struct chrome9_resource *surface = chrome9_resource(resource);
    struct chrome9_resource *draw_surface;
    uint32_t *pixels;
@@ -296,6 +301,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    uint16_t sample_depth = 0;
    void *blend_handle = NULL;
    void *source_over_handle = NULL;
+   void *alpha_only_handle = NULL;
    void *dsa_handle = NULL;
    void *rasterizer_handle = NULL;
    void *elements_handle = NULL;
@@ -306,6 +312,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    context = screen->context_create(screen, NULL, 0);
    if (!context)
       goto out;
+   framebuffer.cbufs[0].format = resource->format;
    blend.rt[0].colormask = PIPE_MASK_RGBA;
    blend_handle = context->create_blend_state(context, &blend);
    source_over.rt[0].blend_enable = true;
@@ -321,6 +328,11 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
           screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND))
       source_over_handle =
          context->create_blend_state(context, &source_over);
+   if (!depth_resource &&
+       resource->format == PIPE_FORMAT_B8G8R8A8_UNORM) {
+      alpha_only.rt[0].colormask = PIPE_MASK_A;
+      alpha_only_handle = context->create_blend_state(context, &alpha_only);
+   }
    if (depth_resource) {
       dsa.depth_enabled = true;
       dsa.depth_writemask = true;
@@ -350,6 +362,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
         chrome9_screen_has_capability(
            screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND) &&
         !source_over_handle) ||
+       (!depth_resource &&
+        resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+        !alpha_only_handle) ||
        !dsa_handle || !rasterizer_handle ||
        !elements_handle || !vs || !fs)
       goto out;
@@ -390,6 +405,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       for (unsigned x = 0; x < resource->width0; x++)
          changed += pixels[(size_t)y * surface->stride / 4 + x] != 0;
    passed = changed >= 30000 && changed <= 257U * 129U;
+   if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
+      passed = passed &&
+               (pixels[32 * (surface->stride / 4) + 192] >> 24) == 0xff;
    if (depth_resource) {
       struct chrome9_resource *depth = chrome9_resource(depth_resource);
       uint16_t *depth_pixels = (uint16_t *)
@@ -411,11 +429,13 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                      &green, 1.0, 0);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
-      pixel = pixels[32 * (surface->stride / 4) + 192] & 0xffffff;
-      red = pixel >> 16;
+      pixel = pixels[32 * (surface->stride / 4) + 192];
+      red = (pixel >> 16) & 0xff;
       green_channel = pixel >> 8 & 0xff;
       passed = !(pixel & 0xff) && red >= 0x7f && red <= 0x80 &&
                green_channel >= 0x7f && green_channel <= 0x80 &&
+               (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                (pixel >> 24) == 0x80) &&
                smoke_guard_pages_match(draw_surface);
       if (passed)
          printf("Gallium source-over blend passed: sample=%08x\n", pixel);
@@ -423,6 +443,23 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          fprintf(stderr,
                  "Gallium source-over blend mismatch: sample=%08x\n",
                  pixel);
+      if (passed && alpha_only_handle) {
+         context->bind_blend_state(context, alpha_only_handle);
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &alpha_mask_base, 1.0, 0);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush(context, NULL, 0);
+         pixel = pixels[32 * (surface->stride / 4) + 192];
+         passed = pixel == 0x80332211 &&
+                  smoke_guard_pages_match(draw_surface);
+         if (passed)
+            printf("Gallium BGRA alpha-only mask passed: sample=%08x\n",
+                   pixel);
+         else
+            fprintf(stderr,
+                    "Gallium BGRA alpha-only mask mismatch: sample=%08x\n",
+                    pixel);
+      }
    }
    if (!passed)
       fprintf(stderr,
@@ -453,6 +490,8 @@ out:
          context->delete_blend_state(context, blend_handle);
       if (source_over_handle)
          context->delete_blend_state(context, source_over_handle);
+      if (alpha_only_handle)
+         context->delete_blend_state(context, alpha_only_handle);
       context->destroy(context);
    }
    return passed;
@@ -980,6 +1019,7 @@ main(int argc, char **argv)
       .array_size = 1,
       .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
    };
+   struct pipe_resource bgra_templ = surface_templ;
    struct chrome9_resource *surface;
    struct chrome9_resource *shared_surface;
    struct pipe_resource *shared_resource;
@@ -1179,6 +1219,36 @@ main(int argc, char **argv)
       }
    } else {
       puts("textured triangle capability unavailable; texture smoke skipped");
+   }
+   bgra_templ.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_BLEND_BGRA8888)) {
+      struct pipe_resource *bgra_resource;
+
+      if (!screen->is_format_supported(screen, bgra_templ.format,
+                                       bgra_templ.target, 1, 1,
+                                       bgra_templ.bind) ||
+          screen->is_format_supported(screen, bgra_templ.format,
+                                      bgra_templ.target, 1, 1,
+                                      bgra_templ.bind | PIPE_BIND_SHARED)) {
+         fputs("BGRA8888 bounded render-target bindings mismatch\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      bgra_resource = screen->resource_create(screen, &bgra_templ);
+      if (!bgra_resource ||
+          !run_pipe_triangle(screen, bgra_resource, NULL)) {
+         fputs("Chrome9 Gallium BGRA8888 triangle failed\n", stderr);
+         if (bgra_resource)
+            screen->resource_destroy(screen, bgra_resource);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      screen->resource_destroy(screen, bgra_resource);
+   } else {
+      puts("BGRA8888 render-target capability unavailable; smoke skipped");
    }
    screen->resource_destroy(screen, resource);
    screen->destroy(screen);
