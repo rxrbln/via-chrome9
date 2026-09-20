@@ -17,6 +17,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE	0x05
 #define DRM_CHROME9_DRAW_TRIANGLE_BLEND	0x06
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND	0x07
+#define DRM_CHROME9_DRAW_TRIANGLE_D16_BLEND	0x08
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -42,6 +43,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND, \
 		struct drm_chrome9_draw_textured_triangle_blend)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_BLEND \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16_BLEND, \
+		struct drm_chrome9_draw_triangle_d16_blend)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -72,8 +76,12 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND	(1ULL << 8)
 /* Blend successors can render to guarded A8R8G8B8 surfaces. */
 #define DRM_CHROME9_CAP_BLEND_BGRA8888	(1ULL << 9)
+/* Blend-aware draw successors expose fixed-function fragment alpha test. */
+#define DRM_CHROME9_CAP_ALPHA_TEST	(1ULL << 10)
 /* Every bounded draw ABI accepts an optional half-open raster scissor. */
 #define DRM_CHROME9_CAP_SCISSOR	(1ULL << 11)
+/* D16 LESS/write can be combined with blend, masks, and alpha test. */
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND	(1ULL << 12)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -225,7 +233,8 @@ struct drm_chrome9_draw_textured_triangle {
 	__u32 reserved;
 };
 
-#define DRM_CHROME9_BLEND_ENABLE	(1U << 0)
+#define DRM_CHROME9_BLEND_ENABLE		(1U << 0)
+#define DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE	(1U << 1)
 
 #define DRM_CHROME9_BLEND_FACTOR_ZERO		0
 #define DRM_CHROME9_BLEND_FACTOR_ONE		1
@@ -233,6 +242,15 @@ struct drm_chrome9_draw_textured_triangle {
 #define DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA	3
 
 #define DRM_CHROME9_BLEND_FUNC_ADD	0
+
+#define DRM_CHROME9_COMPARE_NEVER	0
+#define DRM_CHROME9_COMPARE_LESS		1
+#define DRM_CHROME9_COMPARE_EQUAL	2
+#define DRM_CHROME9_COMPARE_LEQUAL	3
+#define DRM_CHROME9_COMPARE_GREATER	4
+#define DRM_CHROME9_COMPARE_NOTEQUAL	5
+#define DRM_CHROME9_COMPARE_GEQUAL	6
+#define DRM_CHROME9_COMPARE_ALWAYS	7
 
 #define DRM_CHROME9_COLOR_MASK_R	(1U << 0)
 #define DRM_CHROME9_COLOR_MASK_G	(1U << 1)
@@ -251,7 +269,8 @@ struct drm_chrome9_blend_state {
 	__u32 rgb_func;
 	__u32 alpha_func;
 	__u32 color_mask;
-	__u32 reserved[2];
+	__u32 alpha_test_func;
+	__u32 alpha_test_ref;	/* normalized byte, 0..255 */
 };
 
 /*
@@ -296,6 +315,27 @@ struct drm_chrome9_draw_textured_triangle_blend {
 	struct drm_chrome9_textured_vertex vertices[3];
 	__u32 destination_format;
 	struct drm_chrome9_scissor_state scissor;
+};
+
+/*
+ * State-complete untextured D16 successor.  Depth remains the live-proven
+ * linear D16 LESS comparison with writes enabled; blend and alpha-test state
+ * use the same normalized lowering as the color-only successor.
+ */
+struct drm_chrome9_draw_triangle_d16_blend {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 pad;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_vertex_d16 vertices[3];
+	__u32 destination_format;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 reserved[2];
 };
 
 #if defined(__cplusplus)
