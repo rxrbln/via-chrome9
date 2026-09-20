@@ -2,6 +2,9 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include <linux/errno.h>
+#include <linux/mm.h>
+#include <linux/pci.h>
+#include <linux/sizes.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -52,8 +55,25 @@ static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
 	return 0;
 }
 
+static void chrome9_pipe_update(struct drm_simple_display_pipe *pipe,
+				struct drm_plane_state *old_plane_state)
+{
+	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
+	struct drm_plane_state *plane_state = pipe->plane.state;
+	int ret;
+
+	if (!plane_state || !plane_state->fb)
+		return;
+
+	ret = chrome9_gem_copy_fb_to_scanout(cdev, plane_state->fb);
+	if (ret)
+		dev_err_ratelimited(&cdev->pdev->dev,
+				    "BAR2 scanout staging copy failed: %d\n", ret);
+}
+
 static const struct drm_simple_display_pipe_funcs chrome9_pipe_funcs = {
 	.check = chrome9_pipe_check,
+	.update = chrome9_pipe_update,
 };
 
 static const u32 chrome9_primary_formats[] = {
@@ -71,10 +91,64 @@ static const struct drm_mode_config_funcs chrome9_mode_config_funcs = {
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
-int chrome9_kms_init(struct chrome9_device *cdev)
+static int chrome9_scanout_carveout_init(struct chrome9_device *cdev,
+					 unsigned long offset,
+					 unsigned long size)
+{
+	void __iomem * const *iomap_table;
+	resource_size_t usable;
+
+	mutex_init(&cdev->scanout_lock);
+	if (offset == ULONG_MAX && !size)
+		return 0;
+	if (offset == ULONG_MAX || !size)
+		return dev_err_probe(&cdev->pdev->dev, -EINVAL,
+			"scanout_offset and scanout_size must be supplied together\n");
+	if (!IS_ALIGNED(offset, PAGE_SIZE) || !IS_ALIGNED(size, PAGE_SIZE))
+		return dev_err_probe(&cdev->pdev->dev, -EINVAL,
+			"scanout carveout must be page aligned\n");
+	if (cdev->vram_size < SZ_64K)
+		return dev_err_probe(&cdev->pdev->dev, -ENODEV,
+			"BAR2 size is unavailable for scanout validation\n");
+
+	usable = cdev->vram_size - SZ_64K;
+	if (offset > usable || size > usable - offset)
+		return dev_err_probe(&cdev->pdev->dev, -ERANGE,
+			"scanout carveout [%#lx,%#lx) overlaps the final 64-KiB GART or exceeds BAR2\n",
+			offset, offset + size);
+	if (!chrome9_iga1_base_valid(offset) ||
+	    offset + size > CHROME9_IGA1_BASE_MAX)
+		return dev_err_probe(&cdev->pdev->dev, -ERANGE,
+			"scanout carveout is outside the IGA1 addressable range\n");
+
+	iomap_table = pcim_iomap_table(cdev->pdev);
+	if (iomap_table && iomap_table[2])
+		cdev->vram = iomap_table[2];
+	else
+		cdev->vram = pcim_iomap(cdev->pdev, 2, 0);
+	if (!cdev->vram)
+		return dev_err_probe(&cdev->pdev->dev, -ENOMEM,
+				     "cannot map BAR2 scanout carveout\n");
+
+	cdev->scanout_offset = offset;
+	cdev->scanout_size = size;
+	dev_info(&cdev->pdev->dev,
+		 "lab-only BAR2 scanout staging enabled: [%#lx,%#lx), final 64 KiB reserved for GART\n",
+		 offset, offset + size);
+	return 0;
+}
+
+int chrome9_kms_init(struct chrome9_device *cdev,
+		     unsigned long scanout_offset,
+		     unsigned long scanout_size)
 {
 	struct drm_device *drm = &cdev->drm;
 	int ret;
+
+	ret = chrome9_scanout_carveout_init(cdev, scanout_offset,
+					    scanout_size);
+	if (ret)
+		return ret;
 
 	ret = drmm_mode_config_init(drm);
 	if (ret)
@@ -105,7 +179,8 @@ int chrome9_kms_init(struct chrome9_device *cdev)
 		return ret;
 
 	drm_mode_config_reset(drm);
-	dev_warn(&cdev->pdev->dev,
-		 "KMS scanout allocation disabled: no firmware-free BAR2 interval is established\n");
+	if (!cdev->scanout_size)
+		dev_warn(&cdev->pdev->dev,
+			 "KMS scanout staging disabled: no private BAR2 carveout supplied\n");
 	return 0;
 }

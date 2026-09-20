@@ -38,6 +38,16 @@ module_param_named(kms, chrome9_kms, bool, 0400);
 MODULE_PARM_DESC(kms,
 		 "Expose the preparatory disconnected KMS skeleton (default: false)");
 
+static unsigned long chrome9_scanout_offset = ULONG_MAX;
+module_param_named(scanout_offset, chrome9_scanout_offset, ulong, 0400);
+MODULE_PARM_DESC(scanout_offset,
+		 "Operator-reserved BAR2 scanout carveout byte offset");
+
+static unsigned long chrome9_scanout_size;
+module_param_named(scanout_size, chrome9_scanout_size, ulong, 0400);
+MODULE_PARM_DESC(scanout_size,
+		 "Operator-reserved BAR2 scanout carveout size (default: disabled)");
+
 static bool chrome9_mmio_probe;
 module_param_named(mmio_probe, chrome9_mmio_probe, bool, 0400);
 MODULE_PARM_DESC(mmio_probe,
@@ -2338,7 +2348,9 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = chrome9_selftest_pcie_ring(cdev);
 	if (ret)
 		return ret;
-	if (chrome9_mmio_probe) {
+	if (chrome9_mmio_probe ||
+	    (chrome9_kms && (chrome9_scanout_offset != ULONG_MAX ||
+			    chrome9_scanout_size))) {
 		ret = chrome9_detect_vram(cdev);
 		if (ret)
 			return ret;
@@ -2350,7 +2362,8 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	if (ret)
 		return ret;
 	if (chrome9_kms) {
-		ret = chrome9_kms_init(cdev);
+		ret = chrome9_kms_init(cdev, chrome9_scanout_offset,
+				       chrome9_scanout_size);
 		if (ret) {
 			chrome9_engine_fini(cdev);
 			return ret;

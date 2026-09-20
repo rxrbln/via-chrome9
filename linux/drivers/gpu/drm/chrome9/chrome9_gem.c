@@ -2,6 +2,7 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include <linux/dma-mapping.h>
+#include <linux/io.h>
 #include <linux/mm.h>
 
 #include <drm/drm_dumb_buffers.h>
@@ -9,6 +10,7 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_vma_manager.h>
@@ -41,6 +43,9 @@ static int chrome9_scanout_layout_validate(u32 width, u32 height, u32 pitch,
 int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 			    struct drm_mode_create_dumb *args)
 {
+	struct chrome9_device *cdev = to_chrome9(drm);
+	struct drm_gem_shmem_object *shmem_obj;
+	struct drm_gem_object *obj;
 	int ret;
 
 	/* The only primary-plane format exposed by KMS is linear XRGB8888. */
@@ -55,16 +60,18 @@ int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 					      args->pitch, 0);
 	if (ret)
 		return ret;
+	if (!cdev->scanout_size)
+		return -EOPNOTSUPP;
+	if (args->size > cdev->scanout_size)
+		return -ENOSPC;
 
-	/*
-	 * Do not fall back to drm_gem_shmem_dumb_create().  Display fetches SL
-	 * offsets, while render GEM objects intentionally remain SF-backed
-	 * shmem.  BAR2 has no ownership table: viafb may put the primary at the
-	 * bottom and its second framebuffer, VQ, and cursor at the top.  Until
-	 * firmware scanout and those tail reservations can be bounded, there is
-	 * no interval that a local-VRAM allocator may safely claim.
-	 */
-	return -EOPNOTSUPP;
+	shmem_obj = drm_gem_shmem_create(drm, args->size);
+	if (IS_ERR(shmem_obj))
+		return PTR_ERR(shmem_obj);
+	obj = &shmem_obj->base;
+	ret = drm_gem_handle_create(file, obj, &args->handle);
+	drm_gem_object_put(obj);
+	return ret;
 }
 
 struct drm_framebuffer *
@@ -72,7 +79,9 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		      const struct drm_format_info *info,
 		      const struct drm_mode_fb_cmd2 *mode_cmd)
 {
+	struct chrome9_device *cdev = to_chrome9(drm);
 	u64 modifier;
+	u64 footprint;
 	int ret;
 
 	if (info->format != DRM_FORMAT_XRGB8888 || info->num_planes != 1)
@@ -89,9 +98,64 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 					      mode_cmd->offsets[0]);
 	if (ret)
 		return ERR_PTR(ret);
+	if (!cdev->scanout_size)
+		return ERR_PTR(-EOPNOTSUPP);
+	footprint = (u64)mode_cmd->pitches[0] * mode_cmd->height;
+	if (footprint > cdev->scanout_size)
+		return ERR_PTR(-ENOSPC);
 
-	/* Current handles are shmem render BOs, not BAR2 scanout BOs. */
-	return ERR_PTR(-EOPNOTSUPP);
+	return drm_gem_fb_create(drm, file, info, mode_cmd);
+}
+
+int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
+				   struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj;
+	struct iosys_map map = IOSYS_MAP_INIT_VADDR(NULL);
+	size_t row_bytes;
+	size_t footprint;
+	unsigned int y;
+	int ret;
+
+	if (!cdev->scanout_size || !cdev->vram || !fb)
+		return -EOPNOTSUPP;
+	if (fb->format->format != DRM_FORMAT_XRGB8888 ||
+	    fb->format->num_planes != 1)
+		return -EINVAL;
+	ret = chrome9_scanout_layout_validate(fb->width, fb->height,
+					      fb->pitches[0], fb->offsets[0]);
+	if (ret)
+		return ret;
+	footprint = (size_t)fb->pitches[0] * fb->height;
+	if (footprint > cdev->scanout_size)
+		return -ENOSPC;
+
+	obj = drm_gem_fb_get_obj(fb, 0);
+	if (!obj)
+		return -EINVAL;
+	ret = drm_gem_vmap(obj, &map);
+	if (ret)
+		return ret;
+	if (map.is_iomem) {
+		ret = -EOPNOTSUPP;
+		goto out_vunmap;
+	}
+
+	row_bytes = (size_t)fb->width * fb->format->cpp[0];
+	mutex_lock(&cdev->scanout_lock);
+	for (y = 0; y < fb->height; y++)
+		memcpy_toio(cdev->vram + cdev->scanout_offset +
+			    (size_t)y * fb->pitches[0],
+			    map.vaddr + (size_t)y * fb->pitches[0], row_bytes);
+	/* Flush posted BAR writes before an eventual scanout-base update. */
+	wmb();
+	readb(cdev->vram + cdev->scanout_offset +
+	      (size_t)(fb->height - 1) * fb->pitches[0] + row_bytes - 1);
+	mutex_unlock(&cdev->scanout_lock);
+
+out_vunmap:
+	drm_gem_vunmap(obj, &map);
+	return ret;
 }
 
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,

@@ -3,6 +3,7 @@
 #ifndef __CHROME9_DRV_H__
 #define __CHROME9_DRV_H__
 
+#include <linux/mutex.h>
 #include <linux/pci.h>
 
 #include <drm/drm_device.h>
@@ -105,6 +106,10 @@ struct chrome9_device {
 	void __iomem *vram;
 	resource_size_t vram_size;
 	u64 sl_base;
+	resource_size_t scanout_offset;
+	resource_size_t scanout_size;
+	/* Serializes CPU copies into the single BAR2 staging interval. */
+	struct mutex scanout_lock;
 	struct chrome9_engine *engine;
 	struct drm_simple_display_pipe display_pipe;
 	struct drm_connector display_connector;
@@ -123,7 +128,11 @@ struct drm_framebuffer *
 chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		      const struct drm_format_info *info,
 		      const struct drm_mode_fb_cmd2 *mode_cmd);
-int chrome9_kms_init(struct chrome9_device *cdev);
+int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
+				   struct drm_framebuffer *fb);
+int chrome9_kms_init(struct chrome9_device *cdev,
+		     unsigned long scanout_offset,
+		     unsigned long scanout_size);
 
 /* Live-verified H5S2VP1/H6 sequences shared with the fixed engine path. */
 void chrome9_init_2d_h6(struct chrome9_device *cdev);
