@@ -510,7 +510,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	    body[160] != 0xfe020440 || body[163] != 0xcc000000)
 		return -EINVAL;
 
-	/* Insert the four live-proven D16 words before the next H6 group. */
+	/* Add the D16 words and the wide-open near/far clip state. */
 	memmove(body + 28, body + 24, (188 - 24) * sizeof(*body));
 	body[6] = 0x52980000 | (request->pitch >> 5);
 	body[19] = 0x01c0154c;
@@ -518,7 +518,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	body[23] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
 	body[24] = 0x12380000;
 	body[25] = 0x13010000;
-	body[26] = 0xcc000000;
+	body[26] = 0x20007fff;
 	body[27] = 0xcc000000;
 	body[53] = 0x23004f02;
 	body[54] = 0x24000003;
@@ -577,7 +577,7 @@ static int chrome9_emit_depth_body(u32 **cursor, u32 target, u32 depth,
 	body[23] = 0x11004001;
 	body[24] = 0x12380000;
 	body[25] = 0x13010000;
-	body[26] = 0xcc000000;
+	body[26] = 0x20007fff;
 	body[27] = 0xcc000000;
 	body[53] = 0x23000f02;
 	body[54] = 0x24000003;
@@ -1315,9 +1315,10 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	if (ret)
 		goto out_prepublication;
 
-	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
-				 DMA_BIDIRECTIONAL);
 	if (request->kind == CHROME9_DRAW_FIXED) {
+		/* The kernel initializes oracle storage after reclaiming it. */
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
+					 DMA_BIDIRECTIONAL);
 		if (request->flags == DRM_CHROME9_FIXED_QUAD_DEPTH_ORACLE)
 			chrome9_prepare_depth_oracle(job);
 		else if (request->flags == DRM_CHROME9_FIXED_QUAD_BLEND_ORACLE)
@@ -1617,10 +1618,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	if (ret)
 		goto out_prepublication;
 
-	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
-				 DMA_BIDIRECTIONAL);
-	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->depth_sgt,
-				 DMA_BIDIRECTIONAL);
+	/* Structured BO contents are already CPU-owned on ioctl entry. */
 	chrome9_prepare_map_guards(&job->map, request->object_size);
 	chrome9_prepare_map_guards(&job->depth_map,
 				   request->depth_object_size);

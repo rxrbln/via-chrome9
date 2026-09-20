@@ -6,7 +6,6 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_fourcc.h>
-#include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 
@@ -67,7 +66,7 @@ static const u64 chrome9_primary_modifiers[] = {
 };
 
 static const struct drm_mode_config_funcs chrome9_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create,
+	.fb_create = chrome9_gem_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -106,5 +105,7 @@ int chrome9_kms_init(struct chrome9_device *cdev)
 		return ret;
 
 	drm_mode_config_reset(drm);
+	dev_warn(&cdev->pdev->dev,
+		 "KMS scanout allocation disabled: no firmware-free BAR2 interval is established\n");
 	return 0;
 }

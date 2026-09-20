@@ -91,6 +91,10 @@ static inline u32 chrome9_iga2_base_pack(u32 old, u32 byte_address)
 #define CHROME9_2D_REG_FG_COLOR		0x0058
 
 struct drm_file;
+struct drm_format_info;
+struct drm_framebuffer;
+struct drm_mode_create_dumb;
+struct drm_mode_fb_cmd2;
 struct chrome9_engine;
 
 struct chrome9_device {
@@ -113,6 +117,12 @@ static inline struct chrome9_device *to_chrome9(struct drm_device *drm)
 
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
+int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
+			    struct drm_mode_create_dumb *args);
+struct drm_framebuffer *
+chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
+		      const struct drm_format_info *info,
+		      const struct drm_mode_fb_cmd2 *mode_cmd);
 int chrome9_kms_init(struct chrome9_device *cdev);
 
 /* Live-verified H5S2VP1/H6 sequences shared with the fixed engine path. */
