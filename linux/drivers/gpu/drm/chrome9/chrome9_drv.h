@@ -97,6 +97,7 @@ struct drm_framebuffer;
 struct drm_mode_create_dumb;
 struct drm_mode_fb_cmd2;
 struct chrome9_engine;
+struct chrome9_kms_state;
 
 struct chrome9_device {
 	struct drm_device drm;
@@ -110,6 +111,7 @@ struct chrome9_device {
 	resource_size_t scanout_size;
 	/* Serializes CPU copies into the single BAR2 staging interval. */
 	struct mutex scanout_lock;
+	struct chrome9_kms_state *kms_state;
 	struct chrome9_engine *engine;
 	struct drm_simple_display_pipe display_pipe;
 	struct drm_connector display_connector;
@@ -132,7 +134,8 @@ int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
 				   struct drm_framebuffer *fb);
 int chrome9_kms_init(struct chrome9_device *cdev,
 		     unsigned long scanout_offset,
-		     unsigned long scanout_size);
+		     unsigned long scanout_size, bool fixed_iga1);
+void chrome9_kms_fini(struct chrome9_device *cdev);
 
 /* Live-verified H5S2VP1/H6 sequences shared with the fixed engine path. */
 void chrome9_init_2d_h6(struct chrome9_device *cdev);

@@ -2,6 +2,7 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include <linux/module.h>
+#include <linux/aperture.h>
 #include <linux/pci.h>
 #include <linux/iopoll.h>
 #include <linux/dma-mapping.h>
@@ -16,6 +17,7 @@
 #endif
 
 #include <drm/drm_drv.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -47,6 +49,11 @@ static unsigned long chrome9_scanout_size;
 module_param_named(scanout_size, chrome9_scanout_size, ulong, 0400);
 MODULE_PARM_DESC(scanout_size,
 		 "Operator-reserved BAR2 scanout carveout size (default: disabled)");
+
+static bool chrome9_fixed_iga1;
+module_param_named(fixed_iga1, chrome9_fixed_iga1, bool, 0400);
+MODULE_PARM_DESC(fixed_iga1,
+		 "Drive the lab-only fixed 1024x768@60 IGA1 VGA mode");
 
 static bool chrome9_mmio_probe;
 module_param_named(mmio_probe, chrome9_mmio_probe, bool, 0400);
@@ -2316,6 +2323,21 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	if (!chrome9_enable)
 		return dev_err_probe(&pdev->dev, -ENODEV,
 			"driver disabled; use chrome9.enable=1 for bring-up\n");
+	if (chrome9_fixed_iga1 && !chrome9_kms)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+			"fixed_iga1 requires kms=1\n");
+	/*
+	 * vgaarb only serializes legacy-port accesses.  It does not stop vgacon
+	 * from rewriting the IGA1 timing and base after a KMS update, so take
+	 * exclusive display ownership before the first fixed-mode operation.
+	 * Keep render-only and disconnected staging probes non-destructive.
+	 */
+	if (chrome9_fixed_iga1) {
+		ret = aperture_remove_conflicting_pci_devices(pdev,
+							CHROME9_DRIVER_NAME);
+		if (ret)
+			return ret;
+	}
 
 	ret = pcim_enable_device(pdev);
 	if (ret)
@@ -2361,9 +2383,15 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = chrome9_engine_init(cdev);
 	if (ret)
 		return ret;
+	if (chrome9_fixed_iga1 && !chrome9_engine_ready(cdev)) {
+		chrome9_engine_fini(cdev);
+		return dev_err_probe(&pdev->dev, -EINVAL,
+			"fixed_iga1 requires engine=1 to establish known T11 state\n");
+	}
 	if (chrome9_kms) {
 		ret = chrome9_kms_init(cdev, chrome9_scanout_offset,
-				       chrome9_scanout_size);
+				       chrome9_scanout_size,
+				       chrome9_fixed_iga1);
 		if (ret) {
 			chrome9_engine_fini(cdev);
 			return ret;
@@ -2372,6 +2400,8 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 
 	ret = drm_dev_register(&cdev->drm, 0);
 	if (ret) {
+		if (chrome9_kms)
+			chrome9_kms_fini(cdev);
 		chrome9_engine_fini(cdev);
 		return ret;
 	}
@@ -2380,7 +2410,8 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	dev_info(&pdev->dev, "VX900 revision %02x: shmem GEM%s%s\n",
 		 pdev->revision,
 		 chrome9_engine_ready(cdev) ? ", validated 3D engine ready" : "",
-		 chrome9_kms ? ", disconnected KMS scaffold" : "");
+		 chrome9_kms ? (chrome9_fixed_iga1 ?
+		 ", lab-only fixed IGA1 KMS" : ", disconnected KMS scaffold") : "");
 	return 0;
 }
 
@@ -2390,6 +2421,10 @@ static void chrome9_pci_remove(struct pci_dev *pdev)
 	struct chrome9_device *cdev = to_chrome9(drm);
 
 	drm_dev_unplug(drm);
+	if (chrome9_kms) {
+		drm_atomic_helper_shutdown(drm);
+		chrome9_kms_fini(cdev);
+	}
 	chrome9_engine_fini(cdev);
 }
 
