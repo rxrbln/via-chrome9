@@ -70,6 +70,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND	(1ULL << 7)
 /* RT0 ADD blending and color masks for immediate textured triangles. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND	(1ULL << 8)
+/* Blend successors can select A8R8G8B8 destination storage. */
+#define DRM_CHROME9_CAP_BLEND_BGRA8888	(1ULL << 9)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -221,6 +223,9 @@ struct drm_chrome9_draw_textured_triangle {
 #define DRM_CHROME9_COLOR_MASK_B	(1U << 2)
 #define DRM_CHROME9_COLOR_MASK_A	(1U << 3)
 
+#define DRM_CHROME9_DESTINATION_FORMAT_BGRX8888	0
+#define DRM_CHROME9_DESTINATION_FORMAT_BGRA8888	1
+
 struct drm_chrome9_blend_state {
 	__u32 flags;
 	__u32 rgb_src_factor;
@@ -233,7 +238,10 @@ struct drm_chrome9_blend_state {
 	__u32 reserved[2];
 };
 
-/* Blend-aware successor; the original DRAW_TRIANGLE ABI remains unchanged. */
+/*
+ * Blend-aware successor; the original DRAW_TRIANGLE ABI remains unchanged.
+ * destination_format selects the destination A52 storage format.
+ */
 struct drm_chrome9_draw_triangle_blend {
 	__u32 destination_handle;
 	__u32 flags;
@@ -243,10 +251,14 @@ struct drm_chrome9_draw_triangle_blend {
 	__u32 pad;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_vertex vertices[3];
-	__u32 reserved[4];
+	__u32 destination_format;
+	__u32 reserved[3];
 };
 
-/* Blend-aware successor; the original textured-triangle ABI is unchanged. */
+/*
+ * Blend-aware successor; the original textured-triangle ABI is unchanged.
+ * destination_format selects the destination A52 storage format.
+ */
 struct drm_chrome9_draw_textured_triangle_blend {
 	__u32 destination_handle;
 	__u32 texture_handle;
@@ -266,7 +278,8 @@ struct drm_chrome9_draw_textured_triangle_blend {
 	__u32 pad;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_textured_vertex vertices[3];
-	__u32 reserved[4];
+	__u32 destination_format;
+	__u32 reserved[3];
 };
 
 #if defined(__cplusplus)
