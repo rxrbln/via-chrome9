@@ -178,6 +178,7 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
    }
    if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
        state->unnormalized_coords || state->lod_bias != 0.0f ||
+       state->min_lod != 0.0f || state->max_lod != 1000.0f ||
        state->max_anisotropy > 1 || state->seamless_cube_map ||
        state->reduction_mode != PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE)
       sampler->supported = false;

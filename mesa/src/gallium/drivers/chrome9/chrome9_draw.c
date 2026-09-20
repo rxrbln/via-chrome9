@@ -82,7 +82,10 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    if (crender->textured)
       draw_emit_vertex_attr(&crender->vinfo, EMIT_2F, texcoord);
    draw_compute_vertex_size(&crender->vinfo);
-   crender->layout_valid = position >= 0 && color0 >= 0 &&
+   crender->layout_valid = position >= 0 &&
+                           (color0 >= 0 ||
+                            crender->ctx->fs->fragment_program ==
+                               CHROME9_FS_TEXTURE_REPLACE) &&
                            (!crender->textured || texcoord >= 0) &&
                            crender->vinfo.size ==
                               (crender->textured ? 8 : 6);

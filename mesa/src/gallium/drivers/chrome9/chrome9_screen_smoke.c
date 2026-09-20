@@ -2,9 +2,11 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include "chrome9_public.h"
+#include "chrome9_context.h"
 #include "chrome9_resource.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +21,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_sampler.h"
 
 struct smoke_vertex {
@@ -31,6 +34,43 @@ struct smoke_texture_vertex {
    float color[4];
    float texcoord[2];
 };
+
+#define CHROME9_SMOKE_GUARD_WORD 0x13579bdfU
+
+static bool
+smoke_guard_pages_match(const struct chrome9_resource *resource)
+{
+   const uint32_t *first = resource->bo.map;
+   const uint32_t *last;
+   size_t page_size = resource->data_offset;
+   size_t aligned_data_size;
+
+   if (!page_size || (page_size & 3) || resource->data_size > SIZE_MAX ||
+       resource->bo.size < 2 * page_size)
+      return false;
+   aligned_data_size = ALIGN_POT(resource->data_size, page_size);
+   if (aligned_data_size < resource->data_size ||
+       aligned_data_size > resource->bo.size - 2 * page_size)
+      return false;
+   last = (const uint32_t *)((const uint8_t *)resource->bo.map + page_size +
+                            aligned_data_size);
+   for (size_t i = 0; i < page_size / sizeof(uint32_t); i++)
+      if (first[i] != CHROME9_SMOKE_GUARD_WORD ||
+          last[i] != CHROME9_SMOKE_GUARD_WORD)
+         return false;
+   return true;
+}
+
+static bool
+smoke_bytes_match(const void *data, size_t size, uint8_t expected)
+{
+   const uint8_t *bytes = data;
+
+   for (size_t i = 0; i < size; i++)
+      if (bytes[i] != expected)
+         return false;
+   return true;
+}
 
 static void *
 make_texture_vertex_shader(struct pipe_screen *screen,
@@ -396,6 +436,7 @@ run_pipe_texture(struct pipe_screen *screen)
       .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
       .compare_mode = PIPE_TEX_COMPARE_NONE,
       .max_anisotropy = 1,
+      .max_lod = 1000.0f,
       .reduction_mode = PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE,
    };
    struct pipe_blend_state blend = { 0 };
@@ -423,6 +464,7 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_draw_start_count_bias draw = { .count = 4 };
    union pipe_color_union clear = { 0 };
    struct chrome9_resource *ctarget, *ctexture;
+   struct chrome9_context *ccontext;
    void *blend_handle = NULL, *dsa_handle = NULL, *rasterizer_handle = NULL;
    void *elements_handle = NULL, *sampler_handle = NULL;
    void *vs = NULL, *replace = NULL, *modulate = NULL;
@@ -435,6 +477,7 @@ run_pipe_texture(struct pipe_screen *screen)
    context = screen->context_create(screen, NULL, 0);
    if (!target || !texture || !context)
       goto out;
+   ccontext = chrome9_context(context);
    ctarget = chrome9_resource(target);
    ctexture = chrome9_resource(texture);
    memset(ctarget->bo.map, 0x5a, ctarget->bo.size);
@@ -475,8 +518,16 @@ run_pipe_texture(struct pipe_screen *screen)
    modulate = make_texture_fragment_shader(screen, context, true);
    if (!blend_handle || !dsa_handle || !rasterizer_handle ||
        !elements_handle || !sampler_handle || !view || !vs || !replace ||
-       !modulate)
+       !modulate) {
+      fprintf(stderr,
+              "texture setup failed: target=%p texture=%p context=%p "
+              "blend=%p dsa=%p rasterizer=%p elements=%p sampler=%p "
+              "view=%p vs=%p replace=%p modulate=%p\n",
+              (void *)target, (void *)texture, (void *)context, blend_handle,
+              dsa_handle, rasterizer_handle, elements_handle, sampler_handle,
+              (void *)view, vs, replace, modulate);
       goto out;
+   }
 
    framebuffer.cbufs[0].texture = target;
    samplers[0] = sampler_handle;
@@ -501,6 +552,10 @@ run_pipe_texture(struct pipe_screen *screen)
       };
       const unsigned at[4][2] = { { 8, 8 }, { 24, 8 },
                                   { 8, 24 }, { 24, 24 } };
+      uint32_t sampled[4];
+      uint64_t submitted = ccontext->submitted_triangles;
+      uint64_t rejected = ccontext->rejected_triangles;
+      bool pixels_match = true;
 
       vertex_buffer.buffer.user = program ? red_vertices : white_vertices;
       context->set_vertex_buffers(context, 1, &vertex_buffer);
@@ -511,19 +566,60 @@ run_pipe_texture(struct pipe_screen *screen)
       context->flush(context, NULL, 0);
       pixels = (uint32_t *)((uint8_t *)ctarget->bo.map +
                             ctarget->data_offset);
-      for (unsigned i = 0; i < 4; i++)
-         if ((pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
-              0xffffff) != expect[program][i])
-            goto out;
+      for (unsigned i = 0; i < 4; i++) {
+         sampled[i] =
+            pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] & 0xffffff;
+         pixels_match &= sampled[i] == expect[program][i];
+      }
+      if (!pixels_match || ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected) {
+         fprintf(stderr,
+                 "texture %s mismatch: fs=%u submitted=%" PRIu64
+                 "(+%" PRIu64 ") rejected=%" PRIu64 "(+%" PRIu64 ") "
+                 "samples=%06x,%06x,%06x,%06x "
+                 "expected=%06x,%06x,%06x,%06x\n",
+                 program ? "MODULATE" : "REPLACE",
+                 ((struct chrome9_shader *)(program ? modulate : replace))->
+                    fragment_program,
+                 ccontext->submitted_triangles,
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles,
+                 ccontext->rejected_triangles - rejected,
+                 sampled[0], sampled[1], sampled[2], sampled[3],
+                 expect[program][0], expect[program][1], expect[program][2],
+                 expect[program][3]);
+         goto out;
+      }
    }
-   if (source[0] != source_copy[0] || source[1] != source_copy[1] ||
-       source[ctexture->stride / 4] != source_copy[2] ||
-       source[ctexture->stride / 4 + 1] != source_copy[3] ||
-       ((uint8_t *)ctarget->bo.map)[0] != 0x5a ||
-       ((uint8_t *)ctarget->bo.map)[ctarget->bo.size - 1] != 0x5a ||
-       ((uint8_t *)ctexture->bo.map)[0] != 0xa5 ||
-       ((uint8_t *)ctexture->bo.map)[ctexture->bo.size - 1] != 0xa5)
+   bool source_pixels_match =
+      source[0] == source_copy[0] && source[1] == source_copy[1] &&
+      source[ctexture->stride / 4] == source_copy[2] &&
+      source[ctexture->stride / 4 + 1] == source_copy[3];
+   bool source_padding_match = true;
+   const uint8_t *texture_data =
+      (const uint8_t *)ctexture->bo.map + ctexture->data_offset;
+   size_t texture_aligned_size =
+      ALIGN_POT(ctexture->data_size, ctexture->data_offset);
+
+   for (unsigned y = 0; y < texture->height0; y++)
+      source_padding_match &= smoke_bytes_match(
+         texture_data + (size_t)y * ctexture->stride + texture->width0 * 4,
+         ctexture->stride - texture->width0 * 4, 0xa5);
+   source_padding_match &= smoke_bytes_match(
+      texture_data + ctexture->data_size,
+      texture_aligned_size - ctexture->data_size, 0xa5);
+   bool target_guards_match = smoke_guard_pages_match(ctarget);
+   bool texture_guards_match = smoke_guard_pages_match(ctexture);
+
+   if (!source_pixels_match || !source_padding_match ||
+       !target_guards_match || !texture_guards_match) {
+      fprintf(stderr,
+              "texture preservation mismatch: pixels=%u padding=%u "
+              "target_guards=%u texture_guards=%u\n",
+              source_pixels_match, source_padding_match,
+              target_guards_match, texture_guards_match);
       goto out;
+   }
    puts("Gallium texture REPLACE/MODULATE and guards passed");
    passed = true;
 
