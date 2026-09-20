@@ -113,6 +113,19 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
 
    draw_init_shader_caps(vs);
    vs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
+   /* The draw module executes vertex ALU and constant-buffer accesses, but
+    * Chrome9 does not wire its sampler, image, or shader-buffer interfaces.
+    * In particular, cso_unbind_context() calls those interfaces whenever the
+    * corresponding limits are nonzero.  Do not retain tgsi_exec's generic
+    * limits for interfaces which this pipe context does not install. */
+   vs->max_tex_instructions = 0;
+   vs->max_tex_indirections = 0;
+   vs->max_texture_samplers = 0;
+   vs->max_sampler_views = 0;
+   vs->max_shader_buffers = 0;
+   vs->max_shader_images = 0;
+   vs->max_hw_atomic_counters = 0;
+   vs->max_hw_atomic_counter_buffers = 0;
 
    fs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    fs->max_instructions = 32;
@@ -127,6 +140,29 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       fs->max_tex_instructions = 1;
       fs->max_tex_indirections = 1;
    }
+}
+
+static void
+chrome9_restrict_generic_caps(struct pipe_caps *caps)
+{
+   /* u_init_pipe_screen_caps() supplies defaults intended for complete
+    * Gallium drivers.  Keep this bounded bring-up driver from selecting
+    * unimplemented callbacks or advertising unvalidated fixed-function
+    * behavior.  Mesa's compatibility state tracker requires GLSL 1.20 and a
+    * GL 1.3 floor, so those API-level claims cannot yet be made fully
+    * truthful with pipe_caps alone. */
+   caps->texture_transfer_modes = PIPE_TEXTURE_TRANSFER_DEFAULT;
+   caps->texture_shadow_map = false;
+   caps->gl_clamp = false;
+   caps->texrect = false;
+   caps->native_fp32_depth = false;
+   caps->buffer_map_persistent_coherent = false;
+   caps->dest_surface_srgb_control = false;
+   caps->packed_stream_output = false;
+   caps->two_sided_color = false;
+   caps->clip_planes = 0;
+   caps->dithering = false;
+   caps->mixed_colorbuffer_formats = false;
 }
 
 struct pipe_screen *
@@ -167,6 +203,7 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    screen->base.nir_options[MESA_SHADER_FRAGMENT] = &chrome9_nir_options;
    chrome9_init_shader_caps(screen);
    caps = (struct pipe_caps *)&screen->base.caps;
+   chrome9_restrict_generic_caps(caps);
    caps->vendor_id = 0x1106;
    caps->device_id = screen->device_id;
    caps->endianness = PIPE_ENDIAN_NATIVE;
