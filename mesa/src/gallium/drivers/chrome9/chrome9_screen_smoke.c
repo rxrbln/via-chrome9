@@ -26,12 +26,13 @@ struct smoke_vertex {
 
 static void *
 make_ff_vertex_shader(struct pipe_screen *screen,
-                      struct pipe_context *context,
-                      nir_shader **nir_out)
+                      struct pipe_context *context)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
       "chrome9-glxgears-vertex-color");
+
+   b.shader->info.io_lowered = true;
    nir_def *position = nir_load_input(
       &b, 4, 32, nir_imm_int(&b, 0),
       .io_semantics.location = VERT_ATTRIB_POS);
@@ -52,18 +53,20 @@ make_ff_vertex_shader(struct pipe_screen *screen,
                     .write_mask = 0xf,
                     .io_semantics.location = VARYING_SLOT_COL0);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
-   *nir_out = b.shader;
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
    return context->create_vs_state(context, &state);
 }
 
 static void *
 make_ff_primary_color_fs(struct pipe_screen *screen,
-                         struct pipe_context *context,
-                         nir_shader **nir_out)
+                         struct pipe_context *context)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
       "chrome9-glxgears-primary-color");
+
+   b.shader->info.io_lowered = true;
    nir_def *barycentric = nir_load_barycentric_pixel(&b, 32);
    nir_def *color = nir_load_interpolated_input(
       &b, 4, 32, barycentric, nir_imm_int(&b, 0),
@@ -77,7 +80,8 @@ make_ff_primary_color_fs(struct pipe_screen *screen,
                     .write_mask = 0xf,
                     .io_semantics.location = FRAG_RESULT_COLOR);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
-   *nir_out = b.shader;
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
    return context->create_fs_state(context, &state);
 }
 
@@ -159,8 +163,6 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *elements_handle = NULL;
    void *vs = NULL;
    void *fs = NULL;
-   nir_shader *vs_nir = NULL;
-   nir_shader *fs_nir = NULL;
    bool passed = false;
 
    context = screen->context_create(screen, NULL, 0);
@@ -190,8 +192,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    elements[1].src_stride = sizeof(struct smoke_vertex);
    elements_handle = context->create_vertex_elements_state(context, 2,
                                                             elements);
-   vs = make_ff_vertex_shader(screen, context, &vs_nir);
-   fs = make_ff_primary_color_fs(screen, context, &fs_nir);
+   vs = make_ff_vertex_shader(screen, context);
+   fs = make_ff_primary_color_fs(screen, context);
    if (!blend_handle || !dsa_handle || !rasterizer_handle ||
        !elements_handle || !vs || !fs)
       goto out;
@@ -257,10 +259,8 @@ out:
    if (context) {
       if (vs)
          context->delete_vs_state(context, vs);
-      ralloc_free(vs_nir);
       if (fs)
          context->delete_fs_state(context, fs);
-      ralloc_free(fs_nir);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (rasterizer_handle)
