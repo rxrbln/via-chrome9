@@ -1,0 +1,24 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright 2026 Chrome9 contributors */
+#ifndef CHROME9_DRM_H
+#define CHROME9_DRM_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "drm-uapi/chrome9_drm.h"
+
+struct chrome9_bo {
+   uint32_t handle;
+   uint64_t size;
+   uint64_t mmap_offset;
+   void *map;
+};
+
+bool chrome9_get_param(int fd, uint32_t param, uint64_t *value);
+bool chrome9_bo_create(int fd, uint64_t size, struct chrome9_bo *bo);
+void chrome9_bo_destroy(int fd, struct chrome9_bo *bo);
+bool chrome9_draw_triangle(int fd,
+                           const struct drm_chrome9_draw_triangle *draw);
+
+#endif
