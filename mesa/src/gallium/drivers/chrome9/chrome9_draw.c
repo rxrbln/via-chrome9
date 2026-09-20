@@ -245,6 +245,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct drm_chrome9_blend_state *blend,
                              bool *blend_successor)
 {
+   const struct pipe_surface *surface;
    struct pipe_resource *resource;
 
    *depth = NULL;
@@ -255,7 +256,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        !(*target = chrome9_context_render_target(ctx)))
       return false;
    resource = &(*target)->base;
-   if (resource->target != PIPE_TEXTURE_2D ||
+   surface = ctx->framebuffer.nr_cbufs == 1 ?
+             &ctx->framebuffer.cbufs[0] : NULL;
+   if (!surface || !surface->texture || surface->format != resource->format ||
+       surface->level || surface->first_layer || surface->last_layer ||
+       resource->target != PIPE_TEXTURE_2D ||
        (resource->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         resource->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
        (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&

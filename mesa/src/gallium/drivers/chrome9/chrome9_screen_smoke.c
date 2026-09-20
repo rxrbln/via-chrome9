@@ -534,6 +534,7 @@ run_pipe_texture(struct pipe_screen *screen)
       .width0 = 2, .height0 = 2, .depth0 = 1, .array_size = 1,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
    };
+   struct pipe_resource bgra_target_templ = target_templ;
    struct pipe_resource rhw_target_templ = {
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -547,6 +548,7 @@ run_pipe_texture(struct pipe_screen *screen)
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
    };
    struct pipe_resource *target = NULL, *texture = NULL;
+   struct pipe_resource *bgra_target = NULL;
    struct pipe_resource *rhw_target = NULL, *rhw_texture = NULL;
    struct pipe_context *context = NULL;
    struct pipe_sampler_view view_templ, rhw_view_templ;
@@ -590,7 +592,7 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_draw_start_count_bias draw = { .count = 4 };
    union pipe_color_union clear = { 0 };
    union pipe_color_union green = { .f = { 0, 1, 0, 0 } };
-   struct chrome9_resource *ctarget, *ctexture;
+   struct chrome9_resource *ctarget, *ctexture, *cbgra_target = NULL;
    struct chrome9_resource *crhw_target, *crhw_texture;
    struct chrome9_context *ccontext;
    void *blend_handle = NULL, *dsa_handle = NULL, *rasterizer_handle = NULL;
@@ -601,22 +603,34 @@ run_pipe_texture(struct pipe_screen *screen)
    void *replace = NULL, *modulate = NULL;
    void *samplers[1];
    uint32_t source_copy[4], *source, *pixels;
+   bool bgra_render;
    bool passed = false;
 
+   bgra_target_templ.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+   bgra_render = screen->is_format_supported(
+      screen, bgra_target_templ.format, bgra_target_templ.target, 1, 1,
+      bgra_target_templ.bind);
    target = screen->resource_create(screen, &target_templ);
    texture = screen->resource_create(screen, &texture_templ);
+   if (bgra_render)
+      bgra_target = screen->resource_create(screen, &bgra_target_templ);
    rhw_target = screen->resource_create(screen, &rhw_target_templ);
    rhw_texture = screen->resource_create(screen, &rhw_texture_templ);
    context = screen->context_create(screen, NULL, 0);
-   if (!target || !texture || !rhw_target || !rhw_texture || !context)
+   if (!target || !texture || (bgra_render && !bgra_target) ||
+       !rhw_target || !rhw_texture || !context)
       goto out;
    ccontext = chrome9_context(context);
    ctarget = chrome9_resource(target);
    ctexture = chrome9_resource(texture);
+   if (bgra_target)
+      cbgra_target = chrome9_resource(bgra_target);
    crhw_target = chrome9_resource(rhw_target);
    crhw_texture = chrome9_resource(rhw_texture);
    memset(ctarget->bo.map, 0x5a, ctarget->bo.size);
    memset(ctexture->bo.map, 0xa5, ctexture->bo.size);
+   if (cbgra_target)
+      memset(cbgra_target->bo.map, 0x5a, cbgra_target->bo.size);
    source = (uint32_t *)((uint8_t *)ctexture->bo.map + ctexture->data_offset);
    source[0] = 0x00ff0000;
    source[1] = 0x0000ff00;
@@ -825,6 +839,35 @@ run_pipe_texture(struct pipe_screen *screen)
          goto out;
       }
       puts("Gallium BGRA REPLACE source-over blend passed");
+      if (bgra_target) {
+         uint32_t *bgra_pixels;
+
+         submitted = ccontext->submitted_triangles;
+         rejected = ccontext->rejected_triangles;
+         framebuffer.cbufs[0].format = PIPE_FORMAT_B8G8R8A8_UNORM;
+         framebuffer.cbufs[0].texture = bgra_target;
+         context->set_framebuffer_state(context, &framebuffer);
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &green, 1.0, 0);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush(context, NULL, 0);
+         bgra_pixels = (uint32_t *)((uint8_t *)cbgra_target->bo.map +
+                                    cbgra_target->data_offset);
+         pixel = bgra_pixels[8 * (cbgra_target->stride / 4) + 8];
+         if (pixel != 0x80807f00 ||
+             ccontext->submitted_triangles != submitted + 2 ||
+             ccontext->rejected_triangles != rejected ||
+             !smoke_guard_pages_match(cbgra_target) ||
+             !smoke_guard_pages_match(ctexture)) {
+            fprintf(stderr,
+                    "Gallium textured BGRA target mismatch: sample=%08x "
+                    "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                    pixel, ccontext->submitted_triangles - submitted,
+                    ccontext->rejected_triangles - rejected);
+            goto out;
+         }
+         puts("Gallium textured BGRA render target passed");
+      }
       context->bind_blend_state(context, blend_handle);
    }
 
@@ -851,6 +894,7 @@ run_pipe_texture(struct pipe_screen *screen)
    memset(crhw_texture->bo.map, 0xa5, crhw_texture->bo.size);
    memcpy(rhw_source, rhw_texels, sizeof(rhw_texels));
    framebuffer.width = framebuffer.height = 64;
+   framebuffer.cbufs[0].format = PIPE_FORMAT_B8G8R8X8_UNORM;
    framebuffer.cbufs[0].texture = rhw_target;
    context->set_framebuffer_state(context, &framebuffer);
    context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
@@ -982,6 +1026,7 @@ out:
    }
    if (texture) screen->resource_destroy(screen, texture);
    if (target) screen->resource_destroy(screen, target);
+   if (bgra_target) screen->resource_destroy(screen, bgra_target);
    if (rhw_texture) screen->resource_destroy(screen, rhw_texture);
    if (rhw_target) screen->resource_destroy(screen, rhw_target);
    return passed;

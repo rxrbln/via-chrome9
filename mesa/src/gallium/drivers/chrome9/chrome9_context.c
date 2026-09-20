@@ -752,13 +752,15 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
                               const struct pipe_framebuffer_state *framebuffer)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
-   struct pipe_resource *color = framebuffer->nr_cbufs ?
-                                 framebuffer->cbufs[0].texture : NULL;
+   const struct pipe_surface *surface = framebuffer->nr_cbufs == 1 ?
+                                        &framebuffer->cbufs[0] : NULL;
+   struct pipe_resource *color = surface ? surface->texture : NULL;
 
    chrome9_flush_render_target(ctx);
    pipe_resource_reference(&ctx->render_target, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
-   if (color) {
+   if (color && surface->format == color->format && !surface->level &&
+       !surface->first_layer && !surface->last_layer) {
       struct chrome9_resource *resource = chrome9_resource(color);
 
       if (resource->guarded) {
