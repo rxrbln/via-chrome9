@@ -74,12 +74,13 @@ smoke_bytes_match(const void *data, size_t size, uint8_t expected)
 
 static void *
 make_texture_vertex_shader(struct pipe_screen *screen,
-                           struct pipe_context *context)
+                           struct pipe_context *context, bool emit_color)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
-      "chrome9-one-texture-vertex");
-   nir_def *position, *color, *texcoord;
+      emit_color ? "chrome9-one-texture-color-vertex" :
+                   "chrome9-one-texture-replace-vertex");
+   nir_def *position, *texcoord;
    struct pipe_shader_state state = {
       .type = PIPE_SHADER_IR_NIR,
       .ir.nir = b.shader,
@@ -88,14 +89,18 @@ make_texture_vertex_shader(struct pipe_screen *screen,
    b.shader->info.io_lowered = true;
    position = nir_load_input(&b, 4, 32, nir_imm_int(&b, 0),
                              .io_semantics.location = VERT_ATTRIB_POS);
-   color = nir_load_input(&b, 4, 32, nir_imm_int(&b, 0),
-                          .io_semantics.location = VERT_ATTRIB_COLOR0);
    texcoord = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0),
                              .io_semantics.location = VERT_ATTRIB_TEX0);
    nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = VARYING_SLOT_POS);
-   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
-                    .io_semantics.location = VARYING_SLOT_COL0);
+   if (emit_color) {
+      nir_def *color = nir_load_input(
+         &b, 4, 32, nir_imm_int(&b, 0),
+         .io_semantics.location = VERT_ATTRIB_COLOR0);
+
+      nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .io_semantics.location = VARYING_SLOT_COL0);
+   }
    nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0x3,
                     .io_semantics.location = VARYING_SLOT_TEX0);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
@@ -412,6 +417,16 @@ run_pipe_texture(struct pipe_screen *screen)
       { {  1, -1, 0, 1 }, { 1, 0, 0, 1 }, { 1, 0 } },
       { {  1,  1, 0, 1 }, { 1, 0, 0, 1 }, { 1, 1 } },
    };
+   static const struct smoke_texture_vertex rhw_replace_vertices[] = {
+      { { -1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0.5 } },
+      { {  4, -4, 0, 4 }, { 1, 1, 1, 1 }, { 1, 0.5 } },
+      { {  4,  4, 0, 4 }, { 1, 1, 1, 1 }, { 1, 0.5 } },
+   };
+   static const struct smoke_texture_vertex rhw_modulate_vertices[] = {
+      { { -1, -1, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0.5 } },
+      { {  4, -4, 0, 4 }, { 1, 0, 0, 1 }, { 1, 0.5 } },
+      { {  4,  4, 0, 4 }, { 1, 0, 0, 1 }, { 1, 0.5 } },
+   };
    struct pipe_resource target_templ = {
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -424,9 +439,23 @@ run_pipe_texture(struct pipe_screen *screen)
       .width0 = 2, .height0 = 2, .depth0 = 1, .array_size = 1,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
    };
+   struct pipe_resource rhw_target_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource rhw_texture_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .width0 = 8, .height0 = 1, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
+   };
    struct pipe_resource *target = NULL, *texture = NULL;
+   struct pipe_resource *rhw_target = NULL, *rhw_texture = NULL;
    struct pipe_context *context = NULL;
-   struct pipe_sampler_view view_templ, *view = NULL;
+   struct pipe_sampler_view view_templ, rhw_view_templ;
+   struct pipe_sampler_view *view = NULL, *rhw_view = NULL;
    struct pipe_sampler_state sampler = {
       .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
       .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
@@ -443,6 +472,7 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_vertex_element elements[3] = { 0 };
+   struct pipe_vertex_element replace_elements[2] = { 0 };
    struct pipe_vertex_buffer vertex_buffer = {
       .is_user_buffer = true,
       .buffer.user = white_vertices,
@@ -464,22 +494,29 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_draw_start_count_bias draw = { .count = 4 };
    union pipe_color_union clear = { 0 };
    struct chrome9_resource *ctarget, *ctexture;
+   struct chrome9_resource *crhw_target, *crhw_texture;
    struct chrome9_context *ccontext;
    void *blend_handle = NULL, *dsa_handle = NULL, *rasterizer_handle = NULL;
-   void *elements_handle = NULL, *sampler_handle = NULL;
-   void *vs = NULL, *replace = NULL, *modulate = NULL;
+   void *elements_handle = NULL, *replace_elements_handle = NULL;
+   void *sampler_handle = NULL;
+   void *replace_vs = NULL, *modulate_vs = NULL;
+   void *replace = NULL, *modulate = NULL;
    void *samplers[1];
    uint32_t source_copy[4], *source, *pixels;
    bool passed = false;
 
    target = screen->resource_create(screen, &target_templ);
    texture = screen->resource_create(screen, &texture_templ);
+   rhw_target = screen->resource_create(screen, &rhw_target_templ);
+   rhw_texture = screen->resource_create(screen, &rhw_texture_templ);
    context = screen->context_create(screen, NULL, 0);
-   if (!target || !texture || !context)
+   if (!target || !texture || !rhw_target || !rhw_texture || !context)
       goto out;
    ccontext = chrome9_context(context);
    ctarget = chrome9_resource(target);
    ctexture = chrome9_resource(texture);
+   crhw_target = chrome9_resource(rhw_target);
+   crhw_texture = chrome9_resource(rhw_texture);
    memset(ctarget->bo.map, 0x5a, ctarget->bo.size);
    memset(ctexture->bo.map, 0xa5, ctexture->bo.size);
    source = (uint32_t *)((uint8_t *)ctexture->bo.map + ctexture->data_offset);
@@ -510,22 +547,37 @@ run_pipe_texture(struct pipe_screen *screen)
    elements[2].src_stride = sizeof(struct smoke_texture_vertex);
    elements_handle = context->create_vertex_elements_state(context, 3,
                                                             elements);
+   replace_elements[0] = elements[0];
+   replace_elements[1] = elements[2];
+   replace_elements_handle = context->create_vertex_elements_state(
+      context, 2, replace_elements);
    sampler_handle = context->create_sampler_state(context, &sampler);
    u_sampler_view_default_template(&view_templ, texture, texture->format);
    view = context->create_sampler_view(context, texture, &view_templ);
-   vs = make_texture_vertex_shader(screen, context);
+   u_sampler_view_default_template(&rhw_view_templ, rhw_texture,
+                                   rhw_texture->format);
+   rhw_view = context->create_sampler_view(context, rhw_texture,
+                                           &rhw_view_templ);
+   replace_vs = make_texture_vertex_shader(screen, context, false);
+   modulate_vs = make_texture_vertex_shader(screen, context, true);
    replace = make_texture_fragment_shader(screen, context, false);
    modulate = make_texture_fragment_shader(screen, context, true);
    if (!blend_handle || !dsa_handle || !rasterizer_handle ||
-       !elements_handle || !sampler_handle || !view || !vs || !replace ||
-       !modulate) {
+       !elements_handle || !replace_elements_handle || !sampler_handle ||
+       !view || !rhw_view ||
+       !replace_vs ||
+       !modulate_vs || !replace || !modulate) {
       fprintf(stderr,
               "texture setup failed: target=%p texture=%p context=%p "
-              "blend=%p dsa=%p rasterizer=%p elements=%p sampler=%p "
-              "view=%p vs=%p replace=%p modulate=%p\n",
+              "blend=%p dsa=%p rasterizer=%p elements=%p "
+              "replace_elements=%p sampler=%p "
+              "view=%p rhw_view=%p replace_vs=%p modulate_vs=%p "
+              "replace=%p modulate=%p\n",
               (void *)target, (void *)texture, (void *)context, blend_handle,
-              dsa_handle, rasterizer_handle, elements_handle, sampler_handle,
-              (void *)view, vs, replace, modulate);
+              dsa_handle, rasterizer_handle, elements_handle,
+              replace_elements_handle, sampler_handle,
+              (void *)view, (void *)rhw_view, replace_vs, modulate_vs,
+              replace, modulate);
       goto out;
    }
 
@@ -534,12 +586,10 @@ run_pipe_texture(struct pipe_screen *screen)
    context->bind_blend_state(context, blend_handle);
    context->bind_depth_stencil_alpha_state(context, dsa_handle);
    context->bind_rasterizer_state(context, rasterizer_handle);
-   context->bind_vertex_elements_state(context, elements_handle);
    context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 1,
                                 samplers);
    context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
                               &view);
-   context->bind_vs_state(context, vs);
    context->set_vertex_buffers(context, 1, &vertex_buffer);
    context->set_framebuffer_state(context, &framebuffer);
    context->set_viewport_states(context, 0, 1, &viewport);
@@ -559,6 +609,9 @@ run_pipe_texture(struct pipe_screen *screen)
 
       vertex_buffer.buffer.user = program ? red_vertices : white_vertices;
       context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->bind_vertex_elements_state(
+         context, program ? elements_handle : replace_elements_handle);
+      context->bind_vs_state(context, program ? modulate_vs : replace_vs);
       context->bind_fs_state(context, program ? modulate : replace);
       context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
                      &clear, 1.0, 0);
@@ -621,18 +674,149 @@ run_pipe_texture(struct pipe_screen *screen)
       goto out;
    }
    puts("Gallium texture REPLACE/MODULATE and guards passed");
+
+   static const uint32_t rhw_texels[8] = {
+      0x00ff0000, 0x0000ff00, 0x000000ff, 0x00ffffff,
+      0x00ff00ff, 0x0000ffff, 0x00ffff00, 0x00808080,
+   };
+   const unsigned rhw_y[4] = { 8, 16, 24, 40 };
+   uint32_t *rhw_source = (uint32_t *)
+      ((uint8_t *)crhw_texture->bo.map + crhw_texture->data_offset);
+   uint32_t *rhw_pixels = (uint32_t *)
+      ((uint8_t *)crhw_target->bo.map + crhw_target->data_offset);
+   struct pipe_viewport_state rhw_viewport = {
+      .scale = { 32, 32, 0 }, .translate = { 31.5, 31.5, 0 },
+   };
+   struct pipe_scissor_state rhw_scissor = { .maxx = 64, .maxy = 64 };
+   struct pipe_draw_info rhw_info = {
+      .mode = MESA_PRIM_TRIANGLES, .index_bounds_valid = true,
+      .instance_count = 1, .min_index = 0, .max_index = 2,
+   };
+   struct pipe_draw_start_count_bias rhw_draw = { .count = 3 };
+
+   memset(crhw_target->bo.map, 0x5a, crhw_target->bo.size);
+   memset(crhw_texture->bo.map, 0xa5, crhw_texture->bo.size);
+   memcpy(rhw_source, rhw_texels, sizeof(rhw_texels));
+   framebuffer.width = framebuffer.height = 64;
+   framebuffer.cbufs[0].texture = rhw_target;
+   context->set_framebuffer_state(context, &framebuffer);
+   context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                              &rhw_view);
+   context->set_viewport_states(context, 0, 1, &rhw_viewport);
+   context->set_scissor_states(context, 0, 1, &rhw_scissor);
+   vertex_buffer.buffer.user = rhw_replace_vertices;
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->bind_vertex_elements_state(context, replace_elements_handle);
+   context->bind_vs_state(context, replace_vs);
+   context->bind_fs_state(context, replace);
+   context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                  &clear, 1.0, 0);
+   uint64_t rhw_submitted = ccontext->submitted_triangles;
+   uint64_t rhw_rejected = ccontext->rejected_triangles;
+
+   context->draw_vbo(context, &rhw_info, 0, NULL, &rhw_draw, 1);
+   context->flush(context, NULL, 0);
+   bool rhw_replace_match = ccontext->submitted_triangles ==
+                               rhw_submitted + 1 &&
+                            ccontext->rejected_triangles == rhw_rejected;
+   for (unsigned i = 0; i < ARRAY_SIZE(rhw_y); i++)
+      rhw_replace_match &=
+         (rhw_pixels[rhw_y[i] * (crhw_target->stride / 4) + 48] &
+          0xffffff) == 0xffffff;
+   if (!rhw_replace_match ||
+       memcmp(rhw_source, rhw_texels, sizeof(rhw_texels))) {
+      fprintf(stderr,
+              "varying-RHW REPLACE mismatch: submitted=+%" PRIu64
+              " rejected=+%" PRIu64 " x48=%06x,%06x,%06x,%06x "
+              "expected=ffffff (affine diagnostic=ffff00) source=%u\n",
+              ccontext->submitted_triangles - rhw_submitted,
+              ccontext->rejected_triangles - rhw_rejected,
+              rhw_pixels[rhw_y[0] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_pixels[rhw_y[1] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_pixels[rhw_y[2] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_pixels[rhw_y[3] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              !memcmp(rhw_source, rhw_texels, sizeof(rhw_texels)));
+      goto out;
+   }
+
+   for (unsigned i = 0; i < 8; i++)
+      rhw_source[i] = 0x00ffffff;
+   vertex_buffer.buffer.user = rhw_modulate_vertices;
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, modulate_vs);
+   context->bind_fs_state(context, modulate);
+   context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                  &clear, 1.0, 0);
+   rhw_submitted = ccontext->submitted_triangles;
+   rhw_rejected = ccontext->rejected_triangles;
+   context->draw_vbo(context, &rhw_info, 0, NULL, &rhw_draw, 1);
+   context->flush(context, NULL, 0);
+   bool rhw_modulate_match = ccontext->submitted_triangles ==
+                                rhw_submitted + 1 &&
+                             ccontext->rejected_triangles == rhw_rejected;
+   for (unsigned i = 0; i < ARRAY_SIZE(rhw_y); i++) {
+      uint32_t pixel =
+         rhw_pixels[rhw_y[i] * (crhw_target->stride / 4) + 48] & 0xffffff;
+      unsigned red = pixel >> 16;
+
+      rhw_modulate_match &= !(pixel & 0xffff) && red >= 0x6f && red <= 0x74;
+   }
+   const uint8_t *rhw_texture_data =
+      (const uint8_t *)crhw_texture->bo.map + crhw_texture->data_offset;
+   size_t rhw_texture_aligned_size =
+      ALIGN_POT(crhw_texture->data_size, crhw_texture->data_offset);
+   bool rhw_source_match = true;
+
+   for (unsigned i = 0; i < 8; i++)
+      rhw_source_match &= rhw_source[i] == 0x00ffffff;
+   rhw_source_match &= smoke_bytes_match(
+      rhw_texture_data + crhw_texture->data_size,
+      rhw_texture_aligned_size - crhw_texture->data_size, 0xa5);
+   if (!rhw_modulate_match || !rhw_source_match ||
+       !smoke_guard_pages_match(crhw_target) ||
+       !smoke_guard_pages_match(crhw_texture)) {
+      fprintf(stderr,
+              "varying-RHW MODULATE mismatch: submitted=+%" PRIu64
+              " rejected=+%" PRIu64 " x48=%06x,%06x,%06x,%06x "
+              "expected red=6f..74 (affine diagnostic=c1) source=%u "
+              "target_guards=%u texture_guards=%u\n",
+              ccontext->submitted_triangles - rhw_submitted,
+              ccontext->rejected_triangles - rhw_rejected,
+              rhw_pixels[rhw_y[0] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_pixels[rhw_y[1] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_pixels[rhw_y[2] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_pixels[rhw_y[3] * (crhw_target->stride / 4) + 48] &
+                 0xffffff,
+              rhw_source_match, smoke_guard_pages_match(crhw_target),
+              smoke_guard_pages_match(crhw_texture));
+      goto out;
+   }
+   puts("Gallium varying-RHW REPLACE/MODULATE perspective passed");
    passed = true;
 
 out:
    if (context) {
-      if (vs) context->delete_vs_state(context, vs);
+      if (replace_vs) context->delete_vs_state(context, replace_vs);
+      if (modulate_vs) context->delete_vs_state(context, modulate_vs);
       if (replace) context->delete_fs_state(context, replace);
       if (modulate) context->delete_fs_state(context, modulate);
       if (view) pipe_sampler_view_reference(&view, NULL);
+      if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
       if (sampler_handle)
          context->delete_sampler_state(context, sampler_handle);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
+      if (replace_elements_handle)
+         context->delete_vertex_elements_state(context,
+                                               replace_elements_handle);
       if (rasterizer_handle)
          context->delete_rasterizer_state(context, rasterizer_handle);
       if (dsa_handle)
@@ -643,6 +827,8 @@ out:
    }
    if (texture) screen->resource_destroy(screen, texture);
    if (target) screen->resource_destroy(screen, target);
+   if (rhw_texture) screen->resource_destroy(screen, rhw_texture);
+   if (rhw_target) screen->resource_destroy(screen, rhw_target);
    return passed;
 }
 
