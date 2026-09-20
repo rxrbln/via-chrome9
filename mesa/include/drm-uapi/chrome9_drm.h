@@ -15,6 +15,8 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE	0x03
 #define DRM_CHROME9_DRAW_TRIANGLE_D16	0x04
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE	0x05
+#define DRM_CHROME9_DRAW_TRIANGLE_BLEND	0x06
+#define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND	0x07
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -34,6 +36,12 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE, \
 		struct drm_chrome9_draw_textured_triangle)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_BLEND \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_BLEND, \
+		struct drm_chrome9_draw_triangle_blend)
+#define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND, \
+		struct drm_chrome9_draw_textured_triangle_blend)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -58,6 +66,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16	(1ULL << 5)
 /* One bounded, level-zero 2D texture and immediate triangle are available. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE	(1ULL << 6)
+/* RT0 ADD blending and color masks for immediate color triangles. */
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND	(1ULL << 7)
+/* RT0 ADD blending and color masks for immediate textured triangles. */
+#define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND	(1ULL << 8)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -193,6 +205,68 @@ struct drm_chrome9_draw_textured_triangle {
 	__u32 pad;
 	struct drm_chrome9_textured_vertex vertices[3];
 	__u64 reserved[2];
+};
+
+#define DRM_CHROME9_BLEND_ENABLE	(1U << 0)
+
+#define DRM_CHROME9_BLEND_FACTOR_ZERO		0
+#define DRM_CHROME9_BLEND_FACTOR_ONE		1
+#define DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA	2
+#define DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA	3
+
+#define DRM_CHROME9_BLEND_FUNC_ADD	0
+
+#define DRM_CHROME9_COLOR_MASK_R	(1U << 0)
+#define DRM_CHROME9_COLOR_MASK_G	(1U << 1)
+#define DRM_CHROME9_COLOR_MASK_B	(1U << 2)
+#define DRM_CHROME9_COLOR_MASK_A	(1U << 3)
+
+struct drm_chrome9_blend_state {
+	__u32 flags;
+	__u32 rgb_src_factor;
+	__u32 rgb_dst_factor;
+	__u32 alpha_src_factor;
+	__u32 alpha_dst_factor;
+	__u32 rgb_func;
+	__u32 alpha_func;
+	__u32 color_mask;
+	__u32 reserved[2];
+};
+
+/* Blend-aware successor; the original DRAW_TRIANGLE ABI remains unchanged. */
+struct drm_chrome9_draw_triangle_blend {
+	__u32 destination_handle;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 pitch;
+	__u32 pad;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_vertex vertices[3];
+	__u32 reserved[4];
+};
+
+/* Blend-aware successor; the original textured-triangle ABI is unchanged. */
+struct drm_chrome9_draw_textured_triangle_blend {
+	__u32 destination_handle;
+	__u32 texture_handle;
+	__u32 flags;
+	__u32 program;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 texture_width;
+	__u32 texture_height;
+	__u32 texture_pitch;
+	__u32 texture_format;
+	__u32 min_filter;
+	__u32 mag_filter;
+	__u32 wrap_s;
+	__u32 wrap_t;
+	__u32 pad;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_textured_vertex vertices[3];
+	__u32 reserved[4];
 };
 
 #if defined(__cplusplus)
