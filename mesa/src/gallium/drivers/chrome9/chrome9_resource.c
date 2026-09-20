@@ -41,6 +41,7 @@ chrome9_resource_layout(const struct pipe_resource *templ, uint32_t *stride,
 
    if (templ->target != PIPE_TEXTURE_2D ||
        (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        templ->format != PIPE_FORMAT_B8G8R8A8_UNORM &&
         templ->format != PIPE_FORMAT_Z16_UNORM) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
@@ -80,20 +81,30 @@ chrome9_is_format_supported(struct pipe_screen *screen,
       PIPE_BIND_VERTEX_STATE;
    const unsigned surface_bindings =
       PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
-      PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
+      PIPE_BIND_SCANOUT | PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW;
+   const unsigned texture_bindings = PIPE_BIND_LINEAR | PIPE_BIND_SAMPLER_VIEW;
    const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR;
 
    if (sample_count > 1 || storage_sample_count > 1)
       return false;
    if (target == PIPE_BUFFER)
       return !(bindings & ~buffer_bindings);
+   if ((bindings & PIPE_BIND_SAMPLER_VIEW) &&
+       !chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE))
+      return false;
    if (target == PIPE_TEXTURE_2D && format == PIPE_FORMAT_Z16_UNORM)
       return chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_D16) &&
              !(bindings & ~depth_bindings);
-   return target == PIPE_TEXTURE_2D &&
-          format == PIPE_FORMAT_B8G8R8X8_UNORM &&
-          !(bindings & ~surface_bindings);
+   if (target != PIPE_TEXTURE_2D)
+      return false;
+   if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
+      return !(bindings & ~surface_bindings);
+   return chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) &&
+          format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+          !(bindings & ~texture_bindings);
 }
 
 bool
@@ -106,7 +117,7 @@ chrome9_can_create_resource(struct pipe_screen *screen,
    uint32_t stride;
    bool guarded;
 
-   if (templ->format == PIPE_FORMAT_Z16_UNORM &&
+   if (templ->target != PIPE_BUFFER &&
        !chrome9_is_format_supported(screen, templ->format, templ->target,
                                     templ->nr_samples,
                                     templ->nr_storage_samples, templ->bind))

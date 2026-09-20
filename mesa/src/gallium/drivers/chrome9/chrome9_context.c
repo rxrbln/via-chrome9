@@ -141,8 +141,47 @@ static void *
 chrome9_create_sampler_state(struct pipe_context *pipe,
                              const struct pipe_sampler_state *state)
 {
+   struct chrome9_sampler_state *sampler =
+      CALLOC_STRUCT(chrome9_sampler_state);
+
    (void)pipe;
-   return chrome9_dup_state(state, sizeof(*state));
+   if (!sampler)
+      return NULL;
+   sampler->base = *state;
+   sampler->supported = true;
+
+   switch (state->min_img_filter) {
+   case PIPE_TEX_FILTER_NEAREST: sampler->min_filter = 0; break;
+   case PIPE_TEX_FILTER_LINEAR: sampler->min_filter = 1; break;
+   default: sampler->supported = false; break;
+   }
+   switch (state->mag_img_filter) {
+   case PIPE_TEX_FILTER_NEAREST: sampler->mag_filter = 0; break;
+   case PIPE_TEX_FILTER_LINEAR: sampler->mag_filter = 1; break;
+   default: sampler->supported = false; break;
+   }
+   switch (state->min_mip_filter) {
+   case PIPE_TEX_MIPFILTER_NONE: sampler->mip_filter = 0; break;
+   default: sampler->supported = false; break;
+   }
+   switch (state->wrap_s) {
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE: sampler->wrap_s = 1; break;
+   case PIPE_TEX_WRAP_REPEAT: sampler->wrap_s = 2; break;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_s = 3; break;
+   default: sampler->supported = false; break;
+   }
+   switch (state->wrap_t) {
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE: sampler->wrap_t = 1; break;
+   case PIPE_TEX_WRAP_REPEAT: sampler->wrap_t = 2; break;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_t = 3; break;
+   default: sampler->supported = false; break;
+   }
+   if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
+       state->unnormalized_coords || state->lod_bias != 0.0f ||
+       state->max_anisotropy > 1 || state->seamless_cube_map ||
+       state->reduction_mode != PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE)
+      sampler->supported = false;
+   return sampler;
 }
 
 static void
@@ -150,11 +189,33 @@ chrome9_bind_sampler_states(struct pipe_context *pipe,
                             mesa_shader_stage shader, unsigned start,
                             unsigned count, void **states)
 {
-   (void)pipe;
-   (void)shader;
-   (void)start;
-   (void)count;
-   (void)states;
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   unsigned end;
+
+   if (shader != MESA_SHADER_FRAGMENT || start >= PIPE_MAX_SAMPLERS)
+      return;
+   end = MIN2(start + count, PIPE_MAX_SAMPLERS);
+   for (unsigned i = start; i < end; i++)
+      ctx->sampler_states[i] = states ? states[i - start] : NULL;
+   ctx->num_sampler_states = 0;
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+      if (ctx->sampler_states[i])
+         ctx->num_sampler_states = i + 1;
+}
+
+static void
+chrome9_delete_sampler_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+      if (ctx->sampler_states[i] == state)
+         ctx->sampler_states[i] = NULL;
+   ctx->num_sampler_states = 0;
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+      if (ctx->sampler_states[i])
+         ctx->num_sampler_states = i + 1;
+   FREE(state);
 }
 
 static void
@@ -266,9 +327,114 @@ chrome9_fs_is_primary_color(nir_def *def, unsigned depth)
 }
 
 static bool
-chrome9_fs_passthrough(nir_shader *nir)
+chrome9_fs_is_texcoord(nir_def *def, unsigned depth)
 {
-   bool written = false;
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components < 2)
+      return false;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      nir_variable *var;
+
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_input:
+      case nir_intrinsic_load_interpolated_input:
+         return nir_intrinsic_io_semantics(intr).location ==
+                   VARYING_SLOT_TEX0 &&
+                !nir_intrinsic_component(intr);
+      case nir_intrinsic_load_deref:
+         var = nir_intrinsic_get_var(intr, 0);
+         return var && var->data.mode == nir_var_shader_in &&
+                var->data.location == VARYING_SLOT_TEX0 &&
+                !var->data.location_frac;
+      default:
+         return false;
+      }
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov)
+         return alu->src[0].swizzle[0] == 0 &&
+                alu->src[0].swizzle[1] == 1 &&
+                chrome9_fs_is_texcoord(alu->src[0].src.ssa, depth + 1);
+      if (alu->op == nir_op_vec2) {
+         nir_def *source = alu->src[0].src.ssa;
+
+         return alu->src[1].src.ssa == source &&
+                alu->src[0].swizzle[0] == 0 &&
+                alu->src[1].swizzle[0] == 1 &&
+                chrome9_fs_is_texcoord(source, depth + 1);
+      }
+   }
+   return false;
+}
+
+static bool
+chrome9_fs_is_texture(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_tex_instr *tex;
+   int coord;
+
+   if (def->num_components != 4 || instr->type != nir_instr_type_tex)
+      return false;
+   tex = nir_instr_as_tex(instr);
+   coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   return tex->op == nir_texop_tex &&
+          tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+          !tex->is_shadow && tex->texture_index == 0 &&
+          tex->sampler_index == 0 && tex->coord_components == 2 &&
+          coord >= 0 && tex->num_srcs == 1 &&
+          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, 0);
+}
+
+static unsigned
+chrome9_fs_result(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 4)
+      return CHROME9_FS_UNSUPPORTED;
+   if (chrome9_fs_is_texture(def))
+      return CHROME9_FS_TEXTURE_REPLACE;
+   if (chrome9_fs_is_primary_color(def, depth))
+      return CHROME9_FS_PRIMARY_COLOR;
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[0].swizzle[c] != c)
+               return CHROME9_FS_UNSUPPORTED;
+         return chrome9_fs_result(alu->src[0].src.ssa, depth + 1);
+      }
+      if (alu->op == nir_op_fmul) {
+         unsigned a, b;
+
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[0].swizzle[c] != c ||
+                alu->src[1].swizzle[c] != c)
+               return CHROME9_FS_UNSUPPORTED;
+         a = chrome9_fs_result(alu->src[0].src.ssa, depth + 1);
+         b = chrome9_fs_result(alu->src[1].src.ssa, depth + 1);
+         if ((a == CHROME9_FS_TEXTURE_REPLACE &&
+              b == CHROME9_FS_PRIMARY_COLOR) ||
+             (b == CHROME9_FS_TEXTURE_REPLACE &&
+              a == CHROME9_FS_PRIMARY_COLOR))
+            return CHROME9_FS_TEXTURE_MODULATE;
+      }
+   }
+   return CHROME9_FS_UNSUPPORTED;
+}
+
+static unsigned
+chrome9_fs_classify(nir_shader *nir)
+{
+   unsigned result = CHROME9_FS_UNSUPPORTED;
+   unsigned texture_count = 0;
+   bool written = false, valid = true;
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -277,12 +443,22 @@ chrome9_fs_passthrough(nir_shader *nir)
             nir_variable *var;
             unsigned location;
 
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+               texture_count++;
+               if (!chrome9_fs_is_texture(&tex->def))
+                  valid = false;
+               continue;
+            }
             if (instr->type == nir_instr_type_deref ||
                 instr->type == nir_instr_type_load_const ||
                 instr->type == nir_instr_type_alu)
                continue;
-            if (instr->type != nir_instr_type_intrinsic)
-               return false;
+            if (instr->type != nir_instr_type_intrinsic) {
+               valid = false;
+               continue;
+            }
             intr = nir_instr_as_intrinsic(instr);
             switch (intr->intrinsic) {
             case nir_intrinsic_load_input:
@@ -296,8 +472,9 @@ chrome9_fs_passthrough(nir_shader *nir)
                location = nir_intrinsic_io_semantics(intr).location;
                if ((location != FRAG_RESULT_COLOR &&
                     location != FRAG_RESULT_DATA0) ||
-                   !chrome9_fs_is_primary_color(intr->src[0].ssa, 0))
-                  return false;
+                   written ||
+                   !(result = chrome9_fs_result(intr->src[0].ssa, 0)))
+                  valid = false;
                written = true;
                break;
             case nir_intrinsic_store_deref:
@@ -305,17 +482,24 @@ chrome9_fs_passthrough(nir_shader *nir)
                if (!var || var->data.mode != nir_var_shader_out ||
                    (var->data.location != FRAG_RESULT_COLOR &&
                     var->data.location != FRAG_RESULT_DATA0) ||
-                   !chrome9_fs_is_primary_color(intr->src[1].ssa, 0))
-                  return false;
+                   written ||
+                   !(result = chrome9_fs_result(intr->src[1].ssa, 0)))
+                  valid = false;
                written = true;
                break;
             default:
-               return false;
+               valid = false;
+               break;
             }
          }
       }
    }
-   return written;
+   if (!valid || !written ||
+       (result == CHROME9_FS_PRIMARY_COLOR && texture_count) ||
+       ((result == CHROME9_FS_TEXTURE_REPLACE ||
+         result == CHROME9_FS_TEXTURE_MODULATE) && texture_count != 1))
+      return CHROME9_FS_UNSUPPORTED;
+   return result;
 }
 
 static bool
@@ -402,9 +586,14 @@ chrome9_create_fs_state(struct pipe_context *pipe,
    }
    if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
       shader->nir = state->ir.nir;
-      shader->supported = chrome9_fs_passthrough(state->ir.nir);
-   } else if (state->type == PIPE_SHADER_IR_TGSI)
+      shader->fragment_program = chrome9_fs_classify(state->ir.nir);
+      shader->supported =
+         shader->fragment_program != CHROME9_FS_UNSUPPORTED;
+   } else if (state->type == PIPE_SHADER_IR_TGSI) {
       shader->supported = chrome9_tgsi_fs_passthrough(state->tokens);
+      shader->fragment_program = shader->supported ?
+         CHROME9_FS_PRIMARY_COLOR : CHROME9_FS_UNSUPPORTED;
+   }
    return shader;
 }
 
@@ -503,8 +692,19 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
 {
    struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
 
-   if (!view)
+   if (!view || !texture || texture->target != PIPE_TEXTURE_2D ||
+       templ->target != PIPE_TEXTURE_2D || templ->format != texture->format ||
+       (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        templ->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+       templ->u.tex.first_level || templ->u.tex.last_level ||
+       templ->u.tex.first_layer || templ->u.tex.last_layer ||
+       templ->swizzle_r != PIPE_SWIZZLE_X ||
+       templ->swizzle_g != PIPE_SWIZZLE_Y ||
+       templ->swizzle_b != PIPE_SWIZZLE_Z ||
+       templ->swizzle_a != PIPE_SWIZZLE_W) {
+      FREE(view);
       return NULL;
+   }
    *view = *templ;
    pipe_reference_init(&view->reference, 1);
    view->texture = NULL;
@@ -895,6 +1095,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       goto fail;
    ctx->draw_triangle_d16 =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16);
+   ctx->draw_textured_triangle =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
 
    ctx->base.screen = screen;
    ctx->base.priv = priv;
@@ -916,7 +1118,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.delete_rasterizer_state = chrome9_delete_state;
    ctx->base.create_sampler_state = chrome9_create_sampler_state;
    ctx->base.bind_sampler_states = chrome9_bind_sampler_states;
-   ctx->base.delete_sampler_state = chrome9_delete_state;
+   ctx->base.delete_sampler_state = chrome9_delete_sampler_state;
    ctx->base.create_sampler_view = chrome9_create_sampler_view;
    ctx->base.sampler_view_destroy = chrome9_sampler_view_destroy;
    ctx->base.sampler_view_release = u_default_sampler_view_release;

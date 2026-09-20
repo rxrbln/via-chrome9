@@ -18,6 +18,22 @@ enum chrome9_warning {
 struct chrome9_shader {
    void *draw;
    void *nir;
+   enum {
+      CHROME9_FS_UNSUPPORTED,
+      CHROME9_FS_PRIMARY_COLOR,
+      CHROME9_FS_TEXTURE_REPLACE,
+      CHROME9_FS_TEXTURE_MODULATE,
+   } fragment_program;
+   bool supported;
+};
+
+struct chrome9_sampler_state {
+   struct pipe_sampler_state base;
+   uint8_t min_filter;
+   uint8_t mag_filter;
+   uint8_t mip_filter;
+   uint8_t wrap_s;
+   uint8_t wrap_t;
    bool supported;
 };
 
@@ -36,9 +52,12 @@ struct chrome9_context {
    struct pipe_resource *render_target;
    bool render_target_dirty;
    bool draw_triangle_d16;
+   bool draw_textured_triangle;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
    struct pipe_constant_buffer vs_constants[PIPE_MAX_CONSTANT_BUFFERS];
+   struct chrome9_sampler_state *sampler_states[PIPE_MAX_SAMPLERS];
+   unsigned num_sampler_states;
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
    unsigned num_sampler_views;
 

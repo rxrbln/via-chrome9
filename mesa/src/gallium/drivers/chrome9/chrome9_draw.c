@@ -30,6 +30,7 @@ struct chrome9_vbuf_render {
    size_t capacity;
    uint16_t vertex_size;
    uint16_t vertex_count;
+   bool textured;
    bool layout_valid;
 };
 
@@ -56,7 +57,7 @@ static const struct vertex_info *
 chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
-   int position, color0, color1;
+   int position, color0, color1, texcoord = -1;
 
    position = draw_find_shader_output(crender->ctx->draw,
                                       TGSI_SEMANTIC_POSITION, 0);
@@ -64,13 +65,27 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                                     TGSI_SEMANTIC_COLOR, 0);
    color1 = draw_find_shader_output(crender->ctx->draw,
                                     TGSI_SEMANTIC_COLOR, 1);
+   crender->textured = crender->ctx->fs &&
+      (crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_REPLACE ||
+       crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_MODULATE);
+   if (crender->textured) {
+      texcoord = draw_find_shader_output(crender->ctx->draw,
+                                         TGSI_SEMANTIC_GENERIC, 0);
+      if (texcoord < 0)
+         texcoord = draw_find_shader_output(crender->ctx->draw,
+                                            TGSI_SEMANTIC_TEXCOORD, 0);
+   }
    memset(&crender->vinfo, 0, sizeof(crender->vinfo));
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, position);
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color0);
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
+   if (crender->textured)
+      draw_emit_vertex_attr(&crender->vinfo, EMIT_2F, texcoord);
    draw_compute_vertex_size(&crender->vinfo);
    crender->layout_valid = position >= 0 && color0 >= 0 &&
-                           crender->vinfo.size == 6;
+                           (!crender->textured || texcoord >= 0) &&
+                           crender->vinfo.size ==
+                              (crender->textured ? 8 : 6);
    return &crender->vinfo;
 }
 
@@ -81,7 +96,7 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    size_t size;
 
-   if (vertex_size != 6 * sizeof(uint32_t))
+   if (vertex_size != (crender->textured ? 8 : 6) * sizeof(uint32_t))
       return false;
    size = (size_t)vertex_size * nr_vertices;
 
@@ -146,11 +161,15 @@ static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
                              struct chrome9_resource **depth,
-                             bool *depth_active)
+                             struct chrome9_resource **texture,
+                             struct chrome9_sampler_state **sampler,
+                             bool textured, bool *depth_active)
 {
    struct pipe_resource *resource;
 
    *depth = NULL;
+   *texture = NULL;
+   *sampler = NULL;
    *depth_active = false;
    if (!ctx->vs || !ctx->fs || !ctx->fs->supported ||
        !(*target = chrome9_context_render_target(ctx)))
@@ -190,6 +209,27 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          return false;
       *depth_active = true;
    }
+   if (textured) {
+      struct pipe_sampler_view *view;
+      struct pipe_resource *source;
+
+      if (!ctx->draw_textured_triangle || *depth_active ||
+          ctx->num_sampler_states != 1 ||
+          ctx->num_sampler_views != 1 ||
+          !(*sampler = ctx->sampler_states[0]) || !(*sampler)->supported ||
+          !(view = ctx->sampler_views[0]) || !(source = view->texture))
+         return false;
+      *texture = chrome9_resource(source);
+      if (source == resource || source->target != PIPE_TEXTURE_2D ||
+          (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+           source->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+          source->last_level || !(*texture)->guarded ||
+          !(*texture)->bo.handle || ((*texture)->data_offset & 0xff) ||
+          (*texture)->stride != ALIGN_POT(source->width0 * 4, 32) ||
+          (*texture)->data_size <
+             (uint64_t)(*texture)->stride * source->height0)
+         return false;
+   }
    if (ctx->rasterizer && ctx->rasterizer->scissor && ctx->scissor_valid &&
        (ctx->scissor.minx || ctx->scissor.miny ||
         ctx->scissor.maxx < resource->width0 ||
@@ -205,13 +245,17 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct chrome9_context *ctx = crender->ctx;
    struct chrome9_resource *target;
    struct chrome9_resource *depth;
+   struct chrome9_resource *texture;
+   struct chrome9_sampler_state *sampler;
    struct drm_chrome9_draw_triangle args = { 0 };
    struct drm_chrome9_draw_triangle_d16 depth_args = { 0 };
+   struct drm_chrome9_draw_textured_triangle texture_args = { 0 };
    const unsigned indices[3] = { ia, ib, ic };
    bool depth_active;
 
    if (!crender->layout_valid ||
-       !chrome9_draw_state_supported(ctx, &target, &depth, &depth_active)) {
+       !chrome9_draw_state_supported(ctx, &target, &depth, &texture, &sampler,
+                                     crender->textured, &depth_active)) {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
          fprintf(stderr, "chrome9: triangle rejected by the bounded "
@@ -220,6 +264,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       return;
    }
+   (void)texture;
+   (void)sampler;
    for (unsigned i = 0; i < 3; i++) {
       const uint8_t *vertex;
       const float *position;
@@ -239,7 +285,31 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
-      if (depth_active) {
+      if (crender->textured) {
+         const float *texcoord = (const float *)(vertex + 6 * sizeof(uint32_t));
+
+         if (!isfinite(position[2]) || !isfinite(position[3]) ||
+             position[3] <= 0.0f || !isfinite(texcoord[0]) ||
+             !isfinite(texcoord[1])) {
+            ctx->rejected_triangles++;
+            return;
+         }
+         texture_args.vertices[i].x_16_16 =
+            chrome9_coord_16_16(position[0], target->base.width0);
+         texture_args.vertices[i].y_16_16 =
+            chrome9_coord_16_16(position[1], target->base.height0);
+         texture_args.vertices[i].z_16_16 =
+            chrome9_depth_16_16(position[2]);
+         memcpy(&texture_args.vertices[i].rhw_float, &position[3],
+                sizeof(position[3]));
+         texture_args.vertices[i].color = color;
+         memcpy(&texture_args.vertices[i].specular,
+                vertex + 5 * sizeof(uint32_t), sizeof(uint32_t));
+         memcpy(&texture_args.vertices[i].s_float, &texcoord[0],
+                sizeof(texcoord[0]));
+         memcpy(&texture_args.vertices[i].t_float, &texcoord[1],
+                sizeof(texcoord[1]));
+      } else if (depth_active) {
          depth_args.vertices[i].x_16_16 =
             chrome9_coord_16_16(position[0], target->base.width0);
          depth_args.vertices[i].y_16_16 =
@@ -255,7 +325,28 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
    }
 
-   if (depth_active) {
+   if (crender->textured) {
+      texture_args.destination_handle = target->bo.handle;
+      texture_args.texture_handle = texture->bo.handle;
+      texture_args.program = ctx->fs->fragment_program ==
+                                CHROME9_FS_TEXTURE_REPLACE ?
+                                DRM_CHROME9_TEXTURE_PROGRAM_REPLACE :
+                                DRM_CHROME9_TEXTURE_PROGRAM_MODULATE;
+      texture_args.width = target->base.width0;
+      texture_args.height = target->base.height0;
+      texture_args.destination_pitch = target->stride;
+      texture_args.texture_width = texture->base.width0;
+      texture_args.texture_height = texture->base.height0;
+      texture_args.texture_pitch = texture->stride;
+      texture_args.texture_format = texture->base.format ==
+                                      PIPE_FORMAT_B8G8R8X8_UNORM ?
+                                      DRM_CHROME9_TEXTURE_FORMAT_BGRX8888 :
+                                      DRM_CHROME9_TEXTURE_FORMAT_BGRA8888;
+      texture_args.min_filter = sampler->min_filter;
+      texture_args.mag_filter = sampler->mag_filter;
+      texture_args.wrap_s = sampler->wrap_s;
+      texture_args.wrap_t = sampler->wrap_t;
+   } else if (depth_active) {
       depth_args.destination_handle = target->bo.handle;
       depth_args.depth_handle = depth->bo.handle;
       depth_args.width = target->base.width0;
@@ -268,18 +359,21 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       args.height = target->base.height0;
       args.pitch = target->stride;
    }
-   if (depth_active ?
-          chrome9_draw_triangle_d16(
-             ctx->base.screen->get_screen_fd(ctx->base.screen), &depth_args) :
-          chrome9_draw_triangle(
-             ctx->base.screen->get_screen_fd(ctx->base.screen), &args)) {
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   const bool submitted = crender->textured ?
+      chrome9_draw_textured_triangle(fd, &texture_args) :
+      depth_active ? chrome9_draw_triangle_d16(fd, &depth_args) :
+                     chrome9_draw_triangle(fd, &args);
+
+   if (submitted) {
       ctx->submitted_triangles++;
       chrome9_context_render_target_written(ctx);
    } else {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr,
-                 "chrome9: DRAW_TRIANGLE%s failed: %s target=%ux%u/%u\n",
+                 "chrome9: DRAW_%sTRIANGLE%s failed: %s target=%ux%u/%u\n",
+                 crender->textured ? "TEXTURED_" : "",
                  depth_active ? "_D16" : "", strerror(errno),
                  target->base.width0, target->base.height0, target->stride);
          ctx->warnings |= CHROME9_WARN_SUBMIT;
@@ -412,7 +506,7 @@ chrome9_vbuf_create(struct chrome9_context *ctx)
       return NULL;
    render->ctx = ctx;
    render->base.max_indices = UINT16_MAX;
-   render->base.max_vertex_buffer_bytes = UINT16_MAX * 6 * sizeof(uint32_t);
+   render->base.max_vertex_buffer_bytes = UINT16_MAX * 8 * sizeof(uint32_t);
    render->base.need_pipeline = chrome9_vbuf_need_pipeline;
    render->base.get_vertex_info = chrome9_vbuf_get_vertex_info;
    render->base.allocate_vertices = chrome9_vbuf_allocate_vertices;

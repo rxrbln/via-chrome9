@@ -123,6 +123,10 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
    /* Mesa's compatibility context requires at least one logical unit. */
    fs->max_texture_samplers = 1;
    fs->max_sampler_views = 1;
+   if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) {
+      fs->max_tex_instructions = 1;
+      fs->max_tex_indirections = 1;
+   }
 }
 
 struct pipe_screen *
