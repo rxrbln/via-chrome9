@@ -2256,7 +2256,9 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			args->value |= DRM_CHROME9_CAP_FIXED_QUAD |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE_D16 |
-				       DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE;
+				       DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE |
+				       DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND |
+				       DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND;
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
@@ -2286,6 +2288,12 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  chrome9_draw_triangle_d16_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TEXTURED_TRIANGLE,
 			  chrome9_draw_textured_triangle_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TRIANGLE_BLEND,
+			  chrome9_draw_triangle_blend_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND,
+			  chrome9_draw_textured_triangle_blend_ioctl,
 			  DRM_RENDER_ALLOW),
 };
 
