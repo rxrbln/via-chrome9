@@ -1108,6 +1108,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND);
    ctx->blend_bgra8888 =
       !!(capabilities & DRM_CHROME9_CAP_BLEND_BGRA8888);
+   ctx->scissor_supported =
+      !!(capabilities & DRM_CHROME9_CAP_SCISSOR);
 
    ctx->base.screen = screen;
    ctx->base.priv = priv;

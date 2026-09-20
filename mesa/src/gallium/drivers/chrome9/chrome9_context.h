@@ -56,6 +56,7 @@ struct chrome9_context {
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;
+   bool scissor_supported;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
    struct pipe_constant_buffer vs_constants[PIPE_MAX_CONSTANT_BUFFERS];

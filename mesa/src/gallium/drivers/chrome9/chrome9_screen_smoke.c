@@ -253,6 +253,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    struct pipe_blend_state alpha_only = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
    struct pipe_rasterizer_state rasterizer = { 0 };
+   struct pipe_rasterizer_state scissor_rasterizer;
    struct pipe_vertex_element elements[2] = { 0 };
    struct pipe_vertex_buffer vertex_buffer = {
       .is_user_buffer = true,
@@ -304,6 +305,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *alpha_only_handle = NULL;
    void *dsa_handle = NULL;
    void *rasterizer_handle = NULL;
+   void *scissor_rasterizer_handle = NULL;
    void *elements_handle = NULL;
    void *vs = NULL;
    void *fs = NULL;
@@ -347,6 +349,12 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    rasterizer.depth_clip_near = true;
    rasterizer.depth_clip_far = true;
    rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   scissor_rasterizer = rasterizer;
+   scissor_rasterizer.scissor = true;
+   if (!depth_resource &&
+       chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_SCISSOR))
+      scissor_rasterizer_handle =
+         context->create_rasterizer_state(context, &scissor_rasterizer);
    elements[0].src_offset = offsetof(struct smoke_vertex, position);
    elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
    elements[0].src_stride = sizeof(struct smoke_vertex);
@@ -365,6 +373,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
        (!depth_resource &&
         resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
         !alpha_only_handle) ||
+       (!depth_resource &&
+        chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_SCISSOR) &&
+        !scissor_rasterizer_handle) ||
        !dsa_handle || !rasterizer_handle ||
        !elements_handle || !vs || !fs)
       goto out;
@@ -461,6 +472,44 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                     pixel);
       }
    }
+   if (passed && scissor_rasterizer_handle) {
+      const struct pipe_scissor_state probe = {
+         .minx = 64, .miny = 32, .maxx = 128, .maxy = 64,
+      };
+      uint64_t submitted = chrome9_context(context)->submitted_triangles;
+      uint64_t rejected = chrome9_context(context)->rejected_triangles;
+      uint32_t inside, left, right;
+
+      context->bind_blend_state(context, source_over_handle);
+      context->bind_rasterizer_state(context, scissor_rasterizer_handle);
+      context->set_scissor_states(context, 0, 1, &probe);
+      vertex_buffer.buffer.user = blend_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &clear_color, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush_resource(context, resource);
+      context->flush(context, NULL, 0);
+      inside = pixels[48 * (surface->stride / 4) + 96] & 0xffffff;
+      left = pixels[48 * (surface->stride / 4) + 32] & 0xffffff;
+      right = pixels[48 * (surface->stride / 4) + 192] & 0xffffff;
+      passed = inside >= 0x007f0000 && inside <= 0x00800000 &&
+               !left && !right &&
+               chrome9_context(context)->submitted_triangles ==
+                  submitted + 2 &&
+               chrome9_context(context)->rejected_triangles == rejected &&
+               smoke_guard_pages_match(draw_surface);
+      if (passed)
+         printf("Gallium scissor passed: samples=%08x/%08x/%08x\n",
+                left, inside, right);
+      else
+         fprintf(stderr,
+                 "Gallium scissor mismatch: samples=%08x/%08x/%08x "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                 left, inside, right,
+                 chrome9_context(context)->submitted_triangles - submitted,
+                 chrome9_context(context)->rejected_triangles - rejected);
+   }
    if (!passed)
       fprintf(stderr,
               "Gallium quad-strip coverage/depth mismatch: %zu sample=%08x/%04x\n",
@@ -484,6 +533,9 @@ out:
          context->delete_vertex_elements_state(context, elements_handle);
       if (rasterizer_handle)
          context->delete_rasterizer_state(context, rasterizer_handle);
+      if (scissor_rasterizer_handle)
+         context->delete_rasterizer_state(context,
+                                          scissor_rasterizer_handle);
       if (dsa_handle)
          context->delete_depth_stencil_alpha_state(context, dsa_handle);
       if (blend_handle)

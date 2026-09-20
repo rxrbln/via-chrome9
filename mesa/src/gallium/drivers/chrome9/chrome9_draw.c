@@ -320,10 +320,10 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              (uint64_t)(*texture)->stride * source->height0)
          return false;
    }
-   if (ctx->rasterizer && ctx->rasterizer->scissor && ctx->scissor_valid &&
-       (ctx->scissor.minx || ctx->scissor.miny ||
-        ctx->scissor.maxx < resource->width0 ||
-        ctx->scissor.maxy < resource->height0))
+   if (ctx->rasterizer && ctx->rasterizer->scissor &&
+       (!ctx->scissor_supported || !ctx->scissor_valid ||
+        ctx->scissor.minx > ctx->scissor.maxx ||
+        ctx->scissor.miny > ctx->scissor.maxy))
       return false;
    return true;
 }
@@ -343,6 +343,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct drm_chrome9_draw_textured_triangle texture_args = { 0 };
    struct drm_chrome9_draw_textured_triangle_blend texture_blend_args = { 0 };
    struct drm_chrome9_blend_state blend_state;
+   struct drm_chrome9_scissor_state scissor = { 0 };
    const unsigned indices[3] = { ia, ib, ic };
    bool blend_successor;
    bool depth_active;
@@ -361,6 +362,13 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    }
    (void)texture;
    (void)sampler;
+   if (ctx->rasterizer && ctx->rasterizer->scissor) {
+      scissor.flags = DRM_CHROME9_SCISSOR_ENABLE;
+      scissor.min_x = MIN2(ctx->scissor.minx, target->base.width0);
+      scissor.max_x = MIN2(ctx->scissor.maxx, target->base.width0);
+      scissor.min_y = MIN2(ctx->scissor.miny, target->base.height0);
+      scissor.max_y = MIN2(ctx->scissor.maxy, target->base.height0);
+   }
    for (unsigned i = 0; i < 3; i++) {
       const uint8_t *vertex;
       const float *position;
@@ -439,6 +447,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                                       PIPE_FORMAT_B8G8R8X8_UNORM ?
                                       DRM_CHROME9_TEXTURE_FORMAT_BGRX8888 :
                                       DRM_CHROME9_TEXTURE_FORMAT_BGRA8888;
+      texture_args.scissor = scissor;
       texture_args.min_filter = sampler->min_filter;
       texture_args.mag_filter = sampler->mag_filter;
       texture_args.wrap_s = sampler->wrap_s;
@@ -461,6 +470,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          texture_blend_args.wrap_s = texture_args.wrap_s;
          texture_blend_args.wrap_t = texture_args.wrap_t;
          texture_blend_args.blend = blend_state;
+         texture_blend_args.scissor = scissor;
          texture_blend_args.destination_format =
             target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
             DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
@@ -473,17 +483,20 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       depth_args.height = target->base.height0;
       depth_args.destination_pitch = target->stride;
       depth_args.depth_pitch = depth->stride;
+      depth_args.scissor = scissor;
    } else {
       args.destination_handle = target->bo.handle;
       args.width = target->base.width0;
       args.height = target->base.height0;
       args.pitch = target->stride;
+      args.scissor = scissor;
       if (blend_successor) {
          blend_args.destination_handle = args.destination_handle;
          blend_args.width = args.width;
          blend_args.height = args.height;
          blend_args.pitch = args.pitch;
          blend_args.blend = blend_state;
+         blend_args.scissor = scissor;
          blend_args.destination_format =
             target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
             DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
