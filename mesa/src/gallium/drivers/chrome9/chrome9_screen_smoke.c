@@ -13,43 +13,99 @@
 
 #include "drm-uapi/drm_fourcc.h"
 #include "frontend/winsys_handle.h"
+#include "compiler/nir/nir_builder.h"
 #include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
-#include "pipe/p_shader_tokens.h"
 #include "pipe/p_state.h"
-#include "util/u_simple_shaders.h"
 
 struct smoke_vertex {
    float position[4];
    float color[4];
 };
 
+static void *
+make_ff_vertex_shader(struct pipe_screen *screen,
+                      struct pipe_context *context,
+                      nir_shader **nir_out)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
+      "chrome9-glxgears-vertex-color");
+   nir_def *position = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_POS);
+   nir_def *color = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_COLOR0);
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   /* Fixed-function lighting similarly produces a clamped primary color. */
+   color = nir_fsat(&b, color);
+   nir_store_output(&b, position, nir_imm_int(&b, 0),
+                    .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_store_output(&b, color, nir_imm_int(&b, 0),
+                    .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_COL0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   *nir_out = b.shader;
+   return context->create_vs_state(context, &state);
+}
+
+static void *
+make_ff_primary_color_fs(struct pipe_screen *screen,
+                         struct pipe_context *context,
+                         nir_shader **nir_out)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-glxgears-primary-color");
+   nir_def *barycentric = nir_load_barycentric_pixel(&b, 32);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   nir_store_output(&b, color, nir_imm_int(&b, 0),
+                    .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   *nir_out = b.shader;
+   return context->create_fs_state(context, &state);
+}
+
 static bool
 run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                   struct pipe_resource *depth_resource)
 {
-   static const enum tgsi_semantic semantics[] = {
-      TGSI_SEMANTIC_POSITION, TGSI_SEMANTIC_COLOR,
-   };
-   static const unsigned semantic_indices[] = { 0, 0 };
    static const struct smoke_vertex vertices[] = {
       { { -1, -1, 0, 1 }, { 1, 0, 0, 1 } },
-      { {  1, -1, 0, 1 }, { 0, 1, 0, 1 } },
+      { { -1,  1, 0, 1 }, { 0, 1, 0, 1 } },
+      { {  1, -1, 0, 1 }, { 0, 0, 1, 1 } },
       { {  1,  1, 0, 1 }, { 0, 0, 1, 1 } },
    };
    static const struct smoke_vertex far_vertices[] = {
       { { -1, -1,  0.5, 1 }, { 0, 1, 0, 1 } },
+      { { -1,  1,  0.5, 1 }, { 0, 1, 0, 1 } },
       { {  1, -1,  0.5, 1 }, { 0, 1, 0, 1 } },
       { {  1,  1,  0.5, 1 }, { 0, 1, 0, 1 } },
    };
    static const struct smoke_vertex near_vertices[] = {
       { { -1, -1, -0.5, 1 }, { 1, 0, 0, 1 } },
+      { { -1,  1, -0.5, 1 }, { 1, 0, 0, 1 } },
       { {  1, -1, -0.5, 1 }, { 1, 0, 0, 1 } },
       { {  1,  1, -0.5, 1 }, { 1, 0, 0, 1 } },
    };
    static const struct smoke_vertex rejected_vertices[] = {
       { { -1, -1, 0, 1 }, { 0, 0, 1, 1 } },
+      { { -1,  1, 0, 1 }, { 0, 0, 1, 1 } },
       { {  1, -1, 0, 1 }, { 0, 0, 1, 1 } },
       { {  1,  1, 0, 1 }, { 0, 0, 1, 1 } },
    };
@@ -82,15 +138,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       .maxy = 129,
    };
    struct pipe_draw_info info = {
-      .mode = MESA_PRIM_TRIANGLES,
+      .mode = MESA_PRIM_QUAD_STRIP,
       .index_bounds_valid = true,
       .instance_count = 1,
       .min_index = 0,
-      .max_index = 2,
+      .max_index = 3,
    };
    struct pipe_draw_start_count_bias draw = {
       .start = 0,
-      .count = 3,
+      .count = 4,
    };
    union pipe_color_union clear_color = { 0 };
    struct chrome9_resource *surface = chrome9_resource(resource);
@@ -103,6 +159,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *elements_handle = NULL;
    void *vs = NULL;
    void *fs = NULL;
+   nir_shader *vs_nir = NULL;
+   nir_shader *fs_nir = NULL;
    bool passed = false;
 
    context = screen->context_create(screen, NULL, 0);
@@ -132,10 +190,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    elements[1].src_stride = sizeof(struct smoke_vertex);
    elements_handle = context->create_vertex_elements_state(context, 2,
                                                             elements);
-   vs = util_make_vertex_passthrough_shader(context, 2, semantics,
-                                             semantic_indices, false);
-   fs = util_make_fragment_passthrough_shader(context, TGSI_SEMANTIC_COLOR,
-                                               TGSI_INTERPOLATE_COLOR, false);
+   vs = make_ff_vertex_shader(screen, context, &vs_nir);
+   fs = make_ff_primary_color_fs(screen, context, &fs_nir);
    if (!blend_handle || !dsa_handle || !rasterizer_handle ||
        !elements_handle || !vs || !fs)
       goto out;
@@ -163,13 +219,16 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       context->set_vertex_buffers(context, 1, &vertex_buffer);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
    }
+   if (!context->flush_resource)
+      goto out;
+   context->flush_resource(context, resource);
    context->flush(context, NULL, 0);
 
    pixels = (uint32_t *)((uint8_t *)surface->bo.map + surface->data_offset);
    for (unsigned y = 0; y < resource->height0; y++)
       for (unsigned x = 0; x < resource->width0; x++)
          changed += pixels[(size_t)y * surface->stride / 4 + x] != 0;
-   passed = changed >= 12000 && changed <= 20000;
+   passed = changed >= 30000 && changed <= 257U * 129U;
    if (depth_resource) {
       struct chrome9_resource *depth = chrome9_resource(depth_resource);
       uint16_t *depth_pixels = (uint16_t *)
@@ -183,23 +242,25 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    }
    if (!passed)
       fprintf(stderr,
-              "Gallium triangle coverage/depth mismatch: %zu sample=%08x/%04x\n",
+              "Gallium quad-strip coverage/depth mismatch: %zu sample=%08x/%04x\n",
               changed, pixels[32 * (surface->stride / 4) + 192],
               sample_depth);
    else if (depth_resource)
-      printf("Gallium D16 LESS/write passed: changed=%zu sample=%08x/%04x\n",
+      printf("Gallium D16 quad strip passed: changed=%zu sample=%08x/%04x\n",
              changed, pixels[32 * (surface->stride / 4) + 192],
              sample_depth);
    else
-      printf("Gallium draw/vbuf triangle passed: changed=%zu sample=%08x\n",
+      printf("Gallium draw/vbuf quad strip passed: changed=%zu sample=%08x\n",
              changed, pixels[32 * (surface->stride / 4) + 192]);
 
 out:
    if (context) {
       if (vs)
          context->delete_vs_state(context, vs);
+      ralloc_free(vs_nir);
       if (fs)
          context->delete_fs_state(context, fs);
+      ralloc_free(fs_nir);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (rasterizer_handle)
@@ -266,6 +327,23 @@ main(int argc, char **argv)
    if (!screen) {
       fputs("chrome9_screen_create failed\n", stderr);
       return 1;
+   }
+   if (!screen->fence_reference || !screen->fence_finish ||
+       !screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers ||
+       !screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views) {
+      fprintf(stderr, "Gallium GL/DRI callback or sampler caps missing\n");
+      screen->destroy(screen);
+      return 1;
+   }
+   {
+      struct pipe_fence_handle *fence = NULL;
+
+      screen->fence_reference(screen, &fence, NULL);
+      if (fence || !screen->fence_finish(screen, NULL, NULL, 0)) {
+         fprintf(stderr, "Gallium synchronous fence contract failed\n");
+         screen->destroy(screen);
+         return 1;
+      }
    }
 
    printf("name: %s\nvendor: %s\ndevice vendor: %s\n",

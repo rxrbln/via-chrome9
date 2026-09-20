@@ -816,6 +816,18 @@ chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 }
 
 static void
+chrome9_flush_resource(struct pipe_context *pipe,
+                       struct pipe_resource *resource)
+{
+   (void)resource;
+   /*
+    * Rendering is synchronous, but an imported DRI3 render target may use a
+    * guarded shadow.  Presenting it still requires the shadow copy-back.
+    */
+   chrome9_flush_render_target(chrome9_context(pipe));
+}
+
+static void
 chrome9_set_blend_color(struct pipe_context *pipe,
                         const struct pipe_blend_color *color)
 {
@@ -888,6 +900,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.priv = priv;
    ctx->base.destroy = chrome9_context_destroy;
    ctx->base.flush = chrome9_flush;
+   ctx->base.flush_resource = chrome9_flush_resource;
    ctx->base.draw_vbo = chrome9_draw_vbo;
    ctx->base.clear = chrome9_clear;
    ctx->base.clear_render_target = chrome9_clear_render_target;

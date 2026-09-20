@@ -24,7 +24,7 @@ chrome9_screen_smoke = executable(
   'chrome9-screen-smoke',
   'chrome9_screen_smoke.c',
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
-  dependencies : [dep_libdrm, idep_mesautil],
+  dependencies : [dep_libdrm, idep_mesautil, idep_nir],
   link_with : [libchrome9, libgallium],
   install : false,
 )

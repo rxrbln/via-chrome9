@@ -73,6 +73,28 @@ chrome9_screen_destroy(struct pipe_screen *screen)
    FREE(cscreen);
 }
 
+static void
+chrome9_fence_reference(struct pipe_screen *screen,
+                        struct pipe_fence_handle **ptr,
+                        struct pipe_fence_handle *fence)
+{
+   (void)screen;
+   (void)fence;
+   /* DRAW_TRIANGLE completes synchronously, so the driver never emits a fence. */
+   *ptr = NULL;
+}
+
+static bool
+chrome9_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
+                     struct pipe_fence_handle *fence, uint64_t timeout)
+{
+   (void)screen;
+   (void)ctx;
+   (void)fence;
+   (void)timeout;
+   return true;
+}
+
 static const struct nir_shader_compiler_options chrome9_nir_options = {
    .lower_fdiv = true,
    .lower_flrp32 = true,
@@ -98,6 +120,9 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
    fs->max_inputs = 2;
    fs->max_outputs = 1;
    fs->max_temps = 8;
+   /* Mesa's compatibility context requires at least one logical unit. */
+   fs->max_texture_samplers = 1;
+   fs->max_sampler_views = 1;
 }
 
 struct pipe_screen *
@@ -156,6 +181,8 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    screen->base.get_name = chrome9_screen_name;
    screen->base.get_vendor = chrome9_screen_vendor;
    screen->base.get_device_vendor = chrome9_device_vendor;
+   screen->base.fence_reference = chrome9_fence_reference;
+   screen->base.fence_finish = chrome9_fence_finish;
    screen->base.context_create = chrome9_context_create;
    chrome9_init_screen_resource_functions(&screen->base);
    return &screen->base;
