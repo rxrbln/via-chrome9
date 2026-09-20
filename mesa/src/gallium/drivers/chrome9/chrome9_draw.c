@@ -1,0 +1,393 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright 2026 Chrome9 contributors */
+
+#include "chrome9_draw.h"
+
+#include "chrome9_context.h"
+#include "chrome9_drm.h"
+#include "chrome9_resource.h"
+
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "draw/draw_context.h"
+#include "draw/draw_vbuf.h"
+#include "draw/draw_vertex.h"
+#include "pipe/p_screen.h"
+#include "pipe/p_shader_tokens.h"
+#include "util/u_math.h"
+#include "util/u_memory.h"
+#include "util/u_prim.h"
+
+struct chrome9_vbuf_render {
+   struct vbuf_render base;
+   struct chrome9_context *ctx;
+   struct vertex_info vinfo;
+   enum mesa_prim prim;
+   uint8_t *vertices;
+   size_t capacity;
+   uint16_t vertex_size;
+   uint16_t vertex_count;
+   bool layout_valid;
+};
+
+static inline struct chrome9_vbuf_render *
+chrome9_vbuf_render(struct vbuf_render *render)
+{
+   return (struct chrome9_vbuf_render *)render;
+}
+
+static bool
+chrome9_vbuf_need_pipeline(const struct vbuf_render *render,
+                           const struct pipe_rasterizer_state *rasterizer,
+                           unsigned prim)
+{
+   (void)render;
+   (void)rasterizer;
+   (void)prim;
+   /* The kernel ABI accepts triangles only.  This also makes draw perform
+    * clipping, culling, flat-shade fixup and primitive decomposition. */
+   return true;
+}
+
+static const struct vertex_info *
+chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   int position, color0, color1;
+
+   position = draw_find_shader_output(crender->ctx->draw,
+                                      TGSI_SEMANTIC_POSITION, 0);
+   color0 = draw_find_shader_output(crender->ctx->draw,
+                                    TGSI_SEMANTIC_COLOR, 0);
+   color1 = draw_find_shader_output(crender->ctx->draw,
+                                    TGSI_SEMANTIC_COLOR, 1);
+   memset(&crender->vinfo, 0, sizeof(crender->vinfo));
+   draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, position);
+   draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color0);
+   draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
+   draw_compute_vertex_size(&crender->vinfo);
+   crender->layout_valid = position >= 0 && color0 >= 0 &&
+                           crender->vinfo.size == 6;
+   return &crender->vinfo;
+}
+
+static bool
+chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
+                               uint16_t vertex_size, uint16_t nr_vertices)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   size_t size;
+
+   if (vertex_size != 6 * sizeof(uint32_t))
+      return false;
+   size = (size_t)vertex_size * nr_vertices;
+
+   FREE(crender->vertices);
+   crender->vertices = size ? MALLOC(size) : NULL;
+   if (size && !crender->vertices) {
+      crender->capacity = 0;
+      return false;
+   }
+   crender->capacity = size;
+   crender->vertex_size = vertex_size;
+   crender->vertex_count = nr_vertices;
+   return true;
+}
+
+static void *
+chrome9_vbuf_map_vertices(struct vbuf_render *render)
+{
+   return chrome9_vbuf_render(render)->vertices;
+}
+
+static void
+chrome9_vbuf_unmap_vertices(struct vbuf_render *render, uint16_t min_index,
+                            uint16_t max_index)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+
+   if (min_index > max_index || max_index >= crender->vertex_count)
+      crender->layout_valid = false;
+}
+
+static void
+chrome9_vbuf_set_primitive(struct vbuf_render *render, enum mesa_prim prim)
+{
+   chrome9_vbuf_render(render)->prim = prim;
+}
+
+static int32_t
+chrome9_coord_16_16(float value, unsigned extent)
+{
+   const double minimum = -0.5;
+   const double maximum = (double)extent - 0.5;
+   double scaled;
+
+   if (!isfinite(value))
+      value = 0.0f;
+   value = CLAMP((double)value, minimum, maximum);
+   scaled = value * 65536.0;
+   return scaled < 0.0 ? (int32_t)(scaled - 0.5) :
+                         (int32_t)(scaled + 0.5);
+}
+
+static bool
+chrome9_draw_state_supported(struct chrome9_context *ctx,
+                             struct chrome9_resource **target)
+{
+   struct pipe_resource *resource;
+
+   if (!ctx->vs || !ctx->fs || !ctx->fs->supported ||
+       !(*target = chrome9_context_render_target(ctx)))
+      return false;
+   resource = &(*target)->base;
+   if (resource->target != PIPE_TEXTURE_2D ||
+       resource->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       !(*target)->guarded || !(*target)->bo.handle)
+      return false;
+
+   /* These semantics are not fields of DRAW_TRIANGLE.  Refuse rather than
+    * silently producing pixels with different API state. */
+   if (ctx->blend && ctx->blend->rt[0].blend_enable)
+      return false;
+   if (ctx->blend &&
+       (ctx->blend->logicop_enable ||
+        ctx->blend->rt[0].colormask != PIPE_MASK_RGBA))
+      return false;
+   if (ctx->dsa && (ctx->dsa->depth_enabled ||
+                    ctx->dsa->stencil[0].enabled ||
+                    ctx->dsa->stencil[1].enabled ||
+                    ctx->dsa->alpha_enabled))
+      return false;
+   if (ctx->rasterizer && ctx->rasterizer->scissor && ctx->scissor_valid &&
+       (ctx->scissor.minx || ctx->scissor.miny ||
+        ctx->scissor.maxx < resource->width0 ||
+        ctx->scissor.maxy < resource->height0))
+      return false;
+   return true;
+}
+
+static void
+chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
+                      unsigned ia, unsigned ib, unsigned ic)
+{
+   struct chrome9_context *ctx = crender->ctx;
+   struct chrome9_resource *target;
+   struct drm_chrome9_draw_triangle args = { 0 };
+   const unsigned indices[3] = { ia, ib, ic };
+
+   if (!crender->layout_valid || !chrome9_draw_state_supported(ctx, &target)) {
+      ctx->rejected_triangles++;
+      if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
+         fprintf(stderr, "chrome9: triangle rejected by the bounded "
+                         "color-only draw state\n");
+         ctx->warnings |= CHROME9_WARN_DRAW_STATE;
+      }
+      return;
+   }
+   for (unsigned i = 0; i < 3; i++) {
+      const uint8_t *vertex;
+      const float *position;
+      uint32_t color;
+
+      if (indices[i] >= crender->vertex_count ||
+          (size_t)(indices[i] + 1) * crender->vertex_size >
+          crender->capacity) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      vertex = crender->vertices + (size_t)indices[i] * crender->vertex_size;
+      position = (const float *)vertex;
+      if (!isfinite(position[0]) || !isfinite(position[1])) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
+      args.vertices[i].x_16_16 =
+         chrome9_coord_16_16(position[0], target->base.width0);
+      args.vertices[i].y_16_16 =
+         chrome9_coord_16_16(position[1], target->base.height0);
+      args.vertices[i].color = color;
+   }
+
+   args.destination_handle = target->bo.handle;
+   args.width = target->base.width0;
+   args.height = target->base.height0;
+   args.pitch = target->stride;
+   if (chrome9_draw_triangle(ctx->base.screen->get_screen_fd(ctx->base.screen),
+                             &args)) {
+      ctx->submitted_triangles++;
+      chrome9_context_render_target_written(ctx);
+   } else {
+      ctx->rejected_triangles++;
+      if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
+         fprintf(stderr,
+                 "chrome9: DRAW_TRIANGLE failed: %s target=%ux%u/%u "
+                 "v=(%d,%d),(%d,%d),(%d,%d)\n",
+                 strerror(errno), args.width, args.height, args.pitch,
+                 args.vertices[0].x_16_16, args.vertices[0].y_16_16,
+                 args.vertices[1].x_16_16, args.vertices[1].y_16_16,
+                 args.vertices[2].x_16_16, args.vertices[2].y_16_16);
+         ctx->warnings |= CHROME9_WARN_SUBMIT;
+      }
+   }
+}
+
+static void
+chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
+                         unsigned nr)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   unsigned end;
+
+   if (start > crender->vertex_count || nr > crender->vertex_count - start)
+      return;
+   end = start + nr;
+   switch (crender->prim) {
+   case MESA_PRIM_TRIANGLES:
+      for (unsigned i = start; i + 2 < end; i += 3)
+         chrome9_emit_triangle(crender, i, i + 1, i + 2);
+      break;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      for (unsigned i = start; i + 2 < end; i++)
+         if ((i - start) & 1)
+            chrome9_emit_triangle(crender, i + 1, i, i + 2);
+         else
+            chrome9_emit_triangle(crender, i, i + 1, i + 2);
+      break;
+   case MESA_PRIM_TRIANGLE_FAN:
+   case MESA_PRIM_POLYGON:
+      for (unsigned i = start + 1; i + 1 < end; i++)
+         chrome9_emit_triangle(crender, start, i, i + 1);
+      break;
+   case MESA_PRIM_QUADS:
+      for (unsigned i = start; i + 3 < end; i += 4) {
+         chrome9_emit_triangle(crender, i, i + 1, i + 3);
+         chrome9_emit_triangle(crender, i + 1, i + 2, i + 3);
+      }
+      break;
+   case MESA_PRIM_QUAD_STRIP:
+      for (unsigned i = start; i + 3 < end; i += 2) {
+         chrome9_emit_triangle(crender, i, i + 1, i + 3);
+         chrome9_emit_triangle(crender, i, i + 3, i + 2);
+      }
+      break;
+   default:
+      crender->ctx->rejected_triangles++;
+      break;
+   }
+}
+
+static void
+chrome9_vbuf_draw_elements(struct vbuf_render *render,
+                           const uint16_t *indices, unsigned nr_indices)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+
+   if (!indices)
+      return;
+   switch (crender->prim) {
+   case MESA_PRIM_TRIANGLES:
+      for (unsigned i = 0; i + 2 < nr_indices; i += 3)
+         chrome9_emit_triangle(crender, indices[i], indices[i + 1],
+                               indices[i + 2]);
+      break;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      for (unsigned i = 0; i + 2 < nr_indices; i++)
+         if (i & 1)
+            chrome9_emit_triangle(crender, indices[i + 1], indices[i],
+                                  indices[i + 2]);
+         else
+            chrome9_emit_triangle(crender, indices[i], indices[i + 1],
+                                  indices[i + 2]);
+      break;
+   case MESA_PRIM_TRIANGLE_FAN:
+   case MESA_PRIM_POLYGON:
+      for (unsigned i = 1; i + 1 < nr_indices; i++)
+         chrome9_emit_triangle(crender, indices[0], indices[i],
+                               indices[i + 1]);
+      break;
+   case MESA_PRIM_QUADS:
+      for (unsigned i = 0; i + 3 < nr_indices; i += 4) {
+         chrome9_emit_triangle(crender, indices[i], indices[i + 1],
+                               indices[i + 3]);
+         chrome9_emit_triangle(crender, indices[i + 1], indices[i + 2],
+                               indices[i + 3]);
+      }
+      break;
+   case MESA_PRIM_QUAD_STRIP:
+      for (unsigned i = 0; i + 3 < nr_indices; i += 2) {
+         chrome9_emit_triangle(crender, indices[i], indices[i + 1],
+                               indices[i + 3]);
+         chrome9_emit_triangle(crender, indices[i], indices[i + 3],
+                               indices[i + 2]);
+      }
+      break;
+   default:
+      crender->ctx->rejected_triangles++;
+      break;
+   }
+}
+
+static void
+chrome9_vbuf_release_vertices(struct vbuf_render *render)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+
+   FREE(crender->vertices);
+   crender->vertices = NULL;
+   crender->capacity = 0;
+   crender->vertex_count = 0;
+}
+
+static void
+chrome9_vbuf_destroy(struct vbuf_render *render)
+{
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+
+   FREE(crender->vertices);
+   FREE(crender);
+}
+
+static struct vbuf_render *
+chrome9_vbuf_create(struct chrome9_context *ctx)
+{
+   struct chrome9_vbuf_render *render = CALLOC_STRUCT(chrome9_vbuf_render);
+
+   if (!render)
+      return NULL;
+   render->ctx = ctx;
+   render->base.max_indices = UINT16_MAX;
+   render->base.max_vertex_buffer_bytes = UINT16_MAX * 6 * sizeof(uint32_t);
+   render->base.need_pipeline = chrome9_vbuf_need_pipeline;
+   render->base.get_vertex_info = chrome9_vbuf_get_vertex_info;
+   render->base.allocate_vertices = chrome9_vbuf_allocate_vertices;
+   render->base.map_vertices = chrome9_vbuf_map_vertices;
+   render->base.unmap_vertices = chrome9_vbuf_unmap_vertices;
+   render->base.set_primitive = chrome9_vbuf_set_primitive;
+   render->base.draw_elements = chrome9_vbuf_draw_elements;
+   render->base.draw_arrays = chrome9_vbuf_draw_arrays;
+   render->base.release_vertices = chrome9_vbuf_release_vertices;
+   render->base.destroy = chrome9_vbuf_destroy;
+   return &render->base;
+}
+
+struct draw_stage *
+chrome9_draw_vbuf_stage(struct chrome9_context *ctx)
+{
+   struct vbuf_render *render = chrome9_vbuf_create(ctx);
+   struct draw_stage *stage;
+
+   if (!render)
+      return NULL;
+   stage = draw_vbuf_stage(ctx->draw, render);
+   if (!stage) {
+      render->destroy(render);
+      return NULL;
+   }
+   draw_set_render(ctx->draw, render);
+   return stage;
+}

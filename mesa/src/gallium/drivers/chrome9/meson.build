@@ -3,9 +3,15 @@
 
 libchrome9 = static_library(
   'chrome9',
-  files('chrome9_drm.c', 'chrome9_resource.c', 'chrome9_screen.c'),
+  files(
+    'chrome9_context.c',
+    'chrome9_draw.c',
+    'chrome9_drm.c',
+    'chrome9_resource.c',
+    'chrome9_screen.c',
+  ),
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
-  dependencies : [dep_libdrm, idep_mesautil],
+  dependencies : [dep_libdrm, idep_nir, idep_mesautil],
   gnu_symbol_visibility : 'hidden',
 )
 

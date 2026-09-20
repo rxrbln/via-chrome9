@@ -6,6 +6,8 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include "drm-uapi/drm_fourcc.h"
+#include "frontend/winsys_handle.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "util/u_inlines.h"
@@ -67,9 +69,13 @@ chrome9_is_format_supported(struct pipe_screen *screen,
                             unsigned storage_sample_count,
                             unsigned bindings)
 {
-   const unsigned buffer_bindings = PIPE_BIND_CUSTOM | PIPE_BIND_LINEAR;
-   const unsigned surface_bindings = PIPE_BIND_RENDER_TARGET |
-                                     PIPE_BIND_LINEAR;
+   const unsigned buffer_bindings =
+      PIPE_BIND_CUSTOM | PIPE_BIND_LINEAR | PIPE_BIND_VERTEX_BUFFER |
+      PIPE_BIND_INDEX_BUFFER | PIPE_BIND_CONSTANT_BUFFER |
+      PIPE_BIND_VERTEX_STATE;
+   const unsigned surface_bindings =
+      PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
+      PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
 
    (void)screen;
    if (sample_count > 1 || storage_sample_count > 1)
@@ -125,6 +131,80 @@ chrome9_resource_create(struct pipe_screen *screen,
 fail:
    FREE(resource);
    return NULL;
+}
+
+static struct pipe_resource *
+chrome9_resource_from_handle(struct pipe_screen *screen,
+                             const struct pipe_resource *templ,
+                             struct winsys_handle *whandle, unsigned usage)
+{
+   struct chrome9_resource *resource;
+   uint64_t allocation_size;
+   uint64_t data_offset;
+   uint64_t data_size;
+   uint32_t native_stride;
+   bool guarded;
+   int fd;
+
+   (void)usage;
+   if (!whandle || whandle->type != WINSYS_HANDLE_TYPE_FD ||
+       (whandle->modifier != DRM_FORMAT_MOD_LINEAR &&
+        whandle->modifier != DRM_FORMAT_MOD_INVALID) ||
+       !chrome9_resource_layout(templ, &native_stride, &data_offset,
+                                &data_size, &allocation_size, &guarded) ||
+       templ->target == PIPE_BUFFER || whandle->stride < templ->width0 * 4 ||
+       whandle->stride > 16352 || (whandle->stride & 31))
+      return NULL;
+
+   resource = CALLOC_STRUCT(chrome9_resource);
+   if (!resource)
+      return NULL;
+   fd = screen->get_screen_fd(screen);
+   if (fd < 0 || !chrome9_bo_import_fd(fd, whandle->handle, &resource->bo))
+      goto fail;
+   data_size = (uint64_t)whandle->stride * templ->height0;
+   if (whandle->offset > resource->bo.size ||
+       data_size > resource->bo.size - whandle->offset)
+      goto fail_bo;
+
+   resource->base = *templ;
+   resource->base.screen = screen;
+   pipe_reference_init(&resource->base.reference, 1);
+   resource->stride = whandle->stride;
+   resource->data_offset = whandle->offset;
+   resource->data_size = data_size;
+   resource->guarded = false;
+   return &resource->base;
+
+fail_bo:
+   chrome9_bo_destroy(fd, &resource->bo);
+fail:
+   FREE(resource);
+   return NULL;
+}
+
+static bool
+chrome9_resource_get_handle(struct pipe_screen *screen,
+                            struct pipe_context *context,
+                            struct pipe_resource *pres,
+                            struct winsys_handle *whandle, unsigned usage)
+{
+   struct chrome9_resource *resource = chrome9_resource(pres);
+   int prime_fd;
+
+   (void)context;
+   (void)usage;
+   if (!whandle || pres->target == PIPE_BUFFER || whandle->plane ||
+       whandle->layer || whandle->type != WINSYS_HANDLE_TYPE_FD ||
+       !chrome9_bo_export_fd(screen->get_screen_fd(screen), &resource->bo,
+                             &prime_fd))
+      return false;
+
+   whandle->handle = prime_fd;
+   whandle->stride = resource->stride;
+   whandle->offset = resource->data_offset;
+   whandle->modifier = DRM_FORMAT_MOD_LINEAR;
+   return true;
 }
 
 void
@@ -208,6 +288,8 @@ chrome9_init_screen_resource_functions(struct pipe_screen *screen)
    screen->is_format_supported = chrome9_is_format_supported;
    screen->can_create_resource = chrome9_can_create_resource;
    screen->resource_create = chrome9_resource_create;
+   screen->resource_from_handle = chrome9_resource_from_handle;
+   screen->resource_get_handle = chrome9_resource_get_handle;
    screen->resource_destroy = chrome9_resource_destroy;
 }
 

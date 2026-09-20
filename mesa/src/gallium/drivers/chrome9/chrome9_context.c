@@ -1,0 +1,892 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright 2026 Chrome9 contributors */
+
+#include "chrome9_context.h"
+
+#include "chrome9_draw.h"
+#include "chrome9_drm.h"
+#include "chrome9_resource.h"
+
+#include <stdio.h>
+
+#include "draw/draw_context.h"
+#include "nir.h"
+#include "tgsi/tgsi_parse.h"
+#include "util/u_draw.h"
+#include "util/u_debug_cb.h"
+#include "util/u_framebuffer.h"
+#include "util/u_helpers.h"
+#include "util/u_inlines.h"
+#include "util/u_memory.h"
+#include "util/u_pack_color.h"
+#include "util/u_surface.h"
+#include "util/u_upload_mgr.h"
+
+static void
+chrome9_copy_surface(struct pipe_resource *destination,
+                     struct pipe_resource *source)
+{
+   struct chrome9_resource *dst = chrome9_resource(destination);
+   struct chrome9_resource *src = chrome9_resource(source);
+   unsigned width = MIN2(destination->width0, source->width0) * 4;
+   unsigned height = MIN2(destination->height0, source->height0);
+   uint8_t *dst_map = (uint8_t *)dst->bo.map + dst->data_offset;
+   const uint8_t *src_map = (const uint8_t *)src->bo.map + src->data_offset;
+
+   for (unsigned y = 0; y < height; y++)
+      memcpy(dst_map + (size_t)y * dst->stride,
+             src_map + (size_t)y * src->stride, width);
+}
+
+static void
+chrome9_flush_render_target(struct chrome9_context *ctx)
+{
+   struct pipe_resource *external;
+
+   if (!ctx->render_target_dirty || !ctx->render_target ||
+       !ctx->framebuffer.nr_cbufs ||
+       !(external = ctx->framebuffer.cbufs[0].texture))
+      return;
+   if (external != ctx->render_target)
+      chrome9_copy_surface(external, ctx->render_target);
+   ctx->render_target_dirty = false;
+}
+
+struct chrome9_resource *
+chrome9_context_render_target(struct chrome9_context *ctx)
+{
+   return ctx->render_target ? chrome9_resource(ctx->render_target) : NULL;
+}
+
+void
+chrome9_context_render_target_written(struct chrome9_context *ctx)
+{
+   ctx->render_target_dirty = true;
+}
+
+static void
+chrome9_warn_once(struct chrome9_context *ctx, uint32_t warning,
+                  const char *message)
+{
+   if (ctx->warnings & warning)
+      return;
+   ctx->warnings |= warning;
+   fprintf(stderr, "chrome9: %s\n", message);
+}
+
+static void *
+chrome9_dup_state(const void *state, size_t size)
+{
+   void *copy = MALLOC(size);
+
+   if (copy)
+      memcpy(copy, state, size);
+   return copy;
+}
+
+static void *
+chrome9_create_blend_state(struct pipe_context *pipe,
+                           const struct pipe_blend_state *state)
+{
+   (void)pipe;
+   return chrome9_dup_state(state, sizeof(*state));
+}
+
+static void
+chrome9_bind_blend_state(struct pipe_context *pipe, void *state)
+{
+   chrome9_context(pipe)->blend = state;
+}
+
+static void *
+chrome9_create_dsa_state(struct pipe_context *pipe,
+                         const struct pipe_depth_stencil_alpha_state *state)
+{
+   (void)pipe;
+   return chrome9_dup_state(state, sizeof(*state));
+}
+
+static void
+chrome9_bind_dsa_state(struct pipe_context *pipe, void *state)
+{
+   chrome9_context(pipe)->dsa = state;
+}
+
+static void *
+chrome9_create_rasterizer_state(struct pipe_context *pipe,
+                                const struct pipe_rasterizer_state *state)
+{
+   (void)pipe;
+   return chrome9_dup_state(state, sizeof(*state));
+}
+
+static void
+chrome9_bind_rasterizer_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   ctx->rasterizer = state;
+   draw_set_rasterizer_state(ctx->draw, state, state);
+}
+
+static void *
+chrome9_create_sampler_state(struct pipe_context *pipe,
+                             const struct pipe_sampler_state *state)
+{
+   (void)pipe;
+   return chrome9_dup_state(state, sizeof(*state));
+}
+
+static void
+chrome9_bind_sampler_states(struct pipe_context *pipe,
+                            mesa_shader_stage shader, unsigned start,
+                            unsigned count, void **states)
+{
+   (void)pipe;
+   (void)shader;
+   (void)start;
+   (void)count;
+   (void)states;
+}
+
+static void
+chrome9_delete_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   if (ctx->blend == state)
+      ctx->blend = NULL;
+   if (ctx->dsa == state)
+      ctx->dsa = NULL;
+   if (ctx->rasterizer == state)
+      ctx->rasterizer = NULL;
+   FREE(state);
+}
+
+static void *
+chrome9_create_vs_state(struct pipe_context *pipe,
+                        const struct pipe_shader_state *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_shader *shader = CALLOC_STRUCT(chrome9_shader);
+
+   if (!shader)
+      return NULL;
+   shader->draw = draw_create_vertex_shader(ctx->draw, state);
+   shader->supported = shader->draw != NULL;
+   if (!shader->draw) {
+      FREE(shader);
+      return NULL;
+   }
+   return shader;
+}
+
+static void
+chrome9_bind_vs_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_shader *shader = state;
+
+   ctx->vs = shader;
+   draw_bind_vertex_shader(ctx->draw, shader ? shader->draw : NULL);
+}
+
+static void
+chrome9_delete_vs_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_shader *shader = state;
+
+   if (!shader)
+      return;
+   if (ctx->vs == shader) {
+      ctx->vs = NULL;
+      draw_bind_vertex_shader(ctx->draw, NULL);
+   }
+   draw_delete_vertex_shader(ctx->draw, shader->draw);
+   FREE(shader);
+}
+
+/* The known Chrome9 pixel program is MOV oC0, v0.  Only accept the NIR form
+ * whose sole result is the unmodified primary color; accepting arbitrary NIR
+ * here would silently execute different fragment semantics. */
+static bool
+chrome9_fs_is_primary_color(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 4)
+      return false;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      nir_variable *var;
+
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_input:
+      case nir_intrinsic_load_interpolated_input:
+         return nir_intrinsic_io_semantics(intr).location ==
+                   VARYING_SLOT_COL0 &&
+                !nir_intrinsic_component(intr);
+      case nir_intrinsic_load_deref:
+         var = nir_intrinsic_get_var(intr, 0);
+         return var && var->data.mode == nir_var_shader_in &&
+                var->data.location == VARYING_SLOT_COL0;
+      default:
+         return false;
+      }
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[0].swizzle[c] != c)
+               return false;
+         return chrome9_fs_is_primary_color(alu->src[0].src.ssa, depth + 1);
+      }
+      if (alu->op == nir_op_vec4) {
+         nir_def *source = alu->src[0].src.ssa;
+
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[c].src.ssa != source ||
+                alu->src[c].swizzle[0] != c)
+               return false;
+         return chrome9_fs_is_primary_color(source, depth + 1);
+      }
+   }
+   return false;
+}
+
+static bool
+chrome9_fs_passthrough(nir_shader *nir)
+{
+   bool written = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *intr;
+            nir_variable *var;
+            unsigned location;
+
+            if (instr->type == nir_instr_type_deref ||
+                instr->type == nir_instr_type_load_const ||
+                instr->type == nir_instr_type_alu)
+               continue;
+            if (instr->type != nir_instr_type_intrinsic)
+               return false;
+            intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_input:
+            case nir_intrinsic_load_interpolated_input:
+            case nir_intrinsic_load_barycentric_pixel:
+            case nir_intrinsic_load_barycentric_centroid:
+            case nir_intrinsic_load_barycentric_sample:
+            case nir_intrinsic_load_deref:
+               break;
+            case nir_intrinsic_store_output:
+               location = nir_intrinsic_io_semantics(intr).location;
+               if ((location != FRAG_RESULT_COLOR &&
+                    location != FRAG_RESULT_DATA0) ||
+                   !chrome9_fs_is_primary_color(intr->src[0].ssa, 0))
+                  return false;
+               written = true;
+               break;
+            case nir_intrinsic_store_deref:
+               var = nir_intrinsic_get_var(intr, 0);
+               if (!var || var->data.mode != nir_var_shader_out ||
+                   (var->data.location != FRAG_RESULT_COLOR &&
+                    var->data.location != FRAG_RESULT_DATA0) ||
+                   !chrome9_fs_is_primary_color(intr->src[1].ssa, 0))
+                  return false;
+               written = true;
+               break;
+            default:
+               return false;
+            }
+         }
+      }
+   }
+   return written;
+}
+
+static bool
+chrome9_tgsi_fs_passthrough(const struct tgsi_token *tokens)
+{
+   struct tgsi_parse_context parse;
+   int input = -1, output = -1;
+   unsigned moves = 0;
+   bool valid = tokens && tgsi_parse_init(&parse, tokens) == TGSI_PARSE_OK;
+
+   if (!valid)
+      return false;
+   while (!tgsi_parse_end_of_tokens(&parse) && valid) {
+      const union tgsi_full_token *token;
+
+      tgsi_parse_token(&parse);
+      token = &parse.FullToken;
+      switch (token->Token.Type) {
+      case TGSI_TOKEN_TYPE_DECLARATION: {
+         const struct tgsi_full_declaration *decl = &token->FullDeclaration;
+
+         if (decl->Declaration.File == TGSI_FILE_INPUT &&
+             decl->Declaration.Semantic &&
+             decl->Semantic.Name == TGSI_SEMANTIC_COLOR &&
+             decl->Semantic.Index == 0 &&
+             decl->Range.First == decl->Range.Last)
+            input = decl->Range.First;
+         else if (decl->Declaration.File == TGSI_FILE_OUTPUT &&
+                  decl->Declaration.Semantic &&
+                  decl->Semantic.Name == TGSI_SEMANTIC_COLOR &&
+                  decl->Semantic.Index == 0 &&
+                  decl->Range.First == decl->Range.Last)
+            output = decl->Range.First;
+         else if (decl->Declaration.File != TGSI_FILE_INPUT &&
+                  decl->Declaration.File != TGSI_FILE_OUTPUT)
+            valid = false;
+         break;
+      }
+      case TGSI_TOKEN_TYPE_INSTRUCTION: {
+         const struct tgsi_full_instruction *inst = &token->FullInstruction;
+         const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+         const struct tgsi_src_register *src = &inst->Src[0].Register;
+
+         if (inst->Instruction.Opcode == TGSI_OPCODE_END)
+            break;
+         if (inst->Instruction.Opcode != TGSI_OPCODE_MOV || moves++ ||
+             inst->Instruction.NumDstRegs != 1 ||
+             inst->Instruction.NumSrcRegs != 1 ||
+             dst->File != TGSI_FILE_OUTPUT || dst->Index != output ||
+             dst->WriteMask != TGSI_WRITEMASK_XYZW || dst->Indirect ||
+             src->File != TGSI_FILE_INPUT || src->Index != input ||
+             src->Indirect || src->Negate || src->Absolute ||
+             src->SwizzleX != TGSI_SWIZZLE_X ||
+             src->SwizzleY != TGSI_SWIZZLE_Y ||
+             src->SwizzleZ != TGSI_SWIZZLE_Z ||
+             src->SwizzleW != TGSI_SWIZZLE_W)
+            valid = false;
+         break;
+      }
+      case TGSI_TOKEN_TYPE_PROPERTY:
+         break;
+      default:
+         valid = false;
+         break;
+      }
+   }
+   tgsi_parse_free(&parse);
+   return valid && input >= 0 && output >= 0 && moves == 1;
+}
+
+static void *
+chrome9_create_fs_state(struct pipe_context *pipe,
+                        const struct pipe_shader_state *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_shader *shader = CALLOC_STRUCT(chrome9_shader);
+
+   if (!shader)
+      return NULL;
+   shader->draw = draw_create_fragment_shader(ctx->draw, state);
+   if (!shader->draw) {
+      FREE(shader);
+      return NULL;
+   }
+   if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
+      shader->nir = state->ir.nir;
+      shader->supported = chrome9_fs_passthrough(state->ir.nir);
+   } else if (state->type == PIPE_SHADER_IR_TGSI)
+      shader->supported = chrome9_tgsi_fs_passthrough(state->tokens);
+   return shader;
+}
+
+static void
+chrome9_bind_fs_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_shader *shader = state;
+
+   ctx->fs = shader;
+   draw_bind_fragment_shader(ctx->draw, shader ? shader->draw : NULL);
+}
+
+static void
+chrome9_delete_fs_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_shader *shader = state;
+
+   if (!shader)
+      return;
+   if (ctx->fs == shader) {
+      ctx->fs = NULL;
+      draw_bind_fragment_shader(ctx->draw, NULL);
+   }
+   draw_delete_fragment_shader(ctx->draw, shader->draw);
+   ralloc_free(shader->nir);
+   FREE(shader);
+}
+
+static void *
+chrome9_create_vertex_elements_state(struct pipe_context *pipe,
+                                     unsigned count,
+                                     const struct pipe_vertex_element *elements)
+{
+   struct chrome9_vertex_elements *state;
+
+   (void)pipe;
+   if (count > PIPE_MAX_ATTRIBS)
+      return NULL;
+   state = CALLOC_STRUCT(chrome9_vertex_elements);
+   if (!state)
+      return NULL;
+   state->count = count;
+   memcpy(state->elements, elements, count * sizeof(*elements));
+   return state;
+}
+
+static void
+chrome9_bind_vertex_elements_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct chrome9_vertex_elements *elements = state;
+
+   ctx->vertex_elements = elements;
+   draw_set_vertex_elements(ctx->draw, elements ? elements->count : 0,
+                            elements ? elements->elements : NULL);
+}
+
+static void
+chrome9_delete_vertex_elements_state(struct pipe_context *pipe, void *state)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   if (ctx->vertex_elements == state)
+      ctx->vertex_elements = NULL;
+   FREE(state);
+}
+
+static void
+chrome9_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
+                           const struct pipe_vertex_buffer *buffers)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   util_set_vertex_buffers_count(ctx->vertex_buffers,
+                                 &ctx->num_vertex_buffers, buffers, count);
+   draw_set_vertex_buffers(ctx->draw, count, buffers);
+}
+
+static void
+chrome9_set_constant_buffer(struct pipe_context *pipe,
+                            mesa_shader_stage shader, unsigned index,
+                            const struct pipe_constant_buffer *buffer)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   if (shader == MESA_SHADER_VERTEX && index < PIPE_MAX_CONSTANT_BUFFERS)
+      util_copy_constant_buffer(&ctx->vs_constants[index], buffer);
+}
+
+static struct pipe_sampler_view *
+chrome9_create_sampler_view(struct pipe_context *pipe,
+                            struct pipe_resource *texture,
+                            const struct pipe_sampler_view *templ)
+{
+   struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
+
+   if (!view)
+      return NULL;
+   *view = *templ;
+   pipe_reference_init(&view->reference, 1);
+   view->texture = NULL;
+   pipe_resource_reference(&view->texture, texture);
+   view->context = pipe;
+   return view;
+}
+
+static void
+chrome9_sampler_view_destroy(struct pipe_context *pipe,
+                             struct pipe_sampler_view *view)
+{
+   (void)pipe;
+   pipe_resource_reference(&view->texture, NULL);
+   FREE(view);
+}
+
+static void
+chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
+                          unsigned start, unsigned count,
+                          unsigned unbind_trailing,
+                          struct pipe_sampler_view **views)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   unsigned end;
+
+   if (shader != MESA_SHADER_FRAGMENT || start >= PIPE_MAX_SHADER_SAMPLER_VIEWS)
+      return;
+   end = MIN2(start + count, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+   for (unsigned i = start; i < end; i++)
+      pipe_sampler_view_reference(&ctx->sampler_views[i],
+                                  views ? views[i - start] : NULL);
+   end = MIN2(end + unbind_trailing, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+   for (unsigned i = start + count; i < end; i++)
+      pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
+   ctx->num_sampler_views = 0;
+   for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
+      if (ctx->sampler_views[i])
+         ctx->num_sampler_views = i + 1;
+}
+
+static void
+chrome9_set_framebuffer_state(struct pipe_context *pipe,
+                              const struct pipe_framebuffer_state *framebuffer)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct pipe_resource *color = framebuffer->nr_cbufs ?
+                                 framebuffer->cbufs[0].texture : NULL;
+
+   chrome9_flush_render_target(ctx);
+   pipe_resource_reference(&ctx->render_target, NULL);
+   util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
+   if (color) {
+      struct chrome9_resource *resource = chrome9_resource(color);
+
+      if (resource->guarded) {
+         pipe_resource_reference(&ctx->render_target, color);
+      } else {
+         struct pipe_resource templ = *color;
+
+         templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
+         templ.flags = 0;
+         ctx->render_target = pipe->screen->resource_create(pipe->screen,
+                                                             &templ);
+         if (ctx->render_target)
+            chrome9_copy_surface(ctx->render_target, color);
+      }
+   }
+   draw_set_zs_format(ctx->draw, framebuffer->zsbuf.texture ?
+                                framebuffer->zsbuf.format : PIPE_FORMAT_NONE);
+}
+
+static void
+chrome9_set_viewport_states(struct pipe_context *pipe, unsigned start,
+                            unsigned count,
+                            const struct pipe_viewport_state *viewports)
+{
+   draw_set_viewport_states(chrome9_context(pipe)->draw, start, count,
+                            viewports);
+}
+
+static void
+chrome9_set_scissor_states(struct pipe_context *pipe, unsigned start,
+                           unsigned count,
+                           const struct pipe_scissor_state *scissors)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   if (!start && count) {
+      ctx->scissor = scissors[0];
+      ctx->scissor_valid = true;
+   }
+}
+
+static void
+chrome9_set_clip_state(struct pipe_context *pipe,
+                       const struct pipe_clip_state *clip)
+{
+   draw_set_clip_state(chrome9_context(pipe)->draw, clip);
+}
+
+static void
+chrome9_clear_target(struct chrome9_resource *target,
+                     const union pipe_color_union *color,
+                     unsigned x, unsigned y, unsigned width, unsigned height)
+{
+   union util_color packed;
+
+   if (!target || target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       x >= target->base.width0 || y >= target->base.height0)
+      return;
+   width = MIN2(width, target->base.width0 - x);
+   height = MIN2(height, target->base.height0 - y);
+   util_pack_color_union(target->base.format, &packed, color);
+   util_fill_rect((uint8_t *)target->bo.map + target->data_offset,
+                  target->base.format, target->stride, x, y, width, height,
+                  &packed);
+}
+
+static void
+chrome9_clear(struct pipe_context *pipe, unsigned buffers,
+              uint32_t color_mask, uint8_t stencil_mask,
+              const struct pipe_scissor_state *scissor,
+              const union pipe_color_union *color, double depth,
+              unsigned stencil)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct pipe_resource *resource;
+   unsigned x = 0, y = 0, width, height;
+
+   (void)stencil_mask;
+   (void)depth;
+   (void)stencil;
+   if (!(buffers & PIPE_CLEAR_COLOR0) ||
+       !(resource = ctx->render_target))
+      return;
+   if ((color_mask & 0xf) != 0xf || (buffers & ~PIPE_CLEAR_COLOR0)) {
+      chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
+                        "masked or depth/stencil clears are not implemented");
+      return;
+   }
+   width = resource->width0;
+   height = resource->height0;
+   if (scissor) {
+      x = MIN2(scissor->minx, resource->width0);
+      y = MIN2(scissor->miny, resource->height0);
+      width = MIN2(scissor->maxx, resource->width0) - x;
+      height = MIN2(scissor->maxy, resource->height0) - y;
+   }
+   chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
+                        height);
+   chrome9_context_render_target_written(ctx);
+}
+
+static void
+chrome9_clear_render_target(struct pipe_context *pipe,
+                            struct pipe_surface *surface,
+                            const union pipe_color_union *color,
+                            unsigned x, unsigned y, unsigned width,
+                            unsigned height, bool render_condition)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   struct pipe_resource *target;
+
+   (void)render_condition;
+   if (!surface || !surface->texture)
+      return;
+   target = surface->texture;
+   if (ctx->framebuffer.nr_cbufs &&
+       surface->texture == ctx->framebuffer.cbufs[0].texture &&
+       ctx->render_target)
+      target = ctx->render_target;
+   chrome9_clear_target(chrome9_resource(target), color,
+                        x, y, width, height);
+   if (target == ctx->render_target)
+      chrome9_context_render_target_written(ctx);
+}
+
+static void
+chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
+                 unsigned drawid_offset,
+                 const struct pipe_draw_indirect_info *indirect,
+                 const struct pipe_draw_start_count_bias *draws,
+                 unsigned num_draws)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   const void *indices = NULL;
+
+   if (num_draws > 1) {
+      util_draw_multi(pipe, info, drawid_offset, indirect, draws, num_draws);
+      return;
+   }
+   if (!num_draws || !draws[0].count || !info->instance_count)
+      return;
+   if (indirect) {
+      chrome9_warn_once(ctx, CHROME9_WARN_INDIRECT,
+                        "indirect draws are not implemented");
+      return;
+   }
+   if (!ctx->vs || !ctx->fs || !ctx->fs->supported) {
+      chrome9_warn_once(ctx, CHROME9_WARN_DRAW_STATE,
+                        "draw rejected: only primary-color fragment output is supported");
+      return;
+   }
+
+   for (unsigned i = 0; i < ctx->num_vertex_buffers; i++) {
+      const struct pipe_vertex_buffer *vb = &ctx->vertex_buffers[i];
+      const void *map = vb->is_user_buffer ? vb->buffer.user :
+                        vb->buffer.resource ?
+                        chrome9_resource(vb->buffer.resource)->bo.map : NULL;
+      size_t size = vb->is_user_buffer || !vb->buffer.resource ?
+                    ~(size_t)0 : vb->buffer.resource->width0;
+
+      draw_set_mapped_vertex_buffer(ctx->draw, i, map, size);
+   }
+   if (info->index_size) {
+      indices = info->has_user_indices ? info->index.user :
+                info->index.resource ?
+                chrome9_resource(info->index.resource)->bo.map : NULL;
+      if (!indices)
+         goto unmap;
+      draw_set_indexes(ctx->draw, indices, info->index_size,
+                       info->has_user_indices ? ~(size_t)0 :
+                       info->index.resource->width0);
+   }
+   for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++) {
+      const struct pipe_constant_buffer *cb = &ctx->vs_constants[i];
+      const uint8_t *map = cb->user_buffer;
+
+      if (!map && cb->buffer)
+         map = chrome9_resource(cb->buffer)->bo.map;
+      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, i,
+                                      map ? map + cb->buffer_offset : NULL,
+                                      map ? cb->buffer_size : 0);
+   }
+   draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
+   draw_flush(ctx->draw);
+
+unmap:
+   for (unsigned i = 0; i < ctx->num_vertex_buffers; i++)
+      draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
+   if (info->index_size)
+      draw_set_indexes(ctx->draw, NULL, 0, 0);
+   for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
+      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, i,
+                                      NULL, 0);
+}
+
+static void
+chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
+              unsigned flags)
+{
+   chrome9_flush_render_target(chrome9_context(pipe));
+   (void)flags;
+   /* DRAW_TRIANGLE completes synchronously. */
+   if (fence)
+      *fence = NULL;
+}
+
+static void
+chrome9_set_blend_color(struct pipe_context *pipe,
+                        const struct pipe_blend_color *color)
+{
+   (void)pipe;
+   (void)color;
+}
+
+static void
+chrome9_set_stencil_ref(struct pipe_context *pipe,
+                        const struct pipe_stencil_ref reference)
+{
+   (void)pipe;
+   (void)reference;
+}
+
+static void
+chrome9_set_sample_mask(struct pipe_context *pipe, unsigned mask)
+{
+   (void)pipe;
+   (void)mask;
+}
+
+static void
+chrome9_set_polygon_stipple(struct pipe_context *pipe,
+                            const struct pipe_poly_stipple *stipple)
+{
+   (void)pipe;
+   (void)stipple;
+}
+
+static void
+chrome9_context_destroy(struct pipe_context *pipe)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   chrome9_flush_render_target(ctx);
+   if (ctx->draw)
+      draw_destroy(ctx->draw);
+   if (pipe->stream_uploader)
+      u_upload_destroy(pipe->stream_uploader);
+   util_unreference_framebuffer_state(&ctx->framebuffer);
+   pipe_resource_reference(&ctx->render_target, NULL);
+   util_set_vertex_buffers_count(ctx->vertex_buffers,
+                                 &ctx->num_vertex_buffers, NULL, 0);
+   for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
+      util_copy_constant_buffer(&ctx->vs_constants[i], NULL);
+   for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
+      pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
+   FREE(ctx);
+}
+
+struct pipe_context *
+chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
+{
+   struct chrome9_context *ctx = CALLOC_STRUCT(chrome9_context);
+   struct draw_stage *stage;
+   uint64_t capabilities;
+
+   (void)flags;
+   if (!ctx)
+      return NULL;
+   if (!chrome9_get_param(screen->get_screen_fd(screen),
+                          DRM_CHROME9_PARAM_CAPABILITIES, &capabilities) ||
+       !(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE))
+      goto fail;
+
+   ctx->base.screen = screen;
+   ctx->base.priv = priv;
+   ctx->base.destroy = chrome9_context_destroy;
+   ctx->base.flush = chrome9_flush;
+   ctx->base.draw_vbo = chrome9_draw_vbo;
+   ctx->base.clear = chrome9_clear;
+   ctx->base.clear_render_target = chrome9_clear_render_target;
+   ctx->base.create_blend_state = chrome9_create_blend_state;
+   ctx->base.bind_blend_state = chrome9_bind_blend_state;
+   ctx->base.delete_blend_state = chrome9_delete_state;
+   ctx->base.create_depth_stencil_alpha_state = chrome9_create_dsa_state;
+   ctx->base.bind_depth_stencil_alpha_state = chrome9_bind_dsa_state;
+   ctx->base.delete_depth_stencil_alpha_state = chrome9_delete_state;
+   ctx->base.create_rasterizer_state = chrome9_create_rasterizer_state;
+   ctx->base.bind_rasterizer_state = chrome9_bind_rasterizer_state;
+   ctx->base.delete_rasterizer_state = chrome9_delete_state;
+   ctx->base.create_sampler_state = chrome9_create_sampler_state;
+   ctx->base.bind_sampler_states = chrome9_bind_sampler_states;
+   ctx->base.delete_sampler_state = chrome9_delete_state;
+   ctx->base.create_sampler_view = chrome9_create_sampler_view;
+   ctx->base.sampler_view_destroy = chrome9_sampler_view_destroy;
+   ctx->base.sampler_view_release = u_default_sampler_view_release;
+   ctx->base.set_sampler_views = chrome9_set_sampler_views;
+   ctx->base.create_vs_state = chrome9_create_vs_state;
+   ctx->base.bind_vs_state = chrome9_bind_vs_state;
+   ctx->base.delete_vs_state = chrome9_delete_vs_state;
+   ctx->base.create_fs_state = chrome9_create_fs_state;
+   ctx->base.bind_fs_state = chrome9_bind_fs_state;
+   ctx->base.delete_fs_state = chrome9_delete_fs_state;
+   ctx->base.create_vertex_elements_state =
+      chrome9_create_vertex_elements_state;
+   ctx->base.bind_vertex_elements_state = chrome9_bind_vertex_elements_state;
+   ctx->base.delete_vertex_elements_state =
+      chrome9_delete_vertex_elements_state;
+   ctx->base.set_vertex_buffers = chrome9_set_vertex_buffers;
+   ctx->base.set_constant_buffer = chrome9_set_constant_buffer;
+   ctx->base.set_framebuffer_state = chrome9_set_framebuffer_state;
+   ctx->base.set_viewport_states = chrome9_set_viewport_states;
+   ctx->base.set_scissor_states = chrome9_set_scissor_states;
+   ctx->base.set_clip_state = chrome9_set_clip_state;
+   ctx->base.set_blend_color = chrome9_set_blend_color;
+   ctx->base.set_stencil_ref = chrome9_set_stencil_ref;
+   ctx->base.set_sample_mask = chrome9_set_sample_mask;
+   ctx->base.set_polygon_stipple = chrome9_set_polygon_stipple;
+   ctx->base.set_debug_callback = u_default_set_debug_callback;
+   ctx->base.resource_release = u_default_resource_release;
+   chrome9_init_context_resource_functions(&ctx->base);
+
+   ctx->draw = draw_create(&ctx->base);
+   if (!ctx->draw)
+      goto fail;
+   draw_set_constant_buffer_stride(ctx->draw, sizeof(float));
+   stage = chrome9_draw_vbuf_stage(ctx);
+   if (!stage)
+      goto fail;
+   draw_set_rasterize_stage(ctx->draw, stage);
+
+   ctx->base.stream_uploader = u_upload_create_default(&ctx->base);
+   if (!ctx->base.stream_uploader)
+      goto fail;
+   ctx->base.const_uploader = ctx->base.stream_uploader;
+   return &ctx->base;
+
+fail:
+   chrome9_context_destroy(&ctx->base);
+   return NULL;
+}

@@ -5,14 +5,160 @@
 #include "chrome9_resource.h"
 
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
+#include "drm-uapi/drm_fourcc.h"
+#include "frontend/winsys_handle.h"
+#include "pipe/p_context.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
+#include "pipe/p_shader_tokens.h"
 #include "pipe/p_state.h"
+#include "util/u_simple_shaders.h"
+
+struct smoke_vertex {
+   float position[4];
+   float color[4];
+};
+
+static bool
+run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource)
+{
+   static const enum tgsi_semantic semantics[] = {
+      TGSI_SEMANTIC_POSITION, TGSI_SEMANTIC_COLOR,
+   };
+   static const unsigned semantic_indices[] = { 0, 0 };
+   static const struct smoke_vertex vertices[] = {
+      { { -1, -1, 0, 1 }, { 1, 0, 0, 1 } },
+      { {  1, -1, 0, 1 }, { 0, 1, 0, 1 } },
+      { {  1,  1, 0, 1 }, { 0, 0, 1, 1 } },
+   };
+   struct pipe_context *context = NULL;
+   struct pipe_blend_state blend = { 0 };
+   struct pipe_depth_stencil_alpha_state dsa = { 0 };
+   struct pipe_rasterizer_state rasterizer = { 0 };
+   struct pipe_vertex_element elements[2] = { 0 };
+   struct pipe_vertex_buffer vertex_buffer = {
+      .is_user_buffer = true,
+      .buffer.user = vertices,
+   };
+   struct pipe_framebuffer_state framebuffer = {
+      .width = 257,
+      .height = 129,
+      .nr_cbufs = 1,
+      .cbufs[0] = {
+         .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+         .texture = resource,
+      },
+   };
+   struct pipe_viewport_state viewport = {
+      .scale = { 128.5, 64.5, 0.5 },
+      .translate = { 128.5, 64.5, 0.5 },
+   };
+   struct pipe_scissor_state scissor = {
+      .minx = 0,
+      .miny = 0,
+      .maxx = 257,
+      .maxy = 129,
+   };
+   struct pipe_draw_info info = {
+      .mode = MESA_PRIM_TRIANGLES,
+      .index_bounds_valid = true,
+      .instance_count = 1,
+      .min_index = 0,
+      .max_index = 2,
+   };
+   struct pipe_draw_start_count_bias draw = {
+      .start = 0,
+      .count = 3,
+   };
+   union pipe_color_union clear_color = { 0 };
+   struct chrome9_resource *surface = chrome9_resource(resource);
+   uint32_t *pixels;
+   size_t changed = 0;
+   void *blend_handle = NULL;
+   void *dsa_handle = NULL;
+   void *rasterizer_handle = NULL;
+   void *elements_handle = NULL;
+   void *vs = NULL;
+   void *fs = NULL;
+   bool passed = false;
+
+   context = screen->context_create(screen, NULL, 0);
+   if (!context)
+      goto out;
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   blend_handle = context->create_blend_state(context, &blend);
+   dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   rasterizer.half_pixel_center = true;
+   rasterizer.bottom_edge_rule = true;
+   rasterizer.depth_clip_near = true;
+   rasterizer.depth_clip_far = true;
+   rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   elements[0].src_offset = offsetof(struct smoke_vertex, position);
+   elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[0].src_stride = sizeof(struct smoke_vertex);
+   elements[1].src_offset = offsetof(struct smoke_vertex, color);
+   elements[1].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[1].src_stride = sizeof(struct smoke_vertex);
+   elements_handle = context->create_vertex_elements_state(context, 2,
+                                                            elements);
+   vs = util_make_vertex_passthrough_shader(context, 2, semantics,
+                                             semantic_indices, false);
+   fs = util_make_fragment_passthrough_shader(context, TGSI_SEMANTIC_COLOR,
+                                               TGSI_INTERPOLATE_COLOR, false);
+   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+       !elements_handle || !vs || !fs)
+      goto out;
+
+   context->bind_blend_state(context, blend_handle);
+   context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   context->bind_rasterizer_state(context, rasterizer_handle);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, vs);
+   context->bind_fs_state(context, fs);
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->set_framebuffer_state(context, &framebuffer);
+   context->set_viewport_states(context, 0, 1, &viewport);
+   context->set_scissor_states(context, 0, 1, &scissor);
+   context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                  &clear_color, 1.0, 0);
+   context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+   context->flush(context, NULL, 0);
+
+   pixels = (uint32_t *)((uint8_t *)surface->bo.map + surface->data_offset);
+   for (unsigned y = 0; y < resource->height0; y++)
+      for (unsigned x = 0; x < resource->width0; x++)
+         changed += pixels[(size_t)y * surface->stride / 4 + x] != 0;
+   passed = changed >= 12000 && changed <= 20000;
+   if (!passed)
+      fprintf(stderr, "Gallium triangle coverage mismatch: %zu\n", changed);
+   else
+      printf("Gallium draw/vbuf triangle passed: changed=%zu sample=%08x\n",
+             changed, pixels[32 * (surface->stride / 4) + 192]);
+
+out:
+   if (context) {
+      if (vs)
+         context->delete_vs_state(context, vs);
+      if (fs)
+         context->delete_fs_state(context, fs);
+      if (elements_handle)
+         context->delete_vertex_elements_state(context, elements_handle);
+      if (rasterizer_handle)
+         context->delete_rasterizer_state(context, rasterizer_handle);
+      if (dsa_handle)
+         context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (blend_handle)
+         context->delete_blend_state(context, blend_handle);
+      context->destroy(context);
+   }
+   return passed;
+}
 
 int
 main(int argc, char **argv)
@@ -38,6 +184,9 @@ main(int argc, char **argv)
       .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
    };
    struct chrome9_resource *surface;
+   struct chrome9_resource *shared_surface;
+   struct pipe_resource *shared_resource;
+   struct winsys_handle whandle = { .type = WINSYS_HANDLE_TYPE_FD };
    struct pipe_screen *screen;
    uint32_t *pixels;
    long page_size;
@@ -108,8 +257,47 @@ main(int argc, char **argv)
       screen->destroy(screen);
       return 1;
    }
+
+   if (!screen->resource_get_handle(
+          screen, NULL, resource, &whandle,
+          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE) ||
+       whandle.stride != surface->stride ||
+       whandle.offset != surface->data_offset ||
+       whandle.modifier != DRM_FORMAT_MOD_LINEAR) {
+      fputs("XRGB8888 PRIME export failed\n", stderr);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   shared_resource = screen->resource_from_handle(
+      screen, &surface_templ, &whandle,
+      PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   close(whandle.handle);
+   if (!shared_resource) {
+      fputs("XRGB8888 PRIME import failed\n", stderr);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   shared_surface = chrome9_resource(shared_resource);
+   ((uint32_t *)((uint8_t *)shared_surface->bo.map +
+                 shared_surface->data_offset))[1] = 0x0055aa77;
+   if (pixels[1] != 0x0055aa77) {
+      fputs("XRGB8888 PRIME alias mismatch\n", stderr);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   screen->resource_destroy(screen, shared_resource);
+   if (!run_pipe_triangle(screen, resource)) {
+      fputs("Chrome9 Gallium triangle failed\n", stderr);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
    screen->resource_destroy(screen, resource);
    screen->destroy(screen);
-   puts("Mesa Chrome9 PIPE_BUFFER and guarded 257x129 XRGB8888 smoke passed");
+   puts("Mesa Chrome9 context, Gallium triangle, guarded XRGB8888, and PRIME sharing smoke passed");
    return 0;
 }

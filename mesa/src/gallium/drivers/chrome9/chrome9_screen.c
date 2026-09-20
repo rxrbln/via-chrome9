@@ -2,14 +2,16 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include "chrome9_public.h"
+#include "chrome9_context.h"
 #include "chrome9_drm.h"
 #include "chrome9_resource.h"
 
 #include <fcntl.h>
-#include <stdio.h>
 #include <unistd.h>
 
+#include "draw/draw_context.h"
 #include "drm-uapi/chrome9_drm.h"
+#include "nir.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "util/u_memory.h"
@@ -39,7 +41,7 @@ static const char *
 chrome9_screen_name(struct pipe_screen *screen)
 {
    (void)screen;
-   return "VIA Chrome9 HD (bring-up, no submission)";
+   return "VIA Chrome9 HD (validated triangle bring-up)";
 }
 
 static const char *
@@ -65,15 +67,31 @@ chrome9_screen_destroy(struct pipe_screen *screen)
    FREE(cscreen);
 }
 
-static struct pipe_context *
-chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
+static const struct nir_shader_compiler_options chrome9_nir_options = {
+   .lower_fdiv = true,
+   .lower_flrp32 = true,
+   .lower_fmod = true,
+   .lower_fsat = true,
+   .lower_sincos = true,
+};
+
+static void
+chrome9_init_shader_caps(struct chrome9_screen *screen)
 {
-   (void)screen;
-   (void)priv;
-   (void)flags;
-   fprintf(stderr,
-           "chrome9: rendering is disabled until validated submission exists\n");
-   return NULL;
+   struct pipe_shader_caps *vs =
+      (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_VERTEX];
+   struct pipe_shader_caps *fs =
+      (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_FRAGMENT];
+
+   draw_init_shader_caps(vs);
+   vs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
+
+   fs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
+   fs->max_instructions = 32;
+   fs->max_alu_instructions = 32;
+   fs->max_inputs = 2;
+   fs->max_outputs = 1;
+   fs->max_temps = 8;
 }
 
 struct pipe_screen *
@@ -107,14 +125,26 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    screen->capabilities = value;
 
    screen->base.get_screen_fd = chrome9_screen_fd;
-   u_init_pipe_screen_caps(&screen->base, 1);
+   u_init_pipe_screen_caps(&screen->base,
+                           !!(screen->capabilities &
+                              DRM_CHROME9_CAP_DRAW_TRIANGLE));
+   screen->base.nir_options[MESA_SHADER_VERTEX] = &chrome9_nir_options;
+   screen->base.nir_options[MESA_SHADER_FRAGMENT] = &chrome9_nir_options;
+   chrome9_init_shader_caps(screen);
    caps = (struct pipe_caps *)&screen->base.caps;
-   caps->accelerated = false;
    caps->vendor_id = 0x1106;
    caps->device_id = screen->device_id;
    caps->endianness = PIPE_ENDIAN_NATIVE;
    caps->max_texture_2d_size = 2048;
    caps->max_render_targets = 1;
+   caps->max_vertex_buffers = 16;
+   caps->max_varyings = 2;
+   caps->constant_buffer_offset_alignment = 16;
+   caps->user_vertex_buffers = true;
+   caps->vertex_color_clamped = true;
+   caps->fs_coord_origin_upper_left = true;
+   caps->fs_coord_pixel_center_half_integer = true;
+   caps->shareable_shaders = false;
 
    screen->base.destroy = chrome9_screen_destroy;
    screen->base.get_name = chrome9_screen_name;
