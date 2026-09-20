@@ -2502,9 +2502,9 @@ static struct pci_driver chrome9_pci_driver = {
 	.id_table = chrome9_pci_table,
 	.probe = chrome9_pci_probe,
 	.remove = chrome9_pci_remove,
+	.dev_groups = chrome9_device_groups,
 	.driver = {
 		.suppress_bind_attrs = true,
-		.dev_groups = chrome9_device_groups,
 	},
 };
 module_pci_driver(chrome9_pci_driver);
