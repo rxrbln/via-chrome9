@@ -100,6 +100,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_BLEND,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16,
+	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BLEND,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND,
 };
@@ -141,9 +142,11 @@ static_assert(sizeof(struct drm_chrome9_draw_textured_triangle) == 176);
 static_assert(sizeof(struct drm_chrome9_blend_state) == 40);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_blend) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_blend) == 216);
+static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_blend) == 144);
 
 struct chrome9_blend_words {
 	u32 a00;
+	u32 a33;
 	u32 a34;
 	u32 a35;
 	u32 a36;
@@ -478,6 +481,7 @@ static u32 chrome9_q16_to_float(s32 value)
 static bool chrome9_draw_has_blend(const struct chrome9_draw_request *request)
 {
 	return request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_BLEND ||
+	       request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BLEND ||
 	       request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND;
 }
 
@@ -532,9 +536,18 @@ static u32 chrome9_scissor_x(const struct chrome9_draw_request *request)
 static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
 				struct chrome9_blend_words *words)
 {
+	u32 ref = state->alpha_test_ref;
+
 	words->a00 = 0x00000001;
 	if (state->flags & DRM_CHROME9_BLEND_ENABLE)
 		words->a00 |= BIT(4);
+	if (state->flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE)
+		words->a00 |= BIT(20);
+	if (ref != 255)
+		ref = ref << 2 | ref >> 6;
+	else
+		ref = 0x400;
+	words->a33 = 0x33000000 | state->alpha_test_func << 12 | ref;
 	words->a34 = 0x34000000 |
 		chrome9_blend_factor_code(state->rgb_src_factor, false) << 4;
 	words->a35 = 0x35000100 |
@@ -585,6 +598,9 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 		body[18] = blend_words.a37;
 		body[21] = blend_words.a53;
 		body[22] = blend_words.a00;
+		if (request->blend.flags &
+		    DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE)
+			body[26] = blend_words.a33;
 		delta = 4;
 	}
 	body[6] = 0x52000000 |
@@ -619,6 +635,10 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	      body[16] != blend_words.a35 || body[17] != blend_words.a36 ||
 	      body[18] != blend_words.a37 || body[21] != blend_words.a53 ||
 	      body[22] != blend_words.a00 || body[23] != 0x01c01540 ||
+	      body[26] !=
+		((request->blend.flags &
+		  DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
+		 blend_words.a33 : 0xcc000000) ||
 	      body[53] != 0x23004f02 || body[54] != 0x24000003 ||
 	      body[164] != 0xfe020440 || body[167] != 0xcc000000)))
 		return -EINVAL;
@@ -708,7 +728,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	u32 sampler[4];
 	u32 common[] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
-		0x01c01540, 0x88001ed0, 0x89000800,
+		0x01c01540, 0x88001ed0, 0x89000800, 0xcc000000,
 	};
 	u32 clip[] = {
 		0x80000000 | request->height,
@@ -743,6 +763,9 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		destination_count = ARRAY_SIZE(destination_state);
 		common[2] = blend_words.a53;
 		common[3] = blend_words.a00;
+		if (request->blend.flags &
+		    DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE)
+			common[7] = blend_words.a33;
 		delta = 4;
 	} else {
 		memcpy(destination_state + 3, destination_tail,
@@ -846,7 +869,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	      body[17] != blend_words.a36 || body[18] != blend_words.a37 ||
 	      body[42 + delta] != blend_words.a53 ||
 	      body[43 + delta] != blend_words.a00 ||
-	      body[44 + delta] != common[4])) ||
+	      body[44 + delta] != common[4] ||
+	      body[47 + delta] != common[7])) ||
 	    body[request->texture_program ==
 		 DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ?
 		 200 + delta : 196 + delta] !=
@@ -880,9 +904,12 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
+	struct chrome9_blend_words blend_words;
 	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
 	u32 *body;
 	u32 *p;
+	u32 delta = 0;
+	bool blend = chrome9_draw_has_blend(request);
 	unsigned int i;
 
 	memset(base, 0xcc, PAGE_SIZE);
@@ -896,24 +923,46 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	    body[160] != 0xfe020440 || body[163] != 0xcc000000)
 		return -EINVAL;
 
-	/* Add the D16 words and the wide-open near/far clip state. */
-	memmove(body + 28, body + 24, (188 - 24) * sizeof(*body));
-	body[6] = 0x52980000 | (request->pitch >> 5);
-	body[19] = 0x01c0154c;
-	body[22] = 0x10000000 | (depth >> 8);
-	body[23] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
-	body[24] = 0x12380000;
-	body[25] = 0x13010000;
-	body[26] = 0x20007fff;
-	body[27] = 0xcc000000;
-	body[53] = 0x23004f02;
-	body[54] = 0x24000003;
-	body[104] = 0x80000000 | request->height;
-	body[105] = 0x81000000 | request->width;
-	body[106] = chrome9_scissor_y(request);
-	body[107] = chrome9_scissor_x(request);
+	if (blend) {
+		/* Close A38--A3F before adding depth state to the successor. */
+		memmove(body + 19, body + 15, (188 - 15) * sizeof(*body));
+		chrome9_lower_blend(&request->blend, &blend_words);
+		for (i = 0; i < 8; i++)
+			body[7 + i] = (0x38 + i) << 24;
+		body[15] = blend_words.a34;
+		body[16] = blend_words.a35;
+		body[17] = blend_words.a36;
+		body[18] = blend_words.a37;
+		body[21] = blend_words.a53;
+		body[22] = blend_words.a00;
+		delta = 4;
+	}
+
+	/* Add D16 words and the wide-open near/far clip state. */
+	memmove(body + 28 + delta, body + 24 + delta,
+		(188 - 24) * sizeof(*body));
+	body[6] = 0x52000000 |
+		(request->destination_format ==
+		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
+		 0x00980000) | (request->pitch >> 5);
+	body[19 + delta] = 0x01c0154c;
+	body[22 + delta] = 0x10000000 | (depth >> 8);
+	body[23 + delta] = 0x11000001 |
+		((request->depth_pitch >> 5) << 13);
+	body[24 + delta] = 0x12380000;
+	body[25 + delta] = 0x13010000;
+	body[26 + delta] = 0x20007fff;
+	body[27 + delta] = blend &&
+		(request->blend.flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
+		blend_words.a33 : 0xcc000000;
+	body[53 + delta] = 0x23004f02;
+	body[54 + delta] = 0x24000003;
+	body[104 + delta] = 0x80000000 | request->height;
+	body[105 + delta] = 0x81000000 | request->width;
+	body[106 + delta] = chrome9_scissor_y(request);
+	body[107 + delta] = chrome9_scissor_x(request);
 	for (i = 0; i < ARRAY_SIZE(request->depth_vertices); i++) {
-		u32 *vertex = body + 168 + i * 6;
+		u32 *vertex = body + 168 + delta + i * 6;
 
 		vertex[0] = chrome9_q16_to_float(request->depth_vertices[i].x_16_16);
 		vertex[1] = chrome9_q16_to_float(request->depth_vertices[i].y_16_16);
@@ -922,9 +971,30 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 		vertex[4] = request->depth_vertices[i].color;
 		vertex[5] = 0xffffffff;
 	}
-	body[186] = 0xcc000000;
-	body[187] = 0xcc000000;
-	p = body + 188;
+	body[186 + delta] = 0xcc000000;
+	body[187 + delta] = 0xcc000000;
+	p = body + 188 + delta;
+	if ((!blend &&
+	     (p - body != 188 || body[19] != 0x01c0154c ||
+	      body[22] != (0x10000000 | (depth >> 8)) ||
+	      body[27] != 0xcc000000 || body[53] != 0x23004f02 ||
+	      body[104] != (0x80000000 | request->height) ||
+	      body[164] != 0xfe020440)) ||
+	    (blend &&
+	     (p - body != 192 || body[7] != 0x38000000 ||
+	      body[14] != 0x3f000000 || body[15] != blend_words.a34 ||
+	      body[18] != blend_words.a37 || body[21] != blend_words.a53 ||
+	      body[22] != blend_words.a00 || body[23] != 0x01c0154c ||
+	      body[26] != (0x10000000 | (depth >> 8)) ||
+	      body[31] !=
+		((request->blend.flags &
+		  DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
+		 blend_words.a33 : 0xcc000000) ||
+	      body[32] != 0xfe020440 || body[57] != 0x23004f02 ||
+	      body[58] != 0x24000003 ||
+	      body[108] != (0x80000000 | request->height) ||
+	      body[168] != 0xfe020440)))
+		return -EINVAL;
 	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     status, ARRAY_SIZE(status));
@@ -2196,13 +2266,20 @@ chrome9_validate_scissor(const struct drm_chrome9_scissor_state *scissor,
 
 static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *state)
 {
-	if (state->flags & ~DRM_CHROME9_BLEND_ENABLE ||
+	if (state->flags & ~(DRM_CHROME9_BLEND_ENABLE |
+			     DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ||
 	    state->color_mask & ~(DRM_CHROME9_COLOR_MASK_R |
 				  DRM_CHROME9_COLOR_MASK_G |
 				  DRM_CHROME9_COLOR_MASK_B |
-				  DRM_CHROME9_COLOR_MASK_A) ||
-	    state->reserved[0] || state->reserved[1])
+				  DRM_CHROME9_COLOR_MASK_A))
 		return -EINVAL;
+	if (state->flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) {
+		if (state->alpha_test_func > DRM_CHROME9_COMPARE_ALWAYS ||
+		    state->alpha_test_ref > 255)
+			return -EINVAL;
+	} else if (state->alpha_test_func || state->alpha_test_ref) {
+		return -EINVAL;
+	}
 	if (state->rgb_src_factor > DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA ||
 	    state->rgb_dst_factor > DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA ||
 	    state->alpha_src_factor >
@@ -2341,6 +2418,69 @@ int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
 		return -EINVAL;
 	ret = chrome9_validate_scissor(&args->scissor, args->width,
 				       args->height);
+	if (ret)
+		return ret;
+	if (check_mul_overflow((u64)args->destination_pitch,
+			       (u64)args->height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.object_size))
+		return -E2BIG;
+	if (check_mul_overflow((u64)args->depth_pitch, (u64)args->height,
+			       &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.depth_object_size) ||
+	    check_add_overflow(request.object_size, request.depth_object_size,
+			       &total_size) ||
+	    total_size > SZ_64M - CHROME9_RING_SIZE)
+		return -E2BIG;
+	for (i = 0; i < ARRAY_SIZE(args->vertices); i++) {
+		if (!chrome9_coordinate_valid(args->vertices[i].x_16_16,
+					      args->width) ||
+		    !chrome9_coordinate_valid(args->vertices[i].y_16_16,
+					      args->height) ||
+		    args->vertices[i].z_16_16 < 0 ||
+		    args->vertices[i].z_16_16 > 0x10000)
+			return -EINVAL;
+		request.depth_vertices[i] = args->vertices[i];
+	}
+	return chrome9_submit_depth_triangle(drm, file, &request);
+}
+
+int chrome9_draw_triangle_d16_blend_ioctl(struct drm_device *drm, void *data,
+					  struct drm_file *file)
+{
+	struct drm_chrome9_draw_triangle_d16_blend *args = data;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BLEND,
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->depth_handle,
+		.width = args->width,
+		.height = args->height,
+		.pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+		.destination_format = args->destination_format,
+		.scissor = args->scissor,
+		.blend = args->blend,
+	};
+	u64 surface_size;
+	u64 total_size;
+	unsigned int i;
+	int ret;
+
+	if (args->flags || args->pad || args->reserved[0] ||
+	    args->reserved[1] ||
+	    args->destination_format >
+		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
+	    !args->width || args->width > 2048 ||
+	    !args->height || args->height > 2048 ||
+	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
+	    args->depth_pitch != ALIGN(args->width * sizeof(u16), 32))
+		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
+	ret = chrome9_validate_blend_state(&args->blend);
 	if (ret)
 		return ret;
 	if (check_mul_overflow((u64)args->destination_pitch,
