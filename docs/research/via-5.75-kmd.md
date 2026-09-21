@@ -1073,8 +1073,9 @@ After `0x000896b0`, `0x0008a500` sets adapter byte `+22f01=1`
 (`0x00083dbb..0x00083e0b`).  The old header decodes that mask as global enable
 `80000000` plus DMA1 `00800000` and DMA0 `00200000`; there is no separate CR
 enable bit in it.  Linux does not need to enable DMA interrupts for a CR fence,
-but it must restore global bit 31 with a preserving RMW before submitting any
-interrupting fence.
+but it must restore global bit 31 with the mixed-register helper
+`(old & f7ff0800) | 80000000` before submitting any interrupting fence.  A
+literal preserving RMW would acknowledge sampled `0200` RW1C statuses.
 
 The setup helper in that deferred path is now decoded too.  For PCI `7122`,
 device callback `+0xdf4` is `0x000a17a0`; it resets the software ring

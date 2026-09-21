@@ -377,7 +377,10 @@ the next submission path at `0x00083dbb..0x00083e0b` sees it and performs
 mask as global interrupt enable plus DMA1 and DMA0 enables.  IRQ restoration
 is therefore deferred until submission and still precedes any newly emitted
 interrupt-wait fence; a Linux scheduler may restore only the global bit for
-CR fences, but must preserve unrelated display/video enables.
+CR fences, but must preserve unrelated display/video enables.  It must not
+copy Windows' literal OR: `0200` mixes enable and RW1C status.  The code-ready
+VX900 write is `(old & f7ff0800) | 80000000`, which preserves only documented
+enable fields and writes every status/RO/reserved position as zero.
 
 That same deferred path calls the chip-table slot at device `+0xdf4`.  For
 PCI `7122` this is `0x000a17a0`, which reconstructs the software description
