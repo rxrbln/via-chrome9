@@ -212,6 +212,10 @@ targets.
   edge AA from sample storage, recovers the H6 smooth-line special cycle,
   closes post-viewport validators and native C-to-screen coupling, and keeps
   user clip planes fail-closed behind shader/software lowering.
+- [stipple-polygon-mode-contract.md](stipple-polygon-mode-contract.md)
+  closes A01/A84/A85 line-stipple enable, pattern, repeat and per-primitive
+  reset state, gives exact packet growth and phase oracles, and keeps broken
+  native polygon stipple and two-sided unfilled modes behind safe lowering.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
