@@ -104,6 +104,31 @@ Linux `0x1b33f0..0x1b35cf`).  Consequently:
 This is the main filtering hazard for the next Mesa implementation.  Point,
 bilinear, nearest-mip, and trilinear stay closed; anisotropy does not.
 
+The coefficient upload transaction itself is now exact, although its visual
+behavior is still untested.  Manual type-03/subtype-11 defines 32 entries
+indexed by the five-bit S/T fraction.  Both Linux update paths emit:
+
+```text
+FE03043C 00000020 11030000 CC000000
+<32 coefficient dwords>
+```
+
+`stmFullUpdateHardware_invi:0x1781f1..0x17822f` copies the 32 words from
+`state+0x1fbc`; incremental paths use the same count and selector at
+`0x17b2f2..0x17b306` and `0x17b38a..0x17b39e`.  This proves again that
+`11030000` is the global 4x4-filter table selector, not a stage-1 mip table.
+The two Linux source objects are `INV_4X4FLTCOEF_BSPLINE:0x3f27a0` and the
+misspelled `INV_4X4FLTCOEF_GUASS:0x3f47a0`.  SHA-256 of their first 128 bytes
+is respectively `ea5cf02b1da49962e77466a322fb499b82b55faeba3d7348c3bdc62af83145ee`
+and `b60cb2fd7c2a9fd89cabd5ffa9131b9a0857b14c6db4a068718c03ac37dcf140`.
+The exact host-order words are in `sampler-4x4-coefficients.tsv`.
+
+This packet is 36 dwords including its header.  It is context-global rather
+than per texture stage, so a future implementation must serialize table
+ownership, dirty it when switching B-spline/Gaussian state, and either restore
+a known table after context loss or include it in the complete state image.
+None of that is needed for ordinary point/linear/mip sampling.
+
 ## LOD conversion and fail-closed range
 
 The Windows D3D LOD builder at `0x101d9a40` and Linux
