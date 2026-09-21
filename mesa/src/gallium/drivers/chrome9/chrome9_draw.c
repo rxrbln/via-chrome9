@@ -63,6 +63,8 @@ chrome9_fs_uses_constant_color(unsigned program)
    case CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE:
    case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:
    case CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA:
       return true;
    default:
       return false;
@@ -112,6 +114,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
        program == CHROME9_FS_TEXTURE_RGBX ||
        program == CHROME9_FS_TEXTURE_MODULATE ||
        program == CHROME9_FS_TEXTURE_PROJECTED_MODULATE ||
+       program == CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE ||
+       program == CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA ||
        program == CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
        program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ||
        program == CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
@@ -197,6 +201,8 @@ chrome9_fragment_constant_color(struct chrome9_context *ctx, uint32_t *color)
    switch (ctx->fs->fragment_program) {
    case CHROME9_FS_CONSTANT_COLOR:
    case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA:
       memcpy(rgba, constant[0], sizeof(rgba));
       break;
    case CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE:
@@ -221,6 +227,20 @@ chrome9_fragment_constant_color(struct chrome9_context *ctx, uint32_t *color)
    for (unsigned i = 0; i < ARRAY_SIZE(rgba); i++)
       if (!isfinite(rgba[i]))
          return false;
+   if (ctx->fs->fragment_program ==
+          CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE ||
+       ctx->fs->fragment_program ==
+          CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA) {
+      /* This bounded fallback supplies c0 through normalized D1.  Admit
+       * only constants represented exactly by that UNORM8 path; general
+       * 32-bit c0 needs the native fragment-constant successor. */
+      for (unsigned i = 0; i < ARRAY_SIZE(rgba); i++) {
+         uint8_t channel = float_to_ubyte(rgba[i]);
+
+         if (rgba[i] != (float)channel / 255.0f)
+            return false;
+      }
+   }
    *color = (uint32_t)float_to_ubyte(rgba[2]) |
             (uint32_t)float_to_ubyte(rgba[1]) << 8 |
             (uint32_t)float_to_ubyte(rgba[0]) << 16 |
@@ -580,8 +600,10 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
             return false;
          *reason = "projected-source-format";
          if (!unit &&
-             ctx->fs->fragment_program ==
-                CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA &&
+             (ctx->fs->fragment_program ==
+                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
+              ctx->fs->fragment_program ==
+                 CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA) &&
              source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
             return false;
       }
@@ -805,6 +827,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          if (ctx->fs->fragment_program ==
                 CHROME9_FS_TEXTURE_PROJECTED_MODULATE ||
              ctx->fs->fragment_program ==
+                CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE ||
+             ctx->fs->fragment_program ==
+                CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA ||
+             ctx->fs->fragment_program ==
                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA)
             memcpy(&texcoord_q, &texcoord[3], sizeof(texcoord_q));
 
@@ -813,6 +839,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
              !isfinite(texcoord[1]) ||
              ((ctx->fs->fragment_program ==
                   CHROME9_FS_TEXTURE_PROJECTED_MODULATE ||
+               ctx->fs->fragment_program ==
+                  CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE ||
+               ctx->fs->fragment_program ==
+                  CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA ||
                ctx->fs->fragment_program ==
                   CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA) &&
               texcoord_q != 0x3f800000) ||
