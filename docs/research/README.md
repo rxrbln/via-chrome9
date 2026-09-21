@@ -170,6 +170,11 @@ targets.
   unproved secondary-render-target state boundary.
 - [chrome9-mrt-output-corpus.tsv](chrome9-mrt-output-corpus.tsv) preserves four
   individual outputs and one combined oC0+oC1 compiler differential.
+- [chrome9-texkill-depth-combo-audit.md](chrome9-texkill-depth-combo-audit.md)
+  closes combined discard/color/depth scheduling and defines the guarded
+  kill-before-depth suppression oracle.
+- [chrome9-texkill-depth-combo-corpus.tsv](chrome9-texkill-depth-combo-corpus.tsv)
+  preserves both output token orders, side-effect metadata, and controls.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
