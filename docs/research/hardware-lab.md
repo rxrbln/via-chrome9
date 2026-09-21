@@ -1030,3 +1030,30 @@ color or depth, and the nearer draw passed and wrote red plus `4000` depth.
 Engine-error MMIO `040c` remained zero.  This closes write-enabled A13
 `13030000`; depth read-only and the other six compare functions remain
 unmeasured.
+
+## Gouraud RGBX/RHW application gate
+
+Kernel Chrome9 commit
+`8a16b931bacdaa292d81ea30c8c99b7a369b2cad`, Mesa Chrome9 commit
+`c146218392b627991211f4d326cd35b969992812`, and Mesa parent commit
+`ec38264898cd601b3b2e52a3e6f21276fdef456c` passed the complete hardware
+smoke with exit status zero and engine-error MMIO `040c=0`.  The retained log
+is:
+
+```text
+/root/tmp/chrome9/smoke-rhw-gouraud-v4.log
+```
+
+The real ten-frame glmark2 scene
+`shading:model=cat:nframes=10:shading=gouraud` then executed without a Chrome9
+draw rejection, reporting about 3 FPS / 478.804 ms, and again left `040c=0`.
+Its retained log is:
+
+```text
+/root/tmp/chrome9/glmark2-gouraud-rhw-v4-10f.log
+```
+
+This is a live application/submission and stability gate for the RGBX varying
+classifier plus the RHW D16 successor.  The timing line alone is not a pixel
+oracle; visual/pixel correctness remains bounded by the corresponding smoke
+readback rather than inferred from FPS.

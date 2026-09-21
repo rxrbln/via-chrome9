@@ -173,6 +173,59 @@ Depth-test disable should continue through the color-only draw path.  Do not
 encode write-on/test-off, because both proprietary implementations suppress
 writes when the API depth test is disabled.
 
+### Read-only code-level integration map
+
+At the current UAPI snapshot, flags 0/1 belong to per-ioctl batch/blend state
+and bits 8--10 hold the depth function.  Bit 11 is free in every D16 request,
+so the concrete non-colliding definition is:
+
+```text
+DRM_CHROME9_DEPTH_READ_ONLY = 1U << 11
+DRM_CHROME9_CAP_DEPTH_READ_ONLY = 1ULL << 21   # next free cap at this snapshot
+```
+
+Allocate a different capability bit if another merge consumes 21 first; the
+request flag bit must remain 11 once published.  Capability absence keeps the
+existing unknown-bit rejection and guarantees old kernels fail with EINVAL
+rather than execute a write-enabled approximation.
+
+One helper should derive the A01 word so emission and assertions cannot
+diverge:
+
+```text
+affine base       01c01540
+perspective base  01ce1540
++ test            00000008
++ write unless READ_ONLY 00000004
+```
+
+The resulting exact words remain `01c0154c/01c01548` and
+`01ce154c/01ce1548`.  Apply that helper at every structured D16 emission site:
+
+| builder/path | current A01 location | perspective selector |
+|---|---:|---|
+| untextured D16, blend, batch, RHW batch | `body[19 + delta]` | RHW-batch kind |
+| one-texture D16 | `common[4]`, asserted at `body[44 + delta]` | MODULATE program |
+| two-texture D16 | `common[4]`, asserted at `body[64]` | retain its established affine word |
+
+Do not alter the fixed depth oracle's hard-coded write-enabled word; it is a
+regression reference, not a general UAPI path.  No memmove, body-length, A10,
+A12, A13, A14, A15, or A20 assertion changes are needed for read-only.
+
+Kernel validation must accept bit 11 only on a D16 request.  In the generic
+batch ABI, reject `READ_ONLY` when `TRIANGLE_BATCH_DEPTH` is clear, exactly as
+for a depth-function field without a depth BO.  If the capability is global,
+all advertised D16 ioctl variants must implement it before the cap is set;
+otherwise textured or two-textured draws could silently lose an API write
+mask transition.
+
+Mesa needs one cached capability boolean.  Its draw-state gate changes from
+requiring `depth_writemask` to requiring either the writemask or that cap, and
+sets bit 11 in every selected D16 argument: plain/blend, ordinary/RHW batch,
+one-texture, and two-texture.  It never sets the bit on the color-only path.
+The state object already retains `pipe_depth_stencil_alpha_state`, so no CSO
+layout change is required.
+
 Polygon offset needs two binary32 values and should use a new structured
 successor rather than consume or rename reserved fields in an old ioctl.  A
 minimal depth-state record is:
@@ -208,6 +261,26 @@ unmeasured units conversion.  The full successor should preserve the current
 128-byte batch envelope only if a new layout can do so naturally; ABI safety
 is more important than reusing old `reserved[]` bytes.  A new ioctl number and
 capability leave all existing structure sizes and semantics untouched.
+
+### Polygon-offset packet-growth map
+
+Unlike read-only, a state-complete bias successor grows the type-01 group.
+For the current untextured D16+blend body, replace indices 26--31 with:
+
+```text
+26..29  A10 A11 A12 A13
+30..35  A16 A17 A18 A19 A1A A1B
+36..38  A1E A1F A20
+39      A33 or padding
+40      next header
+```
+
+This is exactly eight additional dwords.  The same logical closure adds eight
+dwords to one-texture D16 because the existing five-word A10--A13/A20 block
+grows by A16--A1B plus A1E/A1F.  Keep A14/A15 absent and inherited for the
+first gate; adding their nominal zero values would combine an unmeasured
+mantissa-mask transition with bias.  Every enabled and disabled draw emits
+all A16--A1B and A1E--A20 words, so offset cannot leak into a legacy COPY.
 
 ## Live oracles
 
@@ -282,6 +355,16 @@ zero, which would make a Z=0 case a poor discriminator.  Before treating an
 exact `4000` result as ABI truth, record the actual D16 readback and allow a
 tight one-ulp implementation tolerance for the manual's fixed-format scaling
 rule.
+
+After that large raw-offset gate, validate the production D16 units lowering
+with factor zero and `units = -1`.  Its exact post-format offset bits are
+`b8000080`, the sign-flipped D16 multiplier.  Against stored `8000`, an equal
+incoming plane should move approximately two D16 steps toward near, pass
+LESS, and store `7ffe` (allow one adjacent code until rounding is measured).
+The `units = +1` control uses `38000080`, moves toward far, and must fail LESS
+against `8000`.  This small-offset pair distinguishes the proved multiplier
+from an accidental direct use of integer units without relying on a large
+quarter-range displacement.
 
 ### 4. Combined read-only bias control
 
