@@ -78,6 +78,12 @@ targets.
   non-expansion, bounded visible domains, and guarded precision oracles.
 - [chrome9-exp-log-scalar-corpus.tsv](chrome9-exp-log-scalar-corpus.tsv)
   retains the 28 selector/dependency and ten shader-version differentials.
+- [chrome9-scalar-mask-broadcast-contract.md](chrome9-scalar-mask-broadcast-contract.md)
+  closes scalar destination-mask packing and production temporary-lane
+  allocation while defining the full-XYZW-only runtime validator and live
+  broadcast, preservation, and precision gates.
+- [chrome9-scalar-mask-corpus.tsv](chrome9-scalar-mask-corpus.tsv) compacts 56
+  Windows/Linux RCP/RSQ/EXP/LOG terminal and masked-temporary differentials.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
