@@ -395,12 +395,13 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    chrome9_init_shader_caps(screen);
    caps = (struct pipe_caps *)&screen->base.caps;
    chrome9_restrict_generic_caps(caps);
-   /* Diagnostic only: this selects PIPE_TEXTURE_2D for DRI drawable/import
-    * resources so level-zero glamor can be exercised while the complete mip
-    * chain remains under validation.  It is deliberately off by default and
-    * must not be used as a conformance claim. */
-   caps->npot_textures =
-      debug_get_bool_option("CHROME9_FORCE_NPOT", false);
+   /* Normalized NPOT sampling is part of the validated textured-triangle
+    * contract.  Besides describing the hardware truthfully, this makes DRI
+    * import drawable images as PIPE_TEXTURE_2D.  Advertising RECT instead
+    * makes st_bind_egl_image reject a GL_TEXTURE_2D pixmap before the driver
+    * can create its guarded sampler shadow. */
+   caps->npot_textures = chrome9_screen_has_capability(
+      &screen->base, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
    caps->vendor_id = 0x1106;
    caps->device_id = screen->device_id;
    caps->endianness = PIPE_ENDIAN_NATIVE;

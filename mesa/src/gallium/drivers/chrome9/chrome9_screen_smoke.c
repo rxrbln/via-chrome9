@@ -4971,7 +4971,8 @@ main(int argc, char **argv)
           screen->caps.mixed_colorbuffer_formats ||
           !screen->caps.mixed_color_depth_bits ||
           screen->caps.npot_textures !=
-             debug_get_bool_option("CHROME9_FORCE_NPOT", false)) {
+             chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE)) {
          fprintf(stderr, "bounded Gallium capability contract failed\n");
          screen->destroy(screen);
          return 1;
