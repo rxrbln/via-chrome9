@@ -199,11 +199,15 @@ time alone.
 
 IRQ installation and vblank enable:
 
-1. Install the shared handler before exposing vblank support.
-2. Under the IRQ lock, sample only `0200 & f7ff0800` into the enable shadow.
-3. Clear stale IGA1 pending by writing `shadow | 00000008`, then flush-read.
-4. Set `80080000` in the shadow and write it with no status bits set.
-5. Flush-read, enable DRM vblank accounting, and verify that bit-3 interrupts
+1. Under the IRQ lock, sample only `0200 & f7ff0800` into the enable shadow,
+   mask owned bit 19, and clear stale IGA1 pending by writing
+   `shadow | 00000008` followed by a flush-read.
+2. Install the shared handler while the owned IGA1 source remains masked; only
+   then expose vblank support.
+3. From the DRM `enable_vblank` callback, set `80080000` in the shadow, clear
+   stale bit 3 with one narrow RW1C write, then write the status-free shadow
+   and flush-read.
+4. Enable DRM vblank accounting and verify that bit-3 interrupts
    advance at the fixed mode's expected cadence.  A read of `ffffffff` or a
    cleared global bit is not a handled device interrupt.
 
@@ -218,10 +222,10 @@ Arming one flip:
    refusal is a fail-closed invariant check.  Also refuse to overwrite `0214`
    if `0204[1]` still reports a previous update pending.
 3. Take a DRM vblank reference.  Under the IRQ/state lock, acknowledge any
-   already-pending bit-3 edge, record the current vblank sequence, and publish
-   the pending `{old_fb,new_fb,expected_base,event}` ownership before the MMIO
-   write.  This prevents the ISR from missing ownership if an edge races the
-   write.
+   already-pending bit-3 edge, record a driver-private monotonic handled-IRQ
+   serial, and publish the expected base before the MMIO write.  The old and
+   new framebuffer references remain owned by the sleeping atomic update
+   thread.  A DRM vblank sequence alone is insufficient for the race below.
 4. Ensure T11 A12 is disarmed and CR32 bit 0 was cleared during the full,
    blanked IGA1 enable, write the packed `0214` value, and read it back to
    flush the posted write.  There must be exactly one direct-base writer; do
@@ -230,15 +234,21 @@ Arming one flip:
 ISR:
 
 1. Read `0200` once.  If bit 3 is clear, do not claim IGA1 vblank.
-2. Write `irq_enable_shadow | 00000008` and flush-read, acknowledging early as
-   the Windows ISR does.
-3. Call `drm_crtc_handle_vblank()` exactly once.
-4. If a flip was armed before this new sequence, sample `0204` and `0214`.
+2. While holding the driver IRQ lock, write
+   `irq_enable_shadow | 00000008`, flush-read, increment the private IRQ
+   serial, and release the driver lock.
+3. Call `drm_crtc_handle_vblank()` exactly once outside the driver lock.  DRM
+   can invoke `enable_vblank` while holding its own vblank locks; nesting the
+   inverse order in the ISR would deadlock.
+4. Reacquire the driver lock.  If a flip was armed before this private edge
+   serial, sample `0204` and `0214`.  If arming raced after the acknowledge but
+   before the DRM callback, it recorded this already-incremented serial and
+   the old edge is therefore ignored.
    Complete/send its DRM event only when the predicate above holds.
 5. Drop the old framebuffer's display pin/SF mapping only after that event/latch
    point.  The new framebuffer remains display-owned.  Since unbinding may
-   sleep, the hard IRQ only marks the latch and transfers a reference to
-   deferred atomic cleanup; it does not tear down the SF mapping itself.
+   sleep, the hard IRQ only records the result and completes the sleeping
+   atomic update thread; it does not send the event or tear down an SF mapping.
 
 This deliberately allows a one-frame-late event if ordering is ambiguous.  A
 late event is recoverable; unmapping a framebuffer which display may still
@@ -356,6 +366,74 @@ arm sequence, requested SF VA, 0200, 0204, 0214, handled sequence
 Success requires repeated alternating flips where each event is delivered on
 a post-arm bit-3 edge with `0204[1]=0`, masked `0214` equal to the requested
 base, no guard corruption, and no stale frame after the old mapping is released.
-First run with both mappings retained for the whole test; only then enable
-post-latch old-mapping unbind.  A missing IRQ or a stuck `0204[1]` is a failed
-oracle, not justification for a polling-only userspace-visible flip.
+Stage the first single transition separately and disable/restore immediately
+after its exact completion record.  A missing IRQ or a stuck `0204[1]` is a
+failed oracle, not justification for a polling-only userspace-visible flip.
+
+## Bounded kernel implementation and live gate
+
+The isolated implementation built on 2026-09-21 deliberately enables this
+path only for the conjunction `fixed_iga1 && !staging_scanout &&
+direct_flips=1`.  Other KMS configurations do not call `drm_vblank_init()` and
+retain their previous no-vblank behavior.  The direct path requests the PCI
+IRQ shared, installs the simple-pipe vblank callbacks, and allows exactly one
+synchronous flip wait.  It uses these hard bounds:
+
+```text
+one armed flip
+three handled post-arm IGA1 edges
+100 ms absolute completion timeout
+success = post-arm edge && !(0204 & 2) && masked 0214 == expected
+```
+
+The ISR does not touch GEM references, reservations, GART PTEs, engine locks,
+VGA indexed registers, or DRM events.  The process-context pipe update already
+holds the new display pin and the old active display pin while it waits.  On
+success it sends the retained event and releases only the old display pin.  A
+post-publication failure blocks all later direct flips, withholds the event,
+and retains both possible display mappings until the existing full IGA1
+restore.  A pre-publication error retains only the old active mapping.
+
+Static acceptance before any hardware load is:
+
+1. a clean `W=1` external-module build with `CONFIG_DRM_CHROME9=m`;
+2. strict `checkpatch.pl` on the isolated diff;
+3. `tools/chrome9_iga1_flip_model.py`, including unrelated shared IRQ,
+   exact latch, three-edge failure, ownership-preserving disable, and the
+   acknowledge/arm/DRM-callback race; and
+4. review that the mapping-cache commit remains an unchanged parent and no
+   existing render reservation, fence, guard, or SF-unbind path moved.
+
+The first live gate must be staged, not inferred from a successful modeset:
+
+1. Load only with the already-proven fixed direct-SF mode plus
+   `chrome9.direct_flips=1`; preserve SSH recovery and do not start Xorg.
+2. Hold `0214` and every SF mapping fixed while observing at least 120 handled
+   IRQs.  Require monotonic DRM sequence, each interior cadence in 14--20 ms,
+   no sub-millisecond storm, unchanged `0204[1]`, unchanged masked `0214`, and
+   no unowned `0200` control change.
+3. Use two guarded 1024x768 XRGB8888 GEM framebuffers at 4096-byte pitch, one
+   solid red and one solid green.  Keep both GEM handles and guarded backing
+   storage alive in the oracle.  Issue one red-to-green flip, verify its exact
+   completion record, and immediately perform a full CRTC disable/restore.
+   Only after that single-transition containment gate passes, re-enable and
+   alternate exactly one page flip per event for at least 120 flips.
+4. For every completion capture the private arm/edge serial, `0200`, `0204`,
+   expected and observed masked `0214`, plus DRM event sequence.  Require the
+   event on a genuine later bit-3 edge, `0204[1]==0`, exact address match, the
+   expected visible color, intact leading/trailing guards, `040c==0`, and no
+   command-reader or GART fault.
+5. Stop after the first timeout, third-edge failure, cadence violation, stale
+   interrupt, unexpected base, guard change, or lost display/SSH.  Verify that
+   another flip is rejected, both mappings remain pinned, and a full CRTC
+   disable restores pre-KMS VGA state before any mapping is released.
+6. The normal success path unpins each old display mapping only after its
+   exact event/latch proof.  During the 120-flip run verify no stale color or
+   freed-page fetch; a failed post-publication transition must instead retain
+   both display mappings until the full restore.
+
+On teardown the driver logs handled/shared-none IRQ counts, minimum/maximum
+cadence, completed flips, and failed flips.  A clean gate has `completed=120`
+or more, `failed=0`, no storm-like minimum cadence, and an exact match between
+userspace events and visible/address transitions.  No polling observation of
+`0200[1]`, time passage, or `0214` readback can substitute for that result.
