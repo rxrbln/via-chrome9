@@ -279,6 +279,8 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_VERTEX];
    struct pipe_shader_caps *fs =
       (struct pipe_shader_caps *)&screen->base.shader_caps[MESA_SHADER_FRAGMENT];
+   unsigned fs_samplers;
+   int debug_fs_samplers;
 
    draw_init_shader_caps(vs);
    vs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
@@ -304,15 +306,25 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       3 : 2;
    fs->max_outputs = 1;
    fs->max_temps = 8;
-   /* Runtime execution currently accepts exactly one full vec4 at c0 for
-    * the bounded solid-color fragment program. */
-   fs->max_const_buffer0_size = 4 * sizeof(float);
+   /* The full two-bank hardware store is independently capability-gated;
+    * shader execution remains restricted to closed semantic programs. */
+   fs->max_const_buffer0_size =
+      (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32) ?
+      32 * 4 * sizeof(float) : 4 * sizeof(float);
    fs->max_const_buffers = 1;
    /* Mesa's compatibility context requires at least one logical unit. */
-   fs->max_texture_samplers =
+   fs_samplers =
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
       2 : 1;
-   fs->max_sampler_views = fs->max_texture_samplers;
+   /* Diagnostic-only GL2 link probe.  Draw classification remains closed
+    * to live-proven one-/two-unit programs, so this cannot submit an
+    * unvalidated higher-unit packet. */
+   debug_fs_samplers =
+      debug_get_num_option("CHROME9_DEBUG_MAX_FS_SAMPLERS", 0);
+   if (debug_fs_samplers > (int)fs_samplers && debug_fs_samplers <= 8)
+      fs_samplers = debug_fs_samplers;
+   fs->max_texture_samplers = fs_samplers;
+   fs->max_sampler_views = fs_samplers;
    if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) {
       fs->max_tex_instructions = fs->max_texture_samplers;
       fs->max_tex_indirections = 1;
@@ -337,6 +349,7 @@ chrome9_restrict_generic_caps(struct pipe_caps *caps)
    caps->dest_surface_srgb_control = false;
    caps->packed_stream_output = false;
    caps->two_sided_color = false;
+   caps->flatshade = false;
    caps->clip_planes = 0;
    caps->dithering = false;
    caps->mixed_colorbuffer_formats = false;

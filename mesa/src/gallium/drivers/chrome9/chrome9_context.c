@@ -1329,6 +1329,530 @@ chrome9_fs_is_rgbx(nir_def *def, unsigned depth)
 }
 
 static bool
+chrome9_fs_is_input_at(nir_def *def, unsigned location)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_intrinsic_instr *intr;
+   nir_variable *var;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_load_interpolated_input:
+      return nir_intrinsic_io_semantics(intr).location == location &&
+             !nir_intrinsic_component(intr);
+   case nir_intrinsic_load_deref:
+      var = nir_intrinsic_get_var(intr, 0);
+      return var && var->data.mode == nir_var_shader_in &&
+             var->data.location == location && !var->data.location_frac;
+   default:
+      return false;
+   }
+}
+
+static bool
+chrome9_fs_is_input_component(const nir_alu_src *src, unsigned location,
+                              unsigned component, unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+   unsigned lane;
+
+   if (depth > 12 || !def)
+      return false;
+   lane = src->swizzle[0];
+   if (chrome9_fs_is_input_at(def, location))
+      return lane == component && component < def->num_components;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov) {
+      nir_alu_src next = alu->src[0];
+
+      next.swizzle[0] = alu->src[0].swizzle[lane];
+      return chrome9_fs_is_input_component(&next, location, component,
+                                            depth + 1);
+   }
+   if (alu->op == nir_op_vec2 || alu->op == nir_op_vec3 ||
+       alu->op == nir_op_vec4) {
+      nir_alu_src next;
+
+      if (lane >= nir_op_infos[alu->op].num_inputs)
+         return false;
+      next = alu->src[lane];
+      return chrome9_fs_is_input_component(&next, location, component,
+                                            depth + 1);
+   }
+   return false;
+}
+
+static bool
+chrome9_fs_texture_component_base(const nir_alu_src *src, unsigned component,
+                                  nir_def **base, unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+   unsigned lane;
+
+   if (depth > 12 || !def)
+      return false;
+   lane = src->swizzle[0];
+   if (def->num_components == 4 && lane == component &&
+       chrome9_fs_is_texture(def, 0)) {
+      *base = def;
+      return true;
+   }
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_mov)
+      return false;
+   nir_alu_src next = alu->src[0];
+
+   next.swizzle[0] = alu->src[0].swizzle[lane];
+   return chrome9_fs_texture_component_base(&next, component, base,
+                                             depth + 1);
+}
+
+static bool
+chrome9_fs_is_packed_texture_primary_component(const nir_alu_src *src,
+                                               unsigned texture_component,
+                                               unsigned input_location,
+                                               unsigned input_component,
+                                               nir_def **texture,
+                                               unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+   nir_alu_src a, b;
+   unsigned lane;
+
+   if (depth > 12 || !def)
+      return false;
+   lane = src->swizzle[0];
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov) {
+      nir_alu_src next = alu->src[0];
+
+      next.swizzle[0] = alu->src[0].swizzle[lane];
+      return chrome9_fs_is_packed_texture_primary_component(
+         &next, texture_component, input_location, input_component,
+         texture, depth + 1);
+   }
+   if (alu->op != nir_op_fmul)
+      return false;
+   a = alu->src[0];
+   b = alu->src[1];
+   a.swizzle[0] = alu->src[0].swizzle[lane];
+   b.swizzle[0] = alu->src[1].swizzle[lane];
+   return (chrome9_fs_texture_component_base(&a, texture_component,
+                                              texture, depth + 1) &&
+           chrome9_fs_is_input_component(&b, input_location,
+                                          input_component, depth + 1)) ||
+          (chrome9_fs_texture_component_base(&b, texture_component,
+                                              texture, depth + 1) &&
+           chrome9_fs_is_input_component(&a, input_location,
+                                          input_component, depth + 1));
+}
+
+static bool
+chrome9_fs_is_ioquake3_generic_result(nir_def *def, unsigned depth)
+{
+   static const unsigned location[4] = {
+      VARYING_SLOT_VAR0, VARYING_SLOT_VAR0,
+      VARYING_SLOT_VAR1, VARYING_SLOT_VAR1,
+   };
+   static const unsigned component[4] = { 2, 3, 0, 1 };
+   nir_instr *instr;
+   nir_def *texture = NULL;
+
+   if (depth > 12 || def->num_components != 4)
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_ioquake3_generic_result(alu->src[0].src.ssa,
+                                                    depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 4; c++) {
+      nir_def *component_texture = NULL;
+
+      if (!chrome9_fs_is_packed_texture_primary_component(
+             &alu->src[c], c, location[c], component[c],
+             &component_texture, depth + 1) ||
+          (texture && texture != component_texture))
+         return false;
+      texture = component_texture;
+   }
+   return texture != NULL;
+}
+
+static bool
+chrome9_fs_is_ioquake3_generic_packed(nir_shader *nir)
+{
+   unsigned derefs = 0, loads = 0, uniforms = 0, terminates = 0, stores = 0;
+   unsigned constants = 0, textures = 0;
+   unsigned vec2 = 0, vec4 = 0, fmul = 0, ieq = 0;
+   unsigned feq = 0, fge = 0, flt = 0, iand = 0;
+   unsigned constant_mask = 0;
+   nir_def *result = NULL;
+
+   if (nir->info.stage != MESA_SHADER_FRAGMENT ||
+       nir->info.num_textures != 1 || !nir->info.fs.uses_discard)
+      return false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_deref:
+               derefs++;
+               break;
+            case nir_instr_type_load_const: {
+               nir_load_const_instr *load = nir_instr_as_load_const(instr);
+               uint32_t value;
+
+               if (load->def.num_components != 1 || load->def.bit_size != 32)
+                  return false;
+               value = load->value[0].u32;
+               if (value == 0)
+                  constant_mask |= 1u << 0;
+               else if (value == 1)
+                  constant_mask |= 1u << 1;
+               else if (value == 2)
+                  constant_mask |= 1u << 2;
+               else if (value == 3)
+                  constant_mask |= 1u << 3;
+               else if (value == 0x3f000000)
+                  constant_mask |= 1u << 4;
+               else
+                  return false;
+               constants++;
+               break;
+            }
+            case nir_instr_type_tex:
+               if (!chrome9_fs_is_texture(&nir_instr_as_tex(instr)->def, 0))
+                  return false;
+               textures++;
+               break;
+            case nir_instr_type_alu: {
+               nir_op op = nir_instr_as_alu(instr)->op;
+
+               if (op == nir_op_vec2)
+                  vec2++;
+               else if (op == nir_op_vec4)
+                  vec4++;
+               else if (op == nir_op_fmul)
+                  fmul++;
+               else if (op == nir_op_ieq)
+                  ieq++;
+               else if (op == nir_op_feq)
+                  feq++;
+               else if (op == nir_op_fge)
+                  fge++;
+               else if (op == nir_op_flt)
+                  flt++;
+               else if (op == nir_op_iand)
+                  iand++;
+               else
+                  return false;
+               break;
+            }
+            case nir_instr_type_intrinsic: {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  loads++;
+               } else if (intr->intrinsic == nir_intrinsic_load_uniform) {
+                  if (!nir_src_is_const(intr->src[0]) ||
+                      nir_src_as_uint(intr->src[0]) ||
+                      nir_intrinsic_base(intr) || intr->def.num_components != 1)
+                     return false;
+                  uniforms++;
+               } else if (intr->intrinsic == nir_intrinsic_terminate_if) {
+                  terminates++;
+               } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+
+                  if (!var || var->data.mode != nir_var_shader_out ||
+                      (var->data.location != FRAG_RESULT_COLOR &&
+                       var->data.location != FRAG_RESULT_DATA0) || stores++)
+                     return false;
+                  result = intr->src[1].ssa;
+               } else {
+                  return false;
+               }
+               break;
+            }
+            default:
+               return false;
+            }
+         }
+      }
+   }
+   return derefs == 3 && loads == 2 && uniforms == 1 && terminates == 3 &&
+          stores == 1 && constants == 5 && constant_mask == 0x1f &&
+          textures == 1 && vec2 == 1 && vec4 == 2 && fmul == 2 &&
+          ieq == 3 && feq == 1 && fge == 1 && flt == 1 && iand == 1 &&
+          result && chrome9_fs_is_ioquake3_generic_result(result, 0);
+}
+
+static bool
+chrome9_fs_is_ioquake3_packed_texture(nir_def *def, unsigned unit)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_tex_instr *tex;
+   nir_instr *coord_instr;
+   nir_alu_instr *coord_alu;
+   int coord;
+   unsigned first = unit ? 2 : 0;
+
+   if (def->num_components != 4 || instr->type != nir_instr_type_tex)
+      return false;
+   tex = nir_instr_as_tex(instr);
+   coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (tex->op != nir_texop_tex || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       tex->is_array || tex->is_shadow || tex->texture_index != unit ||
+       tex->sampler_index != unit || tex->coord_components != 2 || coord < 0 ||
+       tex->num_srcs != 1)
+      return false;
+   coord_instr = nir_def_instr(tex->src[coord].src.ssa);
+   if (coord_instr->type != nir_instr_type_alu)
+      return false;
+   coord_alu = nir_instr_as_alu(coord_instr);
+   return coord_alu->op == nir_op_vec2 &&
+          chrome9_fs_is_input_component(&coord_alu->src[0],
+                                        VARYING_SLOT_VAR0, first, 0) &&
+          chrome9_fs_is_input_component(&coord_alu->src[1],
+                                        VARYING_SLOT_VAR0, first + 1, 0);
+}
+
+static unsigned
+chrome9_fs_ioquake3_lightmap_factors(const nir_alu_src *src,
+                                     unsigned component, unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+   unsigned lane;
+
+   if (depth > 12 || !def)
+      return 0;
+   lane = src->swizzle[0];
+   if (def->num_components == 4 && lane == component) {
+      if (chrome9_fs_is_ioquake3_packed_texture(def, 0))
+         return 1u << 0;
+      if (chrome9_fs_is_ioquake3_packed_texture(def, 1))
+         return 1u << 1;
+   }
+   if (chrome9_fs_is_input_component(src, VARYING_SLOT_VAR1, component, 0))
+      return 1u << 2;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov) {
+      nir_alu_src next = alu->src[0];
+
+      next.swizzle[0] = alu->src[0].swizzle[lane];
+      return chrome9_fs_ioquake3_lightmap_factors(&next, component,
+                                                  depth + 1);
+   }
+   if (alu->op == nir_op_fmul) {
+      nir_alu_src a = alu->src[0];
+      nir_alu_src b = alu->src[1];
+      unsigned ma, mb;
+
+      /* The fixed program evaluates (tex0 * tex1) * primary.  Admit the
+       * captured tex0 * (primary * tex1) tree only when NIR explicitly
+       * permits reassociation. */
+      if (nir_alu_instr_no_reassoc(alu))
+         return 0;
+      a.swizzle[0] = alu->src[0].swizzle[lane];
+      b.swizzle[0] = alu->src[1].swizzle[lane];
+      ma = chrome9_fs_ioquake3_lightmap_factors(&a, component, depth + 1);
+      mb = chrome9_fs_ioquake3_lightmap_factors(&b, component, depth + 1);
+      return ma && mb && !(ma & mb) ? ma | mb : 0;
+   }
+   return 0;
+}
+
+static bool
+chrome9_fs_is_ioquake3_lightmap_result(nir_def *def, unsigned depth)
+{
+   nir_instr *instr;
+
+   if (depth > 12 || def->num_components != 4)
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_ioquake3_lightmap_result(alu->src[0].src.ssa,
+                                                     depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++)
+      if (chrome9_fs_ioquake3_lightmap_factors(&alu->src[c], c,
+                                               depth + 1) != 0x7)
+         return false;
+   return chrome9_fs_ioquake3_lightmap_factors(&alu->src[3], 3,
+                                                depth + 1) == 0x5;
+}
+
+static bool
+chrome9_fs_is_ioquake3_lightmap_packed(nir_shader *nir)
+{
+   unsigned derefs = 0, loads = 0, uniforms = 0, terminates = 0, stores = 0;
+   unsigned constants = 0, textures = 0, texture_mask = 0;
+   unsigned vec2 = 0, vec3 = 0, vec4 = 0, fmul = 0, ieq = 0;
+   unsigned feq = 0, fge = 0, flt = 0, iand = 0;
+   unsigned constant_mask = 0;
+   unsigned fmul_no_reassoc = 0, fmul_ctrl = 0;
+   nir_def *result = NULL;
+
+   if (nir->info.stage != MESA_SHADER_FRAGMENT ||
+       nir->info.num_textures != 2 || !nir->info.fs.uses_discard)
+      return false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_deref:
+               derefs++;
+               break;
+            case nir_instr_type_load_const: {
+               nir_load_const_instr *load = nir_instr_as_load_const(instr);
+               uint32_t value;
+
+               if (load->def.num_components != 1 || load->def.bit_size != 32)
+                  return false;
+               value = load->value[0].u32;
+               if (value == 0)
+                  constant_mask |= 1u << 0;
+               else if (value == 1)
+                  constant_mask |= 1u << 1;
+               else if (value == 2)
+                  constant_mask |= 1u << 2;
+               else if (value == 3)
+                  constant_mask |= 1u << 3;
+               else if (value == 0x3f000000)
+                  constant_mask |= 1u << 4;
+               else
+                  return false;
+               constants++;
+               break;
+            }
+            case nir_instr_type_tex: {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+               if (tex->texture_index > 1 ||
+                   !chrome9_fs_is_ioquake3_packed_texture(&tex->def,
+                                                          tex->texture_index))
+                  return false;
+               texture_mask |= 1u << tex->texture_index;
+               textures++;
+               break;
+            }
+            case nir_instr_type_alu: {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               nir_op op = alu->op;
+
+               if (op == nir_op_vec2)
+                  vec2++;
+               else if (op == nir_op_vec3)
+                  vec3++;
+               else if (op == nir_op_vec4)
+                  vec4++;
+               else if (op == nir_op_fmul) {
+                  fmul++;
+                  fmul_ctrl |= alu->fp_math_ctrl;
+                  fmul_no_reassoc += nir_alu_instr_no_reassoc(alu);
+               }
+               else if (op == nir_op_ieq)
+                  ieq++;
+               else if (op == nir_op_feq)
+                  feq++;
+               else if (op == nir_op_fge)
+                  fge++;
+               else if (op == nir_op_flt)
+                  flt++;
+               else if (op == nir_op_iand)
+                  iand++;
+               else
+                  return false;
+               break;
+            }
+            case nir_instr_type_intrinsic: {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  loads++;
+               } else if (intr->intrinsic == nir_intrinsic_load_uniform) {
+                  if (!nir_src_is_const(intr->src[0]) ||
+                      nir_src_as_uint(intr->src[0]) ||
+                      nir_intrinsic_base(intr) || intr->def.num_components != 1)
+                     return false;
+                  uniforms++;
+               } else if (intr->intrinsic == nir_intrinsic_terminate_if) {
+                  terminates++;
+               } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+
+                  if (!var || var->data.mode != nir_var_shader_out ||
+                      (var->data.location != FRAG_RESULT_COLOR &&
+                       var->data.location != FRAG_RESULT_DATA0) || stores++)
+                     return false;
+                  result = intr->src[1].ssa;
+               } else {
+                  return false;
+               }
+               break;
+            }
+            default:
+               return false;
+            }
+         }
+      }
+   }
+   bool result_match = result &&
+      chrome9_fs_is_ioquake3_lightmap_result(result, 0);
+   bool match = derefs == 3 && loads == 2 && uniforms == 1 &&
+      terminates == 3 && stores == 1 && constants == 5 &&
+      constant_mask == 0x1f && textures == 2 && texture_mask == 0x3 &&
+      vec2 == 2 && vec3 == 0 && vec4 == 1 && fmul == 3 && ieq == 3 &&
+      feq == 1 && fge == 1 && flt == 1 && iand == 1 && result_match;
+
+   if (debug_get_bool_option("CHROME9_DEBUG_LIGHTMAP_MATCH", false))
+      fprintf(stderr, "chrome9: lightmap match=%u result=%u "
+              "deref=%u load=%u uniform=%u term=%u store=%u const=%u/%#x "
+              "tex=%u/%#x vec=%u/%u/%u mul=%u(no-reassoc=%u ctrl=%#x) "
+              "cmp=%u/%u/%u/%u/%u\n",
+              match, result_match, derefs, loads, uniforms, terminates, stores,
+              constants, constant_mask, textures, texture_mask, vec2, vec3,
+              vec4, fmul, fmul_no_reassoc, fmul_ctrl, ieq, feq, fge, flt,
+              iand);
+   return match;
+}
+
+static bool
 chrome9_fs_pair(unsigned a, unsigned b, unsigned x, unsigned y)
 {
    return (a == x && b == y) || (a == y && b == x);
@@ -1415,6 +1939,14 @@ chrome9_fs_classify(nir_shader *nir)
    unsigned constant_count = 0;
    bool written = false, valid = true;
 
+   /* Linked generic_fp packs texture ST in VAR0.xy and primary RGBA in
+    * VAR0.zw/VAR1.xy.  The semantic matcher closes both the color DAG and
+    * complete integer alpha-test tree; draw time admits proven modes 0/1. */
+   if (chrome9_fs_is_ioquake3_generic_packed(nir))
+      return CHROME9_FS_IOQUAKE3_GENERIC_PACKED;
+   if (chrome9_fs_is_ioquake3_lightmap_packed(nir))
+      return CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED;
+
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -1452,6 +1984,12 @@ chrome9_fs_classify(nir_shader *nir)
                constant_count++;
                break;
             case nir_intrinsic_load_input:
+               /* With pipe_caps.flatshade=false, state tracker flat color
+                * arrives as a direct load.  The immediate packet currently
+                * emits Gouraud A23 state and has no provoking-vertex fixup,
+                * so fail closed until that topology-aware path exists. */
+               valid = false;
+               break;
             case nir_intrinsic_load_interpolated_input:
             case nir_intrinsic_load_barycentric_pixel:
             case nir_intrinsic_load_barycentric_centroid:
@@ -1622,6 +2160,15 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->fragment_program = chrome9_fs_classify(state->ir.nir);
       shader->supported =
          shader->fragment_program != CHROME9_FS_UNSUPPORTED;
+      if (!shader->supported &&
+          debug_get_bool_option("CHROME9_DUMP_UNSUPPORTED_NIR", false)) {
+         fprintf(stderr, "chrome9: unsupported FS %p\n", (void *)shader);
+         nir_print_shader(state->ir.nir, stderr);
+      }
+      if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false))
+         fprintf(stderr, "chrome9: create FS %p program=%u supported=%u\n",
+                 (void *)shader, shader->fragment_program,
+                 shader->supported);
    } else if (state->type == PIPE_SHADER_IR_TGSI) {
       shader->supported = chrome9_tgsi_fs_passthrough(state->tokens);
       shader->fragment_program = shader->supported ?
@@ -1637,6 +2184,11 @@ chrome9_bind_fs_state(struct pipe_context *pipe, void *state)
    struct chrome9_shader *shader = state;
 
    ctx->fs = shader;
+   if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false))
+      fprintf(stderr, "chrome9: bind FS %p program=%u supported=%u\n",
+              (void *)shader,
+              shader ? shader->fragment_program : 0,
+              shader ? shader->supported : 0);
    draw_bind_fragment_shader(ctx->draw, shader ? shader->draw : NULL);
 }
 
@@ -2288,6 +2840,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->draw_two_textured_triangle_d16_blend =
       !!(capabilities &
          DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND);
+   ctx->two_texture_tex0_alpha_primary =
+      !!(capabilities &
+         DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY);
    ctx->draw_triangle_blend =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND);
    ctx->draw_textured_triangle_blend =

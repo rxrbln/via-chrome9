@@ -45,6 +45,8 @@ struct chrome9_shader {
       CHROME9_FS_TWO_TEXTURE_MODULATE,
       CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA,
       CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY,
+      CHROME9_FS_IOQUAKE3_GENERIC_PACKED,
+      CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED,
    } fragment_program;
    bool supported;
 };
@@ -110,6 +112,7 @@ struct chrome9_context {
    bool draw_two_textured_triangle;
    bool draw_two_textured_triangle_d16;
    bool draw_two_textured_triangle_d16_blend;
+   bool two_texture_tex0_alpha_primary;
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;

@@ -89,6 +89,7 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    int position, color0, color1, generic0 = -1;
+   int generic1 = -1;
    int texcoord[2] = { -1, -1 };
 
    position = draw_find_shader_output(crender->ctx->draw,
@@ -105,14 +106,20 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ? 2 :
       program == CHROME9_FS_PRIMARY_GENERIC_RGBA ? 3 :
       program == CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX ? 4 :
-      program == CHROME9_FS_PRIMARY_GENERIC_RGBX ? 5 : 0;
+      program == CHROME9_FS_PRIMARY_GENERIC_RGBX ? 5 :
+      program == CHROME9_FS_IOQUAKE3_GENERIC_PACKED ? 6 :
+      program == CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED ? 7 : 0;
    if (crender->packed_generic)
       generic0 = draw_find_shader_output(crender->ctx->draw,
                                          TGSI_SEMANTIC_GENERIC, 0);
+   if (crender->packed_generic >= 6)
+      generic1 = draw_find_shader_output(crender->ctx->draw,
+                                         TGSI_SEMANTIC_GENERIC, 1);
    crender->texture_count =
       (program == CHROME9_FS_TWO_TEXTURE_MODULATE ||
        program == CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA ||
-       program == CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY) ? 2 :
+       program == CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY ||
+       program == CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED) ? 2 :
       (program == CHROME9_FS_TEXTURE_REPLACE ||
        program == CHROME9_FS_TEXTURE_RGBX ||
        program == CHROME9_FS_TEXTURE_MODULATE ||
@@ -122,7 +129,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
        program == CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
        program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ||
        program == CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
-       program == CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE) ? 1 : 0;
+       program == CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE ||
+       program == CHROME9_FS_IOQUAKE3_GENERIC_PACKED) ? 1 : 0;
    crender->textured = crender->texture_count != 0;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
       texcoord[unit] = draw_find_shader_output(crender->ctx->draw,
@@ -134,19 +142,26 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    }
    memset(&crender->vinfo, 0, sizeof(crender->vinfo));
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, position);
-   draw_emit_vertex_attr(&crender->vinfo,
-                         crender->packed_generic ? EMIT_4F : EMIT_4UB_BGRA,
-                         crender->packed_generic ? generic0 : color0);
-   draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
+   if (crender->packed_generic >= 6) {
+      draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, generic0);
+      draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, generic1);
+   } else {
+      draw_emit_vertex_attr(&crender->vinfo,
+                            crender->packed_generic ? EMIT_4F : EMIT_4UB_BGRA,
+                            crender->packed_generic ? generic0 : color0);
+      draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
+   }
    /* Keep a fixed four-float slot for each coordinate set.  Ordinary 2D
     * sampling consumes only S/T; linked shaders are allowed to export a vec2
     * and leave the unused R/Q components at draw's defaults. */
-   if (crender->packed_generic != 2)
+   if (crender->packed_generic != 2 && crender->packed_generic < 6)
       for (unsigned unit = 0; unit < crender->texture_count; unit++)
          draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, texcoord[unit]);
    draw_compute_vertex_size(&crender->vinfo);
    crender->layout_valid = position >= 0 &&
-                           (crender->packed_generic ? generic0 >= 0 :
+                           (crender->packed_generic >= 6 ?
+                            generic0 >= 0 && generic1 >= 0 :
+                            crender->packed_generic ? generic0 >= 0 :
                             (color0 >= 0 ||
                              (program != CHROME9_FS_PRIMARY_COLOR &&
                               program != CHROME9_FS_TEXTURE_MODULATE &&
@@ -159,11 +174,14 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                                  CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY))) &&
                            (!crender->textured ||
                             ((crender->packed_generic == 2 ||
+                              crender->packed_generic >= 6 ||
                               texcoord[0] >= 0) &&
                              (crender->texture_count == 1 ||
+                              crender->packed_generic >= 6 ||
                               texcoord[1] >= 0))) &&
                            crender->vinfo.size ==
-                              (crender->packed_generic ?
+                              (crender->packed_generic >= 6 ? 12 :
+                               crender->packed_generic ?
                                9 : 6 + 4 * crender->texture_count);
    return &crender->vinfo;
 }
@@ -262,7 +280,8 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    size_t size;
 
-   if (vertex_size != (crender->packed_generic ? 9 :
+   if (vertex_size != (crender->packed_generic >= 6 ? 12 :
+                       crender->packed_generic ? 9 :
                        6 + 4 * crender->texture_count) * sizeof(uint32_t))
       return false;
    size = (size_t)vertex_size * nr_vertices;
@@ -449,6 +468,34 @@ chrome9_blend_is_source_over(const struct drm_chrome9_blend_state *blend)
 }
 
 static bool
+chrome9_fragment_uniform_u32(struct chrome9_context *ctx, unsigned offset,
+                             uint32_t *value)
+{
+   const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
+   const uint8_t *map;
+
+   if ((offset & 3) || cb->buffer_size < sizeof(*value) ||
+       offset > cb->buffer_size - sizeof(*value) ||
+       cb->buffer_offset > UINT32_MAX - offset - sizeof(*value))
+      return false;
+   if (cb->user_buffer) {
+      map = (const uint8_t *)cb->user_buffer + cb->buffer_offset + offset;
+   } else if (cb->buffer && cb->buffer->target == PIPE_BUFFER &&
+              cb->buffer->width0 >= sizeof(*value) &&
+              cb->buffer_offset + offset <=
+                 cb->buffer->width0 - sizeof(*value)) {
+      map = chrome9_resource(cb->buffer)->bo.map;
+      if (!map)
+         return false;
+      map += cb->buffer_offset + offset;
+   } else {
+      return false;
+   }
+   memcpy(value, map, sizeof(*value));
+   return true;
+}
+
+static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
                              struct chrome9_resource **depth,
@@ -498,6 +545,25 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
       blend->alpha_test_func = ctx->dsa->alpha_func;
       blend->alpha_test_ref = float_to_ubyte(ctx->dsa->alpha_ref_value);
       *blend_successor = true;
+   }
+   if (ctx->fs->fragment_program == CHROME9_FS_IOQUAKE3_GENERIC_PACKED ||
+       ctx->fs->fragment_program == CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED) {
+      uint32_t mode;
+
+      *reason = "shader-alpha-test";
+      if ((ctx->dsa && ctx->dsa->alpha_enabled) ||
+          !chrome9_fragment_uniform_u32(ctx, 0, &mode) || mode > 3)
+         return false;
+      if (mode) {
+         if (!ctx->alpha_test_supported)
+            return false;
+         blend->flags |= DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE;
+         blend->alpha_test_func = mode == 1 ? PIPE_FUNC_GREATER :
+                                  mode == 2 ? PIPE_FUNC_LESS :
+                                              PIPE_FUNC_GEQUAL;
+         blend->alpha_test_ref = mode == 1 ? 0 : 128;
+         *blend_successor = true;
+      }
    }
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       *blend_successor = true;
@@ -643,6 +709,12 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              source->format != (unit ? PIPE_FORMAT_B8G8R8X8_UNORM :
                                       PIPE_FORMAT_B8G8R8A8_UNORM))
             return false;
+         *reason = "packed-lightmap-source-format";
+         if (ctx->fs->fragment_program ==
+                CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED && unit == 1 &&
+             source->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+             !ctx->two_texture_tex0_alpha_primary)
+            return false;
       }
       *reason = "texture-alias";
       if (texture_count == 2 &&
@@ -730,6 +802,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    const char *state_reason = "vertex-layout";
    bool blend_successor = false;
    bool depth_active = false;
+   bool packed_lightmap_tex0_alpha = false;
    bool perspective_batch;
    const bool two_projected_primary = ctx->fs &&
       (ctx->fs->fragment_program ==
@@ -787,6 +860,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       return;
    }
+   packed_lightmap_tex0_alpha = ctx->fs->fragment_program ==
+      CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED &&
+      textures[1] &&
+      textures[1]->base.format == PIPE_FORMAT_B8G8R8A8_UNORM;
    perspective_batch = depth_active && ctx->draw_triangle_d16_rhw_batch;
    if (depth_active) {
       if (ctx->depth_func_supported || ctx->depth_equal_supported ||
@@ -830,7 +907,25 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       if (crender->packed_generic) {
          packed = (const float *)(vertex + 4 * sizeof(float));
-         if (crender->packed_generic == 3 ||
+         if (crender->packed_generic >= 6) {
+            const unsigned components = crender->packed_generic == 7 ? 8 : 6;
+
+            for (unsigned c = 0; c < components; c++)
+               if (!isfinite(packed[c])) {
+                  ctx->rejected_triangles++;
+                  return;
+               }
+            if (crender->packed_generic == 7)
+               color = (uint32_t)float_to_ubyte(packed[6]) |
+                       (uint32_t)float_to_ubyte(packed[5]) << 8 |
+                       (uint32_t)float_to_ubyte(packed[4]) << 16 |
+                       (uint32_t)float_to_ubyte(packed[7]) << 24;
+            else
+               color = (uint32_t)float_to_ubyte(packed[4]) |
+                       (uint32_t)float_to_ubyte(packed[3]) << 8 |
+                       (uint32_t)float_to_ubyte(packed[2]) << 16 |
+                       (uint32_t)float_to_ubyte(packed[5]) << 24;
+         } else if (crender->packed_generic == 3 ||
              crender->packed_generic == 5) {
             unsigned components = crender->packed_generic == 3 ? 4 : 3;
 
@@ -870,6 +965,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       y[i] = chrome9_coord_16_16(position[1], target->base.height0);
       if (crender->textured) {
          const float *texcoord = crender->packed_generic == 2 ? packed + 1 :
+            crender->packed_generic >= 6 ? packed :
             (const float *)(vertex + 6 * sizeof(uint32_t));
          uint32_t texcoord_q = 0;
 
@@ -910,7 +1006,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          memcpy(&texture_args.vertices[i].rhw_float, &position[3],
                 sizeof(position[3]));
          texture_args.vertices[i].color = color;
-         if (crender->packed_generic == 2) {
+         if (crender->packed_generic == 2 ||
+             crender->packed_generic >= 6) {
             texture_args.vertices[i].specular = 0;
          } else {
             memcpy(&texture_args.vertices[i].specular,
@@ -926,7 +1023,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          if (crender->texture_count == 2) {
             struct drm_chrome9_two_textured_vertex *two_vertex =
                &two_texture_args.vertices[i];
-            const float *texcoord1 = texcoord + 4;
+            const float *texcoord1 = crender->packed_generic == 7 ?
+               texcoord + 2 : texcoord + 4;
             uint32_t texcoord1_q = 0;
 
             if (two_projected_primary)
@@ -995,6 +1093,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
 
    if (crender->texture_count == 2) {
       two_texture_args.destination_handle = target->bo.handle;
+      two_texture_args.flags = packed_lightmap_tex0_alpha ?
+         DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY : 0;
       two_texture_args.width = target->base.width0;
       two_texture_args.height = target->base.height0;
       two_texture_args.destination_pitch = target->stride;
@@ -1022,7 +1122,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          two_texture_depth_args.destination_handle =
             two_texture_args.destination_handle;
          two_texture_depth_args.depth_handle = depth->bo.handle;
-         two_texture_depth_args.flags = depth_flags;
+         two_texture_depth_args.flags = depth_flags |
+            two_texture_args.flags;
          two_texture_depth_args.width = two_texture_args.width;
          two_texture_depth_args.height = two_texture_args.height;
          two_texture_depth_args.destination_pitch =
@@ -1033,7 +1134,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             two_texture_depth_blend_args.destination_handle =
                two_texture_args.destination_handle;
             two_texture_depth_blend_args.depth_handle = depth->bo.handle;
-            two_texture_depth_blend_args.flags = depth_flags;
+            two_texture_depth_blend_args.flags = depth_flags |
+               two_texture_args.flags;
             two_texture_depth_blend_args.width = two_texture_args.width;
             two_texture_depth_blend_args.height = two_texture_args.height;
             two_texture_depth_blend_args.destination_pitch =
