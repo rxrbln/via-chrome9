@@ -192,6 +192,51 @@ smoke_copy_rect(struct pipe_screen *screen)
             goto out;
          }
       }
+
+      /* Characterize a non-origin subrectangle, every outside pixel, and
+       * the following unmasked command so the H6 byte mask cannot leak. */
+      for (unsigned i = 0; i < 32 * 32; i++)
+         destination_pixels[i] = 0x66000000 | i;
+      copy.destination_x = 3;
+      copy.destination_y = 5;
+      copy.source_x = 7;
+      copy.source_y = 9;
+      copy.width = 11;
+      copy.height = 13;
+      if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+         goto out;
+      for (unsigned y = 0; y < 32; y++)
+         for (unsigned x = 0; x < 32; x++) {
+            unsigned i = y * 32 + x;
+            bool inside = x >= 3 && x < 14 && y >= 5 && y < 18;
+            unsigned source_i = (y - 5 + 9) * 32 + (x - 3 + 7);
+            uint32_t expected = inside ?
+               0x66000000 | (source_pixels[source_i] & 0x00ffffff) :
+               0x66000000 | i;
+
+            if (destination_pixels[i] != expected)
+               goto out;
+         }
+      copy.flags = 0;
+      if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+         goto out;
+      for (unsigned y = 0; y < 32; y++)
+         for (unsigned x = 0; x < 32; x++) {
+            unsigned i = y * 32 + x;
+            bool inside = x >= 3 && x < 14 && y >= 5 && y < 18;
+            unsigned source_i = (y - 5 + 9) * 32 + (x - 3 + 7);
+            uint32_t expected = inside ? source_pixels[source_i] :
+                                         0x66000000 | i;
+
+            if (destination_pixels[i] != expected)
+               goto out;
+         }
+      copy.destination_x = 0;
+      copy.destination_y = 0;
+      copy.source_x = 0;
+      copy.source_y = 0;
+      copy.width = 32;
+      copy.height = 32;
    }
    if (chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION)) {
