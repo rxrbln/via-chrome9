@@ -72,14 +72,15 @@ therefore needs only these A31 values:
 | nearest-mip-linear | `31100002` | `31102082` |
 | linear-mip-linear | `31100412` | `31102492` |
 
-The shipping builders also maintain auxiliary A32 high bits while changing
-filter modes.  In particular, their ordinary linear/linear path sets
-A32[19] and A32[16], yielding a low-24 contribution `00090000`.  Current
-VX900 tests have already produced the exact bilinear midpoint with
-A31=`31102490` and those A32 bits clear, so they are not required to obtain
-basic bilinear filtering on this chip.  Their quality/performance effect is
-unmeasured.  Preserve the live minimal A32 encoding in the first Mesa path;
-use a one-word differential oracle before adopting the vendor auxiliary bits.
+The shipping builders also maintain A32 high bits while changing filter
+modes.  The manual resolves them: A32[21:19] and A32[18:16] are R enlargement
+and R shrinking, respectively.  Thus their ordinary linear/linear path sets
+A32[19] and A32[16], yielding `00090000`, because the generic builder applies
+the same filter to S, T, and R.  Current 2-D VX900 tests correctly leave the
+unused R filters nearest/zero while A31=`31102490` produces the exact
+bilinear midpoint.  Preserve that minimal A32 encoding for 2-D; a future
+3-D/STR sampler must program and validate the R fields rather than inheriting
+the 2-D word.
 
 ### Why anisotropy is not an A31-only extension
 
