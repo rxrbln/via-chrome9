@@ -153,6 +153,9 @@ targets.
 - [ioquake3-next-gl1-keys.md](ioquake3-next-gl1-keys.md) ranks the expected
   post-blit GL1 keys, specifies projected one- and three-factor classifiers,
   and fixes the three-factor D16 packet indices and rejection oracles.
+- [two-texture-primary-uapi-design.md](two-texture-primary-uapi-design.md)
+  defines the flag-compatible no-depth/D16 three-factor ABI, exact 266/270
+  dword packet maps, Mesa Q=1 gates, and staged four-object silicon tests.
 - [textured-d16-format-contract.md](textured-d16-format-contract.md) gives the
   exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
   X-versus-alpha sampler semantics, and strict render-target reinterpretation
