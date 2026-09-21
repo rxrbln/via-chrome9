@@ -128,6 +128,14 @@ is respectively `ea5cf02b1da49962e77466a322fb499b82b55faeba3d7348c3bdc62af83145e
 and `b60cb2fd7c2a9fd89cabd5ffa9131b9a0857b14c6db4a068718c03ac37dcf140`.
 The exact host-order words are in `sampler-4x4-coefficients.tsv`.
 
+The Windows tables at `VTGUModeDX32A:0x10046e98` and `0x10048e98` are
+byte-identical to the Linux B-spline and Gaussian arrays respectively.  The
+Windows mode-4 branches copy `0x10048e98`, while mode 5 copies `0x10046e98`;
+Linux's symbol names close the same private mapping as mode 4 = Gaussian and
+mode 5 = B-spline.  This names the coefficient objects, but it still does not
+prove how the earlier D3D/OpenGL API front ends map public quality enums into
+private modes 4/5.
+
 This packet is 36 dwords including its header.  It is context-global rather
 than per texture stage, so a future implementation must serialize table
 ownership, dirty it when switching B-spline/Gaussian state, and either restore
