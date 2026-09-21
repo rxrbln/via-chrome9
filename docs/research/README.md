@@ -70,6 +70,9 @@ targets.
 - [mip-format-projective-oracles.md](mip-format-projective-oracles.md)
   defines bounded mip-level, format, software/native projection, and texture
   cache-transition gates for the post-two-texture implementation.
+- [texture-coordinate-lod-contract.md](texture-coordinate-lod-contract.md)
+  recovers the exact A04/A08 coordinate controls, cross-checks Windows and
+  Linux projective state, and defines bounded rectangle/derivative/LOD gates.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
