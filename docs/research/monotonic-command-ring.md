@@ -95,10 +95,11 @@ unreliable and therefore reads it twice (`:1247..1258,1270..1284,
 1300..1316,1326..1339`).
 
 Its `rewind_ring_agp_inv()` additionally writes A66/A67 while the old range is
-owned, relies on PID01/JUMP behavior, and on H5S2VP1 points JUMP 64 bytes before
-the aligned tail because the 410 jump command requires `4*128` alignment
-(`:1145..1189`).  None of that protocol has been live-proven on this VX900.
-Do not import it into the first monotonic implementation.
+owned and on H5S2VP1 points JUMP 64 bytes before the aligned tail because the
+410 jump command requires `4*128` alignment (`:1145..1189`).  A65 itself stays
+PID00; this is an A66/A67 tail-jump protocol, not an explicit PID01 write.
+None of that protocol has been live-proven on this VX900.  Do not import it
+into the first monotonic implementation.
 
 The Windows executable independently contains the same circular-space
 algorithm at `VTGKModeDX32A.sys:0xa1c50..0xa1f46`.  Its recovered ring fields
@@ -119,6 +120,20 @@ double-read policy, and current-pointer dependency are not Linux-source
 accidents; they are also in the shipping Windows ring manager.  This is useful
 cross-checking, but it strengthens the reason to defer byte reuse until Linux
 has a bounded silicon oracle for `043c`.
+
+The adjacent VX900 128-byte rewind implementation at
+`VTGKModeDX32A.sys:0xc7f80..0xc817a` exposes a generation-sensitive conflict
+which makes reuse still less suitable for initial bring-up.  It emits the
+dummy H2 prefix, pads the tail with `ccccccc7` through a 128-byte cursor,
+sets A66/A67 JUMP to translated tail cursor minus **16**, resets its software
+cursor to the CPU base, sets PID00 A64/A65 to translated base minus 16, and
+writes A66, A67, A64, A65 in that order without A68.  The old Linux H5S2VP1
+path instead subtracts **64** for its JUMP address.  Both use PID00 in A65;
+neither proves that one tail offset is safe for the other subgeneration.
+
+The first driver should therefore defer both the A66/A67 tail-jump rewind and
+any explicit PID01 experiment.  PID10 full idle plus a complete reinstall has
+none of this unresolved `-16` versus `-64` dependency.
 
 ## Implementation-ready layout
 
@@ -291,7 +306,8 @@ the active ring only after full idle.
 
 On a STOP timeout, retain the old epoch untouched and quarantine for reboot.
 On a timeout after the new full install, retain the new epoch and all job
-mappings for reboot.  Never attempt PID01 rewind as fallback.
+mappings for reboot.  Never attempt A66/A67 tail-jump rewind or PID01 as a
+fallback.
 
 Teardown remains identical to the current live-proven path: owned PID00 and
 non-CR idle, then PID10/full wait-mask idle, then and only then invalidate ring
