@@ -1,10 +1,11 @@
 # Chrome9 HD D16 read-only and polygon-offset contract
 
 This note defines the next bounded depth-state extension after the proven D16
-and D16-RHW paths.  Read-only and polygon offset remain a static
-implementation plan, not a claim that those new states have run on hardware.
-The existing LESS/LEQUAL write-enabled ABI and packets must remain unchanged
-until each new-state oracle below passes.
+and D16-RHW paths.  Read-only and native A16--A18 polygon offset remain a
+static implementation plan, not a claim that those new hardware states have
+run.  Mesa draw already has a software vertex-Z offset path, distinguished
+below from the proposed native path.  The existing LESS/LEQUAL write-enabled
+ABI and packets must remain unchanged until each new-state oracle passes.
 
 The most important result is that depth read-only and polygon offset are
 orthogonal:
@@ -16,6 +17,13 @@ orthogonal:
 - polygon offset changes A16--A18 only.  It is not encoded in A14/A15.
 
 ## Independent evidence
+
+The Windows files used here are
+`VTGUModeDX32A.dll` SHA-256
+`8ac6959fc3ab21b73fcf37ae4615e87ab285f3a56bc27623f3094d82cee49b45`
+and `VTGOGL32A.dll` SHA-256
+`a54e38ca7c038d7ce4937f9d940aa6e7d02886ef097730f4a1ae03979c9b4d2c`
+from the VT3410 Windows 7 package.
 
 The *VX900 Series Chrome9 HD Open Graphics Programming Manual*, preliminary
 revision 1.0, pages 91--94, defines A01 bit 3 as Z-test enable, A01 bit 2 as
@@ -38,10 +46,34 @@ The Linux proprietary driver independently supplies executable evidence:
 
 The Windows D3D builder at `VTGUModeDX32A.dll:0x101fa910` and Z-function
 builder at `0x101faa10` perform the same enable/write and comparison updates.
-The Windows OpenGL copy at `VTGOGL32A.dll:0x1024e6d0` is an independent
-compiler build of the same state transition.  Old Mesa 7.11.2
-`via_state.c:viaChooseDepthState` is only policy evidence, but agrees that a
-disabled depth test also disables depth writes.
+The exact write-mask branch is `0x101fa94f..0x101fa966`: a true context
+`+0x1d44` ORs A01 bits 2 and 3, while false clears bit 2 and still ORs bit 3.
+The disabled/unbound branch at `0x101fa96c` masks A01 with `ffffffe3`.
+
+The byte-matching Windows OpenGL routine begins at
+`VTGOGL32A.dll:0x1024e5d0`, not `0x1024e6d0`.  Its write test is at
+`0x1024e60f`; `0x1024e618/0x1024e61c` set bits 2/3 and
+`0x1024e622/0x1024e626` clear bit 2/set bit 3.  This is an independent
+relocated build of the D3D transition, not a manual-only inference.
+
+The Windows D3D bias builder is
+`VTGUModeDX32A.dll:0x101fbde0..0x101fc058`; the independently relocated
+OpenGL copy is `VTGOGL32A.dll:0x1024f790..0x1024fa08`.  In the D3D public
+state dispatcher, `D3DRS_DEPTHBIAS` reaches `0x100ca453`, stores the exact
+float bits at context `+0x1e64`, and dirties class `0x1e`.
+`D3DRS_SLOPESCALEDEPTHBIAS` reaches `0x100ca477`, stores the exact bits at
+`+0x1e68`, and dirties class `0x4a`.  The final builder splits the resulting
+binary32 words into its hardware image at `+0x58/+0x5c/+0x5e/+0x60` at
+`0x101fbfd7..0x101fc002`; the OpenGL copy does the same at
+`0x1024f987..0x1024f9b2`.
+
+Old Mesa 7.11.2 `via_state.c:viaChooseDepthState` is policy evidence only,
+but agrees that a disabled depth test also disables depth writes.  Its older
+UniChrome rasterizer does not program this Chrome9 state: `_NEW_TRI_OFFSET`
+selects the software triangle template in `via_tris.c`, and
+`tnl_dd/t_dd_tritmp.h` adds the computed offset to each vertex Z before
+emission.  That is useful independent evidence for the required state-owner
+rule below, not evidence that the older register layout matches Chrome9.
 
 ## Exact register meanings and deltas
 
@@ -61,6 +93,23 @@ A16/A17/A18, no offset       16000000 17000000 18000000
 A19/A1A/A1B                  19800000 1a800000 1b803fbf
 A1E/A1F/A20                  1e000000 1f000000 20007fff
 ```
+
+The manual gives these exact field interpretations:
+
+| word | fields used by the bounded D16 path |
+|---|---|
+| A10 | depth SF virtual address in 256-byte units |
+| A11 | bits 22:13 pitch in 32-byte units; bits 12/11 reading-Z cache enable/clear; bit 10 cache width; bit 9 direct write-through; bits 1:0 location (`01` = SF) |
+| A12 | bit 23 selects W instead of Z; bits 21/20/19 force 1.0 to 1.0-, clamp above 1.0, and clamp negative to zero; bits 18:16 format (`000` = D16); bit 0 tiled mode |
+| A13 | bits 18:16 comparison; bits 7:0 power-of-two Z normalization factor |
+| A20 | high bytes of the floating far and near per-pixel Z clip values |
+
+Thus `11000001 | ((pitch >> 5) << 13)` deliberately disables both
+reading-Z cache controls and direct write-through, selects the existing
+128-bit/default cache mode, and places the linear surface in SF.  Likewise,
+`12380000` is D16 linear Z, forces/clamps the fixed-point endpoints, and does
+not enable separated stencil.  These words do not change when writes are
+disabled or bias is enabled.
 
 `depth_func` is the native three-bit value:
 
@@ -84,6 +133,24 @@ read-only test still reads the depth surface.  A13 remains live because the
 test still runs.  A20 must remain `20007fff`; reset value `20000000` collapses
 the pre-depth-test pixel-Z interval to zero and can reject ordinary nonzero Z
 before A13.
+
+### A20/A21/A22 are header-qualified namespaces
+
+The register byte alone is not a global register identity.  Three packet
+headers reuse `A20`, and confusing them would corrupt texture dimensions or
+primitive assembly:
+
+| packet namespace | A20 | A21 | A22 |
+|---|---|---|---|
+| type 01 common/depth | far/near clip high bytes, proven `20007fff` | reserved/omitted | reserved/omitted |
+| type 02 texture stage N | `(height << 12) | width` | level-0 length, current `21000001` | layout/POT/log-size; clear POT/log fields for NPOT |
+| type 04 raster/FVF | primitive vertex-cycle/index mode, current `20000000` | reserved | reserved |
+
+The type-01 manual jumps directly from depth A20 to stencil A23; there is no
+depth A21 or A22.  A bias successor must therefore stop its depth closure at
+type-01 A20.  It must leave each type-02 stage's A20/A21/A22 exactly as
+lowered from that texture, including the independently proven NPOT A22
+clearing rule, and leave type-04 A20 at the selected primitive mode.
 
 ### A14/A15 are not depth bias
 
@@ -140,11 +207,41 @@ context prerequisites, not part of each bias toggle.
 The public polygon `factor` becomes `scale` without conversion.  Public
 `units` does not become `offset` directly: the Linux builder multiplies it by
 `0x38000080` when bound-resource field `+0x158` is `0x10`, and by
-`0x34000001` otherwise.  `sfmGetPatchColorKey:0xb6afc..0xb6b52`
+`0x34000001` otherwise.  The Windows D3D builder independently tests the
+bound resource's `+0x124` against `0x10` at `0x101fbe19..0x101fbe3a` and
+selects doubles at `0x1005f760/0x1005f768`.  Rounded to binary32, those are
+exactly `0x38000080` (`3.051804378628731e-5`) and `0x34000001`
+(`1.1920930376163597e-7`).  OpenGL repeats the test and multiplication at
+`0x1024f7c9..0x1024f7ea`.  `sfmGetPatchColorKey:0xb6afc..0xb6b52`
 independently proves that field is bits per pixel: values 8, 16, and 32 select
 byte, word, and dword loads from the surface.  Therefore D16 uses
 `0x38000080` (approximately `3.0518044e-5`), while the 32-bpp D24S8, D24X8,
 and D32 family uses `0x34000001` (approximately `1.1920930e-7`).
+
+The current Mesa 26.2 Chrome9 path already has a conservative software
+lowering.  `chrome9_bind_rasterizer_state()` passes the rasterizer to draw;
+`draw_pipe_validate.c` selects the offset stage for `offset_tri`, and
+`draw_pipe_offset.c` computes
+
+```text
+max(abs(dZ/dX), abs(dZ/dY)) * offset_scale + offset_units * MRD * 2
+```
+
+for a fixed-point depth buffer, then adds it to all three window-space vertex
+Z values.  `chrome9_set_framebuffer_state()` calls `draw_set_zs_format()`, so
+Z16 supplies the correct MRD.  `MRD * 2` for Z16 is precisely the proprietary
+`0x38000080` scale above.  Mesa 7.11.2 used the same style of software
+triangle lowering in `tnl_dd/t_dd_tritmp.h`.
+
+This gives a usable decal fallback today for unclamped filled triangles: keep
+hardware A16--A18 neutral and let draw own polygon offset.  It is exact for a
+planar triangle as long as the adjusted vertices do not hit the software
+`SATURATE` endpoints; it remains an approximation to the manual's stated
+per-fragment placement in the general clipped/clamped case.  A future
+hardware-bias path must pass a copy with all three `offset_*` enables cleared
+to draw while retaining the original state for A16--A18 lowering.  Leaving
+`offset_tri` enabled in draw and also programming hardware bias applies the
+offset twice and is a hard pre-submit error, not an acceptable approximation.
 
 Fill, line, and point enables are separate proprietary context booleans at
 `+0x3c40`, `+0x3c44`, and `+0x3c48`, selected against polygon mode at
@@ -219,18 +316,28 @@ batch ABI, reject `READ_ONLY` when `TRIANGLE_BATCH_DEPTH` is clear, exactly as
 for a depth-function field without a depth BO.  If the capability is global,
 all advertised D16 ioctl variants must implement it before the cap is set;
 otherwise textured or two-textured draws could silently lose an API write
-mask transition.
+mask transition.  Initially retain the depth BO's existing write reservation,
+cache ownership, and post-retirement synchronization even for read-only
+requests.  A later read-only reservation optimization is not worth weakening
+serialization during the first gate, and the full-payload immutability oracle
+below depends on a coherent CPU readback.
 
 Mesa needs one cached capability boolean.  Its draw-state gate changes from
 requiring `depth_writemask` to requiring either the writemask or that cap, and
 sets bit 11 in every selected D16 argument: plain/blend, ordinary/RHW batch,
 one-texture, and two-texture.  It never sets the bit on the color-only path.
 The state object already retains `pipe_depth_stencil_alpha_state`, so no CSO
-layout change is required.
+layout change is required.  This is the immediate ioquake decal prerequisite:
+a typical decal pass needs depth testing with depth writes off, whereas its
+polygon offset can continue through draw's bounded software stage until the
+native bias path is proved.
 
-Polygon offset needs two binary32 values and should use a new structured
-successor rather than consume or rename reserved fields in an old ioctl.  A
-minimal depth-state record is:
+Hardware polygon offset needs two binary32 values and should use a new
+structured successor rather than consume or rename reserved fields in an old
+ioctl.  The original untextured D16 request has only one 32-bit reserved word,
+while other D16 requests have differing spare layouts; partially repurposing
+them would make one Gallium rasterizer state mean different things by shader
+path.  A minimal common depth-state record is:
 
 ```text
 u32 flags;               /* TEST, WRITE, BIAS_FILL; all others rejected */
@@ -256,7 +363,10 @@ The first advertised version should be narrower than the record permits:
    floating point, userspace should pass the resulting finite binary32 offset
    and the kernel should validate its bits and bounds;
 7. kernel generation owns all packet words.  Userspace never supplies A01 or
-   A10--A20 directly.
+   A10--A20 directly;
+8. hardware bias and draw software bias are mutually exclusive for a draw.
+   Assert that the draw-facing rasterizer copy has `offset_point`,
+   `offset_line`, and `offset_tri` clear before setting `BIAS_FILL`.
 
 This split permits read-only depth to land without coupling it to an
 unmeasured units conversion.  The full successor should preserve the current
@@ -266,23 +376,80 @@ capability leave all existing structure sizes and semantics untouched.
 
 ### Polygon-offset packet-growth map
 
-Unlike read-only, a state-complete bias successor grows the type-01 group.
-For the current untextured D16+blend body, replace indices 26--31 with:
+Unlike read-only, a bias/clip-closed successor grows the type-01 group by
+exactly eight dwords.  A shared helper should generate this ordered 13-word
+sequence and all builders should assert it rather than carry independent
+literal lists:
 
 ```text
-26..29  A10 A11 A12 A13
-30..35  A16 A17 A18 A19 A1A A1B
-36..38  A1E A1F A20
-39      A33 or padding
-40      next header
+A10 A11 A12 A13
+A16 A17 A18 A19 A1A A1B
+A1E A1F A20
 ```
 
-This is exactly eight additional dwords.  The same logical closure adds eight
-dwords to one-texture D16 because the existing five-word A10--A13/A20 block
-grows by A16--A1B plus A1E/A1F.  Keep A14/A15 absent and inherited for the
+A14/A15 remain absent and inherit the established initialized context for the
 first gate; adding their nominal zero values would combine an unmeasured
-mantissa-mask transition with bias.  Every enabled and disabled draw emits
-all A16--A1B and A1E--A20 words, so offset cannot leak into a legacy COPY.
+mantissa-mask transition with bias.  The helper emits neutral A16--A18 and the
+same A19--A1B/A1E--A20 closure even when offset is disabled, so bias cannot
+leak into a later COPY or texture draw.
+
+For the current untextured D16 bodies the exact layout becomes:
+
+```text
+                   no blend             blend (delta = 4)
+A01                19                   23
+A10..A13           22..25               26..29
+A16..A1B           26..31               30..35
+A1E..A20           32..34               36..38
+A33/padding        35                   39
+next header        36                   40
+type-04 A20        60                   64
+type-04 A23/A24    61/62                65/66
+clip A80..A83      112..115             116..119
+vertex header      172                  176
+first vertex       176                  180
+```
+
+The untextured body formula changes from `170 + 18*T` to `178 + 18*T`
+without blend, and from `174 + 18*T` to `182 + 18*T` with blend.  One triangle
+is therefore 196/200 dwords.  Keep the proven maximum of 34 triangles; do not
+spend the remaining staging-page margin by increasing it, and retain a final
+pointer-versus-page bound assertion before appending sync/status/cookie.
+
+For one texture, let `d = 4` only when the existing blend destination closure
+is present.  The current texture-stage words remain at body
+`[22+d]/[23+d]/[24+d]` for type-02 A20/A21/A22.  Only the later type-01 common
+group grows:
+
+```text
+A01                 body[44+d]
+A10..A13            body[47+d]..body[50+d]
+A16..A1B            body[51+d]..body[56+d]
+A1E..A20 depth      body[57+d]..body[59+d]
+type-04 A20         body[84+d]
+```
+
+The resulting D16 body lengths are 236 dwords for non-blend REPLACE, 240 for
+non-blend MODULATE, 240 for blend REPLACE, and 244 for blend MODULATE.  The
+REPLACE/MODULATE distinction still selects affine/perspective A01 exactly as
+before; it does not change the bias representation.
+
+For two textures, the two independent type-02 A20/A21/A22 triplets remain at
+body `[22..24]` and `[42..44]`.  The type-01 depth and later raster state
+become:
+
+```text
+A01                 body[64]
+A10..A13            body[67]..body[70]
+A16..A1B            body[71]..body[76]
+A1E..A20 depth      body[77]..body[79]
+type-04 A20         body[101]
+```
+
+The two-texture D16 body grows from 266 to 274 dwords.  Both texture A22 words
+continue to carry their own POT/log-size decision; neither depth read-only nor
+polygon offset may touch them.  This separation is the key assertion for an
+NPOT two-texture decal gate.
 
 ## Live oracles
 
@@ -377,13 +544,53 @@ draw blue at Z=0.5 with EQUAL/read-only; blue must then pass.  This detects an
 implementation that incorrectly applies bias to stored depth or couples the
 write mask to the compare input.
 
+### 5. Textured namespace and transition matrix
+
+Repeat the independent read-only and coplanar tests through all shader packet
+families that bind D16.  Use textures with unequal RGB channels so a stale
+solid-color result cannot pass accidentally:
+
+| path | required cases | additional invariant |
+|---|---|---|
+| one texture REPLACE | write, read-only, negative bias | type-02 A20/A21/A22 and sampled texel unchanged |
+| one texture MODULATE/RHW | write, read-only, negative bias | varying RHW result unchanged except depth acceptance |
+| two texture MODULATE | write, read-only, negative bias | both sampled inputs contribute; both texture state triplets unchanged |
+| untextured RHW | write, read-only, negative bias | perspective A01 changes only at bit 2 for read-only |
+
+For the two-texture row use distinct NPOT dimensions, for example the proven
+30x18 and 22x14 pair.  Assert type-02 words at body `[22..24]` and `[42..44]`
+before submission and four texture/target guards afterward.  A depth helper
+that accidentally writes type-01 values into either texture namespace should
+therefore fail in validation rather than reach hardware.
+
+Run the sequence negative-bias one-texture -> neutral two-texture -> neutral
+untextured without reinitializing 3D.  The latter two draws must behave as
+unbiased.  Then reverse the first transition: read-only textured ->
+write-enabled textured, and verify that only the latter changes the complete
+D16 payload.  Compare the entire depth payload byte-for-byte for read-only
+cases, not just the four guards.
+
+Finally render the same unclamped coplanar triangles twice, once with Mesa's
+existing software offset and neutral A16--A18 and once with draw offset
+disabled plus hardware A16--A18.  Factor zero/units +/-1 and units zero with a
+nonzero-slope factor must agree within the measured D16 rounding tolerance.
+Any result consistent with the sum of both offsets is an ownership failure and
+must disable the hardware-bias capability.
+
 ## Mesa exposure gate
 
-Until live validation completes, report polygon-offset and broad depth-state
-support as unavailable.  After the read-only gate passes, Mesa may lower
+Until live hardware bias validation completes, retain draw's software polygon
+offset and emit neutral A16--A18.  Do not silently ignore `offset_tri`, but do
+not claim a native bias fast path either.  Reject `offset_point`,
+`offset_line`, nonzero `offset_clamp`, floating-point depth, or a depth format
+other than Z16 from the bounded hardware path; those states remain with draw
+or fall back.
+
+After the read-only gate passes, Mesa may lower
 `pipe_depth_state.writemask == false` only when the kernel advertises the new
 capability; otherwise reject/fallback before submission.  After the raw bias
-gate passes, the statically proved D16 `units` multiplier permits a truthful
-D16-only GL/Gallium lowering, but advertise it only after factor, units, and
-state-closure cases pass live.  A diagnostic raw-offset ioctl is evidence
-tooling, not by itself truthful GL polygon-offset support.
+gate and software-versus-hardware comparison pass, the statically proved D16
+`units` multiplier permits switching filled Z16 triangles to hardware bias.
+Make that switch per draw, clear draw's offset enables, and keep every other
+case on the software stage.  A diagnostic raw-offset ioctl is evidence
+tooling, not by itself truthful general GL polygon-offset support.
