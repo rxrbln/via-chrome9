@@ -22,6 +22,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/u_inlines.h"
+#include "util/u_debug.h"
 #include "util/u_math.h"
 #include "util/u_sampler.h"
 
@@ -2001,7 +2002,9 @@ main(int argc, char **argv)
           screen->caps.two_sided_color || screen->caps.clip_planes ||
           screen->caps.dithering ||
           screen->caps.mixed_colorbuffer_formats ||
-          !screen->caps.mixed_color_depth_bits) {
+          !screen->caps.mixed_color_depth_bits ||
+          screen->caps.npot_textures !=
+             debug_get_bool_option("CHROME9_FORCE_NPOT", false)) {
          fprintf(stderr, "bounded Gallium capability contract failed\n");
          screen->destroy(screen);
          return 1;
