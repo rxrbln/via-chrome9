@@ -173,6 +173,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_COPY_RECT	(1ULL << 44)
 /* COPY_RECT may target a strictly sized offset-zero scanout allocation. */
 #define DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION	(1ULL << 45)
+/* GEM_CREATE can keep scanout pages directly addressable by the 32-bit GPU. */
+#define DRM_CHROME9_CAP_GEM_DMA32_SCANOUT	(1ULL << 46)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -186,6 +188,13 @@ struct drm_chrome9_gem_create {
 	__u32 handle;
 	__u64 mmap_offset;
 };
+
+/*
+ * Allocate native pages below 4 GiB and reject the object if the DMA mapping
+ * nevertheless uses SWIOTLB.  This is intended only for exported scanout
+ * buffers: ordinary render resources should not consume constrained memory.
+ */
+#define DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT	(1U << 0)
 
 #define DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE	(1U << 0)
 #define DRM_CHROME9_FIXED_QUAD_CONSTANT_RED	(1U << 1)
