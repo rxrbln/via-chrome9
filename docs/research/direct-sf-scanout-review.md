@@ -75,6 +75,37 @@ closed by retaining display ownership; recovery is a later confirmed restore
 or reboot, never PTE invalidation.  There is still no direct page flip or DRM
 vblank event support.
 
+## Measured static-SF result
+
+The first live direct gate passed on 2026-09-21 with kernel commit `6193bb5`
+and `staging_scanout=N`.  Xorg's active framebuffer was exactly the expected
+native object:
+
+```text
+FB 40, XR24, 1024x768, pitch 4096, offset 4096
+object size 3153920, imported=no
+```
+
+The kernel logged `enabled at SF 0x11000`.  Passive MMIO readback was
+`0214=00008800`, `0204=00000c04` with bit 1 clear, and engine error
+`040c=00000000`.  After the bounded render client had exited and Xorg was idle,
+the indexed VGA snapshot returned CR0C=`88`, CR0D=`00`, CR34=`00`, CR48=`40`.
+Thus both independent reconstructions agree exactly:
+
+```text
+A = 0x00008800
+B = A << 1 = 0x00011000
+CR48[7:6] = 01b (SF)
+0214[28:0] = A
+```
+
+A bounded `glxgears` run rendered at about 20.2 FPS without a fault or engine
+error.  Clean Xorg shutdown logged the confirmed IGA1 restore and debugfs then
+showed no framebuffer.  This proves the complete 770-page persistent mapping,
+the single addition of the 4096-byte plane offset, translated-SF display fetch,
+front-buffer render retirement/resync, and clean static ownership release on
+the tested path.  It does not yet prove vblank IRQ cadence or direct flips.
+
 ## Exact first live gate without a planned reboot
 
 Keep SSH and a text log open for the whole run.  Do not use
@@ -91,7 +122,8 @@ log, a new engine error, or an address mismatch.
    `/sys/kernel/debug/dri/0/state` to show the same active native FB:
    XR24, 1024x768, pitch 4096, offset 4096, object size 3153920,
    `imported=no`, active/enable both one.
-4. Run `chrome9_vga_snapshot` and reconstruct the programmed word address:
+4. Quiesce every userspace render client before running
+   `chrome9_vga_snapshot`, then reconstruct the programmed word address:
 
    ```text
    A = CR0D | (CR0C << 8) | (CR34 << 16) | ((CR48 & 0x1f) << 24)
@@ -126,6 +158,13 @@ cat /sys/kernel/debug/dri/0/state
 /root/tmp/chrome9/chrome9_display_snapshot \
   /sys/bus/pci/devices/0000:00:01.0/resource1
 ```
+
+The display snapshot is passive MMIO.  Despite its name, the VGA snapshot is
+an indexed-register transaction: it writes selector ports and the attribute
+enable value, then restores the selectors.  It has no vgaarb lock and must not
+run concurrently with rendering, a modeset, or any GART update.  The safe
+first discriminator while Xorg is active is therefore the kernel's `SF` log
+plus passive `0214/0204`; capture CR48 only in a deliberately quiesced window.
 
 If output is black/stale but SSH remains, stop Xorg once and inspect logs and
 registers.  A normal confirmed restore permits continued software diagnosis
