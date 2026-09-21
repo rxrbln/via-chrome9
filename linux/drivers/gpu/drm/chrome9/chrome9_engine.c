@@ -36,7 +36,7 @@
 #define CHROME9_GART_CACHED		BIT(25)
 #define CHROME9_RING_PAGES		16U
 #define CHROME9_RING_SIZE		(CHROME9_RING_PAGES * PAGE_SIZE)
-#define CHROME9_RUN_STAGING_SIZE	SZ_32K
+#define CHROME9_RUN_STAGING_SIZE	SZ_64K
 #define CHROME9_CR_READ_AHEAD		0x220U
 #define CHROME9_SEQ_INDEX		0x83c4
 #define CHROME9_SEQ_DATA			0x83c5
@@ -858,6 +858,7 @@ static int chrome9_build_copy_rect(struct chrome9_engine *engine,
 	u32 alpha_mask[] = {
 		0x48, 0x70000000,
 	};
+	static const u32 preserve_alpha[] = { 0x48, 0x80000000 };
 	u32 alpha_fill[] = {
 		0x04, 0x00000300,
 		0x14, target >> 3,
@@ -880,6 +881,9 @@ static int chrome9_build_copy_rect(struct chrome9_engine *engine,
 	p = base;
 	chrome9_emit_header0(&p, pre_sync, 1);
 	chrome9_emit_header0(&p, clear_state, 4);
+	if (request->flags &
+	    DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA)
+		chrome9_emit_header0(&p, preserve_alpha, 1);
 	chrome9_emit_header0(&p, copy, 8);
 	chrome9_emit_header0(&p, post_sync, 1);
 	if (request->flags & DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE) {
@@ -893,6 +897,9 @@ static int chrome9_build_copy_rect(struct chrome9_engine *engine,
 		chrome9_emit_header0(&p, post_sync, 1);
 		chrome9_emit_header0(&p, reset_mask, 1);
 	}
+	if (request->flags &
+	    DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA)
+		chrome9_emit_header0(&p, reset_mask, 1);
 	chrome9_emit_header0(&p, cookie, 1);
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
@@ -1649,8 +1656,8 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	if (ret)
 		return ret;
 	if (run && triangle_count == DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES &&
-	    (*pause != 0x4ff0 || job->segment_stop != 0x5070 ||
-	     body[54 + delta] != 0x24000330))
+	    (*pause != 0x9c70 || job->segment_stop != 0x9cf0 ||
+	     body[54 + delta] != 0x24000660))
 		return -EINVAL;
 	return 0;
 }
@@ -2667,7 +2674,7 @@ static bool chrome9_verify_map_guards(struct iosys_map *map, u64 size)
 }
 
 static void chrome9_copy_rect_cache_flush(struct chrome9_job *job,
-		const struct chrome9_draw_request *request)
+		const struct chrome9_draw_request *request, bool after_device)
 {
 	bool unguarded = request->flags &
 			 DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED;
@@ -2678,8 +2685,9 @@ static void chrome9_copy_rect_cache_flush(struct chrome9_job *job,
 
 	/*
 	 * Only the validated source and destination rectangles participate in
-	 * this closed 2D operation.  Flush their cache-line-covering row ranges,
-	 * plus the two kernel-owned guard pages, under one ownership barrier.
+	 * this closed 2D operation.  Before execution, publish both rectangles;
+	 * after a read-only source operation, invalidate only the destination.
+	 * Include the corresponding kernel-owned guard pages in each phase.
 	 */
 	mb();
 #ifdef CONFIG_X86
@@ -2688,16 +2696,20 @@ static void chrome9_copy_rect_cache_flush(struct chrome9_job *job,
 		clflush_cache_range((u8 *)job->map.vaddr + request->object_size -
 				    PAGE_SIZE, PAGE_SIZE);
 	}
-	clflush_cache_range(job->depth_map.vaddr, PAGE_SIZE);
-	clflush_cache_range((u8 *)job->depth_map.vaddr +
-			    request->depth_object_size - PAGE_SIZE, PAGE_SIZE);
+	if (!after_device) {
+		clflush_cache_range(job->depth_map.vaddr, PAGE_SIZE);
+		clflush_cache_range((u8 *)job->depth_map.vaddr +
+				    request->depth_object_size - PAGE_SIZE,
+				    PAGE_SIZE);
+	}
 	for (y = 0; y < request->copy_height; y++) {
 		clflush_cache_range(destination +
 			(request->destination_y + y) * request->pitch +
 			request->destination_x * sizeof(u32), row_bytes);
-		clflush_cache_range(source +
-			(request->source_y + y) * request->texture_pitch +
-			request->source_x * sizeof(u32), row_bytes);
+		if (!after_device)
+			clflush_cache_range(source +
+				(request->source_y + y) * request->texture_pitch +
+				request->source_x * sizeof(u32), row_bytes);
 	}
 #endif
 	mb();
@@ -3510,7 +3522,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		chrome9_prepare_map_guards(&job->texture3_map,
 					   request->texture3_object_size);
 	if (request->kind == CHROME9_DRAW_COPY_RECT)
-		chrome9_copy_rect_cache_flush(job, request);
+		chrome9_copy_rect_cache_flush(job, request, false);
 	else {
 		chrome9_cache_flush(job->map.vaddr, request->object_size);
 		chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
@@ -3621,7 +3633,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->texture3_sgt,
 					 DMA_BIDIRECTIONAL);
 	if (request->kind == CHROME9_DRAW_COPY_RECT)
-		chrome9_copy_rect_cache_flush(job, request);
+		chrome9_copy_rect_cache_flush(job, request, true);
 	else {
 		chrome9_cache_flush(job->map.vaddr, request->object_size);
 		chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
@@ -5075,9 +5087,17 @@ int chrome9_copy_rect_ioctl(struct drm_device *drm, void *data,
 	u64 total_size;
 
 	if (args->flags & ~(DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE |
-			    DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED) ||
+			    DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED |
+			    DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA) ||
+	    ((args->flags & DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE) &&
+	     (args->flags &
+	      DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA)) ||
 	    ((args->flags & DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE) &&
 	     args->format != DRM_CHROME9_TEXTURE_FORMAT_BGRX8888) ||
+	    ((args->flags &
+	      DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA) &&
+	     (!chrome9_copy_rect_preserve_alpha ||
+	      args->format != DRM_CHROME9_TEXTURE_FORMAT_BGRX8888)) ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->destination_handle || !args->source_handle ||
 	    args->destination_handle == args->source_handle ||

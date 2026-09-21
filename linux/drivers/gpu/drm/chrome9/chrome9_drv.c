@@ -64,6 +64,12 @@ module_param_named(two_texture_signed_repeat,
 MODULE_PARM_DESC(two_texture_signed_repeat,
 		 "Expose the bounded two-texture signed REPEAT path (default: false)");
 
+bool chrome9_copy_rect_preserve_alpha;
+module_param_named(copy_rect_preserve_alpha,
+		   chrome9_copy_rect_preserve_alpha, bool, 0400);
+MODULE_PARM_DESC(copy_rect_preserve_alpha,
+		 "Expose the silicon-gated one-pass RGB copy preserving A/X");
+
 static bool chrome9_staging_scanout;
 module_param_named(staging_scanout, chrome9_staging_scanout, bool, 0400);
 MODULE_PARM_DESC(staging_scanout,
@@ -2383,6 +2389,9 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			if (chrome9_two_texture_signed_repeat)
 				args->value |=
 					DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS;
+			if (chrome9_copy_rect_preserve_alpha)
+				args->value |=
+					DRM_CHROME9_CAP_COPY_RECT_PRESERVE_ALPHA;
 		}
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:

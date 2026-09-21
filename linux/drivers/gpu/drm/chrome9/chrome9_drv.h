@@ -16,6 +16,7 @@
 #define CHROME9_PCI_DEVICE_VX900	0x7122
 
 extern bool chrome9_two_texture_signed_repeat;
+extern bool chrome9_copy_rect_preserve_alpha;
 
 #define CHROME9_REG_ENGINE_STATUS	0x0400
 #define CHROME9_REG_FIFO_EMPTY		0x0404
