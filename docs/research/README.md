@@ -81,6 +81,11 @@ targets.
 - [via-5.75-shader-re.md](via-5.75-shader-re.md) records the executable offline
   Linux shader compiler, native VS fields, PS object limits, and program/control
   upload ABI.
+- [general-shader-runtime-contract.md](general-shader-runtime-contract.md)
+  cross-checks both Windows shader uploaders and the Linux compiler, defines
+  constants, ALU/TEX, varying linkage, activation and termination as one
+  bounded runtime contract, and prioritizes the glamor forms beyond the
+  current fixed fragment classes.
 - [gl-feature-matrix.md](gl-feature-matrix.md) reconstructs the exact Linux and
   Windows OpenGL extension sets, raw limits, texture/render/depth formats,
   framebuffer/query support, and conservative Gallium/NIR capability envelope.
