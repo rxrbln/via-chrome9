@@ -125,13 +125,44 @@ location bits and selects bit 20 for memory type 4, exactly producing the
 live SF word `51100000`.  The older branch at `0x196066..0x196078` selects
 bit 21 instead.
 
-The unambiguous linear interpretation is byte pitch divided by 32.  Both
-builders still perform `>>5` when the tile flag is set, even though the manual
-says tiled A52 counts 256- or 512-byte tiles.  Therefore their surface pitch
-field must already use a tiled-path convention, or another allocator step
-pre-scales it.  Do not feed an ordinary linear byte pitch to A52 while setting
-A51 bit 23, and do not expose tiled modifiers until that producer convention
-and tile swizzle are recovered and measured.
+The unambiguous linear interpretation is byte pitch divided by 32.  The same
+`byte_pitch >> 5` expression is also the exact tiled pitch; it does **not**
+require a second pre-scaling step.  Proprietary Linux helper
+`sfmCalculateTileOffset_invi:0xdee30..0xdee96` selects a tile width of 32, 16,
+or 8 pixels for 8, 16, or 32 bpp respectively, and computes:
+
+```text
+tile_width_pixels = 256 / bytes_per_pixel
+tile_columns = ceil(pixel_pitch / tile_width_pixels)
+offset = 256 * (tile_columns * floor(y / 8) + floor(x / tile_width_pixels))
+       + bytes_per_pixel *
+         (tile_width_pixels * (y & 7) + (x % tile_width_pixels))
+```
+
+For the vendor's normal 32-byte-aligned byte pitch,
+
+```text
+byte_pitch / 32
+    = ceil(pixel_pitch * bytes_per_pixel / 32)
+    = ceil(pixel_pitch / tile_width_pixels)
+    = tile_columns.
+```
+
+Thus A52 `[9:0]` is a 32-byte unit count for linear addressing and the
+numerically identical microtile-column count for an eight-row tiled surface.
+The manual's "256-byte" tiled unit describes the storage consumed by one
+column entry over eight rows, not a request to divide the byte pitch by 256.
+For example, a 32-bpp 256-pixel surface has byte pitch 1024 and A52 pitch 32;
+that is also 32 tiles of 8x8x4 bytes.  The tiled allocation extent is
+`byte_pitch * align(height, 8)` and every tile base is 256-byte aligned.
+
+This closes the A52 producer convention and the eight-row microtile swizzle,
+but it does not by itself make tiled modifiers safe to expose.  The Windows
+RT builder changes only A51 bit 23 from `surface+2c` bit 1 and leaves A51 bit
+22 clear, so its recovered path is specifically the 256-byte/eight-row tile.
+The 512-byte/sixteen-row layout, external modifier identity, CPU detiling,
+2D-copy transitions, and live guarded extent test remain outstanding.  Until
+those pieces land, accept only linear targets in the public resource path.
 
 ## sRGB is A53 state, not an A52 format
 
