@@ -143,6 +143,9 @@ targets.
   integrates every recovered blend/depth/alpha/stencil/color-mask encoding,
   closes polygon-offset units by depth allocation, gives exact packet-growth
   formulas and ranks the safest structured ABI successors for ioquake-era GL.
+- [ioquake3-next-gl1-keys.md](ioquake3-next-gl1-keys.md) ranks the expected
+  post-blit GL1 keys, specifies projected one- and three-factor classifiers,
+  and fixes the three-factor D16 packet indices and rejection oracles.
 - [textured-d16-format-contract.md](textured-d16-format-contract.md) gives the
   exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
   X-versus-alpha sampler semantics, and strict render-target reinterpretation
