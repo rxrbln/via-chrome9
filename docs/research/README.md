@@ -49,6 +49,12 @@ targets.
 - [chrome9-cmp-abs-sat-corpus.tsv](chrome9-cmp-abs-sat-corpus.tsv) retains all
   eight duplicate CMP topologies, both ABS sources, and the cross-driver SAT
   bit differential across eleven operations.
+- [chrome9-swizzle-neg-boundary.md](chrome9-swizzle-neg-boundary.md) closes
+  A/B/C source selector packing for 70 byte-matched one-record swizzles,
+  identifies DP3 NEG as a wholesale cross-driver mismatch, and defines the
+  safest terminal MOV replication gate.
+- [chrome9-swizzle-neg-corpus.tsv](chrome9-swizzle-neg-corpus.tsv) retains the
+  complete 72-case Windows/Linux differential and its two reject rows.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
