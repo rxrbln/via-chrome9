@@ -15,11 +15,13 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 
 #include "chrome9_drv.h"
+#include "chrome9_engine.h"
 
 #define CHROME9_FIXED_WIDTH		1024U
 #define CHROME9_FIXED_HEIGHT		768U
@@ -69,6 +71,7 @@ struct chrome9_kms_state {
 	/* Serializes ownership of the saved legacy VGA state. */
 	struct mutex lock;
 	bool fixed_iga1;
+	bool staging_scanout;
 	bool snapshot_valid;
 	bool iga1_enabled;
 	u8 seq_index;
@@ -219,9 +222,10 @@ static void chrome9_iga1_restore(struct chrome9_kms_state *kms)
 	kms->snapshot_valid = false;
 }
 
-static void chrome9_iga1_program(struct chrome9_device *cdev)
+static void chrome9_iga1_program(struct chrome9_device *cdev, u32 address,
+				 bool system_framebuffer)
 {
-	u32 base = cdev->scanout_offset >> 1;
+	u32 base = address >> 1;
 	u8 misc;
 
 	/* Blank first, power off VGA, select IGA1, and disable IGA2. */
@@ -243,8 +247,9 @@ static void chrome9_iga1_program(struct chrome9_device *cdev)
 	vga_io_wcrt(0x13, 0x00);
 	vga_io_wcrt(0x35, 0x50);
 
-	/* IGA1 uses a two-byte address unit and must fetch from physical SL. */
-	chrome9_cr_mask(0x48, GENMASK(7, 6), 0);
+	/* IGA1 uses two-byte units; CR48[7:6]=01 selects translated SF. */
+	chrome9_cr_mask(0x48, GENMASK(7, 6),
+			system_framebuffer ? BIT(6) : 0);
 	vga_io_wcrt(0x0d, base);
 	vga_io_wcrt(0x0c, base >> 8);
 	vga_io_wcrt(0x34, base >> 16);
@@ -388,11 +393,42 @@ static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
 			      struct drm_crtc_state *crtc_state)
 {
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
+	struct drm_plane_state *old_plane_state = pipe->plane.state;
 
 	if (crtc_state->enable &&
 	    !chrome9_fixed_state_valid(cdev, plane_state, crtc_state))
 		return -EINVAL;
+	/* Static bring-up supports a base change only across a full disable. */
+	if (crtc_state->enable && READ_ONCE(cdev->kms_state->iga1_enabled) &&
+	    old_plane_state && old_plane_state->fb != plane_state->fb &&
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return -EOPNOTSUPP;
 	return 0;
+}
+
+static int chrome9_pipe_prepare_fb(struct drm_simple_display_pipe *pipe,
+				   struct drm_plane_state *plane_state)
+{
+	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
+	int ret;
+
+	ret = drm_gem_plane_helper_prepare_fb(&pipe->plane, plane_state);
+	if (ret || !plane_state->fb || cdev->kms_state->staging_scanout)
+		return ret;
+	ret = chrome9_gem_fb_pin(plane_state->fb);
+	if (ret)
+		dev_err(&cdev->pdev->dev,
+			"cannot pin framebuffer into SF aperture: %d\n", ret);
+	return ret;
+}
+
+static void chrome9_pipe_cleanup_fb(struct drm_simple_display_pipe *pipe,
+				    struct drm_plane_state *plane_state)
+{
+	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
+
+	if (plane_state->fb && !cdev->kms_state->staging_scanout)
+		chrome9_gem_fb_unpin(plane_state->fb);
 }
 
 static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -401,43 +437,66 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 {
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
 	struct chrome9_kms_state *kms = cdev->kms_state;
+	u32 scanout_base;
+	bool system_framebuffer;
 	int ret;
 
 	if (!chrome9_fixed_state_valid(cdev, plane_state, crtc_state)) {
 		dev_err(&cdev->pdev->dev, "refusing invalid fixed IGA1 enable\n");
 		return;
 	}
-	ret = chrome9_gem_copy_fb_to_scanout(cdev, plane_state->fb);
+	if (kms->staging_scanout) {
+		ret = chrome9_gem_copy_fb_to_scanout(cdev, plane_state->fb);
+		if (ret) {
+			dev_err(&cdev->pdev->dev,
+				"initial BAR2 scanout copy failed: %d\n", ret);
+			return;
+		}
+		scanout_base = cdev->scanout_offset;
+		system_framebuffer = false;
+	} else {
+		ret = chrome9_gem_fb_sf_base(plane_state->fb, &scanout_base);
+		if (ret) {
+			dev_err(&cdev->pdev->dev,
+				"direct framebuffer has no valid SF base: %d\n", ret);
+			return;
+		}
+		chrome9_gem_fb_sync_for_device(plane_state->fb);
+		system_framebuffer = true;
+	}
+
+	ret = chrome9_engine_display_begin(cdev);
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
-			"initial BAR2 scanout copy failed: %d\n", ret);
+			"cannot serialize IGA1 with command reader: %d\n", ret);
 		return;
 	}
 
 	mutex_lock(&kms->lock);
 	if (kms->iga1_enabled)
-		goto out_unlock;
+		goto out_unlock_engine;
 	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	if (ret) {
 		dev_err(&cdev->pdev->dev, "cannot lock VGA I/O: %d\n", ret);
-		goto out_unlock;
+		goto out_unlock_engine;
 	}
 	if (!(vga_io_r(VGA_MIS_R) & VGA_MIS_COLOR)) {
 		dev_err(&cdev->pdev->dev,
 			"refusing IGA1 enable while VGA color I/O decode is off\n");
 		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
-		goto out_unlock;
+		goto out_unlock_engine;
 	}
 	chrome9_iga1_save(kms);
-	chrome9_iga1_program(cdev);
+	chrome9_iga1_program(cdev, scanout_base, system_framebuffer);
 	kms->iga1_enabled = true;
 	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	dev_info(&cdev->pdev->dev,
-		 "lab-only IGA1 1024x768@60 output enabled at BAR2 %#llx\n",
-		 (unsigned long long)cdev->scanout_offset);
+		 "lab-only IGA1 1024x768@60 output enabled at %s %#x\n",
+		 system_framebuffer ? "SF" : "BAR2", scanout_base);
 
-out_unlock:
+out_unlock_engine:
 	mutex_unlock(&kms->lock);
+	chrome9_engine_display_end(cdev);
 }
 
 static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
@@ -446,33 +505,49 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	struct chrome9_kms_state *kms = cdev->kms_state;
 	int ret;
 
+	if (!READ_ONCE(kms->iga1_enabled))
+		return;
+	ret = chrome9_engine_display_begin(cdev);
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"cannot serialize IGA1 restore with command reader: %d\n",
+			ret);
+		return;
+	}
 	mutex_lock(&kms->lock);
 	if (!kms->iga1_enabled)
-		goto out_unlock;
+		goto out_unlock_engine;
 	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"cannot lock VGA I/O to restore IGA1: %d\n", ret);
-		goto out_unlock;
+		goto out_unlock_engine;
 	}
 	chrome9_iga1_restore(kms);
 	kms->iga1_enabled = false;
 	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	dev_info(&cdev->pdev->dev, "restored pre-KMS IGA1 VGA state\n");
 
-out_unlock:
+out_unlock_engine:
 	mutex_unlock(&kms->lock);
+	chrome9_engine_display_end(cdev);
 }
 
 static void chrome9_pipe_update(struct drm_simple_display_pipe *pipe,
 				struct drm_plane_state *old_plane_state)
 {
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
+	struct device *dev = &cdev->pdev->dev;
 	struct drm_plane_state *plane_state = pipe->plane.state;
 	int ret;
 
 	if (!plane_state || !plane_state->fb)
 		return;
+	if (!cdev->kms_state->staging_scanout) {
+		if (old_plane_state && old_plane_state->fb != plane_state->fb)
+			dev_err_ratelimited(dev, "direct SF base change requires modeset\n");
+		return;
+	}
 	ret = chrome9_gem_copy_fb_to_scanout(cdev, plane_state->fb);
 	if (ret)
 		dev_err_ratelimited(&cdev->pdev->dev,
@@ -485,6 +560,8 @@ static const struct drm_simple_display_pipe_funcs chrome9_pipe_funcs = {
 	.disable = chrome9_pipe_disable,
 	.check = chrome9_pipe_check,
 	.update = chrome9_pipe_update,
+	.prepare_fb = chrome9_pipe_prepare_fb,
+	.cleanup_fb = chrome9_pipe_cleanup_fb,
 };
 
 static const u32 chrome9_primary_formats[] = {
@@ -572,7 +649,8 @@ static int chrome9_scanout_carveout_init(struct chrome9_device *cdev,
 
 int chrome9_kms_init(struct chrome9_device *cdev,
 		     unsigned long scanout_offset,
-		     unsigned long scanout_size, bool fixed_iga1)
+		     unsigned long scanout_size, bool fixed_iga1,
+		     bool staging_scanout)
 {
 	struct drm_device *drm = &cdev->drm;
 	struct chrome9_kms_state *kms;
@@ -583,15 +661,26 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 		return -ENOMEM;
 	mutex_init(&kms->lock);
 	cdev->kms_state = kms;
+	kms->staging_scanout = staging_scanout;
+	if (fixed_iga1 && !staging_scanout && !chrome9_engine_ready(cdev))
+		return dev_err_probe(&cdev->pdev->dev, -ENODEV,
+			"direct IGA1 requires a ready SF engine\n");
 
-	ret = chrome9_scanout_carveout_init(cdev, scanout_offset,
-					    scanout_size);
-	if (ret)
-		return ret;
-	if (fixed_iga1 &&
+	if (staging_scanout) {
+		ret = chrome9_scanout_carveout_init(cdev, scanout_offset,
+						    scanout_size);
+		if (ret)
+			return ret;
+	} else {
+		mutex_init(&cdev->scanout_lock);
+		if (scanout_offset != ULONG_MAX || scanout_size)
+			dev_warn(&cdev->pdev->dev,
+				 "ignoring BAR2 scanout carveout in direct-SF mode\n");
+	}
+	if (fixed_iga1 && staging_scanout &&
 	    (!cdev->scanout_size || cdev->scanout_size < CHROME9_FIXED_SIZE))
 		return dev_err_probe(&cdev->pdev->dev, -EINVAL,
-			"fixed IGA1 requires a legacy-addressable scanout carveout of at least %u bytes\n",
+			"staging IGA1 requires a legacy-addressable scanout carveout of at least %u bytes\n",
 			CHROME9_FIXED_SIZE);
 	kms->fixed_iga1 = fixed_iga1;
 
@@ -624,10 +713,8 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	drm_mode_config_reset(drm);
 	if (fixed_iga1)
 		dev_warn(&cdev->pdev->dev,
-			 "lab-only fixed IGA1 driving armed; no vblank or IRQ support\n");
-	else if (!cdev->scanout_size)
-		dev_warn(&cdev->pdev->dev,
-			 "KMS scanout staging disabled: no private BAR2 carveout supplied\n");
+			 "lab-only fixed IGA1 driving armed with %s scanout; no vblank or IRQ support\n",
+			 staging_scanout ? "BAR2 staging" : "direct SF");
 	return 0;
 }
 
@@ -638,6 +725,15 @@ void chrome9_kms_fini(struct chrome9_device *cdev)
 
 	if (!kms)
 		return;
+	if (!READ_ONCE(kms->snapshot_valid))
+		return;
+	ret = chrome9_engine_display_begin(cdev);
+	if (ret) {
+		if (kms->snapshot_valid)
+			dev_crit(&cdev->pdev->dev,
+				 "cannot serialize final IGA1 restore: %d\n", ret);
+		return;
+	}
 	mutex_lock(&kms->lock);
 	if (!kms->snapshot_valid)
 		goto out_unlock;
@@ -653,4 +749,5 @@ void chrome9_kms_fini(struct chrome9_device *cdev)
 
 out_unlock:
 	mutex_unlock(&kms->lock);
+	chrome9_engine_display_end(cdev);
 }

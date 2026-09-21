@@ -134,9 +134,14 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		      const struct drm_mode_fb_cmd2 *mode_cmd);
 int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
 				   struct drm_framebuffer *fb);
+int chrome9_gem_fb_pin(struct drm_framebuffer *fb);
+void chrome9_gem_fb_unpin(struct drm_framebuffer *fb);
+int chrome9_gem_fb_sf_base(struct drm_framebuffer *fb, u32 *base);
+void chrome9_gem_fb_sync_for_device(struct drm_framebuffer *fb);
 int chrome9_kms_init(struct chrome9_device *cdev,
 		     unsigned long scanout_offset,
-		     unsigned long scanout_size, bool fixed_iga1);
+		     unsigned long scanout_size, bool fixed_iga1,
+		     bool staging_scanout);
 void chrome9_kms_fini(struct chrome9_device *cdev);
 
 /* Live-verified H5S2VP1/H6 sequences shared with the fixed engine path. */

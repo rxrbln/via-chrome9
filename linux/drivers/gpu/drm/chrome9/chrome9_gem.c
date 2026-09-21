@@ -4,6 +4,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/slab.h>
 
 #include <drm/drm_dumb_buffers.h>
 #include <drm/drm_file.h>
@@ -16,12 +17,47 @@
 #include <drm/drm_vma_manager.h>
 
 #include "chrome9_drv.h"
+#include "chrome9_engine.h"
 
 #define CHROME9_MAX_BO_SIZE	(256ULL * 1024 * 1024)
 #define CHROME9_SCANOUT_MAX_WIDTH	2048U
 #define CHROME9_SCANOUT_MAX_HEIGHT	2048U
 #define CHROME9_SCANOUT_PITCH_ALIGN	8U
 #define CHROME9_SCANOUT_PITCH_MAX	0x3ff8U
+
+struct chrome9_framebuffer {
+	struct drm_framebuffer base;
+	/* Protects the shared mapping and atomic-state reference count. */
+	struct mutex lock;
+	struct chrome9_sf_mapping *mapping;
+	unsigned int pin_count;
+};
+
+static inline struct chrome9_framebuffer *
+to_chrome9_framebuffer(struct drm_framebuffer *fb)
+{
+	return container_of(fb, struct chrome9_framebuffer, base);
+}
+
+static void chrome9_fb_destroy(struct drm_framebuffer *fb)
+{
+	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
+	struct chrome9_sf_mapping *mapping;
+
+	mutex_lock(&chrome9_fb->lock);
+	WARN_ON(chrome9_fb->pin_count);
+	mapping = chrome9_fb->mapping;
+	chrome9_fb->mapping = NULL;
+	chrome9_fb->pin_count = 0;
+	mutex_unlock(&chrome9_fb->lock);
+	chrome9_sf_unpin(mapping);
+	drm_gem_fb_destroy(fb);
+}
+
+static const struct drm_framebuffer_funcs chrome9_fb_funcs = {
+	.destroy = chrome9_fb_destroy,
+	.create_handle = drm_gem_fb_create_handle,
+};
 
 static int chrome9_scanout_layout_validate(u32 width, u32 height, u32 pitch,
 					   u32 offset)
@@ -44,7 +80,6 @@ static int chrome9_scanout_layout_validate(u32 width, u32 height, u32 pitch,
 int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 			    struct drm_mode_create_dumb *args)
 {
-	struct chrome9_device *cdev = to_chrome9(drm);
 	struct drm_gem_shmem_object *shmem_obj;
 	struct drm_gem_object *obj;
 	int ret;
@@ -61,10 +96,8 @@ int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 					      args->pitch, 0);
 	if (ret)
 		return ret;
-	if (!cdev->scanout_size)
-		return -EOPNOTSUPP;
-	if (args->size > cdev->scanout_size)
-		return -ENOSPC;
+	if (args->size > CHROME9_MAX_BO_SIZE)
+		return -E2BIG;
 
 	shmem_obj = drm_gem_shmem_create(drm, args->size);
 	if (IS_ERR(shmem_obj))
@@ -80,9 +113,9 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		      const struct drm_format_info *info,
 		      const struct drm_mode_fb_cmd2 *mode_cmd)
 {
-	struct chrome9_device *cdev = to_chrome9(drm);
+	struct chrome9_framebuffer *chrome9_fb;
+	struct drm_gem_object *obj;
 	u64 modifier;
-	u64 footprint;
 	int ret;
 
 	if (info->format != DRM_FORMAT_XRGB8888 || info->num_planes != 1)
@@ -99,13 +132,104 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 					      mode_cmd->offsets[0]);
 	if (ret)
 		return ERR_PTR(ret);
-	if (!cdev->scanout_size)
-		return ERR_PTR(-EOPNOTSUPP);
-	footprint = (u64)mode_cmd->pitches[0] * mode_cmd->height;
-	if (footprint > cdev->scanout_size)
-		return ERR_PTR(-ENOSPC);
 
-	return drm_gem_fb_create(drm, file, info, mode_cmd);
+	chrome9_fb = kzalloc_obj(*chrome9_fb);
+	if (!chrome9_fb)
+		return ERR_PTR(-ENOMEM);
+	mutex_init(&chrome9_fb->lock);
+	ret = drm_gem_fb_init_with_funcs(drm, &chrome9_fb->base, file, info,
+					 mode_cmd, &chrome9_fb_funcs);
+	if (ret) {
+		kfree(chrome9_fb);
+		return ERR_PTR(ret);
+	}
+	obj = drm_gem_fb_get_obj(&chrome9_fb->base, 0);
+	if (!obj || obj->dev != drm || drm_gem_is_imported(obj)) {
+		chrome9_fb_destroy(&chrome9_fb->base);
+		return ERR_PTR(-EINVAL);
+	}
+
+	return &chrome9_fb->base;
+}
+
+int chrome9_gem_fb_pin(struct drm_framebuffer *fb)
+{
+	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
+	struct chrome9_device *cdev = to_chrome9(fb->dev);
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+	struct chrome9_sf_mapping *mapping;
+	int ret = 0;
+
+	mutex_lock(&chrome9_fb->lock);
+	if (chrome9_fb->pin_count) {
+		if (!chrome9_engine_ready(cdev))
+			ret = -EIO;
+		else if (chrome9_fb->pin_count == UINT_MAX)
+			ret = -EOVERFLOW;
+		else
+			chrome9_fb->pin_count++;
+		goto out_unlock;
+	}
+	ret = chrome9_sf_pin(cdev, obj, &mapping);
+	if (!ret) {
+		chrome9_fb->mapping = mapping;
+		chrome9_fb->pin_count = 1;
+	}
+out_unlock:
+	mutex_unlock(&chrome9_fb->lock);
+	return ret;
+}
+
+void chrome9_gem_fb_unpin(struct drm_framebuffer *fb)
+{
+	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
+	struct chrome9_sf_mapping *mapping = NULL;
+
+	mutex_lock(&chrome9_fb->lock);
+	if (WARN_ON(!chrome9_fb->pin_count))
+		goto out_unlock;
+	if (--chrome9_fb->pin_count)
+		goto out_unlock;
+	mapping = chrome9_fb->mapping;
+	chrome9_fb->mapping = NULL;
+out_unlock:
+	mutex_unlock(&chrome9_fb->lock);
+	chrome9_sf_unpin(mapping);
+}
+
+int chrome9_gem_fb_sf_base(struct drm_framebuffer *fb, u32 *base)
+{
+	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
+	u64 address;
+	int ret = 0;
+
+	mutex_lock(&chrome9_fb->lock);
+	if (!chrome9_fb->pin_count || !chrome9_fb->mapping) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+	address = (u64)chrome9_sf_mapping_base(chrome9_fb->mapping) +
+		  fb->offsets[0];
+	if (address > U32_MAX || !chrome9_iga1_base_valid(address)) {
+		ret = -ERANGE;
+		goto out_unlock;
+	}
+	*base = address;
+out_unlock:
+	mutex_unlock(&chrome9_fb->lock);
+	return ret;
+}
+
+void chrome9_gem_fb_sync_for_device(struct drm_framebuffer *fb)
+{
+	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
+
+	mutex_lock(&chrome9_fb->lock);
+	if (WARN_ON(!chrome9_fb->pin_count || !chrome9_fb->mapping))
+		goto out_unlock;
+	chrome9_sf_sync_for_device(chrome9_fb->mapping);
+out_unlock:
+	mutex_unlock(&chrome9_fb->lock);
 }
 
 int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,

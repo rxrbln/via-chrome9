@@ -6,12 +6,21 @@
 #include <linux/types.h>
 
 struct chrome9_device;
+struct chrome9_sf_mapping;
 struct drm_device;
 struct drm_file;
+struct drm_gem_object;
 
 int chrome9_engine_init(struct chrome9_device *cdev);
 void chrome9_engine_fini(struct chrome9_device *cdev);
 bool chrome9_engine_ready(const struct chrome9_device *cdev);
+int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
+		   struct chrome9_sf_mapping **mapping);
+void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping);
+u32 chrome9_sf_mapping_base(const struct chrome9_sf_mapping *mapping);
+void chrome9_sf_sync_for_device(struct chrome9_sf_mapping *mapping);
+int chrome9_engine_display_begin(struct chrome9_device *cdev);
+void chrome9_engine_display_end(struct chrome9_device *cdev);
 int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
 int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,

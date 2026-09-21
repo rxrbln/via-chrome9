@@ -55,6 +55,11 @@ module_param_named(fixed_iga1, chrome9_fixed_iga1, bool, 0400);
 MODULE_PARM_DESC(fixed_iga1,
 		 "Drive the lab-only fixed 1024x768@60 IGA1 VGA mode");
 
+static bool chrome9_staging_scanout;
+module_param_named(staging_scanout, chrome9_staging_scanout, bool, 0400);
+MODULE_PARM_DESC(staging_scanout,
+		 "Use the legacy BAR2 copy path instead of direct SF scanout");
+
 static bool chrome9_mmio_probe;
 module_param_named(mmio_probe, chrome9_mmio_probe, bool, 0400);
 MODULE_PARM_DESC(mmio_probe,
@@ -2353,6 +2358,9 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	if (chrome9_fixed_iga1 && !chrome9_kms)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 			"fixed_iga1 requires kms=1\n");
+	if (chrome9_staging_scanout && !chrome9_fixed_iga1)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+			"staging_scanout requires fixed_iga1=1\n");
 	/*
 	 * vgaarb only serializes legacy-port accesses.  It does not stop vgacon
 	 * from rewriting the IGA1 timing and base after a KMS update, so take
@@ -2418,7 +2426,8 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	if (chrome9_kms) {
 		ret = chrome9_kms_init(cdev, chrome9_scanout_offset,
 				       chrome9_scanout_size,
-				       chrome9_fixed_iga1);
+				       chrome9_fixed_iga1,
+				       chrome9_staging_scanout);
 		if (ret) {
 			chrome9_engine_fini(cdev);
 			return ret;
