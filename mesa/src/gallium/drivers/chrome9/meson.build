@@ -28,3 +28,13 @@ chrome9_screen_smoke = executable(
   link_with : [libchrome9, libgallium],
   install : false,
 )
+
+chrome9_shader_offline_test = executable(
+  'chrome9-shader-offline-test',
+  ['chrome9_shader_offline.c', 'chrome9_shader_offline_test.c'],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  native : true,
+  install : false,
+)
+test('chrome9-shader-offline', chrome9_shader_offline_test,
+     suite : ['chrome9'])

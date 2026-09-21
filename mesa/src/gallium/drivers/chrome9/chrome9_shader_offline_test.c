@@ -2,6 +2,12 @@
 /* Copyright 2026 Chrome9 contributors */
 #include "chrome9_shader_offline.h"
 
+/* This is a verifier, including in release builds.  Meson's release profile
+ * defines NDEBUG globally, which must not compile the checks (or the compiler
+ * calls embedded in them) out of this executable. */
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
