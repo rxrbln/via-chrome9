@@ -103,19 +103,23 @@ The exact algorithm is:
 1. `dma_resv_assert_held(shmem->base.resv)`.
 2. Reject true imported proxy objects defensively.  Current submit and KMS
    validation already rejects them before this helper.
-3. If `dma_use_count != 0`, reject `UINT_MAX`, increment the count, call
-   `dma_sync_sgtable_for_cpu()` on the existing non-NULL `dma_sgt`, and return
-   it.  In particular, a draw which reuses an active scanout mapping must take
-   ownership back from the device before touching guards through its vmap.
+3. If `dma_use_count != 0`, reject `UINT_MAX`, increment the count, and return
+   the existing non-NULL `dma_sgt`.  Role acquisition alone does not change
+   CPU/device ownership.
 4. Call `drm_gem_shmem_pin_locked(shmem)`.
 5. Call `drm_gem_shmem_get_sg_table(shmem)`.
 6. Call `dma_map_sgtable(shmem->base.dev->dev, sgt,
    DMA_BIDIRECTIONAL, 0)`.
-7. Immediately call `dma_sync_sgtable_for_cpu(..., DMA_BIDIRECTIONAL)`.
-   `dma_map_sgtable()` grants device ownership and SWIOTLB can copy into its
-   bounce area; all current draw paths subsequently touch guards through a CPU
-   vmap.  Return them to CPU ownership before that access.
-8. Publish `dma_sgt=sgt`, `dma_use_count=1`, and return it.
+7. Publish `dma_sgt=sgt`, `dma_use_count=1`, and return it.  Do not sync for
+   CPU in this generic role helper.
+
+The caller owns the access transition.  A draw calls
+`dma_sync_sgtable_for_cpu()` after its producer-fence wait and before any vmap
+access.  Direct scanout does not need CPU ownership and can be prepared before
+the atomic helper waits its producer fence; it performs the existing
+`dma_sync_sgtable_for_device()` after that wait and immediately before display
+use.  In particular, doing a CPU sync in scanout prepare could copy stale
+SWIOTLB bounce data back over memory which an unsignaled producer still owns.
 
 Failure unwinds in the strict reverse order:
 
@@ -191,6 +195,8 @@ if (IS_ERR(job->sgt)) {
 ret = chrome9_collect_ptes(job);
 if (ret)
         goto out_dma_put;
+dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
+                         DMA_BIDIRECTIONAL);
 ```
 
 The existing vmap, guard preparation, final
@@ -252,8 +258,10 @@ destination, depth, texture2 if present, texture3 if present
 ```
 
 On any failure, put prior roles in reverse order before `drm_exec_fini()`.
-After all gets succeed, collect PTEs from the returned role-owned SGTs and
-continue with the current vmaps.
+After all gets succeed, call `dma_sync_sgtable_for_cpu()` for every role while
+the reservations remain held, then collect PTEs from the role-owned SGTs and
+continue with the current vmaps.  This is required even when the mapping
+already existed for direct scanout.
 
 Preserve the current conservative waits using
 `dma_resv_usage_rw(true)`.  This waits existing readers and writers and is
@@ -289,10 +297,11 @@ shmem SGT:
 
 Atomic `prepare_fb` stashes the incoming producer fence and the atomic helper
 waits it before pipe enable/update.  The first DMA map can therefore happen
-before that fence signals, as is normal for a prepared attachment, but
-`chrome9_gem_fb_sync_for_device()` must remain in enable/update after the
-atomic fence wait.  Its device sync refreshes any SWIOTLB bounce contents
-before IGA fetches them.  Do not remove that sync.
+before that fence signals, as is normal for a prepared attachment.  The
+scanout get path must not sync for CPU.  `chrome9_gem_fb_sync_for_device()`
+must remain in enable/update after the atomic fence wait: its device sync
+refreshes any SWIOTLB bounce contents before IGA fetches them.  Do not remove
+that sync.
 
 Every safe `chrome9_sf_unpin()` path first invalidates SF PTEs under the
 existing engine locks.  After those locks are released, take `obj->resv`, put
@@ -313,7 +322,8 @@ The minimal patch must preserve all of these:
 2. No call to public `drm_gem_shmem_get_pages_sgt()` is made while the
    reservation is held; it would try to lock the same reservation.
 3. PTE collection happens only while a DMA role owns a stable SGT.
-4. First map is returned to CPU ownership before draw-side guard writes.
+4. After its producer wait, every draw explicitly returns the map to CPU
+   ownership before draw-side guard writes; scanout prepare does not.
 5. Every GPU publication is preceded by `dma_sync_sgtable_for_device()`.
 6. Every CPU read/verification after retirement is preceded by
    `dma_sync_sgtable_for_cpu()`.
