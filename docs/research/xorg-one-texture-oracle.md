@@ -892,6 +892,171 @@ stage 1, expected RGBA modulation is again red/black/blue/yellow.  Validate
 this before compressed formats: it exercises non-four-byte pitch/range logic
 without block addressing or alpha ambiguity.
 
+### Bounded immediate triangle-list batching
+
+Invariant H6 state can be shared by consecutive triangles.  The Windows
+normal draw callback gathers and serializes only dirty state and then clears
+the emitted dirty records (`VTGUModeDX32A.dll:10156c97` calls the gatherer;
+`1015741a` calls the clearer).  Consequently an unchanged register is resident
+across later draws rather than implicitly reset at PLEND.  This is static
+vendor evidence for state persistence, not permission to omit state when a
+fresh kernel-owned context/ring is installed.
+
+The safest first batch does not emit several nominal H6 bodies.  It emits the
+complete known state once, changes A24 to the total vertex count, and follows
+one Type-00 header with one continuous immediate payload:
+
+```text
+A20 = 20000000                    # independent triangle list
+A23 = 23004F02                    # Gouraud
+A24 = 24000000 | (3 * triangles)
+payload dwords = 3 * triangles * vertex_stride
+```
+
+The front end fires after every complete three-vertex list primitive and
+generates PLEND only after the A24 total is exhausted.  There is no separator,
+fire word, or PLEND word between triangles.  For one texture the stride is
+eight dwords and for two textures it is ten, so every three-vertex triangle
+adds respectively 24 or 30 payload dwords.  The Type-00 header remains four
+dwords and emitter padding, if any, follows the complete A24-counted payload.
+
+Do not merely concatenate another Type-00 packet after an A24=`3` payload.
+The first list has already exhausted A24.  A genuinely separate primitive
+list must program a new A24 before its next Type-00 payload; A20/A23 and the
+other unchanged registers persist.  This delimiter is exact vendor behavior,
+not only an inference from the self-addressed type-04 format.  Windows helper
+`VTGUModeDX32A.dll:101b0a20` emits an aligned type-04 packet whose sole
+payload is `24000000 | count`, then aligns and emits the following indexed
+payload header.  Helper `101b0ad0` emits only A23 and A24 before its payload;
+its callers at `101b0f75` and `101b10dd` use it repeatedly for three-index
+lists without replaying invariant render state.  The older Linux H6 GL path
+independently does the same in
+`__glS3InvDrawPrimitiveTriangleList_H6:215448..2155f2`: it chunks a triangle
+list to available DMA space, emits one A24 word for each chunk, emits an H3
+inline sequential-index payload, releases the space, and loops to the next
+chunk without state replay.  Its capacity calculation subtracts `0x600`
+bytes from the command manager's reported space before choosing a chunk.
+These are exact static indexed-draw examples rather than a live immediate-
+Type-00 re-arm on VX900.  One enlarged A24 immediate list still avoids this
+extra transition and is both smaller and safer.  State changes between
+triangles should split the first batch/job; a later guarded oracle can
+exercise the vendor A24-only delimiter with consecutive immediate payloads.
+
+For the current one-texture builder, let `B=4` when the closed blend
+destination block is present and zero otherwise, and let `M=12` when one
+eight-entry H3 mip table precedes the sampler and zero otherwise.  With `N`
+triangles the exact body maps are:
+
+```text
+REPLACE:  A24 body[74+B+M], vertex H2 body[196+B+M],
+          payload body[200+B+M ... 199+B+M+24*N],
+          body length = 200+B+M+24*N dwords
+MODULATE: A24 body[74+B+M], vertex H2 body[200+B+M],
+          payload body[204+B+M ... 203+B+M+24*N],
+          body length = 204+B+M+24*N dwords
+```
+
+The largest count valid for all those one-texture variants is **24
+triangles / 72 vertices**, hence A24=`24000048`.  This cap includes blend and
+the first mip table.  In the largest MODULATE+blend+mip case the body is 796
+dwords, begins at slot offset `0x20`, and ends at `0xc90`.  The unchanged
+post-draw sync/status/dummy/cookie sequence ends at `0xcf8`; the current
+strict padding then places PAUSE at `0xcf0` and STOP at `0xd70`.
+This 24-triangle result is specific to a total post-base delta of at most 16
+dwords.  The exact border-color group adds four more dwords: blend+mip+border
+therefore has a 20-dword delta and must cap at 23 triangles.  Palette and
+de-gamma tables can reduce it further.  Keep 24 as the UAPI maximum, but make
+the builder's accepted count depend on the exact generated body length rather
+than assuming every future state combination fits that maximum.
+
+The same arithmetic gives the immediately useful untextured Mesa batch.  Let
+`D=4*blend_variant + 4*D16_variant`; this is a packet-length delta, not a
+hardware bit mask.  The shared map is:
+
+```text
+A24 body[50+D] = 24000000 | (3*N)
+vertex H2 body[160+D]
+payload body[164+D ... 163+D+18*N]
+raw body end = 164+D+18*N dwords; align before the post-draw H0
+```
+
+A single cap valid for color, blend, D16, and D16+blend is **34 triangles /
+102 vertices**, A24=`24000066`.  In the largest D16+blend case (`D=8`) its
+raw body is 784 dwords and ends at slot `0xc60`; cookie/PAUSE/STOP are
+`0xcc8/0xcf0/0xd70`.  The plain color path alone can fit 35 triangles
+(A24=`24000069`, cookie=`0xcf8`), but using 34 uniformly avoids a state-
+dependent userspace split threshold.  Its first two-triangle oracle should
+use an all-red `TL,TR,BR` followed by an all-green `TL,BR,BL`, A24=`24000006`,
+and a non-red/non-green sentinel target.  Interior top-right and bottom-left
+samples then independently prove the first and second automatic fires without
+depending on interpolation along the shared diagonal.
+
+For the exact two-texture program above, the corresponding map is:
+
+```text
+A24 body[95+B+M] = 24000000 | (3*N)
+vertex H2 body[228+B+M]
+payload body[232+B+M ... 231+B+M+30*N]
+body length = 232+B+M+30*N dwords
+```
+
+Here `M=12` is the stage-0 mip table and `B=4` is the same blend delta.  The
+safe cap is **18 triangles / 54 vertices**, A24=`24000036`.  With both deltas
+the 788-dword body ends at slot offset `0xc70`, the cookie ends at `0xcd8`,
+PAUSE is `0xcf0`, and STOP is `0xd70`.  N=19 is invalid even without either
+delta: its body ends at `0xca8`, the following H0 alignment makes the cookie
+end `0xd18`, and `chrome9_finish_ring()` would put STOP at `0xdf0`, beyond the
+allowed `0xde0` read-ahead boundary.  The two-TAU/two-ALU source-times-mask
+and full-RGBA lightmap schedules have the same packet length, so both retain
+this cap.  If later state adds more than eight dwords beyond blend plus this
+mip table, recompute rather than retaining 18 blindly.
+
+The page proof follows the current builder, not the older PAUSE-only trailer.
+`CHROME9_CR_READ_AHEAD=0x220` makes the last legal address `0xde0` in a 4-KiB
+slot.  After the cookie, `chrome9_finish_ring()` uses a do/while to pad to a
+128-byte PAUSE block, emits a 16-byte dummy header, then uses another
+do/while to the next 128-byte STOP block.  Therefore the pre-padding cursor
+must be at most `0xcf8`; a cursor exactly at `0xd00` advances PAUSE to `0xd70`
+and STOP to the illegal `0xdf0`.  For a body of `L` dwords the cursor used in
+the calculations above is:
+
+```text
+cookie_end = ALIGN(0x20 + 4*L, 16) + 0x68
+```
+
+Only per-vertex D0/D1/D2/D3 (and D4 for two textures) may vary inside the
+first batch.  The destination BO/format/pitch/window, every source BO and
+image layout, sampler wrap/filter/LOD/border state, shader and constants,
+FVF/linkage, blend/alpha/depth state, color mask, scissor, viewport, topology,
+and winding/cull convention are shared.  Flush on any such change.  Validate
+each group of three for finite/range-safe attributes and nondegenerate area;
+do not validate only the first triangle.
+
+The smallest stable UAPI successor is a new structured batch ioctl, leaving
+the existing fixed-three-vertex ioctls unchanged.  It can carry the shared
+state once plus `triangle_count` and a 64-bit userspace pointer to an array of
+`3*triangle_count` `drm_chrome9_textured_vertex` records.  Bound count to
+1..24 before multiplication, use `memdup_array_user()` once before taking BO
+locks, validate the copied snapshot, and free it on every exit.  A `__u64`
+pointer decoded with `u64_to_user_ptr()` keeps the layout compat-stable.  The
+builder should not place the maximum 2304-byte converted payload on the
+kernel stack: either allocate it or write checked converted vertices directly
+behind the already-bounded Type-00 header.  Set raster/FVF word 10 to the
+dynamic A24 value and retain the exact index/body-length/PAUSE/STOP assertions
+before publication.  The current submit path builds synchronously, so the
+copied vertices need not survive job retirement; an asynchronous builder
+would instead have to transfer ownership to the job.
+
+The first live batching oracle is two REPLACE triangles forming the existing
+64x64 textured quad.  Emit vertices `TL,TR,BR, TL,BR,BL`, set A24=`24000006`,
+and use the red/green/blue/white 32-square nearest/clamp source.  Samples
+`(8,8)/(48,8)/(48,48)/(8,48)` must be exactly
+`00ff0000/0000ff00/00ffffff/000000ff`.  The last sample is owned only by the
+second triangle and proves that the list continued past the first automatic
+fire; full target/source guards and the unchanged source prove bounded fetch
+and PLEND.  Follow it with the old one-triangle ioctl into a cleared target to
+prove the dynamic A24 batch did not alter closure for the legacy path.
+
 ### One-word RGBA-by-RGBA successor for game lightmaps
 
 The alpha-mask program is not enough for fixed-function `GL_MODULATE` across
