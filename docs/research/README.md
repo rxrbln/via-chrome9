@@ -9,6 +9,13 @@ targets.
 
 ## Documents
 
+- [mesa-ps-encoder-v1.md](mesa-ps-encoder-v1.md) defines the first bounded
+  Mesa NIR-to-native fragment encoder, operand packing, closed scheduler
+  tuples, dependency constraints, and byte-exact golden tests.
+- [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
+  inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
+  adapter-record dependency under Wine, and records the private compiler path
+  which remains usable hardware-free.
 - [source-audit.md](source-audit.md) inventories the supplied primary sources,
   their applicability, and important provenance issues.
 - [chrome9-hd-hardware.md](chrome9-hd-hardware.md) records the hardware model
@@ -292,6 +299,11 @@ targets.
   packet headers, relocation formats, fence candidates, and capture controls.
 - [shader-isa.md](shader-isa.md) records the statically recovered program-upload
   ABI, common OpenGL/Direct3D compiler backend, and partial instruction fields.
+- [native-ps-upload-transaction.md](native-ps-upload-transaction.md) closes the
+  Linux/Windows A90--A9b, `2003`/`2103`/`2203` upload transaction, maps the
+  Mesa canonical PS object onto a semantic kernel ABI and fail-closed
+  validator, enumerates the unsafe raw-program fields, and gives the smallest
+  staged ALU-only silicon oracle.
 - [ioquake3-signed-repeat-command15.md](ioquake3-signed-repeat-command15.md)
   measures q3dm1's real base/lightmap coordinate ranges, proves that Chrome9
   transports raw float S/T and applies wrap in sampler A32, specifies a
