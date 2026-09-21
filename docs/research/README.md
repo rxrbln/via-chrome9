@@ -80,6 +80,9 @@ targets.
 - [gl-feature-matrix.md](gl-feature-matrix.md) reconstructs the exact Linux and
   Windows OpenGL extension sets, raw limits, texture/render/depth formats,
   framebuffer/query support, and conservative Gallium/NIR capability envelope.
+- [game-raster-depth-stencil-oracles.md](game-raster-depth-stencil-oracles.md)
+  gives packet-exact depth, stencil, culling, polygon-offset, color-mask,
+  clear, native-line, and point oracles plus state-transition closure rules.
 - [windows-driver-re.md](windows-driver-re.md) records the static reverse
   engineering of the supplied VX900 Windows UMD, OpenGL ICD, and KMD, including
   packet headers, relocation formats, fence candidates, and capture controls.
