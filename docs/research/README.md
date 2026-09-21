@@ -84,6 +84,12 @@ targets.
   broadcast, preservation, and precision gates.
 - [chrome9-scalar-mask-corpus.tsv](chrome9-scalar-mask-corpus.tsv) compacts 56
   Windows/Linux RCP/RSQ/EXP/LOG terminal and masked-temporary differentials.
+- [chrome9-scalar-result-scale-audit.md](chrome9-scalar-result-scale-audit.md)
+  closes scalar result-scale/SAT packing across both compilers, keeps the
+  zero-scale/no-SAT runtime boundary, and confirms SGE/SLT are not one-record
+  successors.
+- [chrome9-scalar-result-scale-corpus.tsv](chrome9-scalar-result-scale-corpus.tsv)
+  retains the 56 byte-matched scalar scale/SAT cases as 28 paired rows.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
