@@ -16,6 +16,7 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_mode.h>
+#include <drm/drm_modeset_lock.h>
 #include <drm/drm_vma_manager.h>
 
 #include "chrome9_drv.h"
@@ -54,6 +55,10 @@ to_chrome9_framebuffer(struct drm_framebuffer *fb)
 	return container_of(fb, struct chrome9_framebuffer, base);
 }
 
+static int chrome9_gem_copy_fb_damage_to_scanout(
+	struct chrome9_device *cdev, struct drm_framebuffer *fb,
+	const struct drm_clip_rect *clips, unsigned int num_clips);
+
 static void chrome9_fb_destroy(struct drm_framebuffer *fb)
 {
 	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
@@ -69,9 +74,43 @@ static void chrome9_fb_destroy(struct drm_framebuffer *fb)
 	drm_gem_fb_destroy(fb);
 }
 
+static int chrome9_fb_dirty(struct drm_framebuffer *fb, struct drm_file *file,
+			    unsigned int flags, unsigned int color,
+			    struct drm_clip_rect *clips,
+			    unsigned int num_clips)
+{
+	struct chrome9_device *cdev = to_chrome9(fb->dev);
+	struct drm_plane_state *plane_state;
+	int ret = 0;
+
+	/*
+	 * Xorg's modesetting driver publishes front-buffer damage through
+	 * DIRTYFB.  Direct SF scanout needs only store ordering, while the
+	 * compatibility scanout path must mirror the active shmem framebuffer
+	 * into its fixed BAR2 interval.
+	 */
+	if (!cdev->scanout_size) {
+		wmb();
+		return 0;
+	}
+
+	drm_modeset_lock(&cdev->display_pipe.plane.mutex, NULL);
+	plane_state = cdev->display_pipe.plane.state;
+	if (plane_state && plane_state->fb == fb &&
+	    cdev->display_pipe.crtc.state &&
+	    cdev->display_pipe.crtc.state->active)
+		ret = chrome9_gem_copy_fb_damage_to_scanout(
+			cdev, fb,
+			flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY ? NULL : clips,
+			flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY ? 0 : num_clips);
+	drm_modeset_unlock(&cdev->display_pipe.plane.mutex);
+	return ret;
+}
+
 static const struct drm_framebuffer_funcs chrome9_fb_funcs = {
 	.destroy = chrome9_fb_destroy,
 	.create_handle = drm_gem_fb_create_handle,
+	.dirty = chrome9_fb_dirty,
 };
 
 static int chrome9_scanout_layout_validate(u32 width, u32 height, u32 pitch,
@@ -249,14 +288,16 @@ out_unlock:
 	mutex_unlock(&chrome9_fb->lock);
 }
 
-int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
-				   struct drm_framebuffer *fb)
+static int chrome9_gem_copy_fb_damage_to_scanout(
+	struct chrome9_device *cdev, struct drm_framebuffer *fb,
+	const struct drm_clip_rect *clips, unsigned int num_clips)
 {
 	struct drm_gem_object *obj;
 	struct iosys_map map = IOSYS_MAP_INIT_VADDR(NULL);
+	u8 __iomem *last = NULL;
 	size_t row_bytes;
 	size_t footprint;
-	unsigned int y;
+	unsigned int i, y;
 	int ret;
 
 	if (!cdev->scanout_size || !cdev->vram || !fb)
@@ -286,22 +327,56 @@ int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
 		goto out_vunmap;
 	}
 
-	row_bytes = (size_t)fb->width * fb->format->cpp[0];
 	mutex_lock(&cdev->scanout_lock);
-	for (y = 0; y < fb->height; y++)
-		memcpy_toio(cdev->vram + cdev->scanout_offset +
-			    (size_t)y * fb->pitches[0],
-			    map.vaddr + fb->offsets[0] +
-			    (size_t)y * fb->pitches[0], row_bytes);
+	if (!clips || !num_clips) {
+		row_bytes = (size_t)fb->width * fb->format->cpp[0];
+		for (y = 0; y < fb->height; y++) {
+			u8 __iomem *dst = cdev->vram + cdev->scanout_offset +
+					  (size_t)y * fb->pitches[0];
+
+			memcpy_toio(dst, map.vaddr + fb->offsets[0] +
+				    (size_t)y * fb->pitches[0], row_bytes);
+			last = dst + row_bytes - 1;
+		}
+	} else {
+		for (i = 0; i < num_clips; i++) {
+			u32 x1 = min_t(u32, clips[i].x1, fb->width);
+			u32 x2 = min_t(u32, clips[i].x2, fb->width);
+			u32 y1 = min_t(u32, clips[i].y1, fb->height);
+			u32 y2 = min_t(u32, clips[i].y2, fb->height);
+			size_t x_offset;
+
+			if (x1 >= x2 || y1 >= y2)
+				continue;
+			x_offset = (size_t)x1 * fb->format->cpp[0];
+			row_bytes = (size_t)(x2 - x1) * fb->format->cpp[0];
+			for (y = y1; y < y2; y++) {
+				u8 __iomem *dst = cdev->vram +
+					cdev->scanout_offset +
+					(size_t)y * fb->pitches[0] + x_offset;
+
+				memcpy_toio(dst, map.vaddr + fb->offsets[0] +
+					    (size_t)y * fb->pitches[0] +
+					    x_offset, row_bytes);
+				last = dst + row_bytes - 1;
+			}
+		}
+	}
 	/* Flush posted BAR writes before an eventual scanout-base update. */
 	wmb();
-	readb(cdev->vram + cdev->scanout_offset +
-	      (size_t)(fb->height - 1) * fb->pitches[0] + row_bytes - 1);
+	if (last)
+		readb(last);
 	mutex_unlock(&cdev->scanout_lock);
 
 out_vunmap:
 	drm_gem_vunmap(obj, &map);
 	return ret;
+}
+
+int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
+				   struct drm_framebuffer *fb)
+{
+	return chrome9_gem_copy_fb_damage_to_scanout(cdev, fb, NULL, 0);
 }
 
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,

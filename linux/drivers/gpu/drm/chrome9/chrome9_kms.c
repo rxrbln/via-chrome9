@@ -45,15 +45,16 @@ MODULE_PARM_DESC(direct_flips,
 /* Every indexed register written by chrome9_iga1_program(). */
 static const u8 chrome9_saved_sr[] = {
 	0x01, 0x02, 0x03, 0x04, 0x10, 0x15, 0x16, 0x17, 0x18,
-	0x1b, 0x1c, 0x1d, 0x1e, 0x22, 0x31,
-	0x2d, 0x40, 0x44, 0x45, 0x46,
+	0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x22, 0x2a, 0x31,
+	0x2d, 0x40, 0x44, 0x45, 0x46, 0x58, 0x59,
 };
 
 static const u8 chrome9_saved_cr[] = {
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11,
 	0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x32, 0x33, 0x34,
-	0x35, 0x36, 0x45, 0x47, 0x48, 0x6a, 0x6c, 0x91, 0x9b,
+	0x35, 0x36, 0x45, 0x47, 0x48, 0x69, 0x6a, 0x6b, 0x6c,
+	0x88, 0x89, 0x8a, 0x91, 0x96, 0x97, 0x99, 0x9b, 0xd2, 0xd4,
 };
 
 static const u8 chrome9_vpit_gfx[VGA_GFX_C] = {
@@ -89,6 +90,8 @@ struct chrome9_kms_state {
 	u8 cr[256];
 	u8 gfx[VGA_GFX_C];
 	u8 attr[ARRAY_SIZE(chrome9_vpit_attr)];
+	u8 dac_mask;
+	u8 lut[256][3];
 	struct i2c_algo_bit_data ddc_bit;
 	struct i2c_adapter ddc;
 };
@@ -238,6 +241,99 @@ static void chrome9_vpit_program(void)
 	chrome9_attr_enable();
 }
 
+static void chrome9_vx900_common_program(void)
+{
+	/* Exact VX855/VX900 common graphics-mode image from in-tree viafb. */
+	vga_io_wseq(0x10, 0x01);
+	chrome9_sr_mask(0x15, 0x02, 0x02);
+	chrome9_sr_mask(0x16, 0xbf, 0x08);
+	vga_io_wseq(0x17, 0x1f);
+	chrome9_sr_mask(0x18, 0xbf, 0x4e);
+	chrome9_sr_mask(0x1a, 0xfb, 0x08);
+	vga_io_wseq(0x1b, 0xf0);
+	chrome9_sr_mask(0x1e, 0x07, 0x01);
+	chrome9_sr_mask(0x2a, 0xf0, 0x00);
+	vga_io_wseq(0x58, 0x00);
+	vga_io_wseq(0x59, 0x00);
+	chrome9_sr_mask(0x2d, 0xc0, 0xc0);
+
+	vga_io_wcrt(0x32, 0x00);
+	chrome9_cr_mask(0x33, 0x7f, 0x00);
+	vga_io_wcrt(0x35, 0x00);
+	chrome9_cr_mask(0x36, BIT(3), 0);
+	vga_io_wcrt(0x69, 0x00);
+	chrome9_cr_mask(0x6a, 0xfd, 0x60);
+	vga_io_wcrt(0x6b, 0x00);
+	vga_io_wcrt(0x88, 0x40);
+	vga_io_wcrt(0x89, 0x00);
+	vga_io_wcrt(0x8a, 0x88);
+	vga_io_wcrt(0xd4, 0x81);
+	vga_io_wcrt(0x91, 0x80);
+	vga_io_wcrt(0x96, 0x00);
+	vga_io_wcrt(0x97, 0x00);
+	vga_io_wcrt(0x99, 0x00);
+	vga_io_wcrt(0x9b, 0x00);
+	vga_io_wcrt(0xd2, 0xff);
+}
+
+static void chrome9_lut_save(struct chrome9_kms_state *kms)
+{
+	u8 sr1a = vga_io_rseq(0x1a);
+	u8 sr1b = vga_io_rseq(0x1b);
+	unsigned int i;
+
+	/* Select IGA1's LUT and stop its lock clock exactly as viafb does. */
+	vga_io_wseq(0x1a, sr1a & ~BIT(0));
+	vga_io_wseq(0x1b, sr1b & ~GENMASK(7, 6));
+	kms->dac_mask = vga_io_r(VGA_PEL_MSK);
+	vga_io_w(VGA_PEL_IR, 0);
+	for (i = 0; i < ARRAY_SIZE(kms->lut); i++) {
+		kms->lut[i][0] = vga_io_r(VGA_PEL_D);
+		kms->lut[i][1] = vga_io_r(VGA_PEL_D);
+		kms->lut[i][2] = vga_io_r(VGA_PEL_D);
+	}
+	vga_io_wseq(0x1b, sr1b);
+	vga_io_wseq(0x1a, sr1a);
+}
+
+static void chrome9_lut_restore(struct chrome9_kms_state *kms)
+{
+	u8 sr1a = vga_io_rseq(0x1a);
+	u8 sr1b = vga_io_rseq(0x1b);
+	unsigned int i;
+
+	vga_io_wseq(0x1a, sr1a & ~BIT(0));
+	vga_io_wseq(0x1b, sr1b & ~GENMASK(7, 6));
+	vga_io_w(VGA_PEL_MSK, kms->dac_mask);
+	vga_io_w(VGA_PEL_IW, 0);
+	for (i = 0; i < ARRAY_SIZE(kms->lut); i++) {
+		vga_io_w(VGA_PEL_D, kms->lut[i][0]);
+		vga_io_w(VGA_PEL_D, kms->lut[i][1]);
+		vga_io_w(VGA_PEL_D, kms->lut[i][2]);
+	}
+	vga_io_wseq(0x1b, sr1b);
+	vga_io_wseq(0x1a, sr1a);
+}
+
+static void chrome9_lut_program_identity(void)
+{
+	u8 sr1a = vga_io_rseq(0x1a);
+	u8 sr1b = vga_io_rseq(0x1b);
+	unsigned int i;
+
+	vga_io_wseq(0x1a, sr1a & ~BIT(0));
+	vga_io_wseq(0x1b, sr1b & ~GENMASK(7, 6));
+	vga_io_w(VGA_PEL_MSK, 0xff);
+	vga_io_w(VGA_PEL_IW, 0);
+	for (i = 0; i < 256; i++) {
+		vga_io_w(VGA_PEL_D, i);
+		vga_io_w(VGA_PEL_D, i);
+		vga_io_w(VGA_PEL_D, i);
+	}
+	vga_io_wseq(0x1b, sr1b);
+	vga_io_wseq(0x1a, sr1a);
+}
+
 static void chrome9_iga1_save(struct chrome9_kms_state *kms)
 {
 	unsigned int i;
@@ -269,6 +365,7 @@ static void chrome9_iga1_save(struct chrome9_kms_state *kms)
 	for (i = 0; i < ARRAY_SIZE(kms->attr); i++)
 		kms->attr[i] = chrome9_attr_read(i);
 	chrome9_attr_enable();
+	chrome9_lut_save(kms);
 	kms->snapshot_valid = true;
 }
 
@@ -306,6 +403,7 @@ static void chrome9_iga1_restore(struct chrome9_kms_state *kms)
 	for (i = 0; i < ARRAY_SIZE(kms->attr); i++)
 		chrome9_attr_write(i, kms->attr[i]);
 	chrome9_attr_enable();
+	chrome9_lut_restore(kms);
 
 	/* Restore the old PLL while its programming reset is asserted. */
 	chrome9_sr_mask(0x40, BIT(1), BIT(1));
@@ -350,12 +448,15 @@ static int chrome9_iga1_program(struct chrome9_device *cdev,
 	chrome9_cr_mask(0x6a, BIT(6), 0);
 	chrome9_cr_mask(0x6a, BIT(7), 0);
 	chrome9_cr_mask(0x6a, BIT(6), BIT(6));
+	chrome9_vx900_common_program();
 	chrome9_vpit_program();
 	/* viafb marks this bit as required for correct VX900 IGA1 modes. */
 	chrome9_cr_mask(0x45, BIT(0), 0);
 
 	/* XRGB8888 uses viafb's depth-24 selector. */
 	chrome9_sr_mask(0x15, GENMASK(7, 1), 0xae);
+	/* DVP1 uses IGA1's LUT; establish an explicit linear 8-bit ramp. */
+	chrome9_lut_program_identity();
 
 	/* IGA1 uses two-byte units; CR48[7:6]=01 selects translated SF. */
 	chrome9_cr_mask(0x48, GENMASK(7, 6),
@@ -396,14 +497,20 @@ static int chrome9_iga1_program(struct chrome9_device *cdev,
 	 * SR31 and has no responding VT1632 transmitter to program.
 	 */
 	chrome9_cr_mask(0x91, GENMASK(7, 5), BIT(7));
+	/*
+	 * The vendor VIADVIPatchSkew_DVP1 path uses CR9B[3:0]=0xa.
+	 * This is required on the t5550: the viafb default of zero produces
+	 * swapped colors and extensive black corruption on an otherwise valid
+	 * XRGB8888 scanout.
+	 */
 	chrome9_cr_mask(0x9b, GENMASK(6, 0),
 			(mode->flags & DRM_MODE_FLAG_PHSYNC ? 0 : BIT(5)) |
-			(mode->flags & DRM_MODE_FLAG_PVSYNC ? 0 : BIT(6)));
+			(mode->flags & DRM_MODE_FLAG_PVSYNC ? 0 : BIT(6)) |
+			0x0a);
 	chrome9_sr_mask(0x1e, GENMASK(5, 4), GENMASK(5, 4));
 
-	/* Turn outputs on only after base, fetch, timing, and clocks are complete. */
-	chrome9_cr_mask(0x36, GENMASK(5, 4), 0);
-	vga_io_wcrt(0x47, cdev->kms_state->cr[0x47]);
+	/* DVI-only: keep the analog CRT DAC off while DVP1 carries IGA1. */
+	chrome9_cr_mask(0x36, GENMASK(5, 4), GENMASK(5, 4));
 	vga_io_wseq(0x10, cdev->kms_state->sr[0x10]);
 	chrome9_sr_mask(0x01, BIT(5), 0);
 	return 0;
