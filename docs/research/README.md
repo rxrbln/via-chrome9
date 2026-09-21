@@ -25,6 +25,12 @@ targets.
 - [chrome9-two-texture-callback-provenance.md](chrome9-two-texture-callback-provenance.md)
   separates the production r0/r1 compiler object from the still-valid,
   live-proven fixed/Xorg tuple reproduced by the old swapped callback probe.
+- [chrome9-production-three-factor-provenance.md](chrome9-production-three-factor-provenance.md)
+  records the production r0--r3 `tex0*tex1*primary` object and proves that its
+  `90010000` A90 cannot be inferred from the shorter two-texture schedule.
+- [chrome9-production-four-alu-provenance.md](chrome9-production-four-alu-provenance.md)
+  separates three production four-ALU alpha forms from their historical
+  callback-swapped fixed-program counterparts.
 - [chrome9-cmd19-fp-contract.md](chrome9-cmd19-fp-contract.md) separates
   value-independent Linux/Windows MOV/MUL compiler evidence from numerical
   silicon behavior, defines the finite/exceptional-value gate, a guarded
