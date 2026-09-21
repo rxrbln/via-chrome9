@@ -129,6 +129,11 @@ targets.
   LRP lowerings and keeps LRP outside the portable one-record contract.
 - [chrome9-lrp-cross-driver-corpus.tsv](chrome9-lrp-cross-driver-corpus.tsv)
   preserves the exact records, controls, and Linux expansion algebra.
+- [chrome9-crs-expansion-audit.md](chrome9-crs-expansion-audit.md) proves the
+  cross-product's common two-record lowering, Linux dependency delta, and
+  bounded normalized-input oracle while retaining the multi-record rejection.
+- [chrome9-crs-expansion-corpus.tsv](chrome9-crs-expansion-corpus.tsv) retains
+  five terminal Windows/Linux CRS source topologies and exact controls.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
