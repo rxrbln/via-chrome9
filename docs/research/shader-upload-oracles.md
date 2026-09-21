@@ -740,9 +740,10 @@ are deliberately non-one, bind c0.x=`3f800000`, and require unchanged RGB
 plus output alpha `ff`.  Repeat with c0.x=zero to prove the second write is
 active rather than an implicit render-target alpha fill.
 
-The same file now carries seven exact Linux vertex templates: clip position;
+The same file now carries eight exact Linux vertex templates: clip position;
 position plus T0.xy; position plus T0/T1.xy; M4x4 position with zero, one, or
-two texture coordinates; and M4x4 position plus color and T0.xy.  The
+two texture coordinates; M4x4 position plus color and T0.xy; and the complete
+M4x4 position plus color and T0/T1.xy form.  The
 two-texture glamor pass-through has eight uploaded records, six active
 records, metadata `00000204`, A62 low value two, and these three user
 records before the three active finalizer records and two inactive sentinels:
@@ -783,6 +784,15 @@ metadata is:
 | M4x4 position + T0.xy | 11 | 9 | `00000104` | `25f0c000 / 26000000` | 5 | `60800008` |
 | M4x4 position + T0/T1.xy | 12 | 10 | `00000204` | `25f0cc00 / 26000000` | 6 | `60800009` |
 | M4x4 position + oD0 + T0.xy | 12 | 10 | `00000144` | `25f4c000 / 26000000` | 6 | `60800009` |
+| M4x4 position + oD0 + T0/T1.xy | 13 | 11 | `00000244` | `25f4cc00 / 26000000` | 7 | `6080000a` |
+
+The color-plus-texture templates use dense inputs: oD0 reads v1, T0 reads v2,
+and T1 reads v3.  T0 must therefore begin `0008814c`, not the v1-source
+`0008414c` used by the no-color T0 template.  A hardware-free compiler run
+caught and corrected that distinction in the offline table.  The exact
+identity-only UAPI proposal, compact declarations, address-free gates, and
+guarded live sequence are in
+[native-clip-vs-uapi-oracle.md](native-clip-vs-uapi-oracle.md).
 
 ### Safe native-shader live gates
 
@@ -827,7 +837,7 @@ cc -std=c11 -Wall -Wextra -Werror -O2 \
 /tmp/chrome9-shader-offline-test
 ```
 
-It checks fifteen PS and all seven VS templates, exact instruction words,
+It checks fifteen PS and all eight VS templates, exact instruction words,
 controls, metadata, active/upload counts, resource masks, and a rejected
 unsupported form.  This code is intentionally absent from `meson.build` and
 does not change caps or submission.
