@@ -15,6 +15,10 @@ struct pipe_screen;
 struct chrome9_resource {
    struct pipe_resource base;
    struct chrome9_bo bo;
+   uint32_t level_stride[PIPE_MAX_TEXTURE_LEVELS];
+   uint64_t level_offset[PIPE_MAX_TEXTURE_LEVELS];
+   uint64_t level_size[PIPE_MAX_TEXTURE_LEVELS];
+   /* Level-zero aliases retained for the existing draw/ioctl contract. */
    uint32_t stride;
    uint64_t data_offset;
    uint64_t data_size;
