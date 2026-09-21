@@ -77,7 +77,7 @@ and exact one-record controls.
 
 | NIR or recognized expression | compiler result | policy |
 |---|---|---|
-| `nir_op_ffloor` | FRC subop e then subop-9 record | static only; no production dynamic finalized object |
+| `nir_op_ffloor` | FRC subop e then subtract record | production internal streams differ in scratch id and A90; reject as non-portable and silicon-unproved |
 | `nir_op_flrp` | Windows one dedicated record; Linux two ordinary records | reject cross-driver mismatch |
 | `nir_op_fpow` | LOG, multiply, EXP; three records | expansion closed; positive bounded domain only after multi-ALU gate |
 | normalize expression | DP3, subop9, RSQ, MUL; four records | expansion closed only as indivisible vendor NRM lowering |

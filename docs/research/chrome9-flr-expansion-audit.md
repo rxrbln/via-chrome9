@@ -11,6 +11,12 @@ FLR token, and the internal OpenGL grammar path has not yet been invoked with
 a production-initialized allocator/finalizer.  There is consequently no
 dynamic byte-exact FLR stream and no silicon semantics claim here.
 
+That paragraph records the original static-audit boundary. It is superseded
+for three terminal source forms by the production differential in
+[`chrome9-flr-production-audit.md`](chrome9-flr-production-audit.md). The
+dynamic result finds a real Windows/Linux scratch-id and A90 mismatch, so FLR
+remains rejected for a stronger reason.
+
 ## Windows and Linux emitter structure
 
 The Windows internal emitter is `0x10216a10`.  It allocates a temporary at
@@ -68,4 +74,3 @@ guards, fences, reset/error counters, and known-good draws before and after.
 No FLR key should be advertised until the exact production stream, dependency
 finalization, negative-floor rule, lane behavior, and exceptional policy all
 pass.
-
