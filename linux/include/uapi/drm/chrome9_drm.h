@@ -102,6 +102,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DEPTH_FUNC	(1ULL << 15)
 /* One level-zero texture can be combined with linear D16 test/write. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16	(1ULL << 16)
+/* Textured D16 draws can retain alpha in an A8R8G8B8 destination. */
+#define DRM_CHROME9_CAP_TEXTURED_D16_BGRA8888	(1ULL << 17)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -302,10 +304,10 @@ struct drm_chrome9_draw_textured_triangle {
 
 /*
  * Draw one single-textured triangle with linear D16 test/write.  This
- * successor is deliberately narrow: X8R8G8B8 destination, one level-zero
- * 32-bit texture, no framebuffer blend or alpha test, and an explicit LESS
- * or LEQUAL comparison in flags.  All three BOs are distinct native guarded
- * shmem objects.  The depth pitch is ALIGN(width * 2, 32).
+ * successor is deliberately narrow: X8R8G8B8 or A8R8G8B8 destination, one
+ * level-zero 32-bit texture, no framebuffer blend or alpha test, and an
+ * explicit LESS or LEQUAL comparison in flags.  All three BOs are distinct
+ * native guarded shmem objects.  The depth pitch is ALIGN(width * 2, 32).
  */
 struct drm_chrome9_draw_textured_triangle_d16 {
 	__u32 destination_handle;
@@ -327,7 +329,8 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 	__u32 wrap_t;
 	struct drm_chrome9_textured_vertex vertices[3];
 	struct drm_chrome9_scissor_state scissor;
-	__u32 reserved[4];
+	__u32 destination_format;
+	__u32 reserved[3];
 };
 
 #define DRM_CHROME9_BLEND_ENABLE		(1U << 0)
