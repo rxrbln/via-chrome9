@@ -118,6 +118,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
 /* Two level-zero textures can be multiplied with D16 test/write. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16	(1ULL << 20)
+/* Blend state accepts the proven source/destination color/alpha factors. */
+#define DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS	(1ULL << 29)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -378,6 +380,13 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_BLEND_FACTOR_ONE		1
 #define DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA	2
 #define DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA	3
+#define DRM_CHROME9_BLEND_FACTOR_SRC_COLOR	4
+#define DRM_CHROME9_BLEND_FACTOR_INV_SRC_COLOR	5
+#define DRM_CHROME9_BLEND_FACTOR_DST_ALPHA	6
+#define DRM_CHROME9_BLEND_FACTOR_INV_DST_ALPHA	7
+#define DRM_CHROME9_BLEND_FACTOR_DST_COLOR	8
+#define DRM_CHROME9_BLEND_FACTOR_INV_DST_COLOR	9
+#define DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE	10
 
 #define DRM_CHROME9_BLEND_FUNC_ADD	0
 
