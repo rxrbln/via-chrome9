@@ -331,7 +331,15 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	if (IS_ERR(shmem_obj))
 		return PTR_ERR(shmem_obj);
 	obj = &shmem_obj->base;
-	if (args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT)
+	/*
+	 * This VX900 path has an exact 32-bit DMA mask and no IOMMU.  Every GEM
+	 * object submitted to SF must therefore live below 4 GiB; otherwise the
+	 * generic shmem DMA attachment permanently consumes SWIOTLB slots and the
+	 * GPU executes against the bounce copy.  The userspace flag remains the
+	 * stronger scanout contract (eager allocation plus explicit verification),
+	 * while unflagged render resources receive the same physical placement.
+	 */
+	if (chrome9_dma32_scanout_supported(to_chrome9(drm)))
 		chrome9_gem_set_dma32(shmem_obj);
 
 	/*
