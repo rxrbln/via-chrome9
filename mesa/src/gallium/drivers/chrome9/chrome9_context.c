@@ -1931,6 +1931,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND);
    ctx->depth_func_supported =
       !!(capabilities & DRM_CHROME9_CAP_DEPTH_FUNC);
+   ctx->depth_read_only_supported =
+      !!(capabilities & DRM_CHROME9_CAP_DEPTH_READ_ONLY);
    ctx->draw_triangle_batch =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH);
    ctx->draw_triangle_d16_rhw_batch =

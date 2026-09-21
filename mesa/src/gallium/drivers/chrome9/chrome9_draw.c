@@ -484,7 +484,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 
       *reason = "depth-state";
       *depth = chrome9_context_depth_target(ctx);
-      if (!ctx->draw_triangle_d16 || !ctx->dsa->depth_writemask ||
+      if (!ctx->draw_triangle_d16 ||
+          (!ctx->dsa->depth_writemask &&
+           !ctx->depth_read_only_supported) ||
           (ctx->dsa->depth_func != PIPE_FUNC_LESS &&
            !(ctx->depth_func_supported &&
              ctx->dsa->depth_func == PIPE_FUNC_LEQUAL)) || !*depth ||
@@ -658,6 +660,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    bool blend_successor = false;
    bool depth_active = false;
    bool perspective_batch;
+   uint32_t depth_flags = 0;
 
    if (!crender->textured && ctx->draw_triangle_batch &&
        crender->batch_failed) {
@@ -709,6 +712,12 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       return;
    }
    perspective_batch = depth_active && ctx->draw_triangle_d16_rhw_batch;
+   if (depth_active) {
+      if (ctx->depth_func_supported)
+         depth_flags = DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+      if (!ctx->dsa->depth_writemask)
+         depth_flags |= DRM_CHROME9_DEPTH_READ_ONLY;
+   }
    if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program) &&
        !chrome9_fragment_constant_color(ctx, &constant_color)) {
       ctx->rejected_triangles++;
@@ -914,8 +923,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          two_texture_depth_args.destination_handle =
             two_texture_args.destination_handle;
          two_texture_depth_args.depth_handle = depth->bo.handle;
-         two_texture_depth_args.flags =
-            DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+         two_texture_depth_args.flags = depth_flags;
          two_texture_depth_args.width = two_texture_args.width;
          two_texture_depth_args.height = two_texture_args.height;
          two_texture_depth_args.destination_pitch =
@@ -975,8 +983,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             texture_args.destination_handle;
          texture_depth_args.texture_handle = texture_args.texture_handle;
          texture_depth_args.depth_handle = depth->bo.handle;
-         texture_depth_args.flags =
-            DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+         texture_depth_args.flags = depth_flags;
          if (chrome9_blend_is_source_over(&blend_state))
             texture_depth_args.flags |=
                DRM_CHROME9_TEXTURED_D16_SOURCE_OVER;
@@ -1001,9 +1008,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    } else if (depth_active) {
-      if (ctx->depth_func_supported)
-         depth_args.flags =
-            DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+      depth_args.flags = depth_flags;
       depth_args.destination_handle = target->bo.handle;
       depth_args.depth_handle = depth->bo.handle;
       depth_args.width = target->base.width0;
@@ -1057,9 +1062,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             memset(batch, 0, sizeof(*batch));
             batch->destination_handle = target->bo.handle;
             batch->depth_handle = depth->bo.handle;
-            batch->flags = DRM_CHROME9_TRIANGLE_BATCH_DEPTH;
-            if (ctx->depth_func_supported)
-               batch->flags |= DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+            batch->flags = DRM_CHROME9_TRIANGLE_BATCH_DEPTH | depth_flags;
             batch->width = target->base.width0;
             batch->height = target->base.height0;
             batch->destination_pitch = target->stride;
@@ -1081,10 +1084,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             crender->batch.destination_pitch = target->stride;
             crender->batch.scissor = scissor;
             if (depth_active) {
-               crender->batch.flags |= DRM_CHROME9_TRIANGLE_BATCH_DEPTH;
-               if (ctx->depth_func_supported)
-                  crender->batch.flags |=
-                     DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+               crender->batch.flags |=
+                  DRM_CHROME9_TRIANGLE_BATCH_DEPTH | depth_flags;
                crender->batch.depth_handle = depth->bo.handle;
                crender->batch.depth_pitch = depth->stride;
             }
