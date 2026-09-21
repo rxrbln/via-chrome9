@@ -91,6 +91,77 @@ A60--A67 and does not start a usable command ring.  It also does not restore
 `0200`, the page table, any GART sequencer register, the ring contents, or a
 fence value.
 
+### Exact 7122 replay stream
+
+The complete PCI-7122 path through `0x896b0` can be represented without
+ambiguity as the following run-length table.  `group(S, V...)` means one
+`MMIO[043c]=S` write followed by the listed values, in order, to
+`MMIO[0440]`.  A range `a..b << 24` is inclusive.  There are no omitted calls
+or hidden table lookups in this path.
+
+```text
+for offset = 0000..0038 step 4:       MMIO[offset] = 00000000
+for offset = 1e00..1fe0 step 20:      MMIO[offset] = 00000000
+
+group(00080000, 00000001)
+group(00010000, 00..9a << 24)
+for stage = 0..15:
+        group(00020000 | stage<<24, 00..30 << 24)
+for stage = 0..15:
+        group(20020000 | stage<<24, 30..36 << 24)
+group(fe020000, 00..0d << 24)
+
+group(12030000,
+      00030003 03030300 00040004 04040400
+      01010001 00010101 00050005 05050500
+      01060006 05060601 020b000b 00020202
+      020d000d 050d0d02 00080008 08080800
+      0109000c 08090c01 020b000b 080a0a02)
+
+group(15030000,
+      41e03c05 07714434 11b36ca5 2176e565 377bd680)
+
+group(17030000,
+      40d0340d 41a0681a 42709c27 0330cc33
+      04711c47 05715c57 0711c471 08721c87
+      0aa2a8aa 0c731cc7 0f63d8f6 11c4711c
+      13d4f53d 15b56d5b 1755d575 18e6398e
+      1ba6e9ba 1e1785e1 20581605 22689a26
+      26198661 296a5a96 2c5b16c5 2f1bc6f1
+      31ac6b1a 340d0340 364d9364 386e1b86
+      3a6e9ba6 3c6f1bc6 3e4f93e4)
+
+group(00030000, 16 * 00000000)
+group(11030000, 32 * 00000000)
+group(14030000,  8 * 00000000)
+group(00040000, 00..52 << 24)
+
+group(00fe0000,
+      00001004 08000249 0a0002c9 0b0002fb
+      0c000000 0d0002cb 0e000009 10000049
+      110002ff 12000008 130002db 20000000
+      40008408 44000000 46000000 47000404)
+
+MMIO[041c] = 00100000; MMIO[0420] = 680a0000
+MMIO[041c] = 00100000; MMIO[0420] = 02000000
+```
+
+This is 1,355 ordered writes: 31 direct clears and 1,324 transfer-port
+writes.  For an extraction cross-check, serializing every write as the
+little-endian pair `<u32 offset, u32 value>` yields 10,840 bytes and SHA-256
+`4febac244d807fd2ec97a010e530a0d095bf4921b2722ca750c5e2e4bf803d03`.
+The literal 20-word table is read from image VA `0x000eace0`; the 7122
+generation branch is `0x8a1c0..0x8a342`.
+
+This exact Windows stream must not silently replace Linux's already proven
+Xorg-derived initializer.  In addition to the `377bd680` KMD table bug, it
+clears only FE entries `00..0d` and type-04 entries `00..52`, then leaves the
+7122 FE values `40=008408`, `46=000000`, and `47=000404`.  The Linux
+`chrome9_init_3d_h5s2vp1()` deliberately initializes wider ranges and uses the
+live-proven `40=00840f`, `46=000005`, and corrected `374bd680`.  The Windows
+stream is the exact reset oracle; the Linux stream is the correct candidate
+for post-reset operating state.
+
 There is now negative executable evidence against using T10 A68's other
 control bits as an abbreviated recovery.  An exhaustive disassembly search of
 this VX900 KMD finds only these literal T10 A68 emissions:
@@ -406,6 +477,153 @@ production path must save the interrupt-enable policy before Windows' global
 enable bits, and restore both LUT controls changed by the reset helper.  It
 must not raw-restore pending/RW1C status or enable Windows' DMA interrupt bits
 unless Linux has handlers for them.
+
+### Preserve, rebuild, or never restore
+
+The reset transaction cannot use one undifferentiated register snapshot.
+Some values are display ownership and must survive; others are command
+latches whose old contents are precisely what recovery is trying to discard.
+The following split follows the exact Windows write set and the current
+Chrome9 driver's ownership model.
+
+| state | reset effect | Linux policy after bounded full idle |
+|---|---|---|
+| `0200` | literal zero disables the global graphics gate and every display/video/engine IRQ enable in the dword | snapshot only documented RW enable bits `f7ff0800` under the IRQ lock; restore the driver's current enable shadow, not the sampled live/RW1C/RO bits; do not copy Windows' `80a00000` DMA enables |
+| `0204` | early 7122/a122 revisions receive narrow `00000020` CR acknowledgement while busy | never raw-restore; acknowledge only owned stale RW1C sources, and separately require `0204.bit1==0` before considering an IGA1 base update latched |
+| `SR1B.bit0`, `CR92.bit7` | both are cleared before the hang test, including the already-idle return path | save and restore the two LUT-control bits exactly; `CR92` is not in the current fixed-IGA1 snapshot and must be added to a reset snapshot |
+| `SR1A`, `SRC7` | bit 6 and, on 7122, bit 7 are pulsed; other bits are read/modify/written | save for comparison; preserve other bits, but finish with reset bits deasserted rather than reasserting a stale one |
+| `SR4E` | literal `0f`, delay, literal `00` destroys the whole old byte | record for diagnostics, but do not raw-restore reset requests; require the final deasserted value and rebuild the affected engines |
+| `SR3F` clocks | not written directly, but wider reset collateral is unproved | save, force required 2D/3D clocks on through all idle/GART/ring proofs, then restore the prior gating policy |
+| `SR6A/B/C`, `SR7B`, page-table memory | not touched by the vendor helper, which assumes survival | read back and verify against the driver's owned aperture; rewrite base/size/mode and every persistent ring/scanout PTE if needed |
+| `SR6F` | not touched | never raw-restore this self-clearing command register; issue a new bit-7 GTI flush with pre- and post-deadlines |
+| PCI command/BME | not touched by the vendor helper | verify it did not change; do not use clearing BME as proof of engine retirement |
+| `0214`, `CR0c/0d/34/48`, `CR32` | no direct Windows write, but these define active IGA1 SF fetch and flip policy | while KMS is active, preserve base and source/mode bits and retain the active scanout mapping; compare after reset and restore only while blank and serialized with atomic KMS |
+| active IGA1 timing/PLL/FIFO/output | no direct Windows write; collateral of `SR1A`/`SRC7` is unknown | first live reset must keep KMS disabled; production must snapshot the exact active state written by `chrome9_iga1_program()`, not the pre-KMS firmware snapshot, and compare before deciding whether a blanked replay is needed |
+| MMIO `0000..0038` | all 15 dwords are zeroed | these are 2D command/mode/pitch/dimension/address/cookie latches; never restore a pre-hang command or address. Re-run `chrome9_init_2d_h6()` and establish a new cookie baseline |
+| MMIO `0048`, `0058`, `006c` | not directly zeroed, but are part of the current 2D save/test surface | do not preserve an old client operation; the first post-reset guarded 2D packet must provide complete state. Capture only for before/after diagnostics |
+| MMIO `1e00..1fe0` | one dword per `0x20` slot is zeroed | CBU-rotation state is destroyed. The current plane accepts rotation zero only, so zero is the intended rebuild; reject recovery with any future CBU/video owner until that owner's replay exists |
+| `041c/0420`, `043c/0440`, A60--A68 | selectors/defaults are overwritten; A68 trigger ends clear | never restore cursors or the old ring tuple. Replay defaults, then install a newly owned ring and new pause/cookie epoch |
+| `DST_POS`/H0 cookie | cleared as part of `0010` | never restore during recovery; choose the alternate sentinel from the post-reset read and prove the new H0 write |
+| `0494` current fence | no explicit write; reset semantics unknown | treat every pre-reset value as stale; retain the monotonic Linux fence timeline and use a separate reset epoch |
+
+For the current fixed mode, an active-state snapshot must at least cover all
+indices in `chrome9_saved_sr[]` and `chrome9_saved_cr[]`, plus `SR1A`, `SR3F`,
+`SR4E`, `SR6A/B/C/F`, `SR7B`, `CR92`, `SRC7`, VGA selector bytes, Misc,
+graphics/attribute state, `0200`'s enable shadow, `0204`, and `0214`.  The
+existing `chrome9_kms_state` arrays contain the state which preceded KMS
+activation; using them as the reset snapshot would incorrectly restore
+firmware mode instead of the active DRM mode.
+
+The current driver's exact GART recovery image is also derivable, rather than
+an opaque “restore GART” step.  Let `G` be the configured 64-KiB table byte
+offset (required to equal `vram_size - 0x10000`) and `D` the coherent ring DMA
+base.  The required post-reset values are:
+
+```text
+SR6A = (G >> 12) & ff
+SR6B = (G >> 20) & ff
+SR6C = (saved_SR6C & ~81) | ((G >> 28) & 1) | 80
+SR7B = (saved_SR7B & f0) | 04
+
+PTE[0..15] = ((D + index*1000) >> 12) & 3fffffff
+every unowned PTE = 80000000
+every retained shmem/scanout PTE =
+        ((dma_page >> 12) & 3fffffff) | 02000000
+```
+
+`SR6C.bit7` is cleared while editing and restored only after the table is
+published and flushed.  The proof is: compare all four programmed control
+bytes, compare all 16 ring entries plus every active-scanout entry, require
+every quarantined transient range to read `80000000`, execute a posted table
+read and `wmb()`, request `SR6F.bit7`, and require bit 7 to self-clear before
+and after the request under separate deadlines.  A matching control tuple
+without the PTE readback and self-clearing flush is not enough, because reset
+may preserve the aperture registers while leaving cached translations stale.
+
+There are likewise two distinct idle proofs.  Immediately after the reset
+pulses and before touching old translations, require
+`0400 & 00101ff3 == 0`; this is the release authority for old in-flight engine
+work.  After rebuilding the ring, require a newly generated cookie,
+`0444.bit31`, and `0400 & 00101fe3 == 0`; this proves the new ring fetched,
+executed H0, drained work, and stopped at its owned PAUSE.  Record `040c==0`
+at both boundaries.  Neither a clear `040c`, a preserved `0494`, nor PAUSE
+without the new cookie substitutes for these predicates.
+
+### Bounded Linux transaction
+
+The following is a patch-ready transaction boundary.  Every failure from
+step 1 through step 14 leaves `wedged=true`, submissions blocked, old PTEs and
+SF nodes retained, active scanout pinned, and error fences unsignaled.
+
+1. Serialize reset against PM/remove and atomic KMS and set a `resetting`
+   flag.  Briefly take `submit_lock`, set `ready=false`, and take stable fence
+   references to every quarantine job; then drop it, lock all retained object
+   reservations with `drm_exec`, reacquire `submit_lock`, and revalidate job
+   membership and the reset epoch.  This avoids the normal submit path's
+   `dma_resv` -> `submit_lock` inversion.  No normal PID10 ring replacement is
+   attempted for an active-reader hang.
+2. Mark all quarantined fences `-EIO` without signaling them.  Keep
+   `dma_fence_context` and `fence_seqno`; increment a separate `reset_epoch`.
+3. With IRQ and VGA-index locks held in their established order, snapshot the
+   preserve set above and mask engine/display completion handling.  Preserve
+   the active scanout pin and framebuffer reference.
+4. Execute the exact destructive pulse order: both LUT helper calls;
+   `0200=0` plus posted read; `SR4E=0f`, delay, `SR4E=00`; pulse
+   `SR1A.bit6`; on 7122 pulse `SRC7.bit7`.  Preserve the indexed-selector
+   bytes around every indexed access.
+5. Replace the vendor's unbounded loop with a fixed deadline for
+   `0400 & 00101ff3 == 0`.  Revision 0/1 may write only `0204=00000020`
+   while polling.  A posted read follows every pulse and acknowledgement.
+6. Run `chrome9_init_2d_h6()` and the corrected
+   `chrome9_init_3d_h5s2vp1()`; then reapply the T11 A06/A07 and T10 A02
+   command-reader preparation.  Do not combine Windows and Xorg FE tails.
+7. Read back `SR6A/B/C/7B`, the owned page table, and PCI BME.  Reprogram the
+   driver's aperture if any field differs.  Republish only persistent ring
+   and active-scanout PTEs; leave every old transient job entry invalid.
+8. Issue `wmb()`, set `SR6F.bit7`, and require it to self-clear under both the
+   preflush and postflush deadlines.  Read back every ring and scanout PTE.
+9. Refill both software ring slots with dummies.  Install a new A60--A68 tuple
+   pointing only at a newly selected slot and a new PID00 PAUSE; never reuse
+   the saved A64/A65 or `active_slot` as authority.
+10. Submit an address-free H0 write of a new alternating cookie before that
+    PAUSE.  Require the exact cookie, `0444.bit31`,
+    `0400 & 00101fe3 == 0`, and `040c==0`.  Then publish PID10 and require
+    full `0400 & 00101ff3 == 0` before installing the ordinary paused ring;
+    require its new `0444.bit31` plus non-CR idle once more.
+11. While still unavailable to userspace, run one guarded 2D fill and the
+    fixed guarded 3D oracle.  Require destination samples, all guards,
+    cookie/PAUSE/work idle, and `040c==0` for both.
+12. If KMS is active, compare the saved active display state.  On any changed
+    timing/base/source field, blank IGA1, replay the active DRM mode and
+    `0214`, require `0204.bit1==0` and base readback, then unblank.  Restore
+    the two LUT bits even if the engine was found idle.
+13. Restore the saved `0200` **enable shadow** under the IRQ lock, after
+    narrowly acknowledging stale owned status.  Resume completion handling;
+    do not write back the raw sampled dword.
+14. With every quarantined object's reservation still held, complete the DMA
+    CPU-ownership transition, remove old SF nodes, signal the `-EIO` fences,
+    and drop mappings/references.  Only then clear `wedged/resetting`, set
+    `ready=true`, release the quarantine module/device hold, and finish the
+    `drm_exec` transaction.
+
+The reset pulse delays remain the one unresolved numeric parameter.  The
+binary specifies `0x10000` empty iterations, which is CPU/compiler dependent
+and cannot be translated honestly into microseconds.  A first lab-only
+implementation should use a conservative bounded pulse delay as an explicit
+module parameter, log its value, and rely on the status/readback proofs above
+rather than presenting that delay as vendor-documented timing.  It must not
+ship enabled by default until a minimum working delay is measured repeatedly
+on VX900.
+
+Reservation locking also needs special care.  The quarantined fence is
+already installed in each BO reservation, so recovery may use `drm_exec` to
+lock the retained objects but must not wait on the reservation fence it is
+itself trying to resolve.  Preserve the established order `dma_resv` before
+`submit_lock` before `vm_lock`: briefly freeze admission and take stable job
+references, drop `submit_lock`, acquire all reservations with `drm_exec`, then
+reacquire `submit_lock` and revalidate `reset_epoch`/job membership before
+touching transient PTEs.  Holding `submit_lock` while contending on
+`dma_resv` would invert the normal submit path and can deadlock recovery.
 
 ## Current `engine_quiesce` and recoverable-timeout audit
 
