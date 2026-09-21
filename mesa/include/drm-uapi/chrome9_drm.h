@@ -24,6 +24,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH	0x0c
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16	0x0d
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND	0x12
+#define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -70,6 +71,10 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND, \
 		struct drm_chrome9_draw_textured_triangle_d16_blend)
+#define DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND \
+	DRM_IOW(DRM_COMMAND_BASE + \
+		DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND, \
+		struct drm_chrome9_draw_two_textured_triangle_d16_blend)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -125,8 +130,14 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DEPTH_READ_ONLY	(1ULL << 23)
 /* One texture, D16 and the complete normalized blend state can coexist. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16_BLEND	(1ULL << 27)
+/* Two textures, D16 and complete normalized blend state can coexist. */
+#define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	(1ULL << 28)
 /* Blend state accepts the proven source/destination color/alpha factors. */
 #define DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS	(1ULL << 29)
+/* D16 draw flags additionally accept the live-proven EQUAL comparison. */
+#define DRM_CHROME9_CAP_DEPTH_EQUAL	(1ULL << 32)
+/* D16 draw flags additionally accept the live-proven ALWAYS comparison. */
+#define DRM_CHROME9_CAP_DEPTH_ALWAYS	(1ULL << 35)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -507,6 +518,24 @@ struct drm_chrome9_draw_textured_triangle_d16_blend {
 	struct drm_chrome9_scissor_state scissor;
 	__u32 destination_format;
 	__u32 reserved[3];
+};
+
+/* State-complete two-texture D16 blend and alpha-test successor. */
+struct drm_chrome9_draw_two_textured_triangle_d16_blend {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 reserved0;
+	struct drm_chrome9_texture_state textures[2];
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_two_textured_vertex vertices[3];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 destination_format;
+	__u32 reserved[4];
 };
 
 /*
