@@ -165,6 +165,11 @@ targets.
   context-sideband and live depth-ordering gates.
 - [chrome9-depth-output-corpus.tsv](chrome9-depth-output-corpus.tsv) preserves
   depth-only and combined color/depth cross-driver records and order mismatch.
+- [chrome9-mrt-output-audit.md](chrome9-mrt-output-audit.md) closes oC0..oC3
+  destination ids and high-water output-count semantics while retaining the
+  unproved secondary-render-target state boundary.
+- [chrome9-mrt-output-corpus.tsv](chrome9-mrt-output-corpus.tsv) preserves four
+  individual outputs and one combined oC0+oC1 compiler differential.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
