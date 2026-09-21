@@ -13,6 +13,50 @@
 #include <string.h>
 
 static void
+check_ps_encoder(void)
+{
+   static const uint32_t mov_v0[4] = {
+      0x01c00530, 0x301c0053, 0x00f04005, 0x000d0820,
+   };
+   static const uint32_t mul_v0_c0[4] = {
+      0x0140b6d0, 0x30080053, 0x00f04005, 0x00000820,
+   };
+   struct chrome9_ps_source v0 = {
+      .file = CHROME9_PS_SOURCE_INPUT,
+      .swizzle = {
+         CHROME9_PS_SWIZZLE_X, CHROME9_PS_SWIZZLE_Y,
+         CHROME9_PS_SWIZZLE_Z, CHROME9_PS_SWIZZLE_W,
+      },
+   };
+   struct chrome9_ps_source c0 = v0;
+   uint32_t record[4];
+
+   c0.file = CHROME9_PS_SOURCE_CONSTANT;
+   assert(chrome9_encode_ps_mov(&v0, record));
+   assert(!memcmp(record, mov_v0, sizeof(record)));
+   assert(chrome9_encode_ps_mul(&v0, &c0, record));
+   assert(!memcmp(record, mul_v0_c0, sizeof(record)));
+
+   assert(!chrome9_encode_ps_mov(NULL, record));
+   assert(!chrome9_encode_ps_mov(&v0, NULL));
+   assert(!chrome9_encode_ps_mul(NULL, &c0, record));
+   assert(!chrome9_encode_ps_mul(&v0, NULL, record));
+   assert(!chrome9_encode_ps_mul(&v0, &c0, NULL));
+
+   v0.id = 2;
+   assert(!chrome9_encode_ps_mov(&v0, record));
+   v0.id = 0;
+   v0.swizzle[2] = 6;
+   assert(!chrome9_encode_ps_mov(&v0, record));
+   v0.swizzle[2] = CHROME9_PS_SWIZZLE_Z;
+   v0.modifier = 1;
+   assert(!chrome9_encode_ps_mov(&v0, record));
+   v0.modifier = 0;
+   c0.id = 32;
+   assert(!chrome9_encode_ps_mul(&v0, &c0, record));
+}
+
+static void
 check_fs(void)
 {
    static const struct {
@@ -282,9 +326,10 @@ check_verifier(void)
 int
 main(void)
 {
+   check_ps_encoder();
    check_fs();
    check_vs();
    check_verifier();
-   puts("Chrome9 offline shader corpus: 15 PS + 8 VS templates and verifier passed");
+   puts("Chrome9 PS encoder + offline corpus: 15 PS + 8 VS templates and verifier passed");
    return 0;
 }

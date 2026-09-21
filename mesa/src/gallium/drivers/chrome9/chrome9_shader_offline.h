@@ -39,6 +39,31 @@ struct chrome9_fs_key {
    enum chrome9_fs_leaf src[2];
 };
 
+enum chrome9_ps_source_file {
+   CHROME9_PS_SOURCE_TEMP = 0,
+   CHROME9_PS_SOURCE_INPUT = 1,
+   CHROME9_PS_SOURCE_CONSTANT = 2,
+};
+
+enum chrome9_ps_swizzle {
+   CHROME9_PS_SWIZZLE_X,
+   CHROME9_PS_SWIZZLE_Y,
+   CHROME9_PS_SWIZZLE_Z,
+   CHROME9_PS_SWIZZLE_W,
+   CHROME9_PS_SWIZZLE_ONE,
+   CHROME9_PS_SWIZZLE_ZERO,
+};
+
+#define CHROME9_PS_SOURCE_NEGATE 8
+
+struct chrome9_ps_source {
+   enum chrome9_ps_source_file file;
+   uint8_t id;
+   uint8_t swizzle[4];
+   uint8_t modifier;
+   bool dependency;
+};
+
 struct chrome9_ps_program {
    uint32_t control[12];       /* complete A90..A9b words */
    uint32_t alu[CHROME9_PS_MAX_ALU][4];
@@ -90,6 +115,15 @@ bool chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
                                 struct chrome9_ps_program *program);
 bool chrome9_compile_vs_offline(enum chrome9_vs_key key,
                                 struct chrome9_vs_program *program);
+
+/* Encode the first live-gated straight-line instruction subset.  These
+ * functions validate logical operands before packing native fields and emit
+ * a full oC0 write. */
+bool chrome9_encode_ps_mov(const struct chrome9_ps_source *source,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_c,
+                           uint32_t record[4]);
 
 /* These verify a complete canonical object for a closed key.  They are not
  * validators for arbitrary native shader words. */

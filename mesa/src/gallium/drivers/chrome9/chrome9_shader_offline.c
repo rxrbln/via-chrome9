@@ -5,6 +5,122 @@
 #include <string.h>
 
 static bool
+source_valid(const struct chrome9_ps_source *source)
+{
+   unsigned limit;
+
+   if (!source)
+      return false;
+   switch (source->file) {
+   case CHROME9_PS_SOURCE_TEMP:
+      limit = 12;
+      break;
+   case CHROME9_PS_SOURCE_INPUT:
+      limit = 2;
+      break;
+   case CHROME9_PS_SOURCE_CONSTANT:
+      limit = 32;
+      break;
+   default:
+      return false;
+   }
+   if (source->id >= limit ||
+       (source->modifier != 0 &&
+        source->modifier != CHROME9_PS_SOURCE_NEGATE))
+      return false;
+   for (unsigned i = 0; i < 4; i++) {
+      if (source->swizzle[i] > CHROME9_PS_SWIZZLE_ZERO)
+         return false;
+   }
+   return true;
+}
+
+static void
+encode_source_a(uint32_t record[4], const struct chrome9_ps_source *source)
+{
+   record[1] &= 0x00ffffff;
+   record[2] &= ~0x0003ffff;
+   record[1] |= (uint32_t)source->modifier << 24 |
+                (uint32_t)source->swizzle[3] << 28 |
+                (uint32_t)(source->swizzle[2] & 1) << 31;
+   record[2] |= (uint32_t)source->swizzle[0] << 5 |
+                (uint32_t)source->swizzle[1] << 2 |
+                (uint32_t)source->swizzle[2] >> 1 |
+                (uint32_t)source->id << 8 |
+                (uint32_t)source->file << 14 |
+                (uint32_t)source->dependency << 17;
+}
+
+static void
+encode_source_c(uint32_t record[4], const struct chrome9_ps_source *source)
+{
+   record[0] &= 0x0fffffff;
+   record[1] &= ~0x003fffff;
+   record[3] &= ~0x00100000;
+   record[0] |= (uint32_t)source->modifier << 28;
+   record[1] |= (uint32_t)source->swizzle[0] << 9 |
+                (uint32_t)source->swizzle[1] << 6 |
+                (uint32_t)source->swizzle[2] << 3 |
+                (uint32_t)source->swizzle[3] |
+                (uint32_t)source->id << 12 |
+                (uint32_t)source->file << 18 |
+                (uint32_t)source->dependency << 21;
+   if (source->modifier)
+      record[3] |= 0x00100000;
+}
+
+bool
+chrome9_encode_ps_mov(const struct chrome9_ps_source *source,
+                      uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x01c00530, 0x301c0053, 0x00f08005, 0x000d0820,
+   };
+
+   if (!record || !source_valid(source))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source);
+   return true;
+}
+
+bool
+chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_c,
+                      uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x0140b6d0, 0x30081053, 0x00f08005, 0x00000820,
+   };
+
+   if (!record || !source_valid(source_a) || !source_valid(source_c))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source_a);
+   encode_source_c(record, source_c);
+   return true;
+}
+
+static struct chrome9_ps_source
+source(enum chrome9_ps_source_file file, unsigned id, bool alpha,
+       bool dependency)
+{
+   struct chrome9_ps_source result = {
+      .file = file,
+      .id = id,
+      .swizzle = {
+         alpha ? CHROME9_PS_SWIZZLE_W : CHROME9_PS_SWIZZLE_X,
+         alpha ? CHROME9_PS_SWIZZLE_W : CHROME9_PS_SWIZZLE_Y,
+         alpha ? CHROME9_PS_SWIZZLE_W : CHROME9_PS_SWIZZLE_Z,
+         CHROME9_PS_SWIZZLE_W,
+      },
+      .dependency = dependency,
+   };
+
+   return result;
+}
+
+static bool
 is_pair(const struct chrome9_fs_key *key, enum chrome9_fs_leaf a,
         enum chrome9_fs_leaf b)
 {
@@ -35,47 +151,56 @@ static bool
 compile_alu_only(const struct chrome9_fs_key *key,
                  struct chrome9_ps_program *p)
 {
+   const struct chrome9_ps_source v0 =
+      source(CHROME9_PS_SOURCE_INPUT, 0, false, false);
+   const struct chrome9_ps_source v0a =
+      source(CHROME9_PS_SOURCE_INPUT, 0, true, false);
+   const struct chrome9_ps_source v1 =
+      source(CHROME9_PS_SOURCE_INPUT, 1, false, false);
+   const struct chrome9_ps_source v1a =
+      source(CHROME9_PS_SOURCE_INPUT, 1, true, false);
+   const struct chrome9_ps_source c0 =
+      source(CHROME9_PS_SOURCE_CONSTANT, 0, false, false);
+   const struct chrome9_ps_source c0a =
+      source(CHROME9_PS_SOURCE_CONSTANT, 0, true, false);
+   const struct chrome9_ps_source c1 =
+      source(CHROME9_PS_SOURCE_CONSTANT, 1, false, false);
+   const struct chrome9_ps_source c1a =
+      source(CHROME9_PS_SOURCE_CONSTANT, 1, true, false);
+
    if (key->op == CHROME9_FS_OP_MOV && key->src[0] == CHROME9_FS_LEAF_V0) {
-      const uint32_t alu[4] = { 0x01c00530, 0x301c0053,
-                                0x00f04005, 0x000d0820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mov(&v0, p->alu[0]))
+         return false;
       p->varying_mask = 1;
    } else if (key->op == CHROME9_FS_OP_MOV &&
               key->src[0] == CHROME9_FS_LEAF_C0) {
-      const uint32_t alu[4] = { 0x01c00530, 0x301c0053,
-                                0x00f08005, 0x000d0820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mov(&c0, p->alu[0]))
+         return false;
       p->constant_mask = 1;
    } else if (is_pair(key, CHROME9_FS_LEAF_V0, CHROME9_FS_LEAF_C0)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0x30080053,
-                                0x00f04005, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&v0, &c0, p->alu[0]))
+         return false;
       p->varying_mask = 1;
       p->constant_mask = 1;
    } else if (is_pair(key, CHROME9_FS_LEAF_C0, CHROME9_FS_LEAF_C1)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0x30081053,
-                                0x00f08005, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&c0, &c1, p->alu[0]))
+         return false;
       p->constant_mask = 3;
    } else if (is_pair(key, CHROME9_FS_LEAF_V0, CHROME9_FS_LEAF_V1_A)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0x300416db,
-                                0x00f04005, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&v0, &v1a, p->alu[0]))
+         return false;
       p->varying_mask = 3;
    } else if (is_pair(key, CHROME9_FS_LEAF_V0_A, CHROME9_FS_LEAF_V1)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0xb0041053,
-                                0x00f0406d, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&v0a, &v1, p->alu[0]))
+         return false;
       p->varying_mask = 3;
    } else if (is_pair(key, CHROME9_FS_LEAF_C0, CHROME9_FS_LEAF_C1_A)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0x300816db,
-                                0x00f08005, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&c0, &c1a, p->alu[0]))
+         return false;
       p->constant_mask = 3;
    } else if (is_pair(key, CHROME9_FS_LEAF_C0_A, CHROME9_FS_LEAF_C1)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0xb0081053,
-                                0x00f0806d, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&c0a, &c1, p->alu[0]))
+         return false;
       p->constant_mask = 3;
    } else {
       return false;
@@ -91,30 +216,36 @@ static bool
 compile_one_texture(const struct chrome9_fs_key *key,
                     struct chrome9_ps_program *p)
 {
+   const struct chrome9_ps_source texture =
+      source(CHROME9_PS_SOURCE_TEMP, 0, false, true);
+   const struct chrome9_ps_source texture_alpha =
+      source(CHROME9_PS_SOURCE_TEMP, 0, true, true);
+   const struct chrome9_ps_source v0 =
+      source(CHROME9_PS_SOURCE_INPUT, 0, false, false);
+   const struct chrome9_ps_source c0 =
+      source(CHROME9_PS_SOURCE_CONSTANT, 0, false, false);
+   const struct chrome9_ps_source c0a =
+      source(CHROME9_PS_SOURCE_CONSTANT, 0, true, false);
+
    if (key->op == CHROME9_FS_OP_MOV &&
        key->src[0] == CHROME9_FS_LEAF_TEX0) {
-      const uint32_t alu[4] = { 0x01c00530, 0x301c0053,
-                                0x00f20005, 0x000d0820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mov(&texture, p->alu[0]))
+         return false;
    } else if (is_pair(key, CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_V0)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0x30040053,
-                                0x00f20005, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&texture, &v0, p->alu[0]))
+         return false;
       p->varying_mask = 1;
    } else if (is_pair(key, CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0x30080053,
-                                0x00f20005, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&texture, &c0, p->alu[0]))
+         return false;
       p->constant_mask = 1;
    } else if (is_pair(key, CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0_A)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0xb0200053,
-                                0x00f0806d, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&c0a, &texture, p->alu[0]))
+         return false;
       p->constant_mask = 1;
    } else if (is_pair(key, CHROME9_FS_LEAF_TEX0_A, CHROME9_FS_LEAF_C0)) {
-      const uint32_t alu[4] = { 0x0140b6d0, 0xb0080053,
-                                0x00f2006d, 0x00000820 };
-      memcpy(p->alu[0], alu, sizeof(alu));
+      if (!chrome9_encode_ps_mul(&texture_alpha, &c0, p->alu[0]))
+         return false;
       p->constant_mask = 1;
    } else {
       return false;
