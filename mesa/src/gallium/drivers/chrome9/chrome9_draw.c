@@ -433,7 +433,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
       *reason = "depth-state";
       *depth = chrome9_context_depth_target(ctx);
       if (!ctx->draw_triangle_d16 || !ctx->dsa->depth_writemask ||
-          ctx->dsa->depth_func != PIPE_FUNC_LESS || !*depth ||
+          (ctx->dsa->depth_func != PIPE_FUNC_LESS &&
+           !(ctx->depth_func_supported &&
+             ctx->dsa->depth_func == PIPE_FUNC_LEQUAL)) || !*depth ||
           surface->format != PIPE_FORMAT_Z16_UNORM || surface->level ||
           surface->first_layer || surface->last_layer ||
           ((*depth)->base.target != PIPE_TEXTURE_2D &&
@@ -814,6 +816,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    } else if (depth_active) {
+      if (ctx->depth_func_supported)
+         depth_args.flags =
+            DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
       depth_args.destination_handle = target->bo.handle;
       depth_args.depth_handle = depth->bo.handle;
       depth_args.width = target->base.width0;
@@ -830,6 +835,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          depth_blend_args.destination_pitch =
             depth_args.destination_pitch;
          depth_blend_args.depth_pitch = depth_args.depth_pitch;
+         depth_blend_args.flags = depth_args.flags;
          depth_blend_args.blend = blend_state;
          depth_blend_args.scissor = scissor;
          depth_blend_args.destination_format =
@@ -866,6 +872,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          crender->batch.scissor = scissor;
          if (depth_active) {
             crender->batch.flags |= DRM_CHROME9_TRIANGLE_BATCH_DEPTH;
+            if (ctx->depth_func_supported)
+               crender->batch.flags |=
+                  DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
             crender->batch.depth_handle = depth->bo.handle;
             crender->batch.depth_pitch = depth->stride;
          }

@@ -725,6 +725,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *source_over_handle = NULL;
    void *alpha_only_handle = NULL;
    void *dsa_handle = NULL;
+   void *lequal_dsa_handle = NULL;
    void *alpha_dsa_handle = NULL;
    void *rasterizer_handle = NULL;
    void *scissor_rasterizer_handle = NULL;
@@ -766,12 +767,21 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       alpha_only_handle = context->create_blend_state(context, &alpha_only);
    }
    if (depth_resource) {
+      struct pipe_depth_stencil_alpha_state lequal_dsa;
+
       dsa.depth_enabled = true;
       dsa.depth_writemask = true;
       dsa.depth_func = PIPE_FUNC_LESS;
       framebuffer.zsbuf.format = PIPE_FORMAT_Z16_UNORM;
       framebuffer.zsbuf.texture = depth_resource;
       vertex_buffer.buffer.user = far_vertices;
+      if (chrome9_screen_has_capability(screen,
+                                        DRM_CHROME9_CAP_DEPTH_FUNC)) {
+         lequal_dsa = dsa;
+         lequal_dsa.depth_func = PIPE_FUNC_LEQUAL;
+         lequal_dsa_handle = context->create_depth_stencil_alpha_state(
+            context, &lequal_dsa);
+      }
    }
    dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
    alpha_dsa = dsa;
@@ -828,7 +838,12 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
        (!depth_resource &&
         chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_SCISSOR) &&
         !scissor_rasterizer_handle) ||
-       !dsa_handle || !rasterizer_handle ||
+       !dsa_handle ||
+       (depth_resource &&
+        chrome9_screen_has_capability(screen,
+                                      DRM_CHROME9_CAP_DEPTH_FUNC) &&
+        !lequal_dsa_handle) ||
+       !rasterizer_handle ||
        (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST) &&
         !alpha_dsa_handle) ||
        !elements_handle || !vs || !fs ||
@@ -905,6 +920,64 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                (pixels[32 * (surface->stride / 4) + 192] & 0xffffff) ==
                   0xff0000 &&
                sample_depth >= 0x3ffe && sample_depth <= 0x4001;
+      if (passed && lequal_dsa_handle) {
+         uint64_t submitted = chrome9_context(context)->submitted_triangles;
+         uint64_t rejected = chrome9_context(context)->rejected_triangles;
+         uint32_t equal_pixel, far_pixel, near_pixel;
+         uint16_t equal_depth, far_depth, near_depth;
+
+         context->bind_depth_stencil_alpha_state(context,
+                                                  lequal_dsa_handle);
+         context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                        PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 0.5, 0);
+         vertex_buffer.buffer.user = rejected_vertices;
+         context->set_vertex_buffers(context, 1, &vertex_buffer);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush(context, NULL, 0);
+         equal_pixel = pixels[32 * (surface->stride / 4) + 192] & 0xffffff;
+         equal_depth = depth_pixels[32 * (depth->stride / 2) + 192];
+
+         vertex_buffer.buffer.user = far_vertices;
+         context->set_vertex_buffers(context, 1, &vertex_buffer);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush(context, NULL, 0);
+         far_pixel = pixels[32 * (surface->stride / 4) + 192] & 0xffffff;
+         far_depth = depth_pixels[32 * (depth->stride / 2) + 192];
+
+         vertex_buffer.buffer.user = near_vertices;
+         context->set_vertex_buffers(context, 1, &vertex_buffer);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush_resource(context, resource);
+         context->flush(context, NULL, 0);
+         near_pixel = pixels[32 * (surface->stride / 4) + 192] & 0xffffff;
+         near_depth = depth_pixels[32 * (depth->stride / 2) + 192];
+         passed = equal_pixel == 0x000000ff &&
+                  equal_depth >= 0x7ffe && equal_depth <= 0x8001 &&
+                  far_pixel == equal_pixel &&
+                  far_depth >= 0x7ffe && far_depth <= 0x8001 &&
+                  near_pixel == 0x00ff0000 &&
+                  near_depth >= 0x3ffe && near_depth <= 0x4001 &&
+                  chrome9_context(context)->submitted_triangles ==
+                     submitted + 6 &&
+                  chrome9_context(context)->rejected_triangles == rejected &&
+                  smoke_guard_pages_match(draw_surface) &&
+                  smoke_guard_pages_match(depth);
+         if (passed)
+            printf("Gallium D16 LEQUAL passed: "
+                   "equal=%08x/%04x far=%08x/%04x near=%08x/%04x\n",
+                   equal_pixel, equal_depth, far_pixel, far_depth,
+                   near_pixel, near_depth);
+         else
+            fprintf(stderr,
+                    "Gallium D16 LEQUAL mismatch: "
+                    "equal=%08x/%04x far=%08x/%04x near=%08x/%04x "
+                    "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                    equal_pixel, equal_depth, far_pixel, far_depth,
+                    near_pixel, near_depth,
+                    chrome9_context(context)->submitted_triangles - submitted,
+                    chrome9_context(context)->rejected_triangles - rejected);
+         context->bind_depth_stencil_alpha_state(context, dsa_handle);
+      }
    } else if (passed && source_over_handle) {
       uint32_t pixel;
       unsigned red, green_channel;
@@ -1224,6 +1297,9 @@ out:
                                           scissor_rasterizer_handle);
       if (dsa_handle)
          context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (lequal_dsa_handle)
+         context->delete_depth_stencil_alpha_state(context,
+                                                   lequal_dsa_handle);
       if (alpha_dsa_handle)
          context->delete_depth_stencil_alpha_state(context,
                                                    alpha_dsa_handle);
