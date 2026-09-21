@@ -94,6 +94,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH	(1ULL << 13)
 /* Two level-zero textures can be multiplied RGBA-by-RGBA. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE	(1ULL << 14)
+/* D16 draw flags can select a validated depth comparison function. */
+#define DRM_CHROME9_CAP_DEPTH_FUNC	(1ULL << 15)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -310,6 +312,17 @@ struct drm_chrome9_draw_textured_triangle {
 #define DRM_CHROME9_COMPARE_NOTEQUAL	5
 #define DRM_CHROME9_COMPARE_GEQUAL	6
 #define DRM_CHROME9_COMPARE_ALWAYS	7
+
+/*
+ * D16 draw flag field.  A zero field retains the original ABI's implicit
+ * LESS comparison.  Kernels advertise DRM_CHROME9_CAP_DEPTH_FUNC before
+ * accepting explicit values; the first bounded implementation accepts only
+ * LESS and LEQUAL.
+ */
+#define DRM_CHROME9_DEPTH_FUNC_SHIFT	8
+#define DRM_CHROME9_DEPTH_FUNC_MASK	(7U << DRM_CHROME9_DEPTH_FUNC_SHIFT)
+#define DRM_CHROME9_DEPTH_FUNC(func) \
+	((__u32)(func) << DRM_CHROME9_DEPTH_FUNC_SHIFT)
 
 #define DRM_CHROME9_COLOR_MASK_R	(1U << 0)
 #define DRM_CHROME9_COLOR_MASK_G	(1U << 1)
