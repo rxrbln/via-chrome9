@@ -21,7 +21,7 @@ The Windows compiler emits one record:
 ```
 
 Its sources decode as A=`c1`, B=`c0`, C=`c2`, all identity, with full XYZW
-output.  The exact final controls are A90=`90040000`, A92=`92000001`.
+output.  The exact final controls are A90=`90058000`, A92=`92000001`.
 The low-nibble decoder labels dword 3's operation field as subop 1, but that
 generic label is not sufficient to explain LRP arithmetic; this document
 therefore calls it only the **dedicated Windows LRP form** and does not infer a
@@ -49,8 +49,17 @@ program, not the Windows record plus a finalizer-only dependency rewrite.
 
 The machine-readable evidence is in
 [`chrome9-lrp-cross-driver-corpus.tsv`](chrome9-lrp-cross-driver-corpus.tsv).
-The differential JSON SHA-256 is
-`ad6b7e16425282e96a030df8187615dde0d7b8872743d8047c6e9fc46a89abc5`.
+The corrected production-register-manager LRP/DP2ADD differential JSON
+SHA-256 is
+`6f5d1a727b5ed2ef78af0190114dd1fe2a8d71b8af1fe85e6451869ed77428c6`.
+It used Windows production-RegMgr wrapper SHA-256
+`c56637fad7bfaeb994595e3363d439b7f0e35bcf78138bdc0d2bfdc70fdfa4e1`,
+which collects usage and calls `stmSetRegMgr(instance,8,12)` before dispatch,
+and Linux production probe SHA-256
+`a22c873536dc4b6c45c43a00a48dbc183e40ddb89ed5e1461890efad2d21e6ba`.
+The earlier JSON `ad6b7e16...` used the pre-production Windows identity
+allocator.  LRP's one native record is unchanged, but the old A90 value was a
+harness artifact.
 
 ## Runtime policy
 

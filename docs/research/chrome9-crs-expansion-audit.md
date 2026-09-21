@@ -1,11 +1,12 @@
 # Chrome9 pixel CRS expansion audit
 
 Pixel CRS is a stable two-record expansion in both production compilers.  All
-five tested terminal topologies have identical arithmetic words between
-Windows and Linux before dependency finalization.  Linux configuration 2 adds
-only the second record's temporary-B dependency bit.  CRS is therefore a good
-future multi-record compiler target, but it is not a one-record command-19
-successor and remains rejected today.
+five tested terminal topologies have the same arithmetic and swizzle lowering,
+but not identical records: production Windows allocates special r12 while
+Linux allocates ordinary r0.  Both configuration-2 streams mark the second
+record's temporary-B read as last use.  CRS is therefore a good future
+multi-record compiler target, but it is not a one-record command-19 successor
+and remains rejected today.
 
 ## Exact lowering
 
@@ -25,33 +26,49 @@ oC0 = -t0 + a.yzx0 * b.zxy0
         0)
 ```
 
-For `CRS c0,c1`, Windows emits:
+For `CRS c0,c1`, finalized production Windows emits:
+
+```
+0140b6d0 d0081285 00f08040 00000320
+020c0538 5008140d 00f08028 00000820
+```
+
+Finalized Linux emits the same operand algebra through ordinary r0:
 
 ```
 0140b6d0 d0081285 00f08040 00000020
-00000538 5008140d 00f08028 00000820
+02000538 5008140d 00f08028 00000820
 ```
 
-Linux configuration 2 emits the same first record and changes only the second
-dword 0 from `00000538` to `02000538`, marking the temporary B source as a
-dependency.  Windows controls are A90=`90040000`, A92=`92000002`; Linux uses
-A90=`90058000`, A92=`92000002`.  The same dependency delta holds for `v0,v1`,
-`v0,v0`, `v0,c0`, and `c0,v0`; all exact words are in
+The Windows second record changes from raw `000c0538` to finalized
+`020c0538`; Linux likewise changes ordinary-r0 `00000538` to `02000538`.
+This bit is the temporary-B last-use marker, not a producer dependency.
+Windows controls are A90=`90040000`, A92=`92000002`; Linux uses
+A90=`90058000`, A92=`92000002`.  The same allocation and finalization split
+holds for `v0,v1`, `v0,v0`, `v0,c0`, and `c0,v0`; all exact words are in
 [`chrome9-crs-expansion-corpus.tsv`](chrome9-crs-expansion-corpus.tsv).
 
-This result also explains the older r0 corpus context, whose record-tail bits
-differ because it stores to a temporary rather than terminal oC0.  Destination
-context must not be mixed into the executable terminal contract.
+The prior corpus was generated with a Windows identity allocator that omitted
+`stmSetRegMgr(instance,8,12)`.  Its Windows r0 bytes only coincidentally
+matched Linux before finalization and are not production compiler output.
+Destination and allocator context must not be mixed into the executable
+terminal contract.
 
-The five-case differential JSON SHA-256 is
-`0bd5da93a67836703497acc39c055f6e322cddc33d517116e720f46ccab943ee`.
+The corrected nine-case CRS/SINCOS production differential JSON SHA-256 is
+`51fd2836baf75ff03460eff830ae310709b090626319468ab2ac621a1b5bae6e`.
+It used Windows production-RegMgr wrapper SHA-256
+`c56637fad7bfaeb994595e3363d439b7f0e35bcf78138bdc0d2bfdc70fdfa4e1`,
+which collects usage and calls `stmSetRegMgr(instance,8,12)` before dispatch,
+and Linux production probe SHA-256
+`a22c873536dc4b6c45c43a00a48dbc183e40ddb89ed5e1461890efad2d21e6ba`.
 
 ## Runtime and numerical boundary
 
 Keep CRS rejected by the current one-record validator.  The lowering needs one
-compiler-managed temporary, an ordered pair of records, and a configuration-2
-dependency rewrite.  Those properties are outside the current structured
-UAPI even though the record algebra is now exact.
+compiler-managed temporary, an ordered pair of records, a configuration-2
+last-use rewrite, and an explicit scratch-allocation/control policy.  Those
+properties are outside the current structured UAPI even though the record
+algebra is now exact.
 
 `CRS(v0,v1)` is the preferred future bounded topology because both D3D color
 inputs are normalized to [0,1].  Each product lies in [0,1] and each component

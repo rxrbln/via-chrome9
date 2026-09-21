@@ -1,41 +1,50 @@
 # Chrome9 SINCOS and split SIN/COS rejection audit
 
 This audit closes the public ps_2_0 SINCOS expansion for terminal oC0 masks
-X, Y, XY, and XYZW.  All four Windows/Linux probes compile successfully to
-three ALU records.  Exact streams are in
+X, Y, XY, and XYZW.  All four Windows/Linux production probes compile
+successfully to three ALU records.  The arithmetic sequence agrees, but
+Windows allocates special r12 while Linux allocates ordinary r0.  Exact
+finalized streams are in
 [`chrome9-sincos-terminal-corpus.tsv`](chrome9-sincos-terminal-corpus.tsv).
 Split SIN and COS remain internal-frontend-only and have no production
 dynamic byte contract.
 
-The terminal differential JSON SHA256 is
-`b5fb1b5ccae22688252a684b2b11c12f40fa3089ff4d0eaa0bccd5c53f34766f`.
+The corrected nine-case CRS/SINCOS production differential JSON SHA256 is
+`51fd2836baf75ff03460eff830ae310709b090626319468ab2ac621a1b5bae6e`.
+The prior SINCOS JSON `b5fb1b5c...` used a Windows identity allocator that
+omitted `stmSetRegMgr(instance,8,12)`; its r0 schedule was not production
+Windows output.
 
 ## Public SINCOS expansion
 
-For every destination mask, the Windows raw schedule begins with the same two
-records:
+For every destination mask, the Windows production raw schedule begins with
+the same two records through special r12:
 
 ```text
-01c00530 b01c0053 00f080b6 000d0020
-0140b6d0 30096000 00f00005 00000020
+01c00530 b01c0053 00f080b6 000d0320
+0140b6d0 30096000 00f00c05 00000320
 ```
 
 The terminal record is:
 
 ```text
-01c00530 301c0053 00M00005 000f0820
+01c00530 301c0053 00M00c05 000f0820
 ```
 
-where native destination mask `M` is 1, 2, 3, or f.  Linux configuration 2
-changes only this record's source word from `00M00005` to `00M20005`, adding
-the generic source-A dependency bit.  Full XYZW is therefore
-`01c00530 301c0053 00f20005 000f0820` in the Linux execution stream.
+where native destination mask `M` is 1, 2, 3, or f.  Windows configuration 2
+marks the terminal special-r12 read as last use, changing `00M00c05` to
+`00M20c05`.  Linux emits the same subop sequence through ordinary r0 and its
+final record is `01c00530 301c0053 00M20005 000f0820`.  Full XYZW is thus
+`01c00530 301c0053 00f20c05 000f0820` on Windows and
+`01c00530 301c0053 00f20005 000f0820` on Linux.
 
 Windows reports `A90=90040000`, `A92=92000003`; production Linux reports
 `A90=90058000`, `A92=92000003`.  The first record uses the dedicated scalar
 c0.w source and subop d, the middle record uses subop 0, and the terminal uses
 subop f.  Destination masking does not select a shorter or split operation.
-The three source tokens c0/c1/c2 are accepted without payload range checks;
+The two compiler streams must not be mixed: each needs its matching scratch
+allocation and A90 control.  The three source tokens c0/c1/c2 are accepted
+without payload range checks;
 the two auxiliary approximation constants remain part of the indivisible
 vendor lowering.
 
@@ -78,4 +87,3 @@ guards, ordered fences, reset/error counters, and known-good draws before and
 after.  Only after public SINCOS passes should a production-initialized split
 emitter wrapper be considered; it must be treated as a separate ABI and
 silicon gate.
-

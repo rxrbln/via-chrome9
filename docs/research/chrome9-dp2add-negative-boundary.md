@@ -2,9 +2,10 @@
 
 An isolated terminal PS 2.0 DP2ADD is not portable across the recovered
 production compilers.  The Windows UMD returns success but emits zero ALU and
-zero TAU records, leaves phase and color-output count zero, and produces empty
-controls.  Linux 5.75 emits a two-record arithmetic expansion.  This is a
-strict rejection boundary, not a one-record opcode candidate.
+zero TAU records and leaves phase and color-output count zero.  Its production
+updater still emits the default A90 resource-bucket field; this is not an
+executable program.  Linux 5.75 emits a two-record arithmetic expansion.  This
+is a strict rejection boundary, not a one-record opcode candidate.
 
 ## Dynamic result
 
@@ -14,7 +15,7 @@ Two terminal forms were compiled through the initialized production paths:
 - `DP2ADD oC0,v0,v1,c0`
 
 For both, Windows returns success with `ALU=0`, `TAU=0`, phase 0,
-color-output count 0, A90=`90000000`, and A92=`92000000`.  The lack of a
+color-output count 0, A90=`90018000`, and A92=`92000000`.  The lack of a
 compiler error is therefore not evidence of an executable shader.
 
 Linux configuration 2 lowers the constant form to:
@@ -38,8 +39,12 @@ through that temporary.  Exact source swizzles matter to DP2ADD's scalar
 semantics, so the identity-swizzle test rows are retained as compiler evidence
 and are not promoted into a general NIR semantic contract.
 
-The two-case differential JSON SHA-256 is
-`3a548756b41c22a4fb39b29a04eddab66dbc3f0755a44c58aa106551ff53eca7`.
+The corrected production-register-manager LRP/DP2ADD differential JSON
+SHA-256 is
+`6f5d1a727b5ed2ef78af0190114dd1fe2a8d71b8af1fe85e6451869ed77428c6`.
+The earlier JSON `3a548756...` omitted the Windows register-manager builder;
+its zero-record result was accurate, but its zero A90 payload was a harness
+artifact.
 Exact tokens and records are in
 [`chrome9-dp2add-negative-boundary.tsv`](chrome9-dp2add-negative-boundary.tsv).
 
