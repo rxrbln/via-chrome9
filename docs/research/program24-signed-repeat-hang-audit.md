@@ -18,6 +18,43 @@ or state-transition fault remains possible until the combined guarded oracle
 below passes, but body-length overflow and command-15 execution are excluded
 by the current source.
 
+## 2026-09-21 live composition failure
+
+A later complete smoke run with `two_texture_signed_repeat=1` passed the
+ordinary two-unit signed-REPEAT sweep and then failed the dedicated
+"program24-equivalent signed-repeat draw" gate.  Engine status remained
+clean.  This narrows the failure to the selector-2 program/state/readback
+contract rather than cap-40 coordinate validation or a command-reader wedge.
+
+The old A01 affine-primary discrepancy is no longer present in the tested
+source.  `chrome9_build_two_textured_triangle()` now calls
+`chrome9_depth_control_word(request, tex0_alpha_primary)` and asserts the
+same word, producing `01ce154c` for this depth-writing selector-2 case.
+
+The highest-priority remaining packet discriminator is the raw oracle's
+stage-1 image format.  The recovered selector-2 object below requires BGRA
+for both samplers (`A30=30990000`), but
+`run_pipe_two_npot_textures(..., texture0_alpha=true)` currently constructs
+the final direct-ioctl oracle with unit 0 BGRA and unit 1 BGRX.  That changes
+unit 1 to `A30=30980000`.  The kernel currently accepts the tuple, so it can
+retire without an engine error while remaining outside the exact recovered
+program contract.  Change only unit 1 to BGRA for the next run and retain its
+texels as `00ffffff`; program 24 ignores TEX1 alpha, so the expected output
+does not change.  Do not broaden selector 2 to BGRX until that tuple has its
+own readback proof.
+
+The smoke contains two distinct post-cap-40 checks and should report their
+actual pixels separately on the next run:
+
+1. the Gallium selector-2 signed loop, which expects output alpha
+   `0x3e..0x41`; and
+2. the direct unequal-RHW oracle at `(48,16)`, which expects alpha `0x80`, red
+   `0x6f..0x74`, and green/blue zero.
+
+An ioctl error distinguishes validation from execution; a retired but wrong
+pixel distinguishes sampler/program/FVF state.  Preserve submitted/rejected
+counters, all four BO guards, D16, cookie, and `040c` in either case.
+
 ## Exact semantic discriminator
 
 Use command `0x13`, the already-audited two-texture D16+blend envelope, so a
