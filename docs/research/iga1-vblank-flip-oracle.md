@@ -85,6 +85,58 @@ path.  The old DRI1 writes CR11 bits 5:4 as undocumented magic, conflicting
 with the VX900 manual's legacy vertical-interrupt descriptions; do not copy
 that write into the first VX900 oracle.
 
+At instruction level, `0x767e0..0x7691c` performs one final `0200` write.  It
+reads `0200` at `0x767f0..0x76801`, unconditionally ORs global bit 31 at
+`0x76804..0x7680d`, and for an active IGA1 ORs enable bit 19 and RW1C bit 3 at
+`0x76836..0x76848`.  It then writes the accumulated dword at
+`0x76906..0x76916`.  This proves the required values and ordering, but not that
+echoing every other bit from the sampled mixed-status register is safe.  The
+control-only Linux shadow above preserves the order without acknowledging
+unowned status classes.
+
+### Minimal base-invariant vblank cadence oracle
+
+Before enabling page flips, prove the interrupt path while the framebuffer
+base and all SF mappings remain unchanged.  The bounded lab-only sequence is:
+
+```text
+pre: engine retired, 040c=0, fixed IGA1 active, save 0200/0204/0214/CR32/CR48
+
+under irq_lock:
+    control = readl(0200) & f7ff0800
+    shadow = control | 80000000 | 00080000
+    writel(shadow | 00000008, 0200)    # enable and clear stale IGA1 RW1C
+    readl(0200)                        # posting barrier
+
+IRQ:
+    sample = readl(0200) exactly once
+    reject ffffffff, global-clear, or bit3-clear
+    writel(shadow | 00000008, 0200)    # early, narrow acknowledgement
+    readl(0200)
+    drm_crtc_handle_vblank(crtc)
+    record count, sequence, timestamp, 0204, and 0214
+```
+
+Accept only after at least 120 consecutive IGA1 IRQs at the fixed 60-Hz mode,
+with a monotonic DRM vblank sequence, no implausible sub-millisecond IRQ storm,
+unchanged masked `0214`, unchanged `0204.bit1`, no engine error, and no display
+corruption.  A practical timing bound is 14--20 ms for every interior interval;
+log outliers rather than silently fabricating an event.  This is cadence
+validation, not a flip, so no framebuffer reference or PTE may change.
+
+Abort immediately if acknowledgement fails to clear bit 3, the rate exceeds
+200 IRQ/s, an unowned `0200` enable changes, `0214` changes, `0204.bit1`
+changes, or SSH/display health is lost.  On abort or normal completion, clear
+only owned bit 19, write the control shadow plus bit 3 to clear the final
+edge, flush-read, and `synchronize_irq()`.  Clear global bit 31 only if this
+oracle introduced it and no other enabled source remains.  Restore neither
+the whole sampled `0200` dword nor a literal zero.
+
+Only after this oracle passes may one armed flip attach its pending state to a
+recorded sequence and apply the three-part completion predicate.  The cadence
+oracle is deliberately useful even if the later base latch still fails: it
+separates missing interrupt ownership from CR32/base-latch semantics.
+
 ## Exact direct-base latch
 
 The Part II manual, Video Register printed page 10, defines MMIO `0204[1]` as
@@ -226,6 +278,72 @@ retaining the mappings until device power-down/removal is safer than freeing
 pages which an active display client may DMA-read.
 
 ## First live oracle
+
+### 2026-09-21 direct-write result: address accepted, latch did not complete
+
+The first bounded fullscreen run rejects the earlier assumption that a
+polled blank transition is sufficient for this KMS image.  Initial scanout was
+FB 40 at SF byte address `00011000`, with `0214=00008800` and
+`0204=00000c04`.  Xorg then requested FB 42 at plane offset zero and SF byte
+address `00312000`.  The driver wrote and read back:
+
+```text
+requested byte address       00312000
+expected packed 0214         00189000
+observed 0214                00189000
+observed 0204                00000c06
+observed 0200                00080002
+```
+
+The packed address is bit-exact: `00312000 >> 1 = 00189000`.  This proves the
+MMIO write reached the documented starting-address shadow.  It does not prove
+that the display fetch latch adopted it.  `0204.bit1` remained set for the
+complete 100-ms bounded poll, spanning several 60-Hz blank intervals, and the
+driver reported `-ETIMEDOUT`.  The mapped old and new framebuffers were
+retained.  A one-shot Xorg stop produced generic helper `flip_done` timeouts,
+then completed the full pre-KMS VGA restore.  Debugfs framebuffer state became
+empty, `0214` returned to zero, `0204` returned to `00000c04`, and both `0400`
+and `040c` were zero.  The failure was therefore contained without a GPU
+fault or leaked active framebuffer.
+
+The final `0200=00080002` has IGA1 VSYNC enable bit 19 and live blank level
+bit 1, but lacks global interrupt-enable bit 31 and has no sampled pending
+bit 3.  This is not the complete Windows interrupt state.  The Windows
+`S3gSetVidPnSourceAddress` call chain configures IGA1 display interrupts before
+calling the exact `0x79080` source-address helper.  Re-disassembly of
+`0x79580..0x796fb` confirms that the normal VX900 branch performs T11 A12
+disarm, optional CR32 bit-zero selection, and the masked `0214` write, then
+returns.  It emits no hidden post-write trigger and does not poll `0204`.
+Inventing another MMIO write is therefore unsupported by the executable.
+
+The only exact missing call-chain prerequisite is the complete Windows-style
+interrupt setup and acknowledgement.  Whether that setup is required for the
+hardware latch itself, rather than only for WDDM completion reporting, remains
+unproved.  Other bounded checks are CR32 readback during the active mode and
+the exact FB 42 object size.  Offset zero is valid for a true offset-zero/dumb
+allocation; if FB 42 instead has the 3,153,920-byte canonical guarded size,
+offset zero addresses its leading guard and is not a valid pixel view even
+though it does not explain the stuck hardware latch.
+
+Direct flips must remain disabled by default after this result.  The next live
+gate is not another base write:
+
+1. implement the narrow `0200` enable shadow and IRQ acknowledgement already
+   specified above;
+2. with the base unchanged, prove repeated bit-3 IGA1 edges and monotonically
+   advancing DRM vblank sequence at the fixed mode cadence;
+3. capture active-mode CR32, CR48, `0200`, `0204`, and `0214` before arming;
+4. acknowledge stale bit 3, record the vblank sequence, then issue one flip
+   while both mappings remain pinned; and
+5. on each of a bounded number of genuine post-arm IRQs, record `0204` and
+   `0214`; complete only when bit 1 clears and the address matches.
+
+If bit 1 remains set after three genuine frame edges, retain both mappings,
+withhold the event, block subsequent flips, and perform the already-proven
+full restore.  Do not complete from elapsed time, `0200.bit1`, or the exact
+`0214` readback.  A CR32 by-line experiment changes presentation semantics
+and belongs only after the by-frame IRQ gate; it is not a justified workaround
+for the failed first run.
 
 Use two guarded 1024x768 XRGB8888 SF mappings with conspicuously different
 solid colors and the existing 4096-byte pitch.  Keep CR48's channel at SF and
