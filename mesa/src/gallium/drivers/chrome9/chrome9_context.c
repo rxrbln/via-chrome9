@@ -675,7 +675,7 @@ chrome9_fs_is_generic0_rgbx(nir_def *def, nir_def **base, unsigned depth)
    for (unsigned c = 0; c < 3; c++) {
       nir_def *source = NULL;
 
-      if (!chrome9_fs_is_generic0_component(&alu->src[c], 0, &source,
+      if (!chrome9_fs_is_generic0_component(&alu->src[c], c, &source,
                                             depth + 1) ||
           (found && source != found))
          return false;
@@ -853,9 +853,12 @@ chrome9_fs_result(nir_def *def)
       return CHROME9_FS_PRIMARY_GENERIC_RGBA;
    if (chrome9_fs_is_generic0_blue_rgbx(def, &generic, 0))
       return CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX;
-   if (chrome9_fs_is_generic0_rgbx(def, &generic, 0) &&
-       generic->num_components == 1)
-      return CHROME9_FS_PRIMARY_SCALAR_RGBX;
+   if (chrome9_fs_is_generic0_rgbx(def, &generic, 0)) {
+      if (generic->num_components == 3)
+         return CHROME9_FS_PRIMARY_GENERIC_RGBX;
+      if (generic->num_components == 1)
+         return CHROME9_FS_PRIMARY_SCALAR_RGBX;
+   }
    if (chrome9_fs_is_packed_gray_modulate(def))
       return CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE;
    if (chrome9_fs_is_rgbx(def, 0))
@@ -980,6 +983,7 @@ chrome9_fs_classify(nir_shader *nir)
    switch (result) {
    case CHROME9_FS_PRIMARY_COLOR:
    case CHROME9_FS_PRIMARY_GENERIC_RGBA:
+   case CHROME9_FS_PRIMARY_GENERIC_RGBX:
    case CHROME9_FS_PRIMARY_SCALAR_RGBX:
    case CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX:
       valid = !texture_count && !constant_count;
