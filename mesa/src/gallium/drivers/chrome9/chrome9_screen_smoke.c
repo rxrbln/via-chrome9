@@ -864,20 +864,18 @@ make_ff_primary_color_fs(struct pipe_screen *screen,
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
       "chrome9-glxgears-primary-color");
-
-   b.shader->info.io_lowered = true;
-   nir_def *barycentric = nir_load_barycentric_pixel(&b, 32);
-   nir_def *color = nir_load_interpolated_input(
-      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
-      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_variable *input = nir_variable_create(
+      b.shader, nir_var_shader_in, glsl_vec4_type(), "primary_color");
+   nir_variable *output = nir_variable_create(
+      b.shader, nir_var_shader_out, glsl_vec4_type(), "fragment_color");
    struct pipe_shader_state state = {
       .type = PIPE_SHADER_IR_NIR,
       .ir.nir = b.shader,
    };
 
-   nir_store_output(&b, color, nir_imm_int(&b, 0),
-                    .write_mask = 0xf,
-                    .io_semantics.location = FRAG_RESULT_COLOR);
+   input->data.location = VARYING_SLOT_COL0;
+   output->data.location = FRAG_RESULT_COLOR;
+   nir_store_var(&b, output, nir_load_var(&b, input), 0xf);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader,
                           nir_var_shader_in | nir_var_shader_out);

@@ -2159,11 +2159,21 @@ chrome9_backend_primary(nir_def *def)
 {
    nir_instr *instr = nir_def_instr(def);
    nir_intrinsic_instr *load, *bary;
+   nir_deref_instr *deref;
+   nir_variable *var;
 
    if (def->num_components != 4 || def->bit_size != 32 ||
        instr->type != nir_instr_type_intrinsic)
       return false;
    load = nir_instr_as_intrinsic(instr);
+   if (load->intrinsic == nir_intrinsic_load_deref) {
+      deref = nir_src_as_deref(load->src[0]);
+      var = nir_intrinsic_get_var(load, 0);
+      return deref && deref->deref_type == nir_deref_type_var && var &&
+             var->data.mode == nir_var_shader_in &&
+             var->data.location == VARYING_SLOT_COL0 &&
+             !var->data.index && !var->data.location_frac;
+   }
    if (load->intrinsic != nir_intrinsic_load_interpolated_input ||
        nir_intrinsic_io_semantics(load).location != VARYING_SLOT_COL0 ||
        nir_intrinsic_component(load) || !load->src[0].ssa ||
@@ -2298,6 +2308,7 @@ chrome9_fs_key_from_nir(nir_shader *nir, struct chrome9_fs_key *key)
                           nir_intrinsic_load_barycentric_pixel ||
                        intr->intrinsic ==
                           nir_intrinsic_load_interpolated_input ||
+                       intr->intrinsic == nir_intrinsic_load_deref ||
                        intr->intrinsic == nir_intrinsic_load_uniform ||
                        intr->intrinsic == nir_intrinsic_load_ubo ||
                        intr->intrinsic == nir_intrinsic_load_ubo_vec4) {
