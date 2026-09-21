@@ -15,7 +15,8 @@ The tested stack is:
 - Mesa Chrome9 `9f4732a`, parent `3543230` for the measured glmark runs;
 - Gallivm legacy float-set fix `0ed5ce5`;
 - smoke expectation follow-up Chrome9 `6704691`, parent `8db06cd`;
-- test tools `6750d74` and post-warmup FPS gate `5318cb5`.
+- test tools `6750d74`, post-warmup FPS gate `5318cb5`, and maximum-run
+  oracle fix `5cb0ff1`.
 
 ## Correctness gates
 
@@ -24,6 +25,12 @@ advertised.  `chrome9_textured_run` submitted six MODULATE+D16 triangles in
 one command-`0x14` request.  Alternating cells passed/rejected LESS exactly,
 all color/depth/texture guards matched, the source texel was unchanged, and a
 25-triangle request was rejected.  This was run before Mesa or X.
+
+The same oracle subsequently passed the exact 24-triangle UAPI maximum with
+alternating D16 cells and all guards intact.  Its first maximum-size run found
+an oracle-only overflow: the expected-color generator did not wrap a computed
+red channel to eight bits after triangle 13.  `5cb0ff1` makes each generated
+channel explicitly `uint8_t`; the unchanged hardware result then passed.
 
 The full Gallium smoke then passed, including D16 LESS/LEQUAL/EQUAL and
 read-only state, source-over and extended blending, one- and two-texture D16,
@@ -93,4 +100,3 @@ Target logs are retained in:
 
 - `/root/tmp/chrome9-live/validate-20260921-131735/`
 - `/root/tmp/chrome9-live/glmark-cmd14-20260921/`
-
