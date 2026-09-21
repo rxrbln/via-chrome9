@@ -294,7 +294,8 @@ cull CCW:  A01 bit7=1, type-04 A23=23004f02
 ```
 
 The apparently unchanged last word in the CCW row is meaningful only with
-A01 bit 7 set.  Bit 7 of type-04 A23 stays set in every row.  Front/back and
+A01 bit 7 set.  Bit 7 of type-04 A23 stays unchanged (clear in the established
+`23004f02/23004e02` pair) in every row.  Front/back and
 viewport-Y inversions must be resolved to physical winding before submission;
 `FRONT_AND_BACK` suppresses the draw rather than selecting a native mode.
 
