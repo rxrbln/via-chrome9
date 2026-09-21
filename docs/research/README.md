@@ -192,6 +192,11 @@ targets.
   defines the flag-compatible no-depth/D16 three-factor ABI, exact full-RGBA
   and primary-alpha-bypass programs, TEXLD/TEXLDP Q boundaries, packet maps,
   Mesa keys, format semantics, and staged four-object silicon tests.
+- [three-factor-two-texture-runtime.md](three-factor-two-texture-runtime.md)
+  closes the general nonwhite `tex0*tex1*primary` runtime path across all
+  three two-texture ioctls, records the reproducible Wine compiler evidence,
+  and fixes the alpha-mask, packet-index, validation, and silicon-oracle
+  contract beyond the existing white-primary specialization.
 - [ioquake-live-lightmap-alpha-successors.md](ioquake-live-lightmap-alpha-successors.md)
   records the two live projected lightmap/primary NIR variants, proves that
   exact XRGB/BGRA view translation lets one three-factor RGBA object cover

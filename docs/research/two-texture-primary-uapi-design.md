@@ -1,11 +1,12 @@
 # Chrome9 projected two-texture-primary draw design
 
 Status: implementation-grade static design plus executable Linux/Windows
-compiler differentials, 2026-09-21. The existing two-texture and
-two-texture+D16 ioctls are merged and the two-factor RGBA program is live.
-The full-RGBA three-factor and primary-alpha-bypass programs in this note are
-compiler-exact but not yet executed on VX900 silicon. No new program UAPI or
-capability described here is currently advertised.
+compiler differentials, 2026-09-21. The existing two-texture,
+two-texture+D16, and state-complete two-texture+D16+blend ioctls are merged;
+the two-factor RGBA program is live. The full-RGBA three-factor and
+primary-alpha-bypass programs in this note are compiler-exact but not yet
+executed on VX900 silicon. No new program UAPI or capability described here
+is currently advertised.
 
 ## Exact bounded operation
 
@@ -22,11 +23,12 @@ fragment alpha is provably unobservable. They are not interchangeable on a
 BGRA destination, under alpha test, or under a blend equation which consumes
 source alpha.
 
-For the initial opaque ioquake3 subset, both texture resources are BGRX8888,
+For the initial silicon gate, both texture resources are BGRX8888,
 the target is BGRX8888, vertex D1 alpha is exactly `0xff`, blend and alpha test
 are disabled, and both sample views are level zero. Thus either semantic has
-output alpha one. This restriction remains the safest first public program
-flag even though the exact BGRA programs are now recovered.
+output alpha one. This is the safest first raw test, not a kernel validation
+restriction: the full-RGBA object has exact format-98/99 alpha semantics and
+arbitrary normalized D1 is its reason to exist.
 
 `RB_StageIteratorLightmappedMultitexture()` uses
 `tess.constantColor255`, initialized entirely to `0xff` in `tr_init.c:1193`.
@@ -52,38 +54,43 @@ one of the separately bounded projective paths below is implemented.
 ## UAPI without a new ioctl
 
 The current allocation ledger reserves capability bits through 24, making 25
-the next free bit. Reuse the existing command `0x0a` and `0x0d` structures:
+the next free bit. Reuse the existing command `0x0a`, `0x0d`, and `0x13`
+structures:
 
 ```c
 #define DRM_CHROME9_CAP_TWO_TEXTURE_PRIMARY_MODULATE (1ULL << 25)
 #define DRM_CHROME9_TWO_TEXTURE_PRIMARY_MODULATE     (1U << 0)
 ```
 
-Capability bit 25 means the program flag is accepted by both
-`DRAW_TWO_TEXTURED_TRIANGLE` and `DRAW_TWO_TEXTURED_TRIANGLE_D16`; userspace
-must still require capability 14 or 20 for the selected base ioctl. Structure
-sizes remain 240 and 256 bytes. No reserved field changes meaning.
+Capability bit 25 means the program flag is accepted consistently by
+`DRAW_TWO_TEXTURED_TRIANGLE`, `DRAW_TWO_TEXTURED_TRIANGLE_D16`, and
+`DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND`; userspace must still require
+capability 14, 20, or 28 for the selected base ioctl. Structure sizes remain
+240, 256, and 296 bytes. No reserved field changes meaning. In command 13 the
+program bit shares the top-level `flags` word with depth compare/read-only;
+the nested `blend.flags` namespace is unchanged.
 
 Validation is exact:
 
 * no-depth `flags` may be zero or the program bit, with every other bit zero;
 * D16 `flags` additionally contain explicit LESS or LEQUAL in bits `[10:8]`
   and may contain live `DEPTH_READ_ONLY` bit 11 when cap 23 is present;
-* when the program bit is set, both texture formats must be
-  `DRM_CHROME9_TEXTURE_FORMAT_BGRX8888` and every vertex color must have alpha
-  byte `0xff`;
-* target format remains the ioctl's implicit BGRX8888; blend, alpha test,
-  destination reinterpretation, mip levels and borders remain unavailable;
+* the program bit does not narrow either source format or D1: existing source
+  formats 98/99 and all four D1 bytes are valid; A30 supplies alpha one for
+  logical XRGB and stored alpha for logical BGRA;
+* target format remains implicit BGRX8888 in commands 0a/0d; command 13 keeps
+  its validated destination, blend and alpha-test state; mip levels and
+  borders remain unavailable;
 * target, texture 0 and texture 1 are distinct for `0x0a`; depth is a fourth
-  distinct object for `0x0d`; and
+  distinct object for `0x0d` and `0x13`; and
 * all existing size, canonical pitch, guard, finite RHW/S/T, normalized S/T,
   scissor and nondegenerate-triangle checks remain unchanged.
 
 An old kernel rejects the nonzero flag. A new kernel continues to interpret
-flags zero as the byte-identical two-factor operation. The capability must be
-entered in `chrome9-uapi-allocation.md` in the same commit which reserves bit
-25; if another feature claims 25 first, update this design and all three UAPI
-copies atomically rather than silently reusing the number.
+the program bit clear as the byte-identical two-factor operation. The
+capability must be entered in `chrome9-uapi-allocation.md` in the same commit
+which reserves bit 25; if another feature claims 25 first, update this design
+and all three UAPI copies atomically rather than silently reusing the number.
 
 No new object lifetime logic is needed. The no-depth job keeps target WRITE
 and both textures READ under one `drm_exec` transaction and fence. The D16 job
@@ -369,13 +376,14 @@ the new three- or four-ALU object rather than a state-only promotion.
 
 #### Patch-ready command-13 lowering
 
-The fast path uses the 296-byte
+The white-primary fast path uses the 296-byte
 `drm_chrome9_draw_two_textured_triangle_d16_blend` request at private command
 `0x13` (x86 ioctl `0x41286453`), guarded by cap 28. It does not consume
 `reserved0` or any member of `reserved[4]`; all five remain zero. The fixed
-two-factor program is implicit, so there is deliberately no fragment-program
-member in this request. Textures start at byte 32, normalized blend state at
-104, three vertices at 144, scissor at 264, and destination format at 276.
+two-factor program is selected when top-level flag bit 0 is clear; capability
+25 makes that bit select the full three-factor program without adding a
+member. Textures start at byte 32, normalized blend state at 104, three
+vertices at 144, scissor at 264, and destination format at 276.
 
 For the live ioquake filter tuple, populate:
 
@@ -530,12 +538,15 @@ four floats per coordinate, so the Mesa emitter must inspect T0.q and T1.q
 before dropping them and require both raw bits equal `0x3f800000`. Validate
 only the consumed S/T as finite after the identity-Q check; R is unused.
 
-The first public flag remains the opaque subset: two guarded BGRX level-zero
-2D resources, D1 alpha `ff`, distinct texture handles, guarded BGRX target,
-no blend/alpha successor, and either no depth or guarded Z16 LESS/LEQUAL.
-Read-only depth may be admitted independently now that cap 23 is live. Set the
-program flag on the selected existing no-depth or D16 ioctl; no screen GL
-capability changes.
+The first live gate remains the opaque subset: two guarded BGRX level-zero 2D
+resources, D1 alpha `ff`, distinct texture handles, guarded BGRX target, no
+blend/alpha successor, and either no depth or guarded Z16 LESS/LEQUAL. That is
+a test-order rule, not the advertised ABI. Before capability 25 is exposed,
+the same implementation must accept the recovered BGRX/BGRA matrix and
+arbitrary packed D1 through all three two-texture ioctls, with command 13
+retaining its independently validated blend/alpha/destination restrictions.
+Read-only depth composes when cap 23 is present. No screen GL capability
+changes.
 
 Before using that flag, test the post-TNL white-primary specialization. A full
 key with all D1=`ffffffff` selects the existing two-factor program for any
@@ -559,8 +570,9 @@ their own not-yet-allocated program capability until their live gates pass.
 4. **D16 raw ioctl.** Add a fourth guarded BO, clear depth to `0x8000`, submit
    LEQUAL at `0x8000`, LESS at the same value, then LESS at `0x4000` with
    distinguishable primary colors. Verify pass/fail color and exact depth.
-5. **BGRA alpha discriminator.** On a BGRA target use texture0=`80ff8040`,
-   texture1=`40c0ffff`, and D1=`80ff40c0`. Full RGBA must store approximately
+5. **BGRA alpha discriminator.** Through command 13 on a BGRA target use
+   texture0=`80ff8040`, texture1=`40c0ffff`, and D1=`80ff40c0`. Full RGBA
+   must store approximately
    `10c02030`; bypass must store `80c02030`. Repeat with both sampler views
    XRGB: both keys must produce alpha `80`. This proves A30 source alpha and
    A52 destination alpha independently.
