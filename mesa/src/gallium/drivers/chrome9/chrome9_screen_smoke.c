@@ -3352,6 +3352,6 @@ main(int argc, char **argv)
    }
    screen->resource_destroy(screen, resource);
    screen->destroy(screen);
-   puts("Mesa Chrome9 context, Gallium triangle/D16, guarded resources, and PRIME sharing smoke passed");
+   puts("Mesa Chrome9 context, Gallium triangle/D16, guarded resources, and same-device dma-buf sharing smoke passed");
    return 0;
 }
