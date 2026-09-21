@@ -112,6 +112,10 @@ targets.
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
   operation remap, and keeps compatibility alpha test on fixed A33.
+- [textured-d16-format-contract.md](textured-d16-format-contract.md) gives the
+  exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
+  X-versus-alpha sampler semantics, and strict render-target reinterpretation
+  boundary.
 - [render-to-scanout-ownership.md](render-to-scanout-ownership.md) defines the
   same-device, same-BO 3D-to-IGA1 ownership boundary and separates producer
   drain, display latch, GTI invalidation, and CPU cache transitions.
