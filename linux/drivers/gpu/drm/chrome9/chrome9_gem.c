@@ -34,7 +34,8 @@ static int chrome9_scanout_layout_validate(u32 width, u32 height, u32 pitch,
 
 	min_pitch = width * 4;
 	if (pitch < min_pitch || pitch > CHROME9_SCANOUT_PITCH_MAX ||
-	    !IS_ALIGNED(pitch, CHROME9_SCANOUT_PITCH_ALIGN) || offset)
+	    !IS_ALIGNED(pitch, CHROME9_SCANOUT_PITCH_ALIGN) ||
+	    (offset && offset != PAGE_SIZE))
 		return -EINVAL;
 
 	return 0;
@@ -133,6 +134,9 @@ int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
 	obj = drm_gem_fb_get_obj(fb, 0);
 	if (!obj)
 		return -EINVAL;
+	if (fb->offsets[0] > obj->size ||
+	    footprint > obj->size - fb->offsets[0])
+		return -EINVAL;
 	ret = drm_gem_vmap(obj, &map);
 	if (ret)
 		return ret;
@@ -146,7 +150,8 @@ int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
 	for (y = 0; y < fb->height; y++)
 		memcpy_toio(cdev->vram + cdev->scanout_offset +
 			    (size_t)y * fb->pitches[0],
-			    map.vaddr + (size_t)y * fb->pitches[0], row_bytes);
+			    map.vaddr + fb->offsets[0] +
+			    (size_t)y * fb->pitches[0], row_bytes);
 	/* Flush posted BAR writes before an eventual scanout-base update. */
 	wmb();
 	readb(cdev->vram + cdev->scanout_offset +

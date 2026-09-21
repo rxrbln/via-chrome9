@@ -320,7 +320,8 @@ static bool chrome9_fixed_state_valid(struct chrome9_device *cdev,
 	    fb->modifier != DRM_FORMAT_MOD_LINEAR ||
 	    fb->width != CHROME9_FIXED_WIDTH ||
 	    fb->height != CHROME9_FIXED_HEIGHT ||
-	    fb->pitches[0] != CHROME9_FIXED_PITCH || fb->offsets[0])
+	    fb->pitches[0] != CHROME9_FIXED_PITCH ||
+	    (fb->offsets[0] && fb->offsets[0] != PAGE_SIZE))
 		return false;
 	if (plane_state->src_x || plane_state->src_y ||
 	    plane_state->src_w != CHROME9_FIXED_WIDTH << 16 ||
