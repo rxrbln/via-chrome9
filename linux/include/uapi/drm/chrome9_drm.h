@@ -25,6 +25,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16	0x0d
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND	0x12
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
+#define DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	0x19
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -75,6 +76,10 @@ extern "C" {
 	DRM_IOW(DRM_COMMAND_BASE + \
 		DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND, \
 		struct drm_chrome9_draw_two_textured_triangle_d16_blend)
+#define DRM_IOCTL_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH \
+	DRM_IOW(DRM_COMMAND_BASE + \
+		DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH, \
+		struct drm_chrome9_draw_program_triangle_d16_rhw_batch)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -145,6 +150,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY	(1ULL << 39)
 /* REPEAT two-texture coordinates accept finite values through +/-32. */
 #define DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS	(1ULL << 40)
+/* One compiler-generated MOV/MUL fragment instruction with D16 RHW batches. */
+#define DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	(1ULL << 41)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -631,6 +638,67 @@ struct drm_chrome9_draw_triangle_d16_rhw_batch {
 	__u32 pad;
 	__u64 vertices_ptr;
 	__u64 reserved[3];
+};
+
+/*
+ * Version-one structured fragment instruction.  This is deliberately not a
+ * native packet ABI: the kernel validates these logical operands and rebuilds
+ * the four native instruction words.  The first executable subset writes all
+ * four oC0 channels with one MOV or MUL and exposes only the primary varying
+ * v0 and one job-local float constant c0.
+ */
+#define DRM_CHROME9_PS_OP_MOV		0
+#define DRM_CHROME9_PS_OP_MUL		1
+
+#define DRM_CHROME9_PS_SOURCE_VARYING	0
+#define DRM_CHROME9_PS_SOURCE_CONSTANT	1
+
+#define DRM_CHROME9_PS_SWIZZLE_X	0
+#define DRM_CHROME9_PS_SWIZZLE_Y	1
+#define DRM_CHROME9_PS_SWIZZLE_Z	2
+#define DRM_CHROME9_PS_SWIZZLE_W	3
+#define DRM_CHROME9_PS_SWIZZLE_ONE	4
+#define DRM_CHROME9_PS_SWIZZLE_ZERO	5
+
+struct drm_chrome9_ps_source {
+	__u8 file;
+	__u8 index;
+	__u8 swizzle[4];
+	__u8 modifier;
+	__u8 reserved;
+};
+
+struct drm_chrome9_ps_instruction {
+	__u32 op;
+	__u32 reserved;
+	struct drm_chrome9_ps_source src[2];
+};
+
+/*
+ * Compiler-backed successor to DRAW_TRIANGLE_D16_RHW_BATCH.  DEPTH is
+ * mandatory and vertices_ptr addresses the same perspective-correct records.
+ * constant_c0 contains the exact IEEE-754 words uploaded to fragment c0.
+ * Version one accepts identity swizzles and requires modifier zero.  MUL must
+ * pair v0 with c0.  The remaining defined swizzle values reserve stable
+ * encodings for later independently gated successors.
+ */
+struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	__u32 reserved0;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 pad;
+	__u64 vertices_ptr;
+	struct drm_chrome9_ps_instruction instruction;
+	__u32 constant_c0[4];
 };
 
 #if defined(__cplusplus)
