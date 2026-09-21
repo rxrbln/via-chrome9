@@ -16,11 +16,13 @@ to eight existing 34-triangle command segments synchronously, then performs
 one CPU ownership transition, guard scan, unbind, and fence signal.  The
 existing batch remains the compatibility and fallback path.
 
-This design is based on kernel Chrome9 commit
-`f39a90d6a16b16066dfbd53ee1674f9336d12069`, UAPI commit
-`b623464ba08e02e39475e8cd67ccc31eeb75a67e`, and Mesa Chrome9 commit
-`91cd42a783ce8770ce23bcc6312c7550cd62951b`.  The private-number assignments
-come from [chrome9-uapi-allocation.md](chrome9-uapi-allocation.md).
+The original design was based on kernel Chrome9 commit `f39a90d`, UAPI
+commit `b623464`, and Mesa Chrome9 commit `91cd42a`.  The patch-ready audit
+below was repeated against kernel Chrome9 `f56ac02` and Mesa Chrome9
+`d7c2570` on 2026-09-21.  In particular it includes the subsequently merged
+read-only-depth and extended-blend-factor state.  The private-number
+assignments come from
+[chrome9-uapi-allocation.md](chrome9-uapi-allocation.md).
 
 ## Exact UAPI
 
@@ -65,24 +67,35 @@ duplicates the old fixed state envelope.  Do not reinterpret the old
 structure or raise its maximum.  Add compile-time size assertions to the
 kernel and Mesa UAPI copy.  The resulting x86 ioctl value is `0x4080644f`.
 
-The run initially accepts exactly the state accepted by the old perspective
-batch:
+The run accepts exactly the state accepted by the current perspective batch:
 
 - `DEPTH` is mandatory; `BLEND` is optional and all other unknown flag bits
   are rejected;
-- a depth-function field is accepted only by the existing bounded helper;
+- the depth-function field accepts implicit/explicit LESS and explicit
+  LEQUAL through the existing bounded helper;
+- `DRM_CHROME9_DEPTH_READ_ONLY` is accepted because capability bit 23 and the
+  common A01 lowering are now merged; it disables depth writes without
+  changing the two-object lifetime or the depth object's WRITE reservation
+  fence;
 - width and height are each `1..2048`;
 - destination pitch is exactly `ALIGN(width * 4, 32)` and D16 pitch exactly
   `ALIGN(width * 2, 32)`;
 - destination format is BGRX8888 or the already capability-gated BGRA8888
   blend form;
-- disabled blend requires format zero and an all-zero blend structure;
+- an absent batch `BLEND` flag requires format zero and an all-zero blend
+  structure;
+- an enabled batch blend envelope reuses `chrome9_validate_blend_state()`:
+  factors are the merged enum range ZERO through SRC_ALPHA_SATURATE, RGB and
+  alpha functions are ADD, masks contain only RGBA bits, alpha reference is
+  `0..255`, and blend-disabled state inside that envelope must retain the
+  canonical ONE/ZERO factors;
 - scissor uses the existing half-open validator;
 - all padding and reserved words are zero.
 
-Future read-only depth flag bit 11 is not implicit.  The run accepts it only
-after capability bit 23 and the common A01 lowering are implemented for this
-ioctl too.
+The `DEPTH`, `BLEND`, depth-function and read-only fields share one `u32`, but
+they are not interchangeable namespaces: the exact allowed mask is
+`DEPTH | BLEND | DRM_CHROME9_DEPTH_FUNC_MASK |
+DRM_CHROME9_DEPTH_READ_ONLY`.  All other bits fail before object lookup.
 
 ## Handler validation and overflow order
 
@@ -130,10 +143,16 @@ At the public maxima, the checked quantities are:
 | vertices per segment | `34*3 = 102` |
 
 The coordinate validator's widest possible delta is `2048<<16 = 2^27`;
-the cross-product term is at most `2^54` and fits signed 64-bit arithmetic.
+each cross-product term is at most `2^54` and their difference is at most
+`2^55`, which fits signed 64-bit arithmetic.
 Pointer advancement uses vertex-record units and must assert
 `first <= total`, `chunk <= total-first`, and `first*3 <= vertex_count`
 before adding to the copied-array base.
+
+`chrome9_rhw_valid()` is stricter than the phrase "finite positive": the
+sign bit must be zero and the exponent must be in `1..254`.  Positive zero,
+positive subnormals, infinities and NaNs are all rejected.  The run must call
+that same helper and must not silently broaden the accepted RHW domain.
 
 ## One job, reservation fence, and resource lifetime
 
@@ -208,6 +227,9 @@ the one immutable run envelope.  `job->segment_pause`, `segment_stop`,
 `ring_pause`, and `ring_stop` are intentionally overwritten with the current
 segment so a timeout identifies the reachable command.  Set
 `job->retirement_proven` only after the final chunk has passed all three waits.
+For a build or append rejection after a retired prefix, a separate local
+`current_published`/the append helper's `must_quarantine` result—not the
+cumulative `job->published` bit—decides whether ordinary cleanup is legal.
 
 `chrome9_append_segment()` may wrap the 64-KiB ring during the run.  Waiting
 each segment before building/reusing the one-page staging buffer preserves its
@@ -233,7 +255,7 @@ retired.  An ioctl error must never cause Mesa to replay the whole run.
 | failure point | published work not proved retired? | action |
 |---|---|---|
 | UAPI, copy, vertex, GEM, reservation, vmap, or allocation validation | no | ordinary unwind; no fence attachment/publication |
-| PTE bind or packet build before the first append | no | invalidate any bound PTEs, signal attached fence with error, normal unwind |
+| PTE bind or packet build before the first append | no | invalidate any bound PTEs; signal the fence with error if attachment has occurred, then normal unwind |
 | packet build or append rejection before publication after earlier segments retired | no | preserve last retired cookie, unbind, signal fence with error; partial pixels are allowed |
 | ring-wrap STOP update failed and `must_quarantine` is true | yes | set fence error, wedge engine, retain job/node/maps/objects/ring epoch, do not signal fence |
 | cookie, PAUSE, or engine-work wait timed out | yes | same unsignaled-fence quarantine |
@@ -247,6 +269,17 @@ published-and-retired segments do not require quarantine.  Conversely, never
 free or signal the reservation fence for an unproved current segment: the
 quarantine list and module/device holds intentionally make affected BO waits
 remain blocked until reboot.
+
+The current cleanup has two deliberately different fence outcomes.  A
+published command whose retirement is unproved leaves `signal == false`:
+`drm_exec_fini()` drops the reservation locks, but the unsignaled error fence,
+GEM lookup references, vmaps, SGTs, PTE image and SF node remain owned by the
+quarantined job.  A post-retirement PTE-invalidation failure sets
+`signal == true`; its error fence is signaled, but the same mapping and object
+references remain quarantined because the translation cannot be disproved.
+Preserve this distinction exactly.  Engine teardown already refuses to pass
+`drm_mm_takedown()` when the quarantine list is nonempty and takes permanent
+module/device holds for reboot-scoped safety.
 
 The first nonzero return sets the job fence error.  Stop immediately; do not
 publish later chunks.  A userspace-visible error after a retired prefix is an
@@ -282,6 +315,97 @@ the old ioctl.
 - Add segment index/total, chunk triangle count, and cookie to timeout logs;
   retain ring epoch/current/pause/stop/engine status.
 
+## Patch-ready audit against the current kernel
+
+The following is the smallest source change against Chrome9 `f56ac02`; no
+second resource-management implementation is required.
+
+| file / symbol | required change |
+|---|---|
+| external and Mesa UAPI copies | add command `0x0f`, ioctl macro, cap bit 22, the two run-limit constants and the 128-byte request; retain command `0x0e`/bit 21 for mipmaps and every later ledger allocation |
+| `chrome9_engine.c` static assertions | assert the run request is 128 bytes and keep the 20-byte RHW vertex assertion |
+| `enum chrome9_draw_kind` | append `CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN`; do not renumber existing values |
+| `chrome9_build_depth_triangle()` | treat BATCH and RUN kinds as perspective; leave its public-independent `1..34` chunk check, A24 count, six-dword vertex stride and all body assertions unchanged |
+| `chrome9_draw_triangle_batch()` | factor fixed-envelope validation into a normalized internal copy; old batch keeps max 34 while the new handler selects max 272 and RUN kind |
+| `chrome9_submit_depth_triangle()` | for RUN only, replace the single build/append/wait block with the bounded loop; reuse all code before and after it unchanged |
+| `struct chrome9_job` / timeout log | add current 1-based segment, total segments and current chunk count for diagnostics; overwrite them before each build just like pause/stop |
+| `chrome9_engine.h` / `chrome9_drv.c` | add the handler prototype, `DRM_RENDER_ALLOW` descriptor, and advertise bit 22 only from the engine-ready capability branch |
+
+`DRM_IOCTL_DEF_DRV()` is a designated initializer indexed by private command
+number, so command `0x0f` can be added while `0x0e` remains unimplemented;
+`ARRAY_SIZE(chrome9_ioctls)` grows through index `0x0f` and the zeroed `0x0e`
+slot rejects calls.  Do not insert an unindexed placeholder or compact the
+table, and do not consume the already reserved `0x0e` mipmap command.
+
+The submit refactor should move cookie selection from its present one-time
+location before SF allocation to immediately before each packet build and use
+one helper returning the alternate of only `0x00010001` and `0x00020002`.
+After each successful `chrome9_wait_job()`, update `engine->last_cookie`
+immediately under `submit_lock`.  Remove the old success-only assignment from
+the PTE-unbind branch or leave it as an assertion/equal assignment; otherwise
+a later prepublication failure after a retired prefix loses the actual cookie
+history.
+
+The existing two-object path already supplies all required lifetime rules:
+
+- destination and depth aliases, foreign devices, imports and noncanonical
+  exact sizes are rejected before mapping;
+- both SGTs and the one combined PTE array live in `chrome9_job`; one
+  `drm_exec` locks both objects and both reservation dependencies are waited;
+- destination and depth both receive the same fence with WRITE usage, even
+  for read-only depth, because this first ABI deliberately keeps conservative
+  ownership and guard handling;
+- the one combined SF node places color data at `node.start + PAGE_SIZE` and
+  D16 data at `node.start + color_object_size + PAGE_SIZE`;
+- one device sync precedes the loop, and one CPU sync, full cache flush,
+  four-guard verification, active-scanout resync and PTE invalidation follow
+  the final retired segment;
+- normal cleanup unmaps, calls `drm_exec_fini()`, signals the one fence, drops
+  both lookup references and drops the submitter's fence reference.  Fence
+  release alone frees `job->ptes` and the job after reservation references
+  disappear;
+- live-engine quarantine bypasses every unmap/object-put/fence-put label.
+
+Do not add an explicit put for the pointers returned by
+`drm_gem_shmem_get_pages_sgt()` in this patch.  They are cached by the shmem
+object and remain valid under the retained GEM reference; adding an unmatched
+SGT put would create a new lifetime bug.  Deferred DMA-map lifetime changes
+remain a separate project.
+
+The current `page_count` additions use native `unsigned int`.  The public
+limits make the exact run maximum only 6,148 pages, but the new normalized
+validator should still calculate color pages, depth pages and their sum in
+`u64`, reject any value above `UINT_MAX`, and only then narrow for
+`kcalloc()`.  Similarly, compute rounded payload size as a checked add of
+`PAGE_SIZE - 1` followed by `round_down()` before adding the two guards; the
+present width/height maxima prove `ALIGN()` safe, but explicit checked order
+keeps the new ABI review local and mechanically complete.
+
+### Exact one-page packet boundary
+
+The packet limit is still exact after read-only depth and extended blend
+factors because neither changes command length.  The initial H0 sync leaves
+the aligned H6 body at byte `0x20`:
+
+| case | body dwords | body end | PAUSE | STOP | copied through read-ahead | headroom |
+|---|---:|---:|---:|---:|---:|---:|
+| 34 triangles, no blend | `170 + 102*6 = 782` | `0x0c58` | `0x0cf0` | `0x0d70` | `0x0f90` | `0x70` |
+| 34 triangles, blend | `174 + 102*6 = 786` | `0x0c68` | `0x0cf0` | `0x0d70` | `0x0f90` | `0x70` |
+| 35 triangles, either form | 105 vertices | beyond safe limit | `0x0d70` | `0x0df0` | `0x1010` | overflow |
+
+Thus every loop chunk remains at most 34 triangles.  The builder writes A24
+as 102 vertices for a full chunk (34 triangles), not 816 vertices for the
+whole run.  `chrome9_finish_ring()` supplies the immutable STOP trailer and
+`chrome9_append_segment()` copies exactly `segment_stop + 0x220`; neither
+function needs a size or allocation change.
+
+The ring can wrap between any two chunks.  A retired chunk leaves the reader
+at its PAUSE.  On wrap, `chrome9_stop_active_ring()` first publishes PID10
+STOP for that exact active tuple; only after it retires may the ring be
+refilled and reinstalled.  If that STOP publication cannot be proved retired,
+`must_quarantine` is authoritative even though the draw cookie for the prior
+chunk was observed.
+
 ## Mesa integration checklist
 
 - Copy command `0x0f`, capability bit 22, constants, and the 128-byte structure
@@ -290,9 +414,9 @@ the old ioctl.
   introduced.
 - Add `draw_triangle_d16_rhw_run` to `chrome9_context`, set it only from the
   new capability, and retain the old RHW-batch boolean independently.
-- Give `chrome9_vbuf_render` storage for 272 triangles, or 816 RHW vertex
-  records (16,320 bytes), and a run envelope.  The vbuf object is heap
-  allocated, so an inline array is bounded and avoids a second
+- Resize only `batch_vertices_rhw[]` to 816 records (16,320 bytes) and add a
+  run envelope; the affine array remains 102 records.  The vbuf object is
+  heap allocated, so the bounded inline array avoids a second
   failure/lifetime path.
 - Select a 272-triangle flush limit only for perspective untextured D16 when
   the run cap is present.  Affine, textured, old-kernel, and non-depth paths
@@ -310,6 +434,64 @@ the old ioctl.
   `batch_failed`, log once, and never replay through command `0x0c`.
 - Preserve `CHROME9_DRAW_LIMIT`: the test against submitted plus queued
   triangles must operate correctly through 272.
+
+The current draw backend already proves that batching need not cross state:
+`chrome9_vbuf_draw_arrays()` and `chrome9_vbuf_draw_elements()` reset the
+batch at entry and call the flush helper before returning.  The vbuf stage may
+invoke either callback multiple times for one Gallium draw, so the first run
+implementation must not carry pending vertices across those callback
+boundaries.  Consequently no new context-flush, state-bind or CPU-map hook is
+needed in this tranche.  If a later optimization crosses callbacks, all of
+those hooks become mandatory before that change is enabled.
+
+Use the run iff the current triangle is untextured, D16 is active, the RHW-run
+cap is present, and the existing state validator accepted the complete
+envelope.  `batch_perspective` must become true for either RHW cap; select
+limit 272 and the run wrapper only for the run cap, otherwise retain the
+34-triangle RHW-batch fallback.  Affine color/D16 batching stays at 34.
+Capacity flushes and callback-end partial flushes both use the selected limit.
+
+On a failed run, add the entire attempted count to `rejected_triangles`, set
+`batch_failed`, clear `batch_count`, and reject each later primitive in the
+same callback.  Do not try command `0x0c`: the kernel may have retired a
+prefix before returning the error.  `CHROME9_DRAW_LIMIT` remains exact with
+the existing test `submitted_triangles + batch_count >= draw_limit`; a
+capacity flush updates `submitted_triangles` before the next primitive, while
+a callback-end partial remains queued in `batch_count` until that flush.
+
+## Benchmark counters and acceptance thresholds
+
+The live baseline is 237 command-`0x0c` calls among 258 ioctls, with
+0.383435 seconds in all ioctls and a 584.657-ms frame.  The trace proves no
+triangle-count or callback-boundary distribution.  With at most eight old
+segments per run, 30 calls is the theoretical floor
+`DIV_ROUND_UP(237, 8)`, not a guaranteed result: the actual count is the sum
+of `DIV_ROUND_UP(old_batches_in_callback, 8)` over vbuf callbacks.
+
+Add cheap counters before interpreting a benchmark:
+
+| layer | counter | update point |
+|---|---|---|
+| Mesa | `rhw_run_ioctls`, `rhw_run_triangles`, `rhw_run_failures` | once in the run flush wrapper |
+| Mesa | `rhw_run_full`, `rhw_run_callback_partial` | capacity flush versus draw-arrays/elements tail flush |
+| Mesa | exact `count[1..272]` histogram | immediately before the ioctl, including failed attempts |
+| kernel | `rhw_run_ioctls`, `rhw_run_requested_triangles` | after full UAPI/copy validation, under `submit_lock` |
+| kernel | `rhw_run_retired_segments`, `rhw_run_retired_triangles` | after each successful three-phase wait |
+| kernel | `rhw_run_failures`, `rhw_run_quarantines` | first run error and quarantine transition respectively |
+
+Keep per-engine kernel totals under `submit_lock`; they require no atomics.
+Print them with the existing engine-stop append/wrap totals for the first
+oracle.  Keep Mesa counters per context and print only behind a new
+disabled-by-default `CHROME9_DEBUG_BATCH` option.  Do not add a telemetry
+ioctl or take VGA/VM/reservation locks to read counters.
+
+Acceptance requires: old `0x0c` calls disappear on a run-capable kernel;
+Mesa and kernel requested triangle totals agree; kernel retired segments
+equal the sum of `DIV_ROUND_UP(count,34)` for successful run calls; bind,
+unbind, ownership-round-trip and guard-scan counts become one per run rather
+than one per segment; and rendering, rejection totals and frame checksum stay
+unchanged.  Report both ioctl reduction and frame time—the first verifies the
+patch, while the second includes software VS/clipping and presentation costs.
 
 ## Legacy and proprietary batching cross-check
 
@@ -355,8 +537,10 @@ list, native strip/fan reuse, and indexing remain separate optimizations.
    34+1.  Put unequal positive RHW and diffuse colors in triangles 34 and 35
    so an affine or stale-record implementation cannot pass.
 5. Put overlapping LESS and LEQUAL triangles on opposite sides of a segment
-   boundary.  Require exact equal/far/near color and D16 values, proving that
-   no depth clear or state loss occurs between packets.
+   boundary.  Repeat with `DEPTH_READ_ONLY` and prove color changes while
+   every D16 sample remains unchanged.  Require exact equal/far/near values,
+   proving that no depth clear, write-mask loss or state loss occurs between
+   packets.
 6. Repeat with BGRX/BGRA, source-over blend, channel masks, and enabled
    scissor.  Require all four guards and MMIO `040c=0`.
 7. Force a ring wrap between segments.  Require cookie alternation and the

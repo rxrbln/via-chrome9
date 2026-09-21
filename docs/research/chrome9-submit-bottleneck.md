@@ -304,12 +304,19 @@ the current path does; it never tries to unwind because earlier chunks may
 have rendered.
 
 Mesa can fill the new run only within one existing `draw_arrays` or
-`draw_elements` callback at first.  It must still flush on callback end,
-state/resource change, explicit context flush, CPU map, draw limit, or vbuf
-release.  This avoids inventing cross-draw state snapshots.  With the current
-8,058-triangle upper bound, a 272-triangle run needs at most 30 draw ioctls
-instead of 237, while also reducing transient map/cache/guard work to at most
-30 ownership rounds.  The old ABI remains the automatic fallback.
+`draw_elements` callback at first.  It must still flush on callback end and
+must not invent cross-draw state snapshots.  The current source never leaves
+a batch pending beyond either callback, so state/resource changes, context
+flush, CPU map, draw limit and vbuf release need no new hook in this first
+tranche.  Crossing callbacks later would require every such hook.
+
+The observed 237 old batch calls have a theoretical floor of 30 run calls
+(`DIV_ROUND_UP(237,8)`), not a proven upper bound: actual run count is the sum
+of `DIV_ROUND_UP(old_batches_in_callback,8)` over callbacks and can remain as
+high as 237 if every callback is short.  A Mesa callback/count histogram is
+therefore a required acceptance counter.  Every group that does coalesce
+reduces its transient map/cache/guard ownership rounds from one per old batch
+to one per run.  The old ABI remains the automatic fallback.
 
 Do not implement this by accepting one 272-triangle command packet or merely
 raising `DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES`: either would exceed the
