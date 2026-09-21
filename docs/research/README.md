@@ -12,6 +12,9 @@ targets.
 - [mesa-ps-encoder-v1.md](mesa-ps-encoder-v1.md) defines the first bounded
   Mesa NIR-to-native fragment encoder, operand packing, closed scheduler
   tuples, dependency constraints, and byte-exact golden tests.
+- [chrome9-multi-alu-structured-uapi.md](chrome9-multi-alu-structured-uapi.md)
+  defines an unallocated, fail-closed three-record MOV/MUL semantic successor
+  with exact packet growth, validation, and native live-oracle rows.
 - [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
   finalized oC0 and texture-consumer golden corpus for the bounded encoder.
 - [chrome9-ps-temp-lifetime-finalizer.md](chrome9-ps-temp-lifetime-finalizer.md)
