@@ -10,7 +10,7 @@ shader compiler.  The source audited here is the T2 copy at
 
 | rank | scene/key | minimum new work | packet change | wedge risk |
 |---:|---|---|---|---|
-| 1 | `shading:shading=gouraud` | accept direct `vec4 VAR0` as primary RGBA and pack it into D1 | none | low |
+| 1 | `shading:shading=gouraud` | accept direct `vec4 VAR0` or the exact scalarized blue-material form and pack it into D1 | none | low |
 | 2 | `shading:shading=blinn-phong-inf` | a native fragment ALU program with interpolated normal/eye vector, normalize, dot, max and pow | new verified PS | high |
 | 3 | `bump:bump-render=off/high-poly` | general per-fragment normal lighting, including normalize/dot/max/pow | new verified PS | high |
 | 4 | `bump:bump-render=normals` | sampled normal remap plus matrix multiply and the same lighting program | sampler plus new verified PS | high |
@@ -77,9 +77,88 @@ both target guards unchanged
 
 A follow-up live glmark2 run should use
 `shading:shading=gouraud:model=cat:nframes=1` with NIR dumping enabled.  The
-accepted shader must still be the direct four-component `VAR0` store.  Any
-extra operation means it is a different key and must not be admitted by this
-lowering.
+accepted shader must be either the direct four-component `VAR0` store or the
+exact scalarized blue-material form below.  Any other operation means it is a
+different key and must not be admitted by this lowering.
+
+### Default blue-material linked form
+
+The default Gouraud material is exactly `(0,0,1,1)`.  Mesa can therefore
+scalarize the linked varying and reconstruct the fragment result as:
+
+```text
+b = scalar VAR0.x
+result = vec4(0.0, 0.0, b, 1.0)
+```
+
+This is a second closed lowering to the same D1 path.  Require two literal
+positive-zero sources, one scalar float32 `VAR0` source in B, and literal one
+in A; identity `mov`/`fsat` around the final vec4 is harmless.  Pack only B
+from the finite scalar and force `R=G=0`, `A=255`.  A scalar value `0.25`
+must produce `ff000040` on BGRA or RGB `000040` on BGRX.  It changes no packet
+word and must not accept an arbitrary coefficient, swizzle, or second source.
+
+## Later default-suite scenes
+
+### Desktop
+
+The common desktop blit (`desktop.frag`) is already the exact one-texture
+REPLACE key: one normalized 2D coordinate and one texture result stored
+unchanged.  Window/background composition uses canonical source-over, also
+already bounded.  The shadow benchmark therefore has a plausible fully
+covered base path once its render-target transitions pass.
+
+The blur benchmark is different.  Its default radius is five and separable
+mode synthesizes eleven texture samples per horizontal pass and eleven per
+vertical pass, each with a constant coordinate offset and kernel multiply,
+then adds them and forces alpha to one.  No established Chrome9 combiner or
+two-texture packet represents eleven dependent samples.  It needs a native PS
+ALU/TEX compiler; do not approximate it with LINEAR filtering or repeated
+two-texture jobs because that changes both weights and intermediate rounding.
+
+### Ideas
+
+The scene mixes easy and hard programs, so no single scene-wide capability
+claim is justified:
+
+* `ideas-lamp-unlit`, `ideas-table`, `ideas-text`, and `ideas-under-table`
+  end in a direct vertex-computed color.  Gallium draw executes their vertex
+  ALU in software; their fragment side reduces to the full RGBA, scalar-gray,
+  or constant primary-color keys already documented.
+* `ideas-logo-flat` is an exact fragment constant (`c0`) and maps to the
+  established constant-color path.
+* `ideas-paper` may link as `(s,s,0.78125*s,1)`.  It is affine and could be
+  reconstructed into D1, but the coefficient-bearing classifier and oracle
+  are not yet implemented.  Do not fold it into scalar gray.
+* lit logo/lamp programs normalize vectors and use dot/reflect/pow per
+  fragment.  They require general PS ALU.
+* logo shadow derives coordinates from `gl_FragCoord`, samples a texture, and
+  discards alpha below 0.5.  Although the hardware alpha-test register is
+  known, the missing screen-coordinate-to-texture lowering means this is not
+  merely an alpha-test state extension.
+
+Thus the safe next diagnostic after Gouraud is an `ideas:nframes=1` NIR/state
+capture to identify its first unsupported draw.  Preserve the already covered
+draws rather than treating the first complex lighting program as permission
+to broaden the shader classifier.
+
+### Jellyfish
+
+The vertex program is suitable for software draw despite its animation and
+lighting.  The fragment program is not a fixed two-texture MODULATE:
+
+```text
+caustics = tex1(screen/world-derived coordinate)
+colorMap = tex0(vTextureCoord)
+alpha = colorMap.a + pow(fresnel.r, 2) - 0.3
+rgb = (ambient + diffuse + caustics.rgb) * colorMap.rgb
+```
+
+It needs two independent coordinate sets, two samples, multiple interpolated
+vectors, ADD/MUL and POW.  The established two-texture packet only computes
+`tex0 * tex1`; admitting jellyfish under that key would silently render a
+different program.  Keep it rejected until the native PS verifier covers the
+full arithmetic expression.
 
 ## Why the other scenes stay closed
 
