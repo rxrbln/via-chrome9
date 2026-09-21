@@ -181,6 +181,11 @@ targets.
   D24S8/stencil successor, 204-dword packet map, validators, capability
   allocation, alpha-kill ordering checks, and guarded promotion suite while
   retaining software cull and polygon offset.
+- [native-cull-bias-lowering.md](native-cull-bias-lowering.md) closes the
+  post-viewport Gallium-to-physical winding formula, proves the proprietary
+  CW/CCW orientation swap, fixes every current D16 cull index, and gives
+  exact D16/D24S8 bias words, packet growth, ownership rules, and live
+  discriminators.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
