@@ -68,16 +68,20 @@ successor addresses instead use this complete H3 packet:
 
 ```text
 FE03043C 00000008 10030000 CC000000
-40000010 00000000 00000000 00000000
+40000020 00000000 00000000 00000000
 00000000 00000000 00000000 00000000
 ```
 
 `10030000 | (stage << 3)` selects the first of a stage's eight entries.  Entry
 index `stage*8 + level-1` names L1 through L8.  Each entry's low 24 bits are
 an address or offset in 256-byte units and bits `[31:30]` select the location.
-For the current relative SF form, `40000010` means L1 is `0x1000` bytes after
-L0.  Emit all eight entries even for two levels, and write the unused entries
-as zero.  Never reinterpret image A19/A1A/A1B as a shorter address packet.
+For the current compatibility-guarded Mesa allocation, `40000020` means L1
+is `0x2000` bytes after L0: the preserved old L0 trailing guard occupies the
+intervening page.  The vendor-packed layout instead puts L1 `0x1000` after L0
+and uses `40000010`.  Both are legal explicit offsets; the table word must
+match the actual allocation.  Emit all eight entries even for two levels,
+and write unused entries as zero.  Never reinterpret image A19/A1A/A1B as a
+shorter address packet.
 
 The manual permits sampler maximum/minimum levels 0 through 11, and the
 Windows LOD builders cap a resource to 12 total levels before subtracting
@@ -136,10 +140,10 @@ Gallium lowering.  In particular, changing only `PIPE_TEX_FILTER_MAG` changes
 A31 bits `[15:13]` and `[9:7]`; it must not alter the two shrinking fields or
 the D field.  A32 wrap is orthogonal and is still written on every draw.
 
-## Canonical two-level allocation
+## Vendor-packed and current guarded allocations
 
-For an uncompressed 32-bit texture, derive every level in the kernel and in
-the matching Mesa resource allocator as:
+The proprietary drivers use this packed formula for an uncompressed 32-bit
+texture:
 
 ```text
 w_l = max(width0  >> l, 1)
@@ -164,6 +168,15 @@ The useful range is `0x1400` bytes.  Do not compute L1 as
 uses the eight-row allocation height.  The first live gate should require POT
 base dimensions of at least 2x2 and at most 2048x2048, canonical pitches,
 last level exactly one, and a BO large enough for the derived complete range.
+
+The current Mesa allocator deliberately preserves the complete old L0 object,
+including its trailing page guard, before adding mip levels.  With a 4 KiB
+page its 32x32/16x16 object has L0 at object offset `0x1000`, the retained
+guard at `0x2000`, L1 at `0x3000`, and a complete size of `0x5000`.  Relative
+to L0, the table entry is therefore `40000020`.  This is the safest first ABI
+profile because it does not silently change existing L0 resource layout.
+See [mip-guarded-import-contract.md](mip-guarded-import-contract.md) for the
+exact allocator and import boundary.
 
 ## Packet insertion and exact lengths
 
@@ -228,8 +241,10 @@ needed.  Kernel validation and lowering should:
    base image for the first capability;
 2. validate `last_level == 1`, the existing independent nearest/linear
    spatial filters, mip filter 0--2, and signed bias range;
-3. derive L0/L1 pitches, sizes, and L1 offset with the formula above;
-4. reject integer overflow and a BO smaller than `size0 + size1`;
+3. derive L0/L1 pitches, sizes, and L1 offset with the selected, capability-
+   defined layout; initially use the current compatibility-guarded layout;
+4. reject integer overflow and require the BO's exact derived complete size,
+   including leading, retained-L0, and final guards;
 5. map and retain every page covering both levels and guards until bounded
    retirement, including timeout quarantine;
 6. emit A18=`18001101`, the complete eight-entry SF-relative table, and A30,
@@ -238,13 +253,16 @@ needed.  Kernel validation and lowering should:
    tests below pass.
 
 The `none` mip-filter value is useful for the forced-bias address oracle, but
-ordinary mipmapped Gallium sampling uses nearest or linear.  Mesa should
-allocate the full vendor-contiguous chain and pass semantic level/filter/bias
-fields.  It must not manufacture GPU offsets.
+ordinary mipmapped Gallium sampling uses nearest or linear.  Mesa should pass
+semantic level/filter/bias fields.  The kernel must derive H3 words from the
+agreed resource layout; userspace must not manufacture GPU offsets.  A later
+switch to a vendor-packed chain must change allocator, kernel derivation, and
+tests atomically.
 
 ## Bounded two-level silicon sequence
 
-Allocate the 32x32 plus 16x16 resource above between guard pages.  Fill every
+Allocate the current compatibility-guarded 32x32 plus 16x16 resource above.
+Fill every
 logical L0 texel opaque red and every logical L1 texel opaque green.  Fill row
 and pitch padding with distinct poison colors.  Keep the destination and
 texture BOs distinct, and validate both guards and all padding after each
@@ -277,4 +295,3 @@ the texture merely because the userspace call returned an error after packet
 publication.  Only after all steps pass should Gallium expose this mip path;
 none of these tests proves the implicit L9--L11 tail, sparse levels, or NPOT
 mipmapping.
-

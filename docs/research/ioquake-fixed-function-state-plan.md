@@ -382,6 +382,97 @@ final alignment word.  Packet assertions must be updated as a single change;
 do not append A33 after the aligned group and accidentally shift every later
 shader or immediate-vertex index.
 
+## Measured first unsupported ioquake GL1 shader
+
+Before that shader is submitted, the current run reaches a separate CPU-side
+driver omission.  GDB capture
+`/root/tmp/chrome9/ioquake3-gl1-gdb-c146218.log` records:
+
+```text
+#0  0x0
+#1  st_texture_image_copy
+#2  st_finalize_texture
+#3  st_get_sampler_views
+#4  update_textures
+#5  st_prepare_draw
+```
+
+Chrome9 does not initialize `pipe_context.resource_copy_region`; its context
+resource setup currently wires map/unmap, flush-region, and subdata callbacks
+only.  The NULL call is therefore a Gallium callback bug, not a GPU fault or
+VM corruption.  The matching engine snapshot has `040c=0`.
+
+The smallest correct bridge is the Mesa fallback
+`util_resource_copy_region`.  It maps the requested source and destination
+levels through `texture_map`, copies using the returned per-level strides,
+then unmaps both.  Chrome9's existing transfer path already validates
+`level <= last_level`, minifies the bounds, and addresses
+`level_offset[level] + y*level_stride[level] + x*cpp`.  Thus the fallback is
+mip-layout-aware without exposing mip sampling to hardware.  It must still be
+covered by same-level and L0-to-L1 CPU copy tests, source preservation, row
+padding/internal/final guard checks, and supported equal-byte-size format
+checks before relying on it in the game path.
+
+This callback repair and the shader key below are independent gates: wiring
+the copy callback gets `st_finalize_texture` past the NULL dispatch; it does
+not make the subsequent projected shader executable.
+
+The root-owned capture
+`/root/tmp/chrome9/ioquake3-gl1-nir-c146218.log` records the first unsupported
+fragment shape reached by the GL1 renderer.  In semantic form it is:
+
+```text
+st = TEX0.xy / TEX0.w
+t  = texture2D(tex0, st)
+m  = t * COL0
+COLOR.rgb = m.rgb
+COLOR.a   = COL0.a
+```
+
+This is not the existing four-lane MODULATE key.  Texture alpha participates
+in the temporary multiplication but is discarded at the output; final alpha
+must come directly from the primary color.  Treating it as ordinary
+`texture * color` would produce `t.a * COL0.a` and changes alpha test and
+blend results even when RGB looks right.
+
+The path has two independent requirements:
+
+1. one projected 2D sample, with normalized S/T and perspective-correct TEX0
+   interpolation; and
+2. a distinct fragment program/key which multiplies only output RGB and
+   routes primary-color alpha unchanged.
+
+The safe first projection lowering is the already recovered one-texture
+software transform:
+
+```text
+rhw' = rhw * q
+s'   = s / q
+t'   = t / q
+```
+
+followed by the ordinary, already-live A01/A08/A18 state.  It is valid only
+for finite nonzero Q and one independently projected texture unit.  Native
+`A18=18001901`, `A01=01002543`, `A08=08010301` remains a separate unproved
+silicon gate.  The transformed path must also keep D3DColor normalization for
+COL0 so its alpha lane reaches the fragment program as `[0,1]`.
+
+No existing closed native fragment object proves the required alpha bypass.
+Do not alias this shape to MODULATE or advertise it based on an RGB-only
+image.  Add a dedicated compiler differential and bounded runtime key.  A
+discriminating oracle uses a BGRA texture whose alpha is `0x20`, COL0 alpha
+`0x80`, and nontrivial RGB factors.  The stored alpha must be approximately
+`0x80`; an RGBA MODULATE misclassification produces approximately `0x10`.
+Vary Q across vertices so affine TEX0.xy and TEX0.xy/TEX0.w land on different
+interior texels, then repeat with Q=1 as transition closure.  Only after both
+alpha routing and projection pass should this shader cease being a fail-
+closed key.
+
+This measured shape does not by itself require mipmapping, but its projected
+derivatives feed the same A30/A31 LOD selection when the application chooses
+a mip minification filter.  Shader-key support and mip capability therefore
+remain separable gates.
+
 ## Ranked ABI successors
 
 The ordering below ranks safety first and ioquake usefulness second.

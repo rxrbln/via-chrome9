@@ -77,6 +77,10 @@ targets.
   A18 versus reserved A19--A1F namespace, cross-checks the fixed eight-entry
   table and LOD/filter words in both Windows UMDs, and specifies a bounded
   two-level kernel/Mesa successor ABI and silicon sequence.
+- [mip-guarded-import-contract.md](mip-guarded-import-contract.md) reconciles
+  the vendor-packed and current compatibility-guarded mip layouts, gives the
+  exact H3 offset for each, and proves that the recent unguarded-import smoke
+  failure was a shader-classification issue rather than a missing shadow.
 - [legacy-texture-format-oracles.md](legacy-texture-format-oracles.md)
   recovers A8/L8/L8A8 and RGB565/ARGB1555/ARGB4444 sampler and render-target
   encodings, channel and alpha semantics, guarded readback tests, and safe
