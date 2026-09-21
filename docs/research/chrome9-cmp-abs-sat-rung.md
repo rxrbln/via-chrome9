@@ -114,12 +114,14 @@ Then use fixed A33 as an observation before normalized target conversion:
 | c0=-0, true v0=1, false c0=-0 | GREATER/ref0 `33004000` | pass; `-0 >= 0` selects one |
 | c0=+0.25, true v0=1, false c0=+0.25 | GREATER/ref0.5 `33004202` | pass; positive condition selects one |
 
-Canary-fill the target so a killed fragment is unambiguous, disable depth,
-and repeat each row 1, 64, and 1024 times.  Require the predicted pass plus
-ordinary asymmetric-color readback, exact submitted words, ordered fences,
-unchanged guards, no reset/error increment, and retirement of the following
-known-good draw.  Include deliberately reversed predicates/arms as negative
-controls before advertising a semantic key.
+Canary-fill the target so a killed fragment is unambiguous.  Command 19 makes
+D16 mandatory: use a freshly cleared depth surface at 1.0, LESS/write, and
+passing z=0.5 for each isolated row; check both color and depth guards.  Repeat
+each row 1, 64, and 1024 times.  Require the predicted pass plus ordinary
+asymmetric-color readback, exact submitted words, ordered fences, unchanged
+guards, no reset/error increment, and retirement of the following known-good
+draw.  Include deliberately reversed predicates/arms as negative controls
+before advertising a semantic key.
 
 ## Native ABS oracle and preferred lowering
 
@@ -137,11 +139,13 @@ that uncertainty entirely by clearing the sign bits on the CPU and using MOV.
 
 ## Destination-SAT lower-clamp oracle and remaining blocker
 
-The terminal UNORM target masks SAT in ordinary readback.  A33 provides one
-valid lower-bound discriminator if it consumes the shader value before target
-conversion.  Compare the unsaturated and saturated MOV(c0) records with
-c0 alpha=-0.5, alpha LESS/ref0 (`33001000`), a canary target, depth disabled,
-and COPY state:
+The terminal UNORM target masks SAT in ordinary readback.  A33 provides
+lower- and upper-bound discriminators if it consumes the shader value before
+target conversion.  Use a canary target, COPY, and the mandatory fresh D16
+clear=1 with LESS/write at z=0.5.
+
+First compare the unsaturated and saturated MOV(c0) records with c0
+alpha=-0.5 and alpha LESS/ref0 (`33001000`):
 
 ```text
 MOV c0      01c00530 301c0053 00f08005 000d0820  -> -0.5 < 0, pass
@@ -153,8 +157,18 @@ proved that A33 sees the raw negative ALU result.  Then require the SAT draw
 to leave the sentinel untouched, followed by a known-good passing draw.  This
 proves the lower clamp and bit-12 effect without relying on UNORM readback.
 
-The upper clamp is still unproved: terminal UNORM conversion masks values
-above one, and no recovered one-record observation has independently closed
-the endpoint ordering.  Full SAT therefore remains rejected until a
-downstream ALU consumer, independently characterized unclamped blend factor,
-or float render target distinguishes raw `x>1` from saturated one.
+Use the symmetric upper-bound pair with c0 alpha=+2.0 and alpha
+GREATER/ref255.  Reference 255 has the special encoded value `0x400`, so the
+candidate state is `A33=33004400`:
+
+```text
+MOV c0      raw 2.0 > 1.0, pass
+MOV_SAT c0      1.0 > 1.0, fail
+```
+
+Again, require the unsaturated draw to pass before interpreting the saturated
+failure.  If either unsaturated control fails, hardware has preclamped the
+A33 input or the recovered ordering is wrong; that result is inconclusive,
+not evidence for SAT.  Full destination SAT remains rejected until both
+negative/lower and positive/upper pairs pass with fresh depth, unchanged
+guards, clean error/reset counters, and succeeding known-good retirement.

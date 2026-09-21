@@ -45,7 +45,7 @@ targets.
   including every duplicated MAD source topology.
 - [chrome9-cmp-abs-sat-rung.md](chrome9-cmp-abs-sat-rung.md) closes compiler
   placement for CMP/ABS/SAT, defines guarded CMP and native-ABS oracles, and
-  isolates the still-unproved upper half of destination saturation.
+  defines paired A33 lower/upper destination-saturation candidates.
 - [chrome9-cmp-abs-sat-corpus.tsv](chrome9-cmp-abs-sat-corpus.tsv) retains all
   eight duplicate CMP topologies, both ABS sources, and the cross-driver SAT
   bit differential across eleven operations.
