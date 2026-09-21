@@ -131,6 +131,13 @@ writes A66, A67, A64, A65 in that order without A68.  The old Linux H5S2VP1
 path instead subtracts **64** for its JUMP address.  Both use PID00 in A65;
 neither proves that one tail offset is safe for the other subgeneration.
 
+This identification is not based only on code adjacency.  The chip dispatch
+tuple in `.data` at image address `0x1084b0` is exactly
+`c7c00,a17a0,c7f80,c8190`: hardware ring install at callback `+0xdf0`, software
+ring reconstruction at `+0xdf4`, rewind at `+0xdf8`, and ordinary PID00
+kickoff at `+0xdfc`.  The allocator at `0xa1c50` invokes `+0xdf8` only on its
+wrap branches and `+0xdfc` for ordinary publication.
+
 The first driver should therefore defer both the A66/A67 tail-jump rewind and
 any explicit PID01 experiment.  PID10 full idle plus a complete reinstall has
 none of this unresolved `-16` versus `-64` dependency.
