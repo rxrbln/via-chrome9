@@ -218,9 +218,11 @@ an image mismatch alone does not justify widening the compare set.
 
 This live draw has stencil disabled, so adding stencil cannot help it. The
 current Gallium vbuf path always requests the draw pipeline, which performs
-clipping, physical-orientation culling, flat-shade fixup, and decomposition
-before emitting independent triangles. Keep hardware culling disabled for
-this promotion. ioquake back-face culling is therefore already semantically
+clipping, physical-orientation culling, and decomposition before emitting
+independent triangles.  Its ordinary flat-color path still requires the
+separate provoking D1/D2 lowering, but this constant-color depth-only draw
+does not consume a vertex color. Keep hardware culling disabled for this
+promotion. ioquake back-face culling is therefore already semantically
 handled without a new kernel field; a native A01/A23 cull cap is a later
 performance path and must not be coupled to depth ALWAYS.
 

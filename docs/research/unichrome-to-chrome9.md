@@ -43,7 +43,7 @@ Consequently, the first supported contract can deliberately be narrow:
 * one viewport/scissor rectangle;
 * untextured primary-color fragment output;
 * triangle-list submission after software transform, lighting, clipping,
-  culling, primitive decomposition, and flat-shade fixup;
+  culling, primitive decomposition, and explicit provoking-color lowering;
 * depth compare/write and color write masks;
 * synchronous submission initially, with a Gallium fence facade;
 * CPU clears as a temporary bring-up fallback, followed by accelerated color
@@ -128,7 +128,7 @@ limitations remain.
 | Primitive emission | `via_tris.c:87` `via_draw_triangle`; `via_tris.c:101` `via_draw_quad`; `via_tris.c:900` `viaRasterPrimitive`; `via_tris.c:1044` `viaFinishPrimitive`; `via_tris.c:1151` `viaRunPipeline` | Normalize everything to triangle lists in the draw stage. The first implementation can invoke `DRAW_TRIANGLE` once per output triangle; then extend it to a bounded list to avoid one synchronous ioctl per primitive. Emit H6 type-04 declarations/state, A20 triangle-list mode, A23 Gouraud mode, A24 vertex count, and `count * 6` immediate dwords. | Type-04 A20 list=`0x20000000`; strip=`0x201c7800`; fan=`0x201c5c00`. A23/A24 semantics and the immediate stream are live for fixed draw; `chrome9_build_triangle` implements one variable Gouraud triangle. H6 ends from A24/payload length; the Unichrome explicit fire/PLEND sequence in `viaFinishPrimitive` is incompatible and must not appear. |
 | Viewport and scissor | `via_context.c:726` `viaXMesaWindowMoved`; `via_state.c:600` `viaScissor`; `via_state.c:719` `viaCalcViewport` | Have `draw` bake viewport transform into x/y/z/w, retaining the known pretransformed H6 envelope. Convert Gallium's scissor to Chrome9's exclusive-right/exclusive-bottom type-01 A82/A83 rectangle. Keep DRI3 drawable coordinates resource-relative; do not add DRI1 window origins or iterate cliprects. | Type-01 A80/A81 color window and A82/A83 scissor use top/left in `[23:12]`, exclusive bottom/right in `[11:0]`, with a documented 2048 maximum. The live variable ioctl programs full-target windows and accepts half-pixel-bounded screen coordinates, but cannot set a smaller scissor. Type-04 A40-A48 encode split IEEE x/y/z scale-offset pairs and must match VS c256/c257; type-04 A50-A52 are coordinate clamps, not type-01 render-target registers. |
 | Depth | `via_state.c:1274` `viaChooseDepthState` | Translate Gallium depth state to type-01 A13 compare, A01 depth-test/depth-write bits, and D16 A10-A12 surface state. Allocate and retain the depth BO in each job. Begin with LESS/LEQUAL/ALWAYS plus write enable; reject unsupported combinations. | The fixed guarded D16 LESS/write oracle is **live**: 528 red/zero-depth samples, equal-depth green rejected, four guards intact. Variable per-vertex Z and a general D16 draw ABI are still required for gears. |
-| Cull and flat shade | `via_state.c:1312` `viaChoosePolygonState`; `via_state.c:1424` `viaChooseTriangle`; `via_tris.c:648` `viaChooseRenderState` | Initially let `draw` cull and resolve provoking-vertex/flat color, duplicate the flat color onto all three emitted vertices, and leave hardware culling disabled.  This avoids a Y-flip-dependent front-face error.  Later enable A01 bit 7 and select orientation with A23 bit 8 after a winding test. | The programming manual identifies A01.7 as back-face-cull enable and A23.8 as the cull orientation (0 clockwise, 1 counter-clockwise). This is static evidence. A23 solid/flat-A/B/C/Gouraud encodings are recovered, but only the known Gouraud path belongs in the first implementation. |
+| Cull and flat shade | `via_state.c:1312` `viaChoosePolygonState`; `via_state.c:1424` `viaChooseTriangle`; `via_tris.c:648` `viaChooseRenderState` | Let `draw` cull, but explicitly carry the API provoking index through topology decomposition and duplicate only packed flat D1/D2 inputs onto all three emitted vertices. Leave hardware culling disabled and A23 Gouraud. Later enable A01 bit 7 and select orientation with A23 bit 8 after a winding test. | The programming manual identifies A01.7 as back-face-cull enable and A23.8 as the cull orientation (0 clockwise, 1 counter-clockwise). A23 solid/FlatA/B/C/Gouraud encodings are exact. Ordinary filled triangles do not automatically traverse draw's flatshade-copy stage; the bounded fix and topology table are documented separately. |
 | Blend and color mask | `via_state.c:526` `viaBlendEquationSeparate`; `via_state.c:548` `viaBlendFunc`; `via_state.c:681` `viaClearColor`; `via_state.c:699` color mask; `via_state.c:953` `viaChooseColorState` | Lower only validated RT0 ADD factors and the API-order channel mask; reject every wider state. | **Live:** normalized COLOR0 plus structured color/textured successors pass `SRC_ALPHA/INV_SRC_ALPHA`, disabled R-mask and successor-to-legacy closure. Raw untextured and BGRA-textured source-over yielded `00807f00`; Gallium yielded the valid alternate rounding `007f8000`. Format-99 COPY, A-only mask, and independent-alpha source-over proved stored destination alpha (`80ff0000`, `80332211`, `80807f00`). Wider factors/functions remain unproved. |
 | Flush, finish, and fences | `via_ioctl.c:376` `viaEmitBreadcrumbLocked`; `via_ioctl.c:416` `viaCheckBreadcrumb`; `via_ioctl.c:443` `viaWaitIdle`; `via_ioctl.c:674` `fire_buffer`; `via_ioctl.c:802` `viaFlushDmaLocked`; `via_ioctl.c:954` `viaFlush`; `via_ioctl.c:960` `viaFinish` | Accumulate one validated draw job/batch, submit on flush/swap/resource hazard, and return a `pipe_fence_handle`. Initially the ioctl may synchronously finish and return an already-signaled fence. Add `fence_reference`/`fence_finish`; resource mapping waits on the BO reservation. Later expose asynchronous syncobj/fence completion without changing Gallium behavior. | `chrome9_engine.c:895` `chrome9_submit_draw` installs an internal `dma_fence`, BO reservation, and cache transition, then `chrome9_engine.c:737` waits synchronously. Neither draw ioctl exports a fence. The old breadcrumb, status-register spin, DRI lock, and raw command-buffer ioctls are unusable. |
 | Swap/present/resize | `via_context.c:927` `viaSwapBuffers`; `via_ioctl.c:346` `viaDoSwapBuffers` | Flush rendering and hand the external color resource back to the loader/present path. Re-import or recreate resources when drawable dimensions/handles change. | PRIME import/export plus guarded shadow allocation and CPU copy-back are **live** through an imported-target draw/flush/readback test. Real DRI3/GLX presentation remains; the exact GPU SF 2D copy successor is documented in `sf-2d-copy-present.md`. |
@@ -231,14 +231,15 @@ packets.  Mirror these interactions:
   `draw_set_mapped_constant_buffer`, invoke `draw_vbo`, then remove all mapped
   pointers and call `draw_flush`.
 
-This is not relying on unspecified helper behavior. Current
-`draw_pipe_validate.c:228` inserts the flatshade stage when required and
-`:253` inserts the cull stage; `draw_pipe_cull.c:75` classifies post-viewport
-winding, while `draw_pipe_flatshade.c:200` identifies constant/color
-interpolants and `:263` selects the API provoking vertex. Keeping hardware
-culling off and H6 in Gouraud mode therefore still produces correct GL cull
-and flat-color behavior, provided the rasterizer and FS objects are mirrored
-into draw as above.
+This is not relying on unspecified helper behavior for culling:
+`draw_pipe_validate.c` inserts the cull stage and `draw_pipe_cull.c:75`
+classifies post-viewport winding.  Flat shading has a narrower boundary.
+`draw_pipe_flatshade.c:200` identifies constant/color interpolants and `:263`
+selects the API provoking vertex, but `draw_pipe_validate.c` inserts that
+stage only when another raster stage requests precomputed flat values.  An
+ordinary filled triangle can bypass it.  Keeping H6 in Gouraud mode therefore
+also requires the explicit D1/D2 provoking-color lowering in
+[flatshade-edge-ownership-contract.md](flatshade-edge-ownership-contract.md).
 
 The Chrome9 `vbuf_render::get_vertex_info` should always describe the proven
 six-dword record, rather than vary with arbitrary fragment inputs:

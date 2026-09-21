@@ -241,7 +241,9 @@ Initial draw restrictions are deliberately strict:
 
 Returning false from `chrome9_vbuf_need_pipeline()` is insufficient: the
 draw middle end still shades vertices (`PT_SHADE`) and only omits clipping,
-culling, flat-shade fixup, and topology stages.  Conversely, pointing native
+culling, optional raster stages, and topology decomposition.  Ordinary
+filled flat shading is not automatically fixed even with the full pipeline;
+it needs the explicit provoking-color path.  Conversely, pointing native
 fetch at raw application data is invalid because the proven post-TNL
 declaration consumes float4 position plus normalized packed colors, not
 arbitrary float3 positions/normals.  The fast path must either pack the

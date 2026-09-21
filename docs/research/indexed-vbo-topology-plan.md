@@ -83,8 +83,12 @@ test must compare rendered images for all array/VBO/interleave forms.
 `chrome9_draw_vbo()` maps each user or resource vertex buffer and maps index
 buffers of API element sizes 1, 2, or 4 bytes into Mesa draw.  Because
 `chrome9_vbuf_need_pipeline()` always returns true, draw performs the vertex
-shader, homogeneous clipping, viewport transform, culling, flat-shade fixup,
-and primitive decomposition before the Chrome9 callback sees vertices.
+shader, homogeneous clipping, viewport transform, culling, and primitive
+decomposition before the Chrome9 callback sees vertices.  It preserves flat
+attributes while clipping, but an ordinary filled primitive does not
+automatically traverse draw's flatshade-copy stage; Chrome9 must apply the
+explicit provoking-color mapping in
+[flatshade-edge-ownership-contract.md](flatshade-edge-ownership-contract.md).
 
 The vbuf boundary deliberately uses 16-bit *post-transform* indices:
 

@@ -134,8 +134,10 @@ The Xorg 21.1.24 glamor tree contains no `GL_CULL_FACE`, `glCullFace`,
 `glFrontFace`, `GL_DEPTH_TEST`, or `GL_RASTERIZER_DISCARD` state change.  The
 copy relies on their GL defaults: disabled.  The current driver copies the
 Gallium rasterizer state into draw and always requests the software pipeline,
-which performs clipping, culling, flat-shade fixup, and primitive decomposition
-before vbuf (`chrome9_context.c:125-139`, `chrome9_draw.c:69-78`).
+which performs clipping, culling, and primitive decomposition before vbuf
+(`chrome9_context.c:125-139`, `chrome9_draw.c:69-78`).  Glamor's copy shader
+uses smooth texture coordinates and constant color, so the separate ordinary
+filled-triangle flatshade gap does not affect this path.
 
 The corresponding native state is independently exact:
 
