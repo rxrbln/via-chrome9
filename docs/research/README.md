@@ -33,6 +33,10 @@ targets.
   MIN silicon gate and the exact source-B and finite-domain boundary for ADD.
 - [chrome9-min-add-rung-corpus.tsv](chrome9-min-add-rung-corpus.tsv) records
   the eight additional Windows/Linux ADD/MIN swizzle and NEG differentials.
+- [chrome9-max-sub-rung.md](chrome9-max-sub-rung.md) defines the guarded MAX
+  and SUB validators, live pixel oracles, and rounding-independent SUB bound.
+- [chrome9-max-sub-rung-corpus.tsv](chrome9-max-sub-rung-corpus.tsv) records
+  the matching Windows/Linux MAX/SUB swizzle and NEG differentials.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
