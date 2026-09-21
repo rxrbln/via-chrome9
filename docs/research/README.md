@@ -21,6 +21,18 @@ targets.
 - [chrome9-cmd19-fp-compiler-corpus.tsv](chrome9-cmd19-fp-compiler-corpus.tsv)
   records the exact signed-zero, denormal, finite-endpoint, NaN, and infinity
   `DEF c0` differential across both proprietary compilers.
+- [chrome9-next-alu-one-record.md](chrome9-next-alu-one-record.md) records the
+  bounded next-operation compiler evidence, static operand boundary, and
+  fail-closed promotion order beyond MOV/MUL.
+- [chrome9-next-alu-one-record-corpus.tsv](chrome9-next-alu-one-record-corpus.tsv)
+  is the 32-row Windows/Linux byte-matched v0/c0 ALU corpus.
+- [chrome9-next-alu-static-policy.tsv](chrome9-next-alu-static-policy.tsv)
+  separates byte-exact rows from static-only, numerical, and reject-only
+  swizzle/modifier candidates.
+- [chrome9-min-add-rung.md](chrome9-min-add-rung.md) defines the first guarded
+  MIN silicon gate and the exact source-B and finite-domain boundary for ADD.
+- [chrome9-min-add-rung-corpus.tsv](chrome9-min-add-rung-corpus.tsv) records
+  the eight additional Windows/Linux ADD/MIN swizzle and NEG differentials.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
