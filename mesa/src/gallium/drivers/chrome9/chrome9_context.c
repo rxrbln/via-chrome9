@@ -2137,16 +2137,225 @@ chrome9_fs_native_key(unsigned program, struct chrome9_fs_key *key)
 }
 
 static bool
-chrome9_compile_native_fs(struct chrome9_shader *shader)
+chrome9_backend_alpha_leaf(enum chrome9_fs_leaf *leaf)
+{
+   switch (*leaf) {
+   case CHROME9_FS_LEAF_V0:
+      *leaf = CHROME9_FS_LEAF_V0_A;
+      return true;
+   case CHROME9_FS_LEAF_C0:
+      *leaf = CHROME9_FS_LEAF_C0_A;
+      return true;
+   case CHROME9_FS_LEAF_C1:
+      *leaf = CHROME9_FS_LEAF_C1_A;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+chrome9_backend_primary(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_intrinsic_instr *load, *bary;
+
+   if (def->num_components != 4 || def->bit_size != 32 ||
+       instr->type != nir_instr_type_intrinsic)
+      return false;
+   load = nir_instr_as_intrinsic(instr);
+   if (load->intrinsic != nir_intrinsic_load_interpolated_input ||
+       nir_intrinsic_io_semantics(load).location != VARYING_SLOT_COL0 ||
+       nir_intrinsic_component(load) || !load->src[0].ssa ||
+       !nir_src_is_const(load->src[1]) ||
+       nir_src_as_uint(load->src[1]))
+      return false;
+   instr = nir_def_instr(load->src[0].ssa);
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   bary = nir_instr_as_intrinsic(instr);
+   return bary->intrinsic == nir_intrinsic_load_barycentric_pixel &&
+          (nir_intrinsic_interp_mode(bary) == INTERP_MODE_NONE ||
+           nir_intrinsic_interp_mode(bary) == INTERP_MODE_SMOOTH);
+}
+
+/* The backend deliberately unwraps MOV only.  Treating FSAT as a copy would
+ * miscompile an FMUL operand whenever the source lies outside [0,1]. */
+static bool
+chrome9_backend_leaf(nir_def *def, unsigned depth,
+                     enum chrome9_fs_leaf *leaf)
+{
+   nir_instr *instr;
+
+   if (!def || depth > 8 || def->num_components != 4 || def->bit_size != 32)
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      bool alpha = true, identity = true;
+
+      if (alu->op != nir_op_mov)
+         return false;
+      for (unsigned c = 0; c < 4; c++) {
+         identity &= alu->src[0].swizzle[c] == c;
+         alpha &= alu->src[0].swizzle[c] == 3;
+      }
+      if ((!identity && !alpha) ||
+          !chrome9_backend_leaf(alu->src[0].src.ssa, depth + 1, leaf))
+         return false;
+      return identity || chrome9_backend_alpha_leaf(leaf);
+   }
+   if (chrome9_backend_primary(def)) {
+      *leaf = CHROME9_FS_LEAF_V0;
+      return true;
+   }
+   if (chrome9_fs_is_constant_color(def, 0, 0)) {
+      *leaf = CHROME9_FS_LEAF_C0;
+      return true;
+   }
+   if (chrome9_fs_is_constant_color(def, 1, 0)) {
+      *leaf = CHROME9_FS_LEAF_C1;
+      return true;
+   }
+   return false;
+}
+
+static bool
+chrome9_backend_source(const nir_alu_src *source,
+                       enum chrome9_fs_leaf *leaf)
+{
+   bool alpha = true, identity = true;
+
+   if (!source->src.ssa || source->src.ssa->num_components != 4)
+      return false;
+   for (unsigned c = 0; c < 4; c++) {
+      identity &= source->swizzle[c] == c;
+      alpha &= source->swizzle[c] == 3;
+   }
+   if ((!identity && !alpha) ||
+       !chrome9_backend_leaf(source->src.ssa, 0, leaf))
+      return false;
+   return identity || chrome9_backend_alpha_leaf(leaf);
+}
+
+/*
+ * Lower the canonical NIR output expression to the first native backend IR.
+ * Unlike the compatibility program classifier, this follows the output DAG
+ * and derives opcode and operands directly.  The bounded initial scheduler
+ * accepts one full-vector MOV or FMUL; later ISA work extends this same IR
+ * rather than adding more application-shaped program enums.
+ */
+static bool
+chrome9_fs_key_from_nir(nir_shader *nir, struct chrome9_fs_key *key)
+{
+   nir_def *result = NULL;
+
+   memset(key, 0, sizeof(*key));
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *intr;
+            nir_variable *var;
+            unsigned location;
+            nir_def *stored;
+
+            if (instr->type == nir_instr_type_alu ||
+                instr->type == nir_instr_type_deref ||
+                instr->type == nir_instr_type_load_const)
+               continue;
+            if (instr->type != nir_instr_type_intrinsic)
+               return false;
+            intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_output) {
+               struct nir_io_semantics semantics =
+                  nir_intrinsic_io_semantics(intr);
+
+               location = semantics.location;
+               if (nir_intrinsic_component(intr) ||
+                   semantics.dual_source_blend_index ||
+                   nir_intrinsic_write_mask(intr) != 0xf ||
+                   !nir_src_is_const(intr->src[1]) ||
+                   nir_src_as_uint(intr->src[1]))
+                  return false;
+               stored = intr->src[0].ssa;
+            } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+
+               var = nir_intrinsic_get_var(intr, 0);
+               if (!deref || deref->deref_type != nir_deref_type_var ||
+                   !var || var->data.mode != nir_var_shader_out ||
+                   var->data.index || var->data.location_frac ||
+                   nir_intrinsic_write_mask(intr) != 0xf)
+                  return false;
+               location = var->data.location;
+               stored = intr->src[1].ssa;
+            } else if (intr->intrinsic ==
+                          nir_intrinsic_load_barycentric_pixel ||
+                       intr->intrinsic ==
+                          nir_intrinsic_load_interpolated_input ||
+                       intr->intrinsic == nir_intrinsic_load_uniform ||
+                       intr->intrinsic == nir_intrinsic_load_ubo ||
+                       intr->intrinsic == nir_intrinsic_load_ubo_vec4) {
+               continue;
+            } else {
+               /* Discard, demote, memory, atomics, and extra outputs are
+                * outside this one-record backend and must not disappear. */
+               return false;
+            }
+            if ((location != FRAG_RESULT_COLOR &&
+                 location != FRAG_RESULT_DATA0) || result)
+               return false;
+            result = stored;
+         }
+      }
+   }
+   if (!result || result->num_components != 4 || result->bit_size != 32)
+      return false;
+
+   if (chrome9_backend_leaf(result, 0, &key->src[0])) {
+      key->op = CHROME9_FS_OP_MOV;
+      return true;
+   }
+
+   nir_instr *instr = nir_def_instr(result);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_fmul ||
+       !chrome9_backend_source(&alu->src[0], &key->src[0]) ||
+       !chrome9_backend_source(&alu->src[1], &key->src[1]))
+      return false;
+   key->op = CHROME9_FS_OP_MUL;
+   return true;
+}
+
+static bool
+chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
 {
    struct chrome9_fs_key key;
    enum chrome9_shader_verify_error error;
+   bool from_nir = nir && chrome9_fs_key_from_nir(nir, &key);
 
-   if (!chrome9_fs_native_key(shader->fragment_program, &key) ||
+   if ((!from_nir &&
+        !chrome9_fs_native_key(shader->fragment_program, &key)) ||
        !chrome9_compile_fs_offline(&key, &shader->native_fs))
       return false;
 
-   return chrome9_verify_fs_offline(&key, &shader->native_fs, &error);
+   if (!chrome9_verify_fs_offline(&key, &shader->native_fs, &error))
+      return false;
+   shader->native_fs_key = key;
+   shader->native_fs_from_nir = from_nir;
+   return true;
+}
+
+static bool
+chrome9_native_fs_is_program_batch(const struct chrome9_shader *shader)
+{
+   return shader->native_fs_valid && shader->native_fs_from_nir &&
+          shader->native_fs.alu_count == 1 && !shader->native_fs.tau_count &&
+          !shader->native_fs.sampler_mask &&
+          !(shader->native_fs.varying_mask & ~1u) &&
+          !(shader->native_fs.constant_mask & ~1u);
 }
 
 static bool
@@ -2236,6 +2445,12 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);
       shader->fragment_program = chrome9_fs_classify(state->ir.nir);
+      shader->native_fs_valid =
+         chrome9_compile_native_fs(shader, state->ir.nir);
+      if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
+          ctx->draw_program_triangle_d16_rhw_batch &&
+          chrome9_native_fs_is_program_batch(shader))
+         shader->fragment_program = CHROME9_FS_COMPILED_ALU;
       shader->supported =
          shader->fragment_program != CHROME9_FS_UNSUPPORTED;
       if (!shader->supported &&
@@ -2252,13 +2467,14 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->fragment_program = shader->supported ?
          CHROME9_FS_PRIMARY_COLOR : CHROME9_FS_UNSUPPORTED;
    }
-   if (shader->supported)
-      shader->native_fs_valid = chrome9_compile_native_fs(shader);
+   if (shader->supported && !shader->native_fs_valid)
+      shader->native_fs_valid = chrome9_compile_native_fs(
+         shader, state->type == PIPE_SHADER_IR_NIR ? state->ir.nir : NULL);
    if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false) &&
        shader->supported)
-      fprintf(stderr, "chrome9: native FS valid=%u alu=%u tau=%u\n",
-              shader->native_fs_valid, shader->native_fs.alu_count,
-              shader->native_fs.tau_count);
+      fprintf(stderr, "chrome9: native FS valid=%u nir=%u alu=%u tau=%u\n",
+              shader->native_fs_valid, shader->native_fs_from_nir,
+              shader->native_fs.alu_count, shader->native_fs.tau_count);
    return shader;
 }
 
@@ -2918,6 +3134,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH);
    ctx->draw_triangle_d16_rhw_batch =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH);
+   ctx->draw_program_triangle_d16_rhw_batch =
+      !!(capabilities &
+         DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);
    ctx->draw_textured_triangle =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
    ctx->draw_textured_triangle_d16 =

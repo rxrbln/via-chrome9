@@ -49,9 +49,13 @@ struct chrome9_shader {
       CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY,
       CHROME9_FS_IOQUAKE3_GENERIC_PACKED,
       CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED,
+      /* Generic one-instruction NIR backend result, not an app-shaped key. */
+      CHROME9_FS_COMPILED_ALU,
    } fragment_program;
+   struct chrome9_fs_key native_fs_key;
    struct chrome9_ps_program native_fs;
    bool native_fs_valid;
+   bool native_fs_from_nir;
    bool supported;
 };
 
@@ -109,6 +113,7 @@ struct chrome9_context {
    bool depth_read_only_supported;
    bool draw_triangle_batch;
    bool draw_triangle_d16_rhw_batch;
+   bool draw_program_triangle_d16_rhw_batch;
    bool draw_textured_triangle;
    bool draw_textured_triangle_d16;
    bool draw_textured_triangle_d16_blend;
@@ -145,6 +150,7 @@ struct chrome9_context {
 
    uint64_t submitted_triangles;
    uint64_t submitted_batches;
+   uint64_t submitted_program_batches;
    uint64_t rejected_triangles;
    uint64_t draw_limit;
    bool debug_draws;

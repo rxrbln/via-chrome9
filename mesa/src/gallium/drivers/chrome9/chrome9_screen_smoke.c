@@ -968,6 +968,63 @@ make_constant_product_fs(struct pipe_screen *screen,
    return context->create_fs_state(context, &state);
 }
 
+enum smoke_program_fs_mode {
+   SMOKE_PROGRAM_FS_VALID,
+   SMOKE_PROGRAM_FS_SATURATE,
+   SMOKE_PROGRAM_FS_PARTIAL_STORE,
+   SMOKE_PROGRAM_FS_DISCARD,
+   SMOKE_PROGRAM_FS_NOPERSPECTIVE,
+   SMOKE_PROGRAM_FS_INPUT_OFFSET,
+};
+
+/* Exercise the NIR-driven backend independently of the older program-shape
+ * classifier.  Only the first form is in the one-record cmd19 ABI; each
+ * negative form differs by one semantic that the backend must reject. */
+static void *
+make_program_backend_fs(struct pipe_screen *screen,
+                        struct pipe_context *context,
+                        enum smoke_program_fs_mode mode)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-one-record-backend-boundary");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *barycentric;
+   nir_def *color;
+   nir_def *constant;
+
+   b.shader->info.io_lowered = true;
+   if (mode == SMOKE_PROGRAM_FS_NOPERSPECTIVE)
+      barycentric = nir_load_barycentric_pixel(
+         &b, 32, .interp_mode = INTERP_MODE_NOPERSPECTIVE);
+   else
+      barycentric = nir_load_barycentric_pixel(
+         &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric,
+      nir_imm_int(&b, mode == SMOKE_PROGRAM_FS_INPUT_OFFSET ? 1 : 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   constant = nir_load_ubo(
+      &b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .align_mul = 16, .range_base = 0, .range = 16);
+   if (mode == SMOKE_PROGRAM_FS_SATURATE)
+      constant = nir_fsat(&b, constant);
+   if (mode == SMOKE_PROGRAM_FS_DISCARD)
+      nir_discard_if(&b, nir_imm_false(&b));
+   nir_store_output(&b, nir_fmul(&b, color, constant),
+                    nir_imm_int(&b, 0),
+                    .write_mask = mode == SMOKE_PROGRAM_FS_PARTIAL_STORE ?
+                                  0x7 : 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
 static bool
 run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                   struct pipe_resource *depth_resource)
@@ -1082,6 +1139,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       0.8f, 0.4f, 0.2f, 0.75f,
       0.5f, 0.25f, 1.0f, 0.25f,
    };
+   const float program_color[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
    struct pipe_constant_buffer solid_constant = {
       .buffer_size = sizeof(solid_color),
       .user_buffer = solid_color,
@@ -1092,6 +1150,10 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    struct pipe_constant_buffer product_constant = {
       .buffer_size = sizeof(product_colors),
       .user_buffer = product_colors,
+   };
+   struct pipe_constant_buffer program_constant = {
+      .buffer_size = sizeof(program_color),
+      .user_buffer = program_color,
    };
    const struct pipe_resource solid_buffer_template = {
       .target = PIPE_BUFFER,
@@ -1114,6 +1176,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    size_t changed = 0;
    uint16_t sample_depth = 0;
    uint64_t initial_batches = 0;
+   uint64_t initial_program_batches = 0;
    void *blend_handle = NULL;
    void *source_over_handle = NULL;
    void *multiply_handle = NULL;
@@ -1137,6 +1200,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *scalar_blue_fs = NULL;
    void *generic_rgba_vs = NULL, *generic_rgba_fs = NULL;
    void *generic_rgbx_vs = NULL, *generic_rgbx_fs = NULL;
+   void *program_fs = NULL;
+   void *rejected_program_fs[5] = { NULL };
    struct pipe_resource *solid_buffer = NULL;
    bool passed = false;
 
@@ -1227,6 +1292,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                                                             elements);
    vs = make_ff_vertex_shader(screen, context);
    fs = make_ff_primary_color_fs(screen, context);
+   if (depth_resource && chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH)) {
+      program_fs = make_program_backend_fs(screen, context,
+                                           SMOKE_PROGRAM_FS_VALID);
+      for (unsigned i = 0; i < ARRAY_SIZE(rejected_program_fs); i++)
+         rejected_program_fs[i] = make_program_backend_fs(
+            screen, context,
+            (enum smoke_program_fs_mode)(SMOKE_PROGRAM_FS_SATURATE + i));
+   }
    if (!depth_resource) {
       solid_buffer = screen->resource_create(screen, &solid_buffer_template);
       solid_elements_handle =
@@ -1284,7 +1358,38 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
        (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST) &&
         !alpha_dsa_handle) ||
        !elements_handle || !vs || !fs ||
-       !((struct chrome9_shader *)fs)->native_fs_valid || !scalar_gray_vs ||
+       !((struct chrome9_shader *)fs)->native_fs_valid ||
+       (depth_resource && chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH) &&
+        (!((struct chrome9_shader *)fs)->native_fs_from_nir ||
+         !program_fs ||
+         !((struct chrome9_shader *)program_fs)->supported ||
+         ((struct chrome9_shader *)program_fs)->fragment_program !=
+            CHROME9_FS_COMPILED_ALU ||
+         !((struct chrome9_shader *)program_fs)->native_fs_valid ||
+         !((struct chrome9_shader *)program_fs)->native_fs_from_nir ||
+         ((struct chrome9_shader *)program_fs)->native_fs_key.op !=
+            CHROME9_FS_OP_MUL ||
+         ((struct chrome9_shader *)program_fs)->native_fs_key.src[0] !=
+            CHROME9_FS_LEAF_V0 ||
+         ((struct chrome9_shader *)program_fs)->native_fs_key.src[1] !=
+            CHROME9_FS_LEAF_C0 ||
+         !rejected_program_fs[0] ||
+         !rejected_program_fs[1] ||
+         !rejected_program_fs[2] ||
+         !rejected_program_fs[3] ||
+         !rejected_program_fs[4] ||
+         ((struct chrome9_shader *)rejected_program_fs[0])->supported ||
+         ((struct chrome9_shader *)rejected_program_fs[0])->native_fs_valid ||
+         ((struct chrome9_shader *)rejected_program_fs[1])->supported ||
+         ((struct chrome9_shader *)rejected_program_fs[1])->native_fs_valid ||
+         ((struct chrome9_shader *)rejected_program_fs[2])->supported ||
+         ((struct chrome9_shader *)rejected_program_fs[2])->native_fs_valid ||
+         ((struct chrome9_shader *)rejected_program_fs[3])->supported ||
+         ((struct chrome9_shader *)rejected_program_fs[3])->native_fs_valid ||
+         ((struct chrome9_shader *)rejected_program_fs[4])->supported ||
+         ((struct chrome9_shader *)rejected_program_fs[4])->native_fs_valid)) ||
+       !scalar_gray_vs ||
        !scalar_gray_fs ||
        ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=
           CHROME9_FS_PRIMARY_SCALAR_RGBX ||
@@ -1340,6 +1445,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                   PIPE_MASK_RGBA, 0xff, NULL,
                   &clear_color, 1.0, 0);
    initial_batches = chrome9_context(context)->submitted_batches;
+   initial_program_batches =
+      chrome9_context(context)->submitted_program_batches;
    context->draw_vbo(context, &info, 0, NULL, &draw, 1);
    if (depth_resource) {
       vertex_buffer.buffer.user = near_vertices;
@@ -1361,7 +1468,11 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    passed = changed >= 30000 && changed <= 257U * 129U &&
             (!chrome9_context(context)->draw_triangle_batch ||
              chrome9_context(context)->submitted_batches ==
-                initial_batches + 1);
+                initial_batches + 1) &&
+            (!depth_resource ||
+             !chrome9_context(context)->draw_program_triangle_d16_rhw_batch ||
+             chrome9_context(context)->submitted_program_batches ==
+                initial_program_batches + 1);
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       passed = passed &&
                (pixels[32 * (surface->stride / 4) + 192] >> 24) == 0xff;
@@ -1943,13 +2054,72 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                  chrome9_context(context)->submitted_triangles - submitted,
                  chrome9_context(context)->rejected_triangles - rejected);
    }
+   if (passed && depth_resource && program_fs) {
+      struct chrome9_resource *depth = chrome9_resource(depth_resource);
+      uint16_t *depth_pixels = (uint16_t *)
+         ((uint8_t *)depth->bo.map + depth->data_offset);
+      uint64_t submitted = chrome9_context(context)->submitted_triangles;
+      uint64_t batches =
+         chrome9_context(context)->submitted_program_batches;
+      uint64_t rejected = chrome9_context(context)->rejected_triangles;
+      uint32_t pixel;
+      unsigned red, green_channel, blue;
+
+      context->bind_blend_state(context, blend_handle);
+      context->bind_depth_stencil_alpha_state(context, dsa_handle);
+      context->bind_rasterizer_state(context, rasterizer_handle);
+      context->bind_vertex_elements_state(context, elements_handle);
+      context->bind_vs_state(context, vs);
+      context->bind_fs_state(context, program_fs);
+      vertex_buffer.buffer.user = generic_rgba_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0,
+                                   &program_constant);
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush_resource(context, resource);
+      context->flush(context, NULL, 0);
+      context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0, NULL);
+      pixel = pixels[32 * (surface->stride / 4) + 192];
+      red = pixel >> 16 & 0xff;
+      green_channel = pixel >> 8 & 0xff;
+      blue = pixel & 0xff;
+      passed = red >= 0x1f && red <= 0x21 &&
+               green_channel >= 0x3f && green_channel <= 0x41 &&
+               blue >= 0x5f && blue <= 0x61 &&
+               depth_pixels[32 * (depth->stride / 2) + 192] >= 0x7ffe &&
+               depth_pixels[32 * (depth->stride / 2) + 192] <= 0x8001 &&
+               chrome9_context(context)->submitted_triangles ==
+                  submitted + 2 &&
+               chrome9_context(context)->submitted_program_batches ==
+                  batches + 1 &&
+               chrome9_context(context)->rejected_triangles == rejected &&
+               smoke_guard_pages_match(draw_surface) &&
+               smoke_guard_pages_match(depth);
+      if (passed)
+         printf("Gallium compiled v0*c0 D16 passed: sample=%08x\n", pixel);
+      else
+         fprintf(stderr,
+                 "Gallium compiled v0*c0 D16 mismatch: sample=%08x "
+                 "submitted=+%" PRIu64 " batches=+%" PRIu64
+                 " rejected=+%" PRIu64 "\n",
+                 pixel,
+                 chrome9_context(context)->submitted_triangles - submitted,
+                 chrome9_context(context)->submitted_program_batches -
+                    batches,
+                 chrome9_context(context)->rejected_triangles - rejected);
+   }
    if (!passed)
       fprintf(stderr,
               "Gallium quad-strip coverage/depth mismatch: %zu "
-              "sample=%08x/%04x batches=+%" PRIu64 "\n",
+              "sample=%08x/%04x batches=+%" PRIu64
+              " program-batches=+%" PRIu64 "\n",
               changed, pixels[32 * (surface->stride / 4) + 192],
               sample_depth,
-              chrome9_context(context)->submitted_batches - initial_batches);
+              chrome9_context(context)->submitted_batches - initial_batches,
+              chrome9_context(context)->submitted_program_batches -
+                 initial_program_batches);
    else if (depth_resource)
       printf("Gallium D16 quad strip passed: changed=%zu sample=%08x/%04x\n",
              changed, pixels[32 * (surface->stride / 4) + 192],
@@ -1989,6 +2159,11 @@ out:
          context->delete_vs_state(context, generic_rgbx_vs);
       if (generic_rgbx_fs)
          context->delete_fs_state(context, generic_rgbx_fs);
+      if (program_fs)
+         context->delete_fs_state(context, program_fs);
+      for (unsigned i = 0; i < ARRAY_SIZE(rejected_program_fs); i++)
+         if (rejected_program_fs[i])
+            context->delete_fs_state(context, rejected_program_fs[i]);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (solid_elements_handle)
