@@ -293,6 +293,11 @@ targets.
   transports raw float S/T and applies wrap in sampler A32, specifies a
   conservative two-unit signed-repeat capability and no-wedge oracle, and
   separates command 15's depth/blend flags from its semantic program selector.
+- [program24-signed-repeat-hang-audit.md](program24-signed-repeat-hang-audit.md)
+  combines the exact four-ALU TEX0-alpha-primary object with live signed
+  stage-0 repeat, gives exact RGB/alpha and body-word oracles, and proves that
+  its current one-triangle length and inactive command-15 path cannot explain
+  increased ring pressure under sustained ioquake3 submission.
 - [`../../tools/chrome9_alu_decode.py`](../../tools/chrome9_alu_decode.py)
   decodes the established fields from a four-dword pixel-ALU instruction while
   keeping unresolved fields visible.
