@@ -50,6 +50,9 @@ targets.
   A00/A33--A37/A53 lowering recipes for common blend equations, channel masks,
   and alpha test, while separating live clamped state from the proprietary
   no-clamp policy.
+- [fixed-function-state-transitions.md](fixed-function-state-transitions.md)
+  combines blend, alpha-test, fog, scissor, and texture-format words into a
+  transition-closed two-texture state image with exact body-index formulas.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
