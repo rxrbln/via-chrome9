@@ -18,6 +18,9 @@ targets.
 - [chrome9-multi-alu-cross-driver-corpus.tsv](chrome9-multi-alu-cross-driver-corpus.tsv)
   retains matching Linux/Mesa finalized rows and the deliberately separate
   unresolved Windows-wrapper raw rows for that successor.
+- [glmark2-texture-half-pixel-oracle.md](glmark2-texture-half-pixel-oracle.md)
+  reconstructs the nearest and linear validation failures exactly and
+  isolates the post-viewport half-pixel correction.
 - [chrome9-mov-mul-short-chain-three-driver.md](chrome9-mov-mul-short-chain-three-driver.md)
   cross-checks short-chain destination ids, A/C release precedence, resource
   counts, and normalized finalizer provenance in Linux, D3D, and OpenGL.
