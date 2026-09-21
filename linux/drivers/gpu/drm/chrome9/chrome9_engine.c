@@ -1053,8 +1053,11 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	memcpy(destination_state + 3, destination_tail,
 	       sizeof(destination_tail));
 	for (i = 0; i < 2; i++) {
-		u32 log_size = BIT(15) | ilog2(heights[i]) << 4 |
-			       ilog2(widths[i]);
+		u32 log_size = 0;
+
+		if (is_power_of_2(widths[i]) && is_power_of_2(heights[i]))
+			log_size = BIT(15) | ilog2(heights[i]) << 4 |
+				   ilog2(widths[i]);
 
 		image[i][0] = addresses[i] >> 8;
 		image[i][1] = 0x18001101;
@@ -3483,7 +3486,6 @@ static int chrome9_validate_two_texture_state(
 
 	if (!texture->handle || !texture->width || texture->width > 2048 ||
 	    !texture->height || texture->height > 2048 ||
-	    !is_power_of_2(texture->width) || !is_power_of_2(texture->height) ||
 	    texture->pitch != ALIGN(texture->width * sizeof(u32), 32) ||
 	    texture->format > DRM_CHROME9_TEXTURE_FORMAT_BGRA8888 ||
 	    texture->min_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
