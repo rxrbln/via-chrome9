@@ -238,6 +238,42 @@ SUB is the important exception: because the sampled value is in parallel
 source B, dependency finalization changes d0 rather than d2. A generic
 "sampled operand means d2.bit17" rule is therefore wrong.
 
+## Cmd19 one-record operand boundary
+
+The structured cmd19 encoder's executable v0/c0 surface is narrower than the
+native field width suggests. Production Linux compilation byte-matches MOV
+and MUL with identity or `aaaa` swizzles in either A or C. Every such
+one-record, no-texture object uses the same controls:
+
+```text
+90058000 91000000 92000001 93000000 94000000 95000000
+96000000 97000000 98000000 99000000 9a000000 9b000000
+```
+
+A-slot NEG also byte-matches the current packing formula. C-slot NEG does
+not: Linux emits no d3.bit20, while the Windows compiler and current generic
+encoder set it. For example, `v0 * -c0` is respectively:
+
+```text
+Linux   8140b6d0 30080053 00f04005 00000820
+encoder 8140b6d0 30080053 00f04005 00100820
+```
+
+Keep C-slot NEG rejected until numerical silicon testing resolves that
+version/chip difference. A-slot NEG is byte-exact but likewise remains a
+separate numerical gate, not part of the current cmd19 allowlist.
+
+ONE/ZERO are native literal selectors, not ordinary v0/c0 component
+swizzles. Vendor canonical literal operands carry source class 5. Retaining
+the requested input/constant class produces a different, unproved tuple: for
+example the generic encoder makes `v0.1111` source A `00f04092`, whereas the
+canonical literal source A is `00f14092`; a canonical source-C ONE is
+`30140924`, not the c0-class `30080924`. D3D PS 2.0 cannot express selectors
+4/5 for a differential. Cmd19 must continue to reject v0/c0 ONE and ZERO.
+
+The complete records and statuses are in
+[chrome9-cmd19-one-record-corpus.tsv](chrome9-cmd19-one-record-corpus.tsv).
+
 ## Golden acceptance corpus
 
 `via-5.75-shader-corpus.tsv` and `windows-closed-key-shader-corpus.tsv` are
