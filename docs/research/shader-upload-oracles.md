@@ -117,8 +117,10 @@ choice.  The normal Linux creation path calls
 `stmPPS_PostTranslationSetting_invi(compiled+0x10, 2)`.  Configuration two
 turns compiler metadata `+2c=00040000` into `00058000` for an ALU-only
 program, and zero into `00018000` for one TAU followed by ALU.  It also sets
-the texture case's `+70=1`, TAU dependency bit 28, and the consuming ALU
-source dependency bit 17.  Consequently a complete generic one-texture
+the texture case's `+70=1`, TAU live-result bit 28, and the consuming ALU
+source-A final-use/release bit 17.  The latter is not a producer-edge
+dependency: the whole-program finalizer marks only the terminal read of a
+physical temporary-like value.  Consequently a complete generic one-texture
 MODULATE transaction uses:
 
 ```text
@@ -360,7 +362,8 @@ the ADD/MUL MAD lowerings; they are not user constants.
 Each PS ALU instruction is four dwords.  The independently reproduced fields
 include all three source ids/classes/swizzles/modifiers, destination id/class,
 mask, saturation, result scale, and the main sub-operation.  The finalizer also
-sets dependency bits and low dword-3 slots; never rebuild or zero those after
+sets whole-program final-use/release markers and low dword-3 slots; never
+rebuild or zero those after
 scheduling.  The texture-address instruction is one dword; TEXLD/TEXLDB/
 TEXLDP operation values are 1/3/7 in bits `23:20`, and sampler id appears in
 both bits `27:24` and `3:0`.  Destination/source fields overlap in bits 17:16,

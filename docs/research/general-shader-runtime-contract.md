@@ -102,9 +102,12 @@ A9b = kernel-owned runtime state
 
 Each transition word carries 24 positions. A93/A94 cover TAU 0..31;
 A95..A9a cover ALU 0..95. A set bit switches stores after that record. Counts,
-start phase, transition maps, TAU dependency bits, and ALU dependency fields
+start phase, transition maps, TAU schedule/lifetime bits, and ALU final-use
+release markers
 must be generated and verified as one object. Uploading pre-finalizer semantic
-instructions is invalid.
+instructions is invalid.  The exact terminal-read rules and same-register
+A/C/B precedence are in
+[`chrome9-ps-temp-lifetime-finalizer.md`](chrome9-ps-temp-lifetime-finalizer.md).
 
 The first four safe schedule shapes are exact:
 
@@ -181,8 +184,8 @@ The one-dword TAU layout is field-exact:
 
 | bits | meaning |
 |---:|---|
-| `31:29` | class/dependency bits, finalized by scheduling |
-| `28` | finalizer dependency bit |
+| `31:29` | schedule/lifetime bits, finalized over the whole program |
+| `28` | one observed live-result/finalizer bit; not a sampler-id carry |
 | `27:24` and `3:0` | duplicated sampler id |
 | `23:20` | operation: TEXLD=1, TEXLDB=3, TEXKILL=4, TEXLDP=7 |
 | `19:16` | allocated temporary destination |

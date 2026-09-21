@@ -507,7 +507,9 @@ object+70 = 00000001   # A91 payload
 ALU/TAU counts = 1/1  # A92 = 00010001
 ```
 
-The finalizer sets ALU source-A dependency bit 17 and TAU bit 28.  These
+The finalizer sets ALU source-A final-use/release bit 17 and TAU live-result
+bit 28.  The ALU bit is not a producer-edge dependency: repeated reads remain
+clear until the terminal read of that allocated value.  These
 changes independently reproduce the live Xorg control tuple
 `90018000/91000001/92010001/93000001`; the Xorg fixed body allocates r1 and
 therefore uses `301101b0`, while this generic compiler example allocates r0.
