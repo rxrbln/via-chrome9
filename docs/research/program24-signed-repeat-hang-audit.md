@@ -31,14 +31,20 @@ source.  `chrome9_build_two_textured_triangle()` now calls
 `chrome9_depth_control_word(request, tex0_alpha_primary)` and asserts the
 same word, producing `01ce154c` for this depth-writing selector-2 case.
 
-The highest-priority remaining packet discriminator is the raw oracle's
-stage-1 image format.  The recovered selector-2 object below requires BGRA
-for both samplers (`A30=30990000`), but
-`run_pipe_two_npot_textures(..., texture0_alpha=true)` currently constructs
-the final direct-ioctl oracle with unit 0 BGRA and unit 1 BGRX.  That changes
-unit 1 to `A30=30980000`.  The kernel currently accepts the tuple, so it can
-retire without an engine error while remaining outside the exact recovered
-program contract.  Change only unit 1 to BGRA for the next run and retain its
+The highest-priority remaining packet discriminator is stage 1's image
+format.  The recovered selector-2 object below requires BGRA for both
+samplers (`A30=30990000`), but
+`run_pipe_two_npot_textures(..., texture0_alpha=true)` currently creates only
+unit 0 as BGRA; unit 1 remains BGRX.  Thus the Gallium baseline and signed
+loop already use `A30=30980000` for unit 1 and may return before the final
+direct-ioctl oracle.  That direct oracle independently assigns unit 1 BGRX as
+well.  The kernel accepts the tuple, so it can retire without an engine error
+while remaining outside the exact recovered program contract.
+
+For the next run, change only unit 1 to BGRA in both places: set
+`texture_templates[1].format = PIPE_FORMAT_B8G8R8A8_UNORM` in the
+`texture0_alpha` branch before resource creation, and assign
+`DRM_CHROME9_TEXTURE_FORMAT_BGRA8888` to direct-oracle unit 1.  Retain its
 texels as `00ffffff`; program 24 ignores TEX1 alpha, so the expected output
 does not change.  Do not broaden selector 2 to BGRX until that tuple has its
 own readback proof.
