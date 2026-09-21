@@ -265,10 +265,15 @@ TEXTURE source probes receive those same class-driven bits, proving they are
 not producer-edge or texture-dependency flags.  If a physical temporary is
 read more than once, only its last read is marked; if it occurs in multiple
 slots of one record, the compiler emits one release marker rather than one per
-occurrence.  Therefore a generic "sampled operand means d2.bit17" rule is
-wrong, as is setting every source occurrence from the SSA graph.  The first
-patch should accept only linear chains whose temporary has exactly one
-unambiguous final source occurrence.
+occurrence, with exact precedence A over C over B.  A+C, A+B, and A+C+B set
+only d2.bit17; C+B sets only d1.bit21.  The result is identical with an actual
+r0 producer and with an undefined direct r0 read.  The precedence corpus is
+SHA-256
+`8c0cc9d6ccb09c46ba83b550c28d62aab02478559e90fe3035b3f48abc50937a`.
+Therefore a generic "sampled operand means d2.bit17" rule is wrong, as is
+setting every source occurrence from the SSA graph.  The first patch should
+accept only linear chains whose temporary has exactly one unambiguous final
+source occurrence.
 
 The Windows direct-slot/raw and two-record artifacts are SHA-256
 `ef0645552e914325a353ccb740f3715a9917dea3da144569055f354d150108bd`
