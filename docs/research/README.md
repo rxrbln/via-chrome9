@@ -94,6 +94,10 @@ targets.
   exact 192-byte versioned two-level ioctl, fail-closed guarded-object
   validation, H3 insertion indices, A30/A31 lowering, ownership rules, and a
   raw live oracle sequence ready for the next implementation tranche.
+- [ioquake3-q3dm1-mip-envelope.md](ioquake3-q3dm1-mip-envelope.md) proves that
+  default-picmip q3dm1 needs only the explicit L0--L8 address table, records
+  the exact current guarded 256x256 chain, and defines the smallest combined
+  two-texture+D16 nearest-mip successor and promotion sequence.
 - [legacy-texture-format-oracles.md](legacy-texture-format-oracles.md)
   recovers A8/L8/L8A8 and RGB565/ARGB1555/ARGB4444 sampler and render-target
   encodings, channel and alpha semantics, guarded readback tests, and safe
