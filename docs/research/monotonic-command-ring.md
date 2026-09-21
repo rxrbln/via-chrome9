@@ -455,3 +455,30 @@ Only after this monotonic design is stable should PID01 and within-epoch byte
 reuse be considered.  That later optimization needs its own bounded,
 live-proven current-pointer protocol; it is not required to eliminate the
 per-triangle replacement bottleneck.
+
+## VX900 silicon result (2026-09-21)
+
+Kernel commit `b2fa050` implemented the 64-KiB design above.  Before loading
+it, review caught and fixed a stale two-page posted-write readback: ring PTE
+publication now reads the sixteenth and final programmed PTE.  The module was
+then loaded through the recoverable `engine_quiesce` path, without rebooting.
+
+The live VX900 passed 1,000 consecutive two-triangle batch oracles in
+5.55 seconds.  Every oracle retained the exact red and green triangle pixels,
+blue outside sentinel, and destination guards.  A following ten-frame,
+three-gear D16/blend run retained checksum `f8b37bc9fe5e12b7`; one-frame
+Chrome9 KMS presentation retained checksum `6df9316f63806fdd` and restored the
+VGA state cleanly.
+
+The subsequent bounded quiesce logged:
+
+```text
+persistent SF engine stopped: appends=1272 wraps=28 epochs=28
+```
+
+Thus ordinary multi-append execution and 28 exhaustion transactions completed
+without a timeout or GPU wedge.  The module unloaded, reloaded, rebound all 16
+ring PTEs, and passed the two-triangle oracle again.  This validates the normal
+A64/A65 append path, the PID10/full-install wrap path, enlarged-PTE teardown,
+and reboot-free lifecycle together.  Fault-injected post-publication timeout
+quarantine remains intentionally untested on this useful boot.
