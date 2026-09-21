@@ -96,7 +96,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
 
    crender->packed_generic =
       program == CHROME9_FS_PRIMARY_SCALAR_RGBX ? 1 :
-      program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ? 2 : 0;
+      program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ? 2 :
+      program == CHROME9_FS_PRIMARY_GENERIC_RGBA ? 3 : 0;
    if (crender->packed_generic)
       generic0 = draw_find_shader_output(crender->ctx->draw,
                                          TGSI_SEMANTIC_GENERIC, 0);
@@ -668,15 +669,27 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       if (crender->packed_generic) {
-         unsigned gray;
-
          packed = (const float *)(vertex + 4 * sizeof(float));
-         if (!isfinite(packed[0])) {
-            ctx->rejected_triangles++;
-            return;
+         if (crender->packed_generic == 3) {
+            for (unsigned c = 0; c < 4; c++)
+               if (!isfinite(packed[c])) {
+                  ctx->rejected_triangles++;
+                  return;
+               }
+            color = (uint32_t)float_to_ubyte(packed[2]) |
+                    (uint32_t)float_to_ubyte(packed[1]) << 8 |
+                    (uint32_t)float_to_ubyte(packed[0]) << 16 |
+                    (uint32_t)float_to_ubyte(packed[3]) << 24;
+         } else {
+            unsigned gray;
+
+            if (!isfinite(packed[0])) {
+               ctx->rejected_triangles++;
+               return;
+            }
+            gray = float_to_ubyte(packed[0]);
+            color = gray | gray << 8 | gray << 16 | 0xff000000;
          }
-         gray = float_to_ubyte(packed[0]);
-         color = gray | gray << 8 | gray << 16 | 0xff000000;
       } else {
          memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
       }

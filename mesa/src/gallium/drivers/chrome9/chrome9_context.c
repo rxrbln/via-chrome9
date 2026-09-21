@@ -573,6 +573,42 @@ chrome9_fs_is_generic0(nir_def *def)
    }
 }
 
+/* GLSL user varyings are linked to VAR0 rather than the legacy COL0 slot.
+ * Accept only a complete, identity-ordered vec4 so it can be represented by
+ * the same normalized D1 diffuse attribute as the proven COL0 program. */
+static bool
+chrome9_fs_is_generic0_rgba(nir_def *def, unsigned depth)
+{
+   nir_instr *instr;
+
+   if (depth > 8 || def->num_components != 4 || def->bit_size != 32)
+      return false;
+   if (chrome9_fs_is_generic0(def))
+      return true;
+   instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[0].swizzle[c] != c)
+               return false;
+         return chrome9_fs_is_generic0_rgba(alu->src[0].src.ssa,
+                                             depth + 1);
+      }
+      if (alu->op == nir_op_vec4) {
+         nir_def *source = alu->src[0].src.ssa;
+
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[c].src.ssa != source ||
+                alu->src[c].swizzle[0] != c)
+               return false;
+         return chrome9_fs_is_generic0_rgba(source, depth + 1);
+      }
+   }
+   return false;
+}
+
 static bool
 chrome9_fs_is_generic0_component(const nir_alu_src *src, unsigned component,
                                  nir_def **base, unsigned depth)
@@ -763,6 +799,8 @@ chrome9_fs_result(nir_def *def)
    nir_def *generic = NULL;
    unsigned a, b;
 
+   if (chrome9_fs_is_generic0_rgba(def, 0))
+      return CHROME9_FS_PRIMARY_GENERIC_RGBA;
    if (chrome9_fs_is_generic0_rgbx(def, &generic, 0) &&
        generic->num_components == 1)
       return CHROME9_FS_PRIMARY_SCALAR_RGBX;
@@ -889,6 +927,7 @@ chrome9_fs_classify(nir_shader *nir)
       return CHROME9_FS_UNSUPPORTED;
    switch (result) {
    case CHROME9_FS_PRIMARY_COLOR:
+   case CHROME9_FS_PRIMARY_GENERIC_RGBA:
    case CHROME9_FS_PRIMARY_SCALAR_RGBX:
       valid = !texture_count && !constant_count;
       break;

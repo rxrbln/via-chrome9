@@ -306,6 +306,57 @@ make_generic0_load(nir_builder *b, const struct glsl_type *type,
 }
 
 static void *
+make_generic_rgba_vertex_shader(struct pipe_screen *screen,
+                                struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
+      "chrome9-glmark2-gouraud-vertex");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *position = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_POS);
+   nir_def *color = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_COLOR0);
+   nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_vs_state(context, &state);
+}
+
+static void *
+make_generic_rgba_fragment_shader(struct pipe_screen *screen,
+                                  struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-glmark2-gouraud-fragment");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *color = make_generic0_load(
+      &b, glsl_vector_type(GLSL_TYPE_FLOAT, 4), "Color");
+
+   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static void *
 make_scalar_rgbx_fragment_shader(struct pipe_screen *screen,
                                  struct pipe_context *context)
 {
@@ -626,6 +677,12 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       { {  1, -1, 0, 1 }, { 0.25, 0, 0, 0 } },
       { {  1,  1, 0, 1 }, { 0.25, 0, 0, 0 } },
    };
+   static const struct smoke_vertex generic_rgba_vertices[] = {
+      { { -1, -1, 0, 1 }, { 0.25, 0.5, 0.75, 0.5 } },
+      { { -1,  1, 0, 1 }, { 0.25, 0.5, 0.75, 0.5 } },
+      { {  1, -1, 0, 1 }, { 0.25, 0.5, 0.75, 0.5 } },
+      { {  1,  1, 0, 1 }, { 0.25, 0.5, 0.75, 0.5 } },
+   };
    static const struct smoke_vertex alpha_near_kill_vertices[] = {
       { { -1, -1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
       { { -1,  1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
@@ -736,6 +793,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *product_fs[3] = { NULL };
    void *unsupported_product_fs = NULL;
    void *scalar_gray_vs = NULL, *scalar_gray_fs = NULL;
+   void *generic_rgba_vs = NULL, *generic_rgba_fs = NULL;
    struct pipe_resource *solid_buffer = NULL;
    bool passed = false;
 
@@ -823,6 +881,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       scalar_gray_vs =
          make_scalar_generic_vertex_shader(screen, context, false);
       scalar_gray_fs = make_scalar_rgbx_fragment_shader(screen, context);
+      generic_rgba_vs = make_generic_rgba_vertex_shader(screen, context);
+      generic_rgba_fs = make_generic_rgba_fragment_shader(screen, context);
    }
    if (!blend_handle ||
        (!depth_resource &&
@@ -860,7 +920,10 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          ((struct chrome9_shader *)unsupported_product_fs)->supported ||
          !scalar_gray_vs || !scalar_gray_fs ||
          ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=
-            CHROME9_FS_PRIMARY_SCALAR_RGBX)))
+            CHROME9_FS_PRIMARY_SCALAR_RGBX ||
+         !generic_rgba_vs || !generic_rgba_fs ||
+         ((struct chrome9_shader *)generic_rgba_fs)->fragment_program !=
+            CHROME9_FS_PRIMARY_GENERIC_RGBA)))
       goto out;
    if (solid_buffer) {
       memcpy(chrome9_resource(solid_buffer)->bo.map, solid_buffer_color,
@@ -1247,6 +1310,36 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                     chrome9_context(context)->submitted_triangles - submitted,
                     chrome9_context(context)->rejected_triangles - rejected);
       }
+      if (passed) {
+         submitted = chrome9_context(context)->submitted_triangles;
+         rejected = chrome9_context(context)->rejected_triangles;
+         context->bind_vs_state(context, generic_rgba_vs);
+         context->bind_fs_state(context, generic_rgba_fs);
+         vertex_buffer.buffer.user = generic_rgba_vertices;
+         context->set_vertex_buffers(context, 1, &vertex_buffer);
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &clear_color, 1.0, 0);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush_resource(context, resource);
+         context->flush(context, NULL, 0);
+         pixel = pixels[32 * (surface->stride / 4) + 192];
+         passed = (pixel & 0xffffff) == 0x4080bf &&
+                  (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                   ((pixel >> 24) >= 0x7f && (pixel >> 24) <= 0x80)) &&
+                  chrome9_context(context)->submitted_triangles ==
+                     submitted + 2 &&
+                  chrome9_context(context)->rejected_triangles == rejected &&
+                  smoke_guard_pages_match(draw_surface);
+         if (passed)
+            printf("Gallium vec4 VAR0 RGBA passed: sample=%08x\n", pixel);
+         else
+            fprintf(stderr,
+                    "Gallium vec4 VAR0 RGBA mismatch: sample=%08x "
+                    "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                    pixel,
+                    chrome9_context(context)->submitted_triangles - submitted,
+                    chrome9_context(context)->rejected_triangles - rejected);
+      }
    }
    if (!passed)
       fprintf(stderr,
@@ -1282,6 +1375,10 @@ out:
          context->delete_vs_state(context, scalar_gray_vs);
       if (scalar_gray_fs)
          context->delete_fs_state(context, scalar_gray_fs);
+      if (generic_rgba_vs)
+         context->delete_vs_state(context, generic_rgba_vs);
+      if (generic_rgba_fs)
+         context->delete_fs_state(context, generic_rgba_fs);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (solid_elements_handle)
