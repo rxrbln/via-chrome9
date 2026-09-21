@@ -57,6 +57,26 @@ compile_alu_only(const struct chrome9_fs_key *key,
                                 0x00f08005, 0x00000820 };
       memcpy(p->alu[0], alu, sizeof(alu));
       p->constant_mask = 3;
+   } else if (is_pair(key, CHROME9_FS_LEAF_V0, CHROME9_FS_LEAF_V1_A)) {
+      const uint32_t alu[4] = { 0x0140b6d0, 0x300416db,
+                                0x00f04005, 0x00000820 };
+      memcpy(p->alu[0], alu, sizeof(alu));
+      p->varying_mask = 3;
+   } else if (is_pair(key, CHROME9_FS_LEAF_V0_A, CHROME9_FS_LEAF_V1)) {
+      const uint32_t alu[4] = { 0x0140b6d0, 0xb0041053,
+                                0x00f0406d, 0x00000820 };
+      memcpy(p->alu[0], alu, sizeof(alu));
+      p->varying_mask = 3;
+   } else if (is_pair(key, CHROME9_FS_LEAF_C0, CHROME9_FS_LEAF_C1_A)) {
+      const uint32_t alu[4] = { 0x0140b6d0, 0x300816db,
+                                0x00f08005, 0x00000820 };
+      memcpy(p->alu[0], alu, sizeof(alu));
+      p->constant_mask = 3;
+   } else if (is_pair(key, CHROME9_FS_LEAF_C0_A, CHROME9_FS_LEAF_C1)) {
+      const uint32_t alu[4] = { 0x0140b6d0, 0xb0081053,
+                                0x00f0806d, 0x00000820 };
+      memcpy(p->alu[0], alu, sizeof(alu));
+      p->constant_mask = 3;
    } else {
       return false;
    }
@@ -86,6 +106,16 @@ compile_one_texture(const struct chrome9_fs_key *key,
                                 0x00f20005, 0x00000820 };
       memcpy(p->alu[0], alu, sizeof(alu));
       p->constant_mask = 1;
+   } else if (is_pair(key, CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0_A)) {
+      const uint32_t alu[4] = { 0x0140b6d0, 0xb0200053,
+                                0x00f0806d, 0x00000820 };
+      memcpy(p->alu[0], alu, sizeof(alu));
+      p->constant_mask = 1;
+   } else if (is_pair(key, CHROME9_FS_LEAF_TEX0_A, CHROME9_FS_LEAF_C0)) {
+      const uint32_t alu[4] = { 0x0140b6d0, 0xb0080053,
+                                0x00f2006d, 0x00000820 };
+      memcpy(p->alu[0], alu, sizeof(alu));
+      p->constant_mask = 1;
    } else {
       return false;
    }
@@ -107,6 +137,26 @@ chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
       return false;
    memset(p, 0, sizeof(*p));
 
+   if (key->op == CHROME9_FS_OP_RGBX_C0X &&
+       key->src[0] == CHROME9_FS_LEAF_TEX0 &&
+       key->src[1] == CHROME9_FS_LEAF_C0) {
+      const uint32_t rgb[4] = { 0x01c00530, 0x501c0053,
+                                0x00720005, 0x000d0820 };
+      const uint32_t alpha[4] = { 0x01c00530, 0x801c0053,
+                                  0x008080b6, 0x000d0820 };
+      memcpy(p->alu[0], rgb, sizeof(rgb));
+      memcpy(p->alu[1], alpha, sizeof(alpha));
+      p->tau[0] = 0x301001b0;
+      p->alu_count = 2;
+      p->tau_count = 1;
+      p->constant_mask = 1;
+      p->constant_x_one_mask = 1;
+      p->sampler_mask = 1;
+      set_controls(p, 0x90018000, 0x91000001, 0x92010002,
+                   0x93000001, 0x95000000);
+      return true;
+   }
+
    if (is_pair(key, CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_TEX1)) {
       const uint32_t alu[4] = { 0x0140b6d0, 0x3003f000,
                                 0x00f20005, 0x00000820 };
@@ -121,7 +171,9 @@ chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
       return true;
    }
    if (key->src[0] == CHROME9_FS_LEAF_TEX0 ||
-       key->src[1] == CHROME9_FS_LEAF_TEX0)
+       key->src[1] == CHROME9_FS_LEAF_TEX0 ||
+       key->src[0] == CHROME9_FS_LEAF_TEX0_A ||
+       key->src[1] == CHROME9_FS_LEAF_TEX0_A)
       return compile_one_texture(key, p);
    return compile_alu_only(key, p);
 }

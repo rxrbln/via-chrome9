@@ -12,15 +12,23 @@
 
 enum chrome9_fs_leaf {
    CHROME9_FS_LEAF_V0,
+   CHROME9_FS_LEAF_V1,
    CHROME9_FS_LEAF_C0,
    CHROME9_FS_LEAF_C1,
    CHROME9_FS_LEAF_TEX0,
    CHROME9_FS_LEAF_TEX1,
+   CHROME9_FS_LEAF_V0_A,
+   CHROME9_FS_LEAF_V1_A,
+   CHROME9_FS_LEAF_C0_A,
+   CHROME9_FS_LEAF_C1_A,
+   CHROME9_FS_LEAF_TEX0_A,
 };
 
 enum chrome9_fs_op {
    CHROME9_FS_OP_MOV,
    CHROME9_FS_OP_MUL,
+   /* Copy TEX0.rgb and force output alpha from reserved c0.x == 1.0. */
+   CHROME9_FS_OP_RGBX_C0X,
 };
 
 /* Canonical output expression after NIR scalarization, copy propagation and
@@ -36,6 +44,7 @@ struct chrome9_ps_program {
    uint32_t alu[CHROME9_PS_MAX_ALU][4];
    uint32_t tau[CHROME9_PS_MAX_TAU];
    uint32_t constant_mask;     /* c0..c31 */
+   uint32_t constant_x_one_mask; /* constants whose X must be driver-owned 1 */
    uint16_t varying_mask;      /* bit 0 is primary color v0 */
    uint16_t sampler_mask;      /* s0..s15 */
    uint8_t alu_count;

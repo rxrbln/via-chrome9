@@ -16,40 +16,70 @@ check_fs(void)
       uint32_t tau[2];
       unsigned alu_count, tau_count;
       uint32_t constant_mask;
+      uint32_t constant_x_one_mask;
       uint16_t varying_mask, sampler_mask;
    } corpus[] = {
       { { CHROME9_FS_OP_MOV, { CHROME9_FS_LEAF_V0, 0 } },
         0x90058000, 0x91000000, 0x92000001, 0x93000000,
         { 0x01c00530, 0x301c0053, 0x00f04005, 0x000d0820 }, { 0 }, 1, 0,
-        0, 1, 0 },
+        0, 0, 1, 0 },
       { { CHROME9_FS_OP_MOV, { CHROME9_FS_LEAF_C0, 0 } },
         0x90058000, 0x91000000, 0x92000001, 0x93000000,
         { 0x01c00530, 0x301c0053, 0x00f08005, 0x000d0820 }, { 0 }, 1, 0,
-        1, 0, 0 },
+        1, 0, 0, 0 },
       { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_V0, CHROME9_FS_LEAF_C0 } },
         0x90058000, 0x91000000, 0x92000001, 0x93000000,
         { 0x0140b6d0, 0x30080053, 0x00f04005, 0x00000820 }, { 0 }, 1, 0,
-        1, 1, 0 },
+        1, 0, 1, 0 },
       { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_C0, CHROME9_FS_LEAF_C1 } },
         0x90058000, 0x91000000, 0x92000001, 0x93000000,
         { 0x0140b6d0, 0x30081053, 0x00f08005, 0x00000820 }, { 0 }, 1, 0,
-        3, 0, 0 },
+        3, 0, 0, 0 },
+      { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_V0, CHROME9_FS_LEAF_V1_A } },
+        0x90058000, 0x91000000, 0x92000001, 0x93000000,
+        { 0x0140b6d0, 0x300416db, 0x00f04005, 0x00000820 }, { 0 }, 1, 0,
+        0, 0, 3, 0 },
+      { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_V0_A, CHROME9_FS_LEAF_V1 } },
+        0x90058000, 0x91000000, 0x92000001, 0x93000000,
+        { 0x0140b6d0, 0xb0041053, 0x00f0406d, 0x00000820 }, { 0 }, 1, 0,
+        0, 0, 3, 0 },
+      { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_C0, CHROME9_FS_LEAF_C1_A } },
+        0x90058000, 0x91000000, 0x92000001, 0x93000000,
+        { 0x0140b6d0, 0x300816db, 0x00f08005, 0x00000820 }, { 0 }, 1, 0,
+        3, 0, 0, 0 },
+      { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_C0_A, CHROME9_FS_LEAF_C1 } },
+        0x90058000, 0x91000000, 0x92000001, 0x93000000,
+        { 0x0140b6d0, 0xb0081053, 0x00f0806d, 0x00000820 }, { 0 }, 1, 0,
+        3, 0, 0, 0 },
       { { CHROME9_FS_OP_MOV, { CHROME9_FS_LEAF_TEX0, 0 } },
         0x90018000, 0x91000001, 0x92010001, 0x93000001,
         { 0x01c00530, 0x301c0053, 0x00f20005, 0x000d0820 },
-        { 0x301001b0 }, 1, 1, 0, 0, 1 },
+        { 0x301001b0 }, 1, 1, 0, 0, 0, 1 },
       { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_V0 } },
         0x90018000, 0x91000001, 0x92010001, 0x93000001,
         { 0x0140b6d0, 0x30040053, 0x00f20005, 0x00000820 },
-        { 0x301001b0 }, 1, 1, 0, 1, 1 },
+        { 0x301001b0 }, 1, 1, 0, 0, 1, 1 },
       { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0 } },
         0x90018000, 0x91000001, 0x92010001, 0x93000001,
         { 0x0140b6d0, 0x30080053, 0x00f20005, 0x00000820 },
-        { 0x301001b0 }, 1, 1, 1, 0, 1 },
+        { 0x301001b0 }, 1, 1, 1, 0, 0, 1 },
+      { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0_A } },
+        0x90018000, 0x91000001, 0x92010001, 0x93000001,
+        { 0x0140b6d0, 0xb0200053, 0x00f0806d, 0x00000820 },
+        { 0x301001b0 }, 1, 1, 1, 0, 0, 1 },
+      { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_TEX0_A, CHROME9_FS_LEAF_C0 } },
+        0x90018000, 0x91000001, 0x92010001, 0x93000001,
+        { 0x0140b6d0, 0xb0080053, 0x00f2006d, 0x00000820 },
+        { 0x301001b0 }, 1, 1, 1, 0, 0, 1 },
       { { CHROME9_FS_OP_MUL, { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_TEX1 } },
         0x90000000, 0x91000001, 0x92020001, 0x93000002,
         { 0x0140b6d0, 0x3003f000, 0x00f20005, 0x00000820 },
-        { 0xa01001b0, 0x311001b1 }, 1, 2, 0, 0, 3 },
+        { 0xa01001b0, 0x311001b1 }, 1, 2, 0, 0, 0, 3 },
+      { { CHROME9_FS_OP_RGBX_C0X,
+          { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0 } },
+        0x90018000, 0x91000001, 0x92010002, 0x93000001,
+        { 0x01c00530, 0x501c0053, 0x00720005, 0x000d0820 },
+        { 0x301001b0 }, 2, 1, 1, 1, 0, 1 },
    };
    struct chrome9_ps_program p;
    unsigned i;
@@ -63,6 +93,7 @@ check_fs(void)
       assert(p.alu_count == corpus[i].alu_count);
       assert(p.tau_count == corpus[i].tau_count);
       assert(p.constant_mask == corpus[i].constant_mask);
+      assert(p.constant_x_one_mask == corpus[i].constant_x_one_mask);
       assert(p.varying_mask == corpus[i].varying_mask);
       assert(p.sampler_mask == corpus[i].sampler_mask);
       assert(!memcmp(p.alu[0], corpus[i].alu, sizeof(corpus[i].alu)));
@@ -75,6 +106,19 @@ check_fs(void)
       };
       assert(chrome9_compile_fs_offline(&reversed, &p));
       assert(p.alu[0][1] == 0x30080053 && p.sampler_mask == 1);
+   }
+
+   {
+      static const uint32_t alpha_write[4] = {
+         0x01c00530, 0x801c0053, 0x008080b6, 0x000d0820
+      };
+      const struct chrome9_fs_key rgbx = {
+         CHROME9_FS_OP_RGBX_C0X,
+         { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_C0 }
+      };
+      assert(chrome9_compile_fs_offline(&rgbx, &p));
+      assert(!memcmp(p.alu[1], alpha_write, sizeof(alpha_write)));
+      assert(p.constant_x_one_mask == 1);
    }
 
    {
@@ -115,6 +159,6 @@ main(void)
 {
    check_fs();
    check_vs();
-   puts("Chrome9 offline shader corpus: 8 PS + 4 VS templates passed");
+   puts("Chrome9 offline shader corpus: 15 PS + 4 VS templates passed");
    return 0;
 }
