@@ -316,11 +316,13 @@ replication feeding all four output lanes.  Scalar RCP/RSQ/EXP/LOG likewise
 must not be accepted merely because the native destination mask is XYZW; the
 native result broadcast remains a silicon gate.
 
-No generic multi-record NIR program is patch-ready yet.  The Mesa builder now
-derives `source.last_use` after semantic validation for its current A/C-slot
-subset.  Keep a post-allocation finalizer boundary before admitting B-slot or
-general multi-record runtime paths; same-record duplicate sources additionally
-require the proved A-over-C-over-B release precedence.
+Mesa commit `e34de89` now compiles bounded nested MOV/MUL expression trees to
+at most three ALU records and derives `source.last_use` in a second pass for
+that A/C-slot subset.  The runtime program-batch UAPI remains one-record, so no
+generic multi-record submission path is enabled yet.  Keep the post-allocation
+finalizer boundary before admitting B-slot operations or widening runtime
+submission; same-record duplicate sources additionally require the proved
+A-over-C-over-B release precedence.
 
 ## Cmd19 one-record operand boundary
 
