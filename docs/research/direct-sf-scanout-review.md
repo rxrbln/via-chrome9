@@ -1,10 +1,10 @@
 # Direct SF scanout implementation review and live gate
 
-This is the post-implementation review for Chrome9 kernel commits `2166397`
-and `6193bb5`.  It covers static same-device scanout only: one native Chrome9
-GEM object is rendered through SF and IGA1 fetches it through a persistent SF
-alias.  Page flips remain rejected until the separate IRQ/latch milestone is
-implemented and proven.
+This began as the post-implementation review for Chrome9 kernel commits
+`2166397` and `6193bb5`: one native Chrome9 GEM object is rendered through SF
+and IGA1 fetches it through a persistent SF alias.  Commit `bf2d4a3` now adds
+the first fail-closed direct base update with a polled blank/latch proof.  It
+still has no vblank IRQ or DRM vblank counter.
 
 The reviewed `W=1` build produced `chrome9.ko` SHA-256
 `06eed45e3755dd017329ab1ded2b098ff665c78bd62151173782df8e67fbd78d`.
@@ -72,8 +72,9 @@ The remaining non-memory-corrupting limitation is the atomic callback API:
 `enable` and `disable` are void.  A hardware/VGA failure after state swap can
 leave DRM software state different from hardware.  The implementation fails
 closed by retaining display ownership; recovery is a later confirmed restore
-or reboot, never PTE invalidation.  There is still no direct page flip or DRM
-vblank event support.
+or reboot, never PTE invalidation.  The later `bf2d4a3` path adds a synchronous
+direct base flip and sends the DRM event after its polled latch proof.  There
+is still no IRQ-backed DRM vblank counter.
 
 ## Measured static-SF result
 
@@ -199,7 +200,7 @@ owned edge it writes `irq_enable_shadow | BIT(3)`, flush-reads, calls
 `drm_crtc_handle_vblank()` exactly once, and then checks any pending direct
 flip.  It never takes `submit_lock`, the VGA lock, or `vm_lock`.
 
-## Page-flip implementation boundary
+## Page-flip implementation boundary and `bf2d4a3`
 
 The simple-pipe helper has no atomic-flush callback and does not consume a
 driver's page-flip event automatically.  A Chrome9 direct flip therefore needs
@@ -262,3 +263,24 @@ Timeout, address mismatch, stopped IRQ cadence, or disable failure sends no
 successful event, blocks further flips, and retains both mappings until a
 confirmed complete IGA1 restore.  This fail-closed rule is identical to the
 static active-display ownership fixed by commit `6193bb5`.
+
+Commit `bf2d4a3` implements the same ownership rule synchronously while the
+IRQ path remains unproven.  It saves/restores CR32, clears bit 0 while IGA1 is
+blanked, rejects async flips, syncs and independently display-pins the new BO,
+disarms T11 under `submit_lock`, and writes packed `0214`.  Completion waits
+for a strictly post-arm `0200.bit1` blank-level transition, then requires
+`0204.bit1=0` and the exact masked `0214` value.  The level is used only as a
+bounded frame-boundary poll; it is not counted as a vblank interrupt.
+
+Success transfers `active_fb`, sends the retained event, and then releases the
+old display pin.  A failure before base publication retains the event and
+blocks later flips.  A failure after publication additionally retains the new
+display pin beside the unchanged old active pin because either mapping may be
+fetched.  Confirmed full restore releases the retained ownership.  Strict
+checkpatch and `W=1` passed; the reviewed module SHA-256 is
+`b4ee5b1aff68a095adaaea3fe6d7a9618160bf5ba891211bf3df0c7b57d2127b`.
+
+This primitive does not imply that a 300x300 window swap changes the KMS FB.
+The X server ordinarily uses a glamor COPY into the unchanged full-screen
+scanout pixmap.  The exact path split and live discriminators are in
+[xorg-window-present-copy.md](xorg-window-present-copy.md).
