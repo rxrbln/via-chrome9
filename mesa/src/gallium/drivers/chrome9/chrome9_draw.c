@@ -35,6 +35,10 @@ struct chrome9_vbuf_render {
    struct drm_chrome9_draw_triangle_batch batch;
    struct drm_chrome9_vertex_d16
       batch_vertices[DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES * 3];
+   struct drm_chrome9_draw_textured_triangle_batch batch_textured_state;
+   struct drm_chrome9_textured_vertex
+      batch_textured_vertices[
+         DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES * 3];
    struct drm_chrome9_draw_triangle_d16_rhw_batch batch_rhw;
    struct drm_chrome9_draw_triangle_d16_rhw_run batch_rhw_run;
    struct drm_chrome9_draw_program_triangle_d16_rhw_batch batch_program;
@@ -45,6 +49,7 @@ struct chrome9_vbuf_render {
    bool batch_perspective;
    bool batch_large_run;
    bool batch_compiled_program;
+   bool batch_textured;
    uint8_t texture_count;
    uint8_t packed_generic;
    bool textured;
@@ -847,7 +852,13 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
    bool submitted;
 
-   if (crender->batch_compiled_program) {
+   if (crender->batch_textured) {
+      crender->batch_textured_state.triangle_count = count;
+      crender->batch_textured_state.vertices_ptr =
+         (uintptr_t)crender->batch_textured_vertices;
+      submitted = chrome9_draw_textured_triangle_batch(
+         fd, &crender->batch_textured_state);
+   } else if (crender->batch_compiled_program) {
       crender->batch_program.triangle_count = count;
       crender->batch_program.vertices_ptr =
          (uintptr_t)crender->batch_vertices_rhw;
@@ -886,6 +897,7 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
          fprintf(stderr,
                  "chrome9: DRAW_%sTRIANGLE%s_BATCH failed after=%" PRIu64
                  " count=%u: %s\n",
+                 crender->batch_textured ? "TEXTURED_" :
                  crender->batch_compiled_program ? "PROGRAM_" :
                  crender->batch_large_run ? "RHW_RUN_" : "",
                  crender->batch_perspective ? "_D16_RHW" : "",
@@ -940,9 +952,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
           CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY);
    uint32_t depth_flags = 0;
 
-   if (!crender->textured &&
-       (ctx->draw_triangle_batch ||
-        ctx->draw_program_triangle_d16_rhw_batch) &&
+   if (((!crender->textured &&
+         (ctx->draw_triangle_batch ||
+          ctx->draw_program_triangle_d16_rhw_batch)) ||
+        (crender->textured && ctx->draw_textured_triangle_batch)) &&
        crender->batch_failed) {
       ctx->rejected_triangles++;
       return;
@@ -1454,6 +1467,56 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    }
+   if (crender->textured && crender->texture_count == 1 && !depth_active &&
+       ctx->draw_textured_triangle_batch) {
+      struct drm_chrome9_draw_textured_triangle_batch next = {
+         .destination_handle = texture_args.destination_handle,
+         .texture_handle = texture_args.texture_handle,
+         .program = texture_args.program,
+         .width = texture_args.width,
+         .height = texture_args.height,
+         .destination_pitch = texture_args.destination_pitch,
+         .texture_width = texture_args.texture_width,
+         .texture_height = texture_args.texture_height,
+         .texture_pitch = texture_args.texture_pitch,
+         .texture_format = texture_args.texture_format,
+         .min_filter = texture_args.min_filter,
+         .mag_filter = texture_args.mag_filter,
+         .wrap_s = texture_args.wrap_s,
+         .wrap_t = texture_args.wrap_t,
+         .scissor = texture_args.scissor,
+      };
+
+      if (blend_successor) {
+         next.flags = DRM_CHROME9_TRIANGLE_BATCH_BLEND;
+         next.destination_format = texture_blend_args.destination_format;
+         next.blend = texture_blend_args.blend;
+      }
+      if (crender->batch_count &&
+          (!crender->batch_textured ||
+           memcmp(&crender->batch_textured_state, &next, sizeof(next))))
+         chrome9_flush_triangle_batch(crender);
+      if (crender->batch_failed) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      if (!crender->batch_count) {
+         crender->batch_textured = true;
+         crender->batch_perspective = false;
+         crender->batch_large_run = false;
+         crender->batch_compiled_program = false;
+         crender->batch_textured_state = next;
+      }
+      const unsigned base = crender->batch_count * 3;
+      for (unsigned i = 0; i < 3; i++)
+         crender->batch_textured_vertices[base + i] =
+            texture_args.vertices[i];
+      crender->batch_count++;
+      if (crender->batch_count ==
+          DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES)
+         chrome9_flush_triangle_batch(crender);
+      return;
+   }
    if (!crender->textured &&
        (ctx->draw_triangle_batch || program_batch || rhw_run_batch)) {
       struct drm_chrome9_draw_triangle_batch next = { 0 };
@@ -1527,7 +1590,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          }
       }
       if (crender->batch_count &&
-          (crender->batch_perspective != perspective_batch ||
+          (crender->batch_textured ||
+           crender->batch_perspective != perspective_batch ||
            crender->batch_large_run != rhw_run_batch ||
            crender->batch_compiled_program != program_batch ||
            (program_batch ?
@@ -1543,6 +1607,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       if (!crender->batch_count) {
+         crender->batch_textured = false;
          crender->batch_perspective = perspective_batch;
          crender->batch_large_run = rhw_run_batch;
          crender->batch_compiled_program = program_batch;

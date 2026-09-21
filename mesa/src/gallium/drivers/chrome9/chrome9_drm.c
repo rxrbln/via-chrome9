@@ -16,6 +16,8 @@
 
 _Static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128,
                "Chrome9 RHW run ABI size");
+_Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_batch) == 160,
+               "Chrome9 textured batch ABI size");
 
 bool
 chrome9_get_param(int fd, uint32_t param, uint64_t *value)
@@ -152,6 +154,15 @@ chrome9_draw_textured_triangle(
    if (!draw)
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE, draw) == 0;
+}
+
+bool
+chrome9_draw_textured_triangle_batch(
+   int fd, const struct drm_chrome9_draw_textured_triangle_batch *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH, draw) == 0;
 }
 
 bool
