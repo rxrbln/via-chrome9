@@ -143,6 +143,9 @@ pairs are:
 
 These results exactly demonstrate the `active0+1` rule.  A91 remains the
 ordinary sampler masks `0f`, `1f`, and `ff`; the auxiliary value remains one.
+Because the override is applied after parsing, these injected objects do not
+carry the parser-populated MISC usage masks in instance `+0x6c` or A91.  They
+are updater tests only and must not replace the genuine controls below.
 
 The updater return is consumed by `stmReplaceLocationTexIndexAINST` at Linux
 `0x001990e0..0x001991b7`.  That function walks one 16-byte ALU record and
@@ -179,9 +182,16 @@ relocates the sentinel to:
 
 ```text
 final ALU  01c00530 301c0053 00f2c305 000d0820
-A90        90058000
+A90-A93    90058008 91000000 92000001 93000000
 metadata   instance+68=1 instance+6c=8 instance+80=1
 ```
+
+The bucket contribution at instance `+0x2c` is still `0x58000`; uploaded A90
+also includes the relocated MISC-location usage bit from instance `+0x6c`,
+producing low payload `0x58008`.  Relocation ids 4 and 7 likewise produce low
+usage bits `0x10` and `0x80`.  The exact genuine 3/4/7/15 ladder, including
+its A91 overflow sideband, is retained in
+[chrome9-ps-misc-input-relocation.md](chrome9-ps-misc-input-relocation.md).
 
 The identical vPos/vFace record does not establish how the front end selects
 or supplies either value.  Mesa's current semantic compiler has no

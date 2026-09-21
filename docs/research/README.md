@@ -37,9 +37,22 @@ targets.
 - [chrome9-ps-resource-config-corpus.tsv](chrome9-ps-resource-config-corpus.tsv)
   retains ALU-only threshold probes plus two-, four-, and eight-texture
   production compiler discriminators.
+- [chrome9-ps-prefinal-resource-ordering.md](chrome9-ps-prefinal-resource-ordering.md)
+  proves the counter/updater/rewrite/A91 order and contrasts distinct-temp
+  with WAW texture schedules at every A90 threshold.
+- [chrome9-ps-prefinal-resource-ordering-corpus.tsv](chrome9-ps-prefinal-resource-ordering-corpus.tsv)
+  retains the exact four-, five-, seven-, and eight-stage ordering vectors.
+- [chrome9-ps-misc-input-relocation.md](chrome9-ps-misc-input-relocation.md)
+  identifies PS 2.0 vPos/vFace as the auxiliary-flag producer and closes the
+  genuine A/B/C native-location relocation ladder.
+- [chrome9-ps-misc-input-relocation-corpus.tsv](chrome9-ps-misc-input-relocation-corpus.tsv)
+  retains exact MISC source and 3/4/7/15 relocation records and controls.
 - [windows-stmupdateconfig-static-provenance.md](windows-stmupdateconfig-static-provenance.md)
   cross-checks the bucket updater and its callers in both shipped Windows
   UMDs against the Linux implementation.
+- [chrome9-semantic-min-successor.md](chrome9-semantic-min-successor.md)
+  maps the smallest patch-ready NIR/native operation after MOV/MUL while
+  retaining a mandatory guarded numerical silicon gate.
 - [chrome9-cmd19-fp-contract.md](chrome9-cmd19-fp-contract.md) separates
   value-independent Linux/Windows MOV/MUL compiler evidence from numerical
   silicon behavior, defines the finite/exceptional-value gate, a guarded
