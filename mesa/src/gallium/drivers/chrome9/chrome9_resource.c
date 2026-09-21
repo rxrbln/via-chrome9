@@ -395,7 +395,7 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
    if (!whandle || pres->target == PIPE_BUFFER ||
        pres->last_level ||
        (pres->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-        (!kms || pres->format != PIPE_FORMAT_B8G8R8A8_UNORM)) ||
+        pres->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
        whandle->plane ||
        whandle->layer ||
        (!kms && whandle->type != WINSYS_HANDLE_TYPE_FD) ||
