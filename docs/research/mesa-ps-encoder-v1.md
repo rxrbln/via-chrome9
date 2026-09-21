@@ -174,6 +174,14 @@ temporary rewrite depend on compiler/finalizer metadata, not merely
 closed multi-record objects, but must not emit a general multi-ALU chain until
 the special temporary/dependency rewrite is decoded and validated.
 
+Bit d2.17 is not texture-specific. The ALU-only chain
+`add r0,c0,c1; mul oC0,r0,c2` emits its consumer as
+`0140b6d0 30082053 00f20005 00000820`; it marks an ordinary earlier-ALU
+producer in the same source-A field. The special id-3f path above is a
+different producer/consumer representation associated with the textured
+multi-ALU rewrite. Dependency metadata must come from the complete producer
+graph and phase finalizer, never merely from source register class.
+
 The Windows backend before configuration-2 and the Linux production
 finalizer give exact one-texture dependency deltas for every v1 source slot:
 
