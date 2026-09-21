@@ -60,6 +60,11 @@ the saved last-use location for an equal physical id.  The scan-order
 explanation is an inference; the emitted winner and the requirement to mark
 only one slot are exact.
 
+An independently regenerated initialized/undefined duplicate-source matrix
+reproduces the strict A > C > B winner for A+C, A+B, A+C+B, C+B, and B-only
+cases.  Its retained JSON SHA-256 is
+`8c0cc9d6ccb09c46ba83b550c28d62aab02478559e90fe3035b3f48abc50937a`.
+
 Lifetime is per physical vec4, not per component.  A partial-write program
 that reads r0.x into oC0.x and then r0.y into oC0.y leaves the first read
 unmarked and puts A.bit17 only on the second.  This is one more reason for the

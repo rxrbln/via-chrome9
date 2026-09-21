@@ -19,6 +19,9 @@ targets.
   2 fields from producer dependencies to single last-use/release markers.
 - [chrome9-ps-temp-lifetime-finalizer-corpus.tsv](chrome9-ps-temp-lifetime-finalizer-corpus.tsv)
   retains the exact raw/finalized liveness and overflow differentials.
+- [chrome9-nir-lowering-matrix.md](chrome9-nir-lowering-matrix.md) routes the
+  wider Mesa fragment NIR surface to exact native shapes, guarded expansions,
+  or explicit fail-closed rejection.
 - [chrome9-cmd19-fp-contract.md](chrome9-cmd19-fp-contract.md) separates
   value-independent Linux/Windows MOV/MUL compiler evidence from numerical
   silicon behavior, defines the finite/exceptional-value gate, a guarded
