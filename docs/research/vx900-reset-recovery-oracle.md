@@ -787,9 +787,10 @@ reset state machine or reboot can make its ring storage releasable.
 Before attempting destructive reset, add the bounded non-destructive tranche
 below.  This audit was refreshed against the current source snapshot whose
 `chrome9_engine.c` SHA-256 is
-`294eb659db2a25b909dca8d1de51603355fd3df03133e6f97eba9f97f8af54a5` and
-whose `chrome9_drv.c` SHA-256 is
-`aa9f64d7858581624544dbb7ab489f2d1777acdfef9d41c4ac4d60a04f14ddc4`.
+`294eb659db2a25b909dca8d1de51603355fd3df03133e6f97eba9f97f8af54a5`.
+The adjacent ioctl/capability work changes `chrome9_drv.c` frequently; the
+relevant `engine_quiesce_store()` flow was re-read in the same snapshot rather
+than anchoring conclusions to a whole-file hash.
 
 ### Current state is almost sufficient, but `published` is ambiguous
 
