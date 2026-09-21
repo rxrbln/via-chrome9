@@ -106,9 +106,9 @@ Validation should happen before BO lookup, vertex copying, or ring mutation:
 7. Earlier records must each define a previously undefined temporary. Reject
    read-before-definition, WAW, dead definitions, and any temporary not used.
    Do not require numerical definition order: the recursive Mesa lowering can
-   validly define r1 before r0 for a three-level left-deep expression. After
-   validation, require the set of defined physical ids to be dense: one temp
-   must be `{r0}`, and two temps must be `{r0,r1}`. Reject a lone r1.
+   validly define t1 before t0 for a three-level left-deep expression. After
+   validation, require the set of semantic SSA names to be dense: one temp
+   must be `{t0}`, and two temps must be `{t0,t1}`. Reject a lone t1 or holes.
 8. Count all reads first, then assign release bits on the last read in a
    second pass. For the present A/C operand set, if both slots make the last
    read of the same temporary, set A only. This is the vendor A-over-C rule.
@@ -127,14 +127,23 @@ source zero is A and source one is C. A future SUB or MAD admission cannot
 reuse logical-source ordering blindly because those operations have different
 physical slots.
 
-The UAPI temp index is a bounded allocated physical slot, not a NIR SSA id or
-a D3D token register number. Proprietary Linux configuration two maps a shader
-that mentions only logical D3D r1 to physical r0, while the research Windows
-identity-callback harness preserves id one before production allocation. This
-proves logical ids cannot be copied directly. Mesa may serialize only the
-post-allocation ids in `native_fs_ir`; alternatively a future kernel compiler
-could allocate from a genuinely logical graph, but the two models must never
-be mixed.
+The UAPI temp index is a bounded semantic SSA name, not a native physical id
+or a D3D token register number. After DCE and validation, the kernel allocates
+the sorted dense names deterministically to p0 and p1, rewrites every source
+and destination id, then derives last-use markers. Proprietary Linux
+configuration two proves the rule: lone logical r1 or r7 maps to p0; logical
+set `{r0,r2}` maps to p0/p1; reverse definition r1 then r0 remains p1/p0.
+The compiler object's temporary-write bitmap remains in logical-id space and
+must never be consumed as a native bitmap.
+
+Exact sparse/reverse/dead allocation rows and the Linux/Windows boundary are
+retained in
+[chrome9-ps-canonical-temp-allocation.md](chrome9-ps-canonical-temp-allocation.md).
+
+Mesa serializes the dense semantic ids in `native_fs_ir`. Its cached native
+program is only a comparison oracle for the kernel's rebuilt allocation. The
+research Windows identity-callback harness deliberately preserves logical ids
+and therefore is not an allocation oracle.
 
 ## Mesa submission gate
 
@@ -147,8 +156,8 @@ The draw path may select this request only when all of the following hold:
   `constant_x_one_mask` is zero;
 - every semantic instruction passes the exact opcode/source/destination rules
   above after explicit enum translation;
-- its post-allocation temp-id set is canonical and dense even if definition
-  order is reverse numerical order;
+- its semantic temp-name set is canonical and dense even if definition order
+  is reverse numerical order;
 - runtime c0 satisfies the kernel's `abs(c0)<=1` bound; and
 - the selected vertex path supplies normalized primary color v0 and no
   unrepresented varying.
@@ -247,6 +256,25 @@ Static D3D/OpenGL finalizer provenance, normalized body hashes, destination
 ids, active-resource tuples, and eight additional short-chain rows are in
 [chrome9-mov-mul-short-chain-three-driver.md](chrome9-mov-mul-short-chain-three-driver.md).
 
+The most important two rows are actual shapes emitted by the current recursive
+NIR lowering, rather than manually constructed MOV/temp exercises:
+
+```text
+# (v0*c0)*c0
+MUL p0,v0,c0    0140b6d0 30080053 00f04005 00000020
+MUL oC0,p0,c0   0140b6d0 30080053 00f20005 00000820
+controls        90058000 91000000 92000002 93000000
+
+# (v0*c0)*(v0*c0)
+MUL p0,v0,c0    0140b6d0 30080053 00f04005 00000020
+MUL p1,v0,c0    0140b6d0 30080053 00f04005 00000060
+MUL oC0,p0,p1   0140b6d0 30201053 00f20005 00000820
+controls        90058000 91000000 92000003 93000000
+```
+
+Use these as the first two live oracles. The MOV/temp rows below remain useful
+encoder/finalizer tests but do not currently arise from `chrome9_compile_ps_nir`.
+
 Two records, one temporary:
 
 ```text
@@ -300,15 +328,17 @@ Add the new capability only after all kernel unit vectors byte-match the rows
 above. Then use isolated BGRA8+D16 draws, with guard pages and the normal
 timeout quarantine:
 
-1. `MOV r0,v0; MUL oC0,r0,c0`, with c0=(0.5,1,1,1), checks two-record order.
-2. The linear three-record row checks r0 release before r1 consumption.
-3. The reverse-id row checks that semantic validation does not impose a false
+1. `(v0*c0)*c0`, with c0=(0.5,1,1,1), checks the actual two-record NIR path.
+2. `(v0*c0)*(v0*c0)` checks the actual branched three-record NIR path and
+   simultaneous A/C release.
+3. The manual linear three-record row checks p0 release before p1 consumption.
+4. The reverse-id row checks that semantic validation does not impose a false
    r0-before-r1 rule on compiler output.
-4. The branch row checks simultaneous A/C release without a wedge.
-5. A duplicate-temp row checks A-over-C release precedence.
-6. A `c0*c0; square; square` negative ioctl with any lane just above 1.0
+5. The manual branch row checks simultaneous A/C release after a MOV producer.
+6. A duplicate-temp row checks A-over-C release precedence.
+7. A `c0*c0; square; square` negative ioctl with any lane just above 1.0
    checks that finite-but-unsafe constants fail before publication.
-7. Other negative ioctls cover count 0/4, early COLOR, final TEMP,
+8. Other negative ioctls cover count 0/4, early COLOR, final TEMP,
    undefined/dead temps, lone-r1 allocation, WAW, nonidentity swizzle,
    nonzero modifier/reserved, NaN/Inf c0, and a nonzero unused c0.
 

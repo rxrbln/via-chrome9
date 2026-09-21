@@ -23,6 +23,11 @@ targets.
   counts, and normalized finalizer provenance in Linux, D3D, and OpenGL.
 - [chrome9-mov-mul-short-chain-corpus.tsv](chrome9-mov-mul-short-chain-corpus.tsv)
   retains the eight exact two/three-record allocation rows.
+- [chrome9-ps-canonical-temp-allocation.md](chrome9-ps-canonical-temp-allocation.md)
+  recovers Linux sorted-rank logical-to-physical temp allocation and defines
+  the dense semantic-SSA kernel boundary.
+- [chrome9-ps-canonical-temp-allocation-corpus.tsv](chrome9-ps-canonical-temp-allocation-corpus.tsv)
+  retains sparse, reverse-definition, and dead/nonoverlap allocation rows.
 - [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
   finalized oC0 and texture-consumer golden corpus for the bounded encoder.
 - [chrome9-ps-temp-lifetime-finalizer.md](chrome9-ps-temp-lifetime-finalizer.md)
