@@ -145,6 +145,11 @@ targets.
   PS 3.0 framing and keeps NIR derivatives fail-closed.
 - [chrome9-dsx-dsy-negative-boundary.tsv](chrome9-dsx-dsy-negative-boundary.tsv)
   preserves the four zero-record compiler/version checks and control bases.
+- [chrome9-texkill-schedule-audit.md](chrome9-texkill-schedule-audit.md) closes
+  isolated and initialized discard scheduling, dependency deltas, transition
+  controls, and a guarded color-plus-depth live oracle.
+- [chrome9-texkill-schedule-corpus.tsv](chrome9-texkill-schedule-corpus.tsv)
+  retains four exact Windows/Linux TEXKILL programs and A90..A95 tuples.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
