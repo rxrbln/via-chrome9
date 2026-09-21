@@ -73,6 +73,11 @@ targets.
   retains the 28-case Windows/Linux selector, NEG, producer, and consumer
   differential while separating direct byte matches from the Windows
   wrapper's non-production temporary allocation.
+- [chrome9-exp-log-scalar-audit.md](chrome9-exp-log-scalar-audit.md) closes
+  EXP/LOG scalar selection, generic dependency behavior, shader-version
+  non-expansion, bounded visible domains, and guarded precision oracles.
+- [chrome9-exp-log-scalar-corpus.tsv](chrome9-exp-log-scalar-corpus.tsv)
+  retains the 28 selector/dependency and ten shader-version differentials.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
