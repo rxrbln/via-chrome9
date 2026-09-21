@@ -548,6 +548,24 @@ chrome9_fs_is_one(nir_def *def, unsigned depth)
 }
 
 static bool
+chrome9_fs_is_zero(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 1 || def->bit_size != 32)
+      return false;
+   if (instr->type == nir_instr_type_load_const)
+      return nir_instr_as_load_const(instr)->value[0].u32 == 0;
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      return alu->op == nir_op_mov && !alu->src[0].swizzle[0] &&
+             chrome9_fs_is_zero(alu->src[0].src.ssa, depth + 1);
+   }
+   return false;
+}
+
+static bool
 chrome9_fs_is_generic0(nir_def *def)
 {
    nir_instr *instr = nir_def_instr(def);
@@ -668,6 +686,38 @@ chrome9_fs_is_generic0_rgbx(nir_def *def, nir_def **base, unsigned depth)
       return false;
    *base = found;
    return found != NULL;
+}
+
+/* glmark2's default Gouraud material is (0, 0, 1, 1).  Linking therefore
+ * reduces Color to one user varying and reconstructs blue in the FS. */
+static bool
+chrome9_fs_is_generic0_blue_rgbx(nir_def *def, nir_def **base,
+                                 unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *source = NULL;
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_generic0_blue_rgbx(alu->src[0].src.ssa, base,
+                                               depth + 1);
+   }
+   if (alu->op != nir_op_vec4 || alu->src[0].swizzle[0] ||
+       alu->src[1].swizzle[0] || alu->src[3].swizzle[0] ||
+       !chrome9_fs_is_zero(alu->src[0].src.ssa, depth + 1) ||
+       !chrome9_fs_is_zero(alu->src[1].src.ssa, depth + 1) ||
+       !chrome9_fs_is_generic0_component(&alu->src[2], 0, &source,
+                                         depth + 1) ||
+       !chrome9_fs_is_one(alu->src[3].src.ssa, depth + 1))
+      return false;
+   *base = source;
+   return source && source->num_components == 1;
 }
 
 static bool
@@ -801,6 +851,8 @@ chrome9_fs_result(nir_def *def)
 
    if (chrome9_fs_is_generic0_rgba(def, 0))
       return CHROME9_FS_PRIMARY_GENERIC_RGBA;
+   if (chrome9_fs_is_generic0_blue_rgbx(def, &generic, 0))
+      return CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX;
    if (chrome9_fs_is_generic0_rgbx(def, &generic, 0) &&
        generic->num_components == 1)
       return CHROME9_FS_PRIMARY_SCALAR_RGBX;
@@ -929,6 +981,7 @@ chrome9_fs_classify(nir_shader *nir)
    case CHROME9_FS_PRIMARY_COLOR:
    case CHROME9_FS_PRIMARY_GENERIC_RGBA:
    case CHROME9_FS_PRIMARY_SCALAR_RGBX:
+   case CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX:
       valid = !texture_count && !constant_count;
       break;
    case CHROME9_FS_CONSTANT_COLOR:
