@@ -930,10 +930,39 @@ chrome9_fs_is_projected_primary_product(nir_def *def)
 }
 
 static bool
+chrome9_fs_is_projected_product_component(const nir_alu_src *src,
+                                          unsigned component,
+                                          nir_def **base, unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+
+   if (depth > 8 || !def)
+      return false;
+   if (def->num_components == 4) {
+      if (src->swizzle[0] != component ||
+          !chrome9_fs_is_projected_primary_product(def))
+         return false;
+      *base = def;
+      return true;
+   }
+   if (def->num_components != 1 || src->swizzle[0])
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   return alu->op == nir_op_mov &&
+          chrome9_fs_is_projected_product_component(&alu->src[0], component,
+                                                     base, depth + 1);
+}
+
+static bool
 chrome9_fs_is_projected_primary_rgb_alpha(nir_def *def, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
-   nir_def *product;
+   nir_def *product = NULL;
 
    if (depth > 8 || def->num_components != 4 ||
        instr->type != nir_instr_type_alu)
@@ -949,11 +978,16 @@ chrome9_fs_is_projected_primary_rgb_alpha(nir_def *def, unsigned depth)
    }
    if (alu->op != nir_op_vec4)
       return false;
-   product = alu->src[0].src.ssa;
-   for (unsigned c = 0; c < 3; c++)
-      if (alu->src[c].src.ssa != product || alu->src[c].swizzle[0] != c)
+   for (unsigned c = 0; c < 3; c++) {
+      nir_def *component_product = NULL;
+
+      if (!chrome9_fs_is_projected_product_component(
+             &alu->src[c], c, &component_product, depth + 1) ||
+          (product && product != component_product))
          return false;
-   return chrome9_fs_is_projected_primary_product(product) &&
+      product = component_product;
+   }
+   return product &&
           chrome9_fs_is_primary_component(&alu->src[3], 3, depth + 1);
 }
 
