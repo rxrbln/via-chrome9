@@ -251,9 +251,18 @@ to draw while retaining the original state for A16--A18 lowering.  Leaving
 `offset_tri` enabled in draw and also programming hardware bias applies the
 offset twice and is a hard pre-submit error, not an acceptable approximation.
 
-Fill, line, and point enables are separate proprietary context booleans at
-`+0x3c40`, `+0x3c44`, and `+0x3c48`, selected against polygon mode at
-`+0x1dfc`.  The first implementation is triangle-fill only.
+Point, line, and fill enables are separate proprietary context booleans at
+`+0x3c40`, `+0x3c44`, and `+0x3c48`, respectively.  This ordering is exact:
+`__glEnableDisable:0x28d798..0x28d84b` maps GL enums
+`GL_POLYGON_OFFSET_POINT` (`2a01`) and `GL_POLYGON_OFFSET_LINE` (`2a02`) to
+public bytes `+0x60e5/+0x60e6`, while deferred fill state is copied through
+`+0x60e7` at `__glUpdateDeferedAttributes:0x28f958..0x28f984`.
+`__glDpSTMUpdatePolygonOffset:0x1ecb44..0x1ecb65` copies those bytes in order
+to the three hardware-context booleans.  Finally,
+`STM_DepthBias_INV:0x195a26..0x195ad9` selects point/line/fill only when
+current primitive mode `+0x1dfc` is 1/2/3, otherwise it writes neutral
+A16--A18.  The first implementation is mode 3 triangle-fill only; accepting a
+point or line enable without the corresponding primitive path is incorrect.
 
 ## Bounded ABI plan
 
