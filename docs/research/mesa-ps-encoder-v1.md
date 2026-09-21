@@ -241,9 +241,11 @@ source B, dependency finalization changes d0 rather than d2. A generic
 ## Cmd19 one-record operand boundary
 
 The structured cmd19 encoder's executable v0/c0 surface is narrower than the
-native field width suggests. Production Linux compilation byte-matches MOV
-and MUL with identity or `aaaa` swizzles in either A or C. Every such
-one-record, no-texture object uses the same controls:
+native field width suggests.  Version one admits identity swizzles only.
+Production Linux compilation also byte-matches MOV and MUL with `aaaa`
+swizzles in either A or C, but those forms remain reserved for a separately
+gated successor.  Every measured one-record, no-texture object uses the same
+controls:
 
 ```text
 90058000 91000000 92000001 93000000 94000000 95000000
