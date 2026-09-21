@@ -132,8 +132,10 @@ immediate vertex header        body[236]
 ```
 
 Keep `A02=020041D1`; `D0` reproduces the already measured unnormalized-color
-saturation bug. The common state keeps perspective-correct diffuse
-interpolation (`A01=01c0154c` in the current D16 builder).
+saturation bug. The common state must enable perspective-correct diffuse
+interpolation (`A01=01ce154c` in the D16 builder). The older `01c0...`
+two-factor word is not sufficient once the fragment program consumes primary
+color.
 
 This should be a new structured program selector and capability, not an
 implicit reinterpretation of the existing two-texture ioctl. A minimal ABI
