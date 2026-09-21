@@ -332,8 +332,9 @@ make_texture_vertex_shader(struct pipe_screen *screen,
 }
 
 static void *
-make_texture_fragment_shader(struct pipe_screen *screen,
-                             struct pipe_context *context, bool modulate)
+make_texture_fragment_shader_slot(struct pipe_screen *screen,
+                                  struct pipe_context *context,
+                                  bool modulate, unsigned texcoord_location)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
@@ -349,8 +350,7 @@ make_texture_fragment_shader(struct pipe_screen *screen,
    barycentric = nir_load_barycentric_pixel(&b, 32);
    texcoord = nir_load_interpolated_input(
       &b, 2, 32, barycentric, nir_imm_int(&b, 0),
-      .io_semantics.location = modulate ?
-         VARYING_SLOT_TEX0 : VARYING_SLOT_VAR0);
+      .io_semantics.location = texcoord_location);
    tex = nir_tex_instr_create(b.shader, 1);
    tex->op = nir_texop_tex;
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
@@ -374,6 +374,15 @@ make_texture_fragment_shader(struct pipe_screen *screen,
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
    return context->create_fs_state(context, &state);
+}
+
+static void *
+make_texture_fragment_shader(struct pipe_screen *screen,
+                             struct pipe_context *context, bool modulate)
+{
+   return make_texture_fragment_shader_slot(
+      screen, context, modulate,
+      modulate ? VARYING_SLOT_TEX0 : VARYING_SLOT_VAR0);
 }
 
 static void *
@@ -3789,7 +3798,7 @@ run_pipe_textured_depth(struct pipe_screen *screen,
    void *read_only_dsa_handle = NULL;
    void *equal_read_only_dsa_handle = NULL;
    void *rasterizer_handle = NULL, *elements_handle = NULL;
-   void *vs = NULL, *fs = NULL, *sampler_handle = NULL;
+   void *vs = NULL, *fs = NULL, *replace_fs = NULL, *sampler_handle = NULL;
    struct chrome9_resource *ctarget, *ctexture, *cdepth;
    struct chrome9_context *ccontext;
    uint32_t texture_copy[4] = { 0xffffffff, 0xffffffff,
@@ -3872,6 +3881,9 @@ run_pipe_textured_depth(struct pipe_screen *screen,
    view = context->create_sampler_view(context, texture, &view_templ);
    vs = make_texture_vertex_shader(screen, context, true);
    fs = make_texture_fragment_shader(screen, context, true);
+   if (!source_over)
+      replace_fs = make_texture_fragment_shader_slot(
+         screen, context, false, VARYING_SLOT_TEX0);
    if (!blend_handle || !dsa_handle ||
        (!source_over && chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DEPTH_READ_ONLY) &&
@@ -3886,7 +3898,8 @@ run_pipe_textured_depth(struct pipe_screen *screen,
            screen, DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS) &&
         !multiply_handle) ||
        !rasterizer_handle ||
-       !elements_handle || !sampler_handle || !view || !vs || !fs)
+       !elements_handle || !sampler_handle || !view || !vs || !fs ||
+       (!source_over && !replace_fs))
       goto out;
 
    framebuffer.cbufs[0].format = target->format;
@@ -3958,6 +3971,45 @@ run_pipe_textured_depth(struct pipe_screen *screen,
             smoke_guard_pages_match(ctarget) &&
             smoke_guard_pages_match(ctexture) &&
             smoke_guard_pages_match(cdepth);
+   if (passed && replace_fs) {
+      uint64_t replace_submitted = ccontext->submitted_triangles;
+      uint64_t replace_rejected = ccontext->rejected_triangles;
+      uint32_t *pixels = (uint32_t *)
+         ((uint8_t *)ctarget->bo.map + ctarget->data_offset);
+      uint16_t *depth_pixels = (uint16_t *)
+         ((uint8_t *)cdepth->bo.map + cdepth->data_offset);
+
+      context->bind_fs_state(context, replace_fs);
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &clear, 0.5, 0);
+      vertex_buffer.buffer.user = vertices[0];
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      passed = (pixels[16 * (ctarget->stride / 4) + 16] & 0xffffff) ==
+                  0xffffff &&
+               depth_pixels[16 * (cdepth->stride / 2) + 16] >= 0x7ffe &&
+               depth_pixels[16 * (cdepth->stride / 2) + 16] <= 0x8001 &&
+               ccontext->submitted_triangles == replace_submitted + 2 &&
+               ccontext->rejected_triangles == replace_rejected &&
+               smoke_guard_pages_match(ctarget) &&
+               smoke_guard_pages_match(ctexture) &&
+               smoke_guard_pages_match(cdepth);
+      if (passed)
+         printf("Gallium textured D16 REPLACE format %u passed\n",
+                target_format);
+      else
+         fprintf(stderr,
+                 "Gallium textured D16 REPLACE format %u mismatch: "
+                 "sample=%08x/%04x submitted=+%" PRIu64
+                 " rejected=+%" PRIu64 "\n",
+                 target_format,
+                 pixels[16 * (ctarget->stride / 4) + 16],
+                 depth_pixels[16 * (cdepth->stride / 2) + 16],
+                 ccontext->submitted_triangles - replace_submitted,
+                 ccontext->rejected_triangles - replace_rejected);
+      context->bind_fs_state(context, fs);
+   }
    if (passed && read_only_dsa_handle) {
       uint32_t equal_pixel, near_pixel, far_pixel;
       uint16_t equal_depth, near_depth, far_depth;
@@ -4136,6 +4188,7 @@ out:
       if (view) pipe_sampler_view_reference(&view, NULL);
       if (vs) context->delete_vs_state(context, vs);
       if (fs) context->delete_fs_state(context, fs);
+      if (replace_fs) context->delete_fs_state(context, replace_fs);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (sampler_handle)

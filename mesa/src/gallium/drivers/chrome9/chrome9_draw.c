@@ -2120,11 +2120,51 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr,
                  "chrome9: DRAW_%sTRIANGLE%s failed after=%" PRIu64
-                 ": %s target=%ux%u/%u xy=(%d,%d)(%d,%d)(%d,%d)\n",
+                 ": %s target=%ux%u/%u flags=%#x format=%u program=%u "
+                 "filter=%u/%u wrap=%u/%u blend=%#x/%u/%u/%u/%u/%#x "
+                 "xy=(%d,%d)(%d,%d)(%d,%d)\n",
                  crender->textured ? "TEXTURED_" : "",
                  depth_active ? "_D16" : "", ctx->submitted_triangles,
                  strerror(errno), target->base.width0, target->base.height0,
-                 target->stride, x[0], y[0], x[1], y[1], x[2], y[2]);
+                 target->stride, depth_flags,
+                 target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+                    DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+                    DRM_CHROME9_DESTINATION_FORMAT_BGRX8888,
+                 crender->textured ? texture_args.program : 0,
+                 crender->textured ? texture_args.min_filter : 0,
+                 crender->textured ? texture_args.mag_filter : 0,
+                 crender->textured ? texture_args.wrap_s : 0,
+                 crender->textured ? texture_args.wrap_t : 0,
+                 blend_state.flags, blend_state.rgb_src_factor,
+                 blend_state.rgb_dst_factor, blend_state.alpha_src_factor,
+                 blend_state.alpha_dst_factor, blend_state.color_mask,
+                 x[0], y[0], x[1], y[1], x[2], y[2]);
+         if (crender->textured)
+            for (unsigned i = 0; i < 3; i++)
+               fprintf(stderr,
+                       "chrome9: failed textured vertex[%u] "
+                       "z=%d rhw=%08x color=%08x specular=%08x "
+                       "st=%08x/%08x\n", i,
+                       texture_args.vertices[i].z_16_16,
+                       texture_args.vertices[i].rhw_float,
+                       texture_args.vertices[i].color,
+                       texture_args.vertices[i].specular,
+                       texture_args.vertices[i].s_float,
+                       texture_args.vertices[i].t_float);
+         if (crender->textured)
+            fprintf(stderr,
+                    "chrome9: failed objects target=%u/%" PRIu64
+                    " texture=%u/%" PRIu64 " depth=%u/%" PRIu64
+                    " texture-size=%ux%u/%u depth-pitch=%u "
+                    "scissor=%#x/%u,%u-%u,%u\n",
+                    target->bo.handle, target->bo.size,
+                    textures[0]->bo.handle, textures[0]->bo.size,
+                    depth ? depth->bo.handle : 0,
+                    depth ? depth->bo.size : 0,
+                    textures[0]->base.width0, textures[0]->base.height0,
+                    textures[0]->stride, depth ? depth->stride : 0,
+                    scissor.flags, scissor.min_x, scissor.min_y,
+                    scissor.max_x, scissor.max_y);
          ctx->warnings |= CHROME9_WARN_SUBMIT;
       }
    }
