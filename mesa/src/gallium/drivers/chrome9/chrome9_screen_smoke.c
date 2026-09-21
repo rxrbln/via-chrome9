@@ -43,6 +43,12 @@ struct smoke_two_texture_vertex {
    float texcoord1[2];
 };
 
+struct smoke_projected_texture_vertex {
+   float position[4];
+   float color[4];
+   float texcoord[4];
+};
+
 #define CHROME9_SMOKE_GUARD_WORD 0x13579bdfU
 
 static bool
@@ -160,6 +166,87 @@ make_texture_fragment_shader(struct pipe_screen *screen,
 
       result = nir_fmul(&b, result, color);
    }
+   nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static void *
+make_projected_texture_vertex_shader(struct pipe_screen *screen,
+                                     struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
+      "chrome9-projected-texture-primary-vertex");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *position = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_POS);
+   nir_def *color = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_COLOR0);
+   nir_def *texcoord = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_TEX0);
+
+   nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_COL0);
+   nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_TEX0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
+   return context->create_vs_state(context, &state);
+}
+
+static void *
+make_projected_texture_fragment_shader(struct pipe_screen *screen,
+                                       struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-projected-texture-primary-rgb-alpha");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *barycentric = nir_load_barycentric_pixel(&b, 32);
+   nir_def *texcoord = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_TEX0);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_def *coord = nir_trim_vector(&b, texcoord, 2);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_projector,
+                                     nir_channel(&b, texcoord, 3));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_def *product = nir_fmul(&b, &tex->def, color);
+   nir_def *result = nir_vec4(&b, nir_channel(&b, product, 0),
+                              nir_channel(&b, product, 1),
+                              nir_channel(&b, product, 2),
+                              nir_channel(&b, color, 3));
+
    nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = FRAG_RESULT_COLOR);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
@@ -1675,6 +1762,18 @@ run_pipe_texture(struct pipe_screen *screen)
       { {  4, -4, 0, 4 }, { 1, 0, 0, 1 }, { 1, 0.5 } },
       { {  4,  4, 0, 4 }, { 1, 0, 0, 1 }, { 1, 0.5 } },
    };
+   static const struct smoke_projected_texture_vertex projected_vertices[] = {
+      { { -1, -1, 0, 1 }, { 1, 1, 1, 0.25 }, { 0, 0.5, 0, 1 } },
+      { { -1,  1, 0, 1 }, { 1, 1, 1, 0.25 }, { 0, 0.5, 0, 1 } },
+      { {  1, -1, 0, 1 }, { 1, 1, 1, 0.25 }, { 1, 0.5, 0, 1 } },
+      { {  1,  1, 0, 1 }, { 1, 1, 1, 0.25 }, { 1, 0.5, 0, 1 } },
+   };
+   static const struct smoke_projected_texture_vertex bad_q_vertices[] = {
+      { { -1, -1, 0, 1 }, { 1, 1, 1, 0.25 }, { 0, 0.5, 0, 2 } },
+      { { -1,  1, 0, 1 }, { 1, 1, 1, 0.25 }, { 0, 0.5, 0, 2 } },
+      { {  1, -1, 0, 1 }, { 1, 1, 1, 0.25 }, { 1, 0.5, 0, 2 } },
+      { {  1,  1, 0, 1 }, { 1, 1, 1, 0.25 }, { 1, 0.5, 0, 2 } },
+   };
    struct pipe_resource target_templ = {
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -1732,6 +1831,7 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_vertex_element elements[3] = { 0 };
    struct pipe_vertex_element replace_elements[2] = { 0 };
+   struct pipe_vertex_element projected_elements[3] = { 0 };
    struct pipe_vertex_buffer vertex_buffer = {
       .is_user_buffer = true,
       .buffer.user = white_vertices,
@@ -1771,11 +1871,13 @@ run_pipe_texture(struct pipe_screen *screen)
    void *blend_handle = NULL, *dsa_handle = NULL, *rasterizer_handle = NULL;
    void *source_over_handle = NULL;
    void *elements_handle = NULL, *replace_elements_handle = NULL;
+   void *projected_elements_handle = NULL;
    void *sampler_handle = NULL;
    void *replace_vs = NULL, *modulate_vs = NULL;
    void *replace = NULL, *modulate = NULL, *constant_modulate = NULL;
    void *constant_alpha_modulate = NULL, *rgbx = NULL;
    void *packed_gray_vs = NULL, *packed_gray_fs = NULL;
+   void *projected_vs = NULL, *projected_fs = NULL;
    void *samplers[1];
    uint32_t source_copy[4], mip_copy = 0x5aa55aa5, *source, *pixels;
    uint32_t *mip_pixel;
@@ -1880,6 +1982,19 @@ run_pipe_texture(struct pipe_screen *screen)
    replace_elements[1] = elements[2];
    replace_elements_handle = context->create_vertex_elements_state(
       context, 2, replace_elements);
+   projected_elements[0].src_offset =
+      offsetof(struct smoke_projected_texture_vertex, position);
+   projected_elements[1].src_offset =
+      offsetof(struct smoke_projected_texture_vertex, color);
+   projected_elements[2].src_offset =
+      offsetof(struct smoke_projected_texture_vertex, texcoord);
+   for (unsigned i = 0; i < ARRAY_SIZE(projected_elements); i++) {
+      projected_elements[i].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      projected_elements[i].src_stride =
+         sizeof(struct smoke_projected_texture_vertex);
+   }
+   projected_elements_handle = context->create_vertex_elements_state(
+      context, ARRAY_SIZE(projected_elements), projected_elements);
    sampler_handle = context->create_sampler_state(context, &sampler);
    u_sampler_view_default_template(&view_templ, texture, texture->format);
    mip_view = context->create_sampler_view(context, texture, &view_templ);
@@ -1932,12 +2047,15 @@ run_pipe_texture(struct pipe_screen *screen)
       make_scalar_generic_vertex_shader(screen, context, true);
    packed_gray_fs =
       make_packed_gray_texture_fragment_shader(screen, context);
+   projected_vs = make_projected_texture_vertex_shader(screen, context);
+   projected_fs = make_projected_texture_fragment_shader(screen, context);
    if (!blend_handle ||
        (chrome9_screen_has_capability(
            screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND) &&
         !source_over_handle) ||
        !dsa_handle || !rasterizer_handle ||
-       !elements_handle || !replace_elements_handle || !sampler_handle ||
+       !elements_handle || !replace_elements_handle ||
+       !projected_elements_handle || !sampler_handle ||
        !view || !rhw_view || !shadow_source || !shadow_view ||
        chrome9_resource(shadow_source)->guarded ||
        !chrome9_sampler_view(shadow_view)->shadow ||
@@ -1946,7 +2064,7 @@ run_pipe_texture(struct pipe_screen *screen)
        !replace_vs ||
        !modulate_vs || !replace || !modulate || !constant_modulate ||
        !constant_alpha_modulate || !rgbx ||
-       !packed_gray_vs || !packed_gray_fs ||
+       !packed_gray_vs || !packed_gray_fs || !projected_vs || !projected_fs ||
        ((struct chrome9_shader *)constant_modulate)->fragment_program !=
           CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
        ((struct chrome9_shader *)constant_alpha_modulate)->fragment_program !=
@@ -1954,7 +2072,9 @@ run_pipe_texture(struct pipe_screen *screen)
        ((struct chrome9_shader *)rgbx)->fragment_program !=
           CHROME9_FS_TEXTURE_RGBX ||
        ((struct chrome9_shader *)packed_gray_fs)->fragment_program !=
-          CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE) {
+          CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ||
+       ((struct chrome9_shader *)projected_fs)->fragment_program !=
+          CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA) {
       fprintf(stderr,
               "texture setup failed: target=%p texture=%p context=%p "
               "blend=%p dsa=%p rasterizer=%p elements=%p "
@@ -2221,6 +2341,57 @@ run_pipe_texture(struct pipe_screen *screen)
       context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
                                  &view);
       puts("Gallium texture RGBX lowering passed");
+   }
+   {
+      const unsigned at[4][2] = { { 8, 8 }, { 24, 8 },
+                                  { 8, 24 }, { 24, 24 } };
+      const uint32_t expect[4] = {
+         0xff0000, 0xffffff, 0xff0000, 0xffffff,
+      };
+      uint64_t submitted = ccontext->submitted_triangles;
+      uint64_t rejected = ccontext->rejected_triangles;
+      bool pixels_match = true;
+
+      context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                                 &rhw_view);
+      context->bind_vertex_elements_state(context,
+                                          projected_elements_handle);
+      context->bind_vs_state(context, projected_vs);
+      context->bind_fs_state(context, projected_fs);
+      vertex_buffer.buffer.user = projected_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &clear, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++)
+         pixels_match &=
+            (pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
+             0xffffff) == expect[i];
+
+      vertex_buffer.buffer.user = bad_q_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      vertex_buffer.buffer.user = projected_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                                 &view);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      if (!pixels_match || ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected + 4 ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(ctexture) ||
+          !smoke_guard_pages_match(crhw_texture)) {
+         fprintf(stderr,
+                 "projected texture*primary mismatch: submitted=+%" PRIu64
+                 " rejected=+%" PRIu64 " pixels=%u\n",
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected, pixels_match);
+         goto out;
+      }
+      puts("Gallium projected XRGB texture*primary q=1 lowering passed");
    }
    bool source_pixels_match =
       source[0] == source_copy[0] && source[1] == source_copy[1] &&
@@ -2525,6 +2696,10 @@ out:
          context->delete_vs_state(context, packed_gray_vs);
       if (packed_gray_fs)
          context->delete_fs_state(context, packed_gray_fs);
+      if (projected_vs)
+         context->delete_vs_state(context, projected_vs);
+      if (projected_fs)
+         context->delete_fs_state(context, projected_fs);
       if (view) pipe_sampler_view_reference(&view, NULL);
       if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
       if (shadow_view) pipe_sampler_view_reference(&shadow_view, NULL);
@@ -2535,6 +2710,9 @@ out:
       if (replace_elements_handle)
          context->delete_vertex_elements_state(context,
                                                replace_elements_handle);
+      if (projected_elements_handle)
+         context->delete_vertex_elements_state(context,
+                                               projected_elements_handle);
       if (rasterizer_handle)
          context->delete_rasterizer_state(context, rasterizer_handle);
       if (dsa_handle)

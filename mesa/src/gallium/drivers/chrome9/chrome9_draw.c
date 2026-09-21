@@ -111,6 +111,7 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       (program == CHROME9_FS_TEXTURE_REPLACE ||
        program == CHROME9_FS_TEXTURE_RGBX ||
        program == CHROME9_FS_TEXTURE_MODULATE ||
+       program == CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
        program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ||
        program == CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
        program == CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE) ? 1 : 0;
@@ -140,7 +141,9 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                            (crender->packed_generic ? generic0 >= 0 :
                             (color0 >= 0 ||
                              (program != CHROME9_FS_PRIMARY_COLOR &&
-                              program != CHROME9_FS_TEXTURE_MODULATE))) &&
+                              program != CHROME9_FS_TEXTURE_MODULATE &&
+                              program !=
+                                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA))) &&
                            (!crender->textured ||
                             ((crender->packed_generic == 2 ||
                               texcoord[0] >= 0) &&
@@ -539,6 +542,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          if (!unit && ctx->fs->fragment_program == CHROME9_FS_TEXTURE_RGBX &&
              source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
             return false;
+         *reason = "projected-source-format";
+         if (!unit && ctx->fs->fragment_program ==
+                        CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA &&
+             source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
+            return false;
       }
       *reason = "texture-alias";
       if (texture_count == 2 &&
@@ -735,10 +743,18 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (crender->textured) {
          const float *texcoord = crender->packed_generic == 2 ? packed + 1 :
             (const float *)(vertex + 6 * sizeof(uint32_t));
+         uint32_t texcoord_q = 0;
+
+         if (ctx->fs->fragment_program ==
+             CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA)
+            memcpy(&texcoord_q, &texcoord[3], sizeof(texcoord_q));
 
          if (!isfinite(position[2]) || !isfinite(position[3]) ||
              position[3] <= 0.0f || !isfinite(texcoord[0]) ||
              !isfinite(texcoord[1]) ||
+             (ctx->fs->fragment_program ==
+                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA &&
+              texcoord_q != 0x3f800000) ||
              (crender->texture_count == 2 &&
               (texcoord[0] < 0.0f || texcoord[0] > 1.0f ||
                texcoord[1] < 0.0f || texcoord[1] > 1.0f))) {
