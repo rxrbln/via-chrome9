@@ -368,6 +368,24 @@ a typical decal pass needs depth testing with depth writes off, whereas its
 polygon offset can continue through draw's bounded software stage until the
 native bias path is proved.
 
+The patch-ready capability plumbing is deliberately small:
+
+1. add bit 11/cap 23 to both kernel UAPI and Mesa's synchronized UAPI copy;
+2. accept bit 11 in `chrome9_validate_depth_flags()`, add the no-depth batch
+   rejection, and include cap 23 in `chrome9_get_param_ioctl()` only in the
+   final enabling commit;
+3. cache cap 23 in `chrome9_context` during `chrome9_context_create()`;
+4. in `chrome9_draw_state_supported()`, permit a false writemask only with
+   that cached cap;
+5. in `chrome9_emit_triangle()`, derive one semantic depth flag word and copy
+   it into `depth_args`, `depth_blend_args`, `texture_depth_args`,
+   `two_texture_depth_args`, and the initial `crender->batch`/`batch_rhw`;
+6. lower that same request bit in all three kernel packet builders, then run
+   old write-enabled and new read-only smokes before advertising the cap.
+
+This ordering lets mismatched Mesa/kernel combinations fail closed: new Mesa
+does not set the bit without cap 23, while old kernels reject the unknown bit.
+
 Hardware polygon offset needs two binary32 values and should use a new
 structured successor rather than consume or rename reserved fields in an old
 ioctl.  The original untextured D16 request has only one 32-bit reserved word,
