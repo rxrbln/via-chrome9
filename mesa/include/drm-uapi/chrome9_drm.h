@@ -142,6 +142,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DEPTH_ALWAYS	(1ULL << 35)
 /* Two-texture programs can preserve tex0*primary alpha when tex1 has alpha. */
 #define DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY	(1ULL << 39)
+/* REPEAT two-texture coordinates accept finite values through +/-32. */
+#define DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS	(1ULL << 40)
 
 struct drm_chrome9_get_param {
 	__u32 param;
