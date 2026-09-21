@@ -252,6 +252,12 @@ needed.  Kernel validation and lowering should:
 7. advertise the capability only after the forced-L1, min=max, and transition
    tests below pass.
 
+[two-level-mip-ioctl-design.md](two-level-mip-ioctl-design.md) fixes this
+sketch to an exact 192-byte structure, current guarded object-size
+derivation, command/capability allocation, builder indices, submission
+ownership changes, and immediately runnable raw oracle.  That focused design
+is authoritative for the first implementation.
+
 The `none` mip-filter value is useful for the forced-bias address oracle, but
 ordinary mipmapped Gallium sampling uses nearest or linear.  Mesa should pass
 semantic level/filter/bias fields.  The kernel must derive H3 words from the

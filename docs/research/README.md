@@ -81,6 +81,10 @@ targets.
   the vendor-packed and current compatibility-guarded mip layouts, gives the
   exact H3 offset for each, and proves that the recent unguarded-import smoke
   failure was a shader-classification issue rather than a missing shadow.
+- [two-level-mip-ioctl-design.md](two-level-mip-ioctl-design.md) specifies the
+  exact 192-byte versioned two-level ioctl, fail-closed guarded-object
+  validation, H3 insertion indices, A30/A31 lowering, ownership rules, and a
+  raw live oracle sequence ready for the next implementation tranche.
 - [legacy-texture-format-oracles.md](legacy-texture-format-oracles.md)
   recovers A8/L8/L8A8 and RGB565/ARGB1555/ARGB4444 sampler and render-target
   encodings, channel and alpha semantics, guarded readback tests, and safe

@@ -214,3 +214,6 @@ Therefore:
    oracles.  Only then advertise mip filters; NPOT mip chains, L9--L11 and
    imported chains remain separate gates.
 
+The exact versioned UAPI structure, internal size split, packet indices, and
+raw test order are fixed in
+[two-level-mip-ioctl-design.md](two-level-mip-ioctl-design.md).
