@@ -134,7 +134,8 @@ or fixed 3D oracle.  At every stage retain the ordinary cookie and PAUSE polls.
    `dma_rmb()` and exact ID equality.  Also record `0494`, but do not require it
    for memory safety until its relation to memory write is measured.
 2. **Interrupt, no wait:** install the shared handler, clear only stale
-   `0204.bit5`, preserve all other `0200` bits while setting bit 31, and use
+   `0204.bit5`, preserve all other `0200` *enable* bits while setting bit 31
+   without echoing its RW1C status bits, and use
    `FE330006`.  Require the memory ID, handler count, exact RW1C ack and normal
    PAUSE.
 3. **Intentionally masked IRQ, still no wait:** use `FE330006` with the global
@@ -187,7 +188,8 @@ Initialization/teardown order is:
 1. allocate and poison coherent slots;
 2. `request_irq(..., IRQF_SHARED, ...)`;
 3. sample and acknowledge stale `0204.bit5` with exactly `BIT(5)`;
-4. read-modify-write `0200 |= BIT(31)`, preserving display/video enables;
+4. update the `0200.bit31` gate through the mixed-register helper below,
+   preserving display/video enables without acknowledging their statuses;
 5. publish only non-waiting FE3x packets;
 6. on teardown stop submissions, prove all records or quarantine, mask only
    the bit owned by this driver, `synchronize_irq()`, then free the IRQ and
@@ -199,6 +201,25 @@ coherent record with the exact expected ID.  A mismatched record increments a
 diagnostic counter and wakes a threaded/bottom-half recheck but never signals
 a fence.  Hard IRQ context must not take `submit_lock`, `vm_lock`, a GEM
 reservation, or invalidate PTEs.
+
+`0200` cannot use a literal read/OR/write.  VX900 Part II page 10 interleaves
+enable bits with RW1C status bits.  Writing a sampled one back would
+acknowledge an unrelated vblank, DMA, capture, HQV, DVI or LVDS event.  The
+documented masks are:
+
+```text
+0200 enable fields = f7ff0800
+0200 RW1C fields   = 0800f3fd
+```
+
+For a gate update, read once for diagnostics, then write
+`(old & ~0800f3fd) | 80000000`; all pending status positions are deliberately
+written as zero while every enable field is retained.  Disabling follows the
+same rule and clears bit 31 only when the driver's central IRQ-user accounting
+proves no display/video consumer still needs the global gate.  Do not copy the
+old Linux `0200=80000000` (destroys other enables) or Windows' unmasked OR
+(can clear sampled RW1C events).  Serialize every `0200` update through one
+driver helper so KMS and render IRQ users cannot race.
 
 ## Kernel lifetime and completion state machine
 
