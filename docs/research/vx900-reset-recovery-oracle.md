@@ -890,7 +890,10 @@ the same VGA-arbitration and `vm_lock` protection require
 `SR6B == (engine_gart_offset >> 20) & ff`,
 `SR6C.bit0 == (engine_gart_offset >> 28) & 1`, and `SR7B[3:0] == 4`.
 `SR6C.bit7` is write protection and may be toggled only around the table write;
-do not compare it as an address bit.  A mismatch means a flush of the BAR2
+do not compare it as an address bit.  `SR7B=4` is the live/5.75 64-KiB-table
+code even though the VX900 open manual marks the nibble reserved; preserve and
+compare the proven value, but do not claim a documented encoding.  A mismatch
+means a flush of the BAR2
 range at `engine->gart` would not prove that the GPU stopped using the job's
 translations, so refuse non-destructive release and retain the quarantine.
 Also verify that the persistent ring's first 16 PTEs still encode
