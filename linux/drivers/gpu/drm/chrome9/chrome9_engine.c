@@ -1106,6 +1106,22 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		0x01c00000, 0x301c0000, 0x00f20105, 0x000d083f,
 		0xcccccccc, 0xdddddddd,
 	};
+	static const u32 tex0_alpha_control[] = {
+		0x90000000, 0x91000001, 0x92020004, 0x93000002,
+		0x94000000, 0x95000000, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000,
+		0xcccccccc, 0xdddddddd,
+	};
+	static const u32 tex0_alpha_tau[] = {
+		0xa01001b0, 0x311001b1, 0xcccccccc, 0xdddddddd,
+	};
+	static const u32 tex0_alpha_program[] = {
+		0x0140b6d0, 0x3003f000, 0x00f00005, 0x000003e0,
+		0x0140b6d0, 0x50040055, 0x00703f00, 0x000003e0,
+		0x0140b6d0, 0xb0040b6b, 0x008200b6, 0x200003e0,
+		0x01c00530, 0x001c0053, 0x00f03f00, 0x000d0820,
+		0xcccccccc, 0xdddddddd,
+	};
 	static const u32 sync[] = { 0x6c, 0x00800000 };
 	static const u32 status[] = {
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
@@ -1141,6 +1157,16 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		request->kind ==
 			CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16 ||
 		blend;
+	bool tex0_alpha_primary = request->flags &
+		DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY;
+	const u32 *selected_control = tex0_alpha_primary ?
+		tex0_alpha_control : ps_control;
+	const u32 *selected_tau = tex0_alpha_primary ? tex0_alpha_tau : tau;
+	const u32 *selected_program = tex0_alpha_primary ?
+		tex0_alpha_program : rgba_program;
+	unsigned int selected_program_count = tex0_alpha_primary ?
+		ARRAY_SIZE(tex0_alpha_program) : ARRAY_SIZE(rgba_program);
+	u32 program_delta = tex0_alpha_primary ? 8 : 0;
 	unsigned int destination_count;
 	const u32 addresses[2] = { texture0, texture1 };
 	const u32 widths[2] = { request->texture_width,
@@ -1266,14 +1292,14 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
 			     vs_control, ARRAY_SIZE(vs_control));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     ps_control, ARRAY_SIZE(ps_control));
+			     selected_control, ARRAY_SIZE(ps_control));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x21030000,
-			     tau, ARRAY_SIZE(tau));
+			     selected_tau, ARRAY_SIZE(tau));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x20030000,
-			     rgba_program, ARRAY_SIZE(rgba_program));
+			     selected_program, selected_program_count);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00000000,
 			     vertices, ARRAY_SIZE(vertices));
-	if (p - body != 262 + delta + depth_delta ||
+	if (p - body != 262 + delta + depth_delta + program_delta ||
 	    body[4] != destination_state[0] ||
 	    body[6] != destination_state[2] ||
 	    (blend &&
@@ -1311,18 +1337,18 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	    body[172 + delta + depth_delta] != 0x0009014c ||
 	    body[175 + delta + depth_delta] != 0x0008029f ||
 	    body[180 + delta + depth_delta] != 0x60800005 ||
-	    body[190 + delta + depth_delta] != 0x92020002 ||
-	    body[208 + delta + depth_delta] != 0x301001b0 ||
-	    body[209 + delta + depth_delta] != 0x311211b1 ||
-	    body[216 + delta + depth_delta] != 0x0140b6d0 ||
-	    body[217 + delta + depth_delta] != 0x30202053 ||
-	    body[219 + delta + depth_delta] != 0x0000007f ||
-	    body[220 + delta + depth_delta] != 0x01c00000 ||
-	    body[223 + delta + depth_delta] != 0x000d083f ||
-	    body[224 + delta + depth_delta] != 0xcccccccc ||
-	    body[225 + delta + depth_delta] != 0xdddddddd ||
-	    body[228 + delta + depth_delta] != 0xfe020440 ||
-	    body[230 + delta + depth_delta] != 0x00000000)
+	    body[190 + delta + depth_delta] != selected_control[2] ||
+	    body[208 + delta + depth_delta] != selected_tau[0] ||
+	    body[209 + delta + depth_delta] != selected_tau[1] ||
+	    body[216 + delta + depth_delta] != selected_program[0] ||
+	    body[217 + delta + depth_delta] != selected_program[1] ||
+	    body[219 + delta + depth_delta] != selected_program[3] ||
+	    body[216 + delta + depth_delta + selected_program_count - 2] !=
+		0xcccccccc ||
+	    body[217 + delta + depth_delta + selected_program_count - 2] !=
+		0xdddddddd ||
+	    body[228 + delta + depth_delta + program_delta] != 0xfe020440 ||
+	    body[230 + delta + depth_delta + program_delta] != 0x00000000)
 		return -EINVAL;
 	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
@@ -3898,6 +3924,7 @@ int chrome9_draw_two_textured_triangle_ioctl(struct drm_device *drm,
 		.depth_handle = args->textures[0].handle,
 		.texture_handle = args->textures[0].handle,
 		.texture2_handle = args->textures[1].handle,
+		.flags = args->flags,
 		.width = args->width,
 		.height = args->height,
 		.pitch = args->destination_pitch,
@@ -3924,7 +3951,9 @@ int chrome9_draw_two_textured_triangle_ioctl(struct drm_device *drm,
 	unsigned int i;
 	int ret;
 
-	if (args->flags || args->reserved0 || args->reserved[0] ||
+	if ((args->flags &
+	     ~DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY) ||
+	    args->reserved0 || args->reserved[0] ||
 	    args->reserved[1] || args->reserved[2] ||
 	    !args->destination_handle ||
 	    args->destination_handle == args->textures[0].handle ||
@@ -4022,7 +4051,9 @@ int chrome9_draw_two_textured_triangle_d16_ioctl(struct drm_device *drm,
 	int ret;
 
 	if (!(args->flags & DRM_CHROME9_DEPTH_FUNC_MASK) ||
-	    chrome9_validate_depth_flags(args->flags, 0) || args->reserved0 ||
+	    chrome9_validate_depth_flags(
+		args->flags, DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY) ||
+	    args->reserved0 ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->destination_handle || !args->depth_handle ||
 	    !args->textures[0].handle || !args->textures[1].handle ||
@@ -4133,7 +4164,9 @@ int chrome9_draw_two_textured_triangle_d16_blend_ioctl(
 	int ret;
 
 	if (!(args->flags & DRM_CHROME9_DEPTH_FUNC_MASK) ||
-	    chrome9_validate_depth_flags(args->flags, 0) || args->reserved0 ||
+	    chrome9_validate_depth_flags(
+		args->flags, DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY) ||
+	    args->reserved0 ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->destination_handle || !args->depth_handle ||
 	    !args->textures[0].handle || !args->textures[1].handle ||

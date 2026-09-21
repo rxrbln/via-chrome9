@@ -144,7 +144,7 @@ MODULE_PARM_DESC(selftest_3d_dma_gem,
 static unsigned int chrome9_selftest_3d_store;
 module_param_named(selftest_3d_store, chrome9_selftest_3d_store, uint, 0400);
 MODULE_PARM_DESC(selftest_3d_store,
-		 "Address-free 3D store probe: 1=PS, 2=VS NOP, 3=VS full, 4=PS control+store, 5=VS full+valid, 6=H6 linkage/constants+VS");
+		 "3D store probe: 1=PS, 2=VS NOP, 3=VS full, 4=PS control+store, 5=VS full+valid, 6=H6 linkage/constants+VS, 7=full PS c0..c31 draw");
 
 static bool chrome9_selftest_cr_sl_physical;
 module_param_named(selftest_cr_sl_physical,
@@ -598,8 +598,10 @@ void chrome9_init_3d_h5s2vp1(struct chrome9_device *cdev)
 	readl(cdev->mmio + CHROME9_REG_FE_TRANSPACE);
 }
 
-void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
-			    bool system_framebuffer)
+static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
+					     unsigned long target,
+					     bool system_framebuffer,
+					     bool constants32)
 {
 	static const u32 config[] = {
 		0x00000001, 0x01002521, 0x08010100, 0x05000000,
@@ -616,6 +618,18 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 		0x52147fff,
 	};
 	static const u32 ps_constants[] = { 0, 0, 0, 0 };
+	static const u32 ps_constants_bank0[64] = {
+		/* c15 = yellow. */
+		[60] = 0x3f800000, [61] = 0x3f800000,
+		[62] = 0x00000000, [63] = 0x3f800000,
+	};
+	static const u32 ps_constants_bank1[64] = {
+		/* c16 = magenta; c31 = blue. */
+		[0] = 0x3f800000, [1] = 0x00000000,
+		[2] = 0x3f800000, [3] = 0x3f800000,
+		[60] = 0x00000000, [61] = 0x00000000,
+		[62] = 0x3f800000, [63] = 0x3f800000,
+	};
 	static const u32 vs_float_constants[] = {
 		0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
 		0x49400000, 0x49400000, 0x00000000, 0x00000000,
@@ -637,8 +651,20 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 		0x98000000, 0x99000000, 0x9a000000,
 		0xcccccccc, 0xdddddddd,
 	};
+	static const u32 ps_control_ps20[] = {
+		0x90058000, 0x91000000, 0x92000001, 0x93000000,
+		0x94000000, 0x95000000, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+		0xcccccccc, 0xdddddddd,
+	};
 	static const u32 ps_program[] = {
 		0x01c00000, 0x301c0000, 0x00f04005, 0x000d083f,
+	};
+	static const u32 ps_program_c15_c16[] = {
+		0x0140b6d0, 0x300a0053, 0x00f08f05, 0x00000820,
+	};
+	static const u32 ps_program_c31[] = {
+		0x01c00530, 0x301c0053, 0x00f0af05, 0x000d0820,
 	};
 	static const u32 vertices[] = {
 		/* TL, TR, BR, BL; x/y use the Xorg -0.5 pixel-center bias. */
@@ -649,6 +675,17 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 		0x41fc0000, 0x41fc0000, 0, 0x3f800000,
 		0xffff0000, 0xffff0000,
 		0xbf000000, 0x41fc0000, 0, 0x3f800000,
+		0xffff0000, 0xffff0000,
+	};
+	static const u32 right_vertices[] = {
+		/* Overwrite x=16..31 only, proving the last legal user vector. */
+		0x41780000, 0xbf000000, 0, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x41fc0000, 0xbf000000, 0, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x41fc0000, 0x41fc0000, 0, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x41780000, 0x41fc0000, 0, 0x3f800000,
 		0xffff0000, 0xffff0000,
 	};
 	u32 state[] = {
@@ -668,8 +705,15 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 			     config, ARRAY_SIZE(config));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
 			     raster_fvf, ARRAY_SIZE(raster_fvf));
-	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x22030000,
-			     ps_constants, ARRAY_SIZE(ps_constants));
+	if (constants32) {
+		chrome9_emit_header3(cursor, 0x22030000, ps_constants_bank0,
+				     ARRAY_SIZE(ps_constants_bank0));
+		chrome9_emit_header3(cursor, 0x22030080, ps_constants_bank1,
+				     ARRAY_SIZE(ps_constants_bank1));
+	} else {
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x22030000,
+				     ps_constants, ARRAY_SIZE(ps_constants));
+	}
 	chrome9_emit_header3(cursor, 0x32030400, vs_float_constants,
 			     ARRAY_SIZE(vs_float_constants));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x33030000,
@@ -682,11 +726,31 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
 			     vs_control, ARRAY_SIZE(vs_control));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
-			     ps_control, ARRAY_SIZE(ps_control));
+			     constants32 ? ps_control_ps20 : ps_control,
+			     constants32 ? ARRAY_SIZE(ps_control_ps20) :
+				     ARRAY_SIZE(ps_control));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x20030000,
-			     ps_program, ARRAY_SIZE(ps_program));
+			     constants32 ? ps_program_c15_c16 : ps_program,
+			     ARRAY_SIZE(ps_program));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00000000,
 			     vertices, ARRAY_SIZE(vertices));
+	if (constants32) {
+		/* A program switch replays the complete compiler control object. */
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
+				     ps_control_ps20,
+				     ARRAY_SIZE(ps_control_ps20));
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x20030000,
+				     ps_program_c31, ARRAY_SIZE(ps_program_c31));
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00000000,
+				     right_vertices, ARRAY_SIZE(right_vertices));
+	}
+}
+
+void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
+			    bool system_framebuffer)
+{
+	chrome9_emit_3d_quad_h6_internal(cursor, target, system_framebuffer,
+					 false);
 }
 
 static void chrome9_emit_3d_texture_h6(u32 **cursor, unsigned long target,
@@ -996,10 +1060,14 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 	if (do_3d_dma_gem && do_3d_shmem)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 			"DMA GEM and shmem target modes are mutually exclusive\n");
-	if (chrome9_selftest_3d_store > 6)
+	if (chrome9_selftest_3d_store > 7)
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "invalid 3D store probe %u\n",
 				     chrome9_selftest_3d_store);
+	if (chrome9_selftest_3d_store == 7 &&
+	    (!chrome9_selftest_3d_quad || do_3d_texture))
+		return dev_err_probe(&pdev->dev, -EINVAL,
+			"full PS constant probe requires an untextured 3D quad\n");
 	if (chrome9_selftest_3d_store &&
 	    (!chrome9_selftest_init_3d || !chrome9_selftest_cr_observe_3d ||
 	     !do_2d_fill))
@@ -1338,7 +1406,7 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 
 		chrome9_emit_header0(&p, observe, ARRAY_SIZE(observe) / 2);
 	}
-	if (chrome9_selftest_3d_store) {
+	if (chrome9_selftest_3d_store && chrome9_selftest_3d_store != 7) {
 		u32 sync_3d[] = { 0x6c, 0x00800000 };
 
 		chrome9_emit_header0(&p, sync_3d, ARRAY_SIZE(sync_3d) / 2);
@@ -1358,12 +1426,14 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 				do_3d_sf ? 5 * PAGE_SIZE : texture_offset,
 				do_3d_sf, do_3d_sf);
 		else
-			chrome9_emit_3d_quad_h6(&p,
+			chrome9_emit_3d_quad_h6_internal(&p,
 				do_3d_sf ? 2 * PAGE_SIZE :
 				chrome9_selftest_2d_offset,
-				do_3d_sf);
+				do_3d_sf,
+				chrome9_selftest_3d_store == 7);
 		body_dwords = p - body;
-		if (body_dwords != (do_3d_texture ? 232 : 188)) {
+		if (body_dwords != (do_3d_texture ? 232 :
+				    chrome9_selftest_3d_store == 7 ? 372 : 188)) {
 			ret = -EINVAL;
 			goto out_free_ring;
 		}
@@ -1565,9 +1635,13 @@ read_results:
 					pixel != CHROME9_SELFTEST_SENTINEL;
 				bad_pixels +=
 					pixel == CHROME9_SELFTEST_SENTINEL;
-			} else if (chrome9_selftest_3d_quad && !do_3d_sf)
-				/* Solid shading stores the 86/87 blue color as 000000ff. */
-				bad_pixels += pixel != 0x000000ff;
+			} else if (chrome9_selftest_3d_quad && !do_3d_sf) {
+				u32 expected = chrome9_selftest_3d_store == 7 ?
+					(i / sizeof(u32)) % CHROME9_SELFTEST_WIDTH < 16 ?
+					0x00ff0000 : 0x000000ff : 0x000000ff;
+
+				bad_pixels += pixel != expected;
+			}
 			else
 				bad_pixels += pixel != CHROME9_SELFTEST_FILL;
 		}
@@ -1635,7 +1709,11 @@ read_results:
 					PAGE_SIZE / sizeof(u32) + i]) !=
 					CHROME9_SELFTEST_GUARD_WORD;
 			} else {
-				sf_bad_pixels += pixel != 0x000000ff;
+				u32 expected = chrome9_selftest_3d_store == 7 ?
+					i % CHROME9_SELFTEST_WIDTH < 16 ?
+					0x00ff0000 : 0x000000ff : 0x000000ff;
+
+				sf_bad_pixels += pixel != expected;
 			}
 			sf_bad_guard +=
 				READ_ONCE(sf_allocation[i]) !=
@@ -1743,7 +1821,9 @@ read_results:
 				 texture_bad_guard + bad_guard);
 		} else if (do_3d_sf) {
 			dev_info(&pdev->dev,
-				 "VX900 H6 SF 3D blue quad gpu=0x2000 dma=%pad ptes=%08x/%08x/%08x first=%08x last=%08x solid_pixels=%u bad_guard=%u; SL 2D bad_pixels=%u bad_guard=%u restored=yes\n",
+				 "VX900 H6 SF 3D %s quad gpu=0x2000 dma=%pad ptes=%08x/%08x/%08x first=%08x last=%08x solid_pixels=%u bad_guard=%u; SL 2D bad_pixels=%u bad_guard=%u restored=yes\n",
+				 chrome9_selftest_3d_store == 7 ?
+				 "c15*c16/c31" : "blue",
 				 &sf_dma, sf_ptes[0], sf_ptes[1], sf_ptes[2],
 				 sf_first_pixel, sf_last_pixel,
 				 (unsigned int)(PAGE_SIZE / sizeof(u32)) -
@@ -1751,7 +1831,9 @@ read_results:
 				 bad_guard);
 		} else {
 			dev_info(&pdev->dev,
-				 "VX900 H6 3D blue quad offset=%#lx first=%08x last=%08x solid_pixels=%u unchanged_2d=%u zero=%u bad_guard=%u restored=yes\n",
+				 "VX900 H6 3D %s quad offset=%#lx first=%08x last=%08x solid_pixels=%u unchanged_2d=%u zero=%u bad_guard=%u restored=yes\n",
+				 chrome9_selftest_3d_store == 7 ?
+				 "c15*c16/c31" : "blue",
 				 chrome9_selftest_2d_offset, first_pixel,
 				 last_pixel,
 				 (unsigned int)(CHROME9_SELFTEST_SIZE /
@@ -2281,7 +2363,9 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			       DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND |
 			       DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS |
 			       DRM_CHROME9_CAP_DEPTH_EQUAL |
-			       DRM_CHROME9_CAP_DEPTH_ALWAYS;
+			       DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32 |
+			       DRM_CHROME9_CAP_DEPTH_ALWAYS |
+			       DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY;
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
@@ -2551,9 +2635,6 @@ static struct pci_driver chrome9_pci_driver = {
 	.probe = chrome9_pci_probe,
 	.remove = chrome9_pci_remove,
 	.dev_groups = chrome9_device_groups,
-	.driver = {
-		.suppress_bind_attrs = true,
-	},
 };
 module_pci_driver(chrome9_pci_driver);
 
