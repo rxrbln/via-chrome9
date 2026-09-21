@@ -82,8 +82,9 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 32 | reserved | `DEPTH_FUNC_EQUAL` |
 | 33 | reserved | `DRAW_TEXTURED_PROGRAM` |
 | 34 | reserved | `FRAGMENT_CONSTANTS_32` |
+| 35 | reserved | `DEPTH_ALWAYS` |
 
-The next unreserved capability bit is 35.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 36.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -115,3 +116,9 @@ It transports job-local constants but never native instructions. Capability
 bit 34 is deliberately separate: only it permits Mesa to advertise the full
 32-vector fragment constant store. The first command implementation can use
 the live-shaped c0 H2 packet without claiming the two-bank H3 path.
+
+Capability bit 35 adds no command or request field. It says the existing
+depth-function bits `[10:8]` accept `ALWAYS=7`, as specified in
+[ioquake-depth-always-mask-zero.md](ioquake-depth-always-mask-zero.md). The
+first observed consumer is an untextured D16 write with RT0 color mask zero;
+it still requires the existing state-complete command-08 capability.

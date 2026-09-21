@@ -172,6 +172,10 @@ targets.
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
   operation remap, and keeps compatibility alpha test on fixed A33.
+- [ioquake-depth-always-mask-zero.md](ioquake-depth-always-mask-zero.md)
+  records the live ioquake depth-only state, fixes the D16 ALWAYS/mask-zero
+  192-dword packet and capability-35 contract, and separates its bounded
+  promotion from later software-cull and D24S8 stencil work.
 - [ioquake-fixed-function-state-plan.md](ioquake-fixed-function-state-plan.md)
   integrates every recovered blend/depth/alpha/stencil/color-mask encoding,
   closes polygon-offset units by depth allocation, gives exact packet-growth
