@@ -367,6 +367,124 @@ bitwise one, or the shader is the primary-alpha-bypass form with a sampler
 whose alpha is not one and an alpha observer is active. Those cases require
 the new three- or four-ALU object rather than a state-only promotion.
 
+#### Patch-ready command-13 lowering
+
+The fast path uses the 296-byte
+`drm_chrome9_draw_two_textured_triangle_d16_blend` request at private command
+`0x13` (x86 ioctl `0x41286453`), guarded by cap 28. It does not consume
+`reserved0` or any member of `reserved[4]`; all five remain zero. The fixed
+two-factor program is implicit, so there is deliberately no fragment-program
+member in this request. Textures start at byte 32, normalized blend state at
+104, three vertices at 144, scissor at 264, and destination format at 276.
+
+For the live ioquake filter tuple, populate:
+
+```text
+flags                    = DEPTH_FUNC(LEQUAL) | DEPTH_READ_ONLY = 00000b00
+blend.flags              = BLEND_ENABLE
+blend.rgb_src_factor     = DST_COLOR       # normalized value 8, needs cap 29
+blend.rgb_dst_factor     = ZERO            # normalized value 0
+blend.alpha_src_factor   = DST_COLOR       # alpha lowering aliases DST_ALPHA
+blend.alpha_dst_factor   = ZERO
+blend.rgb_func           = ADD
+blend.alpha_func         = ADD
+blend.color_mask         = R|G|B|A = 0f
+blend.alpha_test_func    = 0
+blend.alpha_test_ref     = 0
+```
+
+Mesa must require caps 28, 29, 23 and 15 for that exact request, cap 10 if
+alpha test is enabled, and cap 11 if a partial scissor is submitted. It also
+requires the existing BGRA destination caps if destination format is BGRA.
+The kernel independently accepts only the depth compare/read-only flag mask,
+LESS/LEQUAL, known blend flags and factors, ADD equations, four-bit color
+mask, canonical disabled alpha fields, zero reserved words, and the existing
+four distinct guarded objects. Unknown flags fail before GEM lookup. D16 is
+still reserved/fenced WRITE when read-only is selected.
+
+The white-primary and identity-Q proofs are intentionally Mesa-side. The raw
+request has only packed D1 plus S/T for each unit: the two-factor native
+program does not consume D1 and the ABI cannot express Q. Do not add a kernel
+`D1==ffffffff` rule to the unflagged two-factor command; that would reject
+otherwise valid callers without strengthening packet safety. Mesa checks D1
+and both Q lanes before discarding those semantic inputs, while the kernel
+continues to validate the carried S/T coordinates.
+
+The resulting 270-dword body is byte-identical to the state-complete
+two-factor design. These are the patch assertions which matter for the fast
+path:
+
+| body | exact state |
+|---:|---|
+| `4/6` | target A50 / `A52=5298xxxx` or `5299xxxx` |
+| `7..14` | closed zero A38--A3F |
+| `15..18` | `34000010 35000114 36000420 37000224` |
+| `19` | disabled `A33=33007000` |
+| `24/29` | texture-0 base / image A30 |
+| `44/49` | texture-1 base / image A30 |
+| `64..70` | A86,A87,`53010c0f`,`00000011`,`01c01548`,A88,A89 |
+| `71..75` | D16 A10,A11,`12380000`,`13030000`,`20007fff` |
+| `152..155` | A80 height, A81 width, A82 Y-scissor, A83 X-scissor |
+| `196..208` | PS controls, including `A92=92020002` at 198 |
+| `212..219` | two-TAU H2 and `301001b0 311211b1 cccccccc dddddddd` |
+| `220..223` | ALU H2 header |
+| `224..227` | `0140b6d0 30202053 00f20005 0000007f` |
+| `228..231` | `01c00000 301c0000 00f20105 000d083f` |
+| `232..233` | `cccccccc dddddddd` terminators |
+| `236..239` | immediate H2 header |
+| `240..269` | three ten-dword vertices |
+
+The packed blend words follow directly from the live factor-code table:
+RGB `DST_COLOR` is code `01`, RGB ZERO is `05`, alpha `DST_COLOR` is code
+`02`, and alpha ZERO is `09`. Do not substitute the source-over shortcut or
+change A92 to the three-factor count. Read-only changes only A01 bit 2
+(`...154c -> ...1548`); the object mapping, packet length, depth state and
+fence lifetime are unchanged.
+
+#### Alpha test and scissor interaction
+
+Alpha test adds no dword. Enable it by adding
+`BLEND_ALPHA_TEST_ENABLE` to `blend.flags`, setting normalized function/ref,
+putting `A33=33000000|(func<<12)|encode_ref(ref)` at body 19, and setting A00
+bit 20 at body 67. `encode_ref(ff)=400`; every other byte is
+`(ref<<2)|(ref>>6)`. A failed alpha test is already live-proven to suppress
+both the color store and a write-enabled D16 update. With read-only depth it
+still must not perturb color, blend destination reads, or any guard.
+
+Scissor also adds no dword. The UAPI is the half-open rectangle
+`[min_x,max_x) x [min_y,max_y)`. With scissor disabled all four coordinates
+must be zero and the builder emits:
+
+```text
+body[152] A80 = 80000000 | height
+body[153] A81 = 81000000 | width
+body[154] A82 = 82000000 | height
+body[155] A83 = 83000000 | width
+```
+
+When enabled, only A82/A83 change to
+`82000000|min_y<<12|max_y` and `83000000|min_x<<12|max_x`. The kernel checks
+unknown flags, ordering and target bounds. Mesa should turn an empty
+intersection into a no-op rather than relying on unmeasured zero-area raster
+behavior. Alpha test and scissor are orthogonal: A33/A00 control fragment
+alpha, while A82/A83 prevent raster work outside the rectangle. Always emit
+the complete destination and clip blocks so `alpha on -> off` and
+`partial scissor -> full` cannot inherit stale state.
+
+Use two live discriminators in order:
+
+1. Prefill XRGB with `004080c0` and D16 with `8000`; use a two-texture product
+   `00804020`, white D1, LEQUAL/read-only, DST_COLOR/ZERO, and alpha disabled.
+   The inside result is approximately `00202018`, depth remains `8000`, and
+   all four object guards remain intact.
+2. Prefill a 32-square XRGB target with `00ffffff` and D16 with `ffff`.
+   Enable scissor `[8,24)x[8,24)`, alpha LESS/ref 80, and write-enabled
+   LEQUAL. Use a BGRA first sampler and opaque-white second sampler: first
+   draw product `c0ff0000` at Z=`4000` (killed), then `4000ff00` at Z=`8000`
+   (passes). Only the rectangle intersection becomes `0000ff00/8000`;
+   outside remains `00ffffff/ffff`. Follow with alpha-disabled/full-scissor
+   state and then repeat to prove both closure directions.
+
 ## Mesa path
 
 Use two distinct internal keys:
