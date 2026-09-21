@@ -75,6 +75,9 @@ targets.
 - [direct-sf-scanout-review.md](direct-sf-scanout-review.md) audits the first
   persistent SF scanout implementation, gives its exact no-reboot live gate,
   and defines the modern DRM IRQ/event/page-flip integration boundary.
+- [chrome9-submit-bottleneck.md](chrome9-submit-bottleneck.md) accounts for
+  the synchronous batch path's exact PTE, cache-ownership, guard-readback and
+  retirement costs, and orders the fail-closed performance work.
 - [vx900-kms-next-oracles.md](vx900-kms-next-oracles.md) defines the exact
   primary ARGB cursor, scanout format/pitch limits, conservative IGA2 bring-up,
   DDC/hotplug, DPMS, and VX900 pixel-PLL sequences and restore rules.

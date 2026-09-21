@@ -973,7 +973,8 @@ expected `0x7f/0x80` four-color average.  Twelve submitted triangles, source
 padding, and every guard remained exact.  This promotes single-unit,
 level-zero NPOT dimensions plus those wrap/filter combinations to measured
 silicon behavior.  Two-unit NPOT and actual mip-level selection remain gates
-before advertising full `npot_textures`.
+before advertising full `npot_textures`; the two-unit level-zero gate is
+closed by the later result below, while mip selection remains open.
 
 An independent bounded `glxgears` trace with `CHROME9_DRAW_LIMIT=50` proved
 that the application is already reaching hardware rather than merely swapping
@@ -1002,3 +1003,13 @@ support selects the correct DRI 2-D import path and that Xorg can hand KMS the
 same native guarded Chrome9 GEM object.  It does not make the diagnostic cap
 production-ready: mip-level selection and the L9--L11 tail remain mandatory
 before enabling `npot_textures` by default.
+
+The two-unit level-zero NPOT follow-up also passed.  Kernel commit `e55f146`
+removed the POT-only validator and emitted A22=`22000000` independently for
+each NPOT unit; the no-reboot module
+`chrome9-direct-sf-npot-v2.ko` had SHA-256
+`d451b138ceeffbca43eaf6e8e1f86a8942d5a5f4c276946648b2719f8db5a9e6`.
+Mesa nested commit `19972d4` completed the full smoke suite, including the
+30x18 by 22x14 two-unit MODULATE oracle, and MMIO `040c` remained zero.  This
+closes the two-unit POT-validation gap for level zero, not the remaining mip
+and full-capability gates.

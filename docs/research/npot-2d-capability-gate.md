@@ -265,9 +265,9 @@ solve the intended glamor workload.
    closure pass.
 6. The implicit L9--L11 tail passes on silicon for the advertised 2048
    maximum, including at least one asymmetric NPOT chain.
-7. Two-texture draws either remove their current POT-only validation and pass
-   independent per-stage gates, or every NIR path selecting two NPOT samplers
-   has a correct fallback.
+7. Two-texture draws pass independent per-stage wrap/filter/mip gates.  The
+   old POT-only validator is gone and the basic two-NPOT level-zero path is
+   live-proven below, but that result does not cover mip selection.
 
 Before that point, use a private debug override if necessary to prove that
 the DRI target mismatch is the sole glamor blocker, and label it explicitly
@@ -277,6 +277,33 @@ would be a truthful short-term fix, but current Mesa chooses
 both `dri_init_screen()` and `st_context_create()`; Chrome9 cannot express the
 narrower fact with an existing pipe cap.
 
+## Two-unit NPOT silicon result
+
+Kernel commit `e55f146` removed the two-texture ioctl's POT-only dimension
+rejection and made the per-unit A22 size word conditional exactly like the
+already proven one-unit path:
+
+```text
+NPOT A22 = 22000000
+POT  A22 = 22008000 | (ilog2(height) << 4) | ilog2(width)
+```
+
+The change was loaded without reboot as
+`chrome9-direct-sf-npot-v2.ko`, SHA-256
+`d451b138ceeffbca43eaf6e8e1f86a8942d5a5f4c276946648b2719f8db5a9e6`.
+The complete Mesa smoke at nested commit `19972d4` returned zero, including:
+
+```text
+two-unit NPOT 30x18*22x14 MODULATE passed
+```
+
+MMIO engine error `040c` remained zero.  This is measured evidence that two
+independent level-zero NPOT dimensions work with the existing two-sampler
+MODULATE program and that clearing each unit's A22 POT/log field is correct.
+It does not establish NPOT mip tables, per-stage mip selection, the L9--L11
+tail, or every two-unit wrap/filter transition, so the global Gallium NPOT cap
+remains behind the full checklist above.
+
 ## Confidence ledger
 
 | fact | confidence | basis |
@@ -285,7 +312,8 @@ narrower fact with an existing pipe cap.
 | canonical linear pitch retains logical width | high | executable Xorg setter |
 | shared NPOT wrap/filter state words | high static | manual + paired Windows sampler builders |
 | normalized coordinates on NPOT | high static | common sampler/TAU path; no NPOT alternate in either UMD |
-| one-level NPOT execution | unmeasured | existing ioctl is ready for the bounded gate |
+| one-unit level-zero NPOT execution | high measured | 30x18 wrap/filter silicon oracle |
+| two-unit level-zero NPOT execution | high measured | 30x18 by 22x14 MODULATE, `040c=0` |
 | NPOT L1--L8 addressing | high static, unmeasured | manual + both UMD table builders |
 | L9--L11 packing | unresolved | only L8 location/root behavior is documented |
 | truthful Gallium NPOT cap today | no | mip/view/tail execution gates remain |
