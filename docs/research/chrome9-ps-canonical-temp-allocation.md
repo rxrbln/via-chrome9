@@ -1,0 +1,134 @@
+# Chrome9 canonical pixel temporary allocation
+
+Status: exact Linux 5.75 production-compiler differentials, exact Windows D3D
+identity-callback emitter/finalizer differentials, and static D3D/OpenGL
+finalizer agreement.  This is a compiler contract for the bounded MOV/MUL
+successor; it is not new silicon coverage.
+
+## Result
+
+The Linux production register manager does not encode the D3D logical TEMP
+number directly.  For the logical TEMP ids present in the token stream, it
+removes holes while preserving numeric-id order:
+
+```text
+physical(logical id) = rank(logical id in sorted used-logical-id set)
+```
+
+The discriminating rows are:
+
+| token TEMP set / first-definition order | Linux mapping | active tuple |
+|---|---|---|
+| `{1}` / `r1` | `r1 -> p0` | `(0,1,0,0)` |
+| `{7}` / `r7` | `r7 -> p0` | `(0,1,0,0)` |
+| `{0,1}` / `r1,r0` | `r1 -> p1`, `r0 -> p0` | `(0,2,0,0)` |
+| `{0,2}` / `r0,r2` | `r0 -> p0`, `r2 -> p1` | `(0,2,0,0)` |
+
+The reverse-id row rules out first-definition allocation: logical r1 is
+defined first but remains physical 1 after logical r0 is discovered.  The
+non-dense row rules out direct logical encoding: logical r2 becomes physical
+1.  Lone r1 and r7 both become physical 0.
+
+This pass is also not a liveness allocator.  In the three-record programs
+
+```text
+mov r1,c0       # dead
+mov r0,c1
+mov oC0,r0
+```
+
+and its r0/r1 reverse, both logical ids remain separate physical ids and the
+active tuple remains `(0,2,0,0)`.  Configuration two marks the unused first
+destination with d3.bit29; it does not eliminate it or reuse its id.  A Mesa
+compiler should DCE first.  Nothing here proves that the hardware cannot
+reuse a physical id after a last use; it proves only that this vendor
+production path does not do so for the retained nonoverlap cases.
+
+All valid Linux rows close to A90 `90058000`.  A92 is `92000002` for the
+two-record lone-temp programs and `92000003` for the three-record programs.
+The finalizer's active count is the dense physical count, not the highest
+logical id plus one.
+
+One easily confused metadata field remains logical: the compiled object's
+`temporary_write_mask` is `00000002` for lone logical r1 and `00000080` for
+lone logical r7 even though both executable records use physical r0.  It
+must not be used as a native-resource bitmap or as a source of encoded ids.
+
+## Windows boundary
+
+The D3D harness deliberately installs identity register callbacks so native
+fields can be attributed without a production device object.  Its emitter
+therefore retains logical ids: lone r1 uses destination id 1, lone r7 uses id
+7, and non-dense r0/r2 retains ids 0/2.  The real configuration-two finalizer
+adds final-use/dead-destination flags but does not compact or rewrite those
+ids.
+
+This is useful negative evidence.  The identity-callback lone-r7 object
+finishes at A90 `90040000`, not the Linux production `90058000`; holes are
+not a harmless alternate encoding that a kernel should normalize after the
+fact.  The lone-r1 identity object happens to close at `90058000`, but that
+does not make logical id 1 canonical when only one physical TEMP is active.
+
+The complete D3D and OpenGL configuration-two finalizers are statically
+equivalent after normalizing relocations and direct branch displacements:
+
+| binary | VA range | RVA / file offset |
+|---|---|---|
+| D3D | `10202720..10203204` | `00202720` / `00201b20` |
+| OpenGL | `10255740..10256224` | `00255740` / `00254b40` |
+
+Their normalized `0xae5`-byte SHA-256 is
+`0640c204fb3fe1e7b425215e95b246846e7b83571a5024727fdf9e90f35e738a`.
+The identical A/C/B marker blocks are documented in
+`chrome9-mov-mul-short-chain-three-driver.md`.  No remap action appears in
+that finalizer: it consumes already encoded physical ids.  Dynamic OpenGL
+initialization still fails under headless Wine, so the OpenGL claim is
+static equality, not a second dynamic allocator run.
+
+## Patch-ready rule for the bounded structured compiler
+
+For the proposed at-most-three-record MOV/MUL path, the safest policy is:
+
+1. keep NIR values in SSA; run copy propagation and DCE;
+2. reject read-before-definition, WAW, partial TEMP writes, indirect TEMP
+   addressing, and any dead TEMP destination that survives DCE;
+3. build the set of TEMP values that actually survive;
+4. allocate canonical physical ids densely as `p0..pN-1`; do not expose or
+   accept D3D logical register numbers in the UAPI;
+5. for strict vendor byte parity, order physical ids by a deterministic
+   compiler value key corresponding to the logical-id order used by the
+   reference corpus, not scheduled first-definition order;
+6. for the initial at-most-three-ALU gate, require `N <= 2`, destination ids
+   exactly dense, and every TEMP source to name a preceding definition;
+7. recompute final-use flags after scheduling, with A-over-C-over-B
+   same-record precedence; never accept user-supplied marker bits;
+8. derive the active tuple from `N`, require `(0,N,0,0)`, and close both
+   `N=1` and `N=2` to A90 `90058000`.
+
+If the kernel receives a structured SSA program, it should perform steps
+4--8 itself.  If a later internal interface receives compiler-owned physical
+records, the validator should reject any hole, permutation, read-before-def,
+dead destination, or incorrect last-use marker rather than repair it.  This
+keeps the first gate independent of proprietary logical numbering and avoids
+the lone-r7 A90 failure mode.
+
+The current corpus intentionally includes dead/noncanonical vendor rows as
+negative evidence.  They are not candidates for execution.  Multi-record
+silicon validation remains required before enabling this path.
+
+## Evidence
+
+Exact token programs, D3D raw/final records, Linux raw/configuration-two
+records, remaps, active tuples, and controls are retained in
+[`chrome9-ps-canonical-temp-allocation-corpus.tsv`](chrome9-ps-canonical-temp-allocation-corpus.tsv).
+
+The captured combined D3D/Linux JSON SHA-256 is
+`1420061d5ba342e38f2f8535e20562093f8043801943f8985d7baf712c80e542`.
+The corrected D3D wrapper SHA-256 is
+`e9386bd70a8b1a0857135c9b3117e767e297c7b5c72184df557f3c06cbceed1b`.
+The vendor binary hashes remain:
+
+- D3D: `8ac6959fc3ab21b73fcf37ae4615e87ab285f3a56bc27623f3094d82cee49b45`
+- OpenGL: `a54e38ca7c038d7ce4937f9d940aa6e7d02886ef097730f4a1ae03979c9b4d2c`
+- Linux: `fddb4dea85319c76cac3354e43aa9bcb12a8b7f178cee0f70f6c7efe14a69af4`
+
