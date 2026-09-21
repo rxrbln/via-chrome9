@@ -1770,6 +1770,40 @@ must remain `005a5a5a`.  Verify all six source/target guard pages and both
 unchanged source images.  Only after that smoke test passes should the screen
 advertise two samplers to the state tracker.
 
+### Concrete first two-texture ABI contract
+
+The initial structured request is deliberately fixed at 240 bytes.  It uses
+ioctl number `0x0a` and capability bit 14, contains a 24-byte destination
+prefix, two 36-byte texture descriptions, three 40-byte vertices, the common
+12-byte scissor, and twelve reserved zero bytes.  The operation is implicit:
+sample units 0 and 1 and multiply RGBA component-by-component.  There is no
+program selector, mip pointer, blend state, destination-format selector, or
+depth handle to accidentally expose unvalidated state.
+
+Before acquiring reservations the ioctl must reject nonzero flags/reserved
+words, a non-XRGB destination, non-POT or out-of-range source dimensions,
+noncanonical pitches, unsupported formats/filter/wrap values, non-finite
+RHW/coordinates, RHW at or below zero, and any S/T outside `[0,1]`.  Validate
+the guarded object sizes with checked arithmetic and reject all three handle
+aliases.  Each source gets its own independently derived A20/A22/A30/A31/A32
+words; never copy stage 0's geometry or sampler word into stage 1.
+
+The three-object lifetime is indivisible.  Reserve target, texture 0 and
+texture 1 together; append their pages to the PTE array in that order; map,
+guard, cache-flush and hand all three to the device before publication; and
+attach the same completion fence to all reservations.  Normal retirement
+returns DMA ownership and verifies both guards of every object before SF
+unbind.  Any timeout or failed PTE invalidation quarantines the complete job,
+including all three maps, GEM references, SG tables, PTEs and SF node.  It is
+never safe to unwind texture 1 alone after the ring might have observed the
+job.
+
+`tools/chrome9_two_texture.c` is the first raw ABI oracle.  It fills the
+target with `005a5a5a`, uses independent RGBW and red/red/blue/yellow source
+quadrants, checks exact covered results `00ff0000/00000000/00ffff00`, checks
+the outside sentinel, compares both complete source data pages, and verifies
+all six guards.
+
 ## Measured live result
 
 The kernel-owned test used the oracle's exact local-VRAM addresses,
