@@ -77,6 +77,10 @@ targets.
   A18 versus reserved A19--A1F namespace, cross-checks the fixed eight-entry
   table and LOD/filter words in both Windows UMDs, and specifies a bounded
   two-level kernel/Mesa successor ABI and silicon sequence.
+- [legacy-texture-format-oracles.md](legacy-texture-format-oracles.md)
+  recovers A8/L8/L8A8 and RGB565/ARGB1555/ARGB4444 sampler and render-target
+  encodings, channel and alpha semantics, guarded readback tests, and safe
+  32-bit upload-expansion fallbacks.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
