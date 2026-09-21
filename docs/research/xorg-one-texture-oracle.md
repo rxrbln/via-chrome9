@@ -913,6 +913,26 @@ A24 = 24000000 | (3 * triangles)
 payload dwords = 3 * triangles * vertex_stride
 ```
 
+The first live untextured two-triangle attempt exposed an important template
+inheritance bug before validating this list form.  `chrome9_emit_3d_quad_h6()`
+contains the four-vertex fan word `201c5c00` at body index 48.  The original
+single-triangle derivative changed only A23/A24 at 49/50, so three submitted
+vertices could not reveal that A20 was still a fan.  The initial batch did
+the same.  Its red first triangle and nominally all-green second triangle
+produced `0028d700` at `(16,48)`: for the inset 7.5--55.5 quad, a fan anchored
+at the first red TL vertex has red weight `(55.5-48)/48 = 0.15625`, exactly
+`40/255`, and green weight `215/255`.  This is precise fan interpolation, not
+an attribute-latch anomaly.
+
+Therefore the untextured color builder must explicitly replace
+`body[48+B]` with `20000000`, where `B=4` for the closed blend insertion.
+The D16 insertion adds four more words before raster state, so its index is
+`body[52+B]`; its A23/A24 remain at `53+B`/`54+B`.  Assert A20 together with
+A23/A24.  The safest corrected live test is the identical N=2 payload with
+only this one-word repair.  Until it passes, regard the batching capacity and
+packet maps below as exact construction bounds backed by static list evidence,
+not as live validation of Chrome9 immediate-list restart behavior.
+
 The front end fires after every complete three-vertex list primitive and
 generates PLEND only after the A24 total is exhausted.  There is no separator,
 fire word, or PLEND word between triangles.  For one texture the stride is
