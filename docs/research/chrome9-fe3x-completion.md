@@ -63,6 +63,10 @@ interrupt-wait `00000010`, and queue-skip `00000020`.  The address has four
 implicit zero bits and only 32 encoded bits.  The completion allocation must
 therefore be 16-byte aligned, coherent, covered by a 32-bit DMA mask, and
 rejected if `upper_32_bits(dma_addr)` is nonzero.
+The current probe already restricts `chrome9_dma_bits` to 24--32 and calls
+`dma_set_mask_and_coherent()`, so a `dma_alloc_coherent()` fence page naturally
+uses the correct device-visible domain; retain the explicit upper-bit check as
+an encoding assertion.
 
 Other Windows wait policies are useful cross-checks but not substitutes:
 
