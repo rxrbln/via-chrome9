@@ -532,7 +532,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              source->target != PIPE_TEXTURE_2D ||
              (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
               source->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
-             view->u.tex.first_level || view->u.tex.last_level ||
+             view->u.tex.first_level ||
+             view->u.tex.last_level > original->last_level ||
              !textures[unit]->guarded ||
              !textures[unit]->bo.handle ||
              (textures[unit]->data_offset & 0xff) ||

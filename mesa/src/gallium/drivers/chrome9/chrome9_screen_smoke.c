@@ -1813,6 +1813,7 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_context *context = NULL;
    struct pipe_sampler_view view_templ, rhw_view_templ;
    struct pipe_sampler_view *view = NULL, *mip_view = NULL, *rhw_view = NULL;
+   struct pipe_sampler_view *bad_view = NULL;
    struct pipe_sampler_view *shadow_view = NULL;
    struct winsys_handle shadow_handle = { .type = WINSYS_HANDLE_TYPE_FD };
    struct pipe_transfer *mip_transfer = NULL;
@@ -2005,20 +2006,19 @@ run_pipe_texture(struct pipe_screen *screen)
    sampler_handle = context->create_sampler_state(context, &sampler);
    u_sampler_view_default_template(&view_templ, texture, texture->format);
    mip_view = context->create_sampler_view(context, texture, &view_templ);
-   if (mip_view) {
-      fputs("multi-level sampler view unexpectedly accepted\n", stderr);
-      pipe_sampler_view_reference(&mip_view, NULL);
+   if (!mip_view) {
+      fputs("multi-level resource level-zero view rejected\n", stderr);
       goto out;
    }
    view_templ.u.tex.first_level = 0;
    view_templ.u.tex.last_level = 0;
    view = context->create_sampler_view(context, texture, &view_templ);
    view_templ.swizzle_a = PIPE_SWIZZLE_1;
-   mip_view = context->create_sampler_view(context, texture, &view_templ);
-   if (mip_view) {
+   bad_view = context->create_sampler_view(context, texture, &view_templ);
+   if (bad_view) {
       fputs("BGRA constant-one-alpha sampler view unexpectedly accepted\n",
             stderr);
-      pipe_sampler_view_reference(&mip_view, NULL);
+      pipe_sampler_view_reference(&bad_view, NULL);
       goto out;
    }
    view_templ.swizzle_a = PIPE_SWIZZLE_W;
@@ -2122,7 +2122,7 @@ run_pipe_texture(struct pipe_screen *screen)
    context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 1,
                                 samplers);
    context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
-                              &view);
+                              &mip_view);
    context->set_vertex_buffers(context, 1, &vertex_buffer);
    context->set_framebuffer_state(context, &framebuffer);
    context->set_viewport_states(context, 0, 1, &viewport);
@@ -2726,6 +2726,7 @@ out:
       if (projected_modulate_fs)
          context->delete_fs_state(context, projected_modulate_fs);
       if (view) pipe_sampler_view_reference(&view, NULL);
+      if (mip_view) pipe_sampler_view_reference(&mip_view, NULL);
       if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
       if (shadow_view) pipe_sampler_view_reference(&shadow_view, NULL);
       if (sampler_handle)

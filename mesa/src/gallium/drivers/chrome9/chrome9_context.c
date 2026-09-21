@@ -1407,7 +1407,7 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                     (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
                      templ->format == PIPE_FORMAT_B8G8R8A8_UNORM) &&
                     !templ->u.tex.first_level &&
-                    !templ->u.tex.last_level &&
+                    templ->u.tex.last_level <= texture->last_level &&
                     !templ->u.tex.first_layer &&
                     !templ->u.tex.last_layer &&
                     templ->swizzle_r == PIPE_SWIZZLE_X &&
