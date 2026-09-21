@@ -1,5 +1,14 @@
 # Bounded one- and two-texture list/run batching
 
+> **Historical one-page proof:** the packet/state/UAPI validation in this
+> document remains applicable, but its eight-segment execution and 192/144
+> run maxima were superseded before capability promotion.  The preferred
+> design uses one 32-KiB list, 256 triangles, and one retirement for either
+> texture count; see
+> [persistent-batched-submit-performance-plan.md](persistent-batched-submit-performance-plan.md).
+> Retain these one-page maxima as staged oracle boundaries and as a fallback
+> if the larger list does not pass silicon validation.
+
 ## Result
 
 Chrome9 can reduce synchronous textured draw submissions without changing

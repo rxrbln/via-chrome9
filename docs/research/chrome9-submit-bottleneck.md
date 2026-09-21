@@ -1,5 +1,13 @@
 # Chrome9 synchronous submission bottleneck audit
 
+> **Performance-design revision:** the accounting and live measurements in
+> this note remain authoritative, but its eight-one-page-segment execution
+> recommendation has been superseded before ABI promotion.  The exact 32-KiB
+> single-list closure and separately gated persistent SF/GART cache are in
+> [persistent-batched-submit-performance-plan.md](persistent-batched-submit-performance-plan.md).
+> Retain the eight-segment design only as the conservative fallback if the
+> staged large-list silicon oracle fails.
+
 The first direct-SF Xorg/glamor gate is correct but deliberately slow.  The
 2026-09-21 run with kernel `6193bb5` reached about 20.2 FPS in bounded
 `glxgears`, with no engine error and a clean display restore.  This note

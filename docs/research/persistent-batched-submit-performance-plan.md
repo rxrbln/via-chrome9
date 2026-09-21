@@ -78,7 +78,18 @@ emit state once before a primitive range:
 - Proprietary Linux 5.75 allocates variable-sized command space through
   `cmGetSpace_inv:0xb2730`, releases it through
   `cmReleaseSpace_inv:0xb2690`, and kicks a resident ring through
-  `cmKickoffDMA_inv:0xb25e0` / `0xb0fb0`.
+  `cmKickoffDMA_inv:0xb25e0` / `0xb0fb0`.  More directly, its PCIe setup maps
+  one SG allocation covering `DMA_size + agp_tex_size` into consecutive PTEs
+  from SF zero; `agp_offset = DMA_size`, and later heap allocations are stable
+  offsets in the post-ring SF range (`via_chrome9_dma.c:157-189,617-620,
+  669-676`, `via_chrome9_mm.c:661-745`).  It does not republish object PTEs at
+  every primitive boundary.
+- Windows KMD's allocator-level SF map/unmap routines are at
+  `VTGKModeDX32A.sys:0x2ddf0` / `0x2db10`.  They populate an allocation
+  residency array alongside the PTEs and issue the `SR6F` translation flush;
+  the UMD draw path instead submits relocation/state ranges.  This supports
+  allocation-lifetime translation residency, while not establishing Linux's
+  proposed LRU limits or eviction policy.
 - Mesa 7.11.2 UniChrome extends a primitive until a 3,968-byte DMA high-water
   mark instead of firing each triangle independently.
 

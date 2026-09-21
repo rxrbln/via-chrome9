@@ -1,5 +1,12 @@
 # Bounded eight-segment D16 RHW run design
 
+> **Historical safe fallback:** this document proves the eight-page-segment
+> form.  Before command `0x0f` capability promotion, the preferred performance
+> design changed to one 32-KiB state-complete list with the same 272-triangle
+> maximum, exact `0x5290` copied end, and one retirement.  See
+> [persistent-batched-submit-performance-plan.md](persistent-batched-submit-performance-plan.md).
+> Use this segmented form only if the staged large-list hardware gate fails.
+
 ## Goal and non-goals
 
 The live Gouraud trace issued 237 synchronous
