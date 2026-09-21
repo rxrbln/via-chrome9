@@ -122,10 +122,9 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                          crender->packed_generic ? EMIT_4F : EMIT_4UB_BGRA,
                          crender->packed_generic ? generic0 : color0);
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
-   /* Keep R/Q visible to the validated userspace boundary.  The first
-    * hardware ABI implements ordinary 2D coordinates only, so draw-time
-    * validation below accepts Q==1 and rejects projective texturing instead
-    * of silently discarding it. */
+   /* Keep a fixed four-float slot for each coordinate set.  Ordinary 2D
+    * sampling consumes only S/T; linked shaders are allowed to export a vec2
+    * and leave the unused R/Q components at draw's defaults. */
    if (crender->packed_generic != 2)
       for (unsigned unit = 0; unit < crender->texture_count; unit++)
          draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, texcoord[unit]);
@@ -452,6 +451,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        (!ctx->draw_two_textured_triangle || *depth_active ||
         *blend_successor))
       return false;
+   if (texture_count && *depth_active && *blend_successor)
+      return false;
    *reason = "successor-capability";
    if (*blend_successor &&
        (*depth_active ? !ctx->draw_triangle_d16_blend :
@@ -461,8 +462,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    if (texture_count) {
       *reason = "texture-count/depth";
       if (!(texture_count == 2 ? ctx->draw_two_textured_triangle :
-                                 ctx->draw_textured_triangle) ||
-          *depth_active ||
+             (*depth_active ? ctx->draw_textured_triangle_d16 :
+                              ctx->draw_textured_triangle)) ||
           ctx->num_sampler_states != texture_count ||
           ctx->num_sampler_views != texture_count)
          return false;
@@ -553,6 +554,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct drm_chrome9_draw_triangle_d16 depth_args = { 0 };
    struct drm_chrome9_draw_triangle_d16_blend depth_blend_args = { 0 };
    struct drm_chrome9_draw_textured_triangle texture_args = { 0 };
+   struct drm_chrome9_draw_textured_triangle_d16 texture_depth_args = { 0 };
    struct drm_chrome9_draw_textured_triangle_blend texture_blend_args = { 0 };
    struct drm_chrome9_draw_two_textured_triangle two_texture_args = { 0 };
    struct drm_chrome9_blend_state blend_state;
@@ -657,8 +659,6 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          if (!isfinite(position[2]) || !isfinite(position[3]) ||
              position[3] <= 0.0f || !isfinite(texcoord[0]) ||
              !isfinite(texcoord[1]) ||
-             (crender->packed_generic != 2 &&
-              (!isfinite(texcoord[2]) || texcoord[3] != 1.0f)) ||
              (crender->texture_count == 2 &&
               (texcoord[0] < 0.0f || texcoord[0] > 1.0f ||
                texcoord[1] < 0.0f || texcoord[1] > 1.0f))) {
@@ -683,13 +683,13 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          memcpy(&texture_args.vertices[i].t_float, &texcoord[1],
                 sizeof(texcoord[1]));
          texture_blend_args.vertices[i] = texture_args.vertices[i];
+         texture_depth_args.vertices[i] = texture_args.vertices[i];
          if (crender->texture_count == 2) {
             struct drm_chrome9_two_textured_vertex *two_vertex =
                &two_texture_args.vertices[i];
             const float *texcoord1 = texcoord + 4;
 
             if (!isfinite(texcoord1[0]) || !isfinite(texcoord1[1]) ||
-                !isfinite(texcoord1[2]) || texcoord1[3] != 1.0f ||
                 texcoord1[0] < 0.0f || texcoord1[0] > 1.0f ||
                 texcoord1[1] < 0.0f || texcoord1[1] > 1.0f) {
                ctx->rejected_triangles++;
@@ -817,6 +817,29 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
             DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
+      if (depth_active) {
+         texture_depth_args.destination_handle =
+            texture_args.destination_handle;
+         texture_depth_args.texture_handle = texture_args.texture_handle;
+         texture_depth_args.depth_handle = depth->bo.handle;
+         texture_depth_args.flags =
+            DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+         texture_depth_args.program = texture_args.program;
+         texture_depth_args.width = texture_args.width;
+         texture_depth_args.height = texture_args.height;
+         texture_depth_args.destination_pitch =
+            texture_args.destination_pitch;
+         texture_depth_args.depth_pitch = depth->stride;
+         texture_depth_args.texture_width = texture_args.texture_width;
+         texture_depth_args.texture_height = texture_args.texture_height;
+         texture_depth_args.texture_pitch = texture_args.texture_pitch;
+         texture_depth_args.texture_format = texture_args.texture_format;
+         texture_depth_args.min_filter = texture_args.min_filter;
+         texture_depth_args.mag_filter = texture_args.mag_filter;
+         texture_depth_args.wrap_s = texture_args.wrap_s;
+         texture_depth_args.wrap_t = texture_args.wrap_t;
+         texture_depth_args.scissor = scissor;
+      }
    } else if (depth_active) {
       if (ctx->depth_func_supported)
          depth_args.flags =
@@ -912,6 +935,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
    const bool submitted = crender->texture_count == 2 ?
       chrome9_draw_two_textured_triangle(fd, &two_texture_args) :
+      crender->textured && depth_active ?
+      chrome9_draw_textured_triangle_d16(fd, &texture_depth_args) :
       crender->textured && blend_successor ?
       chrome9_draw_textured_triangle_blend(fd, &texture_blend_args) :
       crender->textured ?

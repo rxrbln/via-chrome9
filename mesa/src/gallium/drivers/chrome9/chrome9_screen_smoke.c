@@ -104,9 +104,6 @@ make_texture_vertex_shader(struct pipe_screen *screen,
                              .io_semantics.location = VERT_ATTRIB_POS);
    texcoord = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0),
                              .io_semantics.location = VERT_ATTRIB_TEX0);
-   texcoord = nir_vec4(&b, nir_channel(&b, texcoord, 0),
-                       nir_channel(&b, texcoord, 1), nir_imm_float(&b, 0.0f),
-                       nir_imm_float(&b, 1.0f));
    nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = VARYING_SLOT_POS);
    if (emit_color) {
@@ -117,7 +114,7 @@ make_texture_vertex_shader(struct pipe_screen *screen,
       nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
                        .io_semantics.location = VARYING_SLOT_COL0);
    }
-   nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0xf,
+   nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0x3,
                     .io_semantics.location = emit_color ?
                        VARYING_SLOT_TEX0 : VARYING_SLOT_VAR0);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
@@ -2217,6 +2214,226 @@ out:
 }
 
 static bool
+run_pipe_textured_depth(struct pipe_screen *screen)
+{
+   static const struct smoke_texture_vertex vertices[3][4] = {
+      {
+         { { -1, -1,  0.0, 1 }, { 0, 0, 1, 1 }, { 0, 0 } },
+         { { -1,  1,  0.0, 1 }, { 0, 0, 1, 1 }, { 0, 1 } },
+         { {  1, -1,  0.0, 1 }, { 0, 0, 1, 1 }, { 1, 0 } },
+         { {  1,  1,  0.0, 1 }, { 0, 0, 1, 1 }, { 1, 1 } },
+      }, {
+         { { -1, -1,  0.5, 1 }, { 0, 1, 0, 1 }, { 0, 0 } },
+         { { -1,  1,  0.5, 1 }, { 0, 1, 0, 1 }, { 0, 1 } },
+         { {  1, -1,  0.5, 1 }, { 0, 1, 0, 1 }, { 1, 0 } },
+         { {  1,  1,  0.5, 1 }, { 0, 1, 0, 1 }, { 1, 1 } },
+      }, {
+         { { -1, -1, -0.5, 1 }, { 1, 0, 0, 1 }, { 0, 0 } },
+         { { -1,  1, -0.5, 1 }, { 1, 0, 0, 1 }, { 0, 1 } },
+         { {  1, -1, -0.5, 1 }, { 1, 0, 0, 1 }, { 1, 0 } },
+         { {  1,  1, -0.5, 1 }, { 1, 0, 0, 1 }, { 1, 1 } },
+      },
+   };
+   struct pipe_resource target_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .width0 = 32, .height0 = 32, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource texture_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = 2, .height0 = 2, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource depth_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_Z16_UNORM,
+      .width0 = 32, .height0 = 32, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource *target = NULL, *texture = NULL, *depth = NULL;
+   struct pipe_context *context = NULL;
+   struct pipe_sampler_view view_templ;
+   struct pipe_sampler_view *view = NULL;
+   struct pipe_sampler_state sampler = {
+      .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+      .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   struct pipe_blend_state blend = { 0 };
+   struct pipe_depth_stencil_alpha_state dsa = {
+      .depth_enabled = true,
+      .depth_writemask = true,
+      .depth_func = PIPE_FUNC_LEQUAL,
+   };
+   struct pipe_rasterizer_state rasterizer = {
+      .half_pixel_center = true,
+      .bottom_edge_rule = true,
+      .depth_clip_near = true,
+      .depth_clip_far = true,
+   };
+   struct pipe_vertex_element elements[3] = { 0 };
+   struct pipe_vertex_buffer vertex_buffer = {
+      .is_user_buffer = true,
+      .buffer.user = vertices[0],
+   };
+   struct pipe_framebuffer_state framebuffer = {
+      .width = 32, .height = 32, .nr_cbufs = 1,
+   };
+   struct pipe_viewport_state viewport = {
+      .scale = { 16, 16, 0.5 }, .translate = { 16, 16, 0.5 },
+   };
+   struct pipe_scissor_state scissor = { .maxx = 32, .maxy = 32 };
+   struct pipe_draw_info info = {
+      .mode = MESA_PRIM_QUAD_STRIP, .index_bounds_valid = true,
+      .instance_count = 1, .min_index = 0, .max_index = 3,
+   };
+   struct pipe_draw_start_count_bias draw = { .count = 4 };
+   union pipe_color_union clear = { 0 };
+   void *blend_handle = NULL, *dsa_handle = NULL;
+   void *rasterizer_handle = NULL, *elements_handle = NULL;
+   void *vs = NULL, *fs = NULL, *sampler_handle = NULL;
+   struct chrome9_resource *ctarget, *ctexture, *cdepth;
+   struct chrome9_context *ccontext;
+   uint32_t texture_copy[4] = { 0xffffffff, 0xffffffff,
+                                0xffffffff, 0xffffffff };
+   uint32_t samples[3] = { 0 };
+   uint16_t depth_samples[3] = { 0 };
+   uint64_t submitted, rejected;
+   bool passed = false;
+
+   target = screen->resource_create(screen, &target_templ);
+   texture = screen->resource_create(screen, &texture_templ);
+   depth = screen->resource_create(screen, &depth_templ);
+   context = screen->context_create(screen, NULL, 0);
+   if (!target || !texture || !depth || !context)
+      goto out;
+   ctarget = chrome9_resource(target);
+   ctexture = chrome9_resource(texture);
+   cdepth = chrome9_resource(depth);
+   ccontext = chrome9_context(context);
+   memset(ctarget->bo.map, 0x5a, ctarget->bo.size);
+   memset(ctexture->bo.map, 0xa5, ctexture->bo.size);
+   memset(cdepth->bo.map, 0x5a, cdepth->bo.size);
+   uint32_t *texels = (uint32_t *)
+      ((uint8_t *)ctexture->bo.map + ctexture->data_offset);
+   texels[0] = texels[1] = texture_copy[0];
+   texels[ctexture->stride / 4] = texture_copy[2];
+   texels[ctexture->stride / 4 + 1] = texture_copy[3];
+
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   blend_handle = context->create_blend_state(context, &blend);
+   dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   elements[0].src_offset = offsetof(struct smoke_texture_vertex, position);
+   elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[0].src_stride = sizeof(struct smoke_texture_vertex);
+   elements[1].src_offset = offsetof(struct smoke_texture_vertex, color);
+   elements[1].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[1].src_stride = sizeof(struct smoke_texture_vertex);
+   elements[2].src_offset = offsetof(struct smoke_texture_vertex, texcoord);
+   elements[2].src_format = PIPE_FORMAT_R32G32_FLOAT;
+   elements[2].src_stride = sizeof(struct smoke_texture_vertex);
+   elements_handle = context->create_vertex_elements_state(context, 3,
+                                                            elements);
+   sampler_handle = context->create_sampler_state(context, &sampler);
+   u_sampler_view_default_template(&view_templ, texture, texture->format);
+   view = context->create_sampler_view(context, texture, &view_templ);
+   vs = make_texture_vertex_shader(screen, context, true);
+   fs = make_texture_fragment_shader(screen, context, true);
+   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+       !elements_handle || !sampler_handle || !view || !vs || !fs)
+      goto out;
+
+   framebuffer.cbufs[0].format = target->format;
+   framebuffer.cbufs[0].texture = target;
+   framebuffer.zsbuf.format = depth->format;
+   framebuffer.zsbuf.texture = depth;
+   context->bind_blend_state(context, blend_handle);
+   context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   context->bind_rasterizer_state(context, rasterizer_handle);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, vs);
+   context->bind_fs_state(context, fs);
+   context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 1,
+                                &sampler_handle);
+   context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0, &view);
+   context->set_framebuffer_state(context, &framebuffer);
+   context->set_viewport_states(context, 0, 1, &viewport);
+   context->set_scissor_states(context, 0, 1, &scissor);
+   context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                  PIPE_MASK_RGBA, 0xff, NULL, &clear, 0.5, 0);
+   submitted = ccontext->submitted_triangles;
+   rejected = ccontext->rejected_triangles;
+   for (unsigned pass = 0; pass < ARRAY_SIZE(vertices); pass++) {
+      uint32_t *pixels = (uint32_t *)
+         ((uint8_t *)ctarget->bo.map + ctarget->data_offset);
+      uint16_t *depth_pixels = (uint16_t *)
+         ((uint8_t *)cdepth->bo.map + cdepth->data_offset);
+
+      vertex_buffer.buffer.user = vertices[pass];
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      samples[pass] = pixels[16 * (ctarget->stride / 4) + 16] & 0xffffff;
+      depth_samples[pass] = depth_pixels[16 * (cdepth->stride / 2) + 16];
+   }
+   passed = samples[0] == 0x000000ff &&
+            samples[1] == samples[0] &&
+            samples[2] == 0x00ff0000 &&
+            depth_samples[0] >= 0x7ffe && depth_samples[0] <= 0x8001 &&
+            depth_samples[1] >= 0x7ffe && depth_samples[1] <= 0x8001 &&
+            depth_samples[2] >= 0x3ffe && depth_samples[2] <= 0x4001 &&
+            ccontext->submitted_triangles == submitted + 6 &&
+            ccontext->rejected_triangles == rejected &&
+            texels[0] == texture_copy[0] && texels[1] == texture_copy[1] &&
+            texels[ctexture->stride / 4] == texture_copy[2] &&
+            texels[ctexture->stride / 4 + 1] == texture_copy[3] &&
+            smoke_guard_pages_match(ctarget) &&
+            smoke_guard_pages_match(ctexture) &&
+            smoke_guard_pages_match(cdepth);
+   if (passed)
+      printf("Gallium textured D16 LEQUAL passed: "
+             "equal=%08x/%04x far=%08x/%04x near=%08x/%04x\n",
+             samples[0], depth_samples[0], samples[1], depth_samples[1],
+             samples[2], depth_samples[2]);
+   else
+      fprintf(stderr,
+              "Gallium textured D16 LEQUAL mismatch: "
+              "equal=%08x/%04x far=%08x/%04x near=%08x/%04x "
+              "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+              samples[0], depth_samples[0], samples[1], depth_samples[1],
+              samples[2], depth_samples[2],
+              ccontext->submitted_triangles - submitted,
+              ccontext->rejected_triangles - rejected);
+
+out:
+   if (context) {
+      if (view) pipe_sampler_view_reference(&view, NULL);
+      if (vs) context->delete_vs_state(context, vs);
+      if (fs) context->delete_fs_state(context, fs);
+      if (elements_handle)
+         context->delete_vertex_elements_state(context, elements_handle);
+      if (sampler_handle)
+         context->delete_sampler_state(context, sampler_handle);
+      if (rasterizer_handle)
+         context->delete_rasterizer_state(context, rasterizer_handle);
+      if (dsa_handle)
+         context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (blend_handle) context->delete_blend_state(context, blend_handle);
+      context->destroy(context);
+   }
+   if (depth) screen->resource_destroy(screen, depth);
+   if (texture) screen->resource_destroy(screen, texture);
+   if (target) screen->resource_destroy(screen, target);
+   return passed;
+}
+
+static bool
 run_pipe_npot_texture(struct pipe_screen *screen)
 {
    static const struct {
@@ -2968,6 +3185,14 @@ main(int argc, char **argv)
    if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions) {
       if (!run_pipe_texture(screen)) {
          fputs("Chrome9 Gallium texture draw failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16) &&
+          !run_pipe_textured_depth(screen)) {
+         fputs("Chrome9 Gallium textured D16 draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;
