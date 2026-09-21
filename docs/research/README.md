@@ -164,6 +164,9 @@ targets.
 - [ioquake3-blend-alpha-matrix.md](ioquake3-blend-alpha-matrix.md) intersects
   shipped shader-stage blend/alpha/depth tuples with current structured draw
   support, fixes the A52 boundary, and proves A7B is not per-draw state.
+- [textured-d16-blend-uapi-design.md](textured-d16-blend-uapi-design.md)
+  defines capability-gated one-/two-texture D16 blend successors, resolves
+  the A33/A10 collision at body 19, and fixes packet, lifetime and live gates.
 - [two-texture-primary-uapi-design.md](two-texture-primary-uapi-design.md)
   defines the flag-compatible no-depth/D16 three-factor ABI, exact 266/270
   dword packet maps, Mesa Q=1 gates, and staged four-object silicon tests.

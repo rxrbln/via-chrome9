@@ -29,8 +29,10 @@ number; design notes must link here rather than independently claiming the
 | `0f` | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
 | `10` | reserved | `DRAW_CLIP_TRIANGLE` |
 | `11` | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
+| `12` | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
+| `13` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
 
-The next unreserved command is `0x12`.  A reservation is not an advertised
+The next unreserved command is `0x14`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -69,8 +71,10 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 24 | reserved | `DRAW_CLIP_TRIANGLE` |
 | 25 | reserved | `TWO_TEXTURE_PRIMARY_MODULATE` |
 | 26 | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
+| 27 | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
+| 28 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
 
-The next unreserved capability bit is 27.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 29.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
