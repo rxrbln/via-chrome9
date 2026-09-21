@@ -811,10 +811,12 @@ class from existing booleans:
   `ring_pause` is not an owned late-retirement target.  Treating every
   `published && !retirement_proven` job as late work would be unsafe.
 * A GTI failure can occur before command publication.  The BOs have already
-  received `dma_sync_sgtable_for_device()`, the reservation fence is attached,
-  and the transient PTEs remain reachable, but no command references them.
-  This is translation-only recovery and still needs a device-to-CPU ownership
-  transition before vunmap/release.  It is not a command timeout.
+  received `dma_sync_sgtable_for_device()` and the reservation fence is
+  attached if the bind succeeded far enough to build a command.  An initial
+  bind failure can instead reach the same quarantine before either action.
+  In both cases transient PTE state remains reachable but no command references
+  it.  This is translation-only recovery, not a command timeout; only the
+  former subcase needs a device-to-CPU ownership transition.
 
 Add an explicit, immutable quarantine reason at the four call-site classes,
 rather than deriving it later:
@@ -831,6 +833,56 @@ actually published.  Do not set it in `CHROME9_QUAR_RING_STOP`.  A reason enum
 is preferable to testing whether the fence is signaled: signaling describes
 userspace completion, not hardware ownership, and is too indirect to be a
 memory-lifetime invariant.
+
+The exact current call-site state is:
+
+| reason | this job body | retirement | fence | DMA ownership |
+|---|---|---|---|---|
+| `GTI_UNPUBLISHED` after initial bind failure | never published | not applicable | not attached, signaled error | CPU |
+| `GTI_UNPUBLISHED` after later build/append rejection | never published | not applicable | attached, signaled error | device |
+| `GTI_RETIRED` | published | cookie + PAUSE + work idle proved | attached, signaled error | CPU |
+| `JOB_TIMEOUT` | published | not yet proved | attached, unsignaled error | device |
+| `RING_STOP` | never published; only the old ring's PID10 was published | old-ring STOP unproved | attached, unsignaled error | device |
+
+Use a job `device_owned` bit, initialized clear, set at every existing
+`dma_sync_sgtable_for_device()` group and cleared at the CPU transition.  This
+is less error-prone than a `cpu_owned` default because it represents the only
+state which requires recovery work and cleanly covers both unpublished GTI
+subcases.
+
+### Engine busy versus a lost interrupt
+
+There is no render-completion IRQ in the current submit path.  Jobs end with a
+2D `DST_POS` cookie and `chrome9_wait_job()` polls MMIO three times; it neither
+enables `0200.bit31`, consumes `0204.bit5`, waits on an IRQ, nor submits an
+FE3x interrupting fence.  Therefore a current `JOB_TIMEOUT` cannot be
+classified as “lost IRQ.”  If the second ordered poll succeeds, it was late
+hardware/software polling completion.  If it fails, the hardware is still
+busy or its state is unclassified and the mapping remains quarantined.
+
+Classify the late sample by the first failed ordered predicate:
+
+| cookie | owned PAUSE | non-CR work | meaning | release |
+|---|---|---|---|---|
+| wrong | any | any | this body has not proved its ordered final write | no |
+| exact | clear, including `0444=60000000` | clear | body drained, reader still active | not in the first tranche |
+| exact | set | nonzero | CR stopped but an already-dispatched engine is busy | no |
+| exact | set | zero | late ordinary retirement | yes, after CPU sync and successful GTI invalidation |
+
+Sample `040c`, `043c`, and `0440` for diagnosis only.  Neither a clear error
+register nor a fetch cursor upgrades any row.  `0400.bit4` alone is the legal
+paused reader and is excluded by `00101fe3`; using the full `00101ff3` mask
+would falsely turn normal PAUSE into a busy engine.
+
+A future IRQ-driven implementation may call a timeout “lost IRQ” only when an
+independent, same-epoch completion record proves the exact fence ID (the
+Windows path uses an FE3x system-memory write and `0494`), while the cookie,
+owned PAUSE and non-CR-idle proof also succeeds.  `0204.bit5` merely reports a
+pending CR interrupt and `0494` alone can be stale; neither permits release.
+Bring up that path separately as already specified: coherent system write by
+polling, then interrupt generation without interrupt-wait, exact RW1C ack of
+only `0204.bit5`, and only then interrupt-wait.  Recovery of today's cookie
+jobs must not consult `0494` or alter IRQ registers.
 
 ### Smallest safe recovery transaction
 
@@ -866,11 +918,11 @@ The transaction is:
    cookie alone, full-idle `00101ff3`, or a PAUSE without the cookie.  On
    success set `retirement_proven=true`; on any miss, leave every resource and
    fence unchanged.
-4. If CPU ownership was not already restored, run
+4. If `device_owned` is set, run
    `dma_sync_sgtable_for_cpu(..., DMA_BIDIRECTIONAL)` for every present role,
    flush/invalidate each entire mapped GEM size, and `dma_rmb()`.  Record a
-   per-job `cpu_owned` bit at the existing successful transition so the
-   retired-GTI case is not transitioned twice.  Preserve exact logical guard
+   per-job transition by clearing `device_owned` so the retired-GTI case is not
+   transitioned twice.  Preserve exact logical guard
    offsets in the job and run the same guard checks for a late job.  A failed
    guard upgrades/logs the fence error but does not forbid PTE invalidation and
    release: the existing normal path also releases after an intra-object guard
