@@ -136,10 +136,12 @@ For modesetting and atomic KMS the indexed display registers remain relevant:
 IGA2 CR61 bit 5 is a read-only `start address change/Flip Flag`.  More usefully
 for the first IGA1 path, the Part II manual defines MMIO `0204[1]` as Graphics
 Starting Address Update Status: writing `0214` sets it, and hardware clears it
-when the start address is updated.  Complete an IGA1 direct flip only on a
-post-arm vblank for which that bit is clear and the masked `0214` base matches.
-The full race and teardown rules are in
-[iga1-vblank-flip-oracle.md](iga1-vblank-flip-oracle.md).
+when the start address is updated.  A live VX900 direct write reached the new
+`0214` shadow but left this RO bit set across a measured frame boundary.
+Neither Windows nor Xorg reads or acknowledges it, so it remains a fail-closed
+diagnostic rather than a qualified completion predicate.  See
+[iga1-flip-pending-contradiction.md](iga1-flip-pending-contradiction.md) for
+the exact trace and next discriminators.
 
 ## Vsync interrupt and blank-status matrix
 

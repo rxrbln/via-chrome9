@@ -272,6 +272,14 @@ for a strictly post-arm `0200.bit1` blank-level transition, then requires
 `0204.bit1=0` and the exact masked `0214` value.  The level is used only as a
 bounded frame-boundary poll; it is not counted as a vblank interrupt.
 
+That completion predicate subsequently failed live: `0214` accepted the new
+shadow while RO `0204.bit1` remained set for 100 ms after a measured boundary.
+The driver correctly quarantined both mappings and full restore succeeded.
+The Windows KMD never tests bit 1 and always arms global `0200.bit31` before
+the write, whereas this run had bit 31 clear.  The exact evidence and bounded
+next test are in
+[iga1-flip-pending-contradiction.md](iga1-flip-pending-contradiction.md).
+
 Success transfers `active_fb`, sends the retained event, and then releases the
 old display pin.  A failure before base publication retains the event and
 blocks later flips.  A failure after publication additionally retains the new

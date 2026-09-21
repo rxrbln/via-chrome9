@@ -116,6 +116,9 @@ targets.
   exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
   X-versus-alpha sampler semantics, and strict render-target reinterpretation
   boundary.
+- [iga1-flip-pending-contradiction.md](iga1-flip-pending-contradiction.md)
+  reconciles the live stuck `0204[1]` flip status with the manual and Windows
+  KMD, proves it is not RW1C, and defines the next latch discriminators.
 - [render-to-scanout-ownership.md](render-to-scanout-ownership.md) defines the
   same-device, same-BO 3D-to-IGA1 ownership boundary and separates producer
   drain, display latch, GTI invalidation, and CPU cache transitions.

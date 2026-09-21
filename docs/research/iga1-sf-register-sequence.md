@@ -183,7 +183,7 @@ which is not fully bound, a stale/absent producer fence result, or
 retain display references.  Reading back the new `0214` value is not latch
 completion.
 
-The completion predicate remains exactly:
+The original conservative completion predicate was:
 
 ```text
 a newly handled post-arm 0200.bit3 IGA1-vsync interrupt
@@ -191,10 +191,14 @@ and (readl(0204) & BIT(1)) == 0
 and (readl(0214) & 1fffffff) == (packed & 1fffffff)
 ```
 
-Only then send the DRM event, make `new` active, and defer release of the old
-display reference.  If the first vblank still sees bit 1, retain both and try
-a bounded later vblank.  Timeout, address mismatch, or stopped IRQ cadence
-quarantines both until a confirmed full CRTC disable.
+Only then would the driver send the DRM event, make `new` active, and defer
+release of the old display reference.  Live VX900 testing subsequently found
+that `0214` accepted the new shadow while RO `0204.bit1` stayed set over the
+measured frame boundary and 100-ms follow-up.  This predicate is therefore
+not qualified for successful completion.  Timeout, address mismatch, or
+stopped IRQ cadence still quarantines both mappings until a confirmed full
+CRTC disable.  The exact contradiction and next discriminators are in
+[iga1-flip-pending-contradiction.md](iga1-flip-pending-contradiction.md).
 
 ## Exact IRQ enable and acknowledgement
 
@@ -357,7 +361,8 @@ Run each gate on a fresh boot and stop at the first mismatch:
    completion predicate.  A software-suppressed completion must leave both
    mappings pinned and must not send a successful event.
 
-Expected idle behavior is ordinary CR PAUSE/retired producer state before
-each display publication, `0204.bit1` transiently one or already zero, then
-zero by a bounded post-arm vblank.  No display step may leave `0400` newly
-busy, set `040c`, alter the command ring, or modify guard pages.
+The intended manual behavior was `0204.bit1` transiently one, then zero by a
+bounded post-arm vblank.  That did not occur in the first live direct-flip
+test, although ordinary CR PAUSE/retired producer state and full restore were
+clean.  No display step may leave `0400` newly busy, set `040c`, alter the
+command ring, or modify guard pages.
