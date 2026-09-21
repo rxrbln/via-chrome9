@@ -10,7 +10,7 @@ shader compiler.  The source audited here is the T2 copy at
 
 | rank | scene/key | minimum new work | packet change | wedge risk |
 |---:|---|---|---|---|
-| 1 | `shading:shading=gouraud` | accept direct `vec4 VAR0` or the exact scalarized blue-material form and pack it into D1 | none | low |
+| 1 | `shading:shading=gouraud` | accept the live linked `vec3 VAR0` RGB plus constant-one alpha form and pack it into D1 | none | low |
 | 2 | `shading:shading=blinn-phong-inf` | a native fragment ALU program with interpolated normal/eye vector, normalize, dot, max and pow | new verified PS | high |
 | 3 | `bump:bump-render=off/high-poly` | general per-fragment normal lighting, including normalize/dot/max/pow | new verified PS | high |
 | 4 | `bump:bump-render=normals` | sampled normal remap plus matrix multiply and the same lighting program | sampler plus new verified PS | high |
@@ -75,28 +75,30 @@ rejected triangles unchanged
 both target guards unchanged
 ```
 
-A follow-up live glmark2 run should use
-`shading:shading=gouraud:model=cat:nframes=1` with NIR dumping enabled.  The
-accepted shader must be either the direct four-component `VAR0` store or the
-exact scalarized blue-material form below.  Any other operation means it is a
-different key and must not be admitted by this lowering.
+A follow-up live glmark2 run used
+`shading:shading=gouraud:model=cat:nframes=1` with NIR dumping enabled.  It
+disproved the earlier scalar-blue reconstruction: the linked input is a
+three-component RGB varying.  The accepted shader must be the exact RGBX form
+below.  Any other operation means it is a different key and must not be
+admitted by this lowering.
 
-### Default blue-material linked form
+### Live linked RGBX form
 
-The default Gouraud material is exactly `(0,0,1,1)`.  Mesa can therefore
-scalarize the linked varying and reconstruct the fragment result as:
+The target-captured fragment NIR is:
 
 ```text
-b = scalar VAR0.x
-result = vec4(0.0, 0.0, b, 1.0)
+rgb = smooth vec3 VAR0.xyz
+result = vec4(rgb.x, rgb.y, rgb.z, 1.0)
 ```
 
-This is a second closed lowering to the same D1 path.  Require two literal
-positive-zero sources, one scalar float32 `VAR0` source in B, and literal one
-in A; identity `mov`/`fsat` around the final vec4 is harmless.  Pack only B
-from the finite scalar and force `R=G=0`, `A=255`.  A scalar value `0.25`
-must produce `ff000040` on BGRA or RGB `000040` on BGRX.  It changes no packet
-word and must not accept an arbitrary coefficient, swizzle, or second source.
+This is a second closed lowering to the same D1 path.  Require one 32-bit
+three-component `VAR0` source, identity XYZ component order, and literal one
+in A; identity `mov`/`fsat` around the final vec4 is harmless.  Pack all three
+finite components and force `A=255`.  RGB `(0.25,0.5,0.75)` must produce
+`ff4080bf` on BGRA or RGB `4080bf` on BGRX.  It changes no packet word and
+must not accept a swizzle, arbitrary coefficient, partial input, or second
+source.  The former `vec4(0,0,VAR0.x,1)` description and its scalar-blue
+classifier were based on an incomplete dump and are not the live contract.
 
 ## Later default-suite scenes
 

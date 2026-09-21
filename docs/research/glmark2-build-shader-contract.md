@@ -4,10 +4,10 @@ This note bounds the shader work required by the observed glmark2 2023.01
 `build:model=cube` path.  It separates target-captured NIR from offline GLSL
 compiler output and from native Chrome9 shader reverse engineering.  The
 conclusion is deliberately narrow: Mesa `draw` already executes the required
-vertex program in software, and nested Chrome9 commit
-`86cb963e230bc8b605b58b5656af0db190d96fa8` already recognizes the exact
-linked fragment program.  The remaining shader-related correctness gap is
-perspective interpolation of the resulting scalar lighting varying, not a
+vertex program in software.  A later full live dump corrected the initial
+interpretation of the linked fragment program: it carries a `vec3` RGB
+varying, not one replicated scalar.  The remaining shader-related correctness
+gaps are the exact RGBX classifier and perspective interpolation, not a
 missing vertex ALU lowering.
 
 This does not authorize advertising general GLSL.  The implementation remains
@@ -70,13 +70,13 @@ shader with these `source_blake3` words:
 46d83156 9a4abb0b d1a4de24 422a9790
 ```
 
-Its only live input is the 32-bit highp scalar
-`Color (VARYING_SLOT_VAR0.x)`.  The executable expression is exactly the
+Its only live input is the 32-bit highp `vec3`
+`Color (VARYING_SLOT_VAR0.xyz)`.  The executable expression is exactly the
 following shape, allowing ordinary NIR `mov` wrappers:
 
 ```text
-g = load smooth VAR0.x
-o = vec4(g, g, g, 1.0)
+rgb = load smooth VAR0.xyz
+o = vec4(rgb.x, rgb.y, rgb.z, 1.0)
 store_output FRAG_RESULT_COLOR, o.xyzw
 ```
 
@@ -96,7 +96,9 @@ operation classes:
 3. Normalize the transformed normal as
    `n * rsq(dot(n,n))`.
 4. Compute `max(dot(normalized_n, constant_light), 0)`.
-5. Export that scalar in RGB and constant `1.0` in alpha.
+5. Export the three-component diffuse result in RGB and constant `1.0` in
+   alpha.  Although this GLSL computes the same diffuse scalar in each channel
+   for a white material, the linked interface remains `vec3`.
 6. Construct `(position.xyz, 1)` and multiply by
    `ModelViewProjectionMatrix` for clip position.
 7. Pass through `texcoord`, which full VS/FS linking can delete because the
@@ -135,14 +137,13 @@ and the vbuf output layout must match the classifier-selected layout.
 
 ## Exact bounded fragment implementation
 
-Nested Chrome9 commit
-`86cb963e230bc8b605b58b5656af0db190d96fa8` added
-`CHROME9_FS_PRIMARY_SCALAR_RGBX`.  Its classifier accepts the target shape
-only when all of these conditions hold:
+The earlier scalar-blue/scalar-gray implementation does not recognize this
+live shader and must not be treated as validation.  The correct classifier
+accepts the target shape only when all of these conditions hold:
 
-* the source is 32-bit `VARYING_SLOT_VAR0`, component zero;
-* the linked source has one component;
-* R, G, and B are the same scalar;
+* the source is 32-bit `VARYING_SLOT_VAR0`, components XYZ;
+* the linked source has exactly three components;
+* R, G, and B preserve source components X, Y and Z respectively;
 * alpha is the exact constant `1.0`;
 * only bounded whole-vector `mov` or `fsat` wrappers are present, with
   recursion depth at most eight;
@@ -152,22 +153,22 @@ The selected vbuf layout is nine dwords:
 
 ```text
 D0.xyzw      position, EMIT_4F
-generic0     scalar-bearing generic slot, EMIT_4F
+generic0     RGB-bearing generic slot, EMIT_4F
 secondary    COLOR1, EMIT_4UB_BGRA
 ```
 
-`chrome9_emit_triangle()` checks that `generic0.x` is finite, clamps and
-rounds it with `float_to_ubyte()`, and forms opaque packed grayscale:
+`chrome9_emit_triangle()` checks that `generic0.xyz` are finite, clamps and
+rounds each with `float_to_ubyte()`, and forms opaque packed RGB:
 
 ```text
-gray | gray << 8 | gray << 16 | 0xff000000
+B | G << 8 | R << 16 | 0xff000000
 ```
 
 The existing untextured primary-color pixel program then consumes the packed
 diffuse color.  Consequently **no additional fragment instruction or native
 pixel-shader blob is needed for the captured cube shader**.  Variants which
 retain a texture lookup, use a non-white alpha expression, add specular or
-ambient arithmetic in the fragment shader, or export more than this scalar
+ambient arithmetic in the fragment shader, or use another varying shape
 remain outside this classifier and must fail closed.
 
 There is an intentional precision limitation: the software varying is
@@ -179,7 +180,7 @@ not evidence of general GLSL varying precision or conformance.
 
 ## The remaining perspective-correction defect
 
-The target varying is ordinary GLSL `smooth`, so its scalar value must be
+The target varying is ordinary GLSL `smooth`, so each RGB component must be
 perspective-correct.  The current untextured/D16 path cannot do that:
 
 * `struct drm_chrome9_vertex_d16` carries only fixed-point X, Y, Z and packed
@@ -235,20 +236,20 @@ output encodings.  The matching PS is the one-record `MOV oC0,v0`:
 That oracle is valuable ISA evidence but is not byte-for-byte the glmark2
 shader.  The proprietary fixed-function form has its own ambient/material
 constant layout, while glmark2 explicitly normalizes the transformed normal,
-uses a compile-time normalized light direction, and exports only a linked
-scalar varying.  Do not insert the native fixed-function blob into this path;
+uses a compile-time normalized light direction, and exports a linked RGB
+varying.  Do not insert the native fixed-function blob into this path;
 the current software VS is both more general and already wired.
 
 ## Bounded validation plan
 
 ### Offline classifier corpus
 
-The existing smoke corpus has a positive constant-gray execution case.  Add a
-positive NIR case matching the captured `vec4(g,g,g,1)` graph under D16 and
+The smoke corpus must include a positive NIR case matching the captured
+`vec4(rgb.x,rgb.y,rgb.z,1)` graph under D16 and
 reject at least these single-delta mutations:
 
-* input location other than `VAR0` or component other than x;
-* unequal RGB sources;
+* input location other than `VAR0` or non-XYZ component order;
+* fewer/more than three source components or a component swizzle;
 * nonconstant or non-one alpha;
 * texture, fragment constant, discard, branch, second output, or second
   store;
@@ -260,7 +261,8 @@ they are not part of this untextured program.
 ### Software-VS reference
 
 With identity matrices, normals `(1,0,0)`, `(0,1,0)`, `(0,0,1)`, and
-`(-1,0,0)` must produce scalar diffuse values `2/3`, `2/3`, `1/3`, and zero.
+`(-1,0,0)` must produce RGB diffuse values `(2/3)^3`, `(2/3)^3`, `(1/3)^3`,
+and `(0,0,0)` for the white material.
 Use a nontrivial normal matrix as a second case to ensure the normal is
 renormalized after transformation.  Inspect the vbuf callback output, not
 just shader creation, and require finite post-viewport XYZRHW.
@@ -286,7 +288,7 @@ Accept a small subpixel/rounding band of `0x6f..0x74`; `0xc0..0xc4` proves
 lost RHW or disabled diffuse correction.  Run this first against a guarded
 offscreen BGRX target with D16, verify both guard pages and unchanged source,
 and require idle engine/error-zero status.  Only then route the successor ABI
-from the Mesa scalar classifier.
+from the Mesa RGBX classifier.
 
 Because the existing classifier quantizes each endpoint to 8 bits, add a
 separate low-gradient test whose vertices differ by less than `1/255`.  It is
