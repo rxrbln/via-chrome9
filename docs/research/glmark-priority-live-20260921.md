@@ -49,10 +49,11 @@ texture:model=cube:texture=crate-base:texture-filter=linear   Success
 shading:model=cat:shading=gouraud                             Success
 ```
 
-The exact fixed-frame captures are:
+Fresh fixed-frame captures from the measured command-`0x14`/LLVM deployment
+are:
 
-- `artifacts/glmark2-texture-fixed-frame-correct-20260921.png`
-- `artifacts/glmark2-gouraud-fixed-frame-correct-20260921.png`
+- `artifacts/glmark2-texture-cmd14-correct-20260921.png`
+- `artifacts/glmark2-gouraud-llvm-correct-20260921.png`
 
 ## Performance
 
