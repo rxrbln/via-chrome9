@@ -155,6 +155,11 @@ targets.
   and mip-bias silicon gates.
 - [chrome9-texldp-texldb-corpus.tsv](chrome9-texldp-texldb-corpus.tsv) retains
   exact terminal operation-7/operation-3 TAU programs and controls.
+- [chrome9-texldd-texldl-negative-boundary.md](chrome9-texldd-texldl-negative-boundary.md)
+  proves explicit-gradient/LOD opcodes emit no TAU under PS 2.0 or PS 3.0 and
+  distinguishes silent drop from cross-driver parser desynchronization.
+- [chrome9-texldd-texldl-negative-corpus.tsv](chrome9-texldd-texldl-negative-corpus.tsv)
+  retains the baseline plus four exact token, metadata, and residue rows.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
