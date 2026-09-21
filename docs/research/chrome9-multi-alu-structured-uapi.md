@@ -200,6 +200,20 @@ multi-record builder.
 The c0 H2 store stays four dwords and byte-identical to command 19. Keeping
 that store unchanged is a safety property of this first successor.
 
+The control store likewise stays in command 19's silicon-proven Xorg H2
+compatibility form: A90--A9a followed by `CC/DD` padding. It does **not** add
+an A9b write and does not switch the ALU or constant store to counted H3.
+Although the proprietary generic builder proves a complete twelve-word
+A90--A9b object and counted H3 stores, that transaction is a separate,
+still-ungated silicon feature. Mixing it into the first multi-record gate
+would change three variables at once.
+
+This omission is safe only while every advertised runtime path preserves the
+same compatibility contract and no path writes nonzero kernel-owned A9b.
+Qualifying the generic transaction later requires its documented
+no-draw/old-new-old gates and recomputed packet offsets; it is not an in-place
+upgrade of this ABI.
+
 ### Why finite-only c0 is unsafe here
 
 Command 19's single `v0*c0` cannot overflow when normalized v0 is in `[0,1]`
@@ -321,10 +335,12 @@ their own tests:
    ioctl passes one; v2 passes its validated 1..3 count. Validation errors
    return before `memdup_array_user()`, BO reservation, or publication.
 5. In `chrome9_build_depth_triangle()`, replay the normal complete state,
-   patch `body[142+delta]`, shift the immediate-vertex header, copy exactly
+   including the exact existing H2 compatibility PS control/store form, patch
+   `body[142+delta]`, shift the immediate-vertex header, copy exactly
    `count*4` ALU dwords, and adjust every following offset by
    `program_extra`. The per-draw replay ensures a following v1 draw restores
-   A92=one; never rely on inherited program count.
+   A92=one; never rely on inherited program count. Do not add A9b or H3 in
+   this patch.
 6. Advertise the new capability from `chrome9_drv.c` only behind a distinct
    default-off module gate until all live oracles pass. Timeout quarantine and
    teardown ownership remain unchanged.
@@ -342,8 +358,9 @@ read-ahead checks rather than relying on this arithmetic informally.
 
 This design does not admit textures, more than one constant, partial writes,
 SAT, source modifiers, arbitrary swizzles, B-slot operations, control flow,
-discard, depth output, or raw native programs. It also does not reserve an ABI
-number. Those are separate successors with separate corpus and silicon gates.
+discard, depth output, raw native programs, or the generic A9b/H3 upload
+transaction. It also does not reserve an ABI number. Those are separate
+successors with separate corpus and silicon gates.
 
 ## Windows wrapper boundary
 
