@@ -3396,10 +3396,11 @@ main(int argc, char **argv)
                      PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
    {
       struct pipe_resource *bgra_resource;
+      struct pipe_resource *bgra_shared = NULL;
       struct chrome9_resource *bgra;
+      struct chrome9_resource *shared_bgra;
       struct winsys_handle bgra_kms = { .type = WINSYS_HANDLE_TYPE_KMS };
       struct winsys_handle bgra_fd = { .type = WINSYS_HANDLE_TYPE_FD };
-      bool bgra_exported;
 
       if (!screen->is_format_supported(screen, bgra_templ.format,
                                        bgra_templ.target, 1, 1,
@@ -3430,21 +3431,36 @@ main(int argc, char **argv)
          screen->destroy(screen);
          return 1;
       }
-      bgra_exported = screen->resource_get_handle(
-         screen, NULL, bgra_resource, &bgra_fd,
-         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
-      if (bgra_exported)
-         close(bgra_fd.handle);
-      if (bgra_exported ||
-          (chrome9_screen_has_capability(
-              screen, DRM_CHROME9_CAP_BLEND_BGRA8888) &&
-           !run_pipe_triangle(screen, bgra_resource, NULL))) {
-         fputs("Chrome9 Gallium BGRA8888 contract failed\n", stderr);
+      if (!screen->resource_get_handle(
+             screen, NULL, bgra_resource, &bgra_fd,
+             PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE)) {
+         fputs("BGRA8888 same-device dma-buf export failed\n", stderr);
          screen->resource_destroy(screen, bgra_resource);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;
       }
+      bgra_shared = screen->resource_from_handle(
+         screen, &bgra_templ, &bgra_fd,
+         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      close(bgra_fd.handle);
+      shared_bgra = bgra_shared ? chrome9_resource(bgra_shared) : NULL;
+      if (!shared_bgra || !shared_bgra->guarded ||
+          shared_bgra->stride != bgra->stride ||
+          shared_bgra->data_offset != bgra->data_offset ||
+          shared_bgra->bo.size != bgra->bo.size ||
+          (chrome9_screen_has_capability(
+              screen, DRM_CHROME9_CAP_BLEND_BGRA8888) &&
+           !run_pipe_triangle(screen, bgra_shared, NULL))) {
+         fputs("Chrome9 Gallium BGRA8888 contract failed\n", stderr);
+         if (bgra_shared)
+            screen->resource_destroy(screen, bgra_shared);
+         screen->resource_destroy(screen, bgra_resource);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      screen->resource_destroy(screen, bgra_shared);
       screen->resource_destroy(screen, bgra_resource);
    }
    screen->resource_destroy(screen, resource);
