@@ -4,6 +4,7 @@
 #include <linux/build_bug.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
+#include <linux/gfp.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
@@ -32,7 +33,7 @@
 #define CHROME9_GART_ENTRIES		(CHROME9_GART_SIZE / sizeof(u32))
 #define CHROME9_GART_INVALID		0x80000000U
 #define CHROME9_GART_CACHED		BIT(25)
-#define CHROME9_RING_PAGES		2U
+#define CHROME9_RING_PAGES		16U
 #define CHROME9_RING_SIZE		(CHROME9_RING_PAGES * PAGE_SIZE)
 #define CHROME9_CR_READ_AHEAD		0x220U
 #define CHROME9_SEQ_INDEX		0x83c4
@@ -87,9 +88,11 @@ struct chrome9_job {
 	unsigned int depth_page_count;
 	u32 cookie;
 	u32 flags;
-	u32 stop;
+	u32 segment_pause;
+	u32 segment_stop;
+	u32 ring_pause;
+	u32 ring_stop;
 	u8 kind;
-	u8 slot;
 	bool mapped;
 	bool depth_mapped;
 	bool node_allocated;
@@ -171,6 +174,7 @@ struct chrome9_engine {
 	struct list_head quarantine;
 	void *ring_cpu;
 	dma_addr_t ring_dma;
+	void *staging_cpu;
 	void __iomem *gart;
 	void *gart_saved;
 	u64 fence_context;
@@ -181,9 +185,12 @@ struct chrome9_engine {
 	u8 saved_6b;
 	u8 saved_6c;
 	u8 saved_7b;
-	u8 active_slot;
+	u32 append;
 	u32 active_pause;
 	u32 active_stop;
+	u32 ring_epoch;
+	u64 append_count;
+	u64 wrap_count;
 	u32 last_cookie;
 	bool mm_initialized;
 	bool gart_programmed;
@@ -398,15 +405,13 @@ static int chrome9_finish_ring(u32 *base, u32 *p, u32 *pause, u32 *stop)
 		*p++ = 0xccccccc0;
 		*p++ = 0xddd00000;
 	}
-	chrome9_cache_flush(base, PAGE_SIZE);
-	dma_wmb();
 	return 0;
 }
 
-static int chrome9_build_prime(struct chrome9_engine *engine, u8 slot,
+static int chrome9_build_prime(struct chrome9_engine *engine,
 			       u32 *pause, u32 *stop)
 {
-	u32 *base = engine->ring_cpu + slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *p;
 
 	memset(base, 0xcc, PAGE_SIZE);
@@ -432,7 +437,7 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
-	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
 
@@ -466,7 +471,7 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->stop);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
 static u32 chrome9_q16_to_float(s32 value)
@@ -600,7 +605,7 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
-	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
 	u32 delta = 0;
@@ -694,7 +699,7 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->stop);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
 static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
@@ -773,7 +778,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		chrome9_scissor_x(request),
 	};
 	u32 vertices[3 * 8];
-	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
 	u32 delta = 0;
@@ -917,7 +922,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->stop);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
 static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
@@ -930,7 +935,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
-	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
 	u32 delta = 0;
@@ -1040,7 +1045,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->stop);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
 static int chrome9_emit_depth_body(u32 **cursor, u32 target, u32 depth,
@@ -1081,7 +1086,7 @@ static int chrome9_build_depth_oracle(struct chrome9_engine *engine,
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
-	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *p;
 	int ret;
 
@@ -1099,7 +1104,7 @@ static int chrome9_build_depth_oracle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->stop);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
 static int chrome9_emit_blend_body(u32 **cursor, u32 target, u32 solid_color)
@@ -1136,7 +1141,7 @@ static int chrome9_build_blend_oracle(struct chrome9_engine *engine,
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
-	u32 *base = engine->ring_cpu + job->slot * PAGE_SIZE;
+	u32 *base = engine->staging_cpu;
 	u32 *p;
 	int ret;
 
@@ -1154,7 +1159,7 @@ static int chrome9_build_blend_oracle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->stop);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
 static void chrome9_install_stopped_ring(struct chrome9_device *cdev,
@@ -1181,7 +1186,8 @@ static void chrome9_install_stopped_ring(struct chrome9_device *cdev,
 	readl(cdev->mmio + CHROME9_REG_CR_TRANSPACE);
 }
 
-static int chrome9_stop_active_ring(struct chrome9_engine *engine)
+static int chrome9_stop_active_ring(struct chrome9_engine *engine,
+				    bool *pid10_published)
 {
 	struct chrome9_device *cdev = engine->cdev;
 	u32 address;
@@ -1189,6 +1195,8 @@ static int chrome9_stop_active_ring(struct chrome9_engine *engine)
 	int ret;
 
 	lockdep_assert_held(&engine->submit_lock);
+	if (pid10_published)
+		*pid10_published = false;
 	if (engine->active_stop <= engine->active_pause ||
 	    engine->active_stop - engine->active_pause < 0x20)
 		return -EINVAL;
@@ -1198,7 +1206,7 @@ static int chrome9_stop_active_ring(struct chrome9_engine *engine)
 	     CHROME9_ENGINE_WORK_MASK))
 		return -EBUSY;
 
-	address = engine->active_slot * PAGE_SIZE + engine->active_stop;
+	address = engine->active_stop;
 	/* Vendor replacement sequence: changing PID00 PAUSE to a later PID10
 	 * STOP resumes the owned reader without touching A60--A63 or A68. */
 	dma_wmb();
@@ -1208,17 +1216,102 @@ static int chrome9_stop_active_ring(struct chrome9_engine *engine)
 	writel(0x65000200 | (address >> 24),
 	       cdev->mmio + CHROME9_REG_CR_TRANSPACE);
 	readl(cdev->mmio + CHROME9_REG_CR_TRANSPACE);
+	if (pid10_published)
+		*pid10_published = true;
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_ENGINE_STATUS,
 				 status, !(status & CHROME9_ENGINE_WAIT_MASK), 10,
 				 CHROME9_HW_TIMEOUT_US);
 	if (ret)
 		dev_err(&cdev->pdev->dev,
-			"PID10 STOP timeout slot=%u pause=%#x stop=%#x cr=%08x engine=%08x\n",
-			engine->active_slot, engine->active_pause,
-			engine->active_stop,
+			"PID10 STOP timeout epoch=%u pause=%#x stop=%#x cr=%08x engine=%08x\n",
+			engine->ring_epoch, engine->active_pause, engine->active_stop,
 			readl(cdev->mmio + CHROME9_REG_CR_STATUS),
 			readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS));
 	return ret;
+}
+
+static void chrome9_fill_ring_dummy(struct chrome9_engine *engine)
+{
+	u32 *ring = engine->ring_cpu;
+	unsigned int i;
+
+	for (i = 0; i < CHROME9_RING_SIZE / sizeof(*ring); i += 2) {
+		ring[i] = 0xccccccc0;
+		ring[i + 1] = 0xddd00000;
+	}
+}
+
+static int chrome9_append_segment(struct chrome9_engine *engine,
+				  struct chrome9_job *job, u32 segment_pause,
+				  bool *must_quarantine)
+{
+	struct chrome9_device *cdev = engine->cdev;
+	size_t copy_len;
+	u32 append;
+	u32 status;
+	bool pid10_published;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	*must_quarantine = false;
+	job->segment_pause = segment_pause;
+	if (job->segment_stop <= segment_pause ||
+	    job->segment_stop - segment_pause < 0x20 ||
+	    check_add_overflow((size_t)job->segment_stop,
+			       (size_t)CHROME9_CR_READ_AHEAD, &copy_len) ||
+	    copy_len > PAGE_SIZE)
+		return -E2BIG;
+
+	status = readl(cdev->mmio + CHROME9_REG_CR_STATUS);
+	if (!(status & BIT(31)) ||
+	    (readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS) &
+	     CHROME9_ENGINE_WORK_MASK))
+		return -EBUSY;
+
+	append = engine->append;
+	/* Equality is an exact fit: the copied read-ahead closure ends at A62. */
+	if (append > CHROME9_RING_SIZE - copy_len) {
+		ret = chrome9_stop_active_ring(engine, &pid10_published);
+		if (ret) {
+			*must_quarantine = pid10_published;
+			return ret;
+		}
+		chrome9_fill_ring_dummy(engine);
+		memcpy(engine->ring_cpu, engine->staging_cpu, copy_len);
+		chrome9_cache_flush(engine->ring_cpu, CHROME9_RING_SIZE);
+		dma_wmb();
+		append = 0;
+		job->ring_pause = segment_pause;
+		job->ring_stop = job->segment_stop;
+		chrome9_install_stopped_ring(cdev, 1, CHROME9_RING_SIZE,
+					     job->ring_pause);
+		engine->ring_epoch++;
+		engine->wrap_count++;
+	} else {
+		memcpy((u8 *)engine->ring_cpu + append, engine->staging_cpu,
+		       copy_len);
+		chrome9_cache_flush((u8 *)engine->ring_cpu + append, copy_len);
+		dma_wmb();
+		job->ring_pause = append + segment_pause;
+		job->ring_stop = append + job->segment_stop;
+		writel(0x00100000, cdev->mmio + CHROME9_REG_CR_TRANSSET);
+		writel(0x64000000 | (job->ring_pause & 0x00fffff0),
+		       cdev->mmio + CHROME9_REG_CR_TRANSPACE);
+		writel(0x65000000 | (job->ring_pause >> 24),
+		       cdev->mmio + CHROME9_REG_CR_TRANSPACE);
+		readl(cdev->mmio + CHROME9_REG_CR_TRANSPACE);
+	}
+
+	/*
+	 * A65 (or the full install's A65/A68 sequence) publishes this tuple.
+	 * Update ownership immediately even if the following retirement waits.
+	 */
+	job->published = true;
+	engine->active_pause = job->ring_pause;
+	engine->active_stop = job->ring_stop;
+	engine->append = job->ring_pause + 0x10;
+	engine->append_count++;
+	return 0;
 }
 
 static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
@@ -1292,7 +1385,7 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 					    PAGE_SHIFT) & 0x3fffffff;
 		writel(ptes[i], engine->gart + i * sizeof(u32));
 	}
-	readl(engine->gart + sizeof(u32));
+	readl(engine->gart + (CHROME9_RING_PAGES - 1) * sizeof(u32));
 	/* Publish invalid defaults and ring PTEs before the GTI flush. */
 	wmb();
 	ret = chrome9_gart_flush(cdev);
@@ -1562,7 +1655,7 @@ static bool chrome9_verify_blend_oracle(struct chrome9_job *job)
 }
 
 static int chrome9_wait_job(struct chrome9_engine *engine,
-			    struct chrome9_job *job, u32 pause)
+			    struct chrome9_job *job)
 {
 	struct chrome9_device *cdev = engine->cdev;
 	const char *phase = "cookie";
@@ -1599,10 +1692,10 @@ timeout:
 	engine_status = readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS);
 	cr_current = readl(cdev->mmio + CHROME9_REG_FE_TRANSSET);
 	dev_err(&cdev->pdev->dev,
-		"job timeout phase=%s seq=%llu kind=%u flags=%#x slot=%u cookie=%08x/%08x current=%08x pause=%#x cr=%08x engine=%08x\n",
-		phase, job->fence.base.seqno, job->kind, job->flags, job->slot,
-		cookie, job->cookie, cr_current,
-		(u32)(job->slot * PAGE_SIZE + pause), cr_status, engine_status);
+		"job timeout phase=%s seq=%llu kind=%u flags=%#x epoch=%u cookie=%08x/%08x current=%08x pause=%#x stop=%#x cr=%08x engine=%08x\n",
+		phase, job->fence.base.seqno, job->kind, job->flags,
+		engine->ring_epoch, cookie, job->cookie, cr_current,
+		job->ring_pause, job->ring_stop, cr_status, engine_status);
 	if (!(cr_current & 3) && cr_current < CHROME9_RING_SIZE) {
 		u32 first = cr_current >= CHROME9_CR_READ_AHEAD ?
 			    cr_current - CHROME9_CR_READ_AHEAD : 0;
@@ -1690,6 +1783,11 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 		ret = -ERANGE;
 		goto err_free_ring;
 	}
+	engine->staging_cpu = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!engine->staging_cpu) {
+		ret = -ENOMEM;
+		goto err_free_ring;
+	}
 	cdev->engine = engine;
 	engine->saved_dst_pos = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
 	ret = chrome9_gart_bind_ring(engine);
@@ -1705,14 +1803,19 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	writel(0x02000000, cdev->mmio + CHROME9_REG_CR_TRANSPACE);
 	/* Complete the documented 3D initialization before publishing a ring. */
 	wmb();
-	ret = chrome9_build_prime(engine, 0, &pause, &stop);
+	ret = chrome9_build_prime(engine, &pause, &stop);
 	if (ret)
 		goto err_restore_gart;
+	chrome9_fill_ring_dummy(engine);
+	memcpy(engine->ring_cpu, engine->staging_cpu,
+	       stop + CHROME9_CR_READ_AHEAD);
+	chrome9_cache_flush(engine->ring_cpu, CHROME9_RING_SIZE);
+	dma_wmb();
 	pci_read_config_word(cdev->pdev, PCI_COMMAND, &command);
 	engine->was_master = command & PCI_COMMAND_MASTER;
 	pci_set_master(cdev->pdev);
 	engine->ring_published = true;
-	chrome9_install_stopped_ring(cdev, 1, PAGE_SIZE, pause);
+	chrome9_install_stopped_ring(cdev, 1, CHROME9_RING_SIZE, pause);
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, status,
 				 status & BIT(31), 10, CHROME9_HW_TIMEOUT_US);
 	if (!ret)
@@ -1730,7 +1833,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	drm_mm_init(&engine->sf_mm, CHROME9_RING_SIZE,
 		    SZ_64M - CHROME9_RING_SIZE);
 	engine->mm_initialized = true;
-	engine->active_slot = 0;
+	engine->append = pause + 0x10;
 	engine->active_pause = pause;
 	engine->active_stop = stop;
 	engine->last_cookie = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
@@ -1753,6 +1856,8 @@ err_restore_gart:
 	}
 err_free_ring:
 	cdev->engine = NULL;
+	if (engine->staging_cpu)
+		free_page((unsigned long)engine->staging_cpu);
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
 			  engine->ring_cpu, engine->ring_dma);
 err_free_saved:
@@ -1775,6 +1880,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	long wait;
 	bool signal = false;
 	bool quarantine = false;
+	bool must_quarantine;
 	int dev_idx;
 	int ret;
 
@@ -1842,7 +1948,6 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 		ret = -EIO;
 		goto out_unlock_submit;
 	}
-	job->slot = engine->active_slot ^ 1;
 	job->kind = request->kind;
 	job->flags = request->flags;
 	job->cookie = engine->last_cookie == 0x00010001 ?
@@ -1897,19 +2002,21 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	}
 	if (ret)
 		goto out_prepublication;
-	ret = chrome9_stop_active_ring(engine);
+	ret = chrome9_append_segment(engine, job, pause, &must_quarantine);
 	if (ret) {
+		if (!must_quarantine)
+			goto out_prepublication;
 		dma_fence_set_error(&job->fence.base, -ETIME);
+		/*
+		 * PID10 was published but did not retire.  Conservatively retain
+		 * this job's mappings together with the still-owned ring.
+		 */
 		job->published = true;
 		chrome9_quarantine_job_locked(engine, job);
 		quarantine = true;
 		goto out_unlock_submit;
 	}
-	job->published = true;
-	chrome9_install_stopped_ring(cdev, job->slot * PAGE_SIZE | 1,
-				     (job->slot + 1) * PAGE_SIZE,
-				     job->slot * PAGE_SIZE + pause);
-	ret = chrome9_wait_job(engine, job, pause);
+	ret = chrome9_wait_job(engine, job);
 	if (ret) {
 		dma_fence_set_error(&job->fence.base, -ETIME);
 		chrome9_quarantine_job_locked(engine, job);
@@ -1950,9 +2057,6 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 		job->sf_bound = false;
 		drm_mm_remove_node(&job->sf_node);
 		job->node_allocated = false;
-		engine->active_slot = job->slot;
-		engine->active_pause = pause;
-		engine->active_stop = job->stop;
 		engine->last_cookie = job->cookie;
 	}
 	mutex_unlock(&engine->vm_lock);
@@ -2046,6 +2150,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	bool device_owned = false;
 	bool signal = false;
 	bool quarantine = false;
+	bool must_quarantine;
 	int dev_idx;
 	int ret;
 
@@ -2158,7 +2263,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		ret = -EIO;
 		goto out_unlock_submit;
 	}
-	job->slot = engine->active_slot ^ 1;
 	job->kind = request->kind;
 	job->flags = request->flags;
 	job->cookie = engine->last_cookie == 0x00010001 ?
@@ -2207,19 +2311,21 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 					   depth_target, &pause);
 	if (ret)
 		goto out_prepublication;
-	ret = chrome9_stop_active_ring(engine);
+	ret = chrome9_append_segment(engine, job, pause, &must_quarantine);
 	if (ret) {
+		if (!must_quarantine)
+			goto out_prepublication;
 		dma_fence_set_error(&job->fence.base, -ETIME);
+		/*
+		 * PID10 was published but did not retire.  Conservatively retain
+		 * this job's mappings together with the still-owned ring.
+		 */
 		job->published = true;
 		chrome9_quarantine_job_locked(engine, job);
 		quarantine = true;
 		goto out_unlock_submit;
 	}
-	job->published = true;
-	chrome9_install_stopped_ring(cdev, job->slot * PAGE_SIZE | 1,
-				     (job->slot + 1) * PAGE_SIZE,
-				     job->slot * PAGE_SIZE + pause);
-	ret = chrome9_wait_job(engine, job, pause);
+	ret = chrome9_wait_job(engine, job);
 	if (ret) {
 		dma_fence_set_error(&job->fence.base, -ETIME);
 		chrome9_quarantine_job_locked(engine, job);
@@ -2253,9 +2359,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		job->sf_bound = false;
 		drm_mm_remove_node(&job->sf_node);
 		job->node_allocated = false;
-		engine->active_slot = job->slot;
-		engine->active_pause = pause;
-		engine->active_stop = job->stop;
 		engine->last_cookie = job->cookie;
 	}
 	mutex_unlock(&engine->vm_lock);
@@ -2955,14 +3058,15 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 void chrome9_engine_fini(struct chrome9_device *cdev)
 {
 	struct chrome9_engine *engine = cdev->engine;
-	u32 invalid[CHROME9_RING_PAGES] = {
-		CHROME9_GART_INVALID, CHROME9_GART_INVALID,
-	};
+	u32 invalid[CHROME9_RING_PAGES];
+	unsigned int i;
 	u32 status;
 	int ret;
 
 	if (!engine)
 		return;
+	for (i = 0; i < ARRAY_SIZE(invalid); i++)
+		invalid[i] = CHROME9_GART_INVALID;
 	mutex_lock(&engine->submit_lock);
 	engine->stopping = true;
 	engine->ready = false;
@@ -2980,7 +3084,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 					 !(status & CHROME9_ENGINE_WORK_MASK),
 					 10, CHROME9_HW_TIMEOUT_US);
 	if (!ret)
-		ret = chrome9_stop_active_ring(engine);
+		ret = chrome9_stop_active_ring(engine, NULL);
 	if (ret) {
 		engine->wedged = true;
 		chrome9_take_quarantine_hold(engine);
@@ -3011,8 +3115,12 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
 	if (!engine->was_master)
 		pci_clear_master(cdev->pdev);
+	dev_info(&cdev->pdev->dev,
+		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u\n",
+		 engine->append_count, engine->wrap_count, engine->ring_epoch);
 	mutex_unlock(&engine->submit_lock);
 	cdev->engine = NULL;
+	free_page((unsigned long)engine->staging_cpu);
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
 			  engine->ring_cpu, engine->ring_dma);
 	kvfree(engine->gart_saved);
