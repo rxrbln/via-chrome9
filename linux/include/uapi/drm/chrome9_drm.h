@@ -137,8 +137,12 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS	(1ULL << 29)
 /* D16 draw flags additionally accept the live-proven EQUAL comparison. */
 #define DRM_CHROME9_CAP_DEPTH_EQUAL	(1ULL << 32)
+/* Both discontinuous banks provide 32 live-proven PS float vec4 constants. */
+#define DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32	(1ULL << 34)
 /* D16 draw flags additionally accept the live-proven ALWAYS comparison. */
 #define DRM_CHROME9_CAP_DEPTH_ALWAYS	(1ULL << 35)
+/* Two-texture programs can preserve tex0*primary alpha when tex1 has alpha. */
+#define DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY	(1ULL << 39)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -429,6 +433,9 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_DEPTH_FUNC(func) \
 	((__u32)(func) << DRM_CHROME9_DEPTH_FUNC_SHIFT)
 #define DRM_CHROME9_DEPTH_READ_ONLY	(1U << 11)
+
+/* Select RGB=tex0*tex1*primary, A=tex0*primary for two-texture draws. */
+#define DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY	(1U << 1)
 
 #define DRM_CHROME9_COLOR_MASK_R	(1U << 0)
 #define DRM_CHROME9_COLOR_MASK_G	(1U << 1)
