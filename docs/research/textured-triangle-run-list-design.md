@@ -1,5 +1,15 @@
 # Bounded one- and two-texture list/run batching
 
+> **Implemented first rung (2026-09-21):** command `0x14` and capability bit
+> 30 use one state-complete, one-texture list with an immutable maximum of 24
+> triangles, one page-sized staging image, and one retirement.  This is enough
+> to collapse the six-triangle visible glmark2 cube to one ioctl while keeping
+> the first textured+D16 silicon gate at the exact one-page/read-ahead bound.
+> The handler and capability are disabled unless
+> `chrome9.textured_triangle_run=1` is set.  The 192/256-triangle designs below
+> remain evidence for a future separately allocated successor; they must not
+> widen command `0x14` after this UAPI definition.
+
 > **Historical one-page proof:** the packet/state/UAPI validation in this
 > document remains applicable, but its eight-segment execution and 192/144
 > run maxima were superseded before capability promotion.  The preferred

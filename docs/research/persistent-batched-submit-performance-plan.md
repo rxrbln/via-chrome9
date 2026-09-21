@@ -2,6 +2,15 @@
 
 ## Decision
 
+The first implemented one-texture rung deliberately stops at the exact
+one-page maximum of 24 triangles on command `0x14` / capability bit 30.  It
+uses one list and one retirement and is opt-in through
+`chrome9.textured_triangle_run=1` until silicon promotion.  This reaches the
+immediate glmark2 cube objective without making the larger packet part of the
+first hardware experiment.  Because the 24-triangle limit is now an immutable
+UAPI constant, the 256-triangle proposal below requires a new command and
+capability if it is implemented later.
+
 The next performance tranche should combine **one native immediate-list
 packet per immutable draw run** with the already proven persistent 64-KiB
 command ring.  A CPU-only 32-KiB staging area is sufficient for 272

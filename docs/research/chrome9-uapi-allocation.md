@@ -31,7 +31,7 @@ number; design notes must link here rather than independently claiming the
 | `11` | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
 | `12` | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
 | `13` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
-| `14` | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
+| `14` | implemented, opt-in silicon gate | `DRAW_TEXTURED_TRIANGLE_RUN` |
 | `15` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
 | `16` | reserved | `DRAW_TEXTURED_PROGRAM_TRIANGLE` |
 | `17` | reserved | `DRAW_TRIANGLE_D24S8_STENCIL` |
@@ -87,7 +87,7 @@ advertised; Mesa keeps the old 34-triangle fallback for older kernels.
 | 27 | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
 | 28 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
 | 29 | merged | `BLEND_EXTENDED_FACTORS` |
-| 30 | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
+| 30 | implemented, opt-in silicon gate | `DRAW_TEXTURED_TRIANGLE_RUN` |
 | 31 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
 | 32 | reserved | `DEPTH_FUNC_EQUAL` |
 | 33 | reserved | `DRAW_TEXTURED_PROGRAM` |
@@ -121,6 +121,15 @@ one-/two-texture list/run successors specified in
 [textured-triangle-run-list-design.md](textured-triangle-run-list-design.md).
 They retain existing structured shader/state envelopes and do not expose raw
 command streams.
+
+Command `0x14` is implemented with an immutable 24-triangle maximum: the
+exact one-page closure is PAUSE `0x0cf0`, STOP `0x0d70`, and copied/read-ahead
+end `0x0f90` for every accepted state key.  It supports one level-zero
+texture, REPLACE/MODULATE, optional D16 and normalized blend state, scissor,
+and the existing depth-function/read-only flags.  The handler rejects calls
+and bit 30 is hidden unless `chrome9.textured_triangle_run=1` is set.  Command
+`0x15` and bit 31 remain reserved.  A future 256-triangle one-texture list
+must receive a new command and capability rather than widening `0x14`.
 
 Capability bit 32 adds no command or request field. It says the existing
 depth-function field accepts explicit EQUAL in addition to the baseline
