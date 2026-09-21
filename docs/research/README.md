@@ -136,6 +136,10 @@ targets.
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
   and their fail-closed resource/control validation contract.
+- [ioquake-texture-environment-combine.md](ioquake-texture-environment-combine.md)
+  derives exact per-base-format REPLACE/MODULATE/ADD alpha semantics, records
+  compiler-exact partial-mask ADD and mixed two-unit objects, and bounds the
+  closed crossbar keys and guarded promotion sequence needed by ioquake GL1.
 - [gl-feature-matrix.md](gl-feature-matrix.md) reconstructs the exact Linux and
   Windows OpenGL extension sets, raw limits, texture/render/depth formats,
   framebuffer/query support, and conservative Gallium/NIR capability envelope.
