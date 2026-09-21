@@ -24,6 +24,18 @@ targets.
 - [glmark-priority-live-20260921.md](glmark-priority-live-20260921.md)
   records the reference-image gates, one-submit texture cube, LLVM Gouraud
   path, live performance, syscall counts, and post-run GPU health.
+- [d16-rhw-chain-submit.md](d16-rhw-chain-submit.md) specifies and records the
+  independent safety audit for the bounded multi-packet Gouraud submit.
+- [chrome9-dsx-dsy-negative-boundary.md](chrome9-dsx-dsy-negative-boundary.md)
+  records the production Windows/Linux derivative rejection boundary and the
+  corrected A90 provenance.
+- [chrome9-mrt-output-audit.md](chrome9-mrt-output-audit.md) and
+  [chrome9-depth-output-audit.md](chrome9-depth-output-audit.md) retain the
+  production compiler output records while keeping unproved render-target and
+  shader-depth hardware state fail-closed.
+- [chrome9-ps30-dcl-negative-boundary.md](chrome9-ps30-dcl-negative-boundary.md)
+  records the bounded PS 3.0 declaration rejection and its accepted MOV
+  control.
 - [chrome9-mov-mul-short-chain-three-driver.md](chrome9-mov-mul-short-chain-three-driver.md)
   cross-checks short-chain destination ids, A/C release precedence, resource
   counts, and normalized finalizer provenance in Linux, D3D, and OpenGL.

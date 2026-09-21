@@ -91,3 +91,22 @@ does not claim native hardware TCL or eliminate per-packet GPU retirement.
   one command-`0x1c` ioctl per frame and no command-`0x0f` draw ioctl.
 
 Do not advertise capability bit 47 by default until all live cases pass.
+
+## Independent pre-live audit
+
+The implementation at kernel `19ccbc4`, UAPI `c83ea14`, Mesa Chrome9
+`62eff6c`, Mesa parent `91bd8c6`, and tools `3d16ae3` received a separate
+source audit before deployment.  The audit found no blocker and made no code
+change.  In particular it rechecked typed vertex-offset arithmetic at 16,384
+triangles, the 64-KiB staging and 1-MiB ring bounds (including exact fit and
+wrap), fresh-cookie retirement, one fence and DMA-ownership interval across
+the whole chain, timeout quarantine, and Mesa's exact-capacity flush.  The
+128-byte UAPI layout is asserted independently in kernel, Mesa and the direct
+test tool.
+
+The audit also examined a partial-success/internal-error case: an earlier
+segment has completed cookie, PAUSE and idle retirement before the next
+segment is constructed.  Releasing the shared mappings after a later
+pre-publication failure is therefore safe; a failure after publication takes
+the quarantine path instead.  This is a safety conclusion, not a live-silicon
+performance result.  The live ladder listed above remains mandatory.
