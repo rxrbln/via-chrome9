@@ -73,3 +73,59 @@ the submitted program to one ALU record:
 
 Until each step passes guarded readback and wedge recovery, it must remain an
 offline compiler result rather than a structured runtime opcode.
+
+## Static operand boundary
+
+The Linux 5.75 DSO and Windows UMD provide a second, independent boundary on
+the compiler records.  This evidence explains fields but does not replace a
+compiler differential or a silicon test.  Exact static candidates and their
+status are in
+[`chrome9-next-alu-static-policy.tsv`](chrome9-next-alu-static-policy.tsv).
+
+The relevant Linux symbols are `stmPPS_GetSrcSetting_invi` at `0x162490`,
+`stmModifySourceSwizzle_invi` at `0x169960`, MIN/MAX at
+`0x16f480`/`0x16f700`, RCP/RSQ at `0x16abe0`/`0x16aa60`, and ABS at
+`0x1727e0`.  The corresponding Windows routines are the source converter at
+VA `0x1020f070`, writemask helper at `0x1020e600`, MIN/MAX at
+`0x102189b0`/`0x102187f0`, RCP/RSQ at `0x10219920`/`0x10219a80`, and ABS at
+`0x10215590`.
+
+For a full XYZW write, the MIN/MAX emitters preserve every X/Y/Z/W selector
+from both sources and place source 0 in A and source 1 in C.  Their writemask
+helper rewrites selectors only for lanes not written.  This independently
+explains why partial writes are not obtained by changing d2 `23:20` alone.
+Arbitrary swizzles remain reject-only because the byte-exact dynamic corpus
+covers identity operands, not every permutation.
+
+MIN/MAX source-A NEG occupies d1 `27:24`.  Source-C NEG occupies d0
+`31:28`.  Importantly, both common MIN/MAX emitters omit d3.bit20 for a
+source-C modifier.  The bit-20 behavior recovered from the Windows
+programmable MAD converter is therefore operation/path-specific, not a
+generic source-C rule.  All source modifiers remain rejected until a direct
+compiler differential and numerical test cover the exact operation.
+
+RCP and RSQ are scalar-W operations in both static emitters.  Windows calls
+the swizzle helper with mask 8; Linux extracts the packed W selector.  Both
+place that selector in native A.w and force native A.xyz to literal zero.
+Consequently an identity token selects W and compiles exactly like `.wwww`,
+while `.xxxx`, `.yyyy`, and `.zzzz` would select X, Y, and Z through their W
+token lane.  This closes the compiler quirk but not reciprocal arithmetic,
+so every RCP/RSQ form stays rejected.
+
+ABS is an operation, not evidence for an ABS source modifier.  The exact
+identity record expands one source into A=`src`, B=`-src`, C=`src` under
+sub-operation 9.  Windows and Linux byte-match for c0.  Linux also emits the
+listed v0 record; Windows v0 is only statically predicted from its common ABS
+emitter and remains reject-only.  D3D ABS/ABSNEG source-modifier codes have no
+cross-driver contract.
+
+## Next fail-closed NIR candidate
+
+After guarded silicon readback, identity-swizzle MIN/MAX are the safest next
+structured operations.  With finite c0 and normalized finite v0 they cannot
+create infinity or NaN, unlike unrestricted ADD/SUB near the finite endpoint.
+The first admission must still require a terminal full-XYZW oC0 write, one
+record, no texture or temporary, source NONE modifiers, no SAT, v0/c0 only,
+and default FP32 execution modes.  Test both operand orders and signed zero;
+do not infer arbitrary swizzle, NEG, partial-write, or temporary support from
+the static packing proof.
