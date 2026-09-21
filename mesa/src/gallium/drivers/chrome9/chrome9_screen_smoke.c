@@ -96,6 +96,9 @@ make_texture_vertex_shader(struct pipe_screen *screen,
                              .io_semantics.location = VERT_ATTRIB_POS);
    texcoord = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0),
                              .io_semantics.location = VERT_ATTRIB_TEX0);
+   texcoord = nir_vec4(&b, nir_channel(&b, texcoord, 0),
+                       nir_channel(&b, texcoord, 1), nir_imm_float(&b, 0.0f),
+                       nir_imm_float(&b, 1.0f));
    nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = VARYING_SLOT_POS);
    if (emit_color) {
@@ -106,7 +109,7 @@ make_texture_vertex_shader(struct pipe_screen *screen,
       nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
                        .io_semantics.location = VARYING_SLOT_COL0);
    }
-   nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0x3,
+   nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = VARYING_SLOT_TEX0);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
@@ -1487,42 +1490,61 @@ main(int argc, char **argv)
       puts("textured triangle capability unavailable; texture smoke skipped");
    }
    bgra_templ.format = PIPE_FORMAT_B8G8R8A8_UNORM;
-   if (chrome9_screen_has_capability(
-          screen, DRM_CHROME9_CAP_BLEND_BGRA8888)) {
+   bgra_templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
+                     PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
+                     PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
+   {
       struct pipe_resource *bgra_resource;
-      struct winsys_handle bgra_handle = { .type = WINSYS_HANDLE_TYPE_FD };
+      struct chrome9_resource *bgra;
+      struct winsys_handle bgra_kms = { .type = WINSYS_HANDLE_TYPE_KMS };
+      struct winsys_handle bgra_fd = { .type = WINSYS_HANDLE_TYPE_FD };
       bool bgra_exported;
 
       if (!screen->is_format_supported(screen, bgra_templ.format,
                                        bgra_templ.target, 1, 1,
-                                       bgra_templ.bind) ||
-          screen->is_format_supported(screen, bgra_templ.format,
-                                      bgra_templ.target, 1, 1,
-                                      bgra_templ.bind | PIPE_BIND_SHARED)) {
-         fputs("BGRA8888 bounded render-target bindings mismatch\n", stderr);
+                                       bgra_templ.bind)) {
+         fputs("BGRA8888 GBM allocation bindings rejected\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;
       }
       bgra_resource = screen->resource_create(screen, &bgra_templ);
-      bgra_exported = bgra_resource &&
-         screen->resource_get_handle(
-            screen, NULL, bgra_resource, &bgra_handle,
-            PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      if (!bgra_resource) {
+         fputs("BGRA8888 GBM-style allocation failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      bgra = chrome9_resource(bgra_resource);
+      if (!screen->resource_get_handle(
+             screen, NULL, bgra_resource, &bgra_kms,
+             PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE) ||
+          bgra_kms.handle != bgra->bo.handle ||
+          bgra_kms.stride != bgra->stride ||
+          bgra_kms.offset != bgra->data_offset ||
+          bgra_kms.modifier != DRM_FORMAT_MOD_LINEAR) {
+         fputs("BGRA8888 same-fd KMS handle failed\n", stderr);
+         screen->resource_destroy(screen, bgra_resource);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      bgra_exported = screen->resource_get_handle(
+         screen, NULL, bgra_resource, &bgra_fd,
+         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
       if (bgra_exported)
-         close(bgra_handle.handle);
-      if (!bgra_resource || bgra_exported ||
-          !run_pipe_triangle(screen, bgra_resource, NULL)) {
-         fputs("Chrome9 Gallium BGRA8888 triangle failed\n", stderr);
-         if (bgra_resource)
-            screen->resource_destroy(screen, bgra_resource);
+         close(bgra_fd.handle);
+      if (bgra_exported ||
+          (chrome9_screen_has_capability(
+              screen, DRM_CHROME9_CAP_BLEND_BGRA8888) &&
+           !run_pipe_triangle(screen, bgra_resource, NULL))) {
+         fputs("Chrome9 Gallium BGRA8888 contract failed\n", stderr);
+         screen->resource_destroy(screen, bgra_resource);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;
       }
       screen->resource_destroy(screen, bgra_resource);
-   } else {
-      puts("BGRA8888 render-target capability unavailable; smoke skipped");
    }
    screen->resource_destroy(screen, resource);
    screen->destroy(screen);

@@ -169,6 +169,8 @@ chrome9_format_supported(struct pipe_screen *screen,
    const unsigned surface_bindings =
       PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
       PIPE_BIND_SCANOUT | PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW;
+   const unsigned share_bindings = PIPE_BIND_DISPLAY_TARGET |
+                                    PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
    /* Mesa adds SAMPLER_VIEW to user renderbuffers so that common meta paths
     * may address them.  Accept that allocation contract for Z16 even though
     * create_sampler_view keeps rejecting Z16 until depth sampling is wired.
@@ -183,6 +185,22 @@ chrome9_format_supported(struct pipe_screen *screen,
       return false;
    if (target == PIPE_BUFFER)
       return !(bindings & ~buffer_bindings);
+   /* GBM asks for an ARGB allocation carrying its complete render, sampler,
+    * display, scanout, and sharing usage set.  The modesetting path presents
+    * it through the same linear XRGB scanout contract; actual BGRA draws
+    * remain independently capability-gated in chrome9_draw_state_supported.
+    */
+   if (chrome9_is_surface_target(target) &&
+       format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+       (bindings & share_bindings)) {
+      if (bindings & ~surface_bindings)
+         return false;
+      return chrome9_format_supported(screen,
+                                      PIPE_FORMAT_B8G8R8X8_UNORM,
+                                      target, sample_count,
+                                      storage_sample_count,
+                                      PIPE_BIND_SCANOUT);
+   }
    if ((bindings & PIPE_BIND_SAMPLER_VIEW) &&
        !chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE))
@@ -365,7 +383,9 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
    kms = whandle && whandle->type == WINSYS_HANDLE_TYPE_KMS;
    if (!whandle || pres->target == PIPE_BUFFER ||
        pres->last_level ||
-       pres->format != PIPE_FORMAT_B8G8R8X8_UNORM || whandle->plane ||
+       (pres->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        (!kms || pres->format != PIPE_FORMAT_B8G8R8A8_UNORM)) ||
+       whandle->plane ||
        whandle->layer ||
        (!kms && whandle->type != WINSYS_HANDLE_TYPE_FD) ||
        !resource->bo.handle)
