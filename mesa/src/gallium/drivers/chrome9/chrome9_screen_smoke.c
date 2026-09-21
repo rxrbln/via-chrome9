@@ -3247,6 +3247,94 @@ out:
 }
 
 static bool
+run_pipe_resource_copy(struct pipe_screen *screen)
+{
+   const struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .width0 = 8, .height0 = 8, .depth0 = 1, .array_size = 1,
+      .last_level = 2,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource *src = NULL, *dst = NULL;
+   struct pipe_context *context = NULL;
+   struct chrome9_resource *csrc, *cdst;
+   bool passed = false;
+
+   src = screen->resource_create(screen, &templ);
+   dst = screen->resource_create(screen, &templ);
+   context = screen->context_create(screen, NULL, 0);
+   if (!src || !dst || !context || !context->resource_copy_region)
+      goto out;
+   csrc = chrome9_resource(src);
+   cdst = chrome9_resource(dst);
+   memset(csrc->bo.map, 0xa5, csrc->bo.size);
+   memset(cdst->bo.map, 0x5a, cdst->bo.size);
+   for (unsigned level = 0; level <= templ.last_level; level++) {
+      const unsigned width = u_minify(templ.width0, level);
+      const unsigned height = u_minify(templ.height0, level);
+      uint32_t *pixels = (uint32_t *)((uint8_t *)csrc->bo.map +
+                                      csrc->level_offset[level]);
+
+      for (unsigned y = 0; y < height; y++)
+         for (unsigned x = 0; x < width; x++)
+            pixels[y * (csrc->level_stride[level] / 4) + x] =
+               0x5b000000 | level << 16 | y << 8 | x;
+      const struct pipe_box box = {
+         .x = 0, .y = 0, .z = 0,
+         .width = width, .height = height, .depth = 1,
+      };
+
+      context->resource_copy_region(context, dst, level, 0, 0, 0,
+                                    src, level, &box);
+   }
+
+   passed = true;
+   for (unsigned level = 0; level <= templ.last_level; level++) {
+      const unsigned width = u_minify(templ.width0, level);
+      const unsigned height = u_minify(templ.height0, level);
+      const uint8_t *src_data = (const uint8_t *)csrc->bo.map +
+                                csrc->level_offset[level];
+      const uint8_t *dst_data = (const uint8_t *)cdst->bo.map +
+                                cdst->level_offset[level];
+
+      for (unsigned y = 0; y < height; y++) {
+         const uint32_t *src_pixels =
+            (const uint32_t *)(src_data + y * csrc->level_stride[level]);
+         const uint32_t *dst_pixels =
+            (const uint32_t *)(dst_data + y * cdst->level_stride[level]);
+
+         for (unsigned x = 0; x < width; x++)
+            passed &= src_pixels[x] ==
+                         (0x5b000000 | level << 16 | y << 8 | x) &&
+                      dst_pixels[x] == src_pixels[x];
+         passed &= smoke_bytes_match(
+            dst_data + y * cdst->level_stride[level] + width * 4,
+            cdst->level_stride[level] - width * 4, 0x5a);
+      }
+   }
+   size_t page_size = cdst->data_offset;
+   size_t level0_end = page_size + ALIGN_POT(cdst->data_size, page_size);
+
+   passed &= smoke_bytes_match(cdst->bo.map, page_size, 0x5a) &&
+             smoke_bytes_match((uint8_t *)cdst->bo.map + level0_end,
+                               page_size, 0x5a) &&
+             smoke_bytes_match((uint8_t *)cdst->bo.map + cdst->bo.size -
+                                  page_size,
+                               page_size, 0x5a);
+   if (passed)
+      puts("Gallium CPU resource_copy_region levels 0..2 passed");
+   else
+      fputs("Gallium CPU resource_copy_region mismatch\n", stderr);
+
+out:
+   if (context) context->destroy(context);
+   if (dst) screen->resource_destroy(screen, dst);
+   if (src) screen->resource_destroy(screen, src);
+   return passed;
+}
+
+static bool
 run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
 {
    const struct pipe_resource target_template = {
@@ -3847,6 +3935,12 @@ main(int argc, char **argv)
    if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions) {
       if (!run_pipe_texture(screen)) {
          fputs("Chrome9 Gallium texture draw failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (!run_pipe_resource_copy(screen)) {
+         fputs("Chrome9 Gallium resource copy failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;

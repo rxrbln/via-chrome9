@@ -18,6 +18,7 @@
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/u_surface.h"
 #include "util/u_transfer.h"
 
 #define CHROME9_MAX_BUFFER_SIZE (256ULL * 1024 * 1024)
@@ -527,6 +528,7 @@ chrome9_init_context_resource_functions(struct pipe_context *pipe)
    pipe->buffer_unmap = chrome9_transfer_unmap;
    pipe->texture_map = chrome9_transfer_map;
    pipe->texture_unmap = chrome9_transfer_unmap;
+   pipe->resource_copy_region = util_resource_copy_region;
    pipe->transfer_flush_region = u_default_transfer_flush_region;
    pipe->buffer_subdata = u_default_buffer_subdata;
    pipe->texture_subdata = u_default_texture_subdata;
