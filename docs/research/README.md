@@ -19,8 +19,8 @@ targets.
   retains matching Linux/Mesa finalized rows and the deliberately separate
   unresolved Windows-wrapper raw rows for that successor.
 - [glmark2-texture-half-pixel-oracle.md](glmark2-texture-half-pixel-oracle.md)
-  reconstructs the nearest and linear validation failures exactly and
-  isolates the post-viewport half-pixel correction.
+  reconstructs the nearest and linear validation failures exactly and records
+  the live-proven post-viewport half-pixel correction.
 - [chrome9-mov-mul-short-chain-three-driver.md](chrome9-mov-mul-short-chain-three-driver.md)
   cross-checks short-chain destination ids, A/C release precedence, resource
   counts, and normalized finalizer provenance in Linux, D3D, and OpenGL.
@@ -36,6 +36,16 @@ targets.
   defines the first structured compiler's reject-only boundary.
 - [chrome9-ps-inplace-waw-negative-corpus.tsv](chrome9-ps-inplace-waw-negative-corpus.tsv)
   retains the exact Linux/Windows alias and overwrite differentials.
+- [chrome9-ps-temp-swizzle-neg.md](chrome9-ps-temp-swizzle-neg.md) closes
+  production TEMP-source swizzle packing and preserves the Windows/Linux NEG
+  disagreement as a reject-only boundary.
+- [chrome9-ps-temp-swizzle-neg-corpus.tsv](chrome9-ps-temp-swizzle-neg-corpus.tsv)
+  retains the exact finalized swizzle rows and all three NEG mismatches.
+- [chrome9-ps-temp-destination-mask-sat.md](chrome9-ps-temp-destination-mask-sat.md)
+  closes TEMP destination mask/SAT fields, partial-write literal-fill source
+  rewrites, and their interaction with live/dead finalization.
+- [chrome9-ps-temp-destination-mask-sat-corpus.tsv](chrome9-ps-temp-destination-mask-sat-corpus.tsv)
+  retains the 14 exact Windows/Linux live and dead producer rows.
 - [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
   finalized oC0 and texture-consumer golden corpus for the bounded encoder.
 - [chrome9-ps-temp-lifetime-finalizer.md](chrome9-ps-temp-lifetime-finalizer.md)
