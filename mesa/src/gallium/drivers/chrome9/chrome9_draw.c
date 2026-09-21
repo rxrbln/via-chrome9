@@ -864,15 +864,20 @@ chrome9_u32_as_float(uint32_t bits, float *value)
 }
 
 static bool
-chrome9_q16_integer(int32_t value, uint32_t *integer)
+chrome9_q16_raster_edge(int32_t value, bool half_pixel_center,
+                        uint32_t *integer)
 {
+   const int64_t unbiased = (int64_t)value +
+      (half_pixel_center ? 0x8000 : 0);
    int64_t rounded;
    int64_t error;
 
-   if (value < 0)
+   /* Undo the GL half-pixel bias, when present, before deciding whether a
+    * pair of textured triangles is an exact integer copy rectangle. */
+   if (unbiased < 0)
       return false;
-   rounded = ((int64_t)value + 0x8000) >> 16;
-   error = (int64_t)value - (rounded << 16);
+   rounded = (unbiased + 0x8000) >> 16;
+   error = unbiased - (rounded << 16);
    if (llabs(error) > 4 || rounded > UINT32_MAX)
       return false;
    *integer = rounded;
@@ -896,6 +901,7 @@ chrome9_textured_batch_copy_rect(const struct chrome9_vbuf_render *crender,
    unsigned corners = 0;
    unsigned corner_count[4] = { 0 };
    uint32_t rhw_bits = 0;
+   bool half_pixel_edges = false;
 
    if (crender->ctx->debug_draws) {
       fprintf(stderr,
@@ -952,9 +958,20 @@ chrome9_textured_batch_copy_rect(const struct chrome9_vbuf_render *crender,
       float source_x, source_y;
       long rounded_x, rounded_y;
 
-      if (!chrome9_q16_integer(vertex->x_16_16, &dx[i]) ||
-          !chrome9_q16_integer(vertex->y_16_16, &dy[i]))
+      if (!i) {
+         if (!chrome9_q16_raster_edge(vertex->x_16_16, false, &dx[i]) ||
+             !chrome9_q16_raster_edge(vertex->y_16_16, false, &dy[i])) {
+            half_pixel_edges = true;
+            if (!chrome9_q16_raster_edge(vertex->x_16_16, true, &dx[i]) ||
+                !chrome9_q16_raster_edge(vertex->y_16_16, true, &dy[i]))
+               return false;
+         }
+      } else if (!chrome9_q16_raster_edge(vertex->x_16_16,
+                                           half_pixel_edges, &dx[i]) ||
+                 !chrome9_q16_raster_edge(vertex->y_16_16,
+                                           half_pixel_edges, &dy[i])) {
          return false;
+      }
       chrome9_u32_as_float(vertex->rhw_float, &rhw);
       if (!isfinite(rhw) || rhw <= 0.0f ||
           (i && vertex->rhw_float != rhw_bits))
@@ -1162,9 +1179,12 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
 
 static void
 chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
-                      unsigned ia, unsigned ib, unsigned ic)
+                      unsigned ia, unsigned ib, unsigned ic,
+                      unsigned provoking)
 {
    struct chrome9_context *ctx = crender->ctx;
+   const float pixel_center_bias =
+      ctx->rasterizer && ctx->rasterizer->half_pixel_center ? 0.5f : 0.0f;
    struct chrome9_resource *target = NULL;
    struct chrome9_resource *depth = NULL;
    struct chrome9_resource *textures[2];
@@ -1190,6 +1210,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    const unsigned indices[3] = { ia, ib, ic };
    int32_t x[3], y[3];
    uint32_t constant_color = 0;
+   uint32_t flat_color = 0;
    const char *state_reason = "vertex-layout";
    bool blend_successor = false;
    bool depth_active = false;
@@ -1203,6 +1224,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
        ctx->fs->fragment_program ==
           CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY);
    uint32_t depth_flags = 0;
+   const bool flat_primary = ctx->fs && ctx->fs->flat_primary &&
+      ctx->fs->fragment_program == CHROME9_FS_PRIMARY_COLOR;
 
    if (((!crender->textured &&
          (ctx->draw_triangle_batch ||
@@ -1279,6 +1302,11 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    }
    program_batch = perspective_batch &&
       ctx->draw_program_triangle_d16_rhw_batch &&
+      /* The fixed primary path and compiler MOV v0 are semantically
+       * identical.  Keep both smooth and software-flat primary draws in the
+       * larger RHW run so state changes can coalesce across GL draw calls;
+       * reserve cmd19 for programs which actually need uploaded ALU state. */
+      ctx->fs->fragment_program != CHROME9_FS_PRIMARY_COLOR &&
       chrome9_program_instruction(ctx->fs, &program_instruction) &&
       (!(ctx->fs->native_fs.constant_mask & 1) ||
        chrome9_fragment_constant_c0(ctx, program_constant_c0));
@@ -1295,6 +1323,18 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       scissor.max_x = MIN2(ctx->scissor.maxx, target->base.width0);
       scissor.min_y = MIN2(ctx->scissor.miny, target->base.height0);
       scissor.max_y = MIN2(ctx->scissor.maxy, target->base.height0);
+   }
+   if (flat_primary) {
+      if (provoking >= crender->vertex_count ||
+          (size_t)(provoking + 1) * crender->vertex_size >
+             crender->capacity) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      memcpy(&flat_color,
+             crender->vertices + (size_t)provoking * crender->vertex_size +
+                4 * sizeof(float),
+             sizeof(flat_color));
    }
    for (unsigned i = 0; i < 3; i++) {
       const uint8_t *vertex;
@@ -1367,6 +1407,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       } else {
          memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
       }
+      if (flat_primary)
+         color = flat_color;
       if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program))
          color = constant_color;
       if (ctx->fs->fragment_program ==
@@ -1375,8 +1417,13 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          ctx->rejected_triangles++;
          return;
       }
-      x[i] = chrome9_coord_16_16(position[0], target->base.width0);
-      y[i] = chrome9_coord_16_16(position[1], target->base.height0);
+      /* Chrome9 inherits D3D9 integer pixel centers.  Gallium requests GL
+       * half-integer centers explicitly, so translate post-viewport XY while
+       * leaving texture coordinates and every other varying untouched. */
+      x[i] = chrome9_coord_16_16(position[0] - pixel_center_bias,
+                                 target->base.width0);
+      y[i] = chrome9_coord_16_16(position[1] - pixel_center_bias,
+                                 target->base.height0);
       if (crender->textured) {
          const float *texcoord = crender->packed_generic == 2 ? packed + 1 :
             crender->packed_generic >= 6 ? packed :
@@ -1961,6 +2008,8 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
                          unsigned nr)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   const bool first = crender->ctx->rasterizer &&
+      crender->ctx->rasterizer->flatshade_first;
    unsigned end;
 
    if (start > crender->vertex_count || nr > crender->vertex_count - start)
@@ -1969,30 +2018,37 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
    switch (crender->prim) {
    case MESA_PRIM_TRIANGLES:
       for (unsigned i = start; i + 2 < end; i += 3)
-         chrome9_emit_triangle(crender, i, i + 1, i + 2);
+         chrome9_emit_triangle(crender, i, i + 1, i + 2,
+                               first ? i : i + 2);
       break;
    case MESA_PRIM_TRIANGLE_STRIP:
       for (unsigned i = start; i + 2 < end; i++)
          if ((i - start) & 1)
-            chrome9_emit_triangle(crender, i + 1, i, i + 2);
+            chrome9_emit_triangle(crender, i + 1, i, i + 2,
+                                  first ? i : i + 2);
          else
-            chrome9_emit_triangle(crender, i, i + 1, i + 2);
+            chrome9_emit_triangle(crender, i, i + 1, i + 2,
+                                  first ? i : i + 2);
       break;
    case MESA_PRIM_TRIANGLE_FAN:
+      for (unsigned i = start + 1; i + 1 < end; i++)
+         chrome9_emit_triangle(crender, start, i, i + 1,
+                               first ? i : i + 1);
+      break;
    case MESA_PRIM_POLYGON:
       for (unsigned i = start + 1; i + 1 < end; i++)
-         chrome9_emit_triangle(crender, start, i, i + 1);
+         chrome9_emit_triangle(crender, start, i, i + 1, start);
       break;
    case MESA_PRIM_QUADS:
       for (unsigned i = start; i + 3 < end; i += 4) {
-         chrome9_emit_triangle(crender, i, i + 1, i + 3);
-         chrome9_emit_triangle(crender, i + 1, i + 2, i + 3);
+         chrome9_emit_triangle(crender, i, i + 1, i + 3, i + 3);
+         chrome9_emit_triangle(crender, i + 1, i + 2, i + 3, i + 3);
       }
       break;
    case MESA_PRIM_QUAD_STRIP:
       for (unsigned i = start; i + 3 < end; i += 2) {
-         chrome9_emit_triangle(crender, i, i + 1, i + 3);
-         chrome9_emit_triangle(crender, i, i + 3, i + 2);
+         chrome9_emit_triangle(crender, i, i + 1, i + 3, i + 3);
+         chrome9_emit_triangle(crender, i, i + 3, i + 2, i + 3);
       }
       break;
    default:
@@ -2006,6 +2062,8 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
                            const uint16_t *indices, unsigned nr_indices)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   const bool first = crender->ctx->rasterizer &&
+      crender->ctx->rasterizer->flatshade_first;
 
    if (!indices)
       return;
@@ -2013,37 +2071,45 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
    case MESA_PRIM_TRIANGLES:
       for (unsigned i = 0; i + 2 < nr_indices; i += 3)
          chrome9_emit_triangle(crender, indices[i], indices[i + 1],
-                               indices[i + 2]);
+                               indices[i + 2],
+                               first ? indices[i] : indices[i + 2]);
       break;
    case MESA_PRIM_TRIANGLE_STRIP:
       for (unsigned i = 0; i + 2 < nr_indices; i++)
          if (i & 1)
             chrome9_emit_triangle(crender, indices[i + 1], indices[i],
-                                  indices[i + 2]);
+                                  indices[i + 2],
+                                  first ? indices[i] : indices[i + 2]);
          else
             chrome9_emit_triangle(crender, indices[i], indices[i + 1],
-                                  indices[i + 2]);
+                                  indices[i + 2],
+                                  first ? indices[i] : indices[i + 2]);
       break;
    case MESA_PRIM_TRIANGLE_FAN:
+      for (unsigned i = 1; i + 1 < nr_indices; i++)
+         chrome9_emit_triangle(crender, indices[0], indices[i],
+                               indices[i + 1],
+                               first ? indices[i] : indices[i + 1]);
+      break;
    case MESA_PRIM_POLYGON:
       for (unsigned i = 1; i + 1 < nr_indices; i++)
          chrome9_emit_triangle(crender, indices[0], indices[i],
-                               indices[i + 1]);
+                               indices[i + 1], indices[0]);
       break;
    case MESA_PRIM_QUADS:
       for (unsigned i = 0; i + 3 < nr_indices; i += 4) {
          chrome9_emit_triangle(crender, indices[i], indices[i + 1],
-                               indices[i + 3]);
+                               indices[i + 3], indices[i + 3]);
          chrome9_emit_triangle(crender, indices[i + 1], indices[i + 2],
-                               indices[i + 3]);
+                               indices[i + 3], indices[i + 3]);
       }
       break;
    case MESA_PRIM_QUAD_STRIP:
       for (unsigned i = 0; i + 3 < nr_indices; i += 2) {
          chrome9_emit_triangle(crender, indices[i], indices[i + 1],
-                               indices[i + 3]);
+                               indices[i + 3], indices[i + 3]);
          chrome9_emit_triangle(crender, indices[i], indices[i + 3],
-                               indices[i + 2]);
+                               indices[i + 2], indices[i + 3]);
       }
       break;
    default:

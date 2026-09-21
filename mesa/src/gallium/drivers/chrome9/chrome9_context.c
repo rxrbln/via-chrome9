@@ -339,6 +339,27 @@ chrome9_fs_smooth_variable(const nir_variable *var, unsigned location)
 }
 
 static bool
+chrome9_fs_flat_primary_variable(const nir_variable *var)
+{
+   return var && var->data.mode == nir_var_shader_in &&
+          var->data.location == VARYING_SLOT_COL0 && !var->data.index &&
+          !var->data.location_frac && !var->data.centroid &&
+          !var->data.sample && !var->data.patch && !var->data.compact &&
+          !var->data.per_primitive && !var->data.per_vertex &&
+          var->data.interpolation == INTERP_MODE_FLAT;
+}
+
+static bool
+chrome9_fs_has_flat_primary(nir_shader *nir)
+{
+   nir_foreach_shader_in_variable(var, nir) {
+      if (chrome9_fs_flat_primary_variable(var))
+         return true;
+   }
+   return false;
+}
+
+static bool
 chrome9_fs_smooth_pixel_load(const nir_intrinsic_instr *load,
                              unsigned location)
 {
@@ -401,6 +422,43 @@ chrome9_fs_is_primary_color(nir_def *def, unsigned depth)
                 alu->src[c].swizzle[0] != c)
                return false;
          return chrome9_fs_is_primary_color(source, depth + 1);
+      }
+   }
+   return false;
+}
+
+static bool
+chrome9_fs_is_flat_primary_color(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 4)
+      return false;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+      return intr->intrinsic == nir_intrinsic_load_deref &&
+             chrome9_fs_flat_primary_variable(
+                nir_intrinsic_get_var(intr, 0));
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov) {
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[0].swizzle[c] != c)
+               return false;
+         return chrome9_fs_is_flat_primary_color(alu->src[0].src.ssa,
+                                                  depth + 1);
+      }
+      if (alu->op == nir_op_vec4) {
+         nir_def *source = alu->src[0].src.ssa;
+
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[c].src.ssa != source ||
+                alu->src[c].swizzle[0] != c)
+               return false;
+         return chrome9_fs_is_flat_primary_color(source, depth + 1);
       }
    }
    return false;
@@ -1947,6 +2005,9 @@ chrome9_fs_result(nir_def *def)
    nir_def *generic = NULL;
    unsigned a, b;
 
+   if (chrome9_fs_is_flat_primary_color(def, 0))
+      return CHROME9_FS_PRIMARY_COLOR;
+
    if (chrome9_fs_is_generic0_rgba(def, 0))
       return CHROME9_FS_PRIMARY_GENERIC_RGBA;
    if (chrome9_fs_is_generic0_blue_rgbx(def, &generic, 0))
@@ -2798,6 +2859,9 @@ chrome9_create_fs_state(struct pipe_context *pipe,
          nir_print_shader(state->ir.nir, stderr);
       shader->fragment_program = straight_line ?
          chrome9_fs_classify(state->ir.nir) : CHROME9_FS_UNSUPPORTED;
+      shader->flat_primary =
+         shader->fragment_program == CHROME9_FS_PRIMARY_COLOR &&
+         chrome9_fs_has_flat_primary(state->ir.nir);
       shader->native_fs_valid = straight_line &&
          chrome9_compile_native_fs(shader, state->ir.nir);
       if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&

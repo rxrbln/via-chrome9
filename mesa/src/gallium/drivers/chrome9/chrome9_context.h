@@ -57,6 +57,7 @@ struct chrome9_shader {
    struct chrome9_ps_program native_fs;
    bool native_fs_valid;
    bool native_fs_from_nir;
+   bool flat_primary;
    bool supported;
 };
 
