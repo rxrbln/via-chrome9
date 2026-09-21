@@ -255,6 +255,25 @@ D2 = 00000000
 D3 = selected texture coordinate S, T
 ```
 
+That canonical record is consumed by the current five-record VS object,
+unchanged for both keys:
+
+```text
+00380150 00000000 00000000 0008010f
+0008014c 00100150 00384154 0004021f
+0008414c 00000000 00000000 0008422f   D1 -> oD0
+0008814c 00000000 00000000 0008423f   D2 -> oD1
+0008c14c 00000000 00000000 0008028f   D3 -> oT0
+A60 = 60800004
+```
+
+The output destinations are independently decoded by the proprietary VS
+compiler: `8422f/8423f/8028f` are full oD0/oD1/oT0 writes. Therefore the
+linked GLSL semantic number is a Mesa-side lookup only. It must never be
+copied into the kernel packet or PS operand id: after repacking, primary is
+always hardware oD0 -> PS v0 and the sampler coordinate is always oT0 ->
+TAU0.
+
 GENERIC requires both a full four-lane primary varying and a distinct
 two-component texture coordinate. TEXTURECOLOR requires only the coordinate;
 Mesa writes canonical D1=`ffffffff`, D2=`00000000` after post-TNL packing.
