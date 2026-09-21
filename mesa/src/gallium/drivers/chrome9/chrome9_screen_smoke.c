@@ -1959,13 +1959,23 @@ run_pipe_texture(struct pipe_screen *screen)
               "texture setup failed: target=%p texture=%p context=%p "
               "blend=%p dsa=%p rasterizer=%p elements=%p "
               "replace_elements=%p sampler=%p "
-              "view=%p rhw_view=%p replace_vs=%p modulate_vs=%p "
+              "view=%p rhw_view=%p shadow_source=%p shadow_view=%p "
+              "source_guarded=%u shadow=%p shadow_guarded=%u "
+              "replace_vs=%p modulate_vs=%p "
               "replace=%p modulate=%p constant_modulate=%p "
               "constant_alpha_modulate=%p rgbx=%p packed=%p/%p\n",
               (void *)target, (void *)texture, (void *)context, blend_handle,
               dsa_handle, rasterizer_handle, elements_handle,
               replace_elements_handle, sampler_handle,
-              (void *)view, (void *)rhw_view, replace_vs, modulate_vs,
+              (void *)view, (void *)rhw_view, (void *)shadow_source,
+              (void *)shadow_view,
+              shadow_source ? chrome9_resource(shadow_source)->guarded : 0,
+              shadow_view ? (void *)chrome9_sampler_view(shadow_view)->shadow :
+                            NULL,
+              shadow_view && chrome9_sampler_view(shadow_view)->shadow ?
+                 chrome9_resource(
+                    chrome9_sampler_view(shadow_view)->shadow)->guarded : 0,
+              replace_vs, modulate_vs,
               replace, modulate, constant_modulate,
               constant_alpha_modulate, rgbx, packed_gray_vs, packed_gray_fs);
       goto out;

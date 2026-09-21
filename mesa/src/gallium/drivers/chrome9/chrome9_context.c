@@ -675,14 +675,45 @@ chrome9_fs_is_generic0_rgbx(nir_def *def, nir_def **base, unsigned depth)
    for (unsigned c = 0; c < 3; c++) {
       nir_def *source = NULL;
 
-      if (!chrome9_fs_is_generic0_component(&alu->src[c], c, &source,
-                                            depth + 1) &&
-          (!c ||
-           !chrome9_fs_is_generic0_component(&alu->src[c], 0, &source,
-                                             depth + 1) ||
-           source->num_components != 1))
+      if (!chrome9_fs_is_generic0_component(&alu->src[c], 0, &source,
+                                            depth + 1) ||
+          (found && source != found))
          return false;
-      if (found && source != found)
+      found = source;
+   }
+   if (alu->src[3].swizzle[0] ||
+       !chrome9_fs_is_one(alu->src[3].src.ssa, depth + 1))
+      return false;
+   *base = found;
+   return found != NULL;
+}
+
+static bool
+chrome9_fs_is_generic0_vec3_rgbx(nir_def *def, nir_def **base,
+                                 unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *found = NULL;
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_generic0_vec3_rgbx(alu->src[0].src.ssa, base,
+                                               depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++) {
+      nir_def *source = NULL;
+
+      if (!chrome9_fs_is_generic0_component(&alu->src[c], c, &source,
+                                            depth + 1) ||
+          source->num_components != 3 || (found && source != found))
          return false;
       found = source;
    }
@@ -858,12 +889,11 @@ chrome9_fs_result(nir_def *def)
       return CHROME9_FS_PRIMARY_GENERIC_RGBA;
    if (chrome9_fs_is_generic0_blue_rgbx(def, &generic, 0))
       return CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX;
-   if (chrome9_fs_is_generic0_rgbx(def, &generic, 0)) {
-      if (generic->num_components == 3)
-         return CHROME9_FS_PRIMARY_GENERIC_RGBX;
-      if (generic->num_components == 1)
-         return CHROME9_FS_PRIMARY_SCALAR_RGBX;
-   }
+   if (chrome9_fs_is_generic0_vec3_rgbx(def, &generic, 0))
+      return CHROME9_FS_PRIMARY_GENERIC_RGBX;
+   if (chrome9_fs_is_generic0_rgbx(def, &generic, 0) &&
+       generic->num_components == 1)
+      return CHROME9_FS_PRIMARY_SCALAR_RGBX;
    if (chrome9_fs_is_packed_gray_modulate(def))
       return CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE;
    if (chrome9_fs_is_rgbx(def, 0))
