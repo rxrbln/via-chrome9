@@ -21,6 +21,9 @@ targets.
 - [glmark2-texture-half-pixel-oracle.md](glmark2-texture-half-pixel-oracle.md)
   reconstructs the nearest and linear validation failures exactly and records
   the live-proven post-viewport half-pixel correction.
+- [glmark-priority-live-20260921.md](glmark-priority-live-20260921.md)
+  records the reference-image gates, one-submit texture cube, LLVM Gouraud
+  path, live performance, syscall counts, and post-run GPU health.
 - [chrome9-mov-mul-short-chain-three-driver.md](chrome9-mov-mul-short-chain-three-driver.md)
   cross-checks short-chain destination ids, A/C release precedence, resource
   counts, and normalized finalizer provenance in Linux, D3D, and OpenGL.
