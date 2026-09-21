@@ -19,6 +19,12 @@ independently builds the same packet at image offsets
 missing from the old Linux path: 3D uses header `FE33` and wait mask
 `00200000`.
 
+The Windows conditions are bit-exact.  The builder starts mode at `22`; adapter
+`+9bc.bit10` adds interrupt-wait `10`, `+9bc.bit11` adds system write `4`, and
+`+9c4.bit30` suppresses interrupt generation by clearing `2`
+(`0x000b755f..0x000b75d4`).  Thus these are independent controls rather than a
+single opaque “fence enabled” mode.
+
 The old Linux VX900 path at `via_chrome9_dma.c:1640..1694` emits an FE40
 branch followed by FE30, but uses a zero wait mask.  It proves that the chip
 accepts the new fence grammar, system-memory write, interrupt generation and
@@ -137,6 +143,16 @@ MMIO 0200 bit31  global graphics-interrupt gate
 MMIO 0204 bit5   command-reader interrupt status, write one to clear
 MMIO 0494        VX900 current/fallback fence-ID readback
 ```
+
+Windows' progress routine at `0x00076ad0` confirms that `0494` and the memory
+record are alternative primary paths.  With adapter `+9bc.bit11` set it reads
+the per-engine memory array (`0x00076b8a..0x00076bd1`); without that capability,
+device `7122` reads `0494` for engine zero
+(`0x00076c5c..0x00076cea`).  Other branches take additional `0494/049c` samples
+for diagnostics/workarounds, but static code does not establish whether
+`0494` updates before, with, or after an enabled system write.  This is why
+Linux must use the coherent word as the primary record and keep `0494`
+diagnostic until the hardware oracle orders them.
 
 The Windows ISR at `0x00077a60` first rejects an all-ones `0200` or a clear
 global bit, samples `0204`, dispatches bit 5 to the 7122 callback at
