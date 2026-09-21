@@ -83,6 +83,9 @@ targets.
 - [game-raster-depth-stencil-oracles.md](game-raster-depth-stencil-oracles.md)
   gives packet-exact depth, stencil, culling, polygon-offset, color-mask,
   clear, native-line, and point oracles plus state-transition closure rules.
+- [render-to-scanout-ownership.md](render-to-scanout-ownership.md) defines the
+  same-device, same-BO 3D-to-IGA1 ownership boundary and separates producer
+  drain, display latch, GTI invalidation, and CPU cache transitions.
 - [windows-driver-re.md](windows-driver-re.md) records the static reverse
   engineering of the supplied VX900 Windows UMD, OpenGL ICD, and KMD, including
   packet headers, relocation formats, fence candidates, and capture controls.
