@@ -9,6 +9,7 @@ libchrome9 = static_library(
     'chrome9_drm.c',
     'chrome9_resource.c',
     'chrome9_screen.c',
+    'chrome9_shader_offline.c',
   ),
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_nir, idep_mesautil],

@@ -483,7 +483,7 @@ chrome9_fs_is_projected_texture(nir_def *def, unsigned unit)
           chrome9_fs_is_texcoord_q(tex->src[projector].src.ssa, unit, 0);
 }
 
-enum chrome9_fs_leaf {
+enum chrome9_fs_class_leaf {
    CHROME9_FS_LEAF_INVALID,
    CHROME9_FS_LEAF_TEXTURE0,
    CHROME9_FS_LEAF_TEXTURE1,
@@ -2072,6 +2072,84 @@ chrome9_fs_classify(nir_shader *nir)
 }
 
 static bool
+chrome9_fs_native_key(unsigned program, struct chrome9_fs_key *key)
+{
+   memset(key, 0, sizeof(*key));
+
+   switch (program) {
+   case CHROME9_FS_PRIMARY_COLOR:
+      key->op = CHROME9_FS_OP_MOV;
+      key->src[0] = CHROME9_FS_LEAF_V0;
+      return true;
+   case CHROME9_FS_CONSTANT_COLOR:
+      key->op = CHROME9_FS_OP_MOV;
+      key->src[0] = CHROME9_FS_LEAF_C0;
+      return true;
+   case CHROME9_FS_CONSTANT_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_C0;
+      key->src[1] = CHROME9_FS_LEAF_C1;
+      return true;
+   case CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_C0;
+      key->src[1] = CHROME9_FS_LEAF_C1_A;
+      return true;
+   case CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_C0_A;
+      key->src[1] = CHROME9_FS_LEAF_C1;
+      return true;
+   case CHROME9_FS_TEXTURE_REPLACE:
+      key->op = CHROME9_FS_OP_MOV;
+      key->src[0] = CHROME9_FS_LEAF_TEX0;
+      return true;
+   case CHROME9_FS_TEXTURE_RGBX:
+      key->op = CHROME9_FS_OP_RGBX_C0X;
+      key->src[0] = CHROME9_FS_LEAF_TEX0;
+      key->src[1] = CHROME9_FS_LEAF_C0;
+      return true;
+   case CHROME9_FS_TEXTURE_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_TEX0;
+      key->src[1] = CHROME9_FS_LEAF_V0;
+      return true;
+   case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_TEX0;
+      key->src[1] = CHROME9_FS_LEAF_C0;
+      return true;
+   case CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_TEX0;
+      key->src[1] = CHROME9_FS_LEAF_C0_A;
+      return true;
+   case CHROME9_FS_TWO_TEXTURE_MODULATE:
+      key->op = CHROME9_FS_OP_MUL;
+      key->src[0] = CHROME9_FS_LEAF_TEX0;
+      key->src[1] = CHROME9_FS_LEAF_TEX1;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+chrome9_compile_native_fs(struct chrome9_shader *shader)
+{
+   struct chrome9_fs_key key;
+   enum chrome9_shader_verify_error error;
+
+   if (!chrome9_fs_native_key(shader->fragment_program, &key) ||
+       !chrome9_compile_fs_offline(&key, &shader->native_fs))
+      return false;
+
+   return chrome9_verify_fs_offline(&key, &shader->native_fs, &error);
+}
+
+static bool
 chrome9_tgsi_fs_passthrough(const struct tgsi_token *tokens)
 {
    struct tgsi_parse_context parse;
@@ -2174,6 +2252,13 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->fragment_program = shader->supported ?
          CHROME9_FS_PRIMARY_COLOR : CHROME9_FS_UNSUPPORTED;
    }
+   if (shader->supported)
+      shader->native_fs_valid = chrome9_compile_native_fs(shader);
+   if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false) &&
+       shader->supported)
+      fprintf(stderr, "chrome9: native FS valid=%u alu=%u tau=%u\n",
+              shader->native_fs_valid, shader->native_fs.alu_count,
+              shader->native_fs.tau_count);
    return shader;
 }
 

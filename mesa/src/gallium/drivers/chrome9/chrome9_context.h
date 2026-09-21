@@ -6,6 +6,8 @@
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 
+#include "chrome9_shader_offline.h"
+
 struct draw_context;
 
 enum chrome9_warning {
@@ -48,6 +50,8 @@ struct chrome9_shader {
       CHROME9_FS_IOQUAKE3_GENERIC_PACKED,
       CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED,
    } fragment_program;
+   struct chrome9_ps_program native_fs;
+   bool native_fs_valid;
    bool supported;
 };
 

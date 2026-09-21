@@ -1282,13 +1282,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
        !rasterizer_handle ||
        (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST) &&
         !alpha_dsa_handle) ||
-       !elements_handle || !vs || !fs || !scalar_gray_vs ||
+       !elements_handle || !vs || !fs ||
+       !((struct chrome9_shader *)fs)->native_fs_valid || !scalar_gray_vs ||
        !scalar_gray_fs ||
        ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=
           CHROME9_FS_PRIMARY_SCALAR_RGBX ||
        (!depth_resource &&
         (!solid_buffer || !solid_elements_handle || !solid_vs || !solid_fs ||
          !((struct chrome9_shader *)solid_fs)->supported ||
+         !((struct chrome9_shader *)solid_fs)->native_fs_valid ||
          !unsupported_solid_fs ||
          ((struct chrome9_shader *)unsupported_solid_fs)->supported ||
          !product_fs[0] || !product_fs[1] || !product_fs[2] ||
@@ -1298,6 +1300,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
             CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE ||
          ((struct chrome9_shader *)product_fs[2])->fragment_program !=
             CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE ||
+         !((struct chrome9_shader *)product_fs[0])->native_fs_valid ||
+         !((struct chrome9_shader *)product_fs[1])->native_fs_valid ||
+         !((struct chrome9_shader *)product_fs[2])->native_fs_valid ||
          !unsupported_product_fs ||
          ((struct chrome9_shader *)unsupported_product_fs)->supported ||
          !scalar_blue_fs ||
@@ -2372,6 +2377,13 @@ run_pipe_texture(struct pipe_screen *screen)
        !packed_gray_vs || !packed_gray_fs || !projected_vs || !projected_fs ||
        !projected_modulate_fs || !projected_constant_fs ||
        !projected_constant_alpha_fs ||
+       !((struct chrome9_shader *)replace)->native_fs_valid ||
+       !((struct chrome9_shader *)modulate)->native_fs_valid ||
+       !((struct chrome9_shader *)constant_modulate)->native_fs_valid ||
+       !((struct chrome9_shader *)constant_alpha_modulate)->native_fs_valid ||
+       !((struct chrome9_shader *)rgbx)->native_fs_valid ||
+       !((struct chrome9_shader *)projected_modulate_fs)->native_fs_valid ||
+       !((struct chrome9_shader *)projected_constant_fs)->native_fs_valid ||
        ((struct chrome9_shader *)constant_modulate)->fragment_program !=
           CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
        ((struct chrome9_shader *)constant_alpha_modulate)->fragment_program !=
@@ -4190,6 +4202,8 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
           screen, DRM_CHROME9_CAP_DEPTH_READ_ONLY) &&
         !read_only_dsa_handle) ||
        !vs || !fs ||
+       (!projected_blend &&
+        !((struct chrome9_shader *)fs)->native_fs_valid) ||
        ((struct chrome9_shader *)fs)->fragment_program !=
           (projected_blend ?
              (texture0_alpha ?
