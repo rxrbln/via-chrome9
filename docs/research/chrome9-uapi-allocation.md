@@ -37,8 +37,11 @@ number; design notes must link here rather than independently claiming the
 | `17` | reserved | `DRAW_TRIANGLE_D24S8_STENCIL` |
 | `18` | reserved | `DRAW_FOG_TRIANGLE` |
 | `19` | implemented | `DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH` |
+| `1a` | implemented | `DRAW_TEXTURED_TRIANGLE_BATCH` |
+| `1b` | implemented | `COPY_RECT` |
+| `1c` | implemented, opt-in silicon gate | `DRAW_TRIANGLE_D16_RHW_CHAIN` |
 
-The next unreserved command is `0x1a`.  A reservation is not an advertised
+The next unreserved command is `0x1d`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -99,10 +102,14 @@ advertised; Mesa keeps the old 34-triangle fallback for older kernels.
 | 39 | reserved | `TWO_TEXTURE_PRIMARY_TEX0_ALPHA` |
 | 40 | reserved, live-proven | `TWO_TEXTURE_SIGNED_REPEAT_COORDS` |
 | 41 | implemented, awaiting silicon validation | `DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH` |
-| 42 | reserved | `PS_MOV_SWIZZLE` |
-| 43 | reserved | `DRAW_TEXTURED_TRIANGLE_BATCH` |
+| 42 | implemented | `COPY_RECT_PRESERVE_ALPHA` |
+| 43 | implemented | `DRAW_TEXTURED_TRIANGLE_BATCH` |
+| 44 | implemented | `COPY_RECT` |
+| 45 | implemented | `COPY_RECT_UNGUARDED_DESTINATION` |
+| 46 | implemented | `GEM_DMA32_SCANOUT` |
+| 47 | implemented, opt-in silicon gate | `DRAW_TRIANGLE_D16_RHW_CHAIN` |
 
-The next unreserved capability bit is 44.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 48.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -197,16 +204,21 @@ packet word crosses the UAPI.  The kernel fixes the one-ALU resource controls,
 uploads only c0, and rejects unused or non-finite fields.  The guarded v0/c0
 exact-pixel test is the required silicon acceptance gate before deployment.
 
-Capability bit 42 is reserved for the first independently gated command-19
-source-swizzle extension.  Its initial semantic key is terminal full-XYZW
-`MOV(v0.wwww)` only; it does not authorize arbitrary selectors, partial
-writes, source modifiers, or arithmetic swizzles.  The exact record and
-mandatory D16 oracle are specified in
-[chrome9-swizzle-neg-boundary.md](chrome9-swizzle-neg-boundary.md).
+The historical capability-bit-42 reservation for a command-19 source-swizzle
+extension was never implemented and has been superseded by the merged
+`COPY_RECT_PRESERVE_ALPHA` ABI. Any future `MOV(v0.wwww)` extension must
+receive a new free capability bit; the semantic boundary remains documented
+in [chrome9-swizzle-neg-boundary.md](chrome9-swizzle-neg-boundary.md).
 
-Capability bit 43 is reserved exclusively for
+Capability bit 43 and command `0x1a` implement
 `DRAW_TEXTURED_TRIANGLE_BATCH`, the structured one-texture batch used by the
-same-device Present path.  This reservation assigns no command ordinal by
-itself; the implementing UAPI commit must add the selected command to the
-ioctl table above and define the complete request contract before advertising
-the bit.
+same-device Present path.
+
+Private command `0x1c` and capability bit 47 are the bounded multi-packet
+successor to command `0x0f`.  One request carries at most 16,384 immutable
+post-viewport D16 RHW triangles.  The kernel copies and validates the entire
+array before GEM lookup, retains one reservation/mapping/fence lifetime, and
+internally emits and retires unchanged state-complete packets of at most 544
+triangles.  It is hidden unless `chrome9.rhw_chain=1` is set.  The exact
+lifetime and failure rules are specified in
+[d16-rhw-chain-submit.md](d16-rhw-chain-submit.md).
