@@ -194,6 +194,10 @@ targets.
   reconstructs the Windows mirror-then-exchange face builder, maps Gallium
   front/back state and dynamic refs to physical CW/CCW A23--A26 payloads,
   reserves the unequal-face capability, and defines the live winding matrix.
+- [line-point-raster-contract.md](line-point-raster-contract.md) closes the
+  proprietary point/list/strip topology words, point-size insertion without
+  packet growth, variable immediate-body bounds, current draw-expansion gap,
+  and guarded coverage/diamond-rule promotion suite.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
