@@ -421,6 +421,23 @@ mantissa-mask transition with bias.  The helper emits neutral A16--A18 and the
 same A19--A1B/A1E--A20 closure even when offset is disabled, so bias cannot
 leak into a later COPY or texture draw.
 
+That last property is global, not local to the new ioctl.  A16--A18 persist in
+the 3D context and every current legacy D16 builder omits them.  Therefore a
+production kernel must use the expanded helper for **every** D16 draw that can
+follow a biased draw: plain, blend, ordinary batch, RHW batch, one texture,
+and two texture.  The fixed depth diagnostic must also establish neutral bias
+before its primitive if it remains callable after userspace submissions.  It
+is sufficient to close at the start of each D16 draw; color-only draws may
+leave the dormant value because the next D16 draw closes it before vertices.
+
+Do not advertise native bias if only the bias-enabled successor emits
+A16--A18.  A one-shot raw oracle may do that only on an isolated boot with no
+later 3D work and immediate successful unload/reboot; a timeout still invokes
+the normal quarantine rule.  For production, changing the internal packets of
+old D16 ioctls to emit neutral state does not change their UAPI semantics, but
+it does require all old-path regression oracles and exact-length assertions to
+pass before the capability bit is exposed.
+
 For the current untextured D16 bodies the exact layout becomes:
 
 ```text
