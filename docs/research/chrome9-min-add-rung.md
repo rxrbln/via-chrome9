@@ -18,8 +18,9 @@ until the guarded silicon oracle below passes.
 
 ADD with exactly one v0 and one c0 is the second candidate.  Its B source
 packing and literal-one C slot are compiler-exact, but it exercises more
-native fields than MIN.  Arbitrary constant/constant ADD is outside this
-rung.
+native fields than MIN.  Its first fail-closed validator must additionally
+bound every c0 lane to `abs(bits) <= 0x7effffff` (FLT_MAX/2).  Arbitrary
+constant/constant ADD is outside this rung.
 
 The additional eight Windows/Linux compiler differentials are retained in
 [`chrome9-min-add-rung-corpus.tsv`](chrome9-min-add-rung-corpus.tsv).
@@ -107,16 +108,22 @@ remains rejected; the companion bit is operation/path-specific.
 
 ## ADD finite constant domain
 
-No magnitude cap beyond the existing finite-c0 check is required for the
-exact v0+c0 rung under the required default round-to-nearest behavior.  v0 is
-D3DColor-normalized in `[0,1]`.  The worst positive case is
-`FLT_MAX + 1`, still far below the round-to-nearest overflow threshold
-`FLT_MAX + 2^103`, so it rounds to finite `FLT_MAX`.  Adding nonnegative v0
-to a negative c0 moves toward zero.  Every other finite c0 has still more
-headroom.
+The first ADD validator must require each c0 lane's sign-cleared binary32
+word to be at most `0x7effffff`, exactly FLT_MAX/2.  v0 is
+D3DColor-normalized in `[0,1]`, so the exact positive sum is at most
+`FLT_MAX/2 + 1`, far below FLT_MAX.  Every IEEE rounding direction therefore
+produces a finite result.  Adding nonnegative v0 to a negative c0 moves toward
+zero, and the same symmetric bound remains sufficient.
 
-This proof is deliberately tuple-specific.  It does not admit c0+c1,
-NEG, a temporary, an unbounded float varying, an explicit non-default
-rounding mode, or multi-record use.  Signed zero, denormal rounding, exact
-addition, and endpoint safety still need live numerical coverage before ADD
-becomes a runtime key.
+The weaker finite-only rule is not rounding-mode independent.  Under RNE or
+RTZ, `FLT_MAX + 1` remains finite; under round-toward-positive the exact value
+above FLT_MAX can round to positive infinity.  Rejecting explicit NIR FP
+modes does not prove the fixed Chrome9 default mode.  The remaining finite
+range may be admitted only after a silicon oracle establishes that default
+behavior or a hardware mode control is recovered.
+
+This proof is deliberately tuple-specific.  It does not admit c0+c1, a c0
+lane above the symmetric bound, NEG, a temporary, an unbounded float varying,
+an explicit non-default rounding mode, or multi-record use.  Signed zero,
+denormal rounding, exact addition, and bounded-endpoint safety still need live
+numerical coverage before ADD becomes a runtime key.
