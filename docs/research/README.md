@@ -140,6 +140,10 @@ targets.
   ioquake's post-constant GL2 shader families, records exact common ALU and
   multi-phase sampler objects, proves fragment flow/derivatives are silently
   unsupported, and defines fail-closed NIR keys and live promotion oracles.
+- [ioquake3-gl2-generic-texturecolor.md](ioquake3-gl2-generic-texturecolor.md)
+  maps the first executable GL2 generic and texturecolor programs, fixes the
+  job-local semantic-program UAPI, constant/sampler linkage, post-TNL varying
+  contract, unchanged packet indices, and guarded promotion sequence.
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,

@@ -33,8 +33,9 @@ number; design notes must link here rather than independently claiming the
 | `13` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
 | `14` | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
 | `15` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
+| `16` | reserved | `DRAW_TEXTURED_PROGRAM_TRIANGLE` |
 
-The next unreserved command is `0x16`.  A reservation is not an advertised
+The next unreserved command is `0x17`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -79,8 +80,10 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 30 | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
 | 31 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
 | 32 | reserved | `DEPTH_FUNC_EQUAL` |
+| 33 | reserved | `DRAW_TEXTURED_PROGRAM` |
+| 34 | reserved | `FRAGMENT_CONSTANTS_32` |
 
-The next unreserved capability bit is 33.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 35.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -104,3 +107,11 @@ Capability bit 32 adds no command or request field. It says the existing
 depth-function field accepts explicit EQUAL in addition to the baseline
 LESS/LEQUAL subset, as designed in
 [ioquake-fog-dlight-successors.md](ioquake-fog-dlight-successors.md).
+
+Private command `0x16` and capability bit 33 belong to the version-one
+one-texture semantic-program successor in
+[ioquake3-gl2-generic-texturecolor.md](ioquake3-gl2-generic-texturecolor.md).
+It transports job-local constants but never native instructions. Capability
+bit 34 is deliberately separate: only it permits Mesa to advertise the full
+32-vector fragment constant store. The first command implementation can use
+the live-shaped c0 H2 packet without claiming the two-bank H3 path.
