@@ -2843,6 +2843,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->two_texture_tex0_alpha_primary =
       !!(capabilities &
          DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY);
+   ctx->two_texture_signed_repeat_coords =
+      !!(capabilities &
+         DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS);
    ctx->draw_triangle_blend =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND);
    ctx->draw_textured_triangle_blend =

@@ -3,6 +3,7 @@
 
 #include "chrome9_public.h"
 #include "chrome9_context.h"
+#include "chrome9_drm.h"
 #include "chrome9_resource.h"
 
 #include <fcntl.h>
@@ -763,11 +764,14 @@ make_two_projected_texture_vertex_shader(struct pipe_screen *screen,
 
 static void *
 make_two_projected_texture_fragment_shader(struct pipe_screen *screen,
-                                           struct pipe_context *context)
+                                           struct pipe_context *context,
+                                           bool preserve_texture0_alpha)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
-      "chrome9-two-projected-texture-primary-rgb-alpha");
+      preserve_texture0_alpha ?
+         "chrome9-two-projected-texture0-alpha-primary" :
+         "chrome9-two-projected-texture-primary-rgb-alpha");
    struct pipe_shader_state state = {
       .type = PIPE_SHADER_IR_NIR,
       .ir.nir = b.shader,
@@ -807,7 +811,9 @@ make_two_projected_texture_fragment_shader(struct pipe_screen *screen,
    nir_def *product = nir_fmul(&b, sample[1], first_rgb_primary_alpha);
    nir_def *result = nir_vec4(
       &b, nir_channel(&b, product, 0), nir_channel(&b, product, 1),
-      nir_channel(&b, product, 2), nir_channel(&b, color, 3));
+      nir_channel(&b, product, 2),
+      preserve_texture0_alpha ? nir_channel(&b, first_product, 3) :
+                                nir_channel(&b, color, 3));
 
    nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = FRAG_RESULT_COLOR);
@@ -3981,14 +3987,14 @@ out:
 
 static bool
 run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
-                           bool projected_blend)
+                           bool projected_blend, bool texture0_alpha)
 {
-   const struct pipe_resource target_template = {
+   struct pipe_resource target_template = {
       .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8X8_UNORM,
       .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
       .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
    };
-   const struct pipe_resource texture_templates[2] = {
+   struct pipe_resource texture_templates[2] = {
       { .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8X8_UNORM,
         .width0 = 30, .height0 = 18, .depth0 = 1, .array_size = 1,
         .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR },
@@ -4072,8 +4078,15 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
    void *read_only_dsa_handle = NULL;
    void *rasterizer_handle = NULL;
    void *elements_handle = NULL, *sampler_handles[2] = { NULL, NULL };
+   void *repeat_sampler_handle = NULL;
    void *vs = NULL, *fs = NULL;
    bool passed = false;
+
+   if (texture0_alpha) {
+      target_template.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+      texture_templates[0].format = PIPE_FORMAT_B8G8R8A8_UNORM;
+      framebuffer.cbufs[0].format = target_template.format;
+   }
 
    target = screen->resource_create(screen, &target_template);
    for (unsigned i = 0; i < 2; i++)
@@ -4100,8 +4113,9 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
    for (unsigned y = 0; y < textures[0]->height0; y++)
       for (unsigned x = 0; x < textures[0]->width0; x++)
          source0[y * (ctextures[0]->stride / 4) + x] =
-            y < 9 ? (x < 15 ? 0x00ff0000 : 0x000000ff) :
-                    (x < 15 ? 0x0000ff00 : 0x00ffffff);
+            (texture0_alpha ? 0x80000000 : 0) |
+            (y < 9 ? (x < 15 ? 0x00ff0000 : 0x000000ff) :
+                     (x < 15 ? 0x0000ff00 : 0x00ffffff));
    for (unsigned y = 0; y < textures[1]->height0; y++)
       for (unsigned x = 0; x < textures[1]->width0; x++)
          source1[y * (ctextures[1]->stride / 4) + x] = 0x00808080;
@@ -4166,7 +4180,8 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
       make_two_projected_texture_vertex_shader(screen, context) :
       make_two_texture_vertex_shader(screen, context);
    fs = projected_blend ?
-      make_two_projected_texture_fragment_shader(screen, context) :
+      make_two_projected_texture_fragment_shader(screen, context,
+                                                 texture0_alpha) :
       make_two_texture_fragment_shader(screen, context);
    if (!blend_handle || !dsa_handle || !rasterizer_handle || !elements_handle ||
        !sampler_handles[0] || !sampler_handles[1] || !views[0] || !views[1] ||
@@ -4177,7 +4192,9 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
        !vs || !fs ||
        ((struct chrome9_shader *)fs)->fragment_program !=
           (projected_blend ?
-             CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA :
+             (texture0_alpha ?
+                CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY :
+                CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA) :
              CHROME9_FS_TWO_TEXTURE_MODULATE))
       goto out;
 
@@ -4221,6 +4238,8 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
             goto out;
    }
    if (projected_blend) {
+      const unsigned center = 32 * (ctarget->stride / 4) + 32;
+
       if (!depth_test ||
           ccontext->submitted_triangles != submitted + 2 ||
           ccontext->rejected_triangles != rejected ||
@@ -4229,7 +4248,161 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
           !smoke_guard_pages_match(ctextures[1]) ||
           !smoke_guard_pages_match(cdepth))
          goto out;
-      puts("Gallium two projected XRGB textures D16+blend passed");
+      if (texture0_alpha) {
+         static const struct {
+            float coord;
+            uint32_t expected_rgb;
+         } repeat_cases[] = {
+            { 1.109375f, 0x800000 }, { -1.109375f, 0x808000 },
+            { 16.109375f, 0x800000 }, { -16.109375f, 0x808000 },
+            { 31.109375f, 0x800000 }, { -31.109375f, 0x808000 },
+         };
+         struct pipe_sampler_state repeat_sampler = sampler;
+         void *repeat_samplers[2];
+         unsigned baseline_alpha = pixels[center] >> 24;
+
+         if (baseline_alpha < 0x7f || baseline_alpha > 0x81)
+            goto out;
+         repeat_sampler.wrap_s = PIPE_TEX_WRAP_REPEAT;
+         repeat_sampler.wrap_t = PIPE_TEX_WRAP_REPEAT;
+         repeat_sampler_handle =
+            context->create_sampler_state(context, &repeat_sampler);
+         if (!repeat_sampler_handle)
+            goto out;
+         repeat_samplers[0] = repeat_sampler_handle;
+         repeat_samplers[1] = sampler_handles[1];
+         context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 2,
+                                      repeat_samplers);
+         for (unsigned v = 0; v < ARRAY_SIZE(vertices); v++) {
+            vertices[v].color[0] = 1.0f;
+            vertices[v].color[1] = 1.0f;
+            vertices[v].color[2] = 0.0f;
+            vertices[v].color[3] = 0.5f;
+         }
+         for (unsigned c = 0; c < ARRAY_SIZE(repeat_cases); c++) {
+            uint64_t repeat_submitted = ccontext->submitted_triangles;
+            uint64_t repeat_rejected = ccontext->rejected_triangles;
+
+            for (unsigned v = 0; v < ARRAY_SIZE(vertices); v++) {
+               vertices[v].texcoord0[0] = repeat_cases[c].coord;
+               vertices[v].texcoord0[1] = repeat_cases[c].coord;
+            }
+            context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                           NULL, &clear, 1.0, 0);
+            context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+            context->flush(context, NULL, 0);
+            uint32_t pixel = pixels[center];
+
+            for (unsigned shift = 0; shift <= 16; shift += 8)
+               if (abs((int)(pixel >> shift & 0xff) -
+                       (int)(repeat_cases[c].expected_rgb >> shift & 0xff)) >
+                   1)
+                  goto out;
+            if ((pixel >> 24) < 0x3e || (pixel >> 24) > 0x41 ||
+                ccontext->submitted_triangles != repeat_submitted + 2 ||
+                ccontext->rejected_triangles != repeat_rejected ||
+                !smoke_guard_pages_match(ctarget) ||
+                !smoke_guard_pages_match(ctextures[0]) ||
+                !smoke_guard_pages_match(ctextures[1]) ||
+                !smoke_guard_pages_match(cdepth))
+               goto out;
+         }
+         {
+            struct drm_chrome9_draw_two_textured_triangle_d16_blend oracle = {
+               .destination_handle = ctarget->bo.handle,
+               .depth_handle = cdepth->bo.handle,
+               .flags = DRM_CHROME9_TWO_TEXTURE_TEX0_ALPHA_PRIMARY |
+                        DRM_CHROME9_DEPTH_FUNC(
+                           DRM_CHROME9_COMPARE_LEQUAL),
+               .width = target->width0,
+               .height = target->height0,
+               .destination_pitch = ctarget->stride,
+               .depth_pitch = cdepth->stride,
+               .blend = {
+                  .rgb_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE,
+                  .rgb_dst_factor = DRM_CHROME9_BLEND_FACTOR_ZERO,
+                  .alpha_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE,
+                  .alpha_dst_factor = DRM_CHROME9_BLEND_FACTOR_ZERO,
+                  .color_mask = DRM_CHROME9_COLOR_MASK_R |
+                                DRM_CHROME9_COLOR_MASK_G |
+                                DRM_CHROME9_COLOR_MASK_B |
+                                DRM_CHROME9_COLOR_MASK_A,
+               },
+               .vertices = {
+                  {
+                     .x_16_16 = -0x8000, .y_16_16 = -0x8000,
+                     .z_16_16 = 0x8000, .rhw_float = 0x3f800000,
+                     .color = 0x80000000, .s0_float = 0x41f8e000,
+                     .t0_float = 0x3f000000, .s1_float = 0x3f000000,
+                     .t1_float = 0x3f000000,
+                  },
+                  {
+                     .x_16_16 = 0x3f8000, .y_16_16 = -0x8000,
+                     .z_16_16 = 0x8000, .rhw_float = 0x3e800000,
+                     .color = 0x80ff0000, .s0_float = 0x41f8e000,
+                     .t0_float = 0x3f000000, .s1_float = 0x3f000000,
+                     .t1_float = 0x3f000000,
+                  },
+                  {
+                     .x_16_16 = 0x3f8000, .y_16_16 = 0x3f8000,
+                     .z_16_16 = 0x8000, .rhw_float = 0x3e800000,
+                     .color = 0x80ff0000, .s0_float = 0x41f8e000,
+                     .t0_float = 0x3f000000, .s1_float = 0x3f000000,
+                     .t1_float = 0x3f000000,
+                  },
+               },
+               .destination_format =
+                  DRM_CHROME9_DESTINATION_FORMAT_BGRA8888,
+            };
+            uint16_t *depth_pixels =
+               (uint16_t *)((uint8_t *)cdepth->bo.map + cdepth->data_offset);
+
+            for (unsigned unit = 0; unit < 2; unit++) {
+               struct drm_chrome9_texture_state *state =
+                  &oracle.textures[unit];
+
+               state->handle = ctextures[unit]->bo.handle;
+               state->width = textures[unit]->width0;
+               state->height = textures[unit]->height0;
+               state->pitch = ctextures[unit]->stride;
+               state->format = unit ? DRM_CHROME9_TEXTURE_FORMAT_BGRX8888 :
+                                      DRM_CHROME9_TEXTURE_FORMAT_BGRA8888;
+               state->min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+               state->mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+               state->wrap_s = unit ? DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE :
+                                      DRM_CHROME9_TEXTURE_WRAP_REPEAT;
+               state->wrap_t = state->wrap_s;
+            }
+            for (unsigned y = 0; y < textures[0]->height0; y++)
+               for (unsigned x = 0; x < textures[0]->width0; x++)
+                  source0[y * (ctextures[0]->stride / 4) + x] = 0xffffffff;
+            for (unsigned y = 0; y < textures[1]->height0; y++)
+               for (unsigned x = 0; x < textures[1]->width0; x++)
+                  source1[y * (ctextures[1]->stride / 4) + x] = 0x00ffffff;
+            memset((uint8_t *)ctarget->bo.map + ctarget->data_offset, 0,
+                   ctarget->data_size);
+            memset(depth_pixels, 0xff, cdepth->data_size);
+            if (!chrome9_draw_two_textured_triangle_d16_blend(
+                   screen->get_screen_fd(screen), &oracle))
+               goto out;
+            uint32_t pixel = pixels[16 * (ctarget->stride / 4) + 48];
+
+            if ((pixel >> 24) != 0x80 || (pixel & 0xffff) ||
+                (pixel >> 16 & 0xff) < 0x6f ||
+                (pixel >> 16 & 0xff) > 0x74 ||
+                !smoke_guard_pages_match(ctarget) ||
+                !smoke_guard_pages_match(ctextures[0]) ||
+                !smoke_guard_pages_match(ctextures[1]) ||
+                !smoke_guard_pages_match(cdepth))
+               goto out;
+            puts("Gallium program24-equivalent unequal-RHW primary "
+                 "perspective passed");
+         }
+         puts("Gallium program24-equivalent TEX0*primary alpha with signed "
+              "REPEAT passed");
+      } else {
+         puts("Gallium two projected XRGB textures D16+blend passed");
+      }
       passed = true;
       goto out;
    }
@@ -4334,6 +4507,58 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
        !smoke_guard_pages_match(ctextures[0]) ||
        !smoke_guard_pages_match(ctextures[1]))
       goto out;
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS)) {
+      static const struct {
+         float coord;
+         uint32_t expected;
+      } repeat_cases[] = {
+         { 1.109375f, 0x800000 }, { -1.109375f, 0x808080 },
+         { 16.109375f, 0x800000 }, { -16.109375f, 0x808080 },
+         { 31.109375f, 0x800000 }, { -31.109375f, 0x808080 },
+      };
+      struct pipe_sampler_state repeat_sampler = sampler;
+      void *repeat_samplers[2];
+
+      repeat_sampler.wrap_s = PIPE_TEX_WRAP_REPEAT;
+      repeat_sampler.wrap_t = PIPE_TEX_WRAP_REPEAT;
+      repeat_sampler_handle =
+         context->create_sampler_state(context, &repeat_sampler);
+      if (!repeat_sampler_handle)
+         goto out;
+      repeat_samplers[0] = repeat_sampler_handle;
+      repeat_samplers[1] = sampler_handles[1];
+      context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 2,
+                                   repeat_samplers);
+      for (unsigned c = 0; c < ARRAY_SIZE(repeat_cases); c++) {
+         uint64_t repeat_submitted = ccontext->submitted_triangles;
+         uint64_t repeat_rejected = ccontext->rejected_triangles;
+
+         for (unsigned v = 0; v < ARRAY_SIZE(vertices); v++) {
+            vertices[v].texcoord0[0] = repeat_cases[c].coord;
+            vertices[v].texcoord0[1] = repeat_cases[c].coord;
+         }
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &clear, 1.0, 0);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush(context, NULL, 0);
+         uint32_t pixel = pixels[32 * (ctarget->stride / 4) + 32] &
+                          0xffffff;
+
+         for (unsigned shift = 0; shift <= 16; shift += 8)
+            if (abs((int)(pixel >> shift & 0xff) -
+                    (int)(repeat_cases[c].expected >> shift & 0xff)) > 1)
+               goto out;
+         if (ccontext->submitted_triangles != repeat_submitted + 2 ||
+             ccontext->rejected_triangles != repeat_rejected ||
+             !smoke_guard_pages_match(ctarget) ||
+             !smoke_guard_pages_match(ctextures[0]) ||
+             !smoke_guard_pages_match(ctextures[1]))
+            goto out;
+      }
+      puts("Gallium two-unit signed REPEAT coordinates through +/-31.109375 "
+           "passed");
+   }
    puts("Gallium two-unit NPOT 30x18*22x14 MODULATE passed");
    passed = true;
 
@@ -4346,6 +4571,8 @@ out:
          if (sampler_handles[i])
             context->delete_sampler_state(context, sampler_handles[i]);
       }
+      if (repeat_sampler_handle)
+         context->delete_sampler_state(context, repeat_sampler_handle);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (rasterizer_handle)
@@ -4756,7 +4983,7 @@ main(int argc, char **argv)
          return 1;
       }
       if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers >= 2 &&
-          !run_pipe_two_npot_textures(screen, false, false)) {
+          !run_pipe_two_npot_textures(screen, false, false, false)) {
          fputs("Chrome9 Gallium two-unit NPOT texture draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -4764,7 +4991,7 @@ main(int argc, char **argv)
       }
       if (chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16) &&
-          !run_pipe_two_npot_textures(screen, true, false)) {
+          !run_pipe_two_npot_textures(screen, true, false, false)) {
          fputs("Chrome9 Gallium two-unit textured D16 draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -4773,9 +5000,20 @@ main(int argc, char **argv)
       if (chrome9_screen_has_capability(
              screen,
              DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND) &&
-          !run_pipe_two_npot_textures(screen, true, true)) {
+          !run_pipe_two_npot_textures(screen, true, true, false)) {
          fputs("Chrome9 Gallium two-unit projected D16 blend draw failed\n",
                stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY) &&
+          chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS) &&
+          !run_pipe_two_npot_textures(screen, true, true, true)) {
+         fputs("Chrome9 Gallium program24-equivalent signed-repeat draw "
+               "failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;

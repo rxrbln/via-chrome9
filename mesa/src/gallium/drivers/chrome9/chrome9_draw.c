@@ -72,6 +72,21 @@ chrome9_fs_uses_constant_color(unsigned program)
 }
 
 static bool
+chrome9_two_texture_coord_valid(const struct chrome9_context *ctx,
+                                const struct chrome9_sampler_state *sampler,
+                                bool s_axis, float coord)
+{
+   const unsigned wrap = s_axis ? sampler->wrap_s : sampler->wrap_t;
+
+   if (!isfinite(coord))
+      return false;
+   if (coord >= 0.0f && coord <= 1.0f)
+      return true;
+   return ctx->two_texture_signed_repeat_coords && fabsf(coord) <= 32.0f &&
+          wrap == DRM_CHROME9_TEXTURE_WRAP_REPEAT;
+}
+
+static bool
 chrome9_vbuf_need_pipeline(const struct vbuf_render *render,
                            const struct pipe_rasterizer_state *rasterizer,
                            unsigned prim)
@@ -706,8 +721,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
             return false;
          if (ctx->fs->fragment_program ==
                 CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY &&
-             source->format != (unit ? PIPE_FORMAT_B8G8R8X8_UNORM :
-                                      PIPE_FORMAT_B8G8R8A8_UNORM))
+             (source->format != (unit ? PIPE_FORMAT_B8G8R8X8_UNORM :
+                                       PIPE_FORMAT_B8G8R8A8_UNORM) ||
+              !ctx->two_texture_tex0_alpha_primary))
             return false;
          *reason = "packed-lightmap-source-format";
          if (ctx->fs->fragment_program ==
@@ -860,10 +876,12 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       return;
    }
-   packed_lightmap_tex0_alpha = ctx->fs->fragment_program ==
-      CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED &&
-      textures[1] &&
-      textures[1]->base.format == PIPE_FORMAT_B8G8R8A8_UNORM;
+   packed_lightmap_tex0_alpha =
+      ctx->fs->fragment_program ==
+         CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY ||
+      (ctx->fs->fragment_program == CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED &&
+       textures[1] &&
+       textures[1]->base.format == PIPE_FORMAT_B8G8R8A8_UNORM);
    perspective_batch = depth_active && ctx->draw_triangle_d16_rhw_batch;
    if (depth_active) {
       if (ctx->depth_func_supported || ctx->depth_equal_supported ||
@@ -957,7 +975,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program))
          color = constant_color;
-      if (two_projected_primary && color != 0xffffffff) {
+      if (ctx->fs->fragment_program ==
+             CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA &&
+          color != 0xffffffff) {
          ctx->rejected_triangles++;
          return;
       }
@@ -994,8 +1014,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                two_projected_primary) &&
               texcoord_q != 0x3f800000) ||
              (crender->texture_count == 2 &&
-              (texcoord[0] < 0.0f || texcoord[0] > 1.0f ||
-               texcoord[1] < 0.0f || texcoord[1] > 1.0f))) {
+              (!chrome9_two_texture_coord_valid(ctx, samplers[0], true,
+                                                texcoord[0]) ||
+               !chrome9_two_texture_coord_valid(ctx, samplers[0], false,
+                                                texcoord[1])))) {
             ctx->rejected_triangles++;
             return;
          }
@@ -1030,9 +1052,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             if (two_projected_primary)
                memcpy(&texcoord1_q, &texcoord1[3], sizeof(texcoord1_q));
 
-            if (!isfinite(texcoord1[0]) || !isfinite(texcoord1[1]) ||
-                texcoord1[0] < 0.0f || texcoord1[0] > 1.0f ||
-                texcoord1[1] < 0.0f || texcoord1[1] > 1.0f ||
+            if (!chrome9_two_texture_coord_valid(ctx, samplers[1], true,
+                                                 texcoord1[0]) ||
+                !chrome9_two_texture_coord_valid(ctx, samplers[1], false,
+                                                 texcoord1[1]) ||
                 (two_projected_primary && texcoord1_q != 0x3f800000)) {
                ctx->rejected_triangles++;
                return;
