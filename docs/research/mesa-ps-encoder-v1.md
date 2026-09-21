@@ -271,9 +271,12 @@ r0 producer and with an undefined direct r0 read.  The precedence corpus is
 SHA-256
 `8c0cc9d6ccb09c46ba83b550c28d62aab02478559e90fe3035b3f48abc50937a`.
 Therefore a generic "sampled operand means d2.bit17" rule is wrong, as is
-setting every source occurrence from the SSA graph.  The first patch should
-accept only linear chains whose temporary has exactly one unambiguous final
-source occurrence.
+setting every source occurrence from the SSA graph.  Mesa commit `e34de89`
+now implements the bounded semantic form correctly: its validation pass counts
+uses after physical source placement and its second pass marks only the last
+read, including A-over-C precedence when the same temporary occupies both
+slots.  New opcodes must first map logical operands into their actual A/C/B
+slots; applying the marker from the NIR source ordinal remains invalid.
 
 The Windows direct-slot/raw and two-record artifacts are SHA-256
 `ef0645552e914325a353ccb740f3715a9917dea3da144569055f354d150108bd`

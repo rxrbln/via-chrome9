@@ -31,6 +31,15 @@ targets.
 - [chrome9-production-four-alu-provenance.md](chrome9-production-four-alu-provenance.md)
   separates three production four-ALU alpha forms from their historical
   callback-swapped fixed-program counterparts.
+- [chrome9-ps-resource-config-buckets.md](chrome9-ps-resource-config-buckets.md)
+  recovers the exact four A90 resource buckets, their active-resource
+  thresholds, and the separate opaque auxiliary-resource predicate.
+- [chrome9-ps-resource-config-corpus.tsv](chrome9-ps-resource-config-corpus.tsv)
+  retains ALU-only threshold probes plus two-, four-, and eight-texture
+  production compiler discriminators.
+- [windows-stmupdateconfig-static-provenance.md](windows-stmupdateconfig-static-provenance.md)
+  cross-checks the bucket updater and its callers in both shipped Windows
+  UMDs against the Linux implementation.
 - [chrome9-cmd19-fp-contract.md](chrome9-cmd19-fp-contract.md) separates
   value-independent Linux/Windows MOV/MUL compiler evidence from numerical
   silicon behavior, defines the finite/exceptional-value gate, a guarded

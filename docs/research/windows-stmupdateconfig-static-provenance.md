@@ -38,18 +38,21 @@ uint32_t stmUpdateConfig_equivalent(uint32_t active0,
                                     uint32_t configuration);
 ```
 
-The callee loads `compiled_object+0x70`, the A91 payload, then increments
-`active0` exactly when A91 is nonzero.  Define:
+The callee loads `compiled_object+0x70` and increments `active0` exactly when
+that auxiliary/resource flag is nonzero.  The pointer base matters: the
+post-translation path passes `instance+0x10` as `compiled_object`.  Therefore
+this is instance metadata `+0x80`, not A91.  A91 is instance `+0x70`, or
+`compiled_object+0x60`.  Define:
 
 ```text
-adjusted0 = active0 + (object->A91_payload != 0)
+adjusted0 = active0 + (compiled_object->aux_70 != 0)
 ```
 
 ## Configuration-two buckets
 
 The exact config2 policy in both Windows binaries is:
 
-| condition | `object+0x2c` resource bits | provisional return |
+| condition | `compiled_object+0x1c` / instance `+0x2c` resource bits | provisional return |
 |---|---:|---:|
 | `adjusted0 <= 4 && active1 <= 3` | `0x00018000` | 3 |
 | `adjusted0 <= 5 && active1 <= 4` | `0x00010000` | 4 |
@@ -66,11 +69,14 @@ the updater through the recovered production path, both yield the table above.
 The overflow branch in all implementations clears both bits.
 
 Finally, D3D `0x10202598..0x102025a0` and OpenGL
-`0x10255618..0x10255620` test A91 and replace the return value with zero when
-A91 is zero.  Therefore 3, 4, 7, and 15 are returned only when A91 is nonzero;
-the A90 resource bits are still updated when A91 is zero.  Linux implements
-the same gate after each branch with compare/SBB/NOT/AND sequences.
+`0x10255618..0x10255620` test that same `compiled_object+0x70` auxiliary flag
+and replace the return value with zero when it is zero.  Therefore 3, 4, 7,
+and 15 are returned only when the auxiliary flag is nonzero; the A90 resource
+bits are still updated when it is zero.  Linux implements the same gate after
+each branch with compare/SBB/NOT/AND sequences.
 
 This proves that A90 is resource-bucket output, not a constant determined only
 by ALU/TAU phase order.  The complete compiler object must carry active-resource
-counts, A91, A90, and the returned resource/relocation code together.
+counts, the auxiliary flag, A90, and the returned resource/relocation code
+together.  A91 sampler-mask generation is a separate field and must not be
+fed into this threshold calculation.
