@@ -372,3 +372,61 @@ the four alpha values; A30=`98` must produce `ffff0000` four times.  Sequence
 this proves format closure rather than a fortunate power-on default.  All
 tests use separate guarded source/target/depth BOs and check all six guards
 after retirement.
+
+## Minimal vertex-color texture, D16, and source-over union
+
+The next useful glmark fixed-function combination does not need another
+shader.  The existing MODULATE program computes sampled RGBA times primary
+RGBA; canonical source-over and D16 are later fixed-function stages.  The
+Windows state builders keep those controls in independent words, and all
+three component images have retired separately on VX900.  The first union
+must nevertheless stay narrower than the general blend successor: ADD only,
+RGB `SRC_ALPHA/INV_SRC_ALPHA`, alpha `ONE/INV_SRC_ALPHA`, full RGBA mask,
+alpha test disabled, one texture, and D16 write with LESS or LEQUAL.
+
+Starting from kernel builder `2e78ad0`, enabling source-over closes the full
+destination block and adds four dwords; D16 already adds four common-state
+dwords.  A MODULATE union is therefore exactly 236 body dwords:
+
+```text
+body[6]       5298pppp / 5299pppp       # destination A52
+body[7..14]   38000000..3f000000         # zero blend constants
+body[15..18]  34000020 35000148 36000590 37000244
+body[24]      texture_base >> 8
+body[29]      30980000 / 30990000         # image A30
+body[36]      30000000                    # sampler L0 A30
+body[46]      53010c0f                    # A53 full write mask
+body[47]      00000011                    # A00 source-over enabled
+body[48]      01ce154c                    # MODULATE plus D16
+body[51..55]  A10, A11, A12, A13, A20
+body[80..82]  20000000 23004f02 24000003
+body[188]     FE020440                    # one-stage TAU header
+body[196]     FE020440                    # MODULATE ALU header
+body[208]     FE020440                    # immediate vertex header
+```
+
+REPLACE is the adjacent 232-dword form with vertex header at body 204, but it
+does not prove vertex-color modulation and should not be the first oracle.
+No alpha-test word is permitted in this ABI: the compact blend image uses its
+spare slot differently once D16 is present, so admitting A33 requires a
+separate index map and oracle.
+
+The smallest ABI change is one new flag in the existing 192-byte textured-D16
+request, not another structure: a capability-gated
+`TEXTURED_D16_SOURCE_OVER` bit outside the depth-function field.  The kernel
+synthesizes the exact normalized blend tuple above; it accepts no factors,
+equations, constants, masks, or native words from userspace.  Old kernels
+reject the new bit.  Mapping order, three-object reservation, target/depth
+WRITE fences, texture READ fence, guard checks, and quarantine are unchanged.
+
+Use a format-99 target prefilled transparent green `0000ff00`, an opaque-white
+format-99 2x2 texture, and primary red with alpha 0.5.  At incoming D16
+`4000`, MODULATE produces half-alpha red and source-over must store channels
+within one LSB of `80807f00`, with depth `4000`.  A later far blue draw at
+`c000` must leave both values unchanged.  This vector distinguishes every
+stage: REPLACE produces white, missing primary modulation is opaque white,
+disabled blending stores half-alpha red, wrong RGB factors lose the green
+destination term, mirrored RGB factors darken red, and disabled/reversed D16
+allows the far blue.  Finish with ordinary textured-D16 COPY and ordinary
+textured source-over draws to prove both disable transitions; check all six
+guards after each retirement.
