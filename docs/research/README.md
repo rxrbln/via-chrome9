@@ -53,6 +53,9 @@ targets.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
+- [vx900-2d-operations.md](vx900-2d-operations.md) defines bounded H6 solid,
+  copy, overlap, byte-mask, clipping and CFC recipes, characterizes the
+  AlphaBLT boundary, and records why 2D stretch remains gated.
 - [display-flip-vblank.md](display-flip-vblank.md) records the exact 7122 T11
   automatic-flip packets, direct IGA1/IGA2 scanout-base fields, vsync/blank
   status bits, and the render-fence-to-DRM-vblank ownership protocol.
