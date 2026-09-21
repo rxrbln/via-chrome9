@@ -92,6 +92,7 @@ struct chrome9_context {
    bool draw_textured_triangle;
    bool draw_textured_triangle_d16;
    bool textured_d16_bgra8888;
+   bool textured_d16_source_over;
    bool draw_two_textured_triangle;
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;

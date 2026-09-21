@@ -371,6 +371,24 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
 }
 
 static bool
+chrome9_blend_is_source_over(const struct drm_chrome9_blend_state *blend)
+{
+   return blend->flags == DRM_CHROME9_BLEND_ENABLE &&
+          blend->rgb_src_factor == DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA &&
+          blend->rgb_dst_factor ==
+             DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA &&
+          blend->alpha_src_factor == DRM_CHROME9_BLEND_FACTOR_ONE &&
+          blend->alpha_dst_factor ==
+             DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA &&
+          blend->rgb_func == DRM_CHROME9_BLEND_FUNC_ADD &&
+          blend->alpha_func == DRM_CHROME9_BLEND_FUNC_ADD &&
+          blend->color_mask == (DRM_CHROME9_COLOR_MASK_R |
+                                DRM_CHROME9_COLOR_MASK_G |
+                                DRM_CHROME9_COLOR_MASK_B |
+                                DRM_CHROME9_COLOR_MASK_A);
+}
+
+static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
                              struct chrome9_resource **depth,
@@ -454,15 +472,17 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    if (texture_count && *depth_active && *blend_successor) {
       *reason = "texture-depth-target";
       if (texture_count != 1 ||
-          resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
-          !ctx->textured_d16_bgra8888 || blend->flags ||
+          (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+           !ctx->textured_d16_bgra8888) ||
           blend->color_mask != (DRM_CHROME9_COLOR_MASK_R |
                                 DRM_CHROME9_COLOR_MASK_G |
                                 DRM_CHROME9_COLOR_MASK_B |
-                                DRM_CHROME9_COLOR_MASK_A))
+                                DRM_CHROME9_COLOR_MASK_A) ||
+          (blend->flags &&
+           (!ctx->textured_d16_source_over ||
+            !chrome9_blend_is_source_over(blend))))
          return false;
-      /* BGRA storage alone selected the generic blend successor.  The
-       * textured-D16 ioctl carries A52 explicitly and still requires COPY. */
+      /* This ioctl carries A52 and its one exact blend equation explicitly. */
       *blend_successor = false;
    }
    *reason = "successor-capability";
@@ -836,6 +856,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          texture_depth_args.depth_handle = depth->bo.handle;
          texture_depth_args.flags =
             DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+         if (chrome9_blend_is_source_over(&blend_state))
+            texture_depth_args.flags |=
+               DRM_CHROME9_TEXTURED_D16_SOURCE_OVER;
          texture_depth_args.program = texture_args.program;
          texture_depth_args.width = texture_args.width;
          texture_depth_args.height = texture_args.height;

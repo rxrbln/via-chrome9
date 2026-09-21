@@ -2215,7 +2215,7 @@ out:
 
 static bool
 run_pipe_textured_depth(struct pipe_screen *screen,
-                        enum pipe_format target_format)
+                        enum pipe_format target_format, bool source_over)
 {
    static const struct smoke_texture_vertex vertices[3][4] = {
       {
@@ -2233,6 +2233,19 @@ run_pipe_textured_depth(struct pipe_screen *screen,
          { { -1,  1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 0, 1 } },
          { {  1, -1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 1, 0 } },
          { {  1,  1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 1, 1 } },
+      },
+   };
+   static const struct smoke_texture_vertex blend_vertices[2][4] = {
+      {
+         { { -1, -1, -0.5, 1 }, { 1, 0, 0, 0.5 }, { 0, 0 } },
+         { { -1,  1, -0.5, 1 }, { 1, 0, 0, 0.5 }, { 0, 1 } },
+         { {  1, -1, -0.5, 1 }, { 1, 0, 0, 0.5 }, { 1, 0 } },
+         { {  1,  1, -0.5, 1 }, { 1, 0, 0, 0.5 }, { 1, 1 } },
+      }, {
+         { { -1, -1,  0.5, 1 }, { 0, 0, 1, 1 }, { 0, 0 } },
+         { { -1,  1,  0.5, 1 }, { 0, 0, 1, 1 }, { 0, 1 } },
+         { {  1, -1,  0.5, 1 }, { 0, 0, 1, 1 }, { 1, 0 } },
+         { {  1,  1,  0.5, 1 }, { 0, 0, 1, 1 }, { 1, 1 } },
       },
    };
    struct pipe_resource target_templ = {
@@ -2309,6 +2322,16 @@ run_pipe_textured_depth(struct pipe_screen *screen,
    bool passed = false;
 
    target_templ.format = target_format;
+   if (source_over) {
+      blend.rt[0].blend_enable = true;
+      blend.rt[0].rgb_func = PIPE_BLEND_ADD;
+      blend.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA;
+      blend.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+      blend.rt[0].alpha_func = PIPE_BLEND_ADD;
+      blend.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+      blend.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+      clear.f[1] = 1.0f;
+   }
 
    target = screen->resource_create(screen, &target_templ);
    texture = screen->resource_create(screen, &texture_templ);
@@ -2373,20 +2396,36 @@ run_pipe_textured_depth(struct pipe_screen *screen,
                   PIPE_MASK_RGBA, 0xff, NULL, &clear, 0.5, 0);
    submitted = ccontext->submitted_triangles;
    rejected = ccontext->rejected_triangles;
-   for (unsigned pass = 0; pass < ARRAY_SIZE(vertices); pass++) {
+   unsigned pass_count = source_over ? ARRAY_SIZE(blend_vertices) :
+                                       ARRAY_SIZE(vertices);
+   for (unsigned pass = 0; pass < pass_count; pass++) {
       uint32_t *pixels = (uint32_t *)
          ((uint8_t *)ctarget->bo.map + ctarget->data_offset);
       uint16_t *depth_pixels = (uint16_t *)
          ((uint8_t *)cdepth->bo.map + cdepth->data_offset);
 
-      vertex_buffer.buffer.user = vertices[pass];
+      vertex_buffer.buffer.user = source_over ? blend_vertices[pass] :
+                                                vertices[pass];
       context->set_vertex_buffers(context, 1, &vertex_buffer);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
       samples[pass] = pixels[16 * (ctarget->stride / 4) + 16];
       depth_samples[pass] = depth_pixels[16 * (cdepth->stride / 2) + 16];
    }
-   passed = (target_format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+   if (source_over) {
+      unsigned alpha = samples[0] >> 24;
+      unsigned red = samples[0] >> 16 & 0xff;
+      unsigned green = samples[0] >> 8 & 0xff;
+
+      passed = alpha >= 0x7e && alpha <= 0x80 &&
+               red >= 0x7e && red <= 0x80 &&
+               green >= 0x7f && green <= 0x81 &&
+               !(samples[0] & 0xff) && samples[1] == samples[0] &&
+               depth_samples[0] >= 0x3ffe && depth_samples[0] <= 0x4001 &&
+               depth_samples[1] >= 0x3ffe && depth_samples[1] <= 0x4001 &&
+               ccontext->submitted_triangles == submitted + 4;
+   } else {
+      passed = (target_format == PIPE_FORMAT_B8G8R8A8_UNORM ?
              samples[0] == 0x7f0000ff &&
              samples[1] == samples[0] &&
              samples[2] == 0x3fff0000 :
@@ -2397,19 +2436,32 @@ run_pipe_textured_depth(struct pipe_screen *screen,
             depth_samples[0] >= 0x7ffe && depth_samples[0] <= 0x8001 &&
             depth_samples[1] >= 0x7ffe && depth_samples[1] <= 0x8001 &&
             depth_samples[2] >= 0x3ffe && depth_samples[2] <= 0x4001 &&
-            ccontext->submitted_triangles == submitted + 6 &&
-            ccontext->rejected_triangles == rejected &&
+            ccontext->submitted_triangles == submitted + 6;
+   }
+   passed = passed && ccontext->rejected_triangles == rejected &&
             texels[0] == texture_copy[0] && texels[1] == texture_copy[1] &&
             texels[ctexture->stride / 4] == texture_copy[2] &&
             texels[ctexture->stride / 4 + 1] == texture_copy[3] &&
             smoke_guard_pages_match(ctarget) &&
             smoke_guard_pages_match(ctexture) &&
             smoke_guard_pages_match(cdepth);
-   if (passed)
+   if (passed && source_over)
+      printf("Gallium textured D16 source-over passed: "
+             "near=%08x/%04x far=%08x/%04x\n",
+             samples[0], depth_samples[0], samples[1], depth_samples[1]);
+   else if (passed)
       printf("Gallium textured D16 LEQUAL format %u passed: "
              "equal=%08x/%04x far=%08x/%04x near=%08x/%04x\n",
              target_format, samples[0], depth_samples[0], samples[1],
              depth_samples[1], samples[2], depth_samples[2]);
+   else if (source_over)
+      fprintf(stderr,
+              "Gallium textured D16 source-over mismatch: "
+              "near=%08x/%04x far=%08x/%04x "
+              "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+              samples[0], depth_samples[0], samples[1], depth_samples[1],
+              ccontext->submitted_triangles - submitted,
+              ccontext->rejected_triangles - rejected);
    else
       fprintf(stderr,
               "Gallium textured D16 LEQUAL format %u mismatch: "
@@ -3201,7 +3253,7 @@ main(int argc, char **argv)
       if (chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16) &&
           !run_pipe_textured_depth(screen,
-                                   PIPE_FORMAT_B8G8R8X8_UNORM)) {
+                                   PIPE_FORMAT_B8G8R8X8_UNORM, false)) {
          fputs("Chrome9 Gallium textured D16 draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -3210,8 +3262,17 @@ main(int argc, char **argv)
       if (chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_TEXTURED_D16_BGRA8888) &&
           !run_pipe_textured_depth(screen,
-                                   PIPE_FORMAT_B8G8R8A8_UNORM)) {
+                                   PIPE_FORMAT_B8G8R8A8_UNORM, false)) {
          fputs("Chrome9 Gallium BGRA textured D16 draw failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_TEXTURED_D16_SOURCE_OVER) &&
+          !run_pipe_textured_depth(screen,
+                                   PIPE_FORMAT_B8G8R8A8_UNORM, true)) {
+         fputs("Chrome9 Gallium textured D16 source-over failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;
