@@ -56,6 +56,9 @@ targets.
 - [display-flip-vblank.md](display-flip-vblank.md) records the exact 7122 T11
   automatic-flip packets, direct IGA1/IGA2 scanout-base fields, vsync/blank
   status bits, and the render-fence-to-DRM-vblank ownership protocol.
+- [iga1-vblank-flip-oracle.md](iga1-vblank-flip-oracle.md) gives the exact
+  VX900 IGA1 IRQ enable/RW1C sequence, the `0204[1]` direct-base latch proof,
+  and failure-safe atomic-flip ownership and teardown rules.
 - [sf-render-target-coherency.md](sf-render-target-coherency.md) proves the
   translated SF render-target domain, records the live two-sided CPU-cache
   requirement, and cross-checks Linux CLFLUSH and Windows GART cache policy.

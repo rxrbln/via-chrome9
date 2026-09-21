@@ -133,10 +133,13 @@ For modesetting and atomic KMS the indexed display registers remain relevant:
   the hardware's documented units.  Reconstruct and validate the complete
   mode-specific pitch before accepting a framebuffer.
 
-IGA2 CR61 bit 5 is a read-only `start address change/Flip Flag`.  It is useful
-as a diagnostic latch observation, but the manual gives no durable completion
-protocol or equivalent IGA1 flag.  Do not build the DRM event contract around
-polling it.  Complete page-flip events from the CRTC's vblank sequence.
+IGA2 CR61 bit 5 is a read-only `start address change/Flip Flag`.  More usefully
+for the first IGA1 path, the Part II manual defines MMIO `0204[1]` as Graphics
+Starting Address Update Status: writing `0214` sets it, and hardware clears it
+when the start address is updated.  Complete an IGA1 direct flip only on a
+post-arm vblank for which that bit is clear and the masked `0214` base matches.
+The full race and teardown rules are in
+[iga1-vblank-flip-oracle.md](iga1-vblank-flip-oracle.md).
 
 ## Vsync interrupt and blank-status matrix
 
@@ -152,6 +155,7 @@ VX900 routing:
 | IGA2 vsync pending/status | MMIO `0200[15]` |
 | IGA1 currently in vertical blank | MMIO `0200[1]` |
 | IGA2 currently in vertical blank | MMIO `0204[2]` |
+| IGA1 start-address update pending | MMIO `0204[1]` |
 | CR render-fence interrupt status | MMIO `0204[5]` |
 
 The enable/status pairs are not interchangeable with the blank-level bits.
