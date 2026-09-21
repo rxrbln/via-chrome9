@@ -582,9 +582,10 @@ SF nodes retained, active scanout pinned, and error fences unsignaled.
    and active-scanout PTEs; leave every old transient job entry invalid.
 8. Issue `wmb()`, set `SR6F.bit7`, and require it to self-clear under both the
    preflush and postflush deadlines.  Read back every ring and scanout PTE.
-9. Refill both software ring slots with dummies.  Install a new A60--A68 tuple
-   pointing only at a newly selected slot and a new PID00 PAUSE; never reuse
-   the saved A64/A65 or `active_slot` as authority.
+9. Refill the entire 64-KiB persistent monotonic ring with legal dummies.
+   Install a new A60--A68 tuple pointing at a new PID00 PAUSE in that rebuilt
+   ring; never reuse saved A64/A65 or the pre-reset append/active tuple as
+   authority.
 10. Submit an address-free H0 write of a new alternating cookie before that
     PAUSE.  Require the exact cookie, `0444.bit31`,
     `0400 & 00101fe3 == 0`, and `040c==0`.  Then publish PID10 and require
@@ -1064,13 +1065,13 @@ the separate ring PTEs.
 For a later lab-only destructive recovery, the reusable pieces already in the
 tree are the exact H6 2D initializer, the H5S2VP1 3D replay,
 `chrome9_gart_set()`/GTI flush, `chrome9_build_prime()`, and
-`chrome9_program_ring()`.  They must be composed in this order after the
+`chrome9_install_stopped_ring()`.  They must be composed in this order after the
 vendor reset pulses: require the full `0400 & 00101ff3` idle mask, initialize
 2D then 3D, reapply the T11 `06/07` and T10 `02` CR setup, reprogram and
 verify every owned GART control/PTE, flush GTI, and install a new dummy-only
 A60--A68 ring.  Prove its PAUSE/non-CR idle plus a harmless parser side effect
-before releasing old mappings.  `active_slot` cannot be trusted across the
-reset; start a new software epoch from the newly primed slot.
+before releasing old mappings.  Discard the pre-reset append/PAUSE/STOP tuple
+and start a new software epoch from the rebuilt monotonic ring.
 
 ## First live reset experiment
 
