@@ -42,19 +42,21 @@ A92 = 92000000 | (tau_count << 16) | alu_count
 
 Termination is exhausted count plus final phase. Hard limits are 96 ALUs, 32
 TAUs, and 128 normalized inputs before expansion. Preflight expanded counts.
-V1 constructs only these complete tuples (`N` is the 16-bit ALU count):
+The following are closed tuples, not formulas for arbitrary programs. The
+ALU-only form is reproduced for one and two ordinary records. The textured
+forms are proven only at the stated count and shape:
 
 ```text
-# N ALUs
-90058000 91000000 (92000000|N) 93000000 94000000 95000000
+# one or two ordinary ALUs, no TAU
+90058000 91000000 (92000000|alu_count) 93000000 94000000 95000000
 96000000 97000000 98000000 99000000 9a000000 9b000000
 
-# one leading TAU, then N ALUs
-90018000 91000001 (92010000|N) 93000001 94000000 95000000
+# one leading TAU, then one direct-output ALU
+90018000 91000001 92010001 93000001 94000000 95000000
 96000000 97000000 98000000 99000000 9a000000 9b000000
 
-# two independent TAUs, then N ALUs
-90000000 91000001 (92020000|N) 93000002 94000000 95000000
+# two independent TAUs, then one direct-output ALU
+90000000 91000001 92020001 93000002 94000000 95000000
 96000000 97000000 98000000 99000000 9a000000 9b000000
 ```
 
@@ -141,6 +143,36 @@ ALU ... ... 00f20005 ...
 High TAU bits depend on phase order. Never implement `tau |= 10000000`.
 Until an SSA-edge finalizer byte-matches the corpus, emit only the exact three
 schedule patterns above.
+
+### Why textured record count is not enough
+
+A two-ALU temporary chain disproves a tempting control-word formula. Linux
+configuration-2 compilation of
+
+```text
+texld r0,t0,s0
+add   r1,r0,c0
+mul   oC0,r1,c1
+```
+
+produces:
+
+```text
+A90..A9b 90000000 91000001 92010002 93000001 94000000 95000000
+          96000000 97000000 98000000 99000000 9a000000 9b000000
+TAU       301001b0
+ALU       00800530 30140924 00f20005 200003e0
+          0140b6d0 00081053 00f03f00 00000820
+```
+
+The equivalent first SUB produces `82000530 30140924 00f08005 200003e0`.
+This object uses A90=`90000000`, a special intermediate destination ending
+`200003e0`, and native id `3f` in the consumer. The existing closed RGBX
+two-ALU object instead uses A90=`90018000`. Therefore A90 low bits and the
+temporary rewrite depend on compiler/finalizer metadata, not merely
+`tau_count` and `alu_count`. V1 may encode one-record arithmetic and retain
+closed multi-record objects, but must not emit a general multi-ALU chain until
+the special temporary/dependency rewrite is decoded and validated.
 
 The Windows backend before configuration-2 and the Linux production
 finalizer give exact one-texture dependency deltas for every v1 source slot:
