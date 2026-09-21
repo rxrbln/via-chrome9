@@ -21,6 +21,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE_BATCH	0x09
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE	0x0a
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16	0x0b
+#define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH	0x0c
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -58,6 +59,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_D16 \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16, \
 		struct drm_chrome9_draw_textured_triangle_d16)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH, \
+		struct drm_chrome9_draw_triangle_d16_rhw_batch)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -105,6 +109,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_TEXTURED_D16_BGRA8888	(1ULL << 17)
 /* Textured D16 draws can use one canonical source-over blend equation. */
 #define DRM_CHROME9_CAP_TEXTURED_D16_SOURCE_OVER	(1ULL << 18)
+/* Untextured D16 batches preserve RHW for perspective-correct diffuse. */
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -458,6 +464,42 @@ struct drm_chrome9_draw_triangle_d16_blend {
 #define DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES	34U
 
 struct drm_chrome9_draw_triangle_batch {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	__u32 reserved0;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 pad;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
+};
+
+/*
+ * Perspective-correct untextured D16 vertex.  rhw_float is the exact
+ * IEEE-754 post-viewport reciprocal W; it must be finite and positive.
+ */
+struct drm_chrome9_vertex_d16_rhw {
+	__s32 x_16_16;
+	__s32 y_16_16;
+	__s32 z_16_16;
+	__u32 rhw_float;
+	__u32 color;
+};
+
+/*
+ * D16-only successor to DRAW_TRIANGLE_BATCH.  The state envelope remains
+ * fixed-size, but vertices_ptr addresses triangle_count * 3
+ * drm_chrome9_vertex_d16_rhw records.  DEPTH must be set; the old batch ABI
+ * and vertex record remain unchanged.
+ */
+struct drm_chrome9_draw_triangle_d16_rhw_batch {
 	__u32 destination_handle;
 	__u32 depth_handle;
 	__u32 flags;
