@@ -83,7 +83,7 @@ and exact one-record controls.
 | normalize expression | DP3, subop9, RSQ, MUL; four records | expansion closed only as indivisible vendor NRM lowering |
 | cross-product expression | two-record CRS expansion | expansion closed; one temp and B-slot final-use marker |
 | DST expression `(1,a.y*b.y,a.z,b.w)` | one specialized B+A*C record | encoding closed for exact same-source `v0,v0` first key |
-| `nir_op_fdph_replicated` | DP4-family A=`xyz1`, C=`xyzw` | static only; production wrapper and finalization still missing |
+| `nir_op_fdph_replicated` | DP4-family A=`xyz1`, C=`xyzw` | production internal emitters and A/C TEMP finalization byte-match; reject until scalar broadcast/numerics pass silicon |
 | `nir_op_fsin` / `nir_op_fcos` | public D3D SINCOS is a three-record paired approximation | reject one-to-one mapping; split internal emitters are not dynamic contracts |
 | `nir_op_fsign` | no usable pixel SGN program | reject; Windows tokenizer faults and Linux rejects |
 | `nir_op_fmod` / `nir_op_frem` | no closed direct opcode | reject; do not infer from FRC/FLR/divide identities |
