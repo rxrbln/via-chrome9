@@ -178,6 +178,17 @@ requires the exact complete BO size, verifies all three guards, initializes
 all eight H3 entries, and retains the whole chain through retirement or
 timeout quarantine.  Keep `first_level=0`; a view-range ABI comes later.
 
+The first Mesa path must also require a native guarded source.  Current
+`chrome9_create_sampler_view()` creates a shadow for an unguarded resource by
+forcing `shadow_templ.last_level=0`, even when the accepted original view has
+a nonzero last level.  `chrome9_refresh_sampler_shadows()` then calls
+`chrome9_copy_surface()`, which copies only L0 rows.  That is sufficient for
+the present level-zero ABI but would silently discard every mip successor.
+Until a full-chain shadow copy exists, reject `cview->shadow` whenever the
+view's last level is nonzero and require the chosen source resource to retain
+at least the view's last level.  The native q3 textures already satisfy this;
+imported/noncanonical chains do not.
+
 Insert selector `10030000` immediately after unit 0's image packet and before
 unit 0's sampler packet.  It adds exactly 12 dwords regardless of level count.
 Against the current one-triangle two-texture builder:
