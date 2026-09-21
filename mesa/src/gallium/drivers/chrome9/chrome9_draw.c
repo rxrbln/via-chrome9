@@ -49,6 +49,22 @@ chrome9_vbuf_render(struct vbuf_render *render)
 }
 
 static bool
+chrome9_fs_uses_constant_color(unsigned program)
+{
+   switch (program) {
+   case CHROME9_FS_CONSTANT_COLOR:
+   case CHROME9_FS_CONSTANT_MODULATE:
+   case CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE:
+   case CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE:
+   case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:
+   case CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
 chrome9_vbuf_need_pipeline(const struct vbuf_render *render,
                            const struct pipe_rasterizer_state *rasterizer,
                            unsigned prim)
@@ -73,14 +89,15 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                                     TGSI_SEMANTIC_COLOR, 0);
    color1 = draw_find_shader_output(crender->ctx->draw,
                                     TGSI_SEMANTIC_COLOR, 1);
-   crender->texture_count = crender->ctx->fs &&
-      crender->ctx->fs->fragment_program == CHROME9_FS_TWO_TEXTURE_MODULATE ?
-      2 : crender->ctx->fs &&
-          (crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_REPLACE ||
-           crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_MODULATE ||
-           crender->ctx->fs->fragment_program ==
-              CHROME9_FS_TEXTURE_CONSTANT_MODULATE) ?
-          1 : 0;
+   unsigned program = crender->ctx->fs ?
+      crender->ctx->fs->fragment_program : CHROME9_FS_UNSUPPORTED;
+
+   crender->texture_count = program == CHROME9_FS_TWO_TEXTURE_MODULATE ? 2 :
+      (program == CHROME9_FS_TEXTURE_REPLACE ||
+       program == CHROME9_FS_TEXTURE_RGBX ||
+       program == CHROME9_FS_TEXTURE_MODULATE ||
+       program == CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
+       program == CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE) ? 1 : 0;
    crender->textured = crender->texture_count != 0;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
       texcoord[unit] = draw_find_shader_output(crender->ctx->draw,
@@ -103,14 +120,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    draw_compute_vertex_size(&crender->vinfo);
    crender->layout_valid = position >= 0 &&
                            (color0 >= 0 ||
-                            crender->ctx->fs->fragment_program ==
-                               CHROME9_FS_CONSTANT_COLOR ||
-                            crender->ctx->fs->fragment_program ==
-                               CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
-                            crender->ctx->fs->fragment_program ==
-                               CHROME9_FS_TEXTURE_REPLACE ||
-                            crender->ctx->fs->fragment_program ==
-                               CHROME9_FS_TWO_TEXTURE_MODULATE) &&
+                            (program != CHROME9_FS_PRIMARY_COLOR &&
+                             program != CHROME9_FS_TEXTURE_MODULATE)) &&
                            (!crender->textured ||
                             (texcoord[0] >= 0 &&
                              (crender->texture_count == 1 ||
@@ -125,19 +136,26 @@ chrome9_fragment_constant_color(struct chrome9_context *ctx, uint32_t *color)
 {
    const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
    const uint8_t *map;
-   float rgba[4];
+   float constant[2][4], rgba[4];
+   unsigned count;
 
-   if (!ctx->fs ||
-       (ctx->fs->fragment_program != CHROME9_FS_CONSTANT_COLOR &&
-        ctx->fs->fragment_program != CHROME9_FS_TEXTURE_CONSTANT_MODULATE) ||
-       cb->buffer_size < sizeof(rgba) ||
-       cb->buffer_offset > UINT32_MAX - sizeof(rgba))
+   if (!ctx->fs || !chrome9_fs_uses_constant_color(
+                      ctx->fs->fragment_program))
+      return false;
+   count = (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_MODULATE ||
+            ctx->fs->fragment_program ==
+               CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE ||
+            ctx->fs->fragment_program ==
+               CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE) ? 2 : 1;
+   if (cb->buffer_size < count * sizeof(constant[0]) ||
+       cb->buffer_offset > UINT32_MAX - count * sizeof(constant[0]))
       return false;
    if (cb->user_buffer) {
       map = (const uint8_t *)cb->user_buffer + cb->buffer_offset;
    } else if (cb->buffer && cb->buffer->target == PIPE_BUFFER &&
-              cb->buffer->width0 >= sizeof(rgba) &&
-              cb->buffer_offset <= cb->buffer->width0 - sizeof(rgba)) {
+              cb->buffer->width0 >= count * sizeof(constant[0]) &&
+              cb->buffer_offset <=
+                 cb->buffer->width0 - count * sizeof(constant[0])) {
       map = chrome9_resource(cb->buffer)->bo.map;
       if (!map)
          return false;
@@ -145,7 +163,35 @@ chrome9_fragment_constant_color(struct chrome9_context *ctx, uint32_t *color)
    } else {
       return false;
    }
-   memcpy(rgba, map, sizeof(rgba));
+   memcpy(constant, map, count * sizeof(constant[0]));
+   for (unsigned i = 0; i < count; i++)
+      for (unsigned c = 0; c < ARRAY_SIZE(constant[i]); c++)
+         if (!isfinite(constant[i][c]))
+            return false;
+   switch (ctx->fs->fragment_program) {
+   case CHROME9_FS_CONSTANT_COLOR:
+   case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:
+      memcpy(rgba, constant[0], sizeof(rgba));
+      break;
+   case CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE:
+      for (unsigned c = 0; c < ARRAY_SIZE(rgba); c++)
+         rgba[c] = constant[0][3];
+      break;
+   case CHROME9_FS_CONSTANT_MODULATE:
+      for (unsigned c = 0; c < ARRAY_SIZE(rgba); c++)
+         rgba[c] = constant[0][c] * constant[1][c];
+      break;
+   case CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE:
+      for (unsigned c = 0; c < ARRAY_SIZE(rgba); c++)
+         rgba[c] = constant[0][c] * constant[1][3];
+      break;
+   case CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE:
+      for (unsigned c = 0; c < ARRAY_SIZE(rgba); c++)
+         rgba[c] = constant[0][3] * constant[1][c];
+      break;
+   default:
+      return false;
+   }
    for (unsigned i = 0; i < ARRAY_SIZE(rgba); i++)
       if (!isfinite(rgba[i]))
          return false;
@@ -414,6 +460,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              textures[unit]->data_size <
                 (uint64_t)textures[unit]->stride * source->height0)
             return false;
+         if (!unit && ctx->fs->fragment_program == CHROME9_FS_TEXTURE_RGBX &&
+             source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
+            return false;
       }
       if (texture_count == 2 &&
           textures[0]->bo.handle == textures[1]->bo.handle)
@@ -496,9 +545,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       return;
    }
-   if ((ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR ||
-        ctx->fs->fragment_program ==
-           CHROME9_FS_TEXTURE_CONSTANT_MODULATE) &&
+   if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program) &&
        !chrome9_fragment_constant_color(ctx, &constant_color)) {
       ctx->rejected_triangles++;
       return;
@@ -529,9 +576,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
-      if (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR ||
-          ctx->fs->fragment_program ==
-             CHROME9_FS_TEXTURE_CONSTANT_MODULATE)
+      if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program))
          color = constant_color;
       x[i] = chrome9_coord_16_16(position[0], target->base.width0);
       y[i] = chrome9_coord_16_16(position[1], target->base.height0);
@@ -652,8 +697,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    } else if (crender->textured) {
       texture_args.destination_handle = target->bo.handle;
       texture_args.texture_handle = textures[0]->bo.handle;
-      texture_args.program = ctx->fs->fragment_program ==
-                                CHROME9_FS_TEXTURE_REPLACE ?
+      texture_args.program =
+         (ctx->fs->fragment_program == CHROME9_FS_TEXTURE_REPLACE ||
+          ctx->fs->fragment_program == CHROME9_FS_TEXTURE_RGBX) ?
                                 DRM_CHROME9_TEXTURE_PROGRAM_REPLACE :
                                 DRM_CHROME9_TEXTURE_PROGRAM_MODULATE;
       texture_args.width = target->base.width0;

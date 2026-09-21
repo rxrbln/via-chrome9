@@ -380,7 +380,7 @@ chrome9_fs_is_texcoord(nir_def *def, unsigned unit, unsigned depth)
  * fragment constant.  Keep this deliberately narrower than general uniform
  * support: one full 32-bit vec4, buffer zero, byte/vec4 offset zero. */
 static bool
-chrome9_fs_is_constant_color(nir_def *def, unsigned depth)
+chrome9_fs_is_constant_color(nir_def *def, unsigned index, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
 
@@ -391,21 +391,23 @@ chrome9_fs_is_constant_color(nir_def *def, unsigned depth)
 
       switch (intr->intrinsic) {
       case nir_intrinsic_load_uniform:
-         return !nir_intrinsic_base(intr) &&
-                nir_src_is_const(intr->src[0]) &&
-                !nir_src_as_uint(intr->src[0]);
+         return nir_src_is_const(intr->src[0]) &&
+                nir_intrinsic_base(intr) <= index &&
+                nir_src_as_uint(intr->src[0]) ==
+                   index - nir_intrinsic_base(intr);
       case nir_intrinsic_load_ubo:
          return nir_src_is_const(intr->src[0]) &&
                 !nir_src_as_uint(intr->src[0]) &&
                 nir_src_is_const(intr->src[1]) &&
-                !nir_src_as_uint(intr->src[1]);
+                nir_src_as_uint(intr->src[1]) == index * 16;
       case nir_intrinsic_load_ubo_vec4:
-         return !nir_intrinsic_base(intr) &&
-                !nir_intrinsic_component(intr) &&
+         return !nir_intrinsic_component(intr) &&
                 nir_src_is_const(intr->src[0]) &&
                 !nir_src_as_uint(intr->src[0]) &&
                 nir_src_is_const(intr->src[1]) &&
-                !nir_src_as_uint(intr->src[1]);
+                nir_intrinsic_base(intr) <= index &&
+                nir_src_as_uint(intr->src[1]) ==
+                   index - nir_intrinsic_base(intr);
       default:
          return false;
       }
@@ -417,7 +419,7 @@ chrome9_fs_is_constant_color(nir_def *def, unsigned depth)
          for (unsigned c = 0; c < 4; c++)
             if (alu->src[0].swizzle[c] != c)
                return false;
-         return chrome9_fs_is_constant_color(alu->src[0].src.ssa,
+         return chrome9_fs_is_constant_color(alu->src[0].src.ssa, index,
                                              depth + 1);
       }
    }
@@ -456,69 +458,207 @@ chrome9_fs_is_texture(nir_def *def, unsigned unit)
                unit, 0)));
 }
 
-#define CHROME9_FS_FACTOR_TEXTURE0 (1u << 0)
-#define CHROME9_FS_FACTOR_TEXTURE1 (1u << 1)
-#define CHROME9_FS_FACTOR_PRIMARY  (1u << 2)
-#define CHROME9_FS_FACTOR_CONSTANT0 (1u << 3)
+enum chrome9_fs_leaf {
+   CHROME9_FS_LEAF_INVALID,
+   CHROME9_FS_LEAF_TEXTURE0,
+   CHROME9_FS_LEAF_TEXTURE1,
+   CHROME9_FS_LEAF_PRIMARY,
+   CHROME9_FS_LEAF_CONSTANT0,
+   CHROME9_FS_LEAF_CONSTANT1,
+   CHROME9_FS_LEAF_TEXTURE0_ALPHA,
+   CHROME9_FS_LEAF_CONSTANT0_ALPHA,
+   CHROME9_FS_LEAF_CONSTANT1_ALPHA,
+};
 
 static unsigned
-chrome9_fs_factors(nir_def *def, unsigned depth)
+chrome9_fs_alpha_leaf(unsigned leaf)
+{
+   switch (leaf) {
+   case CHROME9_FS_LEAF_TEXTURE0:
+      return CHROME9_FS_LEAF_TEXTURE0_ALPHA;
+   case CHROME9_FS_LEAF_CONSTANT0:
+      return CHROME9_FS_LEAF_CONSTANT0_ALPHA;
+   case CHROME9_FS_LEAF_CONSTANT1:
+      return CHROME9_FS_LEAF_CONSTANT1_ALPHA;
+   default:
+      return CHROME9_FS_LEAF_INVALID;
+   }
+}
+
+static unsigned
+chrome9_fs_leaf(nir_def *def, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
 
    if (depth > 8 || def->num_components != 4)
-      return 0;
+      return CHROME9_FS_LEAF_INVALID;
    if (chrome9_fs_is_texture(def, 0))
-      return CHROME9_FS_FACTOR_TEXTURE0;
+      return CHROME9_FS_LEAF_TEXTURE0;
    if (chrome9_fs_is_texture(def, 1))
-      return CHROME9_FS_FACTOR_TEXTURE1;
+      return CHROME9_FS_LEAF_TEXTURE1;
    if (chrome9_fs_is_primary_color(def, depth))
-      return CHROME9_FS_FACTOR_PRIMARY;
-   if (chrome9_fs_is_constant_color(def, depth))
-      return CHROME9_FS_FACTOR_CONSTANT0;
+      return CHROME9_FS_LEAF_PRIMARY;
+   if (chrome9_fs_is_constant_color(def, 0, depth))
+      return CHROME9_FS_LEAF_CONSTANT0;
+   if (chrome9_fs_is_constant_color(def, 1, depth))
+      return CHROME9_FS_LEAF_CONSTANT1;
    if (instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
 
       if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
-         for (unsigned c = 0; c < 4; c++)
-            if (alu->src[0].swizzle[c] != c)
-               return 0;
-         return chrome9_fs_factors(alu->src[0].src.ssa, depth + 1);
-      }
-      if (alu->op == nir_op_fmul) {
-         unsigned a, b;
+         bool identity = true, alpha = true;
 
-         for (unsigned c = 0; c < 4; c++)
-            if (alu->src[0].swizzle[c] != c ||
-                alu->src[1].swizzle[c] != c)
-               return 0;
-         a = chrome9_fs_factors(alu->src[0].src.ssa, depth + 1);
-         b = chrome9_fs_factors(alu->src[1].src.ssa, depth + 1);
-         return a && b && !(a & b) ? a | b : 0;
+         for (unsigned c = 0; c < 4; c++) {
+            identity &= alu->src[0].swizzle[c] == c;
+            alpha &= alu->src[0].swizzle[c] == 3;
+         }
+         if (!identity && !alpha)
+            return CHROME9_FS_LEAF_INVALID;
+         unsigned leaf = chrome9_fs_leaf(alu->src[0].src.ssa, depth + 1);
+
+         return identity ? leaf : chrome9_fs_alpha_leaf(leaf);
       }
    }
-   return 0;
+   return CHROME9_FS_LEAF_INVALID;
+}
+
+static unsigned
+chrome9_fs_source_leaf(const nir_alu_src *src, unsigned depth)
+{
+   unsigned leaf;
+   bool identity = true, alpha = true;
+
+   if (!src->src.ssa || src->src.ssa->num_components != 4)
+      return CHROME9_FS_LEAF_INVALID;
+   for (unsigned c = 0; c < 4; c++) {
+      identity &= src->swizzle[c] == c;
+      alpha &= src->swizzle[c] == 3;
+   }
+   if (!identity && !alpha)
+      return CHROME9_FS_LEAF_INVALID;
+   leaf = chrome9_fs_leaf(src->src.ssa, depth + 1);
+   if (identity)
+      return leaf;
+   return chrome9_fs_alpha_leaf(leaf);
+}
+
+static bool
+chrome9_fs_is_one(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 1 || def->bit_size != 32)
+      return false;
+   if (instr->type == nir_instr_type_load_const)
+      return nir_instr_as_load_const(instr)->value[0].u32 == 0x3f800000;
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      return alu->op == nir_op_mov && !alu->src[0].swizzle[0] &&
+             chrome9_fs_is_one(alu->src[0].src.ssa, depth + 1);
+   }
+   return false;
+}
+
+static bool
+chrome9_fs_is_texture_component(const nir_alu_src *src, unsigned component,
+                                unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+
+   if (depth > 8 || !def)
+      return false;
+   if (def->num_components == 4)
+      return src->swizzle[0] == component && chrome9_fs_is_texture(def, 0);
+   if (def->num_components != 1 || src->swizzle[0])
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   return alu->op == nir_op_mov &&
+          chrome9_fs_is_texture_component(&alu->src[0], component,
+                                          depth + 1);
+}
+
+static bool
+chrome9_fs_is_rgbx(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_rgbx(alu->src[0].src.ssa, depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++)
+      if (!chrome9_fs_is_texture_component(&alu->src[c], c, depth + 1))
+         return false;
+   return !alu->src[3].swizzle[0] &&
+          chrome9_fs_is_one(alu->src[3].src.ssa, depth + 1);
+}
+
+static bool
+chrome9_fs_pair(unsigned a, unsigned b, unsigned x, unsigned y)
+{
+   return (a == x && b == y) || (a == y && b == x);
 }
 
 static unsigned
 chrome9_fs_result(nir_def *def)
 {
-   switch (chrome9_fs_factors(def, 0)) {
-   case CHROME9_FS_FACTOR_PRIMARY:
+   nir_instr *instr;
+   nir_alu_instr *alu;
+   unsigned a, b;
+
+   if (chrome9_fs_is_rgbx(def, 0))
+      return CHROME9_FS_TEXTURE_RGBX;
+   switch (chrome9_fs_leaf(def, 0)) {
+   case CHROME9_FS_LEAF_PRIMARY:
       return CHROME9_FS_PRIMARY_COLOR;
-   case CHROME9_FS_FACTOR_CONSTANT0:
+   case CHROME9_FS_LEAF_CONSTANT0:
       return CHROME9_FS_CONSTANT_COLOR;
-   case CHROME9_FS_FACTOR_TEXTURE0:
+   case CHROME9_FS_LEAF_TEXTURE0:
       return CHROME9_FS_TEXTURE_REPLACE;
-   case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_PRIMARY:
-      return CHROME9_FS_TEXTURE_MODULATE;
-   case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_CONSTANT0:
-      return CHROME9_FS_TEXTURE_CONSTANT_MODULATE;
-   case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_TEXTURE1:
-      return CHROME9_FS_TWO_TEXTURE_MODULATE;
    default:
-      return CHROME9_FS_UNSUPPORTED;
+      break;
    }
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu ||
+       (alu = nir_instr_as_alu(instr))->op != nir_op_fmul)
+      return CHROME9_FS_UNSUPPORTED;
+   a = chrome9_fs_source_leaf(&alu->src[0], 0);
+   b = chrome9_fs_source_leaf(&alu->src[1], 0);
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_TEXTURE0,
+                       CHROME9_FS_LEAF_PRIMARY))
+      return CHROME9_FS_TEXTURE_MODULATE;
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_TEXTURE0,
+                       CHROME9_FS_LEAF_CONSTANT0))
+      return CHROME9_FS_TEXTURE_CONSTANT_MODULATE;
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_TEXTURE0,
+                       CHROME9_FS_LEAF_CONSTANT0_ALPHA))
+      return CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE;
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_TEXTURE0,
+                       CHROME9_FS_LEAF_TEXTURE1))
+      return CHROME9_FS_TWO_TEXTURE_MODULATE;
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_CONSTANT0,
+                       CHROME9_FS_LEAF_CONSTANT1))
+      return CHROME9_FS_CONSTANT_MODULATE;
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_CONSTANT0,
+                       CHROME9_FS_LEAF_CONSTANT1_ALPHA))
+      return CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE;
+   if (chrome9_fs_pair(a, b, CHROME9_FS_LEAF_CONSTANT0_ALPHA,
+                       CHROME9_FS_LEAF_CONSTANT1))
+      return CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE;
+   return CHROME9_FS_UNSUPPORTED;
 }
 
 static unsigned
@@ -593,19 +733,37 @@ chrome9_fs_classify(nir_shader *nir)
          }
       }
    }
-   if (!valid || !written ||
-       (result == CHROME9_FS_PRIMARY_COLOR && texture_count) ||
-       (result == CHROME9_FS_CONSTANT_COLOR &&
-        (texture_count || constant_count != 1)) ||
-       (result == CHROME9_FS_TEXTURE_CONSTANT_MODULATE &&
-        (texture_count != 1 || constant_count != 1)) ||
-       (result != CHROME9_FS_CONSTANT_COLOR &&
-        result != CHROME9_FS_TEXTURE_CONSTANT_MODULATE && constant_count) ||
-       ((result == CHROME9_FS_TEXTURE_REPLACE ||
-         result == CHROME9_FS_TEXTURE_MODULATE ||
-         result == CHROME9_FS_TEXTURE_CONSTANT_MODULATE) &&
-        texture_count != 1) ||
-       (result == CHROME9_FS_TWO_TEXTURE_MODULATE && texture_count != 2))
+   if (!valid || !written)
+      return CHROME9_FS_UNSUPPORTED;
+   switch (result) {
+   case CHROME9_FS_PRIMARY_COLOR:
+      valid = !texture_count && !constant_count;
+      break;
+   case CHROME9_FS_CONSTANT_COLOR:
+      valid = !texture_count && constant_count == 1;
+      break;
+   case CHROME9_FS_CONSTANT_MODULATE:
+   case CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE:
+   case CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE:
+      valid = !texture_count && constant_count == 2;
+      break;
+   case CHROME9_FS_TEXTURE_REPLACE:
+   case CHROME9_FS_TEXTURE_RGBX:
+   case CHROME9_FS_TEXTURE_MODULATE:
+      valid = texture_count == 1 && !constant_count;
+      break;
+   case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:
+   case CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE:
+      valid = texture_count == 1 && constant_count == 1;
+      break;
+   case CHROME9_FS_TWO_TEXTURE_MODULATE:
+      valid = texture_count == 2 && !constant_count;
+      break;
+   default:
+      valid = false;
+      break;
+   }
+   if (!valid)
       return CHROME9_FS_UNSUPPORTED;
    return result;
 }
