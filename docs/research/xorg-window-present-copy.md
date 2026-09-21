@@ -252,6 +252,66 @@ The final two cases distinguish an offscreen redirected window pixmap from the
 root scanout pixmap without guessing.  Width and height in every record are
 therefore part of the correctness evidence, not merely diagnostic decoration.
 
+### Decisive one-page DRI3 offset oracle
+
+A 300x300 client back buffer filled with three 100-pixel vertical bands gives
+an address-level discriminator which excludes raster, viewport and texture
+interpolation state.  Its canonical pitch is 1216 bytes, or 304 physical
+pixels: red `[0,100)`, green `[100,200)`, blue `[200,300)`, then four black
+padding pixels.  The Xorg Present copy at root `(100,40)` produced these
+transitions within the window:
+
+```text
+x=0 green, x=8 blue, x=108 black, x=112 red, x=213 green
+```
+
+That is exactly the physical source row read from texel 192:
+green 8, blue 100, padding 4, red 100/101, green 87.  The displacement is not
+an inferred coordinate error:
+
+```text
+4096 mod 1216 = 448 bytes = 112 texels
+304 - 112 = 192
+```
+
+In particular, a viewport or interpolator error cannot insert the BO's four
+physical row-padding pixels into the sampled image.  Explicit type-02
+A04=`04000000`, absolute destination XY `(100,40)..(400,340)`, normalized ST
+`0..1`, and REPEAT addressing do not change this conclusion.
+
+CPU mapping before the first Xorg Chrome9 submit completed the proof.  The
+client's `GL_BACK` capture still had the intended bands, while Xorg imported
+the BO as stride 1216, data offset 4096, size 376832.  `map+4096` already held
+the rotated row, and the nominal first pixel held the guard cookie
+`13579bdf`.  Therefore the cross-process image exchange discarded the plane
+offset at the producer side even though the consumer reconstructed a
+canonical guarded `+4096` tuple.  No 3D packet change can repair this.
+
+The bounded compatibility contract is:
+
+* allocate every level-zero `PIPE_BIND_SHARED` XRGB/BGRA resource with pixels
+  at BO byte zero, canonical 32-byte pitch, page-rounded size, and
+  `guarded=false`;
+* export KMS and dma-buf handles with offset zero and linear modifier;
+* classify an offset-zero import as unguarded even when its size happens to
+  equal a guarded allocation;
+* require the existing guarded render-target shadow plus flush/copyback for
+  every hardware render into that public object;
+* require the existing per-draw refreshed guarded sampler shadow for every
+  hardware sample from it; and
+* allow KMS scanout to consume offset zero directly, which is already an
+  explicit accepted layout.  Do not pass an unguarded shared BO to any 3D
+  ioctl: the kernel draw ABI intentionally continues to add one page before
+  target/texture pixels.
+
+Private and mipmapped resources retain the exact canonical leading-page,
+level-zero, trailing-guard layout.  Shared mipmapped allocations remain
+rejected until cross-process per-level layout metadata exists.  The focused
+regression must cover an offset-zero XRGB shared export, re-import with Xorg's
+render-target/sampler bindings but without `PIPE_BIND_SHARED`, guarded
+render-target execution through the shadow, BGRA GBM-style allocation, and
+the existing draw-refreshed sampler-shadow stale-update oracle.
+
 This follows the exact Xorg 21.1.24 call chain.  `present_execute_copy()` calls
 `present_copy_region(&window->drawable, source, ...)`, whose scratch GC invokes
 `CopyArea(source, window drawable, ...)` and only then calls the screen flush.
