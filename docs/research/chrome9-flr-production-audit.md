@@ -1,12 +1,12 @@
-# Chrome9 FLR production mismatch
+# Chrome9 FLR production allocation closure
 
-Status: internal opcode 103 was invoked through production Windows and Linux
-H5 register management and configuration two. Both drivers emit the expected
-two-record `x - FRC(x)` expansion, but they choose different scratch-register
-classes/ids and different A90 control buckets. FLR is therefore a strict
-cross-driver rejection boundary, not a portable compiler key.
+Status: internal opcode 103 was invoked through matching production Windows
+and Linux H5 register-table initialization and configuration two. Both
+drivers byte-match the two-record `x - FRC(x)` expansion, special scratch r12,
+and A90=`90040000`. An earlier apparent Linux r0/A90=`90058000` result was a
+direct-emitter harness artifact caused by omitting `stmSetRegMgr(instance,8,12)`.
 
-Exact rows are retained in
+Exact corrected rows are retained in
 [`chrome9-flr-production-corpus.tsv`](chrome9-flr-production-corpus.tsv).
 
 ## Invocation provenance
@@ -18,30 +18,57 @@ Wrapper SHA-256 is
 `4062a929ad5188cf75c53aaee1ed369353f3829369ff3cccace75f6dd4caa986`.
 The four-case JSON SHA-256 is
 `9545deb52dd8f24a3b347c27dd900383fea45650f9e87a580daa6847ef46fee5`;
-the separate v0.wwww JSON SHA-256 is
+the v0.wwww JSON SHA-256 is
 `dcc0ed3336dfb88246dd78f28af17935d746c40917b51ed6255104247272f64f`.
 
-Linux exports `stmPPS_FLR_ICD_PS20_invi` at VA `00164290`. Direct invocation
-on an initialized production H5 instance, followed by
-`stmPPS_PostTranslationSetting_invi(instance+0x10,2)`, succeeds for terminal
-v0, c0, and v0.wwww. The bounded helper SHA-256 is
-`8e774cf9d7d42b65935ec30a26b2341dcb92cafde4ba39013fa46a0d1f1fdc63`.
+Linux exports `stmPPS_FLR_ICD_PS20_invi` at VA `00164290`. The corrected
+helper initializes the production H5 callbacks, calls exported
+`stmSetRegMgr_invi(instance,8,12)`, invokes the emitter, then calls
+`stmPPS_PostTranslationSetting_invi(instance+0x10,2)`. Its SHA-256 is
+`67bd937b2dbe16f29c25c5963ff52b9a63308455f72196ccae0ecdb9a0e3508d`.
 
-## Arithmetic closure
+## Allocator call and callback provenance
 
-Both emitters implement exactly two records:
+Both emitters request the same scratch class:
 
-1. FRC subop e writes a scratch TEMP.
-2. An arithmetic record computes original source minus that scratch, with
-   A=original, B=NEG scratch, C=literal ONE, and destination oC0.
+- Windows `10216a2e..10216a37` loads callback `backend+0x138c`, pushes
+  `special_ok=1` and the compiler object, then calls it;
+- Linux `001642e8..001642f9` loads the same `backend+0x138c` callback and
+  passes `(instance,1)`;
+- both release the returned physical id through `backend+0x1394` at Windows
+  `10216bfe..10216c0c` and Linux `001644c2..001644cc`.
 
-Configuration two sets B's last-use flag in d0.bit25. The v0.wwww case
-proves that the source swizzle is propagated to both the FRC source and the
-second record's original-source A slot.
+The Windows H5 allocator is at VA `1020ec70`; Linux
+`stmPPS_GetFreeTmpSlot_h5i` is at `00162000`. The recovered Windows D3D and
+OGL copies of the allocator are raw-identical (size `0x1aa`, SHA-256
+`d58a71a8b82e059d29103b4e588d8026cbe47259eab0a40a57377844fe8d0a8f`).
+Thus there is no proprietary-driver algorithm mismatch to explain.
 
-## Exact portability mismatch
+H5 limits match in both setups:
 
-For terminal FLR(v0), Windows produces:
+```text
+backend+1354 = 12  ordinary TEMP limit
+backend+1358 = 4   special TEMP count
+backend+1360 = 12  special TEMP base
+```
+
+The production table builder at Linux `001b3f20` (byte-matched Windows
+builder RVA `001da3e0`) sets the scratch cursor `backend+0x1350` to special
+base 12 at `001b40aa..001b40b3`, resets ordinary slot activity through
+`001b40c8..001b40df`, and clears special activity through
+`001b40e1..001b4110`. With no logical ordinary TEMP in terminal FLR, the H5
+allocator's ordinary dynamic window is empty and `special_ok=1` selects r12.
+After allocation and release, the observed cursor is 13 and r12 is inactive.
+
+The incomplete earlier helper called only `stmPPSSetRegManager_invi`; its
+ordinary scan window still exposed r0. The identical allocator therefore
+returned r0 and configuration two derived a different resource bucket. That
+result is retained only as a harness-initialization warning, not compiler
+evidence.
+
+## Exact byte-matched expansion
+
+Both production paths emit terminal FLR(v0) as:
 
 ```text
 raw:
@@ -52,25 +79,18 @@ config2:
 020c0538 30140924 00f04005 00000820
 ```
 
-The scratch is special TEMP id12 (`...0320`, B id12),
-`temporary_write_mask=0`, A90=`90040000`, and A92=`92000002`.
+The first record is FRC subop e to special r12. The second computes
+A=original plus B=NEG r12 times C=literal ONE, i.e. `x - FRC(x)`. Configuration
+two sets the B last-use flag in d0.bit25. c0 and v0.wwww byte-match too; the
+swizzle propagates to the FRC source and the second record's original-source
+A slot.
 
-Linux produces:
-
-```text
-raw:
-01c00530 301c0053 00f04005 000e0020
-00000538 30140924 00f04005 00000820
-config2:
-01c00530 301c0053 00f04005 000e0020
-02000538 30140924 00f04005 00000820
-```
-
-The scratch is ordinary physical id0, `temporary_write_mask=0`,
-A90=`90058000`, and A92=`92000002`. c0 and v0.wwww reproduce exactly the
-same id/control mismatch. Although both streams express the same arithmetic,
-neither may be selected as a portable runtime contract without independent
-silicon proof and a deliberate allocator/control policy.
+`temporary_write_mask` remains zero because r12 is compiler scratch rather
+than a logical program TEMP. `stmGetActiveTexTmpNum` reports `(0,13,0,0)`:
+active1 is the highest used scratch location plus one. This exceeds the
+resource-bucket thresholds, so configuration two adds no `0x18000/0x10000/
+0x08000` tier and leaves A90=`90040000`; A92 is `92000002`. The earlier r0
+harness artifact reported active1=1 and therefore A90=`90058000`.
 
 ## Explicit-TEMP timeout boundary
 
@@ -80,16 +100,14 @@ deadline:
 - `mov r0,c0; flr oC0,r0`;
 - `flr r0,c0; mov oC0,r0`.
 
-The terminal internal cases finish in about four seconds. Preserve the two
-timeouts as allocator/composition negative evidence and do not retry them
-unboundedly. Linux public FRC success for analogous tokens is not internal
-FLR evidence.
+Terminal internal cases finish in about four seconds. Preserve the timeouts
+as allocator/composition negative evidence and do not retry them unboundedly.
 
 ## Policy
 
-Reject native FLR and any generic `ffloor` mapping. The current structured
-UAPI cannot encode the internal scratch lifetime, the vendor streams disagree
-on that scratch and A90, and no silicon test has established negative-floor,
-signed-zero, denormal, NaN/Inf, or precision behavior. Terminal finite c0 may
-still be constant-folded on the CPU into the existing MOV(c0) path under its
-separate finite/FP contract.
+Reject native FLR and any generic `ffloor` mapping. Compiler portability is
+now closed for the tested terminal sources, but the current structured UAPI
+does not expose compiler-created scratch lifetime and no silicon test has
+established negative-floor, signed-zero, denormal, NaN/Inf, or precision
+behavior. Terminal finite c0 may still be constant-folded on the CPU into the
+existing MOV(c0) path under its separate finite/FP contract.

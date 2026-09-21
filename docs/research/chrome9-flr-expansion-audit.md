@@ -14,8 +14,10 @@ dynamic byte-exact FLR stream and no silicon semantics claim here.
 That paragraph records the original static-audit boundary. It is superseded
 for three terminal source forms by the production differential in
 [`chrome9-flr-production-audit.md`](chrome9-flr-production-audit.md). The
-dynamic result finds a real Windows/Linux scratch-id and A90 mismatch, so FLR
-remains rejected for a stronger reason.
+fully initialized Windows and Linux streams byte-match. An apparent scratch-id
+and A90 mismatch was traced to an omitted Linux register-table builder call.
+FLR remains rejected for missing silicon semantics and structured scratch
+lifetime support.
 
 ## Windows and Linux emitter structure
 
