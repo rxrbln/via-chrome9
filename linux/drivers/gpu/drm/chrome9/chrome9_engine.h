@@ -15,6 +15,7 @@ int chrome9_engine_init(struct chrome9_device *cdev);
 void chrome9_engine_fini(struct chrome9_device *cdev);
 bool chrome9_engine_ready(const struct chrome9_device *cdev);
 bool chrome9_textured_triangle_run_enabled(void);
+bool chrome9_rhw_chain_enabled(void);
 int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 		   struct chrome9_sf_mapping **mapping);
 void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping);
@@ -40,6 +41,9 @@ int chrome9_draw_triangle_d16_rhw_batch_ioctl(struct drm_device *drm,
 int chrome9_draw_triangle_d16_rhw_run_ioctl(struct drm_device *drm,
 					     void *data,
 					     struct drm_file *file);
+int chrome9_draw_triangle_d16_rhw_chain_ioctl(struct drm_device *drm,
+					       void *data,
+					       struct drm_file *file);
 int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
 		struct drm_device *drm, void *data, struct drm_file *file);
 int chrome9_draw_textured_triangle_ioctl(struct drm_device *drm, void *data,

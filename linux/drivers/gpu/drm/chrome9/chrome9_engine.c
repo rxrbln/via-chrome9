@@ -64,6 +64,11 @@ module_param_named(textured_triangle_run, chrome9_textured_triangle_run,
 MODULE_PARM_DESC(textured_triangle_run,
 		 "Enable the pre-promotion one-texture run ioctl (default: false)");
 
+static bool chrome9_rhw_chain;
+module_param_named(rhw_chain, chrome9_rhw_chain, bool, 0400);
+MODULE_PARM_DESC(rhw_chain,
+		 "Enable the pre-promotion D16 RHW chain ioctl (default: false)");
+
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
@@ -138,6 +143,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN,
+	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_CHAIN,
 	CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
 };
 
@@ -213,6 +219,7 @@ static_assert(sizeof(struct drm_chrome9_copy_rect) == 96);
 static_assert(sizeof(struct drm_chrome9_vertex_d16_rhw) == 20);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128);
+static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_chain) == 128);
 static_assert(sizeof(struct drm_chrome9_ps_source) == 8);
 static_assert(sizeof(struct drm_chrome9_ps_instruction) == 24);
 static_assert(sizeof(struct drm_chrome9_draw_program_triangle_d16_rhw_batch) ==
@@ -2880,6 +2887,11 @@ bool chrome9_textured_triangle_run_enabled(void)
 	return READ_ONCE(chrome9_textured_triangle_run);
 }
 
+bool chrome9_rhw_chain_enabled(void)
+{
+	return READ_ONCE(chrome9_rhw_chain);
+}
+
 int chrome9_engine_init(struct chrome9_device *cdev)
 {
 	struct chrome9_engine *engine;
@@ -3262,6 +3274,8 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	struct drm_gem_object *obj = NULL;
 	struct chrome9_engine *engine;
 	struct chrome9_job *job = NULL;
+	struct chrome9_draw_request segment_request;
+	const struct chrome9_draw_request *segment = request;
 	struct drm_exec exec;
 	u32 pause;
 	u32 target;
@@ -3275,6 +3289,9 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	bool signal = false;
 	bool quarantine = false;
 	bool must_quarantine;
+	bool chained = request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_CHAIN;
+	u32 chain_offset = 0;
 	bool textured_depth =
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16 ||
 		request->kind ==
@@ -3501,8 +3518,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	}
 	job->kind = request->kind;
 	job->flags = request->flags;
-	job->cookie = engine->last_cookie == 0x00010001 ?
-		      0x00020002 : 0x00010001;
 	ret = chrome9_job_acquire_mapping_locked(engine, job, obj, job->sgt,
 						 &target);
 	if (ret)
@@ -3597,62 +3612,93 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		texture2_target += PAGE_SIZE;
 	if (four_objects)
 		texture3_target += PAGE_SIZE;
-	if (request->kind == CHROME9_DRAW_COPY_RECT)
-		ret = chrome9_build_copy_rect(engine, request, job, target,
-					      depth_target, &pause);
-	else if (request->kind ==
-		 CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
-	    two_textured_depth)
-		ret = chrome9_build_two_textured_triangle(engine, request, job,
-						   target, depth_target,
-						   texture2_target,
-						   two_textured_depth ?
-						   texture3_target : 0, &pause);
-	else if (textured_depth)
-		ret = chrome9_build_textured_triangle(engine, request, job, target,
-						      depth_target,
-						      texture2_target, &pause);
-	else if (request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE ||
-	    request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
-	    request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH ||
-	    request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_RUN)
-		ret = chrome9_build_textured_triangle(engine, request, job, target,
-						      depth_target, 0, &pause);
-	else
-		ret = chrome9_build_depth_triangle(engine, request, job, target,
-					   depth_target, &pause);
-	if (ret)
-		goto out_prepublication;
-	if (request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN ||
-	    request->kind == CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH)
-		ret = chrome9_append_segment(engine, job,
+	do {
+		if (chained) {
+			u32 count = min_t(u32,
+				request->triangle_count - chain_offset,
+				DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES);
+
+			segment_request = *request;
+			segment_request.kind =
+				CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN;
+			segment_request.triangle_count = count;
+			segment_request.batch_vertices_rhw =
+				request->batch_vertices_rhw + 3U * chain_offset;
+			segment = &segment_request;
+		}
+		/*
+		 * Every segment receives a new completion value.  Reusing the
+		 * previous cookie could make the retirement poll pass before the
+		 * newly published packet executes.
+		 */
+		job->cookie = engine->last_cookie == 0x00010001 ?
+			      0x00020002 : 0x00010001;
+		job->retirement_proven = false;
+		if (segment->kind == CHROME9_DRAW_COPY_RECT)
+			ret = chrome9_build_copy_rect(engine, segment, job, target,
+						      depth_target, &pause);
+		else if (segment->kind ==
+			 CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
+			 two_textured_depth)
+			ret = chrome9_build_two_textured_triangle(engine, segment,
+					job, target, depth_target, texture2_target,
+					two_textured_depth ? texture3_target : 0,
+					&pause);
+		else if (textured_depth)
+			ret = chrome9_build_textured_triangle(engine, segment, job,
+					target, depth_target, texture2_target, &pause);
+		else if (segment->kind ==
+			 CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE ||
+			 segment->kind ==
+			 CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
+			 segment->kind ==
+			 CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH ||
+			 segment->kind ==
+			 CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_RUN)
+			ret = chrome9_build_textured_triangle(engine, segment, job,
+						      target, depth_target, 0, &pause);
+		else
+			ret = chrome9_build_depth_triangle(engine, segment, job,
+						   target, depth_target, &pause);
+		if (ret)
+			goto out_prepublication;
+		if (segment->kind ==
+			 CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN ||
+		    segment->kind ==
+			 CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH)
+			ret = chrome9_append_segment(engine, job,
 					     engine->run_staging_cpu,
 					     CHROME9_RUN_STAGING_SIZE, pause,
 					     &must_quarantine);
-	else
-		ret = chrome9_append_segment(engine, job, engine->staging_cpu,
-					     PAGE_SIZE, pause, &must_quarantine);
-	if (ret) {
-		if (!must_quarantine)
-			goto out_prepublication;
-		dma_fence_set_error(&job->fence.base, -ETIME);
-		/*
-		 * PID10 was published but did not retire.  Conservatively retain
-		 * this job's mappings together with the still-owned ring.
-		 */
-		job->published = true;
-		chrome9_quarantine_job_locked(engine, job);
-		quarantine = true;
-		goto out_unlock_submit;
-	}
-	ret = chrome9_wait_job(engine, job);
-	if (ret) {
-		dma_fence_set_error(&job->fence.base, -ETIME);
-		chrome9_quarantine_job_locked(engine, job);
-		quarantine = true;
-		goto out_unlock_submit;
-	}
-	job->retirement_proven = true;
+		else
+			ret = chrome9_append_segment(engine, job,
+					     engine->staging_cpu, PAGE_SIZE, pause,
+					     &must_quarantine);
+		if (ret) {
+			if (!must_quarantine)
+				goto out_prepublication;
+			dma_fence_set_error(&job->fence.base, -ETIME);
+			/*
+			 * PID10 was published but did not retire.  Retain every
+			 * mapping covered by the request's single fence.
+			 */
+			job->published = true;
+			chrome9_quarantine_job_locked(engine, job);
+			quarantine = true;
+			goto out_unlock_submit;
+		}
+		ret = chrome9_wait_job(engine, job);
+		if (ret) {
+			dma_fence_set_error(&job->fence.base, -ETIME);
+			chrome9_quarantine_job_locked(engine, job);
+			quarantine = true;
+			goto out_unlock_submit;
+		}
+		job->retirement_proven = true;
+		engine->last_cookie = job->cookie;
+		if (chained)
+			chain_offset += segment->triangle_count;
+	} while (chained && chain_offset < request->triangle_count);
 	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->sgt,
 				 DMA_BIDIRECTIONAL);
 	dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->depth_sgt,
@@ -4345,8 +4391,13 @@ static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 	}
 	if (check_mul_overflow(args->triangle_count, 3U, &vertex_count))
 		return -E2BIG;
-	vertices = memdup_array_user(u64_to_user_ptr(args->vertices_ptr),
-				      vertex_count, vertex_size);
+	if (max_triangles > DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES)
+		vertices = vmemdup_array_user(
+			u64_to_user_ptr(args->vertices_ptr), vertex_count,
+			vertex_size);
+	else
+		vertices = memdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+					      vertex_count, vertex_size);
 	if (IS_ERR(vertices))
 		return PTR_ERR(vertices);
 	for (i = 0; i < vertex_count; i++) {
@@ -4403,7 +4454,7 @@ static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 		      chrome9_submit_draw(drm, file, &request);
 
 out_free:
-	kfree(vertices);
+	kvfree(vertices);
 	return ret;
 }
 
@@ -4455,6 +4506,39 @@ int chrome9_draw_triangle_d16_rhw_run_ioctl(struct drm_device *drm,
 		drm, &batch, file, true,
 		DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES,
 		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN, NULL, NULL);
+}
+
+int chrome9_draw_triangle_d16_rhw_chain_ioctl(struct drm_device *drm,
+					       void *data,
+					       struct drm_file *file)
+{
+	struct drm_chrome9_draw_triangle_d16_rhw_chain *args = data;
+	struct drm_chrome9_draw_triangle_batch batch = {
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->depth_handle,
+		.flags = args->flags,
+		.triangle_count = args->triangle_count,
+		.width = args->width,
+		.height = args->height,
+		.destination_pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+		.destination_format = args->destination_format,
+		.reserved0 = args->reserved0,
+		.blend = args->blend,
+		.scissor = args->scissor,
+		.pad = args->pad,
+		.vertices_ptr = args->vertices_ptr,
+		.reserved = {
+			args->reserved[0], args->reserved[1], args->reserved[2],
+		},
+	};
+
+	if (!chrome9_rhw_chain_enabled())
+		return -EOPNOTSUPP;
+	return chrome9_draw_triangle_batch(
+		drm, &batch, file, true,
+		DRM_CHROME9_TRIANGLE_CHAIN_MAX_TRIANGLES,
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_CHAIN, NULL, NULL);
 }
 
 int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
