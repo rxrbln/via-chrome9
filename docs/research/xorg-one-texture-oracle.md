@@ -2087,6 +2087,45 @@ quadrants, checks exact covered results `00ff0000/00000000/00ffff00`, checks
 the outside sentinel, compares both complete source data pages, and verifies
 all six guards.
 
+### Structured ABI and Gallium silicon result (2026-09-21)
+
+Kernel commits `98d175e` (UAPI) and `97e20ff` (Chrome9 DRM) implement the
+240-byte request above as ioctl `0x0a`, capability bit 14.  The final builder
+asserts the complete 262-dword body, uses three separately reserved GEM BOs,
+and publishes through the already validated monotonic command ring.
+
+The first live VX900 submission passed exactly:
+
+```text
+RGBA two-texture triangle passed: 00ff0000/00000000/00ffff00 outside=005a5a5a
+caps=0x7ffd, bounded two-texture path passed
+```
+
+Both source images and all six guards were unchanged.  Two hundred consecutive
+raw oracles completed in 1.26 seconds, crossing ring epochs without a timeout;
+the previous one-texture REPLACE/MODULATE and variable-size D16 oracles then
+remained exact.  After the complete raw and GL integration sequence, safe
+quiesce reported `appends=558 wraps=17 epochs=17`; unload, reload, and another
+two-texture oracle passed without rebooting.
+
+Mesa commit `e985dfc` completes the GL1 state path.  Mesa's fixed-function NIR
+retains a `nir_tex_src_projector` sourced from `TEXn.w` even for ordinary
+`glMultiTexCoord2f`.  The bounded classifier now recognizes that exact form,
+the draw module carries all four texture-coordinate components through
+software T&L, and runtime validation accepts only finite coordinates with
+`Q == 1`.  Real projective texturing remains rejected instead of being
+silently reduced to S/T.  A surfaceless EGL test enabled both texture units,
+generated the exact `tex0 * tex1` NIR, rendered through ioctl `0x0a`, and
+passed 100 consecutive times.  The ten-frame three-gear D16/blend checksum
+remained `f8b37bc9fe5e12b7` afterward.
+
+Ordinary OpenGL uploads currently request a complete mip-capable resource
+even when the active minification filter uses only level zero.  A 1x1 GL
+texture therefore isolates and proves the full state/NIR/submission path;
+larger GL textures require the separately tracked mip-capable resource-layout
+work before this is a general application path.  The raw oracle already proves
+independent D3/D4 interpolation for 32x32 sources.
+
 ## Measured live result
 
 The kernel-owned test used the oracle's exact local-VRAM addresses,
