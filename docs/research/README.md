@@ -264,6 +264,11 @@ targets.
   exact XRGB/BGRA view translation lets one three-factor RGBA object cover
   all four texture-alpha cases, and maps later masked surfaces into the
   current command-12/13 A33 state.
+- [ioquake3-gl2-lightall-bgra-object.md](ioquake3-gl2-lightall-bgra-object.md)
+  closes the packed GL2 lightall case with BGRA unit 1 using an exact
+  four-ALU texture-0-alpha object, maps all three packet forms and capability
+  bit 39, and proves from the live bind trace that no third unsupported
+  fragment key follows it in the captured interval.
 - [ioquake-fog-dlight-successors.md](ioquake-fog-dlight-successors.md)
   closes ioquake GL1 fog and dynamic-light image formats, fragment keys,
   blend/depth words and identity-Q proof, and specifies the minimal

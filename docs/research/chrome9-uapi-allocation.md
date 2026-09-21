@@ -88,8 +88,9 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 36 | reserved | `DRAW_TRIANGLE_D24S8_STENCIL` |
 | 37 | reserved | `DRAW_FOGPASS` |
 | 38 | reserved | `D24S8_TWO_SIDED_STENCIL` |
+| 39 | reserved | `TWO_TEXTURE_PRIMARY_TEX0_ALPHA` |
 
-The next unreserved capability bit is 39.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 40.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -147,3 +148,11 @@ physical CW/CCW face blocks in command `0x17` after the exact orientation
 matrix in
 [two-sided-stencil-orientation.md](two-sided-stencil-orientation.md) passes.
 Base capability 36 remains sufficient for mirrored one-sided stencil.
+
+Capability bit 39 adds two-texture program flag bit 1 to existing commands
+`0x0a`, `0x0d`, and `0x13`.  It selects the complete four-ALU
+texture-0-alpha-times-primary object needed when packed ioquake3 lightall
+uses a BGRA unit 1 but does not consume its alpha.  Program flag bit 0 retains
+the bit-25 full-RGBA object; bits 0 and 1 are mutually exclusive.  The packet,
+format gate, and silicon oracle are specified in
+[ioquake3-gl2-lightall-bgra-object.md](ioquake3-gl2-lightall-bgra-object.md).
