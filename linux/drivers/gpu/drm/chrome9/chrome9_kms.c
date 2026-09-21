@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 Chrome9 contributors */
 
+#include <linux/dma-mapping.h>
 #include <linux/errno.h>
+#include <linux/iopoll.h>
 #include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/sizes.h>
@@ -19,6 +21,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
+#include <drm/drm_vblank.h>
 
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
@@ -53,7 +56,7 @@ static const u8 chrome9_saved_sr[] = {
 static const u8 chrome9_saved_cr[] = {
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11,
-	0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x33, 0x34,
+	0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x32, 0x33, 0x34,
 	0x35, 0x36, 0x45, 0x47, 0x48, 0x6a, 0x6c,
 };
 
@@ -74,8 +77,12 @@ struct chrome9_kms_state {
 	bool staging_scanout;
 	bool snapshot_valid;
 	bool iga1_enabled;
+	bool flip_blocked;
 	/* Owns a second SF pin until a complete IGA1 restore stops fetch. */
 	struct drm_framebuffer *active_fb;
+	/* A failed post-publication flip retains every possibly fetched BO. */
+	struct drm_framebuffer *blocked_fb;
+	struct drm_pending_vblank_event *blocked_event;
 	u8 seq_index;
 	u8 crt_index;
 	u8 gfx_index;
@@ -280,6 +287,9 @@ static void chrome9_iga1_program(struct chrome9_device *cdev, u32 address,
 	vga_io_wcrt(0x16, 0x25);
 	vga_io_wcrt(0x18, 0xff);
 	chrome9_cr_mask(0x33, 0x37, 0x06);
+	/* Direct 0214 base updates latch by frame, never by scan line. */
+	chrome9_cr_mask(CHROME9_CR_IGA1_FLIP_MODE,
+			CHROME9_CR_IGA1_FLIP_BY_LINE, 0);
 	chrome9_cr_mask(0x36, BIT(3), 0);
 	chrome9_cr_mask(0x11, BIT(7), BIT(7));
 	vga_io_wcrt(0x17, 0x63);
@@ -341,6 +351,74 @@ static bool chrome9_fixed_state_valid(struct chrome9_device *cdev,
 	return true;
 }
 
+static struct drm_pending_vblank_event *
+chrome9_pipe_take_event(struct drm_simple_display_pipe *pipe)
+{
+	struct drm_device *drm = pipe->crtc.dev;
+	struct drm_pending_vblank_event *event;
+	unsigned long flags;
+
+	spin_lock_irqsave(&drm->event_lock, flags);
+	event = pipe->crtc.state->event;
+	pipe->crtc.state->event = NULL;
+	spin_unlock_irqrestore(&drm->event_lock, flags);
+	return event;
+}
+
+static void
+chrome9_pipe_send_event(struct drm_simple_display_pipe *pipe,
+			struct drm_pending_vblank_event *event)
+{
+	struct drm_device *drm = pipe->crtc.dev;
+	unsigned long flags;
+
+	if (!event)
+		return;
+	spin_lock_irqsave(&drm->event_lock, flags);
+	drm_crtc_send_vblank_event(&pipe->crtc, event);
+	spin_unlock_irqrestore(&drm->event_lock, flags);
+}
+
+static void chrome9_pipe_complete_event(struct drm_simple_display_pipe *pipe)
+{
+	chrome9_pipe_send_event(pipe, chrome9_pipe_take_event(pipe));
+}
+
+static int chrome9_wait_iga1_flip(struct chrome9_device *cdev,
+				  bool armed_in_blank, u32 expected)
+{
+	u32 value;
+	int ret;
+
+	/*
+	 * A write made during blank must first leave that blank.  In either
+	 * case, observing the next rising blank level proves a post-arm frame
+	 * boundary without enabling the still-unproven interrupt path.
+	 */
+	if (armed_in_blank) {
+		ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_DISPLAY_STATUS,
+					 value,
+					 !(value & CHROME9_DISPLAY_IGA1_BLANK),
+					 10, 100000);
+		if (ret)
+			return ret;
+	}
+	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_DISPLAY_STATUS,
+				 value, value & CHROME9_DISPLAY_IGA1_BLANK,
+				 10, 100000);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_BASE_UPDATE_STATUS,
+				 value,
+				 !(value & CHROME9_BASE_UPDATE_IGA1_PENDING),
+				 10, 100000);
+	if (ret)
+		return ret;
+	value = readl(cdev->mmio + CHROME9_REG_IGA1_BASE);
+	return (value & CHROME9_IGA1_BASE_ADDR_MASK) ==
+	       (expected & CHROME9_IGA1_BASE_ADDR_MASK) ? 0 : -EIO;
+}
+
 static enum drm_connector_status
 chrome9_connector_detect(struct drm_connector *connector, bool force)
 {
@@ -400,11 +478,12 @@ static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
 	if (crtc_state->enable &&
 	    !chrome9_fixed_state_valid(cdev, plane_state, crtc_state))
 		return -EINVAL;
-	/* Static bring-up supports a base change only across a full disable. */
-	if (crtc_state->enable && READ_ONCE(cdev->kms_state->iga1_enabled) &&
+	if (crtc_state->async_flip)
+		return -EINVAL;
+	if (crtc_state->enable && READ_ONCE(cdev->kms_state->flip_blocked) &&
 	    old_plane_state && old_plane_state->fb != plane_state->fb &&
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
-		return -EOPNOTSUPP;
+		return -EIO;
 	return 0;
 }
 
@@ -440,8 +519,9 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
 	struct chrome9_kms_state *kms = cdev->kms_state;
 	struct drm_framebuffer *display_fb = NULL;
-	u32 scanout_base;
+	u32 scanout_base = 0;
 	bool system_framebuffer;
+	bool enabled = false;
 	int ret;
 
 	if (!chrome9_fixed_state_valid(cdev, plane_state, crtc_state)) {
@@ -501,6 +581,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	chrome9_iga1_save(kms);
 	chrome9_iga1_program(cdev, scanout_base, system_framebuffer);
 	kms->iga1_enabled = true;
+	enabled = true;
 	if (system_framebuffer) {
 		WARN_ON(kms->active_fb);
 		kms->active_fb = display_fb;
@@ -519,6 +600,8 @@ out_put_display:
 		chrome9_gem_fb_unpin(display_fb);
 		drm_framebuffer_put(display_fb);
 	}
+	if (enabled)
+		chrome9_pipe_complete_event(pipe);
 }
 
 static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
@@ -526,6 +609,9 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
 	struct chrome9_kms_state *kms = cdev->kms_state;
 	struct drm_framebuffer *display_fb = NULL;
+	struct drm_framebuffer *blocked_fb = NULL;
+	struct drm_pending_vblank_event *blocked_event = NULL;
+	bool restored = false;
 	int ret;
 
 	if (!READ_ONCE(kms->iga1_enabled))
@@ -550,6 +636,12 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	kms->iga1_enabled = false;
 	display_fb = kms->active_fb;
 	kms->active_fb = NULL;
+	blocked_fb = kms->blocked_fb;
+	kms->blocked_fb = NULL;
+	blocked_event = kms->blocked_event;
+	kms->blocked_event = NULL;
+	kms->flip_blocked = false;
+	restored = true;
 	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	dev_info(&cdev->pdev->dev, "restored pre-KMS IGA1 VGA state\n");
 
@@ -560,27 +652,155 @@ out_unlock_engine:
 		chrome9_gem_fb_unpin(display_fb);
 		drm_framebuffer_put(display_fb);
 	}
+	if (blocked_fb) {
+		chrome9_gem_fb_unpin(blocked_fb);
+		drm_framebuffer_put(blocked_fb);
+	}
+	if (restored) {
+		chrome9_pipe_send_event(pipe, blocked_event);
+		/* A full modeset which remains enabled completes after re-enable. */
+		if (!pipe->crtc.state->enable)
+			chrome9_pipe_complete_event(pipe);
+	}
 }
 
 static void chrome9_pipe_update(struct drm_simple_display_pipe *pipe,
 				struct drm_plane_state *old_plane_state)
 {
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
+	struct chrome9_kms_state *kms = cdev->kms_state;
 	struct device *dev = &cdev->pdev->dev;
 	struct drm_plane_state *plane_state = pipe->plane.state;
+	struct drm_pending_vblank_event *event;
+	struct drm_framebuffer *display_fb = NULL;
+	struct drm_framebuffer *old_display_fb = NULL;
+	u32 scanout_base = 0;
+	u32 old_base;
+	u32 expected;
+	u32 value;
+	bool armed_in_blank;
+	bool published = false;
 	int ret;
 
 	if (!plane_state || !plane_state->fb)
 		return;
-	if (!cdev->kms_state->staging_scanout) {
-		if (old_plane_state && old_plane_state->fb != plane_state->fb)
-			dev_err_ratelimited(dev, "direct SF base change requires modeset\n");
+	/* Initial activation is completed by pipe_enable after programming IGA1. */
+	if (!READ_ONCE(kms->iga1_enabled))
+		return;
+	if (!old_plane_state || old_plane_state->fb == plane_state->fb) {
+		chrome9_pipe_complete_event(pipe);
 		return;
 	}
-	ret = chrome9_gem_copy_fb_to_scanout(cdev, plane_state->fb);
+	if (kms->staging_scanout) {
+		ret = chrome9_gem_copy_fb_to_scanout(cdev, plane_state->fb);
+		if (ret) {
+			dev_err_ratelimited(dev,
+					    "BAR2 scanout staging copy failed: %d\n",
+					    ret);
+			return;
+		}
+		chrome9_pipe_complete_event(pipe);
+		return;
+	}
+
+	event = chrome9_pipe_take_event(pipe);
+	ret = chrome9_gem_fb_sf_base(plane_state->fb, &scanout_base);
 	if (ret)
-		dev_err_ratelimited(&cdev->pdev->dev,
-				    "BAR2 scanout staging copy failed: %d\n", ret);
+		goto out_block;
+	chrome9_gem_fb_sync_for_device(plane_state->fb);
+	ret = chrome9_gem_fb_pin(plane_state->fb);
+	if (ret)
+		goto out_block;
+	drm_framebuffer_get(plane_state->fb);
+	display_fb = plane_state->fb;
+
+	ret = chrome9_engine_display_begin(cdev);
+	if (ret)
+		goto out_block;
+	mutex_lock(&kms->lock);
+	if (!kms->iga1_enabled || kms->flip_blocked ||
+	    kms->active_fb != old_plane_state->fb) {
+		ret = -EIO;
+		goto out_block_locked;
+	}
+	value = readl(cdev->mmio + CHROME9_REG_BASE_UPDATE_STATUS);
+	if (value & CHROME9_BASE_UPDATE_IGA1_PENDING) {
+		ret = -EBUSY;
+		goto out_block_locked;
+	}
+
+	old_base = readl(cdev->mmio + CHROME9_REG_IGA1_BASE);
+	expected = chrome9_iga1_base_pack(old_base, scanout_base);
+	armed_in_blank = !!(readl(cdev->mmio + CHROME9_REG_DISPLAY_STATUS) &
+			    CHROME9_DISPLAY_IGA1_BLANK);
+	/*
+	 * The persistent SF PTEs and DMA device ownership are visible before the
+	 * direct base.  The posted read confirms programming, not display latch.
+	 */
+	dma_wmb();
+	writel(expected, cdev->mmio + CHROME9_REG_IGA1_BASE);
+	published = true;
+	value = readl(cdev->mmio + CHROME9_REG_IGA1_BASE);
+	if ((value & CHROME9_IGA1_BASE_ADDR_MASK) !=
+	    (expected & CHROME9_IGA1_BASE_ADDR_MASK)) {
+		ret = -EIO;
+		goto out_block_locked;
+	}
+	ret = chrome9_wait_iga1_flip(cdev, armed_in_blank, expected);
+	if (ret)
+		goto out_block_locked;
+
+	old_display_fb = kms->active_fb;
+	kms->active_fb = display_fb;
+	display_fb = NULL;
+	mutex_unlock(&kms->lock);
+	chrome9_engine_display_end(cdev);
+
+	/*
+	 * Event completion releases the helper's flip_done dependency only after
+	 * a post-arm frame boundary and the exact hardware latch proof.
+	 */
+	chrome9_pipe_send_event(pipe, event);
+	if (old_display_fb) {
+		chrome9_gem_fb_unpin(old_display_fb);
+		drm_framebuffer_put(old_display_fb);
+	}
+	dev_dbg(dev, "direct SF flip latched at %#x (0214=%08x)\n",
+		scanout_base, expected);
+	return;
+
+out_block_locked:
+	kms->flip_blocked = true;
+	kms->blocked_event = event;
+	event = NULL;
+	/*
+	 * Once 0214 was written, either BO may be fetched.  Retain the new
+	 * independent display pin alongside the unchanged active reference.
+	 */
+	if (published) {
+		kms->blocked_fb = display_fb;
+		display_fb = NULL;
+	}
+	mutex_unlock(&kms->lock);
+	chrome9_engine_display_end(cdev);
+out_block:
+	if (event) {
+		mutex_lock(&kms->lock);
+		kms->flip_blocked = true;
+		kms->blocked_event = event;
+		mutex_unlock(&kms->lock);
+	}
+	if (display_fb) {
+		chrome9_gem_fb_unpin(display_fb);
+		drm_framebuffer_put(display_fb);
+	}
+	dev_crit(dev,
+		 "direct SF flip failed: %d published=%u base=%#x status=%08x update=%08x readback=%08x; presentation blocked%s\n",
+		 ret, published, scanout_base,
+		 readl(cdev->mmio + CHROME9_REG_DISPLAY_STATUS),
+		 readl(cdev->mmio + CHROME9_REG_BASE_UPDATE_STATUS),
+		 readl(cdev->mmio + CHROME9_REG_IGA1_BASE),
+		 published ? "; both mappings retained for restore/reboot" : "");
 }
 
 static const struct drm_simple_display_pipe_funcs chrome9_pipe_funcs = {
@@ -742,7 +962,7 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	drm_mode_config_reset(drm);
 	if (fixed_iga1)
 		dev_warn(&cdev->pdev->dev,
-			 "lab-only fixed IGA1 driving armed with %s scanout; no vblank or IRQ support\n",
+			 "lab-only fixed IGA1 driving armed with %s scanout; direct flips poll the latch, no vblank IRQ support\n",
 			 staging_scanout ? "BAR2 staging" : "direct SF");
 	return 0;
 }
@@ -751,6 +971,8 @@ void chrome9_kms_fini(struct chrome9_device *cdev)
 {
 	struct chrome9_kms_state *kms = cdev->kms_state;
 	struct drm_framebuffer *display_fb = NULL;
+	struct drm_framebuffer *blocked_fb = NULL;
+	struct drm_pending_vblank_event *blocked_event = NULL;
 	int ret;
 
 	if (!kms)
@@ -777,6 +999,11 @@ void chrome9_kms_fini(struct chrome9_device *cdev)
 	kms->iga1_enabled = false;
 	display_fb = kms->active_fb;
 	kms->active_fb = NULL;
+	blocked_fb = kms->blocked_fb;
+	kms->blocked_fb = NULL;
+	blocked_event = kms->blocked_event;
+	kms->blocked_event = NULL;
+	kms->flip_blocked = false;
 	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 
 out_unlock:
@@ -786,4 +1013,9 @@ out_unlock:
 		chrome9_gem_fb_unpin(display_fb);
 		drm_framebuffer_put(display_fb);
 	}
+	if (blocked_fb) {
+		chrome9_gem_fb_unpin(blocked_fb);
+		drm_framebuffer_put(blocked_fb);
+	}
+	chrome9_pipe_send_event(&cdev->display_pipe, blocked_event);
 }

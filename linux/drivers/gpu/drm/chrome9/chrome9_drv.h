@@ -30,8 +30,8 @@
 /*
  * VX900 direct scanout-base aliases recovered independently from the Windows
  * KMD (IGA1 0x79683..0x796de, IGA2 0x79d70..0x79de9).  See the full evidence
- * trail in docs/research/display-flip-vblank.md.  These helpers only pack
- * values; no KMS path writes them yet.
+ * trail in docs/research/display-flip-vblank.md.  Only the kernel KMS path
+ * may use these packers to publish a validated, persistently pinned base.
  *
  * IGA1 stores a byte address shifted right by one in bits 28:0 and preserves
  * bits 31:29.  IGA2 stores an eight-byte-aligned byte address in bits 28:3
@@ -39,6 +39,10 @@
  */
 #define CHROME9_REG_IGA1_BASE		0x0214
 #define CHROME9_REG_IGA2_BASE		0x0218
+#define CHROME9_REG_DISPLAY_STATUS	0x0200
+#define CHROME9_REG_BASE_UPDATE_STATUS	0x0204
+#define CHROME9_DISPLAY_IGA1_BLANK	BIT(1)
+#define CHROME9_BASE_UPDATE_IGA1_PENDING	BIT(1)
 #define CHROME9_IGA1_BASE_KEEP_MASK	GENMASK(31, 29)
 #define CHROME9_IGA1_BASE_ADDR_MASK	GENMASK(28, 0)
 #define CHROME9_IGA2_BASE_KEEP_MASK	(GENMASK(31, 29) | GENMASK(2, 0))
