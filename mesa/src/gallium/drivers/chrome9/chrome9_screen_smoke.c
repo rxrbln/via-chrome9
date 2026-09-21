@@ -4907,15 +4907,21 @@ main(int argc, char **argv)
    };
    struct pipe_resource gl_depth_templ = depth_templ;
    struct pipe_resource bgra_templ = surface_templ;
+   struct pipe_resource shared_xrgb_templ = surface_templ;
    struct chrome9_resource *surface;
    struct chrome9_resource *shared_surface;
    struct pipe_resource *shared_resource;
    struct pipe_resource *offset_source = NULL;
    struct pipe_resource *offset_resource = NULL;
+   struct pipe_resource *shared_xrgb = NULL;
+   struct pipe_resource *shared_xrgb_import = NULL;
    struct pipe_resource *depth_resource = NULL;
    struct winsys_handle whandle = { .type = WINSYS_HANDLE_TYPE_FD };
    struct winsys_handle kms_handle = { .type = WINSYS_HANDLE_TYPE_KMS };
    struct winsys_handle offset_handle = { .type = WINSYS_HANDLE_TYPE_FD };
+   struct winsys_handle shared_xrgb_handle = {
+      .type = WINSYS_HANDLE_TYPE_FD,
+   };
    struct pipe_screen *screen;
    uint32_t *pixels;
    long page_size;
@@ -4933,6 +4939,10 @@ main(int argc, char **argv)
       fputs("chrome9_screen_create failed\n", stderr);
       return 1;
    }
+   shared_xrgb_templ.bind = PIPE_BIND_RENDER_TARGET |
+                             PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR |
+                             PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT |
+                             PIPE_BIND_SHARED;
    if (!screen->fence_reference || !screen->fence_finish ||
        !screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers ||
        !screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views) {
@@ -5151,6 +5161,53 @@ main(int argc, char **argv)
    }
    screen->resource_destroy(screen, offset_resource);
    screen->resource_destroy(screen, offset_source);
+   shared_xrgb = screen->resource_create(screen, &shared_xrgb_templ);
+   if (!shared_xrgb || chrome9_resource(shared_xrgb)->guarded ||
+       chrome9_resource(shared_xrgb)->data_offset ||
+       chrome9_resource(shared_xrgb)->bo.size !=
+          ALIGN_POT(chrome9_resource(shared_xrgb)->data_size,
+                    (uint64_t)page_size) ||
+       !screen->resource_get_handle(
+          screen, NULL, shared_xrgb, &shared_xrgb_handle,
+          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE) ||
+       shared_xrgb_handle.offset ||
+       shared_xrgb_handle.stride != chrome9_resource(shared_xrgb)->stride ||
+       shared_xrgb_handle.modifier != DRM_FORMAT_MOD_LINEAR) {
+      fputs("shared XRGB8888 offset-zero layout/export failed\n", stderr);
+      if (shared_xrgb_handle.handle)
+         close(shared_xrgb_handle.handle);
+      if (shared_xrgb)
+         screen->resource_destroy(screen, shared_xrgb);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   /* Match the Xorg EGL-image consumer, which imports the shared FD with
+    * render-target and sampler usage but without retaining PIPE_BIND_SHARED.
+    */
+   shared_xrgb_import = screen->resource_from_handle(
+      screen, &surface_templ, &shared_xrgb_handle,
+      PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   close(shared_xrgb_handle.handle);
+   shared_xrgb_handle.handle = 0;
+   if (!shared_xrgb_import ||
+       chrome9_resource(shared_xrgb_import)->guarded ||
+       chrome9_resource(shared_xrgb_import)->data_offset ||
+       chrome9_resource(shared_xrgb_import)->bo.size !=
+          chrome9_resource(shared_xrgb)->bo.size ||
+       !run_pipe_triangle(screen, shared_xrgb_import, NULL)) {
+      fputs("shared XRGB8888 guarded-shadow contract failed\n", stderr);
+      if (shared_xrgb_import)
+         screen->resource_destroy(screen, shared_xrgb_import);
+      screen->resource_destroy(screen, shared_xrgb);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   screen->resource_destroy(screen, shared_xrgb_import);
+   screen->resource_destroy(screen, shared_xrgb);
    if (!run_pipe_triangle(screen, shared_resource, NULL)) {
       fputs("Chrome9 imported-shadow Gallium triangle failed\n", stderr);
       screen->resource_destroy(screen, shared_resource);
@@ -5354,9 +5411,9 @@ main(int argc, char **argv)
          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
       close(bgra_fd.handle);
       shared_bgra = bgra_shared ? chrome9_resource(bgra_shared) : NULL;
-      if (!shared_bgra || !shared_bgra->guarded ||
+      if (!shared_bgra || shared_bgra->guarded || bgra->guarded ||
           shared_bgra->stride != bgra->stride ||
-          shared_bgra->data_offset != bgra->data_offset ||
+          shared_bgra->data_offset || bgra->data_offset ||
           shared_bgra->bo.size != bgra->bo.size ||
           (chrome9_screen_has_capability(
               screen, DRM_CHROME9_CAP_BLEND_BGRA8888) &&

@@ -105,6 +105,25 @@ chrome9_resource_layout(const struct pipe_resource *templ,
          (uint64_t)layout->level_stride[level] * height;
    }
 
+   /* Cross-process image paths do not reliably preserve a non-zero plane
+    * offset when they fall back from DRI3 modifiers to the legacy single-FD
+    * protocol.  Keep shared level-zero images conventional: pixels begin at
+    * byte zero and the allocation is page-rounded for KMS/GEM.  Such images
+    * are deliberately unguarded and must render/sample through the guarded
+    * shadows in chrome9_context.c; they must never reach a draw ioctl
+    * directly.  Private resources retain the exact BO+PAGE kernel ABI below.
+    */
+   if (templ->bind & PIPE_BIND_SHARED) {
+      if (templ->last_level ||
+          !chrome9_u64_align(layout->level_size[0], page_size,
+                             &layout->allocation_size) ||
+          layout->allocation_size > CHROME9_MAX_BUFFER_SIZE)
+         return false;
+      layout->level_offset[0] = 0;
+      layout->guarded = false;
+      return true;
+   }
+
    layout->level_offset[0] = page_size;
    if (!chrome9_u64_align(layout->level_size[0], page_size,
                           &aligned_level0_size) ||
