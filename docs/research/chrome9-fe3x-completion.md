@@ -67,6 +67,12 @@ The current probe already restricts `chrome9_dma_bits` to 24--32 and calls
 `dma_set_mask_and_coherent()`, so a `dma_alloc_coherent()` fence page naturally
 uses the correct device-visible domain; retain the explicit upper-bit check as
 an encoding assertion.
+Pass the returned DMA/bus address, not `virt_to_phys(cpu_pointer)` and not an
+SF virtual address.  FE3x performs a direct PCI-master system-memory write;
+the completion page must not consume transient GART PTEs whose invalidation it
+is intended to authorize.  The old KMD's `virt_to_phys(kmalloc_pointer)` works
+only under its historical no-IOMMU/low-memory assumptions and is not a Linux
+DMA API contract.
 
 Other Windows wait policies are useful cross-checks but not substitutes:
 
