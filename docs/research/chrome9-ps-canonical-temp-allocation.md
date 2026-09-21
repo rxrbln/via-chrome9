@@ -143,6 +143,17 @@ table construction.  The Windows identity-callback harness intentionally
 bypasses this production builder; its unremapped records are useful field
 differentials but are not evidence of a different Windows allocation policy.
 
+The builders are reached by the production PS2 validation paths, not dead
+library copies.  D3D `101dcf20..101dcfce` and OpenGL
+`10245720..102457ce` first call their usage collector, push `12`, push `8`,
+and call the table builder at D3D `101dcf37` / OpenGL `10245737`.  They then
+call the configured `manager+0x13a0` callback.  After replacing only the
+three direct CALL rel32 operands, these `0xaf`-byte validator bodies match
+with SHA-256
+`a61d593e5503ec19a10b70574a9510252a59a7b2fb04957ed08650074452479a`.
+This mirrors Linux `stmPPSValidatePS20_invi`'s exact collect, `(8,12)` table
+setup, and configured-callback order.
+
 ## Patch-ready rule for the bounded structured compiler
 
 For the proposed at-most-three-record MOV/MUL path, the safest policy is:
