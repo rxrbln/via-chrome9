@@ -8,17 +8,19 @@
 
 #include "drm-uapi/chrome9_drm.h"
 
+struct chrome9_shared_handle;
+
 struct chrome9_bo {
    uint32_t handle;
    uint64_t size;
    uint64_t mmap_offset;
    void *map;
    bool handle_owned;
+   struct chrome9_shared_handle *shared;
 };
 
 bool chrome9_get_param(int fd, uint32_t param, uint64_t *value);
 bool chrome9_bo_create(int fd, uint64_t size, struct chrome9_bo *bo);
-bool chrome9_bo_import_fd(int fd, int prime_fd, struct chrome9_bo *bo);
 bool chrome9_bo_export_fd(int fd, const struct chrome9_bo *bo, int *prime_fd);
 void chrome9_bo_destroy(int fd, struct chrome9_bo *bo);
 bool chrome9_draw_triangle(int fd,

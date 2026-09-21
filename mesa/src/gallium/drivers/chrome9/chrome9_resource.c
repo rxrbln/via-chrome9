@@ -344,7 +344,8 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    if (!resource)
       return NULL;
    fd = screen->get_screen_fd(screen);
-   if (fd < 0 || !chrome9_bo_import_fd(fd, whandle->handle, &resource->bo))
+   if (fd < 0 ||
+       !chrome9_screen_bo_import_fd(screen, whandle->handle, &resource->bo))
       goto fail;
    data_size = (uint64_t)whandle->stride * templ->height0;
    if (whandle->offset > resource->bo.size ||
@@ -375,7 +376,7 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    return &resource->base;
 
 fail_bo:
-   chrome9_bo_destroy(fd, &resource->bo);
+   chrome9_screen_bo_destroy(screen, &resource->bo);
 fail:
    FREE(resource);
    return NULL;
@@ -410,8 +411,7 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
        * transfer below. */
       whandle->handle = resource->bo.handle;
    } else {
-      if (!chrome9_bo_export_fd(screen->get_screen_fd(screen), &resource->bo,
-                                &prime_fd))
+      if (!chrome9_screen_bo_export_fd(screen, &resource->bo, &prime_fd))
          return false;
       whandle->handle = prime_fd;
    }
@@ -427,7 +427,7 @@ chrome9_resource_destroy(struct pipe_screen *screen,
 {
    struct chrome9_resource *cresource = chrome9_resource(resource);
 
-   chrome9_bo_destroy(screen->get_screen_fd(screen), &cresource->bo);
+   chrome9_screen_bo_destroy(screen, &cresource->bo);
    FREE(cresource);
 }
 

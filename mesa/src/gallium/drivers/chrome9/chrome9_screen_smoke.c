@@ -12,8 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "drm-uapi/drm.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "frontend/winsys_handle.h"
 #include "compiler/nir/nir_builder.h"
@@ -3838,6 +3840,41 @@ main(int argc, char **argv)
    shared_resource = screen->resource_from_handle(
       screen, &surface_templ, &whandle,
       PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   {
+      struct pipe_screen *foreign_screen = NULL;
+      struct pipe_resource *foreign_resource = NULL;
+      struct drm_gem_close close_probe = { 0 };
+      int foreign_fd = open(path, O_RDWR | O_CLOEXEC);
+
+      if (foreign_fd >= 0)
+         foreign_screen = chrome9_screen_create(foreign_fd, NULL);
+      if (foreign_fd >= 0)
+         close(foreign_fd);
+      if (foreign_screen)
+         foreign_resource = foreign_screen->resource_from_handle(
+            foreign_screen, &surface_templ, &whandle,
+            PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      if (foreign_resource)
+         close_probe.handle = chrome9_resource(foreign_resource)->bo.handle;
+      if (foreign_resource)
+         foreign_screen->resource_destroy(foreign_screen, foreign_resource);
+      if (!foreign_screen || !close_probe.handle ||
+          ioctl(foreign_screen ? foreign_screen->get_screen_fd(foreign_screen) :
+                                 -1,
+                DRM_IOCTL_GEM_CLOSE, &close_probe) == 0) {
+         fputs("foreign dma-buf handle lifetime failed\n", stderr);
+         if (foreign_screen)
+            foreign_screen->destroy(foreign_screen);
+         close(whandle.handle);
+         if (shared_resource)
+            screen->resource_destroy(screen, shared_resource);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      foreign_screen->destroy(foreign_screen);
+      puts("Gallium foreign dma-buf handle release passed");
+   }
    close(whandle.handle);
    if (!shared_resource) {
       fputs("XRGB8888 PRIME import failed\n", stderr);

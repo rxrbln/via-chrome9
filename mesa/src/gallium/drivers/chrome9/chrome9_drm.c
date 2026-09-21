@@ -54,39 +54,6 @@ chrome9_bo_create(int fd, uint64_t size, struct chrome9_bo *bo)
 }
 
 bool
-chrome9_bo_import_fd(int fd, int prime_fd, struct chrome9_bo *bo)
-{
-   uint32_t handle;
-   off_t size;
-   void *map;
-
-   if (!bo || prime_fd < 0)
-      return false;
-   memset(bo, 0, sizeof(*bo));
-   size = lseek(prime_fd, 0, SEEK_END);
-   if (size <= 0 || (uint64_t)size > SIZE_MAX ||
-       drmPrimeFDToHandle(fd, prime_fd, &handle))
-      return false;
-
-   map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, prime_fd, 0);
-   if (map == MAP_FAILED) {
-      struct drm_gem_close close_args = { .handle = handle };
-
-      ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_args);
-      return false;
-   }
-   bo->handle = handle;
-   bo->size = size;
-   bo->map = map;
-   /* drmPrimeFDToHandle can return an existing handle in this drm_file.
-    * Closing it from an alias would invalidate the original resource.  Keep
-    * imported handles until the screen fd closes; add a handle cache before
-    * making repeated imports a long-lived production path. */
-   bo->handle_owned = false;
-   return true;
-}
-
-bool
 chrome9_bo_export_fd(int fd, const struct chrome9_bo *bo, int *prime_fd)
 {
    if (!bo || !bo->handle || !prime_fd)

@@ -8,11 +8,18 @@
 
 struct pipe_screen;
 struct pipe_screen_config;
+struct chrome9_bo;
 
 struct pipe_screen *
 chrome9_screen_create(int fd, const struct pipe_screen_config *config);
 
 bool chrome9_screen_has_capability(struct pipe_screen *screen,
                                    uint64_t capability);
+bool chrome9_screen_bo_import_fd(struct pipe_screen *screen, int dma_buf_fd,
+                                 struct chrome9_bo *bo);
+bool chrome9_screen_bo_export_fd(struct pipe_screen *screen,
+                                 struct chrome9_bo *bo, int *dma_buf_fd);
+void chrome9_screen_bo_destroy(struct pipe_screen *screen,
+                               struct chrome9_bo *bo);
 
 #endif

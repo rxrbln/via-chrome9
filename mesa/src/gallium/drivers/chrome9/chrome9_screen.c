@@ -6,17 +6,29 @@
 #include "chrome9_drm.h"
 #include "chrome9_resource.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "draw/draw_context.h"
 #include "drm-uapi/chrome9_drm.h"
+#include "xf86drm.h"
 #include "nir.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "util/u_debug.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
+#include "util/simple_mtx.h"
+
+struct chrome9_shared_handle {
+   struct chrome9_shared_handle *next;
+   uint32_t handle;
+   uint32_t references;
+   bool owns_handle;
+};
 
 struct chrome9_screen {
    struct pipe_screen base;
@@ -24,12 +36,158 @@ struct chrome9_screen {
    uint32_t device_id;
    uint32_t revision;
    uint64_t capabilities;
+   simple_mtx_t shared_lock;
+   struct chrome9_shared_handle *shared_handles;
 };
 
 static inline struct chrome9_screen *
 chrome9_screen(struct pipe_screen *screen)
 {
    return (struct chrome9_screen *)screen;
+}
+
+bool
+chrome9_screen_bo_import_fd(struct pipe_screen *screen, int dma_buf_fd,
+                            struct chrome9_bo *bo)
+{
+   struct chrome9_screen *cscreen = chrome9_screen(screen);
+   struct chrome9_shared_handle *entry, *spare;
+   uint32_t handle;
+   off_t size;
+   void *map;
+
+   if (!bo || dma_buf_fd < 0)
+      return false;
+   size = lseek(dma_buf_fd, 0, SEEK_END);
+   if (size <= 0 || (uint64_t)size > SIZE_MAX)
+      return false;
+   spare = CALLOC_STRUCT(chrome9_shared_handle);
+   if (!spare)
+      return false;
+
+   simple_mtx_lock(&cscreen->shared_lock);
+   if (drmPrimeFDToHandle(cscreen->fd, dma_buf_fd, &handle))
+      goto fail_unlock;
+   for (entry = cscreen->shared_handles; entry; entry = entry->next)
+      if (entry->handle == handle)
+         break;
+   if (entry && entry->references == UINT32_MAX)
+      goto fail_unlock;
+   map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, dma_buf_fd, 0);
+   if (map == MAP_FAILED) {
+      if (!entry) {
+         struct drm_gem_close close_bo = { .handle = handle };
+
+         ioctl(cscreen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
+      }
+      goto fail_unlock;
+   }
+   if (entry) {
+      entry->references++;
+   } else {
+      entry = spare;
+      spare = NULL;
+      entry->handle = handle;
+      entry->references = 1;
+      entry->owns_handle = true;
+      entry->next = cscreen->shared_handles;
+      cscreen->shared_handles = entry;
+   }
+   simple_mtx_unlock(&cscreen->shared_lock);
+
+   memset(bo, 0, sizeof(*bo));
+   bo->handle = handle;
+   bo->size = size;
+   bo->map = map;
+   bo->shared = entry;
+   FREE(spare);
+   return true;
+
+fail_unlock:
+   simple_mtx_unlock(&cscreen->shared_lock);
+   FREE(spare);
+   return false;
+}
+
+bool
+chrome9_screen_bo_export_fd(struct pipe_screen *screen, struct chrome9_bo *bo,
+                            int *dma_buf_fd)
+{
+   struct chrome9_screen *cscreen = chrome9_screen(screen);
+   struct chrome9_shared_handle *entry, *spare = NULL;
+   int exported_fd;
+
+   if (!bo || !bo->handle || !dma_buf_fd)
+      return false;
+   if (!bo->shared) {
+      spare = CALLOC_STRUCT(chrome9_shared_handle);
+      if (!spare)
+         return false;
+   }
+   simple_mtx_lock(&cscreen->shared_lock);
+   if (!chrome9_bo_export_fd(cscreen->fd, bo, &exported_fd))
+      goto fail_unlock;
+   if (!bo->shared) {
+      for (entry = cscreen->shared_handles; entry; entry = entry->next)
+         if (entry->handle == bo->handle)
+            break;
+      if (entry) {
+         if (entry->references == UINT32_MAX) {
+            close(exported_fd);
+            goto fail_unlock;
+         }
+         entry->references++;
+      } else {
+         entry = spare;
+         spare = NULL;
+         entry->handle = bo->handle;
+         entry->references = 1;
+         entry->owns_handle = bo->handle_owned;
+         entry->next = cscreen->shared_handles;
+         cscreen->shared_handles = entry;
+      }
+      bo->shared = entry;
+   }
+   simple_mtx_unlock(&cscreen->shared_lock);
+   FREE(spare);
+   *dma_buf_fd = exported_fd;
+   return true;
+
+fail_unlock:
+   simple_mtx_unlock(&cscreen->shared_lock);
+   FREE(spare);
+   return false;
+}
+
+void
+chrome9_screen_bo_destroy(struct pipe_screen *screen, struct chrome9_bo *bo)
+{
+   struct chrome9_screen *cscreen = chrome9_screen(screen);
+   struct chrome9_shared_handle *entry, **link;
+
+   if (!bo || !bo->shared) {
+      chrome9_bo_destroy(cscreen->fd, bo);
+      return;
+   }
+   entry = bo->shared;
+   bo->handle_owned = false;
+   chrome9_bo_destroy(cscreen->fd, bo);
+
+   simple_mtx_lock(&cscreen->shared_lock);
+   for (link = &cscreen->shared_handles; *link; link = &(*link)->next) {
+      if (*link != entry)
+         continue;
+      if (--entry->references == 0) {
+         struct drm_gem_close close_bo = { .handle = entry->handle };
+
+         *link = entry->next;
+         if (entry->owns_handle)
+            ioctl(cscreen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
+         FREE(entry);
+      }
+      break;
+   }
+   simple_mtx_unlock(&cscreen->shared_lock);
 }
 
 bool
@@ -70,6 +228,16 @@ chrome9_screen_destroy(struct pipe_screen *screen)
 {
    struct chrome9_screen *cscreen = chrome9_screen(screen);
 
+   while (cscreen->shared_handles) {
+      struct chrome9_shared_handle *entry = cscreen->shared_handles;
+      struct drm_gem_close close_bo = { .handle = entry->handle };
+
+      cscreen->shared_handles = entry->next;
+      if (entry->owns_handle)
+         ioctl(cscreen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
+      FREE(entry);
+   }
+   simple_mtx_destroy(&cscreen->shared_lock);
    close(cscreen->fd);
    FREE(cscreen);
 }
@@ -185,6 +353,7 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    screen = CALLOC_STRUCT(chrome9_screen);
    if (!screen)
       return NULL;
+   simple_mtx_init(&screen->shared_lock, mtx_plain);
 
    screen->fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
    if (screen->fd < 0)
@@ -256,6 +425,7 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
 fail_fd:
    close(screen->fd);
 fail:
+   simple_mtx_destroy(&screen->shared_lock);
    FREE(screen);
    return NULL;
 }
