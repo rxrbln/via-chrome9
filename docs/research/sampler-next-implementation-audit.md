@@ -93,8 +93,13 @@ paths do the same at `0x101d94a7..0x101d9527` and
 `0x101d95cd..0x101d964f`.
 
 The builders further disable or rewrite filtering for selected integer,
-floating, and multi-level resources (`Windows 0x101d96ff..0x101d97b1`,
-Linux `0x1b33f0..0x1b35cf`).  Consequently:
+floating, depth, and multi-level resources (`Windows
+0x101d96ff..0x101d97b1`, Linux `0x1b33f0..0x1b35cf`).  The exact private
+format denylist is `101d` D16, `1028` L16, `102c` R16F, `2032` D24X8,
+`2036` V16U16, `203c` G16R16, `203d` G16R16F, `203e` R32F, `203f` D32, and
+`2040` D32F.  RGB565, ARGB1555, ARGB4444, L8, A8, and L8A8 are not in that
+rewrite list, reinforcing their ordinary nearest/linear promotion path.
+Consequently:
 
 * do not expose `max_texture_anisotropy` from the literal A31 value 16;
 * do not lower Gallium anisotropy by setting only A31[20:16]; and
