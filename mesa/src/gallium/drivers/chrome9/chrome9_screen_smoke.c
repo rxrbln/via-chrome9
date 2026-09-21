@@ -2924,6 +2924,12 @@ run_pipe_textured_depth(struct pipe_screen *screen,
          { {  1,  1,  0.5, 1 }, { 0, 0, 1, 1 }, { 1, 1 } },
       },
    };
+   static const struct smoke_texture_vertex multiply_vertices[4] = {
+      { { -1, -1, 0.0, 1 }, { 0.25, 0.5, 0.75, 0.5 }, { 0, 0 } },
+      { { -1,  1, 0.0, 1 }, { 0.25, 0.5, 0.75, 0.5 }, { 0, 1 } },
+      { {  1, -1, 0.0, 1 }, { 0.25, 0.5, 0.75, 0.5 }, { 1, 0 } },
+      { {  1,  1, 0.0, 1 }, { 0.25, 0.5, 0.75, 0.5 }, { 1, 1 } },
+   };
    struct pipe_resource target_templ = {
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -2956,6 +2962,7 @@ run_pipe_textured_depth(struct pipe_screen *screen,
       .max_lod = 1000.0f,
    };
    struct pipe_blend_state blend = { 0 };
+   struct pipe_blend_state multiply = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = {
       .depth_enabled = true,
       .depth_writemask = true,
@@ -2990,7 +2997,12 @@ run_pipe_textured_depth(struct pipe_screen *screen,
    };
    struct pipe_draw_start_count_bias draw = { .count = 4 };
    union pipe_color_union clear = { 0 };
+   union pipe_color_union multiply_destination = {
+      .f = { 0x33 / 255.0f, 0x22 / 255.0f,
+             0x11 / 255.0f, 0x44 / 255.0f },
+   };
    void *blend_handle = NULL, *dsa_handle = NULL;
+   void *multiply_handle = NULL;
    void *read_only_dsa_handle = NULL;
    void *rasterizer_handle = NULL, *elements_handle = NULL;
    void *vs = NULL, *fs = NULL, *sampler_handle = NULL;
@@ -3014,6 +3026,14 @@ run_pipe_textured_depth(struct pipe_screen *screen,
       blend.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA;
       clear.f[1] = 1.0f;
    }
+   multiply.rt[0].blend_enable = true;
+   multiply.rt[0].rgb_func = PIPE_BLEND_ADD;
+   multiply.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_DST_COLOR;
+   multiply.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_SRC_COLOR;
+   multiply.rt[0].alpha_func = PIPE_BLEND_ADD;
+   multiply.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_DST_COLOR;
+   multiply.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_SRC_COLOR;
+   multiply.rt[0].colormask = PIPE_MASK_RGBA;
 
    target = screen->resource_create(screen, &target_templ);
    texture = screen->resource_create(screen, &texture_templ);
@@ -3041,6 +3061,12 @@ run_pipe_textured_depth(struct pipe_screen *screen,
           screen, DRM_CHROME9_CAP_DEPTH_READ_ONLY))
       read_only_dsa_handle =
          context->create_depth_stencil_alpha_state(context, &read_only_dsa);
+   if (!source_over &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16_BLEND) &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS))
+      multiply_handle = context->create_blend_state(context, &multiply);
    rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
    elements[0].src_offset = offsetof(struct smoke_texture_vertex, position);
    elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
@@ -3062,6 +3088,12 @@ run_pipe_textured_depth(struct pipe_screen *screen,
        (!source_over && chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DEPTH_READ_ONLY) &&
         !read_only_dsa_handle) ||
+       (!source_over &&
+        chrome9_screen_has_capability(
+           screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16_BLEND) &&
+        chrome9_screen_has_capability(
+           screen, DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS) &&
+        !multiply_handle) ||
        !rasterizer_handle ||
        !elements_handle || !sampler_handle || !view || !vs || !fs)
       goto out;
@@ -3194,6 +3226,57 @@ run_pipe_textured_depth(struct pipe_screen *screen,
                  ccontext->rejected_triangles - read_only_rejected);
       context->bind_depth_stencil_alpha_state(context, dsa_handle);
    }
+   if (passed && multiply_handle && read_only_dsa_handle) {
+      uint64_t blend_submitted = ccontext->submitted_triangles;
+      uint64_t blend_rejected = ccontext->rejected_triangles;
+      uint32_t *pixels = (uint32_t *)
+         ((uint8_t *)ctarget->bo.map + ctarget->data_offset);
+      uint16_t *depth_pixels = (uint16_t *)
+         ((uint8_t *)cdepth->bo.map + cdepth->data_offset);
+      uint32_t pixel;
+      uint16_t depth_pixel;
+      unsigned alpha, red, green, blue;
+
+      context->bind_blend_state(context, multiply_handle);
+      context->bind_depth_stencil_alpha_state(context, read_only_dsa_handle);
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &multiply_destination,
+                     0.5, 0);
+      vertex_buffer.buffer.user = multiply_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      pixel = pixels[16 * (ctarget->stride / 4) + 16];
+      depth_pixel = depth_pixels[16 * (cdepth->stride / 2) + 16];
+      alpha = pixel >> 24;
+      red = pixel >> 16 & 0xff;
+      green = pixel >> 8 & 0xff;
+      blue = pixel & 0xff;
+      passed = abs((int)red - 0x1a) <= 1 &&
+               abs((int)green - 0x22) <= 1 &&
+               abs((int)blue - 0x1a) <= 1 &&
+               (target_format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                abs((int)alpha - 0x44) <= 1) &&
+               depth_pixel >= 0x7ffe && depth_pixel <= 0x8001 &&
+               ccontext->submitted_triangles == blend_submitted + 2 &&
+               ccontext->rejected_triangles == blend_rejected &&
+               smoke_guard_pages_match(ctarget) &&
+               smoke_guard_pages_match(ctexture) &&
+               smoke_guard_pages_match(cdepth);
+      if (passed)
+         printf("Gallium textured D16 read-only DST_COLOR/SRC_COLOR "
+                "passed: sample=%08x/%04x\n", pixel, depth_pixel);
+      else
+         fprintf(stderr,
+                 "Gallium textured D16 read-only DST_COLOR/SRC_COLOR "
+                 "mismatch: sample=%08x/%04x submitted=+%" PRIu64
+                 " rejected=+%" PRIu64 "\n",
+                 pixel, depth_pixel,
+                 ccontext->submitted_triangles - blend_submitted,
+                 ccontext->rejected_triangles - blend_rejected);
+      context->bind_blend_state(context, blend_handle);
+      context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   }
    if (passed && source_over)
       printf("Gallium textured D16 source-over passed: "
              "near=%08x/%04x far=%08x/%04x\n",
@@ -3238,6 +3321,8 @@ out:
          context->delete_depth_stencil_alpha_state(context,
                                                    read_only_dsa_handle);
       if (blend_handle) context->delete_blend_state(context, blend_handle);
+      if (multiply_handle)
+         context->delete_blend_state(context, multiply_handle);
       context->destroy(context);
    }
    if (depth) screen->resource_destroy(screen, depth);
