@@ -328,6 +328,11 @@ targets.
   cache, batched PTE invalidation, eviction/quarantine rules, counters, and
   deployment order aimed at removing measured per-triangle submission cost
   without weakening hang containment.
+- [single-32k-list-kernel-patch-audit.md](single-32k-list-kernel-patch-audit.md)
+  turns the first untextured 32-KiB list into an exact kernel-only patch
+  checklist, quantifies the live 34-triangle PTE/VGA/cache cost, specifies
+  sized-finisher golden offsets, and defines the 2/34/35/64/128/272 plus
+  ring-wrap silicon oracle.
 - [`../../tools/chrome9_alu_decode.py`](../../tools/chrome9_alu_decode.py)
   decodes the established fields from a four-dword pixel-ALU instruction while
   keeping unresolved fields visible.
