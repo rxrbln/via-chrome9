@@ -302,6 +302,12 @@ targets.
   stage-0 repeat, gives exact RGB/alpha and body-word oracles, and proves that
   its current one-triangle length and inactive command-15 path cannot explain
   increased ring pressure under sustained ioquake3 submission.
+- [sustained-program24-lifetime-hang-audit.md](sustained-program24-lifetime-hang-audit.md)
+  audits the four-BO reservation, DMA/SWIOTLB, SF-PTE, cache, ring-wrap,
+  timeout, and quarantine lifetimes under sustained program-24 submission,
+  and specifies the smallest counters and staged hardware bisect needed to
+  distinguish resource pressure, CPU-side waiting, GART failure, and a true
+  post-publication GPU stall.
 - [`../../tools/chrome9_alu_decode.py`](../../tools/chrome9_alu_decode.py)
   decodes the established fields from a four-dword pixel-ALU instruction while
   keeping unresolved fields visible.
