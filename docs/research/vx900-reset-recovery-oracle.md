@@ -942,7 +942,9 @@ The transaction is:
    so more than one job is an invariant failure and must return `-EUCLEAN`.
    Drop `submit_lock` before reservation locking.
 2. Lock every retained, distinct GEM reservation with `drm_exec`, in the same
-   role order used by structured submit.  Do **not** call
+   role order used by structured submit, using
+   `drm_exec_prepare_obj(&exec, obj, 0)` because recovery adds no new fence.
+   Do **not** call
    `dma_resv_wait_timeout()`: the attached fence is precisely the unsignaled
    fence being recovered.  Reacquire `submit_lock` and revalidate list
    membership, reason, `stopping`, and the fence identity before MMIO.
