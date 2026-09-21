@@ -297,3 +297,87 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
    return p->active_count <= p->upload_count &&
           p->upload_count <= CHROME9_VS_POLICY_MAX;
 }
+
+static bool
+verify_fail(enum chrome9_shader_verify_error *error,
+            enum chrome9_shader_verify_error value)
+{
+   if (error)
+      *error = value;
+   return false;
+}
+
+bool
+chrome9_verify_fs_offline(const struct chrome9_fs_key *key,
+                          const struct chrome9_ps_program *p,
+                          enum chrome9_shader_verify_error *error)
+{
+   struct chrome9_ps_program expected;
+   size_t alu_bytes, tau_bytes;
+
+   if (error)
+      *error = CHROME9_SHADER_VERIFY_OK;
+   if (!key || !p)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_NULL);
+   if (!chrome9_compile_fs_offline(key, &expected))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_KEY);
+   if (p->alu_count != expected.alu_count ||
+       p->tau_count != expected.tau_count ||
+       p->alu_count > CHROME9_PS_MAX_ALU ||
+       p->tau_count > CHROME9_PS_MAX_TAU)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_COUNT);
+   if (p->constant_mask != expected.constant_mask ||
+       p->constant_x_one_mask != expected.constant_x_one_mask ||
+       p->varying_mask != expected.varying_mask ||
+       p->sampler_mask != expected.sampler_mask)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_RESOURCE);
+   if (memcmp(p->control, expected.control, sizeof(p->control)))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_CONTROL);
+
+   alu_bytes = (size_t)p->alu_count * sizeof(p->alu[0]);
+   tau_bytes = (size_t)p->tau_count * sizeof(p->tau[0]);
+   if (memcmp(p->alu, expected.alu, alu_bytes) ||
+       memcmp(p->tau, expected.tau, tau_bytes))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_INSTRUCTION);
+   if (memcmp(p, &expected, sizeof(*p)))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_SLACK);
+   return true;
+}
+
+bool
+chrome9_verify_vs_offline(enum chrome9_vs_key key,
+                          const struct chrome9_vs_program *p,
+                          enum chrome9_shader_verify_error *error)
+{
+   struct chrome9_vs_program expected;
+   size_t instruction_bytes;
+
+   if (error)
+      *error = CHROME9_SHADER_VERIFY_OK;
+   if (!p)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_NULL);
+   if (!chrome9_compile_vs_offline(key, &expected))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_KEY);
+   if (p->active_count != expected.active_count ||
+       p->upload_count != expected.upload_count ||
+       !p->active_count || p->active_count > p->upload_count ||
+       p->upload_count > CHROME9_VS_POLICY_MAX)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_COUNT);
+   if (p->output_metadata != expected.output_metadata ||
+       p->constant_mask[0] != expected.constant_mask[0] ||
+       memcmp(&p->constant_mask[1], &expected.constant_mask[1],
+              sizeof(p->constant_mask) - sizeof(p->constant_mask[0])) ||
+       p->input_mask != expected.input_mask)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_RESOURCE);
+   if (p->a25 != expected.a25 || p->a26 != expected.a26 ||
+       p->a60 != expected.a60 || p->a62_low != expected.a62_low ||
+       (p->a60 & 0x1ff) != (uint32_t)p->active_count - 1u)
+      return verify_fail(error, CHROME9_SHADER_VERIFY_CONTROL);
+
+   instruction_bytes = (size_t)p->upload_count * sizeof(p->instruction[0]);
+   if (memcmp(p->instruction, expected.instruction, instruction_bytes))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_INSTRUCTION);
+   if (memcmp(p, &expected, sizeof(*p)))
+      return verify_fail(error, CHROME9_SHADER_VERIFY_SLACK);
+   return true;
+}

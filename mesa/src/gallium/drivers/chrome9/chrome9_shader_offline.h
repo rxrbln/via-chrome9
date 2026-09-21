@@ -75,9 +75,29 @@ struct chrome9_vs_program {
    uint16_t upload_count;
 };
 
+enum chrome9_shader_verify_error {
+   CHROME9_SHADER_VERIFY_OK,
+   CHROME9_SHADER_VERIFY_NULL,
+   CHROME9_SHADER_VERIFY_KEY,
+   CHROME9_SHADER_VERIFY_COUNT,
+   CHROME9_SHADER_VERIFY_CONTROL,
+   CHROME9_SHADER_VERIFY_RESOURCE,
+   CHROME9_SHADER_VERIFY_INSTRUCTION,
+   CHROME9_SHADER_VERIFY_SLACK,
+};
+
 bool chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
                                 struct chrome9_ps_program *program);
 bool chrome9_compile_vs_offline(enum chrome9_vs_key key,
                                 struct chrome9_vs_program *program);
+
+/* These verify a complete canonical object for a closed key.  They are not
+ * validators for arbitrary native shader words. */
+bool chrome9_verify_fs_offline(const struct chrome9_fs_key *key,
+                               const struct chrome9_ps_program *program,
+                               enum chrome9_shader_verify_error *error);
+bool chrome9_verify_vs_offline(enum chrome9_vs_key key,
+                               const struct chrome9_vs_program *program,
+                               enum chrome9_shader_verify_error *error);
 
 #endif

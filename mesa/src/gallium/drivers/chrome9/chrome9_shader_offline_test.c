@@ -203,11 +203,82 @@ check_vs(void)
    assert(!chrome9_compile_vs_offline((enum chrome9_vs_key)-1, &p));
 }
 
+static void
+check_verifier(void)
+{
+   const struct chrome9_fs_key fs_key = {
+      CHROME9_FS_OP_MUL,
+      { CHROME9_FS_LEAF_TEX0, CHROME9_FS_LEAF_TEX1 },
+   };
+   struct chrome9_ps_program ps;
+   struct chrome9_vs_program vs;
+   enum chrome9_shader_verify_error error;
+
+   assert(chrome9_compile_fs_offline(&fs_key, &ps));
+   assert(!chrome9_verify_fs_offline(NULL, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_NULL);
+   assert(chrome9_verify_fs_offline(&fs_key, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_OK);
+   ps.alu_count++;
+   assert(!chrome9_verify_fs_offline(&fs_key, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_COUNT);
+   ps.alu_count--;
+   ps.sampler_mask ^= 1;
+   assert(!chrome9_verify_fs_offline(&fs_key, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_RESOURCE);
+   ps.sampler_mask ^= 1;
+   ps.control[3] ^= 1;
+   assert(!chrome9_verify_fs_offline(&fs_key, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_CONTROL);
+   ps.control[3] ^= 1;
+   ps.tau[1] ^= 1;
+   assert(!chrome9_verify_fs_offline(&fs_key, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_INSTRUCTION);
+   ps.tau[1] ^= 1;
+   ps.tau[CHROME9_PS_MAX_TAU - 1] = 1;
+   assert(!chrome9_verify_fs_offline(&fs_key, &ps, &error));
+   assert(error == CHROME9_SHADER_VERIFY_SLACK);
+
+   assert(chrome9_compile_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs));
+   assert(!chrome9_verify_vs_offline((enum chrome9_vs_key)-1,
+                                     &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_KEY);
+   assert(chrome9_verify_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_OK);
+   vs.active_count--;
+   assert(!chrome9_verify_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_COUNT);
+   vs.active_count++;
+   vs.input_mask ^= 1;
+   assert(!chrome9_verify_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_RESOURCE);
+   vs.input_mask ^= 1;
+   vs.a62_low ^= 1;
+   assert(!chrome9_verify_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_CONTROL);
+   vs.a62_low ^= 1;
+   vs.instruction[7][0] ^= 1;
+   assert(!chrome9_verify_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_INSTRUCTION);
+   vs.instruction[7][0] ^= 1;
+   vs.instruction[CHROME9_VS_POLICY_MAX - 1][0] = 1;
+   assert(!chrome9_verify_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &vs, &error));
+   assert(error == CHROME9_SHADER_VERIFY_SLACK);
+}
+
 int
 main(void)
 {
    check_fs();
    check_vs();
-   puts("Chrome9 offline shader corpus: 15 PS + 8 VS templates passed");
+   check_verifier();
+   puts("Chrome9 offline shader corpus: 15 PS + 8 VS templates and verifier passed");
    return 0;
 }
