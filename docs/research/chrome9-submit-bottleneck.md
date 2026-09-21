@@ -40,8 +40,11 @@ trace require a one-texture blend envelope.
 
 Mesa's `chrome9_vbuf_draw_arrays()` and `chrome9_vbuf_draw_elements()` collect
 untextured primitives through `chrome9_emit_triangle()`.  They flush at the
-34-triangle ABI limit or at the end of each draw-module primitive call.
-Textured triangles still use one synchronous ioctl per triangle.
+34-triangle ABI limit or on a complete state-key mismatch.  Current Mesa now
+retains a compatible batch across draw-module callbacks and Gallium
+`draw_vbo` calls; framebuffer, clear, sampler-shadow, explicit flush/resource,
+and context teardown paths provide the CPU/presentation boundaries.  Textured
+triangles still use one synchronous ioctl per triangle.
 
 The exact state-, packet-, and lifetime-complete design for retaining
 one-/two-texture triangles is now in
@@ -54,10 +57,10 @@ The perspective D16 successor follows the same aggregation path.  When depth
 is active and `DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH` is present,
 `chrome9_emit_triangle()` copies post-viewport X/Y/Z, the original RHW word,
 and normalized diffuse color into `batch_vertices_rhw[]`; it does not fall
-back to one ioctl per triangle.  `chrome9_vbuf_draw_arrays()` and
-`chrome9_vbuf_draw_elements()` nevertheless reset and flush this array at
-each draw-module callback boundary.  Batches cannot currently span such a
-boundary, a Gallium `draw_vbo`, or a state/resource change.
+back to one ioctl per triangle.  The retained array can now span draw-module
+and Gallium draw boundaries while its complete structured request remains
+identical.  A state/resource mismatch or explicit CPU/presentation boundary
+flushes it first.
 
 The kernel's `chrome9_build_depth_triangle()` emits one common H6 state body
 followed by six dwords per vertex.  For the maximum non-blended D16 batch:
@@ -324,20 +327,19 @@ published chunk quarantines the mapping and reachable ring epoch exactly as
 the current path does; it never tries to unwind because earlier chunks may
 have rendered.
 
-Mesa can fill the new run only within one existing `draw_arrays` or
-`draw_elements` callback at first.  It must still flush on callback end and
-must not invent cross-draw state snapshots.  The current source never leaves
-a batch pending beyond either callback, so state/resource changes, context
-flush, CPU map, draw limit and vbuf release need no new hook in this first
-tranche.  Crossing callbacks later would require every such hook.
+The original segmented design limited Mesa to one existing `draw_arrays` or
+`draw_elements` callback because those were then the known lifetime hooks.
+Current Mesa subsequently gained a complete request comparison plus retained
+cross-draw batching and explicit framebuffer/clear/shadow/flush/teardown
+hooks.  The superseding single-list design reuses that current mechanism; it
+must not reintroduce a callback-end flush.
 
-The observed 237 old batch calls have a theoretical floor of 30 run calls
-(`DIV_ROUND_UP(237,8)`), not a proven upper bound: actual run count is the sum
-of `DIV_ROUND_UP(old_batches_in_callback,8)` over callbacks and can remain as
-high as 237 if every callback is short.  A Mesa callback/count histogram is
-therefore a required acceptance counter.  Every group that does coalesce
-reduces its transient map/cache/guard ownership rounds from one per old batch
-to one per run.  The old ABI remains the automatic fallback.
+The observed 237 old batch calls have a state-ignorant theoretical floor of
+30 272-triangle calls.  Current cross-draw retention removes the former
+callback-boundary lower bound, but actual key changes can still make the count
+higher; a flush-reason histogram remains required.  Every group that does
+coalesce reduces its transient map/cache/guard ownership rounds from one per
+old batch to one per run.  The old ABI remains the automatic fallback.
 
 Do not implement this by accepting one 272-triangle command packet or merely
 raising `DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES`: either would exceed the
