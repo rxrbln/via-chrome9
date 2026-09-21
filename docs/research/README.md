@@ -183,6 +183,11 @@ targets.
   defines the flag-compatible no-depth/D16 three-factor ABI, exact full-RGBA
   and primary-alpha-bypass programs, TEXLD/TEXLDP Q boundaries, packet maps,
   Mesa keys, format semantics, and staged four-object silicon tests.
+- [ioquake-live-lightmap-alpha-successors.md](ioquake-live-lightmap-alpha-successors.md)
+  records the two live projected lightmap/primary NIR variants, proves that
+  exact XRGB/BGRA view translation lets one three-factor RGBA object cover
+  all four texture-alpha cases, and maps later masked surfaces into the
+  current command-12/13 A33 state.
 - [ioquake-fog-dlight-successors.md](ioquake-fog-dlight-successors.md)
   closes ioquake GL1 fog and dynamic-light image formats, fragment keys,
   blend/depth words and identity-Q proof, and specifies the minimal
