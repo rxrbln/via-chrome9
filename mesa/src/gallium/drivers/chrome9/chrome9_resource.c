@@ -304,6 +304,7 @@ chrome9_resource_create(struct pipe_screen *screen,
 {
    struct chrome9_resource *resource;
    struct chrome9_resource_layout layout;
+   uint32_t create_flags = 0;
    int fd;
 
    if (getenv("CHROME9_DEBUG_RESOURCES"))
@@ -321,9 +322,19 @@ chrome9_resource_create(struct pipe_screen *screen,
        !chrome9_resource_layout(templ, &layout))
       goto fail;
 
+   /* Only the exported, offset-zero KMS allocation needs constrained pages.
+    * Keeping private guarded render/depth resources in ordinary memory avoids
+    * consuming DMA32 for data which never becomes the persistent root scanout.
+    */
+   if (!layout.guarded && (templ->bind & PIPE_BIND_SCANOUT) &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_GEM_DMA32_SCANOUT))
+      create_flags = DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT;
+
    fd = screen->get_screen_fd(screen);
    if (fd < 0 ||
-       !chrome9_bo_create(fd, layout.allocation_size, &resource->bo))
+       !chrome9_bo_create(fd, layout.allocation_size, create_flags,
+                          &resource->bo))
       goto fail;
 
    chrome9_resource_apply_layout(resource, &layout);

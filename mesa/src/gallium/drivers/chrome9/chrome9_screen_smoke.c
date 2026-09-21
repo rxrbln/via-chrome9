@@ -5239,7 +5239,7 @@ main(int argc, char **argv)
    if (page_size <= 0 || surface->stride != 1056 ||
        surface->data_offset != (uint64_t)page_size ||
        surface->data_size != 1056U * 129U || !surface->guarded ||
-       !surface->bo.map) {
+       surface->bo.create_flags || !surface->bo.map) {
       fputs("guarded XRGB8888 layout mismatch\n", stderr);
       screen->resource_destroy(screen, resource);
       screen->destroy(screen);
@@ -5382,6 +5382,10 @@ main(int argc, char **argv)
    shared_xrgb = screen->resource_create(screen, &shared_xrgb_templ);
    if (!shared_xrgb || chrome9_resource(shared_xrgb)->guarded ||
        chrome9_resource(shared_xrgb)->data_offset ||
+       chrome9_resource(shared_xrgb)->bo.create_flags !=
+          (chrome9_screen_has_capability(
+              screen, DRM_CHROME9_CAP_GEM_DMA32_SCANOUT) ?
+              DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT : 0) ||
        chrome9_resource(shared_xrgb)->bo.size !=
           ALIGN_POT(chrome9_resource(shared_xrgb)->data_size,
                     (uint64_t)page_size) ||
@@ -5602,7 +5606,11 @@ main(int argc, char **argv)
          return 1;
       }
       bgra = chrome9_resource(bgra_resource);
-      if (!screen->resource_get_handle(
+      if (bgra->bo.create_flags !=
+             (chrome9_screen_has_capability(
+                 screen, DRM_CHROME9_CAP_GEM_DMA32_SCANOUT) ?
+                 DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT : 0) ||
+          !screen->resource_get_handle(
              screen, NULL, bgra_resource, &bgra_kms,
              PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE) ||
           bgra_kms.handle != bgra->bo.handle ||

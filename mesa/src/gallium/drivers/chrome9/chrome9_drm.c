@@ -20,6 +20,8 @@ _Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_batch) == 160,
                "Chrome9 textured batch ABI size");
 _Static_assert(sizeof(struct drm_chrome9_copy_rect) == 96,
                "Chrome9 copy rectangle ABI size");
+_Static_assert(sizeof(struct drm_chrome9_gem_create) == 24,
+               "Chrome9 GEM create ABI size");
 
 bool
 chrome9_get_param(int fd, uint32_t param, uint64_t *value)
@@ -33,9 +35,10 @@ chrome9_get_param(int fd, uint32_t param, uint64_t *value)
 }
 
 bool
-chrome9_bo_create(int fd, uint64_t size, struct chrome9_bo *bo)
+chrome9_bo_create(int fd, uint64_t size, uint32_t flags,
+                  struct chrome9_bo *bo)
 {
-   struct drm_chrome9_gem_create args = { .size = size };
+   struct drm_chrome9_gem_create args = { .size = size, .flags = flags };
 
    if (!bo || !size)
       return false;
@@ -54,6 +57,7 @@ chrome9_bo_create(int fd, uint64_t size, struct chrome9_bo *bo)
    }
 
    bo->handle = args.handle;
+   bo->create_flags = args.flags;
    bo->size = args.size;
    bo->mmap_offset = args.mmap_offset;
    bo->handle_owned = true;
