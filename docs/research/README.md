@@ -124,6 +124,11 @@ targets.
   expands mixed per-lane negate to two complementary-mask records.
 - [chrome9-pixel-swz-static.tsv](chrome9-pixel-swz-static.tsv) retains exact
   Windows/Linux selector, append, loop, and return control-flow anchors.
+- [chrome9-lrp-cross-driver-boundary.md](chrome9-lrp-cross-driver-boundary.md)
+  records the incompatible Windows one-record and Linux two-record terminal
+  LRP lowerings and keeps LRP outside the portable one-record contract.
+- [chrome9-lrp-cross-driver-corpus.tsv](chrome9-lrp-cross-driver-corpus.tsv)
+  preserves the exact records, controls, and Linux expansion algebra.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
