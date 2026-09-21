@@ -163,7 +163,7 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY	(1ULL << 39)
 /* REPEAT two-texture coordinates accept finite values through +/-32. */
 #define DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS	(1ULL << 40)
-/* One compiler-generated MOV/MUL fragment instruction with D16 RHW batches. */
+/* One compiler-generated MOV/MUL fragment instruction with D16 RHW runs. */
 #define DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	(1ULL << 41)
 /* Up to 16 one-texture triangles share one validated state envelope. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH	(1ULL << 43)
@@ -776,8 +776,9 @@ struct drm_chrome9_ps_instruction {
 };
 
 /*
- * Compiler-backed successor to DRAW_TRIANGLE_D16_RHW_BATCH.  DEPTH is
- * mandatory and vertices_ptr addresses the same perspective-correct records.
+ * Compiler-backed successor to DRAW_TRIANGLE_D16_RHW_RUN.  DEPTH is
+ * mandatory and vertices_ptr addresses up to TRIANGLE_RUN_MAX perspective-
+ * correct records.
  * constant_c0 contains the exact IEEE-754 words uploaded to fragment c0.
  * Version one accepts identity swizzles and requires modifier zero.  MUL must
  * pair v0 with c0.  The remaining defined swizzle values reserve stable
