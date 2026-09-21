@@ -2251,6 +2251,11 @@ chrome9_fs_key_from_nir(nir_shader *nir, struct chrome9_fs_key *key)
    nir_def *result = NULL;
 
    memset(key, 0, sizeof(*key));
+   /* The current hardware envelope does not select an IEEE execution mode.
+    * Default GLSL is admissible; explicit preserve/FTZ or rounding promises
+    * must wait for a characterized Chrome9 control word. */
+   if (nir->info.float_controls_execution_mode)
+      return false;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -3134,6 +3139,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH);
    ctx->draw_triangle_d16_rhw_batch =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH);
+   ctx->draw_triangle_d16_rhw_run =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_RUN) ||
+      debug_get_bool_option("CHROME9_FORCE_RHW_RUN", false);
    ctx->draw_program_triangle_d16_rhw_batch =
       !!(capabilities &
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);

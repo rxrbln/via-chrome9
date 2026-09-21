@@ -33,6 +33,8 @@ bool chrome9_draw_triangle_batch(
    int fd, const struct drm_chrome9_draw_triangle_batch *draw);
 bool chrome9_draw_triangle_d16_rhw_batch(
    int fd, const struct drm_chrome9_draw_triangle_d16_rhw_batch *draw);
+bool chrome9_draw_triangle_d16_rhw_run(
+   int fd, const struct drm_chrome9_draw_triangle_d16_rhw_run *draw);
 bool chrome9_draw_program_triangle_d16_rhw_batch(
    int fd,
    const struct drm_chrome9_draw_program_triangle_d16_rhw_batch *draw);

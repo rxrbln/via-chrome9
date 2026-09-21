@@ -14,6 +14,9 @@
 #include "drm-uapi/chrome9_drm.h"
 #include "xf86drm.h"
 
+_Static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128,
+               "Chrome9 RHW run ABI size");
+
 bool
 chrome9_get_param(int fd, uint32_t param, uint64_t *value)
 {
@@ -120,6 +123,15 @@ chrome9_draw_triangle_d16_rhw_batch(
    if (!draw)
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH, draw) == 0;
+}
+
+bool
+chrome9_draw_triangle_d16_rhw_run(
+   int fd, const struct drm_chrome9_draw_triangle_d16_rhw_run *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN, draw) == 0;
 }
 
 bool
