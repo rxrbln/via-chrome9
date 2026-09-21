@@ -8,22 +8,29 @@ for the current compiler work.
 
 ## Exact probe
 
-The retained artifact is `/tmp/chrome9-ps30-dcl.json`, SHA-256
-`4b41b0518e5cbfc0699d4f48e9e2b1d36b0c371d4ea5da632804fc3491105c5e`.
+The corrected production-RegMgr artifact is `/tmp/chrome9-dcl-production.json`,
+SHA-256
+`a4d1d38614dac341ebb99ddde6e16672336271c3c8c29293a45942f1b134142d`.
 The positive PS 3.0 framing control, `mov oC0,v0`, byte-matches:
 
 ```
 01c00530 301c0053 00f04005 000d0820
 ```
 
-Windows reports `90040000/92000001`; Linux configuration 2 reports
-`90058000/92000001`.  Both report one phase and one color output.
+Both production compilers report `90058000/92000001`, one phase, and one
+color output.  The prior JSON `4b41b051...` omitted the Windows
+register-manager builder; its baseline record and DCL rejection were accurate,
+but A90=`90040000` was a harness artifact.
 
 The candidate `dcl_texcoord0 v0` token sequence uses opcode `0x1f`, semantic
 token `00000005`, and destination `100f0000`.  Windows stops in the tokenizer
 (`wine_shader_probe` exit 40) and Linux returns compiler rejection (exit 4), so
 neither produces a native record.  Adding candidate destination modifier bit
 `0x00400000` for centroid produces the same boundary.
+
+Both rejected candidates stop before register-manager setup can affect a
+native program.  Rerunning them with the production wrapper reproduces the
+same Windows tokenizer rejection and Linux compiler rejection.
 
 ## Policy
 

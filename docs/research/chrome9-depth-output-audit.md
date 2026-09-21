@@ -23,9 +23,8 @@ export remain unproved, so depth output stays rejected.
 ```
 
 Both are phase 1 and set depth-output-present.  Windows reports color-output
-count zero.  Windows uses A90=`90040000`; Linux configuration 2 uses
-A90=`90058000`; both have A92=`92000001` and all remaining transition controls
-zero.  The metadata acceptance and exact native destination distinguish the
+count zero.  Both production compilers use A90=`90058000`, A92=`92000001`,
+and all remaining transition controls zero.  The metadata acceptance and exact native destination distinguish the
 real depth register from invalid `oC4`, which can alias the same native word
 without setting depth-output-present.
 
@@ -49,8 +48,11 @@ reports one color output.  This order mismatch means the unordered record set
 is compiler evidence, not a cross-driver executable byte sequence.  A new
 backend must select and validate one target schedule deliberately.
 
-The three-case differential JSON SHA-256 is
-`d73508d0d93b8351533b1f0a0bba754051d3f0abd3313348941a15f622079a99`.
+The corrected production-RegMgr three-case differential JSON SHA-256 is
+`79dc113c3167b516991bd17378fca209537f32cd3ff936e7ef4db77e9a48fdf8`.
+The earlier JSON `d73508d0...` omitted the Windows register-manager builder;
+its records, metadata, and record-order mismatch were accurate, but
+A90=`90040000` was a harness artifact.
 Exact tokens, controls and metadata are retained in
 [`chrome9-depth-output-corpus.tsv`](chrome9-depth-output-corpus.tsv).
 

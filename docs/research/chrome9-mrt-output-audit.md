@@ -19,9 +19,9 @@ oC2 01c00530 301c0053 00f08005 000d08a0
 oC3 01c00530 301c0053 00f08005 000d08e0
 ```
 
-Every row is phase 1, depth-output-present false, and one ALU.  Windows uses
-A90=`90040000`; Linux configuration 2 uses A90=`90058000`; both use
-A92=`92000001`.  No source/destination dependency bit differs.
+Every row is phase 1, depth-output-present false, and one ALU.  Both
+production compilers use A90=`90058000` and A92=`92000001`.  No
+source/destination last-use bit differs.
 
 A single oC0/oC1/oC2/oC3 store gives Windows color-output count 1/2/3/4.
 Therefore the field is a high-water count and cannot say that only oC2 is
@@ -36,9 +36,11 @@ The combined `oC0=c0; oC1=c1` records retain token order and byte-match:
 01c00530 301c0053 00f08105 000d0860
 ```
 
-Both use A92=`92000002`; Windows reports color-output count 2.  The exact
-five-case differential JSON SHA-256 is
-`30930cd295620d1ec311ed45159a6209d528fef4ba1cd02cdfc1f41d5d167154`.
+Both use A90=`90058000`, A92=`92000002`; Windows reports color-output count 2.
+The corrected production-RegMgr five-case differential JSON SHA-256 is
+`84e0efb3f1f726c0a1603b701b0ea26cf7d4c649e818af1f184829e492917cc5`.
+The earlier JSON `30930cd2...` omitted the Windows register-manager builder;
+its native records were accurate, but A90=`90040000` was a harness artifact.
 All rows are retained in
 [`chrome9-mrt-output-corpus.tsv`](chrome9-mrt-output-corpus.tsv).
 
