@@ -8,6 +8,7 @@
 #include "chrome9_resource.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -162,6 +163,17 @@ chrome9_depth_16_16(float value)
 }
 
 static bool
+chrome9_triangle_nondegenerate(const int32_t x[3], const int32_t y[3])
+{
+   const int64_t dx10 = (int64_t)x[1] - x[0];
+   const int64_t dy10 = (int64_t)y[1] - y[0];
+   const int64_t dx20 = (int64_t)x[2] - x[0];
+   const int64_t dy20 = (int64_t)y[2] - y[0];
+
+   return dx10 * dy20 != dy10 * dx20;
+}
+
+static bool
 chrome9_blend_factor(unsigned factor, uint32_t *result)
 {
    switch (factor) {
@@ -260,7 +272,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              &ctx->framebuffer.cbufs[0] : NULL;
    if (!surface || !surface->texture || surface->format != resource->format ||
        surface->level || surface->first_layer || surface->last_layer ||
-       resource->target != PIPE_TEXTURE_2D ||
+       (resource->target != PIPE_TEXTURE_2D &&
+        resource->target != PIPE_TEXTURE_RECT) ||
        (resource->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         resource->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
        (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
@@ -293,7 +306,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
           ctx->dsa->depth_func != PIPE_FUNC_LESS || !*depth ||
           surface->format != PIPE_FORMAT_Z16_UNORM || surface->level ||
           surface->first_layer || surface->last_layer ||
-          (*depth)->base.target != PIPE_TEXTURE_2D ||
+          ((*depth)->base.target != PIPE_TEXTURE_2D &&
+           (*depth)->base.target != PIPE_TEXTURE_RECT) ||
           (*depth)->base.format != PIPE_FORMAT_Z16_UNORM ||
           !(*depth)->guarded || !(*depth)->bo.handle ||
           (*depth)->base.width0 != resource->width0 ||
@@ -353,6 +367,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct drm_chrome9_blend_state blend_state;
    struct drm_chrome9_scissor_state scissor = { 0 };
    const unsigned indices[3] = { ia, ib, ic };
+   int32_t x[3], y[3];
    bool blend_successor;
    bool depth_active;
 
@@ -396,6 +411,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
+      x[i] = chrome9_coord_16_16(position[0], target->base.width0);
+      y[i] = chrome9_coord_16_16(position[1], target->base.height0);
       if (crender->textured) {
          const float *texcoord = (const float *)(vertex + 6 * sizeof(uint32_t));
 
@@ -405,10 +422,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             ctx->rejected_triangles++;
             return;
          }
-         texture_args.vertices[i].x_16_16 =
-            chrome9_coord_16_16(position[0], target->base.width0);
-         texture_args.vertices[i].y_16_16 =
-            chrome9_coord_16_16(position[1], target->base.height0);
+         texture_args.vertices[i].x_16_16 = x[i];
+         texture_args.vertices[i].y_16_16 = y[i];
          texture_args.vertices[i].z_16_16 =
             chrome9_depth_16_16(position[2]);
          memcpy(&texture_args.vertices[i].rhw_float, &position[3],
@@ -422,21 +437,43 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                 sizeof(texcoord[1]));
          texture_blend_args.vertices[i] = texture_args.vertices[i];
       } else if (depth_active) {
-         depth_args.vertices[i].x_16_16 =
-            chrome9_coord_16_16(position[0], target->base.width0);
-         depth_args.vertices[i].y_16_16 =
-            chrome9_coord_16_16(position[1], target->base.height0);
+         depth_args.vertices[i].x_16_16 = x[i];
+         depth_args.vertices[i].y_16_16 = y[i];
          depth_args.vertices[i].z_16_16 = chrome9_depth_16_16(position[2]);
          depth_args.vertices[i].color = color;
          depth_blend_args.vertices[i] = depth_args.vertices[i];
       } else {
-         args.vertices[i].x_16_16 =
-            chrome9_coord_16_16(position[0], target->base.width0);
-         args.vertices[i].y_16_16 =
-            chrome9_coord_16_16(position[1], target->base.height0);
+         args.vertices[i].x_16_16 = x[i];
+         args.vertices[i].y_16_16 = y[i];
          args.vertices[i].color = color;
          blend_args.vertices[i] = args.vertices[i];
       }
+   }
+
+   /* Clipping and fixed-point viewport conversion can collapse otherwise
+    * valid primitives.  Do not submit zero-area immediate triangles. */
+   if (!chrome9_triangle_nondegenerate(x, y))
+      return;
+
+   if (ctx->draw_limit && ctx->submitted_triangles >= ctx->draw_limit) {
+      if (!ctx->draw_limit_reported) {
+         fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
+                         " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
+                 ctx->submitted_triangles, ctx->draw_limit);
+         ctx->draw_limit_reported = true;
+      }
+      return;
+   }
+
+   if (ctx->debug_draws) {
+      fprintf(stderr,
+              "chrome9: submit triangle=%" PRIu64 " kind=%s%s%s "
+              "xy=(%d,%d)(%d,%d)(%d,%d)\n",
+              ctx->submitted_triangles,
+              crender->textured ? "textured" : "color",
+              depth_active ? "+d16" : "",
+              blend_successor ? "+blend" : "",
+              x[0], y[0], x[1], y[1], x[2], y[2]);
    }
 
    if (crender->textured) {
@@ -546,10 +583,12 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr,
-                 "chrome9: DRAW_%sTRIANGLE%s failed: %s target=%ux%u/%u\n",
+                 "chrome9: DRAW_%sTRIANGLE%s failed after=%" PRIu64
+                 ": %s target=%ux%u/%u xy=(%d,%d)(%d,%d)(%d,%d)\n",
                  crender->textured ? "TEXTURED_" : "",
-                 depth_active ? "_D16" : "", strerror(errno),
-                 target->base.width0, target->base.height0, target->stride);
+                 depth_active ? "_D16" : "", ctx->submitted_triangles,
+                 strerror(errno), target->base.width0, target->base.height0,
+                 target->stride, x[0], y[0], x[1], y[1], x[2], y[2]);
          ctx->warnings |= CHROME9_WARN_SUBMIT;
       }
    }

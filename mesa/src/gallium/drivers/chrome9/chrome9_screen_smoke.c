@@ -1192,6 +1192,7 @@ main(int argc, char **argv)
       .array_size = 1,
       .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
    };
+   struct pipe_resource gl_depth_templ = depth_templ;
    struct pipe_resource bgra_templ = surface_templ;
    struct chrome9_resource *surface;
    struct chrome9_resource *shared_surface;
@@ -1382,6 +1383,27 @@ main(int argc, char **argv)
       screen->resource_destroy(screen, depth_resource);
    } else {
       puts("D16 triangle capability unavailable; depth smoke skipped");
+   }
+
+   gl_depth_templ.bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW;
+   if (screen->is_format_supported(screen, gl_depth_templ.format,
+                                   gl_depth_templ.target, 1, 1,
+                                   gl_depth_templ.bind)) {
+      struct pipe_resource *gl_depth_resource =
+         screen->resource_create(screen, &gl_depth_templ);
+
+      if (!gl_depth_resource) {
+         fputs("GL renderbuffer Z16 allocation contract failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      screen->resource_destroy(screen, gl_depth_resource);
+   } else {
+      fputs("GL renderbuffer Z16 binding contract rejected\n", stderr);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
    }
    if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions) {
       if (!run_pipe_texture(screen)) {

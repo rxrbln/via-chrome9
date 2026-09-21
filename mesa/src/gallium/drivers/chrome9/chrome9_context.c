@@ -14,6 +14,7 @@
 #include "nir.h"
 #include "tgsi/tgsi_parse.h"
 #include "util/u_draw.h"
+#include "util/u_debug.h"
 #include "util/u_debug_cb.h"
 #include "util/u_framebuffer.h"
 #include "util/u_helpers.h"
@@ -1114,6 +1115,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =
       !!(capabilities & DRM_CHROME9_CAP_SCISSOR);
+   ctx->draw_limit = MAX2(debug_get_num_option("CHROME9_DRAW_LIMIT", 0), 0);
+   ctx->debug_draws = debug_get_bool_option("CHROME9_DEBUG_DRAWS", false);
 
    ctx->base.screen = screen;
    ctx->base.priv = priv;

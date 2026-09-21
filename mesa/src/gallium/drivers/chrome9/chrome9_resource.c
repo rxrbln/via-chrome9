@@ -6,12 +6,15 @@
 #include "chrome9_public.h"
 
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "drm-uapi/drm_fourcc.h"
 #include "frontend/winsys_handle.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
+#include "util/format/u_format.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
@@ -19,6 +22,12 @@
 
 #define CHROME9_MAX_BUFFER_SIZE (256ULL * 1024 * 1024)
 #define CHROME9_MAX_SURFACE_DIMENSION 2048
+
+static bool
+chrome9_is_surface_target(enum pipe_texture_target target)
+{
+   return target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT;
+}
 
 static bool
 chrome9_resource_layout(const struct pipe_resource *templ, uint32_t *stride,
@@ -39,7 +48,7 @@ chrome9_resource_layout(const struct pipe_resource *templ, uint32_t *stride,
       return true;
    }
 
-   if (templ->target != PIPE_TEXTURE_2D ||
+   if (!chrome9_is_surface_target(templ->target) ||
        (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         templ->format != PIPE_FORMAT_B8G8R8A8_UNORM &&
         templ->format != PIPE_FORMAT_Z16_UNORM) ||
@@ -67,13 +76,13 @@ chrome9_resource_layout(const struct pipe_resource *templ, uint32_t *stride,
    return true;
 }
 
-bool
-chrome9_is_format_supported(struct pipe_screen *screen,
-                            enum pipe_format format,
-                            enum pipe_texture_target target,
-                            unsigned sample_count,
-                            unsigned storage_sample_count,
-                            unsigned bindings)
+static bool
+chrome9_format_supported(struct pipe_screen *screen,
+                         enum pipe_format format,
+                         enum pipe_texture_target target,
+                         unsigned sample_count,
+                         unsigned storage_sample_count,
+                         unsigned bindings)
 {
    const unsigned buffer_bindings =
       PIPE_BIND_CUSTOM | PIPE_BIND_LINEAR | PIPE_BIND_VERTEX_BUFFER |
@@ -82,7 +91,13 @@ chrome9_is_format_supported(struct pipe_screen *screen,
    const unsigned surface_bindings =
       PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET |
       PIPE_BIND_SCANOUT | PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW;
-   const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR;
+   /* Mesa adds SAMPLER_VIEW to user renderbuffers so that common meta paths
+    * may address them.  Accept that allocation contract for Z16 even though
+    * create_sampler_view keeps rejecting Z16 until depth sampling is wired.
+    * Direct hardware depth use remains gated by DEPTH_STENCIL below. */
+   const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL |
+                                   PIPE_BIND_SAMPLER_VIEW |
+                                   PIPE_BIND_LINEAR;
    unsigned bgra_bindings = PIPE_BIND_LINEAR;
    bool bgra_render;
 
@@ -94,11 +109,13 @@ chrome9_is_format_supported(struct pipe_screen *screen,
        !chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE))
       return false;
-   if (target == PIPE_TEXTURE_2D && format == PIPE_FORMAT_Z16_UNORM)
+   if (chrome9_is_surface_target(target) &&
+       format == PIPE_FORMAT_Z16_UNORM)
       return chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_D16) &&
+             (bindings & PIPE_BIND_DEPTH_STENCIL) &&
              !(bindings & ~depth_bindings);
-   if (target != PIPE_TEXTURE_2D)
+   if (!chrome9_is_surface_target(target))
       return false;
    if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
       return !(bindings & ~surface_bindings);
@@ -122,6 +139,27 @@ chrome9_is_format_supported(struct pipe_screen *screen,
 }
 
 bool
+chrome9_is_format_supported(struct pipe_screen *screen,
+                            enum pipe_format format,
+                            enum pipe_texture_target target,
+                            unsigned sample_count,
+                            unsigned storage_sample_count,
+                            unsigned bindings)
+{
+   bool supported = chrome9_format_supported(screen, format, target,
+                                             sample_count,
+                                             storage_sample_count, bindings);
+
+   if (getenv("CHROME9_DEBUG_FORMATS"))
+      fprintf(stderr,
+              "chrome9: format %s target=%u samples=%u/%u bind=%#x: %s\n",
+              util_format_name(format), target, sample_count,
+              storage_sample_count, bindings,
+              supported ? "supported" : "rejected");
+   return supported;
+}
+
+bool
 chrome9_can_create_resource(struct pipe_screen *screen,
                             const struct pipe_resource *templ)
 {
@@ -130,6 +168,15 @@ chrome9_can_create_resource(struct pipe_screen *screen,
    uint64_t data_size;
    uint32_t stride;
    bool guarded;
+
+   if (getenv("CHROME9_DEBUG_RESOURCES"))
+      fprintf(stderr,
+              "chrome9: can-create target=%u format=%s %ux%ux%u array=%u "
+              "last=%u samples=%u/%u bind=%#x\n",
+              templ->target, util_format_name(templ->format), templ->width0,
+              templ->height0, templ->depth0, templ->array_size,
+              templ->last_level, templ->nr_samples,
+              templ->nr_storage_samples, templ->bind);
 
    if (templ->target != PIPE_BUFFER &&
        !chrome9_is_format_supported(screen, templ->format, templ->target,
@@ -147,6 +194,14 @@ chrome9_resource_create(struct pipe_screen *screen,
    struct chrome9_resource *resource;
    uint64_t allocation_size;
    int fd;
+
+   if (getenv("CHROME9_DEBUG_RESOURCES"))
+      fprintf(stderr,
+              "chrome9: resource target=%u format=%u %ux%ux%u array=%u "
+              "last=%u samples=%u/%u bind=%#x\n",
+              templ->target, templ->format, templ->width0, templ->height0,
+              templ->depth0, templ->array_size, templ->last_level,
+              templ->nr_samples, templ->nr_storage_samples, templ->bind);
 
    resource = CALLOC_STRUCT(chrome9_resource);
    if (!resource)
@@ -272,7 +327,7 @@ chrome9_transfer_box_valid(const struct pipe_resource *resource,
              box->depth == 1 && (unsigned)box->x <= resource->width0 &&
              (unsigned)box->width <= resource->width0 - (unsigned)box->x;
 
-   return resource->target == PIPE_TEXTURE_2D && box->z == 0 &&
+   return chrome9_is_surface_target(resource->target) && box->z == 0 &&
           box->depth == 1 && (unsigned)box->x <= resource->width0 &&
           (unsigned)box->width <= resource->width0 - (unsigned)box->x &&
           (unsigned)box->y <= resource->height0 &&

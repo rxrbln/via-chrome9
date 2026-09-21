@@ -78,6 +78,9 @@ struct chrome9_context {
 
    uint64_t submitted_triangles;
    uint64_t rejected_triangles;
+   uint64_t draw_limit;
+   bool debug_draws;
+   bool draw_limit_reported;
    uint32_t warnings;
 };
 
