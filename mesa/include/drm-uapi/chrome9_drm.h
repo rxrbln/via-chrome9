@@ -27,6 +27,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND	0x12
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
 #define DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	0x19
+#define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH	0x1a
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -84,6 +85,9 @@ extern "C" {
 	DRM_IOW(DRM_COMMAND_BASE + \
 		DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH, \
 		struct drm_chrome9_draw_program_triangle_d16_rhw_batch)
+#define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH, \
+		struct drm_chrome9_draw_textured_triangle_batch)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -157,6 +161,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS	(1ULL << 40)
 /* One compiler-generated MOV/MUL fragment instruction with D16 RHW batches. */
 #define DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	(1ULL << 41)
+/* Up to 16 one-texture triangles share one validated state envelope. */
+#define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH	(1ULL << 43)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -584,6 +590,7 @@ struct drm_chrome9_draw_triangle_d16_blend {
 #define DRM_CHROME9_TRIANGLE_BATCH_DEPTH	(1U << 0)
 #define DRM_CHROME9_TRIANGLE_BATCH_BLEND	(1U << 1)
 #define DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES	34U
+#define DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES	16U
 
 struct drm_chrome9_draw_triangle_batch {
 	__u32 destination_handle;
@@ -594,6 +601,38 @@ struct drm_chrome9_draw_triangle_batch {
 	__u32 height;
 	__u32 destination_pitch;
 	__u32 depth_pitch;
+	__u32 destination_format;
+	__u32 reserved0;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 pad;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
+};
+
+/*
+ * Submit a one-texture triangle list under one immutable state envelope.
+ * vertices_ptr addresses triangle_count * 3 drm_chrome9_textured_vertex
+ * records.  The command retains the original level-zero, linear texture
+ * contract and optionally enables the normalized blend/alpha-test state.
+ */
+struct drm_chrome9_draw_textured_triangle_batch {
+	__u32 destination_handle;
+	__u32 texture_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 program;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 texture_width;
+	__u32 texture_height;
+	__u32 texture_pitch;
+	__u32 texture_format;
+	__u32 min_filter;
+	__u32 mag_filter;
+	__u32 wrap_s;
+	__u32 wrap_t;
 	__u32 destination_format;
 	__u32 reserved0;
 	struct drm_chrome9_blend_state blend;
