@@ -39,6 +39,12 @@ trigger `00100000`, idle mode `00010000`, interrupt `00020000`, system write
 chip-selection code deliberately routes H5S2VP1/VX900 to the FE40/FE3x
 builder instead.  Reusing A01--A07 on 7122 would combine a different fence
 queue and wait model with the new command reader without vendor evidence.
+The VX900 Part II manual, internal pages 74 and 83, makes the exclusion
+architectural: enabling command switch disables traditional wait/fence and
+traditional branch.  It also defines traditional interrupt-wait as CR pausing
+until software clears `0204.bit5`, corroborating the 5.75 capability comment
+and the lost-IRQ deadlock risk even though FE3x itself is omitted from the open
+manual.
 
 The four dwords, on a 16-byte boundary, are:
 
@@ -143,6 +149,11 @@ MMIO 0200 bit31  global graphics-interrupt gate
 MMIO 0204 bit5   command-reader interrupt status, write one to clear
 MMIO 0494        VX900 current/fallback fence-ID readback
 ```
+
+VX900 Part II, internal pages 10--11, independently documents `0200.bit31` as
+the global interrupt enable and `0204.bit5` as RW1C CR interrupt status.  This
+is primary hardware documentation for the gate/ack pair; the Windows ISR is
+the executable ordering evidence.
 
 Windows' progress routine at `0x00076ad0` confirms that `0494` and the memory
 record are alternative primary paths.  With adapter `+9bc.bit11` set it reads
