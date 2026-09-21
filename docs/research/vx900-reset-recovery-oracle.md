@@ -668,9 +668,10 @@ touching transient PTEs.  Holding `submit_lock` while contending on
 
 ## Current `engine_quiesce` and recoverable-timeout audit
 
-The audit was refreshed against committed Chrome9 kernel
-`b6b6a1921d4421f02c13a22188b244c890e1b4d1`.  The sysfs quiesce entry first
-unplugs DRM, requires zero open files, and calls `chrome9_engine_fini()`.
+The original audit used Chrome9 kernel
+`b6b6a1921d4421f02c13a22188b244c890e1b4d1`; the patch-ready refresh and exact
+current-source hashes appear below.  The sysfs quiesce entry first unplugs DRM,
+requires zero open files, and calls `chrome9_engine_fini()`.
 Engine teardown holds `submit_lock`, stops admission, then refuses every
 already wedged/quarantined engine or live scanout mapping before touching its
 GART/ring allocation.  That refusal is correct for reachability but means the
@@ -783,32 +784,154 @@ mutate CR ownership without a proven boundary.  If it does not naturally
 reach PAUSE under the late deadline, only the separately validated destructive
 reset state machine or reboot can make its ring storage releasable.
 
-Before attempting destructive reset, add a bounded late-retirement recovery.
-It can recover work which completed just after the ordinary 100-ms deadline:
+Before attempting destructive reset, add the bounded non-destructive tranche
+below.  This audit was refreshed against the current source snapshot whose
+`chrome9_engine.c` SHA-256 is
+`294eb659db2a25b909dca8d1de51603355fd3df03133e6f97eba9f97f8af54a5` and
+whose `chrome9_drv.c` SHA-256 is
+`aa9f64d7858581624544dbb7ab489f2d1777acdfef9d41c4ac4d60a04f14ddc4`.
 
-1. Require the already unplugged, zero-open, no-KMS state; take
-   `submit_lock`, leave `stopping=true` and `ready=false`, and do not accept a
-   new ioctl.  A timed-out job's `job->slot`, not `engine->active_slot`, names
-   the published ring: `active_slot` is updated only after successful
-   retirement.  Store each published PAUSE as well for diagnostics/rebuild.
-2. For each published quarantine job, require its exact `DST_POS` cookie,
-   `0444.bit31`, and `0400 & 00101fe3 == 0` under one new deadline.  Merely
-   sampling `043c` remains insufficient.  A non-published VM-only quarantine
-   skips the hardware-retirement test but still requires a successful GTI
-   invalidation before release.
-3. Perform the normal device-to-CPU DMA/cache transition and guard checks,
-   preserving the fence's existing timeout error even if late data are valid.
-   Under `vm_lock`, retry invalidating the complete retained PTE range with
-   `chrome9_gart_set(..., NULL, page_count)`.  Only a successful SR6F
-   post-wait permits removing its `drm_mm_node` and clearing `sf_bound`.
-4. Splice recovered jobs to a private release list.  Drop both driver locks
-   before unmapping, dropping GEM references, or dropping initial fence
-   references.  Already signaled error fences are not signaled again.  Drop
-   the quarantine device/module hold only after the protected list is empty.
+### Current state is almost sufficient, but `published` is ambiguous
 
-This is a genuine no-reboot recovery for a late completion or GTI retry; it is
-not permission to reclassify a persistent 3D busy bit.  If the cookie, PAUSE,
-non-CR idle, or GTI post-wait still fails, retain the quarantine.
+`struct chrome9_job` now retains all one-to-four GEM roles, vmaps, cached
+shmem SGT pointers, the complete PTE image and page counts, its `drm_mm_node`,
+cookie, segment/ring PAUSE and STOP, and `retirement_proven`.  That last bit is
+set only after `chrome9_wait_job()` has observed, in order, this job's cookie,
+`0444.bit31`, and no `0400 & 00101fe3` work.  It therefore exactly identifies
+a post-retirement GTI-invalidation quarantine.  The normal timeout path leaves
+it clear.
+
+Two details prevent a recovery helper from safely inferring the remaining
+class from existing booleans:
+
+* `published=true` normally means `chrome9_append_segment()` published this
+  job's A64/A65 tuple.  But when wrap first publishes PID10 STOP for the *old*
+  ring and that STOP times out, both submitters manually set the new job's
+  `published=true`, even though its body was never copied/installed.  Its
+  `ring_pause` is not an owned late-retirement target.  Treating every
+  `published && !retirement_proven` job as late work would be unsafe.
+* A GTI failure can occur before command publication.  The BOs have already
+  received `dma_sync_sgtable_for_device()`, the reservation fence is attached,
+  and the transient PTEs remain reachable, but no command references them.
+  This is translation-only recovery and still needs a device-to-CPU ownership
+  transition before vunmap/release.  It is not a command timeout.
+
+Add an explicit, immutable quarantine reason at the four call-site classes,
+rather than deriving it later:
+
+```text
+CHROME9_QUAR_GTI_UNPUBLISHED  out_prepublication invalidation failed
+CHROME9_QUAR_GTI_RETIRED      retirement_proven, final invalidation failed
+CHROME9_QUAR_JOB_TIMEOUT      append succeeded, chrome9_wait_job timed out
+CHROME9_QUAR_RING_STOP        wrap PID10 STOP was published but timed out
+```
+
+Also record `publish_epoch=engine->ring_epoch` only after the new job tuple is
+actually published.  Do not set it in `CHROME9_QUAR_RING_STOP`.  A reason enum
+is preferable to testing whether the fence is signaled: signaling describes
+userspace completion, not hardware ownership, and is too indirect to be a
+memory-lifetime invariant.
+
+### Smallest safe recovery transaction
+
+Keep the first implementation behind the existing irreversible
+`engine_quiesce=1` flow: DRM is unplugged, `open_count` is zero, admission is
+permanently closed with `stopping=true, ready=false`, and any live or
+quarantined scanout mapping makes recovery return `-EBUSY`.  This deliberately
+recovers resources for clean teardown; it does not resume userspace submission
+and therefore needs no reset-generation ABI yet.
+
+Recover only `GTI_UNPUBLISHED`, `GTI_RETIRED`, and `JOB_TIMEOUT`.  A
+`RING_STOP` job remains reboot/destructive-reset-only in this tranche.  In
+particular, do not mistake the later disappearance of one busy bit for proof
+that the partially replaced ring can be stopped a second time.
+
+The transaction is:
+
+1. Under `submit_lock`, freeze the engine and take a temporary fence reference
+   for the sole quarantined job.  A first wedge prevents subsequent submits,
+   so more than one job is an invariant failure and must return `-EUCLEAN`.
+   Drop `submit_lock` before reservation locking.
+2. Lock every retained, distinct GEM reservation with `drm_exec`, in the same
+   role order used by structured submit.  Do **not** call
+   `dma_resv_wait_timeout()`: the attached fence is precisely the unsignaled
+   fence being recovered.  Reacquire `submit_lock` and revalidate list
+   membership, reason, `stopping`, and the fence identity before MMIO.
+3. For `JOB_TIMEOUT`, additionally require
+   `publish_epoch == engine->ring_epoch`,
+   `ring_pause == engine->active_pause`, and
+   `ring_stop == engine->active_stop`.  Then repeat the existing ordered,
+   bounded retirement proof: exact `DST_POS == job->cookie`, followed by
+   `0444.bit31`, followed by `!(0400 & 0x00101fe3)`.  Never accept `043c`, a
+   cookie alone, full-idle `00101ff3`, or a PAUSE without the cookie.  On
+   success set `retirement_proven=true`; on any miss, leave every resource and
+   fence unchanged.
+4. If CPU ownership was not already restored, run
+   `dma_sync_sgtable_for_cpu(..., DMA_BIDIRECTIONAL)` for every present role,
+   flush/invalidate each entire mapped GEM size, and `dma_rmb()`.  Record a
+   per-job `cpu_owned` bit at the existing successful transition so the
+   retired-GTI case is not transitioned twice.  Preserve exact logical guard
+   offsets in the job and run the same guard checks for a late job.  A failed
+   guard upgrades/logs the fence error but does not forbid PTE invalidation and
+   release: the existing normal path also releases after an intra-object guard
+   failure once DMA retirement is proved.  The fence keeps its original
+   `-ETIME`/`-EIO`; late completion is never reported as success.
+5. Still under `submit_lock`, take `vm_lock` and retry exactly
+   `chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT, NULL,
+   job->page_count)`.  Only its successful SR6F prewait, invalid-PTE writes,
+   posted read, barrier, flush request and postwait authorize
+   `sf_bound=false`, `drm_mm_remove_node()`, and `node_allocated=false`.
+   A failed retry changes no software ownership and returns `-EBUSY`.
+6. Remove the job from the quarantine list, but keep the temporary fence
+   reference.  Drop `vm_lock` and `submit_lock`.  While `drm_exec` still owns
+   every reservation, call `drm_gem_shmem_vunmap_locked()` for each mapped
+   role.  The SGT pointers came from `drm_gem_shmem_get_pages_sgt()` and are
+   object-cached; do not `sg_free_table()` or invent a separate SGT put.  Finish
+   `drm_exec`, signal an unsignaled error fence exactly once, clear the job's
+   object pointers, put each retained GEM lookup reference, and finally drop
+   the original and temporary fence references in an order that keeps the job
+   alive throughout cleanup.
+7. Recheck `0444.bit31 && !(0400 & 00101fe3)` after the last release.  If the
+   quarantine and scanout lists are empty, clear `wedged` only to let
+   `chrome9_engine_fini()` execute its existing PID10 STOP, ring invalidation,
+   saved-GART restore and teardown.  Leave `stopping=true` and `ready=false`.
+   Release the quarantine's extra device reference only here; retain the
+   engine's normal `module_hold` until successful engine teardown.  If STOP or
+   restore subsequently fails, the existing teardown path reacquires/retains
+   the safety hold.
+
+Factoring role iteration into three small helpers keeps this tranche bounded:
+`chrome9_job_lock_resvs()`, `chrome9_job_sync_for_cpu()`, and
+`chrome9_job_release_locked_vmaps()`.  The first patch should not implement the
+more complex “body retired but reader still active” split: that needs a second
+lightweight ring-quarantine object after BO release and gains nothing for the
+owned-PAUSE late-retirement case.
+
+This is a genuine no-reboot release for a job which completed just after the
+ordinary deadline and for a late SR6F/GTI flush.  It is not permission to
+reclassify a persistent 3D bit, a `60000000` active command cycle, the
+wrap-time PID10 STOP class, or any job whose cookie/epoch/PAUSE/work/GTI proof
+fails.
+
+### Minimum no-wedge validation
+
+Add counters for reason, attempted recovery, late-retired, GTI-retried,
+released, and refused.  Validate without injecting a real GPU hang:
+
+1. A fault injection immediately before final GTI invalidation creates
+   `GTI_RETIRED`; allow SR6F to clear, quiesce, and require one released job,
+   an error fence, invalid PTE readback, an empty SF node, and successful normal
+   teardown/GART restore.
+2. Inject the same one-shot invalidation failure before publication and prove
+   the CPU ownership transition occurs before vunmap.
+3. Shorten only the software retirement deadline so a known-good oracle lands
+   in `JOB_TIMEOUT`; recovery must accept only the exact cookie/epoch/owned
+   PAUSE/non-CR-idle tuple, preserve `-ETIME`, and then pass normal teardown.
+4. Corrupt each discriminator in turn (cookie, epoch, active PAUSE, work mask,
+   SR6F postwait) and require no PTE/node/vmap/GEM/fence/list mutation.
+5. Force wrap-time PID10 STOP timeout and require unconditional refusal even
+   though `published` is set.  This is the regression test for the current
+   boolean ambiguity.
 
 For a later lab-only destructive recovery, the reusable pieces already in the
 tree are the exact H6 2D initializer, the H5S2VP1 3D replay,
