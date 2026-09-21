@@ -28,8 +28,9 @@ number; design notes must link here rather than independently claiming the
 | `0e` | reserved | `DRAW_TEXTURED_TRIANGLE_MIP` |
 | `0f` | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
 | `10` | reserved | `DRAW_CLIP_TRIANGLE` |
+| `11` | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
 
-The next unreserved command is `0x11`.  A reservation is not an advertised
+The next unreserved command is `0x12`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -66,10 +67,18 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 22 | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
 | 23 | reserved | `DEPTH_READ_ONLY` |
 | 24 | reserved | `DRAW_CLIP_TRIANGLE` |
+| 25 | reserved | `TWO_TEXTURE_PRIMARY_MODULATE` |
+| 26 | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
 
-The next unreserved capability bit is 25.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 27.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
+
+The command ordinal and capability-bit namespaces are not numerically paired.
+In particular, the native list successor is private command `0x11` but
+capability bit 26.  Bit 25 belongs to the two-texture primary-color semantic
+extension documented by commit `a8589b4`; that extension reuses existing
+two-texture commands and therefore consumes no ioctl ordinal.
 
 The merged boundary in this table is kernel Chrome9 commit
 `f39a90d6a16b16066dfbd53ee1674f9336d12069` and kernel UAPI commit
