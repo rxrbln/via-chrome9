@@ -175,6 +175,11 @@ targets.
   kill-before-depth suppression oracle.
 - [chrome9-texkill-depth-combo-corpus.tsv](chrome9-texkill-depth-combo-corpus.tsv)
   preserves both output token orders, side-effect metadata, and controls.
+- [chrome9-ps30-dcl-negative-boundary.md](chrome9-ps30-dcl-negative-boundary.md)
+  records the rejected PS 3.0 input-declaration candidates while preserving a
+  byte-matched undeclared-v0 framing control.
+- [chrome9-ps30-dcl-negative-boundary.tsv](chrome9-ps30-dcl-negative-boundary.tsv)
+  retains the exact tokens, exit boundaries, and strict interpolation policy.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
