@@ -850,6 +850,43 @@ is less error-prone than a `cpu_owned` default because it represents the only
 state which requires recovery work and cleanly covers both unpublished GTI
 subcases.
 
+### Preserve the GTI failure stage
+
+The current `chrome9_gart_set()` collapses several failures into one errno,
+although their hardware side effects differ.  Preserve an output stage for
+diagnostics and fault injection:
+
+```text
+GTI_VGA_LOCK          vga_get failed; no sequencer or PTE write
+GTI_PREWAIT           old SR6F.bit7 did not clear; no PTE write
+GTI_PTES_WRITTEN      complete PTE range + posted read + wmb performed
+GTI_FLUSH_PREWAIT     table changed, but a new bit-7 request was not issued
+GTI_FLUSH_POSTWAIT    bit 7 was issued but did not self-clear by the deadline
+GTI_COMPLETE          new request self-cleared
+```
+
+The source currently performs an outer prewait, writes the full table, then
+calls `chrome9_gart_flush()`, which contains another prewait followed by the
+request/postwait.  A small refactor or an `issued` output from the latter is
+needed to distinguish its two failure points.  Do not infer the phase from a
+late sample of bit 7: it may have cleared after timeout.
+
+All failed stages use the same conservative lifetime rule: keep `sf_bound`,
+the node and every object.  Retrying a complete invalidation is idempotent and
+safe after command retirement even if the first attempt already wrote invalid
+PTEs or its flush completed late.  On the recovery-only path, read back **each**
+retained PTE and require `80000000` after the rewrite, then execute `wmb()`,
+request a new bit-7 flush, and require its self-clear.  Table readback proves
+the backing contents; only the new self-clear proves cached translations were
+discarded.  A prewait which succeeds because an old request finally completed
+does not eliminate the need for this new request.
+
+Reject `count==0` before the existing `first + count - 1` posted-read address;
+all current job/scanout callers are nonzero, but a recovery primitive should
+make that precondition explicit.  Keep `sf_bound=true` before initial bind as
+the current code does: a bind that timed out after PTE writes may already be
+visible even though software never published a command.
+
 ### Engine busy versus a lost interrupt
 
 There is no render-completion IRQ in the current submit path.  Jobs end with a
