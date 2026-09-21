@@ -75,6 +75,22 @@ value deliberately differs from native destination file value two. The kernel
 owns that translation, just as it owns all source packing, release bits,
 controls, and packet lengths.
 
+Mesa's existing internal enums are intentionally compiler-oriented and do
+not have the same numbers as the stable UAPI. Submission must translate them
+field by field, never `memcpy` an internal instruction:
+
+| Mesa internal | value | v2 UAPI | value |
+|---|---:|---|---:|
+| source TEMP | 0 | source TEMP | 2 |
+| source INPUT | 1 | source VARYING | 0 |
+| source CONSTANT | 2 | source CONSTANT | 1 |
+| destination TEMP | 0 | destination TEMP | 0 |
+| destination COLOR | 2 | destination COLOR | 1 |
+
+The differing values are useful defense in depth: accidentally copying the
+compiler object should fail validation or change meaning visibly rather than
+becoming an undocumented raw-program ABI.
+
 ## Fail-closed validation
 
 Validation should happen before BO lookup, vertex copying, or ring mutation:
@@ -89,7 +105,9 @@ Validation should happen before BO lookup, vertex copying, or ring mutation:
 7. Earlier records must each define a previously undefined temporary. Reject
    read-before-definition, WAW, dead definitions, and any temporary not used.
    Do not require numerical definition order: the recursive Mesa lowering can
-   validly define r1 before r0 for a three-level left-deep expression.
+   validly define r1 before r0 for a three-level left-deep expression. After
+   validation, require the set of defined physical ids to be dense: one temp
+   must be `{r0}`, and two temps must be `{r0,r1}`. Reject a lone r1.
 8. Count all reads first, then assign release bits on the last read in a
    second pass. For the present A/C operand set, if both slots make the last
    read of the same temporary, set A only. This is the vendor A-over-C rule.
@@ -107,6 +125,37 @@ encoding must use the same physical-slot mapping: MOV source zero is A; MUL
 source zero is A and source one is C. A future SUB or MAD admission cannot
 reuse logical-source ordering blindly because those operations have different
 physical slots.
+
+The UAPI temp index is a bounded allocated physical slot, not a NIR SSA id or
+a D3D token register number. Proprietary Linux configuration two maps a shader
+that mentions only logical D3D r1 to physical r0, while the research Windows
+identity-callback harness preserves id one before production allocation. This
+proves logical ids cannot be copied directly. Mesa may serialize only the
+post-allocation ids in `native_fs_ir`; alternatively a future kernel compiler
+could allocate from a genuinely logical graph, but the two models must never
+be mixed.
+
+## Mesa submission gate
+
+The draw path may select this request only when all of the following hold:
+
+- `native_fs_from_nir` is true and semantic IR count equals native ALU count
+  in 1..3;
+- native TAU count and sampler mask are zero;
+- varying mask has no bit except v0, constant mask has no bit except c0, and
+  `constant_x_one_mask` is zero;
+- every semantic instruction passes the exact opcode/source/destination rules
+  above after explicit enum translation;
+- its post-allocation temp-id set is canonical and dense even if definition
+  order is reverse numerical order;
+- runtime c0 satisfies the kernel's `abs(c0)<=1` bound; and
+- the selected vertex path supplies normalized primary color v0 and no
+  unrepresented varying.
+
+If any check fails, do not truncate to the first record or silently fall back
+to command 19. Keep the draw on an independently correct path or reject it.
+The native words cached in `shader->native_fs` remain an offline comparison
+oracle; the v2 ioctl carries `shader->native_fs_ir` semantics only.
 
 ## Exact controls and packet growth
 
@@ -242,8 +291,8 @@ timeout quarantine:
 6. A `c0*c0; square; square` negative ioctl with any lane just above 1.0
    checks that finite-but-unsafe constants fail before publication.
 7. Other negative ioctls cover count 0/4, early COLOR, final TEMP,
-   undefined/dead temps, WAW, nonidentity swizzle, nonzero modifier/reserved,
-   NaN/Inf c0, and a nonzero unused c0.
+   undefined/dead temps, lone-r1 allocation, WAW, nonidentity swizzle,
+   nonzero modifier/reserved, NaN/Inf c0, and a nonzero unused c0.
 
 Each positive oracle must verify exact pixels, untouched outside pixels,
 color/depth guards, cookie retirement, 0400/040c idle state, and a clean
