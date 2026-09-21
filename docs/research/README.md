@@ -90,6 +90,11 @@ targets.
   successors.
 - [chrome9-scalar-result-scale-corpus.tsv](chrome9-scalar-result-scale-corpus.tsv)
   retains the 56 byte-matched scalar scale/SAT cases as 28 paired rows.
+- [chrome9-nrm-pow-expansion-audit.md](chrome9-nrm-pow-expansion-audit.md)
+  closes terminal POW/NRM expansion counts, byte streams, and production
+  dependency deltas while keeping both outside the one-record runtime.
+- [chrome9-nrm-pow-expansion-corpus.tsv](chrome9-nrm-pow-expansion-corpus.tsv)
+  preserves the exact Windows and Linux terminal streams and control tuples.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
