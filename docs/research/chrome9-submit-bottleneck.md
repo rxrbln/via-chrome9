@@ -29,6 +29,13 @@ untextured primitives through `chrome9_emit_triangle()`.  They flush at the
 34-triangle ABI limit or at the end of each draw-module primitive call.
 Textured triangles still use one synchronous ioctl per triangle.
 
+The exact state-, packet-, and lifetime-complete design for retaining
+one-/two-texture triangles is now in
+[textured-triangle-run-list-design.md](textured-triangle-run-list-design.md).
+Its one-page maxima are 24 and 18 triangles per packet respectively; an
+eight-segment resource run carries at most 192 or 144 triangles under one
+mapping and fence.
+
 The perspective D16 successor follows the same aggregation path.  When depth
 is active and `DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH` is present,
 `chrome9_emit_triangle()` copies post-viewport X/Y/Z, the original RHW word,

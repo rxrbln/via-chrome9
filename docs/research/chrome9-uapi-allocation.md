@@ -31,8 +31,10 @@ number; design notes must link here rather than independently claiming the
 | `11` | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
 | `12` | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
 | `13` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
+| `14` | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
+| `15` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
 
-The next unreserved command is `0x14`.  A reservation is not an advertised
+The next unreserved command is `0x16`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -74,8 +76,10 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 27 | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
 | 28 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
 | 29 | merged | `BLEND_EXTENDED_FACTORS` |
+| 30 | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
+| 31 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
 
-The next unreserved capability bit is 30.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 32.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -88,3 +92,9 @@ two-texture commands and therefore consumes no ioctl ordinal.
 The merged boundary in this table is kernel Chrome9 commit
 `f56ac02` and kernel UAPI commit `940be59`.  The reservations describe
 reviewed designs, not code present in those commits.
+
+Commands `0x14` and `0x15` and capability bits 30 and 31 are the bounded
+one-/two-texture list/run successors specified in
+[textured-triangle-run-list-design.md](textured-triangle-run-list-design.md).
+They retain existing structured shader/state envelopes and do not expose raw
+command streams.
