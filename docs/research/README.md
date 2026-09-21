@@ -171,6 +171,10 @@ targets.
   defines the flag-compatible no-depth/D16 three-factor ABI, exact full-RGBA
   and primary-alpha-bypass programs, TEXLD/TEXLDP Q boundaries, packet maps,
   Mesa keys, format semantics, and staged four-object silicon tests.
+- [ioquake-fog-dlight-successors.md](ioquake-fog-dlight-successors.md)
+  closes ioquake GL1 fog and dynamic-light image formats, fragment keys,
+  blend/depth words and identity-Q proof, and specifies the minimal
+  capability-gated EQUAL/read-only successor with guarded silicon vectors.
 - [textured-d16-format-contract.md](textured-d16-format-contract.md) gives the
   exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
   X-versus-alpha sampler semantics, and strict render-target reinterpretation

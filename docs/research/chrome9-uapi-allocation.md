@@ -78,8 +78,9 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 29 | merged | `BLEND_EXTENDED_FACTORS` |
 | 30 | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
 | 31 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
+| 32 | reserved | `DEPTH_FUNC_EQUAL` |
 
-The next unreserved capability bit is 32.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 33.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -98,3 +99,8 @@ one-/two-texture list/run successors specified in
 [textured-triangle-run-list-design.md](textured-triangle-run-list-design.md).
 They retain existing structured shader/state envelopes and do not expose raw
 command streams.
+
+Capability bit 32 adds no command or request field. It says the existing
+depth-function field accepts explicit EQUAL in addition to the baseline
+LESS/LEQUAL subset, as designed in
+[ioquake-fog-dlight-successors.md](ioquake-fog-dlight-successors.md).
