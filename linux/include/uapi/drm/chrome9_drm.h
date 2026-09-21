@@ -28,6 +28,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
 #define DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	0x19
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH	0x1a
+#define DRM_CHROME9_COPY_RECT	0x1b
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -88,6 +89,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH, \
 		struct drm_chrome9_draw_textured_triangle_batch)
+#define DRM_IOCTL_CHROME9_COPY_RECT \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_COPY_RECT, \
+		struct drm_chrome9_copy_rect)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -164,6 +168,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	(1ULL << 41)
 /* Up to 16 one-texture triangles share one validated state envelope. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH	(1ULL << 43)
+/* Same-format, linear 32-bpp SF rectangles can use bounded H6 GXcopy. */
+#define DRM_CHROME9_CAP_COPY_RECT	(1ULL << 44)
+/* COPY_RECT may target a strictly sized offset-zero scanout allocation. */
+#define DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION	(1ULL << 45)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -647,6 +655,35 @@ struct drm_chrome9_draw_textured_triangle_batch {
 	__u32 pad;
 	__u64 vertices_ptr;
 	__u64 reserved[3];
+};
+
+#define DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE	(1U << 0)
+#define DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED	(1U << 1)
+
+/*
+ * Copy one integer rectangle between distinct linear SF objects.  Source is
+ * guarded; destination is guarded unless DESTINATION_UNGUARDED is selected.
+ * Source and destination use the same 32-bpp bit significance; no blend,
+ * conversion, keying, scaling, tiling, clipping, or overlap is permitted.
+ */
+struct drm_chrome9_copy_rect {
+	__u32 destination_handle;
+	__u32 source_handle;
+	__u32 flags;
+	__u32 destination_x;
+	__u32 destination_y;
+	__u32 source_x;
+	__u32 source_y;
+	__u32 width;
+	__u32 height;
+	__u32 destination_width;
+	__u32 destination_height;
+	__u32 destination_pitch;
+	__u32 source_width;
+	__u32 source_height;
+	__u32 source_pitch;
+	__u32 format;
+	__u32 reserved[8];
 };
 
 /*
