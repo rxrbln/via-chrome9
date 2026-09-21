@@ -143,8 +143,10 @@ write control: with initial depth `8000`, draw red at `4000` using LESS and
 read-only state, followed by green at `8000` using EQUAL and read-only state.
 The pixel must be green and depth must remain `8000`.
 
-Only the D16 LESS/write case is **Measured** on the live VX900.  Treat the
-remaining matrix as a guarded static oracle.
+D16 LESS/write and LEQUAL/write are **Measured** on the live VX900.  The
+LEQUAL oracle passed equal at `000000ff/8000`, rejected far without changing
+that value, then passed near as `00ff0000/4000`; MMIO `040c` remained zero.
+Treat read-only and the remaining comparison rows as guarded static oracles.
 
 ## Stencil compare, masks, operations, and face state
 

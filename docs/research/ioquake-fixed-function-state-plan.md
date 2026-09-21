@@ -28,7 +28,7 @@ cross-checks are:
   byte-equivalent depth, alpha, stencil, and blend builders at
   `0x1024e6d0`, `0x1024edc0`, `0x1024fa10`, and `0x10251220`.
 
-The current live kernel has proved D16 LESS/write, alpha-test
+The current live kernel has proved D16 LESS/write and LEQUAL/write, alpha-test
 ALWAYS/NEVER/LESS including suppression of D16 writes, clamped ADD blending
 with ZERO/ONE/SRC_ALPHA/INV_SRC_ALPHA, independent RGB/alpha source-over,
 COPY and ONE/ONE ADD, BGRA storage, and A-only color masking.  The wider
@@ -196,10 +196,12 @@ test+write:  01c0154c              # bits 3 and 2
 ```
 
 The API effective write is `depth_test_enable && depth_write_enable`.  Never
-set A01 bit 2 while bit 3 is clear.  LESS/write is live.  LEQUAL is accepted
-by the current capability-gated ABI but, like read-only and the remaining
-functions, still needs the isolated compare oracle before being called
-measured here.
+set A01 bit 2 while bit 3 is clear.  LESS/write is live.  LEQUAL/write is also
+live: equal `000000ff/8000` passed, far retained that value, near produced
+`00ff0000/4000`, and MMIO `040c` remained zero on kernel
+`8a16b931bacdaa292d81ea30c8c99b7a369b2cad` with Mesa
+`b607b9ca59588dad3787d860e84bcacbceeba6fb`.  Read-only and the remaining
+functions still need their isolated compare oracles.
 
 The complete compare oracle CPU-fills D16 with `8000` and tests incoming
 `4000/8000/c000`.  Expected passing sets are none, `4000`, `8000`,

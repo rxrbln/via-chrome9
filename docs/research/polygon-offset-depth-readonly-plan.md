@@ -1,9 +1,10 @@
 # Chrome9 HD D16 read-only and polygon-offset contract
 
 This note defines the next bounded depth-state extension after the proven D16
-and D16-RHW paths.  It is a static implementation plan, not a claim that the
-new states have run on hardware.  The existing LESS/LEQUAL, write-enabled ABI
-and packets must remain unchanged until each oracle below passes.
+and D16-RHW paths.  Read-only and polygon offset remain a static
+implementation plan, not a claim that those new states have run on hardware.
+The existing LESS/LEQUAL write-enabled ABI and packets must remain unchanged
+until each new-state oracle below passes.
 
 The most important result is that depth read-only and polygon offset are
 orthogonal:
@@ -238,6 +239,15 @@ three non-overlapping triangles at normalized 16.16 Z `4000`, `8000`, and
 After every draw, all depth samples must still be `8000`.  EQUAL and NOTEQUAL
 are useful operand-order checks; NEVER and ALWAYS expose accidental function
 aliasing.
+
+The write-enabled LEQUAL subset is **Measured** on live VX900.  With depth
+cleared to `8000`, the Gallium oracle observed equal blue as
+`000000ff/8000`, retained it for the farther draw as `000000ff/8000`, and
+accepted near red as `00ff0000/4000`.  Kernel commit
+`8a16b931bacdaa292d81ea30c8c99b7a369b2cad` and Mesa Chrome9 commit
+`b607b9ca59588dad3787d860e84bcacbceeba6fb` completed with engine-error MMIO
+`040c=0`.  This proves native A13 `13030000` and its existing write path; it
+does not prove the A01 read-only delta or any other compare row.
 
 ### 2. Independent read/write discriminator
 

@@ -2,9 +2,9 @@
 
 Status: packet fields are cross-checked against the VX900 manual, the
 proprietary Linux builder, both Windows UMDs, and the old UniChrome Mesa
-policy.  Only the D16 LESS/write path has been measured on VX900 unless a
-linked live note says otherwise.  The other combinations below are bounded
-implementation oracles, not yet advertised capabilities.
+policy.  D16 LESS/write and LEQUAL/write have been measured on VX900; the
+other combinations below are bounded implementation oracles, not yet
+advertised capabilities.
 
 This note narrows the state which a structured draw ABI should expose.  The
 kernel must receive logical, validated fields and synthesize all native words;
@@ -241,7 +241,7 @@ inert only while the enable is definitely clear.
 
 ## Bounded promotion order
 
-1. Extend the existing D16 oracle with LEQUAL `13030000`, then the complete
+1. Retain the measured LEQUAL `13030000` regression, then run the complete
    compare matrix, resetting color and depth before every row.
 2. Prove read-only depth with LESS/read-only followed by EQUAL/read-only and
    verify the depth BO remains byte-identical.

@@ -1013,3 +1013,20 @@ Mesa nested commit `19972d4` completed the full smoke suite, including the
 30x18 by 22x14 two-unit MODULATE oracle, and MMIO `040c` remained zero.  This
 closes the two-unit POT-validation gap for level zero, not the remaining mip
 and full-capability gates.
+
+## D16 LEQUAL compare gate
+
+The capability-gated Gallium D16 LEQUAL oracle passed on live VX900 with
+kernel Chrome9 commit
+`8a16b931bacdaa292d81ea30c8c99b7a369b2cad` and Mesa Chrome9 commit
+`b607b9ca59588dad3787d860e84bcacbceeba6fb`:
+
+```text
+Gallium D16 LEQUAL passed: equal=000000ff/8000 far=000000ff/8000 near=00ff0000/4000
+```
+
+Equal depth passed and wrote blue, the farther draw failed without changing
+color or depth, and the nearer draw passed and wrote red plus `4000` depth.
+Engine-error MMIO `040c` remained zero.  This closes write-enabled A13
+`13030000`; depth read-only and the other six compare functions remain
+unmeasured.
