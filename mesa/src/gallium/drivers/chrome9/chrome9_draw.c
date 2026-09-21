@@ -379,7 +379,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_sampler_state *samplers[2],
                              unsigned texture_count, bool *depth_active,
                              struct drm_chrome9_blend_state *blend,
-                             bool *blend_successor)
+                             bool *blend_successor, const char **reason)
 {
    const struct pipe_surface *surface;
    struct pipe_resource *resource;
@@ -388,12 +388,14 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    memset(textures, 0, 2 * sizeof(*textures));
    memset(samplers, 0, 2 * sizeof(*samplers));
    *depth_active = false;
+   *reason = "context/target";
    if (!ctx->vs || !ctx->fs || !ctx->fs->supported ||
        !(*target = chrome9_context_render_target(ctx)))
       return false;
    resource = &(*target)->base;
    surface = ctx->framebuffer.nr_cbufs == 1 ?
              &ctx->framebuffer.cbufs[0] : NULL;
+   *reason = "color-surface";
    if (!surface || !surface->texture || surface->format != resource->format ||
        surface->level || surface->first_layer || surface->last_layer ||
        (resource->target != PIPE_TEXTURE_2D &&
@@ -405,9 +407,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        !(*target)->guarded || !(*target)->bo.handle)
       return false;
 
+   *reason = "blend-state";
    if (!chrome9_translate_blend(ctx->blend, blend, blend_successor))
       return false;
    if (ctx->dsa && ctx->dsa->alpha_enabled) {
+      *reason = "alpha-test";
       if (!ctx->alpha_test_supported ||
           ctx->dsa->alpha_func > PIPE_FUNC_ALWAYS)
          return false;
@@ -418,6 +422,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    }
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       *blend_successor = true;
+   *reason = "stencil/depth-bounds";
    if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
                     ctx->dsa->stencil[1].enabled ||
                     ctx->dsa->depth_bounds_test))
@@ -425,6 +430,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    if (ctx->dsa && ctx->dsa->depth_enabled) {
       const struct pipe_surface *surface = &ctx->framebuffer.zsbuf;
 
+      *reason = "depth-state";
       *depth = chrome9_context_depth_target(ctx);
       if (!ctx->draw_triangle_d16 || !ctx->dsa->depth_writemask ||
           ctx->dsa->depth_func != PIPE_FUNC_LESS || !*depth ||
@@ -439,16 +445,19 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          return false;
       *depth_active = true;
    }
+   *reason = "two-texture-successor";
    if (texture_count == 2 &&
        (!ctx->draw_two_textured_triangle || *depth_active ||
         *blend_successor))
       return false;
+   *reason = "successor-capability";
    if (*blend_successor &&
        (*depth_active ? !ctx->draw_triangle_d16_blend :
         !(texture_count ? ctx->draw_textured_triangle_blend :
                      ctx->draw_triangle_blend)))
       return false;
    if (texture_count) {
+      *reason = "texture-count/depth";
       if (!(texture_count == 2 ? ctx->draw_two_textured_triangle :
                                  ctx->draw_textured_triangle) ||
           *depth_active ||
@@ -460,9 +469,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          struct pipe_resource *source = view ? view->texture : NULL;
 
          samplers[unit] = ctx->sampler_states[unit];
+         *reason = "sampler-state";
          if (!samplers[unit] || !samplers[unit]->supported || !source)
             return false;
          textures[unit] = chrome9_resource(source);
+         *reason = "texture-resource";
          if (source == resource ||
              textures[unit]->bo.handle == (*target)->bo.handle ||
              source->target != PIPE_TEXTURE_2D ||
@@ -476,19 +487,23 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              textures[unit]->data_size <
                 (uint64_t)textures[unit]->stride * source->height0)
             return false;
+         *reason = "rgbx-source-format";
          if (!unit && ctx->fs->fragment_program == CHROME9_FS_TEXTURE_RGBX &&
              source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
             return false;
       }
+      *reason = "texture-alias";
       if (texture_count == 2 &&
           textures[0]->bo.handle == textures[1]->bo.handle)
          return false;
    }
+   *reason = "scissor";
    if (ctx->rasterizer && ctx->rasterizer->scissor &&
        (!ctx->scissor_supported || !ctx->scissor_valid ||
         ctx->scissor.minx > ctx->scissor.maxx ||
         ctx->scissor.miny > ctx->scissor.maxy))
       return false;
+   *reason = NULL;
    return true;
 }
 
@@ -525,8 +540,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                       unsigned ia, unsigned ib, unsigned ic)
 {
    struct chrome9_context *ctx = crender->ctx;
-   struct chrome9_resource *target;
-   struct chrome9_resource *depth;
+   struct chrome9_resource *target = NULL;
+   struct chrome9_resource *depth = NULL;
    struct chrome9_resource *textures[2];
    struct chrome9_sampler_state *samplers[2];
    struct drm_chrome9_draw_triangle args = { 0 };
@@ -541,8 +556,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    const unsigned indices[3] = { ia, ib, ic };
    int32_t x[3], y[3];
    uint32_t constant_color = 0;
-   bool blend_successor;
-   bool depth_active;
+   const char *state_reason = "vertex-layout";
+   bool blend_successor = false;
+   bool depth_active = false;
 
    if (!crender->textured && ctx->draw_triangle_batch &&
        crender->batch_failed) {
@@ -552,11 +568,32 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    if (!crender->layout_valid ||
        !chrome9_draw_state_supported(ctx, &target, &depth, textures, samplers,
                                      crender->texture_count, &depth_active,
-                                     &blend_state, &blend_successor)) {
+                                     &blend_state, &blend_successor,
+                                     &state_reason)) {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
-         fprintf(stderr, "chrome9: triangle rejected by the bounded "
-                         "color/D16 draw state\n");
+         const struct pipe_depth_stencil_alpha_state *dsa = ctx->dsa;
+
+         fprintf(stderr,
+                 "chrome9: triangle rejected by bounded draw state: "
+                 "reason=%s fs=%u layout=%u tex=%u views=%u samplers=%u "
+                 "target=%u depth=%u dsa=%u/%u/%u stencil=%u/%u "
+                 "blend_successor=%u caps=d16:%u d16b:%u tex:%u texb:%u\n",
+                 state_reason ? state_reason : "unknown",
+                 ctx->fs ? ctx->fs->fragment_program : 0,
+                 crender->layout_valid, crender->texture_count,
+                 ctx->num_sampler_views, ctx->num_sampler_states,
+                 target ? target->base.format : 0,
+                 depth ? depth->base.format : 0,
+                 dsa ? dsa->depth_enabled : 0,
+                 dsa ? dsa->depth_writemask : 0,
+                 dsa ? dsa->depth_func : 0,
+                 dsa ? dsa->stencil[0].enabled : 0,
+                 dsa ? dsa->stencil[1].enabled : 0,
+                 blend_successor, ctx->draw_triangle_d16,
+                 ctx->draw_triangle_d16_blend,
+                 ctx->draw_textured_triangle,
+                 ctx->draw_textured_triangle_blend);
          ctx->warnings |= CHROME9_WARN_DRAW_STATE;
       }
       return;
