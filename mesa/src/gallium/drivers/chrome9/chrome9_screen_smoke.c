@@ -879,6 +879,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    struct pipe_context *context = NULL;
    struct pipe_blend_state blend = { 0 };
    struct pipe_blend_state source_over = { 0 };
+   struct pipe_blend_state multiply = { 0 };
    struct pipe_blend_state alpha_only = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
    struct pipe_depth_stencil_alpha_state alpha_dsa;
@@ -958,6 +959,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    uint16_t sample_depth = 0;
    void *blend_handle = NULL;
    void *source_over_handle = NULL;
+   void *multiply_handle = NULL;
    void *alpha_only_handle = NULL;
    void *dsa_handle = NULL;
    void *lequal_dsa_handle = NULL;
@@ -999,6 +1001,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
           screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND))
       source_over_handle =
          context->create_blend_state(context, &source_over);
+   multiply = source_over;
+   multiply.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_DST_COLOR;
+   multiply.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_SRC_COLOR;
+   multiply.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_DST_COLOR;
+   multiply.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_SRC_COLOR;
+   if (!depth_resource &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS))
+      multiply_handle = context->create_blend_state(context, &multiply);
    if (!depth_resource &&
        resource->format == PIPE_FORMAT_B8G8R8A8_UNORM) {
       alpha_only.rt[0].colormask = PIPE_MASK_A;
@@ -1081,9 +1092,13 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    scalar_gray_fs = make_scalar_rgbx_fragment_shader(screen, context);
    if (!blend_handle ||
        (!depth_resource &&
-        chrome9_screen_has_capability(
-           screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND) &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND) &&
         !source_over_handle) ||
+       (!depth_resource &&
+        chrome9_screen_has_capability(
+           screen, DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS) &&
+        !multiply_handle) ||
        (!depth_resource &&
         resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
         !alpha_only_handle) ||
@@ -1264,6 +1279,35 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          fprintf(stderr,
                  "Gallium source-over blend mismatch: sample=%08x\n",
                  pixel);
+      if (passed && multiply_handle) {
+         unsigned alpha, red, green_channel, blue;
+
+         context->bind_blend_state(context, multiply_handle);
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &alpha_mask_base, 1.0, 0);
+         vertex_buffer.buffer.user = generic_rgba_vertices;
+         context->set_vertex_buffers(context, 1, &vertex_buffer);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush(context, NULL, 0);
+         pixel = pixels[32 * (surface->stride / 4) + 192];
+         alpha = pixel >> 24;
+         red = pixel >> 16 & 0xff;
+         green_channel = pixel >> 8 & 0xff;
+         blue = pixel & 0xff;
+         passed = abs((int)red - 0x1a) <= 1 &&
+                  abs((int)green_channel - 0x22) <= 1 &&
+                  abs((int)blue - 0x1a) <= 1 &&
+                  (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                   abs((int)alpha - 0x44) <= 1) &&
+                  smoke_guard_pages_match(draw_surface);
+         if (passed)
+            printf("Gallium DST_COLOR/SRC_COLOR blend passed: "
+                   "sample=%08x\n", pixel);
+         else
+            fprintf(stderr,
+                    "Gallium DST_COLOR/SRC_COLOR blend mismatch: "
+                    "sample=%08x\n", pixel);
+      }
       if (passed && alpha_only_handle) {
          context->bind_blend_state(context, alpha_only_handle);
          context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
@@ -1730,6 +1774,8 @@ out:
          context->delete_blend_state(context, blend_handle);
       if (source_over_handle)
          context->delete_blend_state(context, source_over_handle);
+      if (multiply_handle)
+         context->delete_blend_state(context, multiply_handle);
       if (alpha_only_handle)
          context->delete_blend_state(context, alpha_only_handle);
       context->destroy(context);

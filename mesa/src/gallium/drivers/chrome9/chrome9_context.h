@@ -104,6 +104,7 @@ struct chrome9_context {
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;
+   bool blend_extended_factors;
    bool alpha_test_supported;
    bool scissor_supported;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];

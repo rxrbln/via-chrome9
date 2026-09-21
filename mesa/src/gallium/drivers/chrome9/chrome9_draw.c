@@ -309,7 +309,7 @@ chrome9_triangle_nondegenerate(const int32_t x[3], const int32_t y[3])
 }
 
 static bool
-chrome9_blend_factor(unsigned factor, uint32_t *result)
+chrome9_blend_factor(unsigned factor, bool extended, uint32_t *result)
 {
    switch (factor) {
    case PIPE_BLENDFACTOR_ZERO:
@@ -324,6 +324,27 @@ chrome9_blend_factor(unsigned factor, uint32_t *result)
    case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
       *result = DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA;
       return true;
+   case PIPE_BLENDFACTOR_SRC_COLOR:
+      *result = DRM_CHROME9_BLEND_FACTOR_SRC_COLOR;
+      return extended;
+   case PIPE_BLENDFACTOR_INV_SRC_COLOR:
+      *result = DRM_CHROME9_BLEND_FACTOR_INV_SRC_COLOR;
+      return extended;
+   case PIPE_BLENDFACTOR_DST_ALPHA:
+      *result = DRM_CHROME9_BLEND_FACTOR_DST_ALPHA;
+      return extended;
+   case PIPE_BLENDFACTOR_INV_DST_ALPHA:
+      *result = DRM_CHROME9_BLEND_FACTOR_INV_DST_ALPHA;
+      return extended;
+   case PIPE_BLENDFACTOR_DST_COLOR:
+      *result = DRM_CHROME9_BLEND_FACTOR_DST_COLOR;
+      return extended;
+   case PIPE_BLENDFACTOR_INV_DST_COLOR:
+      *result = DRM_CHROME9_BLEND_FACTOR_INV_DST_COLOR;
+      return extended;
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+      *result = DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+      return extended;
    default:
       return false;
    }
@@ -332,7 +353,7 @@ chrome9_blend_factor(unsigned factor, uint32_t *result)
 static bool
 chrome9_translate_blend(const struct pipe_blend_state *state,
                         struct drm_chrome9_blend_state *result,
-                        bool *successor)
+                        bool extended, bool *successor)
 {
    const struct pipe_rt_blend_state *rt;
 
@@ -369,13 +390,13 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
    if (!rt->blend_enable)
       return true;
    if (rt->rgb_func != PIPE_BLEND_ADD || rt->alpha_func != PIPE_BLEND_ADD ||
-       !chrome9_blend_factor(rt->rgb_src_factor,
+       !chrome9_blend_factor(rt->rgb_src_factor, extended,
                              &result->rgb_src_factor) ||
-       !chrome9_blend_factor(rt->rgb_dst_factor,
+       !chrome9_blend_factor(rt->rgb_dst_factor, extended,
                              &result->rgb_dst_factor) ||
-       !chrome9_blend_factor(rt->alpha_src_factor,
+       !chrome9_blend_factor(rt->alpha_src_factor, extended,
                              &result->alpha_src_factor) ||
-       !chrome9_blend_factor(rt->alpha_dst_factor,
+       !chrome9_blend_factor(rt->alpha_dst_factor, extended,
                              &result->alpha_dst_factor))
       return false;
    result->flags = DRM_CHROME9_BLEND_ENABLE;
@@ -437,7 +458,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
       return false;
 
    *reason = "blend-state";
-   if (!chrome9_translate_blend(ctx->blend, blend, blend_successor))
+   if (!chrome9_translate_blend(ctx->blend, blend,
+                                ctx->blend_extended_factors,
+                                blend_successor))
       return false;
    if (ctx->dsa && ctx->dsa->alpha_enabled) {
       *reason = "alpha-test";

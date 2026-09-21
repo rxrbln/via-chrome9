@@ -1953,6 +1953,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND);
    ctx->blend_bgra8888 =
       !!(capabilities & DRM_CHROME9_CAP_BLEND_BGRA8888);
+   ctx->blend_extended_factors =
+      !!(capabilities & DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS);
    ctx->alpha_test_supported =
       !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =
