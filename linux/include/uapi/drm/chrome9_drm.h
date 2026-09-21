@@ -26,6 +26,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN	0x0f
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND	0x12
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
+#define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_RUN	0x14
 #define DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	0x19
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH	0x1a
 #define DRM_CHROME9_COPY_RECT	0x1b
@@ -82,6 +83,9 @@ extern "C" {
 	DRM_IOW(DRM_COMMAND_BASE + \
 		DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND, \
 		struct drm_chrome9_draw_two_textured_triangle_d16_blend)
+#define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_RUN \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_RUN, \
+		struct drm_chrome9_draw_textured_triangle_run)
 #define DRM_IOCTL_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH \
 	DRM_IOW(DRM_COMMAND_BASE + \
 		DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH, \
@@ -154,6 +158,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	(1ULL << 28)
 /* Blend state accepts the proven source/destination color/alpha factors. */
 #define DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS	(1ULL << 29)
+/* Up to 24 one-texture triangles share one state-complete command list. */
+#define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_RUN	(1ULL << 30)
 /* D16 draw flags additionally accept the live-proven EQUAL comparison. */
 #define DRM_CHROME9_CAP_DEPTH_EQUAL	(1ULL << 32)
 /* Both discontinuous banks provide 32 live-proven PS float vec4 constants. */
@@ -611,6 +617,9 @@ struct drm_chrome9_draw_triangle_d16_blend {
 #define DRM_CHROME9_TRIANGLE_BATCH_BLEND	(1U << 1)
 #define DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES	34U
 #define DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES	16U
+#define DRM_CHROME9_TEXTURE_RUN_DEPTH	(1U << 0)
+#define DRM_CHROME9_TEXTURE_RUN_BLEND	(1U << 1)
+#define DRM_CHROME9_TEXTURE_RUN_MAX_TRIANGLES	24U
 
 /*
  * Submit a triangle list under one state envelope.  vertices_ptr addresses
@@ -664,6 +673,30 @@ struct drm_chrome9_draw_textured_triangle_batch {
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_scissor_state scissor;
 	__u32 pad;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
+};
+
+/*
+ * State-complete one-texture list successor.  vertices_ptr addresses
+ * triangle_count * 3 drm_chrome9_textured_vertex records.  DEPTH and BLEND
+ * select their closed state envelopes; all native packet words remain
+ * kernel-generated.
+ */
+struct drm_chrome9_draw_textured_triangle_run {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 program;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	struct drm_chrome9_texture_state texture;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
 	__u64 vertices_ptr;
 	__u64 reserved[3];
 };
