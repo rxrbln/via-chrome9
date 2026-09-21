@@ -272,8 +272,9 @@ the complete job and reachable mapping for reboot exactly as today.
 
 ## Exact static layout verifier
 
-Add a host-side verifier before the kernel implementation is deployed.  Its
-model must reproduce, in order:
+[`../../tools/chrome9_run_layout.py`](../../tools/chrome9_run_layout.py) is the
+host-side verifier to run before the kernel implementation is deployed.  Its
+model reproduces, in order:
 
 1. initial H0 sync and body alignment at `0x20`;
 2. `174 + 18*T` worst-case body;
@@ -294,6 +295,10 @@ Required golden rows are:
 | 128 | 2478 | `0x26d8` | `0x2748` | `0x2770` | `0x27f0` | `0x2a10` |
 | 272 | 5070 | `0x4f58` | `0x4fc8` | `0x4ff0` | `0x5070` | `0x5290` |
 | 273, reject in handler | 5088 | `0x4fa0` | `0x5008` | `0x5070` | `0x50f0` | `0x5310` |
+
+Running the script asserts all rows, the 34/35 one-page boundary, the
+policy-limited-but-physically-fitting 273 row, no-blend T=272 closure, and the
+3/2/2 maximum-run packing of the 64-KiB ring for D16/one-texture/two-texture.
 
 The 35-row deliberately proves why the old page path cannot merely raise its
 maximum: copied end `0x1010` exceeds 4 KiB.  The 273-row still fits 32 KiB,
