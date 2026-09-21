@@ -159,16 +159,21 @@ Arming one flip:
 
 1. Retire the render dependency; pin and bind the complete new SF scanout BO.
    Keep the current BO pinned and mapped.
-2. Refuse a second flip while one is pending.  Refuse to overwrite `0214` if
-   `0204[1]` still reports a previous update pending.
+2. Refuse a second flip while one is pending.  The generic 7.2 atomic helper
+   normally prevents this by keeping the preceding commit's `flip_done`
+   incomplete until its retained event is sent: nonblocking successors return
+   `-EBUSY` and blocking successors wait in the dependency path.  The runtime
+   refusal is a fail-closed invariant check.  Also refuse to overwrite `0214`
+   if `0204[1]` still reports a previous update pending.
 3. Take a DRM vblank reference.  Under the IRQ/state lock, acknowledge any
    already-pending bit-3 edge, record the current vblank sequence, and publish
    the pending `{old_fb,new_fb,expected_base,event}` ownership before the MMIO
    write.  This prevents the ISR from missing ownership if an edge races the
    write.
-4. Ensure T11 A12 is disarmed, clear CR32 bit 0, write the packed `0214` value,
-   and read it back to flush the posted write.  There must be exactly one
-   direct-base writer.
+4. Ensure T11 A12 is disarmed and CR32 bit 0 was cleared during the full,
+   blanked IGA1 enable, write the packed `0214` value, and read it back to
+   flush the posted write.  There must be exactly one direct-base writer; do
+   not perform indexed-VGA I/O in the ordinary flip callback.
 
 ISR:
 

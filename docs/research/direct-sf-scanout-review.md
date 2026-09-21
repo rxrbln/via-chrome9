@@ -204,14 +204,21 @@ flip.  It never takes `submit_lock`, the VGA lock, or `vm_lock`.
 The simple-pipe helper has no atomic-flush callback and does not consume a
 driver's page-flip event automatically.  A Chrome9 direct flip therefore needs
 an explicit pending-flip state and must detach `crtc_state->event` in
-`pipe_update`; `drm_atomic_helper_fake_vblank()` must never see that event.
+`pipe_update`; `drm_atomic_helper_fake_vblank()` must never see that event and
+`drm_atomic_helper_commit_hw_done()` must not find it still attached.
 
-Use a commit-time atomic reservation, not only a runtime check in
-`pipe_update`.  Two nonblocking atomic requests can both pass `atomic_check`
-before the first worker programs hardware.  A small wrapper around
-`drm_atomic_helper_commit()` should atomically reserve the one flip slot before
-the generic prepare/swap path and release it on any synchronous failure.  The
-slot remains reserved until IRQ/deferred completion or confirmed CRTC disable.
+The 7.2 atomic helper already supplies the required one-flip sequencing when
+the driver retains that event until the hardware latch proof.  Every active
+commit gets an event in `drm_atomic_helper_setup_commit()`, including an
+internal completion-only event when userspace did not request one.  State swap
+inserts its `drm_crtc_commit` in the CRTC commit list before another caller can
+swap.  A second nonblocking commit sees incomplete `flip_done` in
+`stall_checks()` and returns `-EBUSY`; a blocking commit reaches
+`drm_atomic_helper_wait_for_dependencies()` and waits for the previous event.
+Therefore no custom `atomic_commit` wrapper or separate pre-swap reservation
+is needed.  Keep a defensive runtime `pending != NULL` rejection, because
+reaching it would reveal a helper/lifetime bug rather than authorize a second
+hardware update.
 
 One pending record owns:
 
@@ -225,10 +232,19 @@ one vblank reference
 bounded post-arm IRQ count
 ```
 
+Before enabling flips, add CR32 to the saved/restored CRTC register set and
+clear CR32 bit 0 while IGA1 is still blank in the full enable path.  The
+current static driver neither saves nor writes CR32.  Part I and both vendor
+paths require bit 0 clear for by-frame base changes.  Do this once under the
+existing VGA lock; ordinary `pipe_update` must not perform indexed-VGA I/O.
+The quiescent-only `chrome9_vga_snapshot` now includes CR32 so the pre-change
+and programmed values can be captured without guessing.
+
 After the incoming render fence wait, `pipe_update` device-syncs the new
 mapping, takes its independent display reference, and under `submit_lock`
-disarms T11, clears CR32 bit 0, rejects `0204.bit1` already pending, and
-publishes the pending record before writing packed `0214`.  It preserves
+disarms T11, verifies that CR32 was configured for by-frame updates, rejects
+`0204.bit1` already pending, and publishes the pending record before writing
+packed `0214`.  It preserves
 `0214[31:29]` and inserts `(new_base >> 1) & 1fffffff`, then readbacks `0214`
 only as a posting/address check.
 
@@ -236,8 +252,9 @@ The hard IRQ completes only on a newly handled post-arm bit-3 edge with
 `0204.bit1 == 0` and matching `0214` low 29 bits.  It sends the event under
 the DRM event lock and queues sleepable work.  Deferred work transfers
 `active_fb` to the new framebuffer, drops the old display pin/reference and
-the flip vblank reference, then releases the atomic flip slot.  Generic
-atomic cleanup may drop prepared-state references earlier; independent
+the flip vblank reference, then clears the pending record.  Delivery of the
+retained event completes the helper's `flip_done` and admits the next commit.
+Generic atomic cleanup may drop prepared-state references earlier; independent
 display references keep both PTE images alive through the hardware latch.
 
 A first-edge miss keeps both mappings and tries a bounded later real vblank.
