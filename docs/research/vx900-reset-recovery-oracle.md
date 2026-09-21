@@ -883,6 +883,19 @@ the backing contents; only the new self-clear proves cached translations were
 discarded.  A prewait which succeeds because an old request finally completed
 does not eliminate the need for this new request.
 
+Before the retry, verify that hardware still names the driver's table.  Under
+the same VGA-arbitration and `vm_lock` protection require
+`engine->gart_programmed`, `engine->mm_initialized`,
+`SR6A == (engine_gart_offset >> 12) & ff`,
+`SR6B == (engine_gart_offset >> 20) & ff`,
+`SR6C.bit0 == (engine_gart_offset >> 28) & 1`, and `SR7B[3:0] == 4`.
+`SR6C.bit7` is write protection and may be toggled only around the table write;
+do not compare it as an address bit.  A mismatch means a flush of the BAR2
+range at `engine->gart` would not prove that the GPU stopped using the job's
+translations, so refuse non-destructive release and retain the quarantine.
+Also verify that the persistent ring's first 16 PTEs still encode
+`engine->ring_dma + i*PAGE_SIZE` before clearing `wedged` for teardown.
+
 Reject `count==0` before the existing `first + count - 1` posted-read address;
 all current job/scanout callers are nonzero, but a recovery primitive should
 make that precondition explicit.  Keep `sf_bound=true` before initial bind as
