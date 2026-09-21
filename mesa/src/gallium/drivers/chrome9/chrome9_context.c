@@ -1129,18 +1129,43 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                             struct pipe_resource *texture,
                             const struct pipe_sampler_view *templ)
 {
+   struct chrome9_context *ctx = chrome9_context(pipe);
    struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
+   bool supported = view && texture && texture->target == PIPE_TEXTURE_2D &&
+                    templ->target == PIPE_TEXTURE_2D &&
+                    templ->format == texture->format &&
+                    (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+                     templ->format == PIPE_FORMAT_B8G8R8A8_UNORM) &&
+                    !templ->u.tex.first_level &&
+                    !templ->u.tex.last_level &&
+                    !templ->u.tex.first_layer &&
+                    !templ->u.tex.last_layer &&
+                    templ->swizzle_r == PIPE_SWIZZLE_X &&
+                    templ->swizzle_g == PIPE_SWIZZLE_Y &&
+                    templ->swizzle_b == PIPE_SWIZZLE_Z &&
+                    templ->swizzle_a == PIPE_SWIZZLE_W;
 
-   if (!view || !texture || texture->target != PIPE_TEXTURE_2D ||
-       templ->target != PIPE_TEXTURE_2D || templ->format != texture->format ||
-       (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-        templ->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
-       templ->u.tex.first_level || templ->u.tex.last_level ||
-       templ->u.tex.first_layer || templ->u.tex.last_layer ||
-       templ->swizzle_r != PIPE_SWIZZLE_X ||
-       templ->swizzle_g != PIPE_SWIZZLE_Y ||
-       templ->swizzle_b != PIPE_SWIZZLE_Z ||
-       templ->swizzle_a != PIPE_SWIZZLE_W) {
+   if (!supported) {
+      if (!(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_CREATE)) {
+         fprintf(stderr,
+                 "chrome9: sampler view rejected: alloc=%u texture=%p "
+                 "resource_target=%u resource_format=%u size=%ux%u "
+                 "last=%u bind=%#x view_target=%u view_format=%u "
+                 "levels=%u..%u layers=%u..%u swizzle=%u/%u/%u/%u\n",
+                 view != NULL, (void *)texture,
+                 texture ? texture->target : 0,
+                 texture ? texture->format : 0,
+                 texture ? texture->width0 : 0,
+                 texture ? texture->height0 : 0,
+                 texture ? texture->last_level : 0,
+                 texture ? texture->bind : 0,
+                 templ->target, templ->format,
+                 templ->u.tex.first_level, templ->u.tex.last_level,
+                 templ->u.tex.first_layer, templ->u.tex.last_layer,
+                 templ->swizzle_r, templ->swizzle_g,
+                 templ->swizzle_b, templ->swizzle_a);
+         ctx->warnings |= CHROME9_WARN_SAMPLER_VIEW_CREATE;
+      }
       FREE(view);
       return NULL;
    }
@@ -1168,6 +1193,7 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
                           struct pipe_sampler_view **views)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
+   bool report = count && !(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_BIND);
    unsigned end;
 
    if (shader != MESA_SHADER_FRAGMENT || start >= PIPE_MAX_SHADER_SAMPLER_VIEWS)
@@ -1183,6 +1209,22 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
    for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
       if (ctx->sampler_views[i])
          ctx->num_sampler_views = i + 1;
+   if (report) {
+      struct pipe_sampler_view *view = views ? views[0] : NULL;
+      struct pipe_resource *texture = view ? view->texture : NULL;
+
+      fprintf(stderr,
+              "chrome9: sampler views set: shader=%u start=%u count=%u "
+              "unbind=%u first_view=%p texture=%p target=%u format=%u "
+              "levels=%u..%u resulting=%u\n",
+              shader, start, count, unbind_trailing, (void *)view,
+              (void *)texture, texture ? texture->target : 0,
+              texture ? texture->format : 0,
+              view ? view->u.tex.first_level : 0,
+              view ? view->u.tex.last_level : 0,
+              ctx->num_sampler_views);
+      ctx->warnings |= CHROME9_WARN_SAMPLER_VIEW_BIND;
+   }
 }
 
 static void
@@ -1193,6 +1235,7 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
    const struct pipe_surface *surface = framebuffer->nr_cbufs == 1 ?
                                         &framebuffer->cbufs[0] : NULL;
    struct pipe_resource *color = surface ? surface->texture : NULL;
+   bool shadow_attempted = false;
 
    chrome9_flush_render_target(ctx);
    pipe_resource_reference(&ctx->render_target, NULL);
@@ -1208,11 +1251,36 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
 
          templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
          templ.flags = 0;
+         shadow_attempted = true;
          ctx->render_target = pipe->screen->resource_create(pipe->screen,
                                                              &templ);
          if (ctx->render_target)
             chrome9_copy_surface(ctx->render_target, color);
       }
+   }
+   if (color && !ctx->render_target &&
+       !(ctx->warnings & CHROME9_WARN_FRAMEBUFFER)) {
+      struct chrome9_resource *resource = chrome9_resource(color);
+
+      fprintf(stderr,
+              "chrome9: framebuffer target rejected: cbufs=%u surface=%p "
+              "surface_format=%u level=%u layers=%u..%u texture=%p "
+              "target=%u format=%u size=%ux%ux%u array=%u last=%u "
+              "samples=%u/%u bind=%#x flags=%#x guarded=%u bo=%u "
+              "stride=%u offset=%" PRIu64 " shadow_attempted=%u\n",
+              framebuffer->nr_cbufs, (void *)surface,
+              surface ? surface->format : 0,
+              surface ? surface->level : 0,
+              surface ? surface->first_layer : 0,
+              surface ? surface->last_layer : 0,
+              (void *)color, color->target, color->format,
+              color->width0, color->height0, color->depth0,
+              color->array_size, color->last_level,
+              color->nr_samples, color->nr_storage_samples,
+              color->bind, color->flags, resource->guarded,
+              resource->bo.handle, resource->stride,
+              resource->data_offset, shadow_attempted);
+      ctx->warnings |= CHROME9_WARN_FRAMEBUFFER;
    }
    draw_set_zs_format(ctx->draw, framebuffer->zsbuf.texture ?
                                 framebuffer->zsbuf.format : PIPE_FORMAT_NONE);

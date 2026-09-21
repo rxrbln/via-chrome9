@@ -13,6 +13,9 @@ enum chrome9_warning {
    CHROME9_WARN_DRAW_STATE = 1u << 1,
    CHROME9_WARN_INDIRECT = 1u << 2,
    CHROME9_WARN_CLEAR = 1u << 3,
+   CHROME9_WARN_FRAMEBUFFER = 1u << 4,
+   CHROME9_WARN_SAMPLER_VIEW_CREATE = 1u << 5,
+   CHROME9_WARN_SAMPLER_VIEW_BIND = 1u << 6,
 };
 
 struct chrome9_shader {
