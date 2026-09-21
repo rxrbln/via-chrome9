@@ -77,10 +77,14 @@ There is also a current capability bug.  `u_init_pipe_screen_caps()` defaults
 override it.  The state tracker therefore keeps fixed-function flat shading
 as rasterizer state instead of lowering it, even though the Chrome9 packet
 path neither selects FlatA/FlatC nor duplicates the provoking color.  The
-immediate fail-closed correction is `caps->flatshade = false`; this can make
-the present bounded fragment classifier reject the resulting explicit-flat
-NIR, which is preferable to silently rendering a gradient.  Re-enable the
-cap only after the D1/D2 lowering below passes.
+first correction is `caps->flatshade = false`, but that toggle is **not
+sufficient by itself**.  `nir_lower_flatshade()` replaces the COL0
+`load_interpolated_input` with `load_input`, and
+`chrome9_fs_is_primary_color()` currently accepts both intrinsics as the same
+primary leaf.  Without a classifier change the supposedly lowered program is
+still admitted and still executes Gouraud.  Until D1/D2 duplication exists,
+reject a COL0/VAR0 `load_input` which represents flat interpolation; then
+re-enable the cap only after the provoking-color oracle passes.
 
 The smallest implementation does not require a new kernel ABI.  For the
 currently admitted fixed-function fragment classes, Mesa can select the
@@ -194,8 +198,9 @@ that physical rule before accepting the other value.
 ## Capability and validator boundary
 
 Gallium does have `pipe_caps::flatshade`, and Chrome9 currently inherits the
-unsafe true default.  Set it false while draws are rejected/lowered, then set
-it true only once the provoking-color oracle passes.  The basic triangle fill
+unsafe true default.  Set it false **and distinguish/reject the lowered
+`load_input` form** until Mesa can duplicate its provoking value; then set it
+true only once the provoking-color oracle passes.  The basic triangle fill
 convention has no comparable opt-in cap.  Do not allocate a private kernel
 capability merely for software D1/D2 duplication.  Keep these fail-closed
 checks as well:

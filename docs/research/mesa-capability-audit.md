@@ -153,13 +153,15 @@ test that draw validation also rejects.  Alpha test is therefore a real
 minimum-GL semantic blocker, not a cap-toggle solution.  The same principle
 applies to unsupported blend, stencil, fog, and texture-environment modes.
 
-`flatshade=false` has the same fail-closed character.  It asks the state
-tracker to make flat interpolation explicit in NIR; the bounded classifier
-may reject that form until its provoking-color path exists.  Leaving the
-initializer's true default is worse: the state tracker keeps only rasterizer
-flatshade state, while Chrome9 emits `A23=23004f02` and can silently Gouraud
-interpolate three different vertex colors.  Exact A23 words and the software
-D1/D2 lowering boundary are in
+`flatshade=false` asks the state tracker to make flat interpolation explicit
+in NIR, but it is not fail-closed by itself.  `nir_lower_flatshade()` changes
+COL0 from `load_interpolated_input` to `load_input`, while the current Chrome9
+primary-color classifier accepts both as the same leaf.  The cap change must
+therefore be paired with rejecting/recording that flat intrinsic.  Leaving
+the initializer's true default is also wrong: the state tracker keeps only
+rasterizer flatshade state, while Chrome9 emits `A23=23004f02` and silently
+Gouraud-interpolates three different vertex colors.  Exact A23 words and the
+software D1/D2 lowering boundary are in
 [flatshade-edge-ownership-contract.md](flatshade-edge-ownership-contract.md).
 
 The exact alternative route is in `st_atom_depth.c`: with
