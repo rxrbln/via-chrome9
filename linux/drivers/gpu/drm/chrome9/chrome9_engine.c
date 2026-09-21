@@ -1193,8 +1193,12 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	      body[76 + delta] != 0x20000000 ||
 	      body[77 + delta] != 0x23004f02 ||
 	      body[78 + delta] != (0x24000000 | vertex_count) ||
-	      body[204 + delta] != 0xfe020440 ||
-	      body[206 + delta] != 0x00000000)) ||
+	      body[(request->texture_program ==
+		     DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ? 204 : 200) +
+		   delta] != 0xfe020440 ||
+	      body[(request->texture_program ==
+		     DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ? 206 : 202) +
+		   delta] != 0x00000000)) ||
 	    body[(request->texture_program ==
 		 DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ?
 		 200 + delta : 196 + delta) + depth_delta] !=
