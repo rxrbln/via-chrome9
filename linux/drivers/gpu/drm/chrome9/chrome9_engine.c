@@ -3778,6 +3778,7 @@ int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,
 		.wrap_s = args->wrap_s,
 		.wrap_t = args->wrap_t,
 		.texture_program = args->program,
+		.destination_format = args->destination_format,
 		.scissor = args->scissor,
 	};
 	u64 surface_size;
@@ -3799,6 +3800,8 @@ int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,
 	    args->texture_pitch !=
 		ALIGN(args->texture_width * sizeof(u32), 32) ||
 	    args->program > DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ||
+	    args->destination_format >
+		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
 	    args->texture_format > DRM_CHROME9_TEXTURE_FORMAT_BGRA8888 ||
 	    args->min_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
 	    args->mag_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
