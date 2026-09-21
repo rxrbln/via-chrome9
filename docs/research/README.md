@@ -198,6 +198,11 @@ targets.
   proprietary point/list/strip topology words, point-size insertion without
   packet growth, variable immediate-body bounds, current draw-expansion gap,
   and guarded coverage/diamond-rule promotion suite.
+- [msaa-aa-viewport-clip-contract.md](msaa-aa-viewport-clip-contract.md)
+  proves both Windows multisample render states are packet no-ops, separates
+  edge AA from sample storage, recovers the H6 smooth-line special cycle,
+  closes post-viewport validators and native C-to-screen coupling, and keeps
+  user clip planes fail-closed behind shader/software lowering.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
