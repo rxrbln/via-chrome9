@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/iopoll.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -31,6 +32,11 @@
 #define CHROME9_FIXED_PITCH		4096U
 #define CHROME9_FIXED_SIZE		(CHROME9_FIXED_PITCH * \
 					 CHROME9_FIXED_HEIGHT)
+
+static bool chrome9_direct_flips;
+module_param_named(direct_flips, chrome9_direct_flips, bool, 0400);
+MODULE_PARM_DESC(direct_flips,
+		 "Enable experimental direct IGA1 SF page flips");
 
 static const struct drm_display_mode chrome9_fixed_mode = {
 	.clock = 65000,
@@ -480,6 +486,18 @@ static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
 		return -EINVAL;
 	if (crtc_state->async_flip)
 		return -EINVAL;
+	/*
+	 * A live VX900 probe accepted the new 0214 address but left 0204[1]
+	 * asserted indefinitely.  Keep ordinary modesets and direct scanout,
+	 * but make Xorg fall back to its native Present copy until a real
+	 * vblank/latch completion path is proven.  The opt-in remains available
+	 * for bounded display-lab work with both mappings retained on failure.
+	 */
+	if (crtc_state->enable && !cdev->kms_state->staging_scanout &&
+	    !chrome9_direct_flips && old_plane_state &&
+	    old_plane_state->fb != plane_state->fb &&
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return -EOPNOTSUPP;
 	if (crtc_state->enable && READ_ONCE(cdev->kms_state->flip_blocked) &&
 	    old_plane_state && old_plane_state->fb != plane_state->fb &&
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
@@ -960,10 +978,15 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 		return ret;
 
 	drm_mode_config_reset(drm);
-	if (fixed_iga1)
-		dev_warn(&cdev->pdev->dev,
-			 "lab-only fixed IGA1 driving armed with %s scanout; direct flips poll the latch, no vblank IRQ support\n",
-			 staging_scanout ? "BAR2 staging" : "direct SF");
+	if (fixed_iga1) {
+		if (!staging_scanout && chrome9_direct_flips)
+			dev_warn(&cdev->pdev->dev,
+				 "lab-only fixed IGA1 driving armed with direct SF scanout and experimental polled flips; no vblank IRQ support\n");
+		else
+			dev_warn(&cdev->pdev->dev,
+				 "lab-only fixed IGA1 driving armed with %s scanout; direct flips disabled\n",
+				 staging_scanout ? "BAR2 staging" : "direct SF");
+	}
 	return 0;
 }
 
