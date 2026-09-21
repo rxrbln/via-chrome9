@@ -186,9 +186,10 @@ ALU        0140b6d0 30202053 00f20005 0000007f
            01c00000 301c0000 00f20105 000d083f
 ```
 
-If unit 1 is BGRA and its stored alpha is not provably one, only the recovered
-primary-alpha-bypass four-ALU object is exact. Do not silently use the full
-RGBA object in that case.
+If unit 1 is BGRA and its stored alpha is not provably one, reject this key or
+use the recovered four-ALU **texture-0-alpha-times-primary** object.  The
+older primary-alpha-only bypass object is not exact when unit 0 contributes
+stored alpha. Do not silently use the full-RGBA object in either case.
 
 The key new Mesa layout is **one packed vec4 fragment input**, not two linked
 coordinate inputs. Record the linked input and require exactly:

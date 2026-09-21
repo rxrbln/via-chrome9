@@ -162,6 +162,11 @@ targets.
   fixes the state-complete command-16 TEX0*c0 packet map, exact constant and
   format semantics, depth/blend/alpha collision rules, validator/lifetime
   contract, and guarded native-c0 silicon sequence.
+- [ioquake3-gl2-linked-texturecolor-lightall.md](ioquake3-gl2-linked-texturecolor-lightall.md)
+  records the exact six reduced-lightall linked NIR hashes and common DAG,
+  closes texturecolor constant-offset edge cases, specifies the packed
+  XY/ZW post-TNL split and no-projector rule, and gives bounded native packet
+  gates and live oracle vectors.
 - [ioquake3-gl2-fogpass-native-design.md](ioquake3-gl2-fogpass-native-design.md)
   closes ioquake3 GL2 fogpass as a five-ALU semantic program with exact
   float-varying linkage, packet indices, D16/source-over state and guarded
