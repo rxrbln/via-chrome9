@@ -29,6 +29,8 @@ bool chrome9_draw_triangle_d16_blend(
    int fd, const struct drm_chrome9_draw_triangle_d16_blend *draw);
 bool chrome9_draw_triangle_batch(
    int fd, const struct drm_chrome9_draw_triangle_batch *draw);
+bool chrome9_draw_triangle_d16_rhw_batch(
+   int fd, const struct drm_chrome9_draw_triangle_d16_rhw_batch *draw);
 bool chrome9_draw_textured_triangle(
    int fd, const struct drm_chrome9_draw_textured_triangle *draw);
 bool chrome9_draw_textured_triangle_d16(

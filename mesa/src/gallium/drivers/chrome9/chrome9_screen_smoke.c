@@ -701,6 +701,11 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       { {  1, -1, 0, 1 }, { 0.25, 0, 0, 0 } },
       { {  1,  1, 0, 1 }, { 0.25, 0, 0, 0 } },
    };
+   static const struct smoke_vertex scalar_perspective_vertices[] = {
+      { { -1, -1, 0, 1 }, { 0, 0, 0, 0 } },
+      { {  4, -4, 0, 4 }, { 1, 0, 0, 0 } },
+      { {  4,  4, 0, 4 }, { 1, 0, 0, 0 } },
+   };
    static const struct smoke_vertex generic_rgba_vertices[] = {
       { { -1, -1, 0, 1 }, { 0.25, 0.5, 0.75, 0.5 } },
       { { -1,  1, 0, 1 }, { 0.25, 0.5, 0.75, 0.5 } },
@@ -903,14 +908,13 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          product_fs[i] = make_constant_product_fs(screen, context, i, 16);
       unsupported_product_fs =
          make_constant_product_fs(screen, context, 0, 32);
-      scalar_gray_vs =
-         make_scalar_generic_vertex_shader(screen, context, false);
-      scalar_gray_fs = make_scalar_rgbx_fragment_shader(screen, context);
       scalar_blue_fs =
          make_scalar_blue_rgbx_fragment_shader(screen, context);
       generic_rgba_vs = make_generic_rgba_vertex_shader(screen, context);
       generic_rgba_fs = make_generic_rgba_fragment_shader(screen, context);
    }
+   scalar_gray_vs = make_scalar_generic_vertex_shader(screen, context, false);
+   scalar_gray_fs = make_scalar_rgbx_fragment_shader(screen, context);
    if (!blend_handle ||
        (!depth_resource &&
         chrome9_screen_has_capability(
@@ -930,7 +934,10 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
        !rasterizer_handle ||
        (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST) &&
         !alpha_dsa_handle) ||
-       !elements_handle || !vs || !fs ||
+       !elements_handle || !vs || !fs || !scalar_gray_vs ||
+       !scalar_gray_fs ||
+       ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=
+          CHROME9_FS_PRIMARY_SCALAR_RGBX ||
        (!depth_resource &&
         (!solid_buffer || !solid_elements_handle || !solid_vs || !solid_fs ||
          !((struct chrome9_shader *)solid_fs)->supported ||
@@ -945,9 +952,6 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
             CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE ||
          !unsupported_product_fs ||
          ((struct chrome9_shader *)unsupported_product_fs)->supported ||
-         !scalar_gray_vs || !scalar_gray_fs ||
-         ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=
-            CHROME9_FS_PRIMARY_SCALAR_RGBX ||
          !scalar_blue_fs ||
          ((struct chrome9_shader *)scalar_blue_fs)->fragment_program !=
             CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX ||
@@ -1398,6 +1402,70 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                     chrome9_context(context)->submitted_triangles - submitted,
                     chrome9_context(context)->rejected_triangles - rejected);
       }
+   }
+   if (passed && depth_resource &&
+       chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH)) {
+      const struct pipe_viewport_state perspective_viewport = {
+         .scale = { 32.0f, 32.0f, 0.5f },
+         .translate = { 31.5f, 31.5f, 0.5f },
+      };
+      const struct pipe_draw_info perspective_info = {
+         .mode = MESA_PRIM_TRIANGLES,
+         .index_bounds_valid = true,
+         .instance_count = 1,
+         .min_index = 0,
+         .max_index = 2,
+      };
+      const struct pipe_draw_start_count_bias perspective_draw = {
+         .start = 0,
+         .count = 3,
+      };
+      struct chrome9_resource *depth = chrome9_resource(depth_resource);
+      uint16_t *depth_pixels = (uint16_t *)
+         ((uint8_t *)depth->bo.map + depth->data_offset);
+      uint64_t submitted = chrome9_context(context)->submitted_triangles;
+      uint64_t rejected = chrome9_context(context)->rejected_triangles;
+      uint32_t pixel;
+      unsigned red;
+
+      context->bind_blend_state(context, blend_handle);
+      context->bind_depth_stencil_alpha_state(context, dsa_handle);
+      context->bind_vertex_elements_state(context, elements_handle);
+      context->bind_vs_state(context, scalar_gray_vs);
+      context->bind_fs_state(context, scalar_gray_fs);
+      vertex_buffer.buffer.user = scalar_perspective_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->set_viewport_states(context, 0, 1, &perspective_viewport);
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 1.0, 0);
+      context->draw_vbo(context, &perspective_info, 0, NULL,
+                        &perspective_draw, 1);
+      context->flush_resource(context, resource);
+      context->flush(context, NULL, 0);
+      context->set_viewport_states(context, 0, 1, &viewport);
+      pixel = pixels[16 * (surface->stride / 4) + 48];
+      red = pixel >> 16 & 0xff;
+      passed = red >= 0x6f && red <= 0x74 &&
+               (pixel & 0xff) == red && (pixel >> 8 & 0xff) == red &&
+               depth_pixels[16 * (depth->stride / 2) + 48] >= 0x7ffe &&
+               depth_pixels[16 * (depth->stride / 2) + 48] <= 0x8001 &&
+               chrome9_context(context)->submitted_triangles ==
+                  submitted + 1 &&
+               chrome9_context(context)->rejected_triangles == rejected &&
+               smoke_guard_pages_match(draw_surface) &&
+               smoke_guard_pages_match(depth);
+      if (passed)
+         printf("Gallium untextured D16 varying-RHW passed: sample=%08x\n",
+                pixel);
+      else
+         fprintf(stderr,
+                 "Gallium untextured D16 varying-RHW mismatch: "
+                 "sample=%08x expected=006f6f6f..00747474 "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                 pixel,
+                 chrome9_context(context)->submitted_triangles - submitted,
+                 chrome9_context(context)->rejected_triangles - rejected);
    }
    if (!passed)
       fprintf(stderr,
