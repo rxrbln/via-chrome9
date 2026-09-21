@@ -240,6 +240,17 @@ and performs byte, word, and dword loads.  Therefore it is bits per pixel:
 | D16, 16 bpp | `38000080` | `3.0518044e-5` |
 | D24S8/D24X8/D32, 32 bpp | `34000001` | `1.1920930e-7` |
 
+The current Mesa 26.2 Chrome9 backend already passes rasterizer state through
+the draw module.  Its offset stage applies filled-triangle bias to window Z
+before the driver quantizes vertices, and for Z16 its
+`offset_units * MRD * 2` multiplier rounds to exactly `38000080`.  This is a
+bounded decal correctness path now; native A16--A18 is a later exactness and
+fast-path improvement.  Depth read-only is still the immediate blocker for a
+normal decal pass.  Do not enable both paths: a native-bias draw must give draw
+an offset-disabled rasterizer copy or factor and units are applied twice.  The
+exact ownership and all-D16 state-closure rules are in
+[polygon-offset-depth-readonly-plan.md](polygon-offset-depth-readonly-plan.md).
+
 Fill, line, and point offset enables are independent proprietary context
 fields.  The ABI must preserve all three rather than expose one global bit.
 For a first hardware discriminator, `offset=-0.25`, `scale=0` is exactly:
@@ -492,10 +503,13 @@ The ordering below ranks safety first and ioquake usefulness second.
    operand order.  Expand legacy closure to all A38--A3F before enabling it.
    Native packet length is unchanged because the successor already emits all
    eight words.
-4. **Polygon-offset successor.**  Add fill/line/point enable bits and validated
-   IEEE scale plus post-format offset.  Close A16--A1B and A1E--A20, costing
-   exactly eight body dwords.  Initially permit D16 fill only; line/point and
-   D24 wait for their respective raster/Z oracles.
+4. **Native polygon-offset successor.**  Keep draw's existing software offset
+   until this path is live-proved.  Add fill/line/point enable bits and
+   validated IEEE scale plus post-format offset.  Close A16--A1B and
+   A1E--A20 in every D16 family, costing exactly eight body dwords, because a
+   biased context otherwise leaks into legacy D16 draws.  Initially permit
+   D16 fill only; line/point and D24 wait for their respective raster/Z
+   oracles.
 5. **D24S8/stencil state-complete successor.**  Add a D24S8 BO binding plus
    normalized physical-CW/CCW compare/op/mask/ref blocks.  Kernel translates
    enums and writes A23--A26; userspace cannot supply words.  This costs four
