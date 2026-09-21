@@ -2,21 +2,20 @@
 
 The initialized `MOV r0,c0; TEXKILL r0` sequence can coexist in the compiler
 object with full oC0 and oDepth outputs.  Both compiler families set TEXKILL
-and depth-output metadata simultaneously and produce the same record set, but
-their output scheduler policy differs: Windows always places depth before
-color, while Linux preserves the requested color/depth token order.  The
-program remains rejected until silicon proves that killed fragments suppress
-both color and shader depth.
+and depth-output metadata simultaneously and produce the same ordered record
+set after the one Linux dependency rewrite.  Both preserve the requested
+color/depth token order.  The program remains rejected until silicon proves
+that killed fragments suppress both color and shader depth.
 
 ## Exact schedule
 
-For token order color then depth, Windows emits:
+For token order color then depth, the Windows raw compiler stream is:
 
 ```
 01c00530 301c0053 00f08005 000d0020  # r0 = c0
 01c00530 301c0053 00f00005 000d0420  # kill address transfer
-01c00530 b01c0053 00f0816d 000d0920  # oDepth = c1.w
 01c00530 301c0053 00f04005 000d0820  # oC0 = v0
+01c00530 b01c0053 00f0816d 000d0920  # oDepth = c1.w
 TAU 214001b1
 ```
 
@@ -30,10 +29,15 @@ Linux configuration 2 preserves color then depth and adds the kill dependency:
 TAU 314001b1
 ```
 
-Reversing the two output tokens leaves the Windows stream unchanged; Linux
-reverses only its final color/depth records.  Thus Windows canonicalizes depth
-before color while Linux preserves token order.  Both variants have phase 1,
-ALU count 4, TAU count 1, both side-effect flags set, and one color output.
+Reversing the two output tokens reverses the final color/depth records in both
+compiler families.  Thus both preserve token order.  Both variants have phase
+1, ALU count 4, TAU count 1, both side-effect flags set, and one color output.
+
+The retained JSON's separately decoded Windows `alu_final` side array reports
+depth-before-color for the first variant even though its `alu_raw` array is
+color-before-depth and `object.changed_dwords` is empty.  Because the object
+comparison proves that finalization changed no dword, this inconsistent side
+array is a probe extraction artifact and is excluded from the byte contract.
 
 Windows uses controls:
 
@@ -71,8 +75,8 @@ depth write leaves the original sentinel because green fails depth.  Read back
 both color and D16, repeat negative X/Y/Z/W separately, and guard surrounding
 pixels.
 
-Run the Linux color-then-depth and depth-then-color streams as separate
-experiments; equality would establish schedule-order tolerance, not permission
-to mix Windows predependency words.  Until kill-vs-depth timing, A13/TEXKILL
+Run the color-then-depth and depth-then-color streams as separate experiments;
+equality would establish schedule-order tolerance, not permission to mix
+Windows predependency words.  Until kill-vs-depth timing, A13/TEXKILL
 enable and clear transitions, reset restoration, and both orderings are
 proven, reject every combined discard plus fragment-depth NIR shape.
