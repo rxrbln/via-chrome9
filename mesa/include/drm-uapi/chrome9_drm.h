@@ -18,6 +18,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE_BLEND	0x06
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND	0x07
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_BLEND	0x08
+#define DRM_CHROME9_DRAW_TRIANGLE_BATCH	0x09
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -46,6 +47,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_BLEND \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16_BLEND, \
 		struct drm_chrome9_draw_triangle_d16_blend)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_BATCH \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_BATCH, \
+		struct drm_chrome9_draw_triangle_batch)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -82,6 +86,7 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_SCISSOR	(1ULL << 11)
 /* D16 LESS/write can be combined with blend, masks, and alpha test. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND	(1ULL << 12)
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH	(1ULL << 13)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -336,6 +341,28 @@ struct drm_chrome9_draw_triangle_d16_blend {
 	__u32 destination_format;
 	struct drm_chrome9_scissor_state scissor;
 	__u32 reserved[2];
+};
+
+#define DRM_CHROME9_TRIANGLE_BATCH_DEPTH	(1U << 0)
+#define DRM_CHROME9_TRIANGLE_BATCH_BLEND	(1U << 1)
+#define DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES	34U
+
+struct drm_chrome9_draw_triangle_batch {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	__u32 reserved0;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 pad;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
 };
 
 #if defined(__cplusplus)
