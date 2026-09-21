@@ -39,7 +39,9 @@ Three independently compiled driver families reproduce those fields:
   cull `0x1024e890`, depth function `0x1024e6d0`, and stencil
   `0x1024fa10`.
 
-The D3D and OpenGL cull routines are byte-identical.  At
+The D3D and OpenGL cull routines are instruction-identical modulo the absolute
+address of one orientation lookup table.  Their 0x118-byte bodies differ only
+at byte offsets 112--114, the relocated table VA.  At
 `0x101fac64-0x101facbd` and `0x1024e924-0x1024e97d`, public modes
 `NONE/CW/CCW = 1/2/3` respectively clear A01 bit 7, set A01 bit 7 while
 clearing type-04 A23 bit 8, and set both bits.  At
