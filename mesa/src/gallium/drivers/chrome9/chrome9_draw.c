@@ -453,6 +453,54 @@ chrome9_triangle_nondegenerate(const int32_t x[3], const int32_t y[3])
    return dx10 * dy20 != dy10 * dx20;
 }
 
+static int32_t
+chrome9_fixed_floor(int32_t value)
+{
+   uint64_t magnitude;
+
+   if (value >= 0)
+      return value / 65536;
+   magnitude = (uint64_t)-(int64_t)value;
+   return -(int32_t)((magnitude + 65535) / 65536);
+}
+
+static int32_t
+chrome9_fixed_ceil(int32_t value)
+{
+   uint64_t magnitude;
+
+   if (value >= 0)
+      return (int32_t)(((uint32_t)value + 65535) / 65536);
+   magnitude = (uint64_t)-(int64_t)value;
+   return -(int32_t)(magnitude / 65536);
+}
+
+static void
+chrome9_damage_triangle(struct chrome9_context *ctx,
+                        const struct chrome9_resource *target,
+                        const int32_t x[3], const int32_t y[3],
+                        const struct drm_chrome9_scissor_state *scissor)
+{
+   int32_t x0 = chrome9_fixed_floor(MIN3(x[0], x[1], x[2])) - 1;
+   int32_t y0 = chrome9_fixed_floor(MIN3(y[0], y[1], y[2])) - 1;
+   int32_t x1 = chrome9_fixed_ceil(MAX3(x[0], x[1], x[2])) + 1;
+   int32_t y1 = chrome9_fixed_ceil(MAX3(y[0], y[1], y[2])) + 1;
+
+   x0 = CLAMP(x0, 0, (int32_t)target->base.width0);
+   y0 = CLAMP(y0, 0, (int32_t)target->base.height0);
+   x1 = CLAMP(x1, 0, (int32_t)target->base.width0);
+   y1 = CLAMP(y1, 0, (int32_t)target->base.height0);
+   if (scissor->flags & DRM_CHROME9_SCISSOR_ENABLE) {
+      x0 = MAX2(x0, (int32_t)scissor->min_x);
+      y0 = MAX2(y0, (int32_t)scissor->min_y);
+      x1 = MIN2(x1, (int32_t)scissor->max_x);
+      y1 = MIN2(y1, (int32_t)scissor->max_y);
+   }
+   if (x0 < x1 && y0 < y1)
+      chrome9_context_render_target_written_region(ctx, x0, y0,
+                                                   x1 - x0, y1 - y0);
+}
+
 static bool
 chrome9_blend_factor(unsigned factor, bool extended, uint32_t *result)
 {
@@ -877,7 +925,6 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
          ctx->submitted_program_batches++;
       if (crender->batch_large_run)
          ctx->submitted_rhw_runs++;
-      chrome9_context_render_target_written(ctx);
       crender->batch_failed = false;
    } else {
       ctx->rejected_triangles += count;
@@ -1584,6 +1631,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          }
       }
       crender->batch_count++;
+      chrome9_damage_triangle(ctx, target, x, y, &scissor);
       if (crender->batch_count ==
           (rhw_run_batch ? DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES :
                            DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES))
@@ -1623,7 +1671,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
 
    if (submitted) {
       ctx->submitted_triangles++;
-      chrome9_context_render_target_written(ctx);
+      chrome9_damage_triangle(ctx, target, x, y, &scissor);
    } else {
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {

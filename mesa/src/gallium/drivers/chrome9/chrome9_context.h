@@ -105,6 +105,10 @@ struct chrome9_context {
     * this guarded shadow and are copied back on flush. */
    struct pipe_resource *render_target;
    bool render_target_dirty;
+   unsigned render_target_damage_x0;
+   unsigned render_target_damage_y0;
+   unsigned render_target_damage_x1;
+   unsigned render_target_damage_y1;
    bool draw_triangle_d16;
    bool draw_triangle_d16_blend;
    bool depth_func_supported;
@@ -172,6 +176,11 @@ chrome9_context_render_target(struct chrome9_context *ctx);
 struct chrome9_resource *
 chrome9_context_depth_target(struct chrome9_context *ctx);
 void chrome9_context_render_target_written(struct chrome9_context *ctx);
+void chrome9_context_render_target_written_region(struct chrome9_context *ctx,
+                                                   unsigned x,
+                                                   unsigned y,
+                                                   unsigned width,
+                                                   unsigned height);
 
 struct pipe_context *
 chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags);
