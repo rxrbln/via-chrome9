@@ -473,6 +473,14 @@ old D16 ioctls to emit neutral state does not change their UAPI semantics, but
 it does require all old-path regression oracles and exact-length assertions to
 pass before the capability bit is exposed.
 
+The proprietary state machines reinforce this atomic closure rule.  Linux
+`STM_DepthBias_INV` loops over dirty indices `0x16..0x18` on both its active
+and zero paths (`0x195a74..0x195ac1` and `0x195b19..0x195b70`).  Windows D3D
+likewise marks all three corresponding dirty bits `0x00400000`, `0x00800000`,
+and `0x01000000` at `0x101fc00b..0x101fc053`; its OpenGL copy does so at
+`0x1024f9bb..0x1024fa03`.  None treats a single bias subword as independently
+inheritable.
+
 For the current untextured D16 bodies the exact layout becomes:
 
 ```text
