@@ -204,6 +204,14 @@ A19--A1B remain the proprietary initialization defaults shown above.  They
 reconstruct -1.0/+1.0 clamp bounds and enable enhanced Z precision; they are
 context prerequisites, not part of each bias toggle.
 
+The reconstruction is bit-exact: A19 payload `800000` plus A1B low byte `bf`
+forms low boundary `bf800000` (-1.0), while A1A payload `800000` plus A1B
+bits 15:8 `3f` forms high boundary `3f800000` (+1.0); A1B bit 23 enables the
+enhanced-precision path.  Likewise, A1E `000000` plus A20 bits 15:8 `7f`
+forms far clip `7f000000`, and A1F `000000` plus A20 bits 7:0 `ff` forms near
+clip `ff000000`.  Thus `20007fff` is a deliberately broad signed pixel-Z
+interval, not the [0,1] fixed-format clamp (that clamp is controlled by A12).
+
 The public polygon `factor` becomes `scale` without conversion.  Public
 `units` does not become `offset` directly: the Linux builder multiplies it by
 `0x38000080` when bound-resource field `+0x158` is `0x10`, and by
