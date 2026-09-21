@@ -160,6 +160,11 @@ targets.
   distinguishes silent drop from cross-driver parser desynchronization.
 - [chrome9-texldd-texldl-negative-corpus.tsv](chrome9-texldd-texldl-negative-corpus.tsv)
   retains the baseline plus four exact token, metadata, and residue rows.
+- [chrome9-depth-output-audit.md](chrome9-depth-output-audit.md) closes the
+  native depth destination and compiler metadata while retaining the required
+  context-sideband and live depth-ordering gates.
+- [chrome9-depth-output-corpus.tsv](chrome9-depth-output-corpus.tsv) preserves
+  depth-only and combined color/depth cross-driver records and order mismatch.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
