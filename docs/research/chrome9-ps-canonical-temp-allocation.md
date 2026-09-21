@@ -120,6 +120,29 @@ that finalizer: it consumes already encoded physical ids.  Dynamic OpenGL
 initialization still fails under headless Wine, so the OpenGL claim is
 static equality, not a second dynamic allocator run.
 
+The production register-table builder itself is also present in both Windows
+compiler copies, and this stronger pair is byte-for-byte identical without
+normalization:
+
+| binary | VA range | RVA / file offset | size |
+|---|---|---|---:|
+| D3D | `101da3e0..101da593` | `001da3e0` / `001d97e0` | `0x1b4` |
+| OpenGL | `10242be0..10242d93` | `00242be0` / `00241fe0` | `0x1b4` |
+
+Both extracted bodies have SHA-256
+`d74997193458bc5036a8279589e32f73404ef5fb8d97114189d884955bba6dd7`.
+At D3D `101da4b8..101da4d8` and OpenGL
+`10242cb8..10242cd8`, the builder walks logical id `edx` upward from zero,
+tests the rolling one-bit mask against instance `+0x44`, stores `edx` at
+manager `+0x1288 + physical*8`, sets the active byte at `+0x128c`, and only
+then increments the physical counter.  The following code computes the high
+logical id and dense active count from those entries.
+
+Thus all three proprietary compiler copies implement the same sorted-rank
+table construction.  The Windows identity-callback harness intentionally
+bypasses this production builder; its unremapped records are useful field
+differentials but are not evidence of a different Windows allocation policy.
+
 ## Patch-ready rule for the bounded structured compiler
 
 For the proposed at-most-three-record MOV/MUL path, the safest policy is:
