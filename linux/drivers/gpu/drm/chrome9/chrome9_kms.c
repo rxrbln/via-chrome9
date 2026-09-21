@@ -3,6 +3,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
+#include <linux/i2c-algo-bit.h>
 #include <linux/iopoll.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
@@ -21,6 +22,7 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
@@ -43,7 +45,7 @@ MODULE_PARM_DESC(direct_flips,
 /* Every indexed register written by chrome9_iga1_program(). */
 static const u8 chrome9_saved_sr[] = {
 	0x01, 0x02, 0x03, 0x04, 0x10, 0x15, 0x16, 0x17, 0x18,
-	0x1b, 0x1c, 0x1d, 0x22,
+	0x1b, 0x1c, 0x1d, 0x1e, 0x22, 0x31,
 	0x2d, 0x40, 0x44, 0x45, 0x46,
 };
 
@@ -51,7 +53,7 @@ static const u8 chrome9_saved_cr[] = {
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11,
 	0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x32, 0x33, 0x34,
-	0x35, 0x36, 0x45, 0x47, 0x48, 0x6a, 0x6c,
+	0x35, 0x36, 0x45, 0x47, 0x48, 0x6a, 0x6c, 0x91, 0x9b,
 };
 
 static const u8 chrome9_vpit_gfx[VGA_GFX_C] = {
@@ -87,6 +89,8 @@ struct chrome9_kms_state {
 	u8 cr[256];
 	u8 gfx[VGA_GFX_C];
 	u8 attr[ARRAY_SIZE(chrome9_vpit_attr)];
+	struct i2c_algo_bit_data ddc_bit;
+	struct i2c_adapter ddc;
 };
 
 static void chrome9_sr_mask(u8 index, u8 mask, u8 value)
@@ -101,6 +105,103 @@ static void chrome9_cr_mask(u8 index, u8 mask, u8 value)
 	u8 old = vga_io_rcrt(index);
 
 	vga_io_wcrt(index, (old & ~mask) | (value & mask));
+}
+
+static void chrome9_ddc_setscl(void *data, int state)
+{
+	u8 value = vga_io_rseq(0x31) & 0xf0;
+
+	(void)data;
+	if (state)
+		value |= BIT(5);
+	else
+		value &= ~BIT(5);
+	vga_io_wseq(0x31, value | BIT(0));
+}
+
+static void chrome9_ddc_setsda(void *data, int state)
+{
+	u8 value = vga_io_rseq(0x31) & 0xf0;
+
+	(void)data;
+	if (state)
+		value |= BIT(4);
+	else
+		value &= ~BIT(4);
+	vga_io_wseq(0x31, value | BIT(0));
+}
+
+static int chrome9_ddc_getscl(void *data)
+{
+	(void)data;
+	return !!(vga_io_rseq(0x31) & BIT(3));
+}
+
+static int chrome9_ddc_getsda(void *data)
+{
+	(void)data;
+	return !!(vga_io_rseq(0x31) & BIT(2));
+}
+
+static int chrome9_ddc_pre_xfer(struct i2c_adapter *adapter)
+{
+	struct chrome9_device *cdev = i2c_get_adapdata(adapter);
+	struct chrome9_kms_state *kms = cdev->kms_state;
+	int ret;
+
+	mutex_lock(&kms->lock);
+	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	if (ret) {
+		mutex_unlock(&kms->lock);
+		return ret;
+	}
+	return ret;
+}
+
+static void chrome9_ddc_post_xfer(struct i2c_adapter *adapter)
+{
+	struct chrome9_device *cdev = i2c_get_adapdata(adapter);
+
+	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	mutex_unlock(&cdev->kms_state->lock);
+}
+
+static void chrome9_ddc_release(struct drm_device *drm, void *res)
+{
+	struct chrome9_kms_state *kms = res;
+
+	(void)drm;
+	i2c_del_adapter(&kms->ddc);
+}
+
+static int chrome9_ddc_init(struct chrome9_device *cdev)
+{
+	struct chrome9_kms_state *kms = cdev->kms_state;
+	struct i2c_algo_bit_data *bit = &kms->ddc_bit;
+	struct i2c_adapter *adapter = &kms->ddc;
+	int ret;
+
+	bit->data = cdev;
+	bit->setsda = chrome9_ddc_setsda;
+	bit->setscl = chrome9_ddc_setscl;
+	bit->getsda = chrome9_ddc_getsda;
+	bit->getscl = chrome9_ddc_getscl;
+	bit->pre_xfer = chrome9_ddc_pre_xfer;
+	bit->post_xfer = chrome9_ddc_post_xfer;
+	bit->udelay = 10;
+	bit->timeout = usecs_to_jiffies(100000);
+
+	adapter->owner = THIS_MODULE;
+	adapter->algo_data = bit;
+	adapter->dev.parent = &cdev->pdev->dev;
+	snprintf(adapter->name, sizeof(adapter->name),
+		 "Chrome9 DVP1 DDC (SR31)");
+	i2c_set_adapdata(adapter, cdev);
+
+	ret = i2c_bit_add_bus(adapter);
+	if (ret)
+		return ret;
+	return drmm_add_action_or_reset(&cdev->drm, chrome9_ddc_release, kms);
 }
 
 static u8 chrome9_attr_read(u8 index)
@@ -288,7 +389,19 @@ static int chrome9_iga1_program(struct chrome9_device *cdev,
 	if (ret)
 		return ret;
 
-	/* Turn CRT on only after base, fetch, timing, and clocks are complete. */
+	/*
+	 * VX900 DVI on the HP t5550 is DVP1 fed from IGA1.  These are the
+	 * in-tree viafb source, polarity and pad-power operations, reproduced
+	 * without its global fbdev policy.  The board exposes DDC directly on
+	 * SR31 and has no responding VT1632 transmitter to program.
+	 */
+	chrome9_cr_mask(0x91, GENMASK(7, 5), BIT(7));
+	chrome9_cr_mask(0x9b, GENMASK(6, 0),
+			(mode->flags & DRM_MODE_FLAG_PHSYNC ? 0 : BIT(5)) |
+			(mode->flags & DRM_MODE_FLAG_PVSYNC ? 0 : BIT(6)));
+	chrome9_sr_mask(0x1e, GENMASK(5, 4), GENMASK(5, 4));
+
+	/* Turn outputs on only after base, fetch, timing, and clocks are complete. */
 	chrome9_cr_mask(0x36, GENMASK(5, 4), 0);
 	vga_io_wcrt(0x47, cdev->kms_state->cr[0x47]);
 	vga_io_wseq(0x10, cdev->kms_state->sr[0x10]);
@@ -410,11 +523,21 @@ chrome9_connector_detect(struct drm_connector *connector, bool force)
 static int chrome9_connector_get_modes(struct drm_connector *connector)
 {
 	struct chrome9_device *cdev = to_chrome9(connector->dev);
+	const struct drm_edid *drm_edid;
 	struct drm_display_mode *mode;
 	int count;
 
 	if (!cdev->kms_state->fixed_iga1)
 		return 0;
+	drm_edid = drm_edid_read(connector);
+	if (drm_edid) {
+		count = drm_edid_connector_update(connector, drm_edid);
+		drm_edid_free(drm_edid);
+		if (count)
+			return count;
+		return drm_edid_connector_add_modes(connector);
+	}
+	drm_edid_connector_update(connector, NULL);
 	count = drm_add_modes_noedid(connector, 2048, 2048);
 	list_for_each_entry(mode, &connector->probed_modes, head)
 		if (mode->hdisplay == CHROME9_FIXED_WIDTH &&
@@ -653,6 +776,7 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	 */
 	chrome9_cr_mask(0x45, BIT(5), BIT(5));
 	chrome9_sr_mask(0x01, BIT(5), BIT(5));
+	chrome9_sr_mask(0x1e, GENMASK(5, 4), 0);
 	chrome9_cr_mask(0x36, GENMASK(5, 4), GENMASK(5, 4));
 	chrome9_cr_mask(0x17, BIT(7), 0);
 	vga_io_rseq(0x01);
@@ -980,6 +1104,10 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
+	ret = chrome9_ddc_init(cdev);
+	if (ret)
+		return dev_err_probe(&cdev->pdev->dev, ret,
+				     "cannot register DVP1 DDC bus\n");
 	drm->mode_config.min_width = 0;
 	drm->mode_config.min_height = 0;
 	drm->mode_config.max_width = 2048;
@@ -989,9 +1117,10 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 
 	drm_connector_helper_add(&cdev->display_connector,
 				 &chrome9_connector_helper_funcs);
-	ret = drm_connector_init(drm, &cdev->display_connector,
-				 &chrome9_connector_funcs,
-				 DRM_MODE_CONNECTOR_VGA);
+	ret = drm_connector_init_with_ddc(drm, &cdev->display_connector,
+					  &chrome9_connector_funcs,
+					  DRM_MODE_CONNECTOR_DVII,
+					  &kms->ddc);
 	if (ret)
 		return ret;
 	ret = drm_simple_display_pipe_init(drm, &cdev->display_pipe,
