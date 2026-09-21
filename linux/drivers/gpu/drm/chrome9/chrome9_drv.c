@@ -2401,6 +2401,9 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			       DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH |
 			       DRM_CHROME9_CAP_COPY_RECT |
 			       DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION;
+			if (chrome9_textured_triangle_run_enabled())
+				args->value |=
+					DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_RUN;
 			if (chrome9_two_texture_signed_repeat)
 				args->value |=
 					DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS;
@@ -2470,6 +2473,9 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND,
 			  chrome9_draw_two_textured_triangle_d16_blend_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TEXTURED_TRIANGLE_RUN,
+			  chrome9_draw_textured_triangle_run_ioctl,
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
 			  chrome9_draw_program_triangle_d16_rhw_batch_ioctl,
