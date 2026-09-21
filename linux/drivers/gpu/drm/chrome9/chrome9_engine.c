@@ -120,6 +120,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BLEND,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND,
+	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16_BLEND,
@@ -175,6 +176,7 @@ struct chrome9_draw_request {
 	struct drm_chrome9_two_textured_vertex two_textured_vertices[3];
 	const struct drm_chrome9_vertex_d16 *batch_vertices;
 	const struct drm_chrome9_vertex_d16_rhw *batch_vertices_rhw;
+	const struct drm_chrome9_textured_vertex *textured_batch_vertices;
 	u32 ps_program[4];
 	u32 ps_constant_c0[4];
 	u32 triangle_count;
@@ -189,6 +191,7 @@ static_assert(sizeof(struct drm_chrome9_draw_triangle_blend) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_blend) == 216);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_blend) == 144);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_batch) == 128);
+static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_batch) == 160);
 static_assert(sizeof(struct drm_chrome9_vertex_d16_rhw) == 20);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128);
@@ -832,7 +835,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		0x00000011, 0x01002521, 0x08010101, 0x04000000,
 		0x05000000, 0x0d810000,
 	};
-	static const u32 raster_fvf[] = {
+	static const u32 raster_fvf_template[] = {
 		0x00000308, 0x010000c2, 0x020041d1, 0x030052d0,
 		0x04006342, 0x1200000f, 0x61800000, 0x623081ff,
 		0x20000000, 0x23004f02, 0x24000003, 0x25f6cc00,
@@ -895,7 +898,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		chrome9_scissor_y(request),
 		chrome9_scissor_x(request),
 	};
-	u32 vertices[3 * 8];
+	u32 raster_fvf[ARRAY_SIZE(raster_fvf_template)];
+	u32 vertices[DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES * 3 * 8];
 	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
@@ -903,6 +907,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	u32 depth_delta = 0;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
+	u32 triangle_count = request->triangle_count ?: 1;
+	u32 vertex_count = triangle_count * 3;
 	unsigned int destination_count;
 	bool blend = chrome9_draw_has_blend(request);
 	bool depth_active =
@@ -915,6 +921,12 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	unsigned int i;
 	u32 log_size = ilog2(request->texture_height) << 4 |
 		       ilog2(request->texture_width);
+
+	if (!triangle_count ||
+	    triangle_count > DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES)
+		return -E2BIG;
+	memcpy(raster_fvf, raster_fvf_template, sizeof(raster_fvf));
+	raster_fvf[10] = 0x24000000 | vertex_count;
 
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
@@ -981,8 +993,10 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		common_count = ARRAY_SIZE(common);
 		depth_delta = 4;
 	}
-	for (i = 0; i < ARRAY_SIZE(request->textured_vertices); i++) {
+	for (i = 0; i < vertex_count; i++) {
 		const struct drm_chrome9_textured_vertex *src =
+			request->textured_batch_vertices ?
+			&request->textured_batch_vertices[i] :
 			&request->textured_vertices[i];
 		u32 *dst = vertices + i * 8;
 
@@ -1040,10 +1054,11 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 				     replace_program, ARRAY_SIZE(replace_program));
 	}
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00000000,
-			     vertices, ARRAY_SIZE(vertices));
+			     vertices, vertex_count * 8);
 	if (p - body != delta + depth_delta +
 	    (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ?
-	     228 : 224) || body[4] != destination_state[0] ||
+	     228 : 224) + (vertex_count - 3) * 8 ||
+	    body[4] != destination_state[0] ||
 	    body[5] != 0x51100000 || body[6] != destination_state[2] ||
 	    body[20 + delta] != texture_state[0] ||
 	    body[21 + delta] != 0x18001101 ||
@@ -1051,6 +1066,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	    body[33 + delta] != sampler[1] ||
 	    body[34 + delta] != sampler[2] ||
 	    body[55 + delta + depth_delta] != 0x04000000 ||
+	    (!depth_active &&
+	     body[74 + delta] != (0x24000000 | vertex_count)) ||
 	    (blend &&
 	     (body[7] != 0x38000000 || body[14] != 0x3f000000 ||
 	      body[15] != blend_words.a34 || body[16] != blend_words.a35 ||
@@ -1073,7 +1090,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	      body[51 + delta] != 0x20007fff ||
 	      body[76 + delta] != 0x20000000 ||
 	      body[77 + delta] != 0x23004f02 ||
-	      body[78 + delta] != 0x24000003 ||
+	      body[78 + delta] != (0x24000000 | vertex_count) ||
 	      body[204 + delta] != 0xfe020440 ||
 	      body[206 + delta] != 0x00000000)) ||
 	    body[(request->texture_program ==
@@ -3123,7 +3140,8 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		textured_depth || four_objects;
 	bool texture_objects = three_objects ||
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE ||
-		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND;
+		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
+		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH;
 	int dev_idx;
 	int ret;
 
@@ -3425,7 +3443,8 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 						      depth_target,
 						      texture2_target, &pause);
 	else if (request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE ||
-	    request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND)
+	    request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
+	    request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH)
 		ret = chrome9_build_textured_triangle(engine, request, job, target,
 						      depth_target, 0, &pause);
 	else
@@ -4766,6 +4785,130 @@ int chrome9_draw_textured_triangle_ioctl(struct drm_device *drm, void *data,
 		args->vertices[2].x_16_16, args->vertices[2].y_16_16))
 		return -EINVAL;
 	return chrome9_submit_depth_triangle(drm, file, &request);
+}
+
+int chrome9_draw_textured_triangle_batch_ioctl(struct drm_device *drm,
+						void *data,
+						struct drm_file *file)
+{
+	struct drm_chrome9_draw_textured_triangle_batch *args = data;
+	struct drm_chrome9_textured_vertex *vertices;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH,
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->texture_handle,
+		.texture_handle = args->texture_handle,
+		.flags = args->flags,
+		.width = args->width,
+		.height = args->height,
+		.pitch = args->destination_pitch,
+		.texture_width = args->texture_width,
+		.texture_height = args->texture_height,
+		.texture_pitch = args->texture_pitch,
+		.texture_format = args->texture_format,
+		.min_filter = args->min_filter,
+		.mag_filter = args->mag_filter,
+		.wrap_s = args->wrap_s,
+		.wrap_t = args->wrap_t,
+		.texture_program = args->program,
+		.destination_format = args->destination_format,
+		.scissor = args->scissor,
+		.blend = args->blend,
+		.triangle_count = args->triangle_count,
+	};
+	u64 surface_size;
+	u64 total_size;
+	u32 vertex_count;
+	bool blend = args->flags & DRM_CHROME9_TRIANGLE_BATCH_BLEND;
+	unsigned int i;
+	int ret;
+
+	if (args->flags & ~DRM_CHROME9_TRIANGLE_BATCH_BLEND ||
+	    !args->triangle_count ||
+	    args->triangle_count >
+		DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES ||
+	    !args->vertices_ptr || args->reserved0 || args->pad ||
+	    args->reserved[0] || args->reserved[1] || args->reserved[2] ||
+	    !args->destination_handle || !args->texture_handle ||
+	    !args->width || args->width > 2048 ||
+	    !args->height || args->height > 2048 ||
+	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
+	    !args->texture_width || args->texture_width > 2048 ||
+	    !args->texture_height || args->texture_height > 2048 ||
+	    args->texture_pitch !=
+		ALIGN(args->texture_width * sizeof(u32), 32) ||
+	    args->program > DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ||
+	    args->destination_format >
+		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
+	    args->texture_format > DRM_CHROME9_TEXTURE_FORMAT_BGRA8888 ||
+	    args->min_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
+	    args->mag_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
+	    (args->wrap_s != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
+	     args->wrap_s != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
+	     args->wrap_s != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
+	    (args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
+	     args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
+	     args->wrap_t != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
+	    (!blend && (args->destination_format ||
+			  memchr_inv(&args->blend, 0, sizeof(args->blend)))))
+		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
+	if (blend) {
+		ret = chrome9_validate_blend_state(&args->blend);
+		if (ret)
+			return ret;
+	}
+	if (check_mul_overflow((u64)args->destination_pitch,
+			       (u64)args->height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.object_size))
+		return -E2BIG;
+	if (check_mul_overflow((u64)args->texture_pitch,
+			       (u64)args->texture_height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.texture_object_size) ||
+	    check_add_overflow(request.object_size, request.texture_object_size,
+			       &total_size) ||
+	    total_size > SZ_64M - CHROME9_RING_SIZE)
+		return -E2BIG;
+	request.depth_object_size = request.texture_object_size;
+	if (check_mul_overflow(args->triangle_count, 3U, &vertex_count))
+		return -E2BIG;
+	vertices = memdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+				     vertex_count, sizeof(*vertices));
+	if (IS_ERR(vertices))
+		return PTR_ERR(vertices);
+	for (i = 0; i < vertex_count; i++) {
+		const struct drm_chrome9_textured_vertex *vertex = &vertices[i];
+
+		if (!chrome9_coordinate_valid(vertex->x_16_16, args->width) ||
+		    !chrome9_coordinate_valid(vertex->y_16_16, args->height) ||
+		    vertex->z_16_16 < 0 || vertex->z_16_16 > 0x10000 ||
+		    !chrome9_rhw_valid(vertex->rhw_float) ||
+		    !chrome9_float_finite(vertex->s_float) ||
+		    !chrome9_float_finite(vertex->t_float)) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+	}
+	for (i = 0; i < vertex_count; i += 3) {
+		if (!chrome9_triangle_nondegenerate(
+			vertices[i].x_16_16, vertices[i].y_16_16,
+			vertices[i + 1].x_16_16, vertices[i + 1].y_16_16,
+			vertices[i + 2].x_16_16, vertices[i + 2].y_16_16)) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+	}
+	request.textured_batch_vertices = vertices;
+	ret = chrome9_submit_depth_triangle(drm, file, &request);
+
+out_free:
+	kfree(vertices);
+	return ret;
 }
 
 int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,
