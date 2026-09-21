@@ -19,6 +19,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BLEND	0x07
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_BLEND	0x08
 #define DRM_CHROME9_DRAW_TRIANGLE_BATCH	0x09
+#define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE	0x0a
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -50,6 +51,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_BATCH \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_BATCH, \
 		struct drm_chrome9_draw_triangle_batch)
+#define DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE, \
+		struct drm_chrome9_draw_two_textured_triangle)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -88,6 +92,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND	(1ULL << 12)
 /* Up to 34 untextured triangles share one validated state envelope. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH	(1ULL << 13)
+/* Two level-zero textures can be multiplied RGBA-by-RGBA. */
+#define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE	(1ULL << 14)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -208,6 +214,53 @@ struct drm_chrome9_textured_vertex {
 	__u32 specular;
 	__u32 s_float;
 	__u32 t_float;
+};
+
+/* One source of the fixed two-texture RGBA MODULATE program. */
+struct drm_chrome9_texture_state {
+	__u32 handle;
+	__u32 width;
+	__u32 height;
+	__u32 pitch;
+	__u32 format;
+	__u32 min_filter;
+	__u32 mag_filter;
+	__u32 wrap_s;
+	__u32 wrap_t;
+};
+
+/* D3 and D4 are independent normalized coordinates for texture units 0/1. */
+struct drm_chrome9_two_textured_vertex {
+	__s32 x_16_16;
+	__s32 y_16_16;
+	__s32 z_16_16;
+	__u32 rhw_float;
+	__u32 color;
+	__u32 specular;
+	__u32 s0_float;
+	__u32 t0_float;
+	__u32 s1_float;
+	__u32 t1_float;
+};
+
+/*
+ * Draw one triangle with the fixed GL1 lightmap operation
+ * texture0.rgba * texture1.rgba.  The destination and both level-zero,
+ * linear texture sources are distinct native guarded shmem BOs.  This first
+ * ABI intentionally excludes depth, blending, mipmaps and programmable
+ * combine state.
+ */
+struct drm_chrome9_draw_two_textured_triangle {
+	__u32 destination_handle;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 reserved0;
+	struct drm_chrome9_texture_state textures[2];
+	struct drm_chrome9_two_textured_vertex vertices[3];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 reserved[3];
 };
 
 /*
