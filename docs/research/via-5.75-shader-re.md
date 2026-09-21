@@ -1128,6 +1128,25 @@ points.  These are not resource counts or generic dependency flags.  The
 proprietary append limits mean only A2T indices 0..95 and T2A indices 0..31
 are reachable, although six A2T words are present in the hardware tuple.
 
+There is a mandatory pass after ordinary compile/validate.  The production
+call chain at `stmCreatePixelShaderInstance_inv:0x1b923f..0x1b9247` invokes
+`stmPPS_PostTranslationSetting_invi(object+0x10, context[0xa08]>>4)`.  Target
+configuration value two is proved by exact convergence with both Xorg
+oracles:
+
+| program | pre-pass `object+2c` | configuration-2 `object+2c` | Xorg A90 |
+|---|---:|---:|---:|
+| ALU-only MOV | `00040000` | `00058000` | `90058000` |
+| TEXLD then ALU | `00000000` | `00018000` | `90018000` |
+
+For the texture case the pass also sets `object+70=1`, keeps T2A bit zero set,
+changes TAU `201001b0` to `301001b0`, and changes the consuming ALU source
+word `00f00005` to `00f20005`.  These are finalizer-owned dependency fields,
+not sampler or register-class changes.  Together they give exact controls
+`90018000 91000001 92010001 93000001`.  Do not upload output from
+`stmPPSCompile_invi` directly; the earlier offline probe deliberately stopped
+before this phase.
+
 Adjacent compiler metadata is also pinned down:
 
 | object offset | meaning | evidence |
@@ -1363,7 +1382,8 @@ raw-token sweep shows every odd modifier code sets native dword-3 saturate bit
 12 and every even code clears it.  Only NONE and SAT are semantic.  Reject all
 other destination modifiers rather than accepting their silent parity alias.
 
-The first texture differentials establish useful TAU golden vectors:
+The first texture differentials establish useful pre-post-translation TAU
+golden vectors:
 
 ```text
 texld  r0,t0,s0: 201001b0
@@ -1377,7 +1397,8 @@ the complete TAU word used by these operations:
 
 | Bits | Meaning |
 |---:|---|
-| `31:28` | fixed class 2 |
+| `31:29` | fixed class bits `001` |
+| `28` | dependency/presence bit; clear in the raw emitter, set by the target finalizer |
 | `27:24` | sampler id |
 | `23:20` | operation: 1 TEXLD, 3 TEXLDB, 4 TEXKILL, 7 TEXLDP |
 | `19:16` | allocated temporary destination id |
@@ -1391,9 +1412,12 @@ the proprietary emitter ORs `(dst_id & 0xf) << 16` with
 physical ids.  They must not be encoded as two independently replaceable
 bitfields after allocation.
 
-The proprietary PS 2.0 frontend accepts sampler tokens `s0..s15` and produces
-the exact sequence `201001b0,211001b1,...,2f1001bf` for otherwise identical
-TEXLD operations.  One shader containing all 16 distinct sampler tokens also
+The proprietary PS 2.0 frontend accepts sampler tokens `s0..s15` and its raw
+emitter produces the exact sequence
+`201001b0,211001b1,...,2f1001bf` for otherwise identical TEXLD operations.
+Configuration-2 post-translation additionally sets bit 28 on an active
+record; for example the one-sampler execution word is `301001b0`.  One shader
+containing all 16 distinct sampler tokens also
 compiles successfully into 16 TAU records followed by one ALU output; its
 T2A map is exactly bit 15 (`object+0x60=00008000`).  Thus the native operand
 and scheduler intentionally cover a real four-bit sampler namespace, even
@@ -1401,7 +1425,10 @@ though both supplied OpenGL ICDs advertise only eight texture units and only
 stage zero has live silicon proof.  Worse, the frontend does not validate
 indices above 15: it ORs the unchecked index both at bit 24 and into the low
 word.  For example s16, s32, and s255 produce `301001b0`, `201001b0`, and
-`ff1001ff`, respectively, corrupting the fixed class and/or swizzle fields.
+`ff1001ff`, respectively, corrupting dependency/class and/or swizzle fields.
+The raw invalid-s16 word is numerically identical to a correctly finalized
+s0 word because both set bit 28 for unrelated reasons.  Validate the logical
+sampler id before encoding; a native-word filter cannot distinguish them.
 Mesa must range-check sampler ids before encoding; expose only s0..s7 until
 higher-stage hardware tests justify raising the API cap.
 
@@ -1551,8 +1578,10 @@ The immediate high-value probes are:
    all four native dwords as a corpus.
 2. Add a decoder for the established vertex source/destination fields and
    assert round trips against that corpus.
-3. Extend `chrome9_pps_probe` with optimizer/finalizer calls and capture every
-   raw/final bit changed by multi-instruction dependencies.
+3. Use `CHROME9_POSTPROCESS=2 chrome9_pps_probe` for every candidate execution
+   vector and compare it with the unfinalized default run.  Extend that corpus
+   from the proved one-TAU dependency bits to two-TAU, TEXLDP/TEXLDB, and
+   TEXKILL programs before enabling those shapes.
 4. Sweep the Linux PPS and Wine/Windows oracles instruction-for-instruction.
    Agreement across two independently built proprietary drivers is the
    strongest available static/dynamic check.

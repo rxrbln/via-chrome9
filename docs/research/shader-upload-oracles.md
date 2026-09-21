@@ -112,6 +112,26 @@ instruction.  Offline differentials validate the decode: `A93=1`, `2`, and
 `3` mean switch after TAU 0, after TAU 1, and after both TAUs respectively;
 `A95=1` switches after ALU 0.  Preserve the finalized scheduling tuple.
 
+The target post-translation configuration is now exact, not an opaque runtime
+choice.  The normal Linux creation path calls
+`stmPPS_PostTranslationSetting_invi(compiled+0x10, 2)`.  Configuration two
+turns compiler metadata `+2c=00040000` into `00058000` for an ALU-only
+program, and zero into `00018000` for one TAU followed by ALU.  It also sets
+the texture case's `+70=1`, TAU dependency bit 28, and the consuming ALU
+source dependency bit 17.  Consequently a complete generic one-texture
+MODULATE transaction uses:
+
+```text
+A90..A93 = 90018000 91000001 92010001 93000001
+ALU       = 0140b6d0 30040053 00f20005 00000820
+TAU       = 301001b0
+```
+
+The fixed Xorg program uses allocated r1 instead (`301101b0` and the matching
+ALU id), but its controls and finalizer-owned bits are identical.  Raw
+compiler outputs `00f00005/201001b0` are semantic templates only and must not
+be passed to the program stores.
+
 ## Exact VS behavior and varying linkage
 
 The four-instruction Xorg VS above is the known-good pretransformed rectangle
@@ -657,6 +677,10 @@ fails to range-check larger ids:
 s16 gives `301001b0`, s32 aliases s0 as `201001b0`, and s255 corrupts the word
 to `ff1001ff`.  Restrict the first Mesa implementation to the independently
 advertised s0..s7 ceiling and mask only after validating the logical id.
+The raw invalid-s16 word numerically collides with a valid finalized-s0 word:
+bit 28 is an unchecked sampler-index carry in the former but a dependency bit
+set by post-translation in the latter.  Native-word validation therefore
+cannot recover the logical sampler id; range-check it before encoding.
 
 The VS 2.0 compiler accepts arithmetic, matrix expansion, relative constants,
 and structured flow emitters.  It has a 256-record normalized IR array and a

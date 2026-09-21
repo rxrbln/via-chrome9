@@ -480,12 +480,45 @@ uploads: `N*4` dwords under `20030000`, then zero or one dword under
 and any nonzero `9b` low state bits rather than blindly copying these zero-
 context examples.
 
-The exact one-texture MODULATE body produced by both offline compilers is:
+The raw one-texture MODULATE body produced by both offline compiler emitters
+before the Linux post-translation dependency pass is:
 
 ```text
 ALU 0140b6d0 30040053 00f00005 00000820
 TAU 201001b0
 ```
+
+The normal Linux creation path does not stop there.
+`stmCreatePixelShaderInstance_inv:0x1b923f..0x1b9247` calls
+`stmPPS_PostTranslationSetting_invi(compiled_object + 0x10,
+context[0xa08] >> 4)`.  The Chrome9/Xorg-compatible configuration value is
+two.  Running that exact hardware-free pass produces the execution-ready
+body and control metadata:
+
+```text
+ALU 0140b6d0 30040053 00f20005 00000820
+TAU 301001b0
+
+object+2c = 00018000   # A90 payload
+object+60 = 00000001   # A93, switch after TAU 0
+object+70 = 00000001   # A91 payload
+ALU/TAU counts = 1/1  # A92 = 00010001
+```
+
+The finalizer sets ALU source-A dependency bit 17 and TAU bit 28.  These
+changes independently reproduce the live Xorg control tuple
+`90018000/91000001/92010001/93000001`; the Xorg fixed body allocates r1 and
+therefore uses `301101b0`, while this generic compiler example allocates r0.
+For ALU-only `MOV oC0,v0`, the same configuration changes object `+2c` from
+`00040000` to `00058000`, exactly reproducing Xorg `A90=90058000`.
+
+`CHROME9_POSTPROCESS=2 tools/re/chrome9_pps_probe.c` replays this phase.  The
+probe source and the executable rebuilt with the documented `gcc -m32`
+command have SHA-256
+`fa4f7a2ecee57dd37530639a245abbaf4abb4dbe7b4962590493b42bc003a039`
+and `fa20920bf562498bbc79d264a58c7b66a1a3f4196624846fedea81fd5e9043c3`.
+The unfinalized words remain useful field templates, but they are not safe
+packet payloads.
 
 The corresponding D3D tokens are `texld r0,t0,s0; mul oC0,r0,v0`.  This is a
 general compiler boundary rather than another fixed shader only if operands,
@@ -528,16 +561,18 @@ and
 `8ac6959fc3ab21b73fcf37ae4615e87ab285f3a56bc27623f3094d82cee49b45`.
 
 That mapping is not permission to use arbitrary `tN`.  The Wine wrapper
-deliberately installs an identity remap callback.  The full Linux compiler,
-using the real H5 register manager, produces the same values for v0, v1, and
-t0 but maps a standalone unallocated t1 (and t7) to native id `3f`, giving
-`00f0ff05`; `object+0x40` still records the logical usage bit.  The `3f` is an
-unchecked not-found sentinel from `stmPPS_GetReMapTexSlot_invi`, not a sixty-
-fourth varying.  A Mesa backend must allocate/link every texture-class input
-before encoding it and reject a missing physical mapping.  Initial execution
-therefore remains bounded to the already proven `v0` color and TAU `t0`
-coordinate path; direct ALU reads of t0/t1 and v1 each need separate linkage
-tests.
+deliberately installs an identity remap callback.  The Linux compile probe
+stops before the normal post-translation pass: at that intermediate point it
+produces the same values for v0, v1, and t0 but maps a standalone t1 (and t7)
+to native id `3f`, giving `00f0ff05`; `object+0x40` still records the logical
+usage bit.  The `3f` is the unchecked not-found result from
+`stmPPS_GetReMapTexSlot_invi`, not a sixty-fourth varying.  Configuration-2
+post-translation adds dependency fields but cannot reconstruct the missing
+logical id from this malformed no-declaration test.  A Mesa backend must
+allocate/link every texture-class input before encoding it and reject a
+missing physical mapping.  Initial execution therefore remains bounded to
+the already proven `v0` color and TAU `t0` coordinate path; direct ALU reads
+of t0/t1 and v1 each need separate linkage tests.
 
 The safest first ALU allowlist is the one-native-record family `MOV`, `ADD`,
 `SUB`, `MUL`, and `MAD`, plus literal zero/one and normal XYZW swizzles.  Their
@@ -550,8 +585,10 @@ compiler's successful return is not validation: it silently truncates ALU and
 TAU stores and accepts several invalid register/modifier encodings.
 
 The next scheduling rung is independently reproduced by the hardware-free
-Windows oracle.  For
-`texld r0,t0,s0; texld r1,t1,s1; mul oC0,r0,r1`, the exact finalized streams
+Windows oracle.  Its identity-remap wrapper proves the semantic records and
+transition maps but does not apply the Linux configuration-2 dependency-bit
+pass.  For
+`texld r0,t0,s0; texld r1,t1,s1; mul oC0,r0,r1`, its exact scheduled streams
 and controls are:
 
 ```text
