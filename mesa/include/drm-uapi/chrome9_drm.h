@@ -22,6 +22,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE	0x0a
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16	0x0b
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH	0x0c
+#define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16	0x0d
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -62,6 +63,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH, \
 		struct drm_chrome9_draw_triangle_d16_rhw_batch)
+#define DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16 \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16, \
+		struct drm_chrome9_draw_two_textured_triangle_d16)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -111,6 +115,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_TEXTURED_D16_SOURCE_OVER	(1ULL << 18)
 /* Untextured D16 batches preserve RHW for perspective-correct diffuse. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
+/* Two level-zero textures can be multiplied with D16 test/write. */
+#define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16	(1ULL << 20)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -278,6 +284,27 @@ struct drm_chrome9_draw_two_textured_triangle {
 	struct drm_chrome9_two_textured_vertex vertices[3];
 	struct drm_chrome9_scissor_state scissor;
 	__u32 reserved[3];
+};
+
+/*
+ * Draw one triangle with texture0.rgba * texture1.rgba and linear D16
+ * test/write.  The destination, both guarded level-zero sources, and depth
+ * surface are four distinct native shmem BOs.  This first successor accepts
+ * only an X8R8G8B8 destination, LESS/LEQUAL, and no blend or alpha test.
+ */
+struct drm_chrome9_draw_two_textured_triangle_d16 {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 reserved0;
+	struct drm_chrome9_texture_state textures[2];
+	struct drm_chrome9_two_textured_vertex vertices[3];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 reserved[5];
 };
 
 /*
