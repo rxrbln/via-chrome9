@@ -606,14 +606,55 @@ SF nodes retained, active scanout pinned, and error fences unsignaled.
     `ready=true`, release the quarantine module/device hold, and finish the
     `drm_exec` transaction.
 
-The reset pulse delays remain the one unresolved numeric parameter.  The
-binary specifies `0x10000` empty iterations, which is CPU/compiler dependent
-and cannot be translated honestly into microseconds.  A first lab-only
-implementation should use a conservative bounded pulse delay as an explicit
-module parameter, log its value, and rely on the status/readback proofs above
-rather than presenting that delay as vendor-documented timing.  It must not
-ship enabled by default until a minimum working delay is measured repeatedly
-on VX900.
+### Pulse duration recovered on the target CPU
+
+The binary has **five**, not one, identical delay loops: one while `SR4E=0f`,
+one while `SR1A.bit6=1`, one after that bit is cleared, one while
+`SRC7.bit7=1`, and one after that bit is cleared.  There is no loop between
+`SR4E=00` and the initial `SR1A` read.  The loop body is exactly:
+
+```asm
+mov    eax,DWORD PTR [ebp-local]
+add    eax,1
+mov    DWORD PTR [ebp-local],eax
+cmp    DWORD PTR [ebp-local],10000h
+jae    done
+jmp    loop
+```
+
+Neither the old Linux KMD, classic DRM, nor Mesa 7.11.2 contains this full
+reset or an alternative time-valued delay.  The Windows binary imports
+`KeStallExecutionProcessor` but deliberately does not use it here, so static
+analysis cannot turn the iteration count into a portable hardware minimum.
+
+It can, however, be measured on the actual target CPU without touching the
+GPU.  The exact dependency chain above was compiled with the same loop
+opcodes and run for 4,096 samples, three times, pinned to CPU 0 on the target
+VIA Nano U3500 at a reported fixed 1.000 GHz:
+
+```text
+run  min (ns)  p50 (ns)  p95 (ns)   p99 (ns)   max (ns)
+ 1     405079    432597    1782978    2022813    2947442
+ 2     405079    432806    1785842    2044882    3356432
+ 3     405149    574095    1781721    2274871    7636865
+```
+
+The repeatable minimum is about 405 microseconds, or about 6.18 target CPU
+cycles per iteration; scheduler/power-management interference only lengthens
+it.  The hardware-free source is retained on the target as
+`/root/tmp/chrome9/chrome9_reset_loop_bench.c`, SHA-256
+`444f1ff11bdcfd2a35a1b220bfc14636dafe613e06b86b98d95b554c8ab74f32`;
+the measured executable SHA-256 is
+`10fbd879cc72bdfdeb0fcbc724a4c6445f4670855b5f2182c9bfcbf2b6a999ae`.
+
+This resolves the target-specific starting floor, not a portable silicon
+timing specification.  The first Linux oracle should use `udelay(500)` at all
+five Windows delay positions: it exceeds the measured minimum by roughly
+23%, cannot wake early, preserves the vendor ordering, and totals only 2.5 ms
+of busy wait.  Keep the value an explicit logged lab parameter.  Do not add an
+invented delay between `SR4E=00` and `SR1A`, and do not interpret a successful
+500-microsecond test as permission to shorten it.  The status, PTE, ring and
+guard proofs remain the authority; the delay alone proves nothing.
 
 Reservation locking also needs special care.  The quarantined fence is
 already installed in each BO reservation, so recovery may use `drm_exec` to
@@ -782,10 +823,40 @@ reset; start a new software epoch from the newly primed slot.
 
 ## First live reset experiment
 
-Do not start with a timed-out 3D job.  On a remotely recoverable machine, first
-exercise the sequence while the owned dummy ring is paused and all engine bits
-are idle.  Keep scanout memory outside every owned range, save all registers
-listed above, and use bounded waits throughout.  A pass requires:
+Do not start with a timed-out 3D job.  The minimal oracle is an **idle reset**
+over the already proved persistent dummy ring.  It is deliberately arranged
+so the display driver has no live ownership:
+
+1. Boot or load with `kms=0` and `fixed_iga1=0`; refuse the oracle if a
+   `chrome9_kms_state` exists, an active/blocked framebuffer or scanout mapping
+   exists, any DRM file is open, or any framebuffer console is bound to this
+   PCI function.  Use remote SSH as the only control path.  Do not substitute
+   “screen appears idle” for these checks.
+2. Require the current owned ring at PID00 PAUSE, exact known last cookie,
+   `0400 & 00101fe3 == 0`, and `040c==0`.  This is safe idle input even though
+   the paused command reader leaves `0400.bit4` set and therefore makes the
+   Windows pre-reset `00161fff` test enter the destructive path.
+3. Snapshot the complete preserve matrix, all 16,384 PTEs, both ring slots,
+   active ring bounds/pause, PCI command, `0200/0204/0214`, and hash every
+   retained CPU buffer.  Allocate no new mapping after this point.
+4. Execute one exact pulse sequence with the five delays set to **1,000 us**.
+   Verify each asserted and deasserted indexed byte by readback.  Use a
+   100-ms bounded full-idle poll, the exact replay/rebuild transaction above,
+   and stop immediately on the first failed predicate.
+5. Prove the new GART image, new H0 cookie, owned PAUSE, non-CR idle, full
+   PID10 idle, error register, guarded 2D fill and guarded fixed 3D draw.  Then
+   compare every display/coexistence snapshot and restore only the classified
+   preserve set.
+6. After a clean unload and preferably a cold reboot, repeat once at the
+   measured **500-us** floor.  There is no value in binary-searching below the
+   known Windows-equivalent floor during bring-up.
+
+The 1-ms first pass is the safer discriminator: success proves ordering and
+rebuild without yet claiming the smaller timing bound; failure proves the
+problem is not a marginally short pulse.  Only a 1-ms pass followed by a
+separate 500-us pass supports selecting 500 us as the lab default.
+
+A pass requires:
 
 - the full status mask clears;
 - GART base/size and PTE readback are restored exactly;
@@ -794,6 +865,14 @@ listed above, and use bounded waits throughout.  A pass requires:
   both complete;
 - display scanout and both LUT-enable bits retain their pre-test state.
 
+Hard-stop conditions are any unexpected display owner, failed reset-byte
+readback, `0400 & 00101ff3` at the post-pulse deadline, nonzero `040c`, changed
+PCI BME, GART-control/PTE mismatch, `SR6F.bit7` timeout, wrong cookie, missing
+owned PAUSE, guard/canary corruption, or any display snapshot difference not
+covered by the explicit restore.  On a hard stop retain all mappings and the
+module/device holds and recover only by reboot; do not try another delay rung.
+
 Only after repeated idle-reset passes should a deliberately wedged off-screen
-workload be used to validate actual recovery.  The Windows busy loops and
-literal `0x10000` delays must never be copied without deadlines.
+workload be used to validate actual recovery.  The Windows unbounded status
+poll must never be copied, and the recovered 500-us pulse floor does not relax
+any post-reset deadline.
