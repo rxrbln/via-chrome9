@@ -209,11 +209,14 @@ make_projected_texture_vertex_shader(struct pipe_screen *screen,
 
 static void *
 make_projected_texture_fragment_shader(struct pipe_screen *screen,
-                                       struct pipe_context *context)
+                                       struct pipe_context *context,
+                                       bool preserve_primary_alpha)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
-      "chrome9-projected-texture-primary-rgb-alpha");
+      preserve_primary_alpha ?
+         "chrome9-projected-texture-primary-rgb-alpha" :
+         "chrome9-projected-texture-primary-rgba");
    struct pipe_shader_state state = {
       .type = PIPE_SHADER_IR_NIR,
       .ir.nir = b.shader,
@@ -242,10 +245,13 @@ make_projected_texture_fragment_shader(struct pipe_screen *screen,
    nir_def_init(&tex->instr, &tex->def, 4, 32);
    nir_builder_instr_insert(&b, &tex->instr);
    nir_def *product = nir_fmul(&b, &tex->def, color);
-   nir_def *result = nir_vec4(&b, nir_channel(&b, product, 0),
-                              nir_channel(&b, product, 1),
-                              nir_channel(&b, product, 2),
-                              nir_channel(&b, color, 3));
+   nir_def *result = product;
+
+   if (preserve_primary_alpha)
+      result = nir_vec4(&b, nir_channel(&b, product, 0),
+                        nir_channel(&b, product, 1),
+                        nir_channel(&b, product, 2),
+                        nir_channel(&b, color, 3));
 
    nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = FRAG_RESULT_COLOR);
@@ -1878,6 +1884,7 @@ run_pipe_texture(struct pipe_screen *screen)
    void *constant_alpha_modulate = NULL, *rgbx = NULL;
    void *packed_gray_vs = NULL, *packed_gray_fs = NULL;
    void *projected_vs = NULL, *projected_fs = NULL;
+   void *projected_modulate_fs = NULL;
    void *samplers[1];
    uint32_t source_copy[4], mip_copy = 0x5aa55aa5, *source, *pixels;
    uint32_t *mip_pixel;
@@ -2048,7 +2055,10 @@ run_pipe_texture(struct pipe_screen *screen)
    packed_gray_fs =
       make_packed_gray_texture_fragment_shader(screen, context);
    projected_vs = make_projected_texture_vertex_shader(screen, context);
-   projected_fs = make_projected_texture_fragment_shader(screen, context);
+   projected_fs =
+      make_projected_texture_fragment_shader(screen, context, true);
+   projected_modulate_fs =
+      make_projected_texture_fragment_shader(screen, context, false);
    if (!blend_handle ||
        (chrome9_screen_has_capability(
            screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND) &&
@@ -2065,6 +2075,7 @@ run_pipe_texture(struct pipe_screen *screen)
        !modulate_vs || !replace || !modulate || !constant_modulate ||
        !constant_alpha_modulate || !rgbx ||
        !packed_gray_vs || !packed_gray_fs || !projected_vs || !projected_fs ||
+       !projected_modulate_fs ||
        ((struct chrome9_shader *)constant_modulate)->fragment_program !=
           CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
        ((struct chrome9_shader *)constant_alpha_modulate)->fragment_program !=
@@ -2074,7 +2085,9 @@ run_pipe_texture(struct pipe_screen *screen)
        ((struct chrome9_shader *)packed_gray_fs)->fragment_program !=
           CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ||
        ((struct chrome9_shader *)projected_fs)->fragment_program !=
-          CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA) {
+          CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
+       ((struct chrome9_shader *)projected_modulate_fs)->fragment_program !=
+          CHROME9_FS_TEXTURE_PROJECTED_MODULATE) {
       fprintf(stderr,
               "texture setup failed: target=%p texture=%p context=%p "
               "blend=%p dsa=%p rasterizer=%p elements=%p "
@@ -2369,6 +2382,16 @@ run_pipe_texture(struct pipe_screen *screen)
             (pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
              0xffffff) == expect[i];
 
+      context->bind_fs_state(context, projected_modulate_fs);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &clear, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++)
+         pixels_match &=
+            (pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
+             0xffffff) == expect[i];
+
       vertex_buffer.buffer.user = bad_q_vertices;
       context->set_vertex_buffers(context, 1, &vertex_buffer);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
@@ -2379,7 +2402,7 @@ run_pipe_texture(struct pipe_screen *screen)
                                  &view);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
-      if (!pixels_match || ccontext->submitted_triangles != submitted + 2 ||
+      if (!pixels_match || ccontext->submitted_triangles != submitted + 4 ||
           ccontext->rejected_triangles != rejected + 4 ||
           !smoke_guard_pages_match(ctarget) ||
           !smoke_guard_pages_match(ctexture) ||
@@ -2391,7 +2414,7 @@ run_pipe_texture(struct pipe_screen *screen)
                  ccontext->rejected_triangles - rejected, pixels_match);
          goto out;
       }
-      puts("Gallium projected XRGB texture*primary q=1 lowering passed");
+      puts("Gallium projected XRGB texture*primary q=1 lowerings passed");
    }
    bool source_pixels_match =
       source[0] == source_copy[0] && source[1] == source_copy[1] &&
@@ -2700,6 +2723,8 @@ out:
          context->delete_vs_state(context, projected_vs);
       if (projected_fs)
          context->delete_fs_state(context, projected_fs);
+      if (projected_modulate_fs)
+         context->delete_fs_state(context, projected_modulate_fs);
       if (view) pipe_sampler_view_reference(&view, NULL);
       if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
       if (shadow_view) pipe_sampler_view_reference(&shadow_view, NULL);

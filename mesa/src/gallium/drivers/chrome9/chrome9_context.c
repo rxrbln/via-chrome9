@@ -1042,6 +1042,8 @@ chrome9_fs_result(nir_def *def)
       return CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE;
    if (chrome9_fs_is_projected_primary_rgb_alpha(def, 0))
       return CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA;
+   if (chrome9_fs_is_projected_primary_product(def))
+      return CHROME9_FS_TEXTURE_PROJECTED_MODULATE;
    if (chrome9_fs_is_rgbx(def, 0))
       return CHROME9_FS_TEXTURE_RGBX;
    switch (chrome9_fs_leaf(def, 0)) {
@@ -1181,6 +1183,7 @@ chrome9_fs_classify(nir_shader *nir)
    case CHROME9_FS_TEXTURE_REPLACE:
    case CHROME9_FS_TEXTURE_RGBX:
    case CHROME9_FS_TEXTURE_MODULATE:
+   case CHROME9_FS_TEXTURE_PROJECTED_MODULATE:
    case CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA:
    case CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE:
       valid = texture_count == 1 && !constant_count;
