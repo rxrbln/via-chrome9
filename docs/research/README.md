@@ -66,6 +66,13 @@ targets.
 - [chrome9-frc-dependency-corpus.tsv](chrome9-frc-dependency-corpus.tsv)
   retains three producer/consumer chains showing only the generic ALU
   dependency rewrite and no FRC-specific finalizer control.
+- [chrome9-rcp-rsq-scalar-audit.md](chrome9-rcp-rsq-scalar-audit.md) closes
+  RCP/RSQ X/Y/Z/W scalar selection, generic dependency finalization, safe
+  positive constant domains, and guarded selector/broadcast pixel oracles.
+- [chrome9-rcp-rsq-scalar-corpus.tsv](chrome9-rcp-rsq-scalar-corpus.tsv)
+  retains the 28-case Windows/Linux selector, NEG, producer, and consumer
+  differential while separating direct byte matches from the Windows
+  wrapper's non-production temporary allocation.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path

@@ -104,13 +104,16 @@ programmable MAD converter is therefore operation/path-specific, not a
 generic source-C rule.  All source modifiers remain rejected until a direct
 compiler differential and numerical test cover the exact operation.
 
-RCP and RSQ are scalar-W operations in both static emitters.  Windows calls
-the swizzle helper with mask 8; Linux extracts the packed W selector.  Both
-place that selector in native A.w and force native A.xyz to literal zero.
-Consequently an identity token selects W and compiles exactly like `.wwww`,
-while `.xxxx`, `.yyyy`, and `.zzzz` would select X, Y, and Z through their W
-token lane.  This closes the compiler quirk but not reciprocal arithmetic,
-so every RCP/RSQ form stays rejected.
+RCP and RSQ are scalar-W operations in both emitters.  Windows calls the
+swizzle helper with mask 8; Linux extracts the packed W selector.  Both place
+that selector in native A.w and force native A.xyz to literal zero.
+Consequently an identity token selects W and compiles exactly like `.wwww`.
+A later 28-case dynamic differential additionally proves byte-identical
+`.xxxx`, `.yyyy`, `.zzzz`, and `.wwww` terminal records across Windows and
+Linux.  The complete selector and finalizer result is in
+[`chrome9-rcp-rsq-scalar-audit.md`](chrome9-rcp-rsq-scalar-audit.md).  Direct
+full-mask output still does not prove scalar broadcast or reciprocal
+arithmetic on silicon, so every RCP/RSQ form stays rejected.
 
 ABS is an operation, not evidence for an ABS source modifier.  The exact
 identity record expands one source into A=`src`, B=`-src`, C=`src` under
