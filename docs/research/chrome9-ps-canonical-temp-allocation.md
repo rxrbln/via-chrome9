@@ -89,6 +89,20 @@ translation, so a dead early token TEMP still occupies its own table entry.
 This is why a new SSA backend should DCE and perform its own liveness-aware
 allocation instead of reproducing the vendor's token-id table literally.
 
+Windows independently confirms that separation.  Its H5 scratch callbacks
+are installed alongside, but separately from, the remap callback:
+
+| action | D3D callback | OpenGL callback | size | raw-equal SHA-256 |
+|---|---:|---:|---:|---|
+| get free TEMP | `1020ec70` | `1026ee40` | `0x1aa` | `d58a71a8b82e059d29103b4e588d8026cbe47259eab0a40a57377844fe8d0a8f` |
+| release TEMP | `1020ee80` | `1026f050` | `0x33` | `3e9059d2373a1701d9c82a7b94c5d4486be211418ceb747576d27d44a288a0ef` |
+
+The free callback scans the manager's active-byte table and marks an
+available slot; release clears that byte and decrements the corresponding
+ordinary or special active count.  Byte identity across D3D/OpenGL makes
+scratch reuse exact compiler behavior, but does not turn the prepopulated
+logical-token table into a liveness allocator.
+
 ## Windows boundary
 
 The D3D harness deliberately installs identity register callbacks so native
