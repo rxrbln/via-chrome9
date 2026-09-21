@@ -91,6 +91,30 @@ A60--A67 and does not start a usable command ring.  It also does not restore
 `0200`, the page table, any GART sequencer register, the ring contents, or a
 fence value.
 
+There is now negative executable evidence against using T10 A68's other
+control bits as an abbreviated recovery.  An exhaustive disassembly search of
+this VX900 KMD finds only these literal T10 A68 emissions:
+
+```text
+680a0000   reset/default replay, trigger clear       (0x8a4ae)
+680a0001   ring install, threshold 0a plus trigger   (0x770f2,
+                                                     0xa1764, 0xc7f49)
+```
+
+The `68000000`/`68000001` words at `0xc66e3`, `0xc6a13`, `0xc6fc8`,
+`0xc7194`, and nearby sites belong to command-stream blocks selected with
+T11 (`041c=00110000`), followed by T11 A69/A6A branch state.  They are not
+writes to T10's main-ring A68 register.  In the proprietary Linux KMD source,
+T10 bit 3 `INV_HAGPBClear`, bit 2 `INV_HRSTTrig_RestoreAGP`, and bit 1
+`INV_HRSTTrig_RestoreAll` are defined in `via_chrome9_3d_reg.h:183..187` but
+have no use anywhere in the driver.
+
+Thus neither shipping vendor driver uses T10 A68 bits 3:1 for ordinary ring
+replacement or hard-hang recovery, and the Windows reset path does not use
+the manual's bit 4 fence-queue clear either.  Those bits remain documented but
+unvalidated.  Do not substitute `680a0002`, `680a0004`, `680a0008`, or
+`680a0010` for PID10/full idle plus destructive reset/replay.
+
 Packet-exact replay and corrected runtime state differ at one known word.  The
 Windows KMD executable itself pushes de-gamma tail `377bd680` at `0x89a13`
 (and again in its duplicate initializer at `0x11d6b4`), matching the old Linux
