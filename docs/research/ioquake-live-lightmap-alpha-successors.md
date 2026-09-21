@@ -28,6 +28,39 @@ blend triangles before reaching a new unsupported program.  Therefore the
 two lightmap forms below are the exact next multi-texture classifiers, not a
 source-only prediction.
 
+### The exact q3dm1 masked material after lightmaps
+
+The shipped q3dm1 BSP texture lump contains
+`textures/base_wall/protobanner`.  Its exact `scripts/base_wall.shader`
+definition is a two-pass material:
+
+```text
+{
+    map textures/base_wall/protobanner.tga
+    alphaFunc GE128
+    depthWrite
+    rgbGen vertex
+}
+{
+    map $lightmap
+    rgbGen identity
+    blendFunc filter
+    depthFunc equal
+}
+```
+
+The surface is two-sided and vertex-deformed, but those operations are
+resolved before the post-TNL immediate record.  The fragment/state sequence
+is exact: projected BGRA texture times primary color, GE128, LEQUAL/write;
+then projected XRGB lightmap times white, `DST_COLOR,ZERO`, EQUAL/read-only.
+The BSP also names `models/mapobjects/gratelamp/gratetorch2b`, whose only
+stage is projected texture times vertex color with GE128 and depth write.
+
+The q3dm1 BSP effects/fog lump has length zero.  Dynamic lights may still be
+introduced at runtime and `RB_FogPass()` remains needed by other maps, but
+neither should displace the banner's alpha-test then EQUAL/filter pair as the
+first q3dm1 state oracle after the general lightmap program.
+
 The first live two-texture form is:
 
 ```text
@@ -257,6 +290,21 @@ force BGRA merely because alpha test is enabled.
 The common two-pass grate follow-up is a distinct tuple: alpha test disabled,
 `DST_COLOR,ZERO`, EQUAL, and read-only D16.  It must use A00 `00000011`, A13
 `13020000`, and A01 `01ce1548`; it must not inherit A33 from the first pass.
+For q3dm1 this is not merely a global shader-count pattern: it is the exact
+second `protobanner` stage.  Its remaining blend words are:
+
+```text
+A33 = 33007000
+A34 = 34000010
+A35 = 35000114
+A36 = 36000420
+A37 = 37000224
+A53 = 53010c0f
+```
+
+The stage's `rgbGen identity` must lower to sampled lightmap times exact white
+(or an equivalent REPLACE only after proving the alpha result is
+unobservable).  Do not retain the banner's interpolated D1 or GE128 state.
 Fog and dynamic-light successors are documented separately in
 [`ioquake-fog-dlight-successors.md`](ioquake-fog-dlight-successors.md).
 
