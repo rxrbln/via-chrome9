@@ -418,9 +418,9 @@ the same masked replacement at
 `VTGUModeDX32A.dll:0x1015aca0..0x1015acb7`, then emits saved words in the exact
 order A61, A62, A60 at `0x1015aeff..0x1015af27`.
 
-Controlled, hardware-free Linux compiler differentials assign `+0x10`: it is
-the number of non-position output vectors.  The results are independent of
-which class contributes the vectors:
+Controlled, hardware-free Linux compiler differentials initially looked like
+an output-vector count.  For simple full-MOV programs the results are
+independent of which class contributes the vectors:
 
 | complete outputs | object `+4` | object `+0x10` |
 |---|---:|---:|
@@ -437,6 +437,14 @@ followed by three active finalizer records and two inactive uploaded sentinels.
 Therefore a generic oPos/oD0/oT0 program must use the initialized A62 control
 word with low nine bits replaced by two; copying `...81ff` from the fixed
 rectangle path is not compiler-equivalent.
+
+M4x4/partial-position differentials prove that “output count” is too broad a
+name.  A four-row M4x4 into r0 followed by full oPos MOV has `+10=3` despite
+having no non-position output.  Adding T0.xy changes it to five; adding both
+T0/T1.xy changes it to six.  M4x4 plus oD0 and T0.xy also gives six.  Thus
+`+0x10` is an opaque compiler-derived A62 resource value influenced by
+partial writes/position temporaries as well as output linkage.  Preserve it
+from the selected compiled template; do not recompute it from `outputs_written`.
 
 `stmUpdateFVFOut_H5i:0x1ba550..0x1baa87` converts object `+4` into the
 corresponding type-04 output format.  With point sprites disabled, the exact
@@ -490,7 +498,7 @@ FE03043C 0000000C 32030400 CC000000
 
 # type-04 control, in vendor order
 FE020440 0000043C 00040000 CC000000
-A61_with_bool_mask  A62_with_output_count  A60_with_active_last
+A61_with_bool_mask  A62_with_compiler_low9  A60_with_active_last
 CC000000
 
 # upload count is independent of A60.active-last
@@ -551,10 +559,10 @@ safe if it is an optional fast path with deterministic fallback to `draw`:
    the unchecked 512-wrap case and the vendor Linux object's 295-record
    overlap boundary.  Raise it only after bounded silicon sweeps.
 5. Derive output metadata from the final NIR writes, build A25/A26 with the
-   exact table above, patch only A28 bits `18:17`, set A62.low9 to the
-   non-position output-vector count, and retain independent active/upload
-   counts.  For the first textured path require exactly oD0 plus oT0.xy, so
-   the expected metadata/A25/A26/A62-low tuple is
+   exact table above, patch only A28 bits `18:17`, carry the template's exact
+   compiler-derived A62.low9, and retain independent active/upload counts.
+   For the simple full-MOV textured path requiring oD0 plus oT0.xy, the
+   expected metadata/A25/A26/A62-low tuple is
    `00000144 / 25f4c000 / 26000000 / 002`.
 6. Keep the current proven H6 input declaration and post-viewport convention
    for the existing fixed-shader regression only.  A generic compiled shader
@@ -732,10 +740,11 @@ are deliberately non-one, bind c0.x=`3f800000`, and require unchanged RGB
 plus output alpha `ff`.  Repeat with c0.x=zero to prove the second write is
 active rather than an implicit render-target alpha fill.
 
-The same file carries four exact Linux vertex templates: clip position;
-position plus T0.xy; position plus T0/T1.xy; and M4x4 position plus color and
-T0.xy.  The two-texture glamor pass-through has eight uploaded records, six
-active records, metadata `00000204`, output count two, and these three user
+The same file now carries seven exact Linux vertex templates: clip position;
+position plus T0.xy; position plus T0/T1.xy; M4x4 position with zero, one, or
+two texture coordinates; and M4x4 position plus color and T0.xy.  The
+two-texture glamor pass-through has eight uploaded records, six active
+records, metadata `00000204`, A62 low value two, and these three user
 records before the three active finalizer records and two inactive sentinels:
 
 ```text
@@ -750,6 +759,65 @@ reciprocal-W/viewport finalizer.  It must not consume the current Gallium
 retain software vertex execution plus the live-proven Xorg post-transform VS;
 only the fragment classifier needs to select the new finalized programs.
 
+For native clip-space execution, the M4x4+T0/T1 form is twelve uploaded
+records, ten active records, metadata `00000204`, and A62 low value six.  Its
+seven semantic records are exact:
+
+```text
+0008014c 0040014c 00000000 00060801
+0008014c 0040414c 00000000 00060802
+0008014c 0040814c 00000000 00060804
+0008014c 0040c14c 0000014c 0034010f
+0010014c 00000000 00000000 00080a0f  # oPos = transformed r0
+0008414c 00000000 00000000 00080283  # oT0.xy = v1.xy
+0008814c 00000000 00000000 00080293  # oT1.xy = v2.xy
+```
+
+It reads c0..c3 and v0..v2.  The three active reciprocal-W/viewport records
+and two inactive sentinels shown earlier follow byte-for-byte.  Exact sibling
+metadata is:
+
+| native template | upload | active | object `+4` | A25 / A26 | A62 low | A60 |
+|---|---:|---:|---:|---|---:|---:|
+| M4x4 position | 10 | 8 | `00000004` | `25f00000 / 26000000` | 3 | `60800007` |
+| M4x4 position + T0.xy | 11 | 9 | `00000104` | `25f0c000 / 26000000` | 5 | `60800008` |
+| M4x4 position + T0/T1.xy | 12 | 10 | `00000204` | `25f0cc00 / 26000000` | 6 | `60800009` |
+| M4x4 position + oD0 + T0.xy | 12 | 10 | `00000144` | `25f4c000 / 26000000` | 6 | `60800009` |
+
+### Safe native-shader live gates
+
+Keep native VS and the offline PS compiler behind an opt-in debug path with
+all public shader/API caps unchanged.  The first live sequence should be
+strictly monotonic and keep the existing post-TNL path as the control:
+
+1. Compile and byte-compare the selected key against this corpus.  Reject if
+   ALU/TAU/VS counts, resource masks, output metadata, active/upload counts,
+   or compiler-derived A62 value differ.
+2. In an otherwise idle ring, emit the already-proven 2D-to-3D transition,
+   exact internal viewport constants, c0..c3, A25/A26/A28, A61/A62, and the
+   entire VS/PS stores, but omit A60 and every vertex/primitive word.  Require
+   CR idle, engine status zero, error zero, target/source/guard bytes
+   unchanged.  This is address-free except for already mapped constants and
+   cannot rasterize.
+3. Emit only the exact A60 active-last word in a second no-vertex submission.
+   Require the same idle/status/guard result.  This isolates activation from
+   fetch and raster launch.
+4. Use a new explicitly clip-space vertex ABI, never the current post-viewport
+   immediate tuple.  First run M4x4 position only with an identity matrix,
+   W=1 finite clip coordinates, constant-color PS, COPY blend, no depth, one
+   guarded target, and one triangle well inside the viewport.  Compare every
+   covered pixel and guard against the existing software-draw/Xorg-VS result.
+5. Add T0.xy with a 2x2 four-color nearest/clamp texture and finite [0,1]
+   coordinates; then add T1.xy and the finalized two-texture MUL.  At each
+   rung require idle/error zero, exact covered-pixel colors, immutable sources,
+   and all guards before allowing the next key.
+
+On any timeout or mismatch, disable the native key for the process and return
+to software `draw`; do not retry a nearby program or reset merely to continue.
+No live gate changes GL/GLSL/ES caps.  Capability exposure waits for ordinary
+application-created NIR, constant updates, varying linkage, resource hazards,
+and negative/rejection tests to pass through the same bounded path.
+
 The standalone corpus builds without Mesa integration:
 
 ```sh
@@ -759,7 +827,7 @@ cc -std=c11 -Wall -Wextra -Werror -O2 \
 /tmp/chrome9-shader-offline-test
 ```
 
-It checks fifteen PS and all four VS templates, exact instruction words,
+It checks fifteen PS and all seven VS templates, exact instruction words,
 controls, metadata, active/upload counts, resource masks, and a rejected
 unsupported form.  This code is intentionally absent from `meson.build` and
 does not change caps or submission.

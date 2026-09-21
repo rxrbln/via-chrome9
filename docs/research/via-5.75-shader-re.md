@@ -691,14 +691,21 @@ The three control words are constructed from compiler metadata:
 - object `+0x08 & 7` controls `state[0x2242].bits6:4`;
 - object `+0x0c != 0` controls `state[0x2242].bit3`.
 
-Hardware-free full-compiler differentials now assign native object `+0x10`
-as the number of non-position output vectors.  oPos only gives zero; adding
-one of oD0 or oT0 gives one; oD0+oD1, oT0+oT1, and oD0+oT0 each give two.
+Hardware-free full-compiler differentials assign native object `+0x10`
+directly as the low A62 resource value.  For the simple full-MOV subset it
+equals the number of non-position output vectors: oPos only gives zero;
+adding one of oD0 or oT0 gives one; oD0+oD1, oT0+oT1, and oD0+oT0 each give
+two.  It is not universally an output count.  A four-row M4x4 position plus
+full oPos MOV gives three with no non-position output; adding T0.xy gives
+five, and adding both T0/T1.xy gives six.  Partial writes and the compiler's
+position temporaries therefore contribute to this opaque resource value.
 The Windows uploader at `VTGUModeDX32A.dll:0x1015aca0..0x1015acb7`
 independently performs the same masked A62-low-nine update.  This means the
 hand-built rectangle value `A62.low9=1ff` is not a valid generic-compiler
-default.  The complete A25/A26 dimension packing and implementation gates are
-recorded in [shader-upload-oracles.md](shader-upload-oracles.md).
+default, and Mesa must carry the compiler-derived value rather than recompute
+it from output declarations.  The complete A25/A26 dimension packing and
+implementation gates are recorded in
+[shader-upload-oracles.md](shader-upload-oracles.md).
 
 `stmUpdateIntBoolConst_inv` at `0x17baa0` closes the independent integer and
 boolean upload contracts.  Sixteen vertex integer constants are stored as
