@@ -114,6 +114,34 @@ last-vertex convention gives both triangles vertex 3.  Do not generalize that
 accident to first-vertex or quad-strip cases.  If provenance is unavailable,
 reject those flat topologies rather than emitting a visible color seam.
 
+Mesa's `draw_decompose_tmp.h` gives the exact reference ordering, and exposes
+two mismatches in Chrome9's custom loops.  In terms of the original input
+indices used by `chrome9_vbuf_draw_arrays()`/`draw_elements()`, copy D1/D2
+from:
+
+| input topology | first convention | last convention |
+|---|---|---|
+| triangles `(i,i+1,i+2)` | `i` | `i+2` |
+| strip triangle `i` | `i` | `i+2` |
+| fan/polygon triangle `(base,i,i+1)` | `i` | `i+1` |
+| legacy quad `i..i+3` | vertex `i+3` while `quads_follow_provoking_vertex_convention=false` | `i+3` |
+| legacy quad-strip quad `i..i+3` | vertex `i+3` while the same cap is false | `i+3` |
+
+For an odd strip triangle, the current geometry order is `(i+1,i,i+2)`;
+therefore choosing argument A would incorrectly use `i+1` for the first
+convention.  For a fan the current A vertex is the fixed anchor, whereas the
+first-convention provoking vertex is the previous rim vertex `i`.  For a
+quad strip, the current second triangle `(i,i+3,i+2)` ends at `i+2`, but both
+triangles of that API quad require `i+3` under the legacy last convention.
+Pass the original provoking index to `chrome9_emit_triangle()` or copy its
+packed color before the geometry indices are reordered; do not infer it from
+the final A/C slot.
+
+If `quads_follow_provoking_vertex_convention` is deliberately enabled later,
+use Mesa's reference decomposition instead: first-convention quads preserve
+the original first vertex in both triangles.  The current screen leaves this
+cap false, matching the legacy GL rule.
+
 Native A23 FlatA/FlatC is a later optimization for known D1/D2-only programs.
 It needs either structured raster state in every ioctl family or a run-level
 state field, and must not be enabled in only one successor.  Software color
