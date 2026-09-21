@@ -53,6 +53,9 @@ targets.
 - [fixed-function-state-transitions.md](fixed-function-state-transitions.md)
   combines blend, alpha-test, fog, scissor, and texture-format words into a
   transition-closed two-texture state image with exact body-index formulas.
+- [mip-format-projective-oracles.md](mip-format-projective-oracles.md)
+  defines bounded mip-level, format, software/native projection, and texture
+  cache-transition gates for the post-two-texture implementation.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
