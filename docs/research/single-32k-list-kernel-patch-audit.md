@@ -381,8 +381,10 @@ safe to remove.
 4. Kernel run handler/builder/ioctl/capability; `W=1` module build,
    `checkpatch`, UAPI 32/64-bit size/ioctl checks, KASAN host self-test.
 5. Standalone live oracle ladder and wrap/reload gate.
-6. Mesa UAPI copy/wrapper/outer-draw accumulation only after kernel silicon
-   validation.
+6. Mesa UAPI copy/wrapper and extension of the existing state-keyed retained
+   batch only after kernel silicon validation.  Preserve its current
+   framebuffer/clear/shadow/context/resource flush hooks and keep compiled
+   program batches capped at 34.
 7. Re-measure phase counters; persistent SF/GART mapping is the next isolated
    kernel patch, not part of command `0x0f`.
 

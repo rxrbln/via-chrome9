@@ -223,8 +223,13 @@ wrap counters show that it matters.
 
 ### Mesa state lifetime
 
-Accumulate triangles only within one Gallium `draw_vbo` call initially.  The
-run key is the complete native state envelope:
+The current Mesa Chrome9 path already retains compatible untextured batches
+across Gallium `draw_vbo` calls.  `chrome9_emit_triangle()` compares the
+complete pending request before appending; framebuffer changes, clears,
+sampler-shadow refreshes, explicit context/resource flushes, and context
+destruction call `chrome9_draw_flush_batch()`.  Extend that existing lifetime
+instead of adding a second accumulator.  The run key remains the complete
+native state envelope:
 
 ```text
 destination object/level/format/pitch/dimensions
@@ -235,12 +240,14 @@ blend equation/factors/mask/alpha test/constant
 scissor and post-TNL vertex layout
 ```
 
-Flush on capacity, key mismatch, outer draw end, validation failure, or
-fallback.  The first implementation must not retain vertices or resource
-references across Gallium draws; that would require explicit state hooks and
-resource-lifetime bookkeeping.  On a failed run ioctl, report the error and
-do not replay a prefix through legacy ioctls because the kernel may have
-published the complete list before the failure.
+Flush on capacity, key mismatch, every existing CPU/shadow/presentation
+boundary, validation failure, or fallback.  Do not add a flush merely at
+ordinary `draw_vbo` end: that would preserve the measured 237-call
+fragmentation.  Command `0x0f` may raise only the fixed-Gouraud perspective
+array from 34 to 272; the separately compiled program batch stays at 34 until
+it receives its own packet/lifetime proof.  On a failed run ioctl, report the
+error and do not replay a prefix through legacy ioctls because the kernel may
+have published the complete list before the failure.
 
 ### File-by-file patch boundary
 
