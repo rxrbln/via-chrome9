@@ -1302,7 +1302,8 @@ main(int argc, char **argv)
           screen->caps.packed_stream_output ||
           screen->caps.two_sided_color || screen->caps.clip_planes ||
           screen->caps.dithering ||
-          screen->caps.mixed_colorbuffer_formats) {
+          screen->caps.mixed_colorbuffer_formats ||
+          !screen->caps.mixed_color_depth_bits) {
          fprintf(stderr, "bounded Gallium capability contract failed\n");
          screen->destroy(screen);
          return 1;

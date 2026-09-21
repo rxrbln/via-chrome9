@@ -213,6 +213,10 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    caps->endianness = PIPE_ENDIAN_NATIVE;
    caps->max_texture_2d_size = 2048;
    caps->max_render_targets = 1;
+   /* The bounded draw paths support a 16-bit Z buffer with both 32-bit
+    * XRGB and BGRA color targets.  DRI needs this explicit contract or it
+    * filters the otherwise supported Z16 format from every 32-bit visual. */
+   caps->mixed_color_depth_bits = true;
    caps->max_vertex_buffers = 16;
    caps->max_varyings = 2;
    caps->constant_buffer_offset_alignment = 16;
