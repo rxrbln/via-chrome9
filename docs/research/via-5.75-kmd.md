@@ -165,8 +165,10 @@ reset, resume, translation rebuild, or change of ring ownership:
 3. Reapply `06000000`, `07100000`, and readback selector `02000000` through the
    CR port.  Install a dummy-only prefix ending at a 128-byte-aligned PAUSE;
    program A60..A68 once and trigger with `680a0001`.
-4. Require bounded confirmation of `0444.bit31` and `045c`/`0464` values inside the
-   owned ring.  Require all **non-CR** ordinary busy bits to be clear:
+4. Require bounded confirmation of `0444.bit31`.  Record `045c`/`0460`/`0464`
+   only as raw diagnostics; their HC3 address-readback meanings have not
+   produced changing or layout-valid values on live VX900 silicon.  Require
+   all **non-CR** ordinary busy bits to be clear:
    `0400 & 00101fe3 == 0`.  Accept CR bit 4 as either zero or one; value
    `00000010` with matching PAUSE is an extendable armed state.  Treat `043c`
    only as a fetch/request pointer and retain all prefetched storage.
@@ -190,7 +192,7 @@ ahead of PAUSE.
 | Reader state | Observable minimum | Permitted transition | Forbidden assumption |
 |---|---|---|---|
 | foreign paused | `0444[31]=1`, ownership/readbacks unknown | install owned dummy ring with complete A60..A68 tuple; preserve old resources if known | `043c` is a safe CPU offset or STOP is teardown |
-| owned prime paused | `0444[31]=1`, `0400 & 00101fe3=0`, `045c`/`0464` in owned ring; bit 4 may remain set | append/publish work, then advance A64/A65 only | CR bit 4 alone is a hang, or pointer movement proves dispatch |
+| owned prime paused | `0444[31]=1`, `0400 & 00101fe3=0`, owned software epoch/pause tuple; bit 4 may remain set | append/publish work, then advance A64/A65 only | CR bit 4 alone is a hang, pointer movement proves dispatch, or raw `045c`/`0464` validates ownership |
 | running/fetching | pause bit not yet observed and/or non-CR busy mask nonzero | wait for fence/pause under deadline | PTE, end, or ring storage can be reclaimed |
 | fetch paused, engine busy | `0444[31]=1`, but `0400 & 00101fe3 != 0` | retain all mappings and collect diagnostics; invoke only a proven full recovery | PAUSE means delivered 2D/3D work retired |
 | owned completed paused | `0444[31]=1`, non-CR mask zero, completion fence/side effect observed; bit 4 may remain set | submit by later A64/A65 or perform atomic owned STOP/replacement | `043c` equals retirement or is behind PAUSE |
@@ -351,9 +353,10 @@ The header defines these command-reader registers
 | `0438` | CR transfer end |
 | `043c` read | current command-request/fetch address, not proven retirement PC |
 | `0444` | command-reader status; bit 31 means PAUSE |
-| `045c` | pause-address readback |
-| `0460` | jump-address readback |
-| `0464` | start-address readback |
+| `045c` | HC3 pause-address readback; not live-validated on VX900 |
+| `0460` | HC3 jump-address readback; not live-validated on VX900 |
+| `0464` | HC3 start-address/location readback; not live-validated on VX900 |
+| `0468` | HC3 end-address readback; not live-validated on VX900 |
 | `0448` | VQ status; bit 30 means full |
 | `0400` | engine status |
 
@@ -403,7 +406,12 @@ CMDQ/MPEG and both HQV engines, then polls `00101ff3` after reset.  These are
 useful scope definitions, not justification for copying its unbounded loops or
 requiring CR bit 4 to clear while an ordinary PAUSE remains armed.  PAUSE-ready
 polling must instead ignore bit 4 and use `00101fe3`, together with
-`0444.bit31` and a matching pause readback.
+`0444.bit31`.  Do not require a matching `045c` value on VX900: four live
+streams with different pauses returned the same `045c/0460/0464` tuple
+`5778e8b1 bbfee773 1f2a0f31`, including low bits which contradict the HC3
+reserved/location fields.  The old Linux ring code consumes `043c` and `0444`
+but never these three address readbacks.  Until a VX900-specific readback
+enable sequence is proved, retain them as raw diagnostics only.
 
 The observed failed quad value `00080031` therefore decomposes exactly as bits
 19, 5, 4, and 0.  Bit 5 localizes the active pipeline stage to VP/front-end;

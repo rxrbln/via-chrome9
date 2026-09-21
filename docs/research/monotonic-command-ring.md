@@ -99,6 +99,40 @@ publish    = T10 select, A64 low, A65 high|PID00
 
 The existing builder's stronger 128-byte cursor alignment should remain.
 
+### Status readbacks: only `043c`, `0440`, and `0444` are actionable
+
+The VX800/VX820 HC3 manual, Part II printed pages 60--61, gives the exact
+older-generation status layout at MMIO `0400 + offset`:
+
+| MMIO | Documented value |
+|---:|---|
+| `043c` | bits 31:4 current executed AGP command address; bits 3:0 reserved |
+| `0440` | bits 31:4 current AGP command-request address; bits 1:0 CR0/CR3 test-mode errors |
+| `0444` | CR/VQ status; bit 31 is specifically `AGP_PAUSE && PID==00` |
+| `045c` | bits 31:4 programmed pause address |
+| `0460` | bits 31:4 programmed jump address |
+| `0464` | bits 31:4 programmed start address, bits 1:0 location |
+| `0468` | bits 31:4 programmed end address |
+
+That table names the registers, but it does **not** make every HC3 readback a
+valid VX900 oracle.  Four independent live VX900 shader-store transactions
+with different owned pauses returned the identical `045c/0460/0464` tuple
+`5778e8b1 bbfee773 1f2a0f31`.  The low nibbles also violate the HC3 reserved
+and location layouts.  The old 5.75 Linux header defines all three registers,
+but its command-ring implementation consumes only `043c` and `0444`; it never
+uses `045c`, `0460`, or `0464` to validate a transition.  The VX900 Part II
+manual documents T10 A60--A68 programming but omits these HC3 status
+readbacks.
+
+Therefore the monotonic implementation must record the expected start/end,
+pause, and STOP addresses in software and dump `045c/0460/0464/0468` only as
+raw diagnostics.  It must not gate readiness, retirement, replacement, or
+teardown on those values until a VX900-specific readback-enable sequence and
+changing live values are demonstrated.  The actionable bounded checks remain
+the exact ordered cookie, `0444.bit31`, and the appropriate `0400` busy mask.
+`043c`/`0440` are fetch diagnostics and conservative overwrite bounds, never
+retirement PCs.
+
 ### Why not copy the legacy circular reuse yet
 
 `get_space_ring_inv()` reserves the requested bytes plus
