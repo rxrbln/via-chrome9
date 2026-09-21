@@ -200,6 +200,9 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
    static const uint32_t pos[4] = {
       0x0008014c, 0x00000000, 0x00000000, 0x00080a0f
    };
+   static const uint32_t pos_tmp[4] = {
+      0x0010014c, 0x00000000, 0x00000000, 0x00080a0f
+   };
    static const uint32_t color[4] = {
       0x0008414c, 0x00000000, 0x00000000, 0x0008422f
    };
@@ -221,16 +224,32 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
       return false;
    memset(p, 0, sizeof(*p));
 
-   if (key == CHROME9_VS_MVP_COLOR_TEX0_XY) {
+   if (key >= CHROME9_VS_MVP_POSITION) {
       for (i = 0; i < 4; i++)
          append_vs(p, mvp[i]);
-      append_vs(p, pos);
-      append_vs(p, color);
-      append_vs(p, tex0);
-      p->output_metadata = 0x00000144;
+      append_vs(p, pos_tmp);
       p->constant_mask[0] = 0x0000000f;
-      p->input_mask = 0x0007;
-      p->output_count = 2;
+      p->input_mask = 0x0001;
+      p->output_metadata = 0x00000004;
+      p->a62_low = 3;
+      if (key == CHROME9_VS_MVP_POSITION_TEX0_XY) {
+         append_vs(p, tex0);
+         p->output_metadata = 0x00000104;
+         p->input_mask |= 0x0002;
+         p->a62_low = 5;
+      } else if (key == CHROME9_VS_MVP_POSITION_TEX0_TEX1_XY) {
+         append_vs(p, tex0);
+         append_vs(p, tex1);
+         p->output_metadata = 0x00000204;
+         p->input_mask |= 0x0006;
+         p->a62_low = 6;
+      } else if (key == CHROME9_VS_MVP_COLOR_TEX0_XY) {
+         append_vs(p, color);
+         append_vs(p, tex0);
+         p->output_metadata = 0x00000144;
+         p->input_mask |= 0x0006;
+         p->a62_low = 6;
+      }
    } else {
       append_vs(p, pos);
       p->output_metadata = 0x00000004;
@@ -239,19 +258,28 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
          append_vs(p, tex0);
          p->output_metadata = 0x00000104;
          p->input_mask |= 0x0002;
-         p->output_count = 1;
+         p->a62_low = 1;
       }
       if (key >= CHROME9_VS_POSITION_TEX0_TEX1_XY) {
          append_vs(p, tex1);
          p->output_metadata = 0x00000204;
          p->input_mask |= 0x0004;
-         p->output_count = 2;
+         p->a62_low = 2;
       }
    }
 
    p->active_count = p->upload_count + 3;
    for (i = 0; i < 5; i++)
       append_vs(p, vs_tail[i]);
+   switch (p->output_metadata) {
+   case 0x00000004: p->a25 = 0x25f00000; break;
+   case 0x00000104: p->a25 = 0x25f0c000; break;
+   case 0x00000204: p->a25 = 0x25f0cc00; break;
+   case 0x00000144: p->a25 = 0x25f4c000; break;
+   default: return false;
+   }
+   p->a26 = 0x26000000;
+   p->a60 = 0x60800000 | (p->active_count - 1);
    return p->active_count <= p->upload_count &&
           p->upload_count <= CHROME9_VS_POLICY_MAX;
 }

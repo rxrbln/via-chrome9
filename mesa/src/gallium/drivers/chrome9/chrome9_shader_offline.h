@@ -55,15 +55,21 @@ enum chrome9_vs_key {
    CHROME9_VS_POSITION,
    CHROME9_VS_POSITION_TEX0_XY,
    CHROME9_VS_POSITION_TEX0_TEX1_XY,
+   CHROME9_VS_MVP_POSITION,
+   CHROME9_VS_MVP_POSITION_TEX0_XY,
+   CHROME9_VS_MVP_POSITION_TEX0_TEX1_XY,
    CHROME9_VS_MVP_COLOR_TEX0_XY,
 };
 
 struct chrome9_vs_program {
    uint32_t instruction[CHROME9_VS_POLICY_MAX][4];
    uint32_t output_metadata;
+   uint32_t a25;
+   uint32_t a26;
+   uint32_t a60;
    uint32_t constant_mask[8];  /* c0..c255 */
    uint16_t input_mask;        /* v0..v15 */
-   uint16_t output_count;      /* A62 low nine bits */
+   uint16_t a62_low;           /* compiler-derived A62 low nine bits */
    uint16_t active_count;      /* A60 is 60800000|(active_count-1) */
    uint16_t upload_count;
 };
