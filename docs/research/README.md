@@ -149,6 +149,11 @@ targets.
   maps the first executable GL2 generic and texturecolor programs, fixes the
   job-local semantic-program UAPI, constant/sampler linkage, post-TNL varying
   contract, unchanged packet indices, and guarded promotion sequence.
+- [ioquake3-gl2-first-native-sequence.md](ioquake3-gl2-first-native-sequence.md)
+  resolves the configuration-dependent first GL2 link failure, maps the
+  reduced renderer's generic/fast-light/texturecolor execution order, proves
+  that fast lightall needs a packed-coordinate post-TNL split rather than a
+  native VS ABI, and records fresh Windows compiler hashes and staged gates.
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
