@@ -649,11 +649,14 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       ctx->rejected_triangles++;
       if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
          const struct pipe_depth_stencil_alpha_state *dsa = ctx->dsa;
+         const struct pipe_rt_blend_state *rt =
+            ctx->blend ? &ctx->blend->rt[0] : NULL;
 
          fprintf(stderr,
                  "chrome9: triangle rejected by bounded draw state: "
                  "reason=%s fs=%u layout=%u tex=%u views=%u samplers=%u "
                  "target=%u depth=%u dsa=%u/%u/%u stencil=%u/%u "
+                 "blend=%u/%u/%u/%u/%u/%u/%u mask=%#x "
                  "blend_successor=%u caps=d16:%u d16b:%u tex:%u texb:%u\n",
                  state_reason ? state_reason : "unknown",
                  ctx->fs ? ctx->fs->fragment_program : 0,
@@ -666,6 +669,14 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                  dsa ? dsa->depth_func : 0,
                  dsa ? dsa->stencil[0].enabled : 0,
                  dsa ? dsa->stencil[1].enabled : 0,
+                 rt ? rt->blend_enable : 0,
+                 rt ? rt->rgb_func : 0,
+                 rt ? rt->rgb_src_factor : 0,
+                 rt ? rt->rgb_dst_factor : 0,
+                 rt ? rt->alpha_func : 0,
+                 rt ? rt->alpha_src_factor : 0,
+                 rt ? rt->alpha_dst_factor : 0,
+                 rt ? rt->colormask : 0,
                  blend_successor, ctx->draw_triangle_d16,
                  ctx->draw_triangle_d16_blend,
                  ctx->draw_textured_triangle,
