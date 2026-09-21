@@ -182,6 +182,29 @@ different producer/consumer representation associated with the textured
 multi-ALU rewrite. Dependency metadata must come from the complete producer
 graph and phase finalizer, never merely from source register class.
 
+The raw/final differential separates scheduler allocation from dependency
+finalization. Before the explicit configuration-2 pass, the textured chain
+already contains destination id 15 and consumer id 63:
+
+```text
+raw ALU0   00800530 30140924 00f00005 000003e0
+raw ALU1   0140b6d0 00081053 00f03f00 00000820
+raw TAU    201001b0
+raw A90    90000000
+
+config2 ALU0 00800530 30140924 00f20005 200003e0
+config2 ALU1 0140b6d0 00081053 00f03f00 00000820
+config2 TAU  301001b0
+config2 A90  90000000
+```
+
+Thus the compiler scheduler chooses the matched 15/63 bypass encoding; the
+explicit dependency pass adds ALU0 d2.bit17, destination d3.bit29, and TAU
+bit28. For the ALU-only two-record chain the raw consumer's d2 is `00f00005`
+and configuration-2 changes it to `00f20005`, while A90 changes from
+`90040000` to `90058000`. Ids 15/63 are special dependency encodings, not
+evidence for 16 or 64 general temporaries.
+
 The Windows backend before configuration-2 and the Linux production
 finalizer give exact one-texture dependency deltas for every v1 source slot:
 
