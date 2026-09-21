@@ -26,6 +26,14 @@ interrupt-wait; it does **not** prove that its zero mask orders arbitrary 3D
 stores.  Windows' nonzero, engine-specific masks are the authority for a new
 driver.
 
+Older H5/H6 branches in the same source are not alternative VX900 encodings.
+They write traditional CR fence subaddresses A01/A02/A03 or A04--A07, with
+trigger `00100000`, idle mode `00010000`, interrupt `00020000`, system write
+`00040000`, interrupt-wait `00200000`, and queue disable `00400000`.  The
+chip-selection code deliberately routes H5S2VP1/VX900 to the FE40/FE3x
+builder instead.  Reusing A01--A07 on 7122 would combine a different fence
+queue and wait model with the new command reader without vendor evidence.
+
 The four dwords, on a 16-byte boundary, are:
 
 ```text
@@ -65,6 +73,11 @@ Keep the existing cookie and owned PAUSE after it:
 
 The memory record proves the selected 3D wait completed; the later cookie and
 owned PAUSE retain the already-live command-order and reader-ownership proof.
+`ADDCmdHeader3X_INVI()` may insert up to three `CC000000` alignment dwords, so
+the kernel helper must run the existing `segment_stop + 0x220 <= PAGE_SIZE`
+check after insertion.  Do not subtract a nominal 16 bytes from the maximum
+batch and assume alignment: reject `-E2BIG` if the completed immutable
+read-ahead closure no longer fits.
 
 ## Why the first production mode should be `FE330006`, not `FE330036`
 
