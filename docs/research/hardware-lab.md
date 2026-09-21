@@ -942,3 +942,25 @@ the temporary BAR2 `0x6000000` staging surface.  The required next milestone
 is to retain one SF/GART mapping for the same framebuffer and make IGA1 scan
 it out directly; dma-buf remains only an optional DRI3 process-sharing
 transport, never the presentation architecture.
+
+The first bounded fragment-uniform path then passed on the same hardware at
+Mesa nested commit `80c2c9d`.  It accepts only one finite vec4 at fragment CB0
+offset zero and lowers it to the proven D1 primary-color input; both user and
+resource constant buffers produced exact samples and intact guards:
+
+```text
+Gallium c0 solid shader passed: sample=004080bf
+Gallium resource c0 solid shader passed: sample=00ff0080
+```
+
+This did not remove the drawable-import failure.  A run with
+`CHROME9_DEBUG_RESOURCES=1` proved the precise frontend mismatch: because
+`pipe_caps.npot_textures` remains false, `dri_init_screen()` chooses
+`PIPE_TEXTURE_RECT` for dma-buf imports.  Glamor passes the same EGL image to
+`glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, ...)`; `st_bind_egl_image()` then
+returns `GL_INVALID_OPERATION` because the Gallium resource target and GL
+texture target differ.  Immediately preceding format probes accepted BGRX as
+both RECT render/sampler and 2D sampler, ruling out format support as the
+failure.  The aligned fix is real NPOT 2D texture support—including mip and
+repeat semantics—rather than falsely setting the cap merely to change the DRI
+import target.
