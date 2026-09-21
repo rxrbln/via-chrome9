@@ -31,6 +31,11 @@ targets.
   the dense semantic-SSA kernel boundary.
 - [chrome9-ps-canonical-temp-allocation-corpus.tsv](chrome9-ps-canonical-temp-allocation-corpus.tsv)
   retains sparse, reverse-definition, and dead/nonoverlap allocation rows.
+- [chrome9-ps-inplace-waw-negative.md](chrome9-ps-inplace-waw-negative.md)
+  proves the vendor register-id finalizer accepts WAW without SSA DCE and
+  defines the first structured compiler's reject-only boundary.
+- [chrome9-ps-inplace-waw-negative-corpus.tsv](chrome9-ps-inplace-waw-negative-corpus.tsv)
+  retains the exact Linux/Windows alias and overwrite differentials.
 - [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
   finalized oC0 and texture-consumer golden corpus for the bounded encoder.
 - [chrome9-ps-temp-lifetime-finalizer.md](chrome9-ps-temp-lifetime-finalizer.md)

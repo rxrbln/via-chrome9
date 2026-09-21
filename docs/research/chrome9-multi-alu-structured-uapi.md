@@ -99,7 +99,8 @@ Validation should happen before BO lookup, vertex copying, or ring mutation:
    Require every byte of `instruction[instruction_count..2]` to be zero.
 2. Accept only MOV and MUL. MOV requires an all-zero second source.
 3. Accept only identity XYZW, modifier zero, and source reserved zero.
-4. VARYING must be `v0`; CONSTANT must be `c0`; TEMP must be `r0` or `r1`.
+4. VARYING must be `v0`; CONSTANT must be `c0`; semantic TEMP must be `t0`
+   or `t1`.
 5. Every destination must have writemask `0xf` and reserved zero.
 6. Only the last record may write COLOR, it must write semantic `oC0`, and the
    last record must write COLOR.
@@ -139,6 +140,28 @@ must never be consumed as a native bitmap.
 Exact sparse/reverse/dead allocation rows and the Linux/Windows boundary are
 retained in
 [chrome9-ps-canonical-temp-allocation.md](chrome9-ps-canonical-temp-allocation.md).
+The permissive vendor WAW boundary, including the decisive overwrite without
+vendor DCE, is retained in
+[chrome9-ps-inplace-waw-negative.md](chrome9-ps-inplace-waw-negative.md).
+
+The kernel implementation order should be explicit:
+
+1. validate the semantic graph and build `defined_mask` plus read counts in
+   semantic-name space;
+2. reject WAW, read-before-definition, dead definitions, holes, and any
+   nonzero unused fixed-width record;
+3. map each surviving semantic name to the rank of that name in the sorted
+   defined set, producing physical p0/p1 independently of definition order;
+4. rewrite all destination and source ids through that table;
+5. count and consume uses again in physical-id space, applying A-over-C when
+   one instruction makes duplicate final reads; and
+6. encode destination/source fields and compare the complete rebuilt native
+   object against the same bounds used for packet construction.
+
+For the present dense `{t0[,t1]}` contract step 3 produces the numerical
+identity map. It must still exist as a distinct phase: treating a semantic
+mask as the native active-resource bitmap would recreate the exact sparse-id
+bug demonstrated by the proprietary identity-callback harness.
 
 Mesa serializes the dense semantic ids in `native_fs_ir`. Its cached native
 program is only a comparison oracle for the kernel's rebuilt allocation. The
