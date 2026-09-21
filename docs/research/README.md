@@ -168,8 +168,9 @@ targets.
   defines capability-gated one-/two-texture D16 blend successors, resolves
   the A33/A10 collision at body 19, and fixes packet, lifetime and live gates.
 - [two-texture-primary-uapi-design.md](two-texture-primary-uapi-design.md)
-  defines the flag-compatible no-depth/D16 three-factor ABI, exact 266/270
-  dword packet maps, Mesa Q=1 gates, and staged four-object silicon tests.
+  defines the flag-compatible no-depth/D16 three-factor ABI, exact full-RGBA
+  and primary-alpha-bypass programs, TEXLD/TEXLDP Q boundaries, packet maps,
+  Mesa keys, format semantics, and staged four-object silicon tests.
 - [textured-d16-format-contract.md](textured-d16-format-contract.md) gives the
   exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
   X-versus-alpha sampler semantics, and strict render-target reinterpretation
