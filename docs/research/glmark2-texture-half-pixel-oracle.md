@@ -2,7 +2,9 @@
 
 This note reduces the September 21, 2026 `glmark2` texture validation failure
 to one post-viewport coordinate convention. It does not require a texture
-format, pitch, shader, or sampler-state change.
+format, pitch, shader, or sampler-state change. The correction is now
+live-proven on VX900 by Mesa nested commit `9fc563b` (parent commit
+`4b6f0e2`).
 
 ## Reproducible inputs
 
@@ -116,6 +118,29 @@ Required gates are:
 Do not change A31, A20/A22, texture pitch, MODULATE words, or upload layout in
 the same experiment. The exact paired nearest/linear reconstruction makes
 those changes both unnecessary and less diagnostic.
+
+## Live closure
+
+The implementation subtracts `0.5f` from both post-viewport X and Y exactly
+when Gallium requests `half_pixel_center`. It leaves S/T and all other
+varyings unchanged. On the target VX900:
+
+- the complete Chrome9 screen smoke passed, including the guarded texture,
+  signed-repeat, D16, blend, scissor, and transition paths;
+- `glmark2 --validate` passed the texture cube with both nearest and linear
+  filtering, and the Gouraud cat remained successful;
+- SWIOTLB occupancy remained 200 and engine MMIO `040c` remained zero; and
+- deterministic full-frame captures were retained locally for comparison.
+
+This promotes the post-viewport half-pixel correction from a derived oracle
+to live-proven behavior. It also confirms the original diagnosis: no sampler,
+texture-layout, format, or MODULATE change was needed.
+
+The same validated build produced these indicative measurements (not a
+correctness contract): no-LLVM Draw ran the cat at 6 FPS over 20 frames and
+texture at 54 FPS over 200 frames; static LLVM Draw ran the cat at 18 FPS over
+20 frames and texture at 51 FPS over 200 frames / 57 FPS over 1000 frames.
+Both configurations preserved validation results.
 
 ## Unrelated build-scene trap
 
