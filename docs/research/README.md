@@ -105,6 +105,11 @@ targets.
   one-record reuse of the FRC key.
 - [chrome9-flr-expansion-static.tsv](chrome9-flr-expansion-static.tsv) records
   exact Windows/Linux allocator, append, and release call-site provenance.
+- [chrome9-dst-one-record-audit.md](chrome9-dst-one-record-audit.md) closes
+  DST source-slot packing and defines normalized `DST(v0,v0)` as the safest
+  bounded one-record key after a guarded pixel oracle.
+- [chrome9-dst-one-record-corpus.tsv](chrome9-dst-one-record-corpus.tsv)
+  retains four byte-matched Windows/Linux v0/c0 DST topologies.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
