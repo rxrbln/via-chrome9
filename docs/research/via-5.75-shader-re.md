@@ -1147,6 +1147,18 @@ not sampler or register-class changes.  Together they give exact controls
 `stmPPSCompile_invi` directly; the earlier offline probe deliberately stopped
 before this phase.
 
+The same target finalizer is now measured for both two-TAU schedule shapes.
+Two independent samples followed by one MUL produce TAUs
+`a01001b0 311001b1`, ALU
+`0140b6d0 3003f000 00f20005 00000820`, and controls
+`90000000 91000001 92020001 93000002`.  Making the second coordinate depend
+on the first result produces TAUs `201001b0 b11001b1`, ALUs
+`01c00530 301c0053 00f00005 000d0420` and
+`0140b6d0 3003f000 00f20005 00000820`, plus controls
+`90000000 91000001 92020002 93000003 94000000 95000001`.
+Consequently TAU bits 31/28 are schedule-dependent finalizer outputs, not
+fixed opcode bits, and finalizing every TAU by a constant OR is wrong.
+
 Adjacent compiler metadata is also pinned down:
 
 | object offset | meaning | evidence |
@@ -1525,7 +1537,7 @@ The smallest compiler-derived constant-color program is
 
 ```text
 fe020440 0000043c 00010000 cc000000
-90040000 91000000 92000001 93000000
+90058000 91000000 92000001 93000000
 94000000 95000000 96000000 97000000
 98000000 99000000 9a000000 9b000000
 
@@ -1536,6 +1548,9 @@ fe03043c 00000004 20030000 cc000000
 fe03043c 00000004 22030000 cc000000
 3f800000 00000000 00000000 3f800000
 ```
+
+`90058000` is the configuration-2 execution form.  The compile pass alone
+reports `90040000`; that pre-post-translation value is not an upload oracle.
 
 For `vs_2_0; mov oPos,v0; end`, the fully dispatched position instruction is
 `0008014c 00000000 00000000 00080a0f`, but the zero-context probe cannot

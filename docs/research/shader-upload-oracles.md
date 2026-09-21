@@ -132,6 +132,28 @@ ALU id), but its controls and finalizer-owned bits are identical.  Raw
 compiler outputs `00f00005/201001b0` are semantic templates only and must not
 be passed to the program stores.
 
+Configuration two is equally material for multiple textures.  It preserves
+the independently recovered control maps but assigns per-record TAU high bits
+and the consuming ALU dependency field according to the phase schedule:
+
+```text
+# texld r0,t0,s0; texld r1,t1,s1; mul oC0,r0,r1
+A90..A95  90000000 91000001 92020001 93000002 94000000 95000000
+TAU       a01001b0 311001b1
+ALU       0140b6d0 3003f000 00f20005 00000820
+
+# texld r0,t0,s0; texld r1,r0,s1; mul oC0,r0,r1
+A90..A95  90000000 91000001 92020002 93000003 94000000 95000001
+TAU       201001b0 b11001b1
+ALU       01c00530 301c0053 00f00005 000d0420
+          0140b6d0 3003f000 00f20005 00000820
+```
+
+Do not implement finalization as `TAU |= 0x10000000`: the first independent
+TAU instead gains bit 31, and the dependent schedule gives the second TAU both
+bits 31 and 28.  The compiler/finalizer transaction or an exactly equivalent
+dependency analysis must own these words as a unit with A90..A9a.
+
 ## Exact VS behavior and varying linkage
 
 The four-instruction Xorg VS above is the known-good pretransformed rectangle
@@ -253,7 +275,7 @@ the proven ARGB0888 target and COPY blend state, all covered pixels should be
 `90058000` as a safe resource superset; it tests constant-store addressing and
 the constant-source ALU encoding while changing the fewest live words.
 
-The compiler-coherent zero-runtime-state PS block is separately known:
+The pre-post-translation zero-runtime-state PS block is separately known:
 
 ```text
 FE020440 0000043C 00010000 CC000000
@@ -263,11 +285,12 @@ FE020440 0000043C 00010000 CC000000
 ```
 
 Linux 5.75 reports object metadata `+2c=00040000`, ALU count one, TAU count
-zero, and all other relevant fields zero; the Windows backend emits the same
-native instruction.  This coherent control tuple is useful as a second
-discriminator after the six-dword derivative, but it is not part of a
-silicon-proven full draw and its packet termination/alignment must be emitted
-by the normal H2 builder rather than copied as a naked 12-word array.
+zero, and all other relevant fields zero before its mandatory target pass;
+the Windows backend emits the same native instruction.  Configuration two
+changes A90 to `90058000`.  The `90040000` tuple is retained only as a
+compiler-phase discriminator and must not be executed.  Packet termination
+and alignment in either case must come from the normal H2 builder rather than
+copying a naked 12-word array.
 
 ## Oracle C: proven texture sample
 
@@ -622,6 +645,100 @@ tests, but truthful ES2 exposure must wait for the full ES2 minimum texture,
 blend, format, varying, shader-language, and draw semantics.  The proprietary
 ICDs themselves did not advertise GLSL, so their compiler is an encoding
 oracle rather than a conformance claim.
+
+## Offline glamor compiler milestone
+
+The matching T2 sysroot's `libglamoregl.so` has SHA-256
+`11fb74c3196900f056657b1ecc1346d0b16440c215f45a62d88df6362507dcd3`.
+Its embedded startup/copy/composite shader strings establish the first useful
+GLSL expression family without guessing from a benchmark:
+
+```glsl
+gl_Position = v_position;
+source_texture = v_texcoord0.xy;
+mask_texture = v_texcoord1.xy;
+
+frag_color = source;                         /* solid */
+frag_color = texture(source_sampler, uv0);   /* copy */
+frag_color = get_source() * get_mask();      /* composite */
+```
+
+`get_source` and `get_mask` independently select a uniform color or a 2-D
+texture.  The adjacent variants multiply by mask alpha, source alpha, perform
+RGBX reconstruction, repeat-coordinate repair, discard, or dual-source
+output.  Those are separate compiler gates, not aliases of the full-vector
+MUL path.
+
+The offline-only Mesa-side compiler in
+`chrome9_shader_offline.[ch]` now recognizes exactly eight finalized fragment
+forms:
+
+| normalized expression | constants | samplers | execution shape |
+|---|---:|---:|---|
+| `v0` | none | none | ALU-only |
+| `c0` | c0 | none | ALU-only |
+| `v0*c0` | c0 | none | ALU-only |
+| `c0*c1` | c0,c1 | none | ALU-only |
+| `tex0` | none | s0 | TAU0, ALU |
+| `tex0*v0` | none | s0 | TAU0, ALU |
+| `tex0*c0` | c0 | s0 | TAU0, ALU |
+| `tex0*tex1` | none | s0,s1 | TAU0, TAU1, ALU |
+
+Every table entry is the exact Linux compiler result after configuration-2
+post-translation, including A90..A9b and the per-record dependency fields.
+MUL inputs are canonicalized only for commutativity.  The compiler reports
+the constant, varying, and sampler masks needed to cross-check draw state; it
+has no raw-native-input entry point.
+
+The same file carries four exact Linux vertex templates: clip position;
+position plus T0.xy; position plus T0/T1.xy; and M4x4 position plus color and
+T0.xy.  The two-texture glamor pass-through has eight uploaded records, six
+active records, metadata `00000204`, output count two, and these three user
+records before the three active finalizer records and two inactive sentinels:
+
+```text
+0008014c 00000000 00000000 00080a0f  # oPos = v0
+0008414c 00000000 00000000 00080283  # oT0.xy = v1.xy
+0008814c 00000000 00000000 00080293  # oT1.xy = v2.xy
+```
+
+This native vertex template takes clip-space input and runs the generic
+reciprocal-W/viewport finalizer.  It must not consume the current Gallium
+`draw` module's post-viewport vertices.  For the first glamor milestone,
+retain software vertex execution plus the live-proven Xorg post-transform VS;
+only the fragment classifier needs to select the new finalized programs.
+
+The standalone corpus builds without Mesa integration:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -O2 \
+  chrome9_shader_offline.c chrome9_shader_offline_test.c \
+  -o /tmp/chrome9-shader-offline-test
+/tmp/chrome9-shader-offline-test
+```
+
+It checks eight PS and all four VS templates, exact instruction words,
+controls, metadata, active/upload counts, resource masks, and a rejected
+unsupported form.  This code is intentionally absent from `meson.build` and
+does not change caps or submission.
+
+The NIR-facing gate may map to this key only after proving all of the
+following: one entry point and one acyclic block; exactly one full-XYZW color
+store; only identity MOV wrappers and one full-vector FMUL; leaves limited to
+COL0, aligned vec4 c0/c1, and ordinary normalized 2-D TEX at linked T0/S0 or
+T1/S1; no source swizzle, partial write, projection, bias/LOD, offset, shadow,
+array, derivative, discard, depth, system value, integer, or indirect access.
+The texture coordinate must be the matching full `Tn.xy` input.  Any unused
+instruction or resource is rejection.  In particular, glamor's `.a` mask,
+RGBX, repeat-repair, gradient, stipple, glyph, and dual-source variants stay
+on fallback until they receive their own native corpus and silicon gate.
+
+This milestone still does not justify GL 2.0, ES 2.0, or glamor enablement.
+It supplies compiler truth for solid/copy/full-RGBA composite only; NPOT,
+FBO/render-to-texture, texture-domain synchronization, all required blend
+equations, stencil, shader-language limits, and the remaining startup shaders
+must pass independently.  A classifier miss must keep the existing safe
+software path or report unsupported, never substitute a nearby template.
 
 ## Compiler feature limits and safe Mesa exposure
 

@@ -455,11 +455,11 @@ object/control transitions:
 2. exactly one leading `TEXLD rN,t0,s0`, followed only by ALU operations and
    ending in `MOV/MUL/... oC0,...`.
 
-For an ALU-only program with `N` native instructions, the compiler-derived
+For an ALU-only program with `N` native instructions, the target-finalized
 control tuple is:
 
 ```text
-90040000 91000000 9200nnnn 93000000
+90058000 91000000 9200nnnn 93000000
 94000000 95000000 96000000 97000000
 98000000 99000000 9a000000 9b000000
 ```
@@ -467,7 +467,7 @@ control tuple is:
 For one leading texture instruction followed by `N` ALU instructions, it is:
 
 ```text
-90000000 91000000 9201nnnn 93000001
+90018000 91000001 9201nnnn 93000001
 94000000 95000000 96000000 97000000
 98000000 99000000 9a000000 9b000000
 ```
@@ -478,7 +478,9 @@ index zero; it never switches back.  Both tuples precede ordinary type-03
 uploads: `N*4` dwords under `20030000`, then zero or one dword under
 `21030000`.  Runtime integration must preserve the normal H2 packet builder
 and any nonzero `9b` low state bits rather than blindly copying these zero-
-context examples.
+context examples.  The older `90040000/91000000` and
+`90000000/91000000` forms are pre-post-translation metadata only and are not
+execution payloads.
 
 The raw one-texture MODULATE body produced by both offline compiler emitters
 before the Linux post-translation dependency pass is:
@@ -625,22 +627,61 @@ for ALU / TAU.  Reproducible cases are `tex2_independent` and
 mechanism but does not promote two samplers in Mesa before texture-state and
 linkage tests pass on silicon.
 
-The same headless path bounds three later fixed-function combine operations.
-After the same two independent TEXLDs, direct output ADD, MAD, and LRP each
-remain one ALU record after finalization, retain TAUs
-`201001b0 211111b1`, and use ALU/TAU count `92020001` with T2A
-`93000002` and no A2T bits:
+The Linux configuration-2 finalizer gives the execution-form counterpart.
+For the independent two-sample MUL it preserves the control tuple but changes
+the first/second TAUs to `a01001b0 311001b1` and sets the consuming ALU source
+word to `00f20005`:
 
 ```text
-add oC0,r0,r1:     00010000 00140924 00f00000 00000820
-mad oC0,r0,r1,v0: 00400530 00001000 00f00000 00000820
-lrp oC0,r0,r1,v0: 00000000 00040053 00f00100 00110820
+TAU a01001b0 311001b1
+ALU 0140b6d0 3003f000 00f20005 00000820
+A90..A95 = 90000000 91000001 92020001 93000002 94000000 95000000
 ```
 
-These are compiler-semantic templates for eventual `GL_ADD`, multiply-add,
-and `GL_INTERPOLATE` lowering.  They use the probe's virtual identity/zero
-allocator and have no silicon proof, so they must not be copied into the
-current Xorg-allocated fixed packet or advertised as texture-env support.
+For the dependent-coordinate form it emits the complete alternating schedule:
+
+```text
+TAU 201001b0 b11001b1
+ALU 01c00530 301c0053 00f00005 000d0420
+    0140b6d0 3003f000 00f20005 00000820
+A90..A95 = 90000000 91000001 92020002 93000003 94000000 95000001
+```
+
+Thus TAU bits 31 and 28 are per-record finalizer fields, not a single fixed
+class nibble.  Their pattern depends on the selected phase order; do not
+derive them merely by setting bit 28 on every TAU.  The final ALU consuming a
+TAU has source dependency bit 17, while the intervening ALU in the dependent
+form does not.  These exact words came from the normal Linux compiler followed
+by `stmPPS_PostTranslationSetting_invi(..., 2)` and are the first suitable
+generic two-texture upload candidates.  They still require stage-1 texture
+state and varying linkage silicon gates.
+
+The same finalized Linux path bounds later fixed-function combine operations.
+After two independent TEXLDs, direct output ADD and MAD each remain one ALU
+record, use TAUs `a01001b0 311001b1`, ALU/TAU count `92020001`, T2A
+`93000002`, and no A2T bits:
+
+```text
+add oC0,r0,r1:     003f0000 30140924 00f20005 00000820
+mad oC0,r0,r1,v0: 00400530 3003f000 00f20005 00000820
+```
+
+LRP is not one native ALU in the Linux backend.  It lowers to two records and
+causes the second TAU to carry the dependent form's high bits, while retaining
+the two-TAU-then-two-ALU control order:
+
+```text
+TAU a01001b0 b11001b1
+ALU 803f0000 30140924 00f04005 00000020
+    00400530 30000053 00f20005 00000820
+A92..A95 = 92020002 93000002 94000000 95000000
+```
+
+These are compiler-semantic and scheduler goldens for eventual `GL_ADD`,
+multiply-add, and `GL_INTERPOLATE` lowering.  They use the compiler's own
+allocation rather than the Xorg fixed program's physical assignment and have
+no silicon proof, so they must not be copied piecemeal into that packet or
+advertised as texture-env support.
 
 ## Direct3D operand normalization
 
