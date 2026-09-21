@@ -150,6 +150,11 @@ targets.
   controls, and a guarded color-plus-depth live oracle.
 - [chrome9-texkill-schedule-corpus.tsv](chrome9-texkill-schedule-corpus.tsv)
   retains four exact Windows/Linux TEXKILL programs and A90..A95 tuples.
+- [chrome9-texldp-texldb-audit.md](chrome9-texldp-texldb-audit.md) closes the
+  projected/bias sample execution-form rewrite and defines distinct projective
+  and mip-bias silicon gates.
+- [chrome9-texldp-texldb-corpus.tsv](chrome9-texldp-texldb-corpus.tsv) retains
+  exact terminal operation-7/operation-3 TAU programs and controls.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
