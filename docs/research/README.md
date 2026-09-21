@@ -43,6 +43,12 @@ targets.
 - [chrome9-mad-dot-rung-corpus.tsv](chrome9-mad-dot-rung-corpus.tsv) retains
   all 16 Windows/Linux byte-matched v0/c0 MAD and dot-product records,
   including every duplicated MAD source topology.
+- [chrome9-cmp-abs-sat-rung.md](chrome9-cmp-abs-sat-rung.md) closes compiler
+  placement for CMP/ABS/SAT, defines guarded CMP and native-ABS oracles, and
+  isolates the still-unproved upper half of destination saturation.
+- [chrome9-cmp-abs-sat-corpus.tsv](chrome9-cmp-abs-sat-corpus.tsv) retains all
+  eight duplicate CMP topologies, both ABS sources, and the cross-driver SAT
+  bit differential across eleven operations.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
