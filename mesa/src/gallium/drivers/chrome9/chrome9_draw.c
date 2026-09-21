@@ -1070,10 +1070,10 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
             copy.destination_handle = external_resource->bo.handle;
             copy.destination_pitch = external_resource->stride;
             copy.flags |= DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED;
-            /* A scanout is an opaque depth-24/XRGB destination even when
-             * GBM stores it in an ARGB allocation.  Preserve its unused X
-             * byte and copy RGB in one H6 pass instead of copying then
-             * repainting alpha over the same rectangle. */
+            /* The opt-in is restricted to a verified opaque depth-24 root:
+             * PIPE_BIND_SCANOUT alone cannot distinguish it from a logical
+             * ARGB scanout.  Preserve the root's unused X byte and copy RGB
+             * in one H6 pass instead of repainting alpha afterward. */
             if (ctx->copy_rect_preserve_alpha &&
                 (copy.flags & DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE)) {
                copy.flags &= ~DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE;
