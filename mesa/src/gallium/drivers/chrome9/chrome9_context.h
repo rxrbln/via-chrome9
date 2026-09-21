@@ -50,6 +50,27 @@ struct chrome9_sampler_state {
    bool supported;
 };
 
+struct chrome9_sampler_view {
+   struct pipe_sampler_view base;
+   /* Unguarded external images remain the Gallium-visible texture.  The
+    * hardware samples this guarded, draw-refreshed copy instead. */
+   struct pipe_resource *shadow;
+};
+
+static inline struct chrome9_sampler_view *
+chrome9_sampler_view(struct pipe_sampler_view *view)
+{
+   return (struct chrome9_sampler_view *)view;
+}
+
+static inline struct pipe_resource *
+chrome9_sampler_view_resource(struct pipe_sampler_view *view)
+{
+   struct chrome9_sampler_view *cview = chrome9_sampler_view(view);
+
+   return cview->shadow ? cview->shadow : view->texture;
+}
+
 struct chrome9_vertex_elements {
    unsigned count;
    struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];

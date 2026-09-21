@@ -1376,9 +1376,12 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_resource *target = NULL, *texture = NULL;
    struct pipe_resource *bgra_target = NULL;
    struct pipe_resource *rhw_target = NULL, *rhw_texture = NULL;
+   struct pipe_resource *shadow_source = NULL;
    struct pipe_context *context = NULL;
    struct pipe_sampler_view view_templ, rhw_view_templ;
    struct pipe_sampler_view *view = NULL, *mip_view = NULL, *rhw_view = NULL;
+   struct pipe_sampler_view *shadow_view = NULL;
+   struct winsys_handle shadow_handle = { .type = WINSYS_HANDLE_TYPE_FD };
    struct pipe_transfer *mip_transfer = NULL;
    struct pipe_box mip_box = {
       .x = 0, .width = 1, .y = 0, .height = 1, .z = 0, .depth = 1,
@@ -1576,6 +1579,18 @@ run_pipe_texture(struct pipe_screen *screen)
    rhw_view_templ.swizzle_a = PIPE_SWIZZLE_1;
    rhw_view = context->create_sampler_view(context, rhw_texture,
                                            &rhw_view_templ);
+   if (screen->resource_get_handle(
+          screen, NULL, rhw_texture, &shadow_handle,
+          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE)) {
+      shadow_handle.offset = 0;
+      shadow_source = screen->resource_from_handle(
+         screen, &rhw_texture_templ, &shadow_handle,
+         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      close(shadow_handle.handle);
+   }
+   if (shadow_source)
+      shadow_view = context->create_sampler_view(context, shadow_source,
+                                                 &rhw_view_templ);
    replace_vs = make_texture_vertex_shader(screen, context, false);
    modulate_vs = make_texture_vertex_shader(screen, context, true);
    replace = make_texture_fragment_shader(screen, context, false);
@@ -1595,7 +1610,11 @@ run_pipe_texture(struct pipe_screen *screen)
         !source_over_handle) ||
        !dsa_handle || !rasterizer_handle ||
        !elements_handle || !replace_elements_handle || !sampler_handle ||
-       !view || !rhw_view ||
+       !view || !rhw_view || !shadow_source || !shadow_view ||
+       chrome9_resource(shadow_source)->guarded ||
+       !chrome9_sampler_view(shadow_view)->shadow ||
+       !chrome9_resource(
+          chrome9_sampler_view(shadow_view)->shadow)->guarded ||
        !replace_vs ||
        !modulate_vs || !replace || !modulate || !constant_modulate ||
        !constant_alpha_modulate || !rgbx ||
@@ -2099,6 +2118,57 @@ run_pipe_texture(struct pipe_screen *screen)
       goto out;
    }
    puts("Gallium varying-RHW REPLACE/MODULATE perspective passed");
+   {
+      struct chrome9_resource *source_resource =
+         chrome9_resource(shadow_source);
+      struct chrome9_resource *shadow_resource = chrome9_resource(
+         chrome9_sampler_view(shadow_view)->shadow);
+      uint32_t *shadow_source_pixels = (uint32_t *)
+         ((uint8_t *)source_resource->bo.map + source_resource->data_offset);
+      const uint32_t colors[2] = { 0x00ff0000, 0x0000ff00 };
+      uint64_t submitted = ccontext->submitted_triangles;
+      uint64_t rejected = ccontext->rejected_triangles;
+      bool updated = true;
+
+      context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                                 &shadow_view);
+      context->bind_vertex_elements_state(context, replace_elements_handle);
+      context->bind_vs_state(context, replace_vs);
+      context->bind_fs_state(context, replace);
+      vertex_buffer.buffer.user = rhw_replace_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      for (unsigned pass = 0; pass < ARRAY_SIZE(colors); pass++) {
+         for (unsigned i = 0; i < 8; i++)
+            shadow_source_pixels[i] = colors[pass];
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &clear, 1.0, 0);
+         context->draw_vbo(context, &rhw_info, 0, NULL, &rhw_draw, 1);
+         context->flush(context, NULL, 0);
+         for (unsigned i = 0; i < ARRAY_SIZE(rhw_y); i++)
+            updated &=
+               (rhw_pixels[rhw_y[i] * (crhw_target->stride / 4) + 48] &
+                0xffffff) == colors[pass];
+      }
+      for (unsigned i = 0; i < 8; i++)
+         updated &= shadow_source_pixels[i] == colors[1];
+      updated &= ccontext->submitted_triangles == submitted + 2 &&
+                 ccontext->rejected_triangles == rejected &&
+                 smoke_guard_pages_match(crhw_target) &&
+                 smoke_guard_pages_match(shadow_resource);
+      if (!updated) {
+         fprintf(stderr,
+                 "draw-refreshed sampler shadow mismatch: "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64
+                 " sample=%08x target_guards=%u shadow_guards=%u\n",
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected,
+                 rhw_pixels[rhw_y[0] * (crhw_target->stride / 4) + 48],
+                 smoke_guard_pages_match(crhw_target),
+                 smoke_guard_pages_match(shadow_resource));
+         goto out;
+      }
+      puts("Gallium draw-refreshed unguarded sampler shadow passed");
+   }
    passed = true;
 
 out:
@@ -2119,6 +2189,7 @@ out:
          context->delete_fs_state(context, packed_gray_fs);
       if (view) pipe_sampler_view_reference(&view, NULL);
       if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
+      if (shadow_view) pipe_sampler_view_reference(&shadow_view, NULL);
       if (sampler_handle)
          context->delete_sampler_state(context, sampler_handle);
       if (elements_handle)
@@ -2139,6 +2210,7 @@ out:
    if (texture) screen->resource_destroy(screen, texture);
    if (target) screen->resource_destroy(screen, target);
    if (bgra_target) screen->resource_destroy(screen, bgra_target);
+   if (shadow_source) screen->resource_destroy(screen, shadow_source);
    if (rhw_texture) screen->resource_destroy(screen, rhw_texture);
    if (rhw_target) screen->resource_destroy(screen, rhw_target);
    return passed;

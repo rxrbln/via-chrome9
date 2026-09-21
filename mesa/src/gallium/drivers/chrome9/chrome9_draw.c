@@ -468,7 +468,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          return false;
       for (unsigned unit = 0; unit < texture_count; unit++) {
          struct pipe_sampler_view *view = ctx->sampler_views[unit];
-         struct pipe_resource *source = view ? view->texture : NULL;
+         struct pipe_resource *original = view ? view->texture : NULL;
+         struct pipe_resource *source = view ?
+            chrome9_sampler_view_resource(view) : NULL;
 
          samplers[unit] = ctx->sampler_states[unit];
          *reason = "sampler-state";
@@ -476,7 +478,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
             return false;
          textures[unit] = chrome9_resource(source);
          *reason = "texture-resource";
-         if (source == resource ||
+         if (original == resource || source == resource ||
              textures[unit]->bo.handle == (*target)->bo.handle ||
              source->target != PIPE_TEXTURE_2D ||
              (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&

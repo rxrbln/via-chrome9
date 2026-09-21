@@ -1130,7 +1130,8 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                             const struct pipe_sampler_view *templ)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
-   struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
+   struct chrome9_sampler_view *cview = CALLOC_STRUCT(chrome9_sampler_view);
+   struct pipe_sampler_view *view = cview ? &cview->base : NULL;
    bool supported = view && texture && texture->target == PIPE_TEXTURE_2D &&
                     templ->target == PIPE_TEXTURE_2D &&
                     templ->format == texture->format &&
@@ -1146,6 +1147,17 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                     (templ->swizzle_a == PIPE_SWIZZLE_W ||
                      (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM &&
                       templ->swizzle_a == PIPE_SWIZZLE_1));
+
+   if (supported && !chrome9_resource(texture)->guarded) {
+      struct pipe_resource shadow_templ = *texture;
+
+      shadow_templ.last_level = 0;
+      shadow_templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR;
+      shadow_templ.flags = 0;
+      cview->shadow = pipe->screen->resource_create(pipe->screen,
+                                                     &shadow_templ);
+      supported = cview->shadow != NULL;
+   }
 
    if (!supported) {
       if (!(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_CREATE)) {
@@ -1168,7 +1180,9 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                  templ->swizzle_b, templ->swizzle_a);
          ctx->warnings |= CHROME9_WARN_SAMPLER_VIEW_CREATE;
       }
-      FREE(view);
+      if (cview && cview->shadow)
+         pipe_resource_reference(&cview->shadow, NULL);
+      FREE(cview);
       return NULL;
    }
    *view = *templ;
@@ -1183,9 +1197,12 @@ static void
 chrome9_sampler_view_destroy(struct pipe_context *pipe,
                              struct pipe_sampler_view *view)
 {
+   struct chrome9_sampler_view *cview = chrome9_sampler_view(view);
+
    (void)pipe;
    pipe_resource_reference(&view->texture, NULL);
-   FREE(view);
+   pipe_resource_reference(&cview->shadow, NULL);
+   FREE(cview);
 }
 
 static void
@@ -1448,6 +1465,21 @@ chrome9_clear_render_target(struct pipe_context *pipe,
 }
 
 static void
+chrome9_refresh_sampler_shadows(struct chrome9_context *ctx)
+{
+   for (unsigned i = 0; i < ctx->num_sampler_views; i++) {
+      struct pipe_sampler_view *view = ctx->sampler_views[i];
+      struct chrome9_sampler_view *cview;
+
+      if (!view)
+         continue;
+      cview = chrome9_sampler_view(view);
+      if (cview->shadow)
+         chrome9_copy_surface(cview->shadow, view->texture);
+   }
+}
+
+static void
 chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                  unsigned drawid_offset,
                  const struct pipe_draw_indirect_info *indirect,
@@ -1456,6 +1488,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
    const void *indices = NULL;
+
+   /* Imported drawable contents may change after a view is created or
+    * bound.  Refresh immediately before every Gallium draw so hardware never
+    * samples a create-time/set-time snapshot. */
+   chrome9_refresh_sampler_shadows(ctx);
 
    if (num_draws > 1) {
       util_draw_multi(pipe, info, drawid_offset, indirect, draws, num_draws);
