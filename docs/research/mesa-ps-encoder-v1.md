@@ -81,6 +81,27 @@ are BIAS=1, COMP=2, X2=4, NEG=8; v1 allows only NONE/NEG.
 Destination writemask is d2 `23:20`, id d3 `9:6`, class d3 `11:10`, SAT
 d3.bit12, and scale d3 `15:13`. V1 allows oC0 or r0--r11 and zero scale.
 
+The destination id is only four native bits.  With twelve ordinary temporaries
+simultaneously live, Linux production output proves the complete linear map
+`r0=...0020`, `r1=...0060`, through `r11=...02e0`; requested `r12` and `r15`
+encode `...0320` and `...03e0`.  Both Windows and Linux accept requested r16
+but its destination aliases `...0020` while a later source still carries id
+16.  That is an unsafe frontend wrap, not a seventeenth physical temporary.
+The first Mesa allocator therefore remains capped at r0--r11; a later r12--r15
+promotion needs its own live gate.  Logical ids at or above 16 are always
+rejected before packing.
+
+Do not assume that a requested logical id is the final physical id.  The Linux
+production register manager compacts a lone logical r1 or r11 to physical r0,
+whereas the twelve-simultaneously-live case preserves ids 0--11.  Allocation
+and liveness must precede encoding.  The exact raw/configuration-2 corpus is
+SHA-256
+`9e28634dc951fce310e62494363317ed2437dc990e5cdc6daf93623bbfa292bf`.
+Windows destination-field controls are retained by SHA-256
+`25f6c24c2a471d35c956f256491e82c7529af8e5fab35fc9abe0d2e00ffc9af2`
+and
+`08e4c407aa09cc6fcaf3aa43e2e26b996c5451b8987b20e9d32a7a58181b715a`.
+
 Start from the independently recovered neutral operation template and encode
 only named slots. D3 `19:16` is a sub-operation selector, not a complete
 opcode, so compare all four dwords in tests.
@@ -118,7 +139,7 @@ DP3/DP4/MIN/MAX use A=src0 and C=src1. RCP/RSQ use A=src. CMP uses
 A=condition src0, C=true src1 and B=false src2. These assignments come from
 complete output records, not temporary-only opcode inference.
 
-## Texture and dependency finalization
+## Texture phase and temporary-lifetime finalization
 
 Raw ordinary compiler TEXLD words are:
 
@@ -131,8 +152,9 @@ TEXLDP=`207001b0` and TEXLDB=`203001b0` remain excluded pending runtime
 semantics. Validate sampler id before packing; unchecked s16 collides with a
 valid finalized s0 word.
 
-Configuration-2 finalization owns dependency fields. One leading sample
-becomes TAU `301001b0` and a consuming ALU gets d2.bit17. Two independent
+Configuration-2 finalization owns TAU phase fields and ALU temporary-lifetime
+fields. One leading sample becomes TAU `301001b0` and a final source-A use gets
+d2.bit17. Two independent
 samples followed by a consuming ALU use:
 
 ```text
@@ -141,7 +163,7 @@ ALU ... ... 00f20005 ...
 ```
 
 High TAU bits depend on phase order. Never implement `tau |= 10000000`.
-Until an SSA-edge finalizer byte-matches the corpus, emit only the exact
+Until a liveness/phase finalizer byte-matches the corpus, emit only the exact
 shapes and bounded counts above.
 
 ### Production callback selection and multi-ALU allocation
@@ -188,12 +210,15 @@ it is still not silicon proof for every possible chain.
 
 Bit d2.17 is not texture-specific. The ALU-only chain
 `add r0,c0,c1; mul oC0,r0,c2` emits its consumer as
-`0140b6d0 30082053 00f20005 00000820`; it marks an ordinary earlier-ALU
-producer in the same source-A field. Dependency metadata must come from the
-complete producer graph and phase finalizer, never merely from source
-register class.
+`0140b6d0 30082053 00f20005 00000820`; it marks the final use of the temporary
+in source A.  It is not a producer-edge bit.  An undefined `mov oC0,r0` and
+`mov oC0,t0` receive the same d2.bit17 because TEMP/TEXTURE sources are
+eligible and that occurrence is their final use, even though neither has a
+producer.  Conversely, a non-final temporary read does not receive the bit.  A
+correct finalizer must compute last use after physical allocation, not set
+fields merely because an SSA producer exists.
 
-The raw/final differential separates scheduler allocation from dependency
+The raw/final differential separates scheduler allocation from lifetime/phase
 finalization. Before the explicit configuration-2 pass, the production
 textured chain already contains ordinary destination/source id 1:
 
@@ -209,20 +234,19 @@ config2 TAU  301001b0
 config2 A90  90018000
 ```
 
-Configuration-2 adds dependency bits to both records, changes TAU bit28, and
-updates A90. The historical destination-id-15/source-id-63 object is retained
+Configuration-2 adds source final-use bits to both records, changes TAU bit28,
+and updates A90. The historical destination-id-15/source-id-63 object is retained
 in the corpus only as `NONPROD_CALLBACK_SWAP_*`: it is reproduced by swapping
 the validator and processor callback slots and is not hardware evidence.
 
-The H5 register manager exposes 12 ordinary plus four high temporary slots;
-the native destination field is four bits. Production compilation maps r0
-through r15 without the id-63 miss. The vendor frontend nevertheless accepts
-r16: its destination wraps to native id 0 while its source remains id 16.
-Mesa must therefore allocate at most 16 simultaneously addressable physical
-fragment temporaries and reject or spill anything beyond that boundary.
+The H5 register manager exposes 12 allocatable ordinary slots plus four high
+native ids.  The high r12--r15 ids encode without the historical id-63 miss,
+but are not part of the first Mesa allocation contract.  The vendor frontend
+nevertheless accepts r16 with the asymmetric wrap described above; Mesa must
+reject it rather than rely on truncation.
 
 The Windows backend before configuration-2 and the Linux production
-finalizer give exact one-texture dependency deltas for every v1 source slot:
+finalizer give exact one-texture final-use deltas for every v1 source slot:
 
 | operation | Windows scheduled ALU | Linux configuration-2 ALU |
 |---|---|---|
@@ -235,8 +259,61 @@ finalizer give exact one-texture dependency deltas for every v1 source slot:
 
 DP4, MIN, MAX and RSQ follow the same slot-specific delta as DP3 or RCP.
 SUB is the important exception: because the sampled value is in parallel
-source B, dependency finalization changes d0 rather than d2. A generic
-"sampled operand means d2.bit17" rule is therefore wrong.
+source B, finalization changes d0 rather than d2.  The exact per-slot final-use
+bits are B=d0.bit25, C=d1.bit21, and A=d2.bit17.  Direct undefined TEMP and
+TEXTURE source probes receive those same class-driven bits, proving they are
+not producer-edge or texture-dependency flags.  If a physical temporary is
+read more than once, only its last read is marked; if it occurs in multiple
+slots of one record, the compiler emits one release marker rather than one per
+occurrence.  Therefore a generic "sampled operand means d2.bit17" rule is
+wrong, as is setting every source occurrence from the SSA graph.  The first
+patch should accept only linear chains whose temporary has exactly one
+unambiguous final source occurrence.
+
+The Windows direct-slot/raw and two-record artifacts are SHA-256
+`ef0645552e914325a353ccb740f3715a9917dea3da144569055f354d150108bd`
+and
+`0edc7b2d153b15ed0666e0e7005379a1214a8c000166a7d1e112b6ea2fb536fc`.
+That wrapper establishes raw field placement but does not run the Linux
+configuration-2 lifetime pass; the Linux production differential above is
+authoritative for the three final-use bits.
+
+## Fail-closed NIR mapping
+
+Native compiler evidence and a valid NIR mapping are separate gates.  The
+following is the patch boundary; “encoded” does not mean advertised before its
+listed silicon oracle succeeds.
+
+| NIR shape | native mapping | initial status |
+|---|---|---|
+| `mov(vec4)` | MOV, source A | implemented; identity/aaaa leaf only |
+| `fmul(vec4,vec4)` | MUL, A=src0, C=src1 | implemented; cmd19 only exact v0/c0 identity pair |
+| `fadd` | ADD, A=src0, B=src1, C=literal ONE | proven bytes; disabled until source-B encoder and numerical gate |
+| `fsub` | SUB, B=src0, A=src1, C=literal NEG_ONE | proven bytes; never lower as generic ADD+NEG |
+| `fmin` / `fmax` | MIN/MAX, A=src0, C=src1 | proven bytes; MIN(v0,c0) is the safest first successor |
+| scalar `fdot3`/`fdot4` replicated to all four store lanes | DP3/DP4, A/C | proven bytes; reject scalar/partial-store shortcuts |
+| `ffract(vec4)` | FRC, source A | proven bytes; guarded silicon gate pending |
+| scalar `frcp`, `frsq`, `fexp2`, `flog2` broadcast to XYZW | scalar subop, dedicated A=000W form | proven bytes; initially c0.w only and operation-specific finite domain |
+| `fsat` | destination SAT bit | compiler bytes proven; reject until lower and upper pre-RT alpha oracles pass |
+| terminal `fabs(c0)` | CPU-clear c0 sign bits then ordinary MOV | no native ABS admission needed; native ABS remains future work |
+| `bcsel` | not general CMP | reject; NIR boolean condition is not automatically D3D CMP's floating sign test |
+| `ffma` / `fmad` | potential MAD A/C/B | reject; fusion/rounding equivalence and three-source ABI are unproved |
+| derivatives, discard, depth output, MRT, flow | separate control/state paths | reject from this ALU encoder |
+
+Every accepted floating ALU must have 32-bit components, full XYZW output,
+zero destination scale, no explicit NIR floating-control mode, and only its
+operation's independently proven source swizzles/modifiers.  `fdot3` and
+`fdot4` are scalar NIR operations: admission requires recognizing the explicit
+replication feeding all four output lanes.  Scalar RCP/RSQ/EXP/LOG likewise
+must not be accepted merely because the native destination mask is XYZW; the
+native result broadcast remains a silicon gate.
+
+No generic multi-record NIR program is patch-ready yet.  The current Mesa
+builder's `source.dependency` boolean happens to reproduce d2.bit17 for a
+single A-slot temp consumer, but its name and semantics are wrong for reuse,
+B/C consumers, and same-record duplicate sources.  Rename it to a final-use
+property or replace it with a post-allocation pass before enabling any
+multi-record runtime path.
 
 ## Cmd19 one-record operand boundary
 
