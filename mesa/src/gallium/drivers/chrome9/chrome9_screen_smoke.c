@@ -1697,12 +1697,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
              chrome9_context(context)->submitted_batches ==
                 initial_batches + 1) &&
             (!depth_resource ||
-             (chrome9_context(context)->draw_program_triangle_d16_rhw_batch ?
-                 chrome9_context(context)->submitted_program_batches ==
-                       initial_program_batches + 1 &&
-                    chrome9_context(context)->submitted_rhw_runs ==
-                       initial_rhw_runs :
-              chrome9_context(context)->draw_triangle_d16_rhw_run ?
+             (chrome9_context(context)->draw_triangle_d16_rhw_run ?
                  chrome9_context(context)->submitted_rhw_runs ==
                        initial_rhw_runs + 1 &&
                     chrome9_context(context)->submitted_program_batches ==
