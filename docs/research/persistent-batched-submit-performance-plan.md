@@ -300,7 +300,6 @@ struct chrome9_sf_binding {
         u32 *ptes;
         u32 page_count;
         unsigned int active;
-        struct dma_fence *last_fence;
         u64 last_used_seq;
         bool scanout;
         bool quarantined;
@@ -347,7 +346,7 @@ submit_lock
   active++ for every referenced binding
   guards/cache sync, fence attach, build, append, wait
   CPU sync, guards, scanout resync
-  active-- and record last_fence/last_used_seq
+  active-- and record last_used_seq
 submit_unlock
 unlock reservations, signal fence
 ```
@@ -410,7 +409,8 @@ A binding can be evicted only when all conditions are true:
 - `active == 0`;
 - it is not a scanout mapping;
 - it is not quarantined;
-- its retained last fence is signaled without an outstanding ownership use;
+- `dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_READ)` confirms that all
+  implicit read and write fences are signaled;
 - the engine is at its software-owned PID00 PAUSE and the complete engine
   work mask is clear; and
 - it is the oldest eligible LRU entry needed to satisfy the object/byte limit
@@ -418,9 +418,12 @@ A binding can be evicted only when all conditions are true:
 
 There is a subtle fence race in the current synchronous path: `active` can
 be decremented under `submit_lock` before the fence is signaled after
-reservation unlock.  Therefore `active == 0` alone is insufficient; eviction
-must also test the retained fence.  Drop victim GEM/fence references and free
-CPU memory outside `vm_lock` after the PTE invalidation/node removal is
+reservation unlock.  Therefore `active == 0` alone is insufficient.  The
+lockless reservation test observes the still-attached unsignaled job fence
+and temporarily makes that victim ineligible.  It also avoids retaining a
+reference to the current embedded Chrome9 fence, which would retain the
+entire old `chrome9_job` until eviction.  Drop the victim GEM reference and
+free CPU memory outside `vm_lock` after PTE invalidation/node removal is
 committed.
 
 CPU/device DMA ownership is independent of PTE residency.  Every run still
