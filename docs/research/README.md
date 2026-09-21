@@ -134,6 +134,12 @@ targets.
   bounded normalized-input oracle while retaining the multi-record rejection.
 - [chrome9-crs-expansion-corpus.tsv](chrome9-crs-expansion-corpus.tsv) retains
   five terminal Windows/Linux CRS source topologies and exact controls.
+- [chrome9-dp2add-negative-boundary.md](chrome9-dp2add-negative-boundary.md)
+  closes the Windows silent-zero-record versus Linux two-record DP2ADD split
+  and defines the strict frontend-success validation rule.
+- [chrome9-dp2add-negative-boundary.tsv](chrome9-dp2add-negative-boundary.tsv)
+  preserves two terminal source topologies, empty Windows metadata, and exact
+  Linux configuration-2 programs.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
