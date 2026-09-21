@@ -39,6 +39,10 @@ Explicit `cl_renderer opengl1` gets much farther. The live run proves:
 * the first attempted textured render, rejected cleanly as an unsupported
   bounded fragment program with no reported engine error or wedge.
 
+A follow-up dump at
+`/root/tmp/chrome9/ioquake3-gl1-nir-c146218.log` captures that first rejected
+program exactly; it is recorded below.
+
 The trace then restarts the renderer and later receives SIGSEGV while loading
 cgame/UI. That crash is not evidence of a GPU fault and should be diagnosed
 separately after the first fragment rejection is captured and removed.
@@ -52,20 +56,24 @@ emits two indexed triangles with one 2D coordinate and one RGBA byte color per
 vertex. The default 2D shader has `rgbGen vertex`, `alphaGen vertex`, one
 texture, and the same blend equation.
 
-Mesa's fixed-function fragment builder constructs the unit-zero MODULATE
-operation exactly as:
+The live linked NIR is:
 
 ```text
-t0 = tex(unit=0, smooth TEX0.xy)
-c0 = smooth COL0
-out = t0 * c0
+tc = smooth vec4 TEX0
+t0 = tex(unit=0, coord=tc.xy, projector=tc.w)
+c0 = smooth vec4 COL0
+m = t0 * c0
+out = vec4(m.x, m.y, m.z, c0.w)
 ```
 
-This expression is **Mesa-construction exact**: `ff_fragment_shader.c` starts
-PREVIOUS at primary color and emits `nir_fmul(texture, previous)` for
-MODULATE. NIR copy propagation can exchange the multiply operands and wrap
-loads in identity moves, but cannot fold the color array merely because a
-particular draw filled it with white.
+This expression is **live exact**. It has one sampler and one output, but is
+not the existing full-RGBA texture-times-primary key: only RGB comes from the
+multiply and output alpha is primary alpha unchanged. The texture instruction
+also retains the fixed-function projector source `TEX0.w`; the current closed
+sampler classifier accepts only a coordinate source. A safe successor must
+recognize both distinctions explicitly. For the current size-two texture
+coordinate array Q defaults to one, but that must be proved by the post-TNL
+layout/vertex values rather than silently discarding an arbitrary projector.
 
 Required state is:
 
@@ -77,12 +85,14 @@ Required state is:
 | raster | two-sided triangles; software `draw` may expand indices |
 | color | smooth primary RGBA |
 
-The current Chrome9 tree has a closed one-texture-times-primary classifier,
-normalized D1 color, BGRA/XRGB targets and canonical source-over. Therefore
-the live unsupported-FS result is probably an unrecognized optimized spelling
-of this pattern or a different loading shader, not proof that new silicon
-state is required. The next run must dump the sole rejected NIR before this
-gate is broadened.
+The current Chrome9 tree has normalized D1 color, BGRA/XRGB targets and
+canonical source-over, but its texture-times-primary PS multiplies alpha too.
+For an XRGB source whose sampler alpha is the proven constant one, that same
+PS is algebraically exact; a closed classifier may select it only with an
+XRGB sampler-view gate. Other formats require an exact RGB-only
+multiply/primary-alpha PS oracle. Both cases also need the identity-projector
+gate. Do not broaden ordinary sampler2D acceptance to arbitrary projective
+coordinates or approximate the captured alpha expression for an RGBA source.
 
 ### 2. Single-texture opaque entity/world stage
 
@@ -228,7 +238,7 @@ uniform contract or justify a general GLSL claim.
 
 | rank | renderer/path | first missing block | evidence | wedge risk |
 |---:|---|---|---|---:|
-| 1 | GL1 first live textured draw | capture and classify the exact rejected NIR; likely one texture times primary | live rejection; source-derived expected key | low |
+| 1 | GL1 first live textured draw | projected one-texture RGB*primary with primary alpha; XRGB-format gate plus Q=1 post-TNL validation can reuse RGBA MODULATE | exact live NIR | low-medium |
 | 2 | GL1 normal textured assets | full mip view/address/LOD and mip-nearest/mip-linear filters | source and live texture mode | medium |
 | 3 | GL1 opaque world | two textures times primary plus Z16 LEQUAL/write | exact Mesa construction; static PS bytes | medium-high |
 | 4 | GL1 masked world | alpha test combined with texture(s) and D16 | exact GL state mapping | medium |
@@ -239,11 +249,13 @@ uniform contract or justify a general GLSL claim.
 | 9 | GL2 default lightall | 4+ samples and general normalize/dot/specular ALU | exact feature defines/source | very high |
 
 The GL1 route is therefore the only bounded near-term game path. The safest
-next evidence sequence is: dump the first rejected GL1 NIR; rerun with a
-non-mip diagnostic filter to expose its next state gate; validate the
-two-texture+D16 four-BO oracle; then validate the three-factor PS with distinct
-non-white primary colors. GL2 should remain fail-closed until its startup
-shader set is representable rather than papered over with larger caps.
+next evidence sequence is: prove the first draw's XRGB format and Q=1 values,
+then reuse RGBA MODULATE behind those two gates (or recover an exact RGB/alpha
+PS if either premise fails); rerun with a non-mip diagnostic filter to expose
+its next state gate; validate the two-texture+D16 four-BO oracle; then validate
+the three-factor PS with distinct non-white primary colors. GL2 should remain
+fail-closed until its startup shader set is representable rather than papered
+over with larger caps.
 
 ## Exact capture checklist
 
