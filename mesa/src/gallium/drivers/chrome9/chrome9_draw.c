@@ -407,10 +407,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              (textures[unit]->data_offset & 0xff) ||
              textures[unit]->stride != ALIGN_POT(source->width0 * 4, 32) ||
              textures[unit]->data_size <
-                (uint64_t)textures[unit]->stride * source->height0 ||
-             (texture_count == 2 &&
-              (!util_is_power_of_two_nonzero(source->width0) ||
-               !util_is_power_of_two_nonzero(source->height0))))
+                (uint64_t)textures[unit]->stride * source->height0)
             return false;
       }
       if (texture_count == 2 &&
