@@ -33,7 +33,7 @@ targets.
   callback-swapped fixed-program counterparts.
 - [chrome9-ps-resource-config-buckets.md](chrome9-ps-resource-config-buckets.md)
   recovers the exact four A90 resource buckets, their active-resource
-  thresholds, and the separate opaque auxiliary-resource predicate.
+  thresholds, and the separate miscellaneous-input relocation predicate.
 - [chrome9-ps-resource-config-corpus.tsv](chrome9-ps-resource-config-corpus.tsv)
   retains ALU-only threshold probes plus two-, four-, and eight-texture
   production compiler discriminators.

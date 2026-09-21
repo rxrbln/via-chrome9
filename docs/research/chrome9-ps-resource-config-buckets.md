@@ -123,10 +123,71 @@ ALU     01c00530 301c0053 00f20005 000d0820
 
 Mistaking the updater's `compiled_object+0x70` for instance `+0x70` A91 would
 increment eight to nine and incorrectly choose bucket zero.  The A90 decision
-must use the opaque auxiliary predicate at instance `+0x80`; sampler-mask A91
-does not participate.  All retained production rows have that auxiliary
-predicate clear.  A future nonzero case must be recovered before Mesa admits
-the corresponding program class.
+must use the auxiliary relocation predicate at instance `+0x80`; sampler-mask
+A91 does not participate.  Ordinary v0/c0/TEX production rows have that
+predicate clear.  The nonzero producer is closed below.
+
+## Nonzero auxiliary and native-location relocation
+
+The probe's research-only `CHROME9_AUX80=1` override sets instance `+0x80`
+after compilation and before configuration two.  It is not evidence that a
+PS 2.0 token naturally produces the flag, but it executes the otherwise
+static-only updater branches without touching the GPU.  Exact WAW threshold
+pairs are:
+
+| active tuple | aux=0 A90 | injected aux=1 A90 | aux=1 return |
+|---:|---:|---:|---:|
+| `(4,1,4,4)` | `90018000` | `90010000` | 4 |
+| `(5,1,5,5)` | `90010000` | `90008000` | 7 |
+| `(8,1,8,8)` | `90008000` | `90000000` | 15 |
+
+These results exactly demonstrate the `active0+1` rule.  A91 remains the
+ordinary sampler masks `0f`, `1f`, and `ff`; the auxiliary value remains one.
+
+The updater return is consumed by `stmReplaceLocationTexIndexAINST` at Linux
+`0x001990e0..0x001991b7`.  That function walks one 16-byte ALU record and
+replaces native sentinel indices with the low bits of the return:
+
+| sentinel test | replaced record bits | return mask |
+|---|---:|---:|
+| `d2 & 0x0001ff00 == 0x0000cf00` | d2 `[13:8]` | `0x3f` |
+| `d1 & 0x001ff000 == 0x000cf000` | d1 `[17:12]` | `0x3f` |
+| `d0 & 0x000001ff == 0x000000cf` | d0 `[5:0]` | `0x3f` |
+| `d3 & 0x00000fc0 == 0x000007c0` | d3 `[9:6]` | `0x0f` |
+| `d3 & 0x0000003f == 0x0000001f` | d3 `[3:0]` | `0x0f` |
+
+The exact role is therefore a native-location relocation code, not an A91 or
+sampler count.
+
+The smallest genuine PS 2.0 producers are D3D miscellaneous input sources:
+
+```text
+ffff0200 03000001 000f0800 10e41000 0000ffff  # MOV oC0,vPos
+ffff0200 03000001 000f0800 10e41001 0000ffff  # MOV oC0,vFace
+```
+
+Both set instance `+0x80=1`, report resources `(0,0,0,0)`, and initially emit
+the A-source relocation sentinel:
+
+```text
+raw ALU    01c00530 301c0053 00f0cf05 000d0820
+```
+
+Configuration two increments active0 from zero to one, selects the first
+bucket, returns location 3, applies the generic terminal-read marker, and
+relocates the sentinel to:
+
+```text
+final ALU  01c00530 301c0053 00f2c305 000d0820
+A90        90058000
+metadata   instance+68=1 instance+6c=8 instance+80=1
+```
+
+The identical vPos/vFace record does not establish how the front end selects
+or supplies either value.  Mesa's current semantic compiler has no
+miscellaneous-input source class and must reject both until that linkage and
+silicon behavior are separately closed.  Native records containing any
+relocation sentinel must likewise stay compiler-owned.
 
 ## Mesa implementation boundary
 
@@ -139,9 +200,9 @@ goldens.  A safe extension must:
 1. keep semantic IR and SSA-style no-WAW validation;
 2. allocate physical temporaries before choosing the bucket;
 3. calculate active0/active1 from the scheduled object;
-4. keep sampler-mask A91 separate from the instance `+0x80` auxiliary
-   predicate and reject any program that would require the unrecovered
-   nonzero case;
+4. keep sampler-mask A91 separate from the instance `+0x80` miscellaneous-
+   input relocation predicate and reject miscellaneous sources until their
+   front-end linkage is recovered;
 5. emit a kernel-owned complete A90--A9b tuple; and
 6. byte-compare each admitted schedule against a production compiler golden
    before enabling its hardware gate.
@@ -156,7 +217,8 @@ The dynamic rows were generated with `tools/re/chrome9_pps_probe.c`, production
 chip-5 callbacks, `CHROME9_RESOURCE_COUNTS=1`, and
 `CHROME9_POSTPROCESS=2`.  Raw/final paired probes establish the active tuples,
 bucket transitions, final A91 values, and clear instance `+0x80` auxiliary
-predicate for the ordinary and eight-TEX samples.  The static corpus verifier
-is `tools/re/chrome9_ps_resource_config_check.py`.  The Linux DRI
+predicate for ordinary production samples.  The injected rows additionally
+use `CHROME9_AUX80=1`.  The static corpus verifier is
+`tools/re/chrome9_ps_resource_config_check.py`.  The Linux DRI
 SHA-256 is
 `fddb4dea85319c76cac3354e43aa9bcb12a8b7f178cee0f70f6c7efe14a69af4`.
