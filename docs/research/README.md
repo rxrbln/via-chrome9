@@ -216,6 +216,11 @@ targets.
   closes A01/A84/A85 line-stipple enable, pattern, repeat and per-primitive
   reset state, gives exact packet growth and phase oracles, and keeps broken
   native polygon stipple and two-sided unfilled modes behind safe lowering.
+- [flatshade-edge-ownership-contract.md](flatshade-edge-ownership-contract.md)
+  closes H6 FlatA/B/C/Gouraud state across Linux and both Windows builders,
+  identifies the current draw-pipeline flat-color gap, and defines bounded
+  provoking-color and shared-edge ownership oracles without inventing a
+  top-left control bit.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
