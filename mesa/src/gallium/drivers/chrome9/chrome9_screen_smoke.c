@@ -2263,6 +2263,7 @@ run_pipe_textured_depth(struct pipe_screen *screen)
       .min_img_filter = PIPE_TEX_FILTER_NEAREST,
       .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
       .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+      .max_lod = 1000.0f,
    };
    struct pipe_blend_state blend = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = {
