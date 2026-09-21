@@ -740,11 +740,11 @@ address creates an unreserved, unpinned fetch:
 | lookup | hold three `drm_gem_object_lookup()` references; reject NULL, foreign-device, imported, wrong-size, and any pairwise alias for the first ABI |
 | job construction | add texture-1 shmem object, SG table, map, mapped flag, and page count; include all three counts in `job->page_count` |
 | PTE collection | allocate one total PTE array; append destination, texture 0, then texture 1 at offsets 0, `destination_page_count`, and `destination_page_count + texture0_page_count` |
-| reservation | initialize `drm_exec` for three objects and prepare all three inside the retry loop; wait for `DMA_RESV_USAGE_WRITE` on all three before writing their guard pages |
+| reservation | initialize `drm_exec` for three objects and prepare all three inside the retry loop; because guard initialization writes every BO, use the write-access dependency class (`dma_resv_usage_rw(true)`) so both prior readers and writers finish |
 | CPU maps | vmap destination, texture 0, then texture 1; reject `is_iomem` for each and unwind only maps which succeeded |
 | SF binding | allocate one node of the checked three-object total, install the complete PTE array, and derive the three data addresses using full guarded object sizes |
 | device handoff | prepare both guards, cache-flush the full object, and call `dma_sync_sgtable_for_device(..., DMA_BIDIRECTIONAL)` for each object |
-| fences | attach the same initialized job fence to all three reservations with WRITE usage before publishing the ring |
+| fences | attach the same initialized job fence with WRITE usage to the target and READ usage to both texture sources before publishing the ring |
 | retirement | sync all three SG tables for CPU, flush all three CPU maps, execute `dma_rmb()`, then validate both guards for each object before unbinding PTEs |
 | normal unwind | if device-owned, reverse DMA ownership/cache state for all three; vunmap texture 1, texture 0, destination in reverse-success order; finish `drm_exec`, signal when required, put all three GEM references, then drop the fence |
 | pre-fence failures | before `dma_fence_init64`, free the total PTE/job allocation and put every successfully looked-up object; do not enter the fence-release path |
@@ -758,6 +758,118 @@ all errors converge through the existing `out_exec`/fence lifetime rather
 than directly freeing the job.  Extend both successful and `device_owned`
 cache/DMA reversal blocks symmetrically—missing the latter leaves a partial
 builder failure with texture 1 still device-owned.
+
+### Recommended next gate: D16 lightmaps, then one-state batching
+
+After the three-object RGBA oracle passes, ioquake3's smallest useful
+successor is two-texture RGBA MODULATE with the already proven linear D16
+LESS/write state.  Do this before blend, alpha test, mipmaps, overbright
+scale, or batching so a failure has only one new state group and one new BO.
+The base packet already carries normalized Z in D0; no FVF, VS, PS, TAU,
+ALU, or vertex-stride word changes.
+
+Replace the common group's trailing `cc000000` pad with the five established
+depth words.  The payload grows from eight to twelve dwords, hence the whole
+group grows by only four:
+
+```text
+body[56..59] common type-01 header
+body[60]     860000ff
+body[61]     870000ff
+body[62]     53010c0f
+body[63]     00000011
+body[64]     01c0154c                         # A01 D16 LESS/write
+body[65]     88001ed0
+body[66]     89000800
+body[67]     10000000 | (depth_base >> 8)      # A10
+body[68]     11000001 | ((depth_pitch/32)<<13) # A11 linear pitch
+body[69]     12380000                          # A12 D16
+body[70]     13010000                          # A13
+body[71]     20007fff                          # A20 wide Z clip
+```
+
+The depth-only, no-blend, no-mip three-vertex body is exactly **266 dwords**:
+
+| dwords | block |
+|---:|---|
+| `0..55` | unchanged destination and two image/sampler pairs |
+| `56..71` | common render state plus D16 |
+| `72..83` | two-texture configuration |
+| `84..115` | two-texture FVF/linkage and list tuple |
+| `116..151` | constants and clip |
+| `152..179` | six-instruction VS |
+| `180..187` | VS activation |
+| `188..207` | PS controls |
+| `208..215` | two TAUs |
+| `216..229` | RGBA ALUs and terminators |
+| `230..231` | vertex-header alignment |
+| `232..265` | Type-00 header plus three ten-dword vertices |
+
+Assert A20/A23/A24 at `97/98/99`, the RGBA source-C word
+`body[221]=30202053`, and the vertex header at 232.  A following non-depth
+two-texture draw must restore A01=`01c01540`; stale A10--A13 addresses are
+then inert.  Alternate depth and non-depth draws without engine
+reinitialization before exposing the capability.
+
+The first D16 ABI should add only a depth handle and canonical D16 pitch to
+the existing fixed three-vertex request.  Keep XRGB destination, two POT
+level-zero sources, fixed RGBA MODULATE, finite `[0,1]` D3/D4, and three
+vertices.  Require four distinct native guarded objects and map them in the
+order target, texture 0, texture 1, depth.  Reserve all four together and
+concatenate all four PTE sets before binding.  Target and depth get WRITE
+fences; both sources get READ fences.  Since guard initialization writes all
+four objects, dependency waits must cover prior readers as well as writers.
+Every normal retirement, prepublication unwind, PTE-unbind failure, and
+timeout quarantine must treat the four maps, SG tables, references, guards,
+DMA ownership transitions, and one SF node as an indivisible job.
+
+A safe ordered D16 oracle uses constant in-range coordinates.  Clear XRGB
+target to `005a5a5a` and D16 to `ffff`.  First draw the covered half at
+Z=`4000`, sampling stage-0 red and stage-1 red; an interior must become
+`00ff0000` and depth approximately `4000`.  Submit the same geometry at
+Z=`c000` while sampling the yellow product.  LESS must preserve both the red
+color and `4000` depth.  The uncovered half remains sentinel/`ffff`; both
+source images remain byte-identical; all eight guard pages survive.  Follow
+with the base non-depth RGBA ioctl and repeat the D16 sequence to test closure
+in both directions.
+
+Only after that passes should one-state immediate batching be added.  Set one
+list A24 and stream a continuous `3*N*10`-dword payload; do not concatenate
+nominal single-triangle bodies.  For D16 without blend or mips:
+
+```text
+A20 body[97] = 20000000
+A23 body[98] = 23004f02
+A24 body[99] = 24000000 | (3*N)
+vertex H2     body[232]
+payload       body[236 .. 235 + 30*N]
+body length = 236 + 30*N dwords
+```
+
+The existing universal two-texture cap of **18 triangles / 54 vertices**
+remains safe: N=18 gives a 776-dword body and the normal PAUSE=`0xcf0`,
+STOP=`0xd70`; N=19 exceeds the page/read-ahead bound.  Preflight the complete
+body and trailer before writing staging memory, copy at most 54 userspace
+vertices once with `memdup_array_user()`, validate every triple and all four
+S/T values, and emit converted vertices into bounded allocated storage rather
+than a multi-kilobyte kernel-stack array.  All destination, source, depth,
+sampler, scissor, shader, and depth state is shared across the batch.
+
+The first D16 batch oracle uses two triangles `TL,TR,BR` and `TL,BR,BL` at
+Z=`4000` with the RGBW-times-red/red/blue/yellow sources.  Four quadrant
+interiors must be red, black, blue, and yellow, and D16 must be approximately
+`4000` at each; an outer sentinel and `ffff` depth remain untouched.  Then
+submit a deeper red full-quad batch and require all first-pass color/depth
+samples to remain unchanged.  This simultaneously proves A24 automatic fire,
+ten-dword stride, D4 linkage, depth interpolation, and four-BO lifetime.
+
+Mesa should keep this batch local to one vbuf callback and flush at 18 or on
+return, just like the untextured batch.  Enable it only for the exact
+`T0|T1` classifier, two supported sampler/view slots, Z16 LESS with writes,
+no blend/alpha test, and the fixed two-texture capability pair.  Preserve
+primitive expansion order and per-triangle nondegenerate checks.  On one
+failed ioctl reject the entire chunk and stop that callback; never retry its
+triangles individually against a possibly wedged engine.
 
 #### Exact first raw RGBA oracle
 
