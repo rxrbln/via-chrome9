@@ -547,10 +547,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
             return false;
          *reason = "projected-source-format";
          if (!unit &&
-             (ctx->fs->fragment_program ==
-                 CHROME9_FS_TEXTURE_PROJECTED_MODULATE ||
-              ctx->fs->fragment_program ==
-                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA) &&
+             ctx->fs->fragment_program ==
+                CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA &&
              source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
             return false;
       }

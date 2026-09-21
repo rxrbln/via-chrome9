@@ -2363,6 +2363,9 @@ run_pipe_texture(struct pipe_screen *screen)
       const uint32_t expect[4] = {
          0xff0000, 0xffffff, 0xff0000, 0xffffff,
       };
+      const uint32_t bgra_expect[4] = {
+         0x0000ff, 0xffffff, 0x0000ff, 0xffffff,
+      };
       uint64_t submitted = ccontext->submitted_triangles;
       uint64_t rejected = ccontext->rejected_triangles;
       bool pixels_match = true;
@@ -2404,7 +2407,14 @@ run_pipe_texture(struct pipe_screen *screen)
                                  &view);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
-      if (!pixels_match || ccontext->submitted_triangles != submitted + 4 ||
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++)
+         pixels_match &=
+            (pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
+             0xffffff) == bgra_expect[i];
+      context->bind_fs_state(context, projected_fs);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      if (!pixels_match || ccontext->submitted_triangles != submitted + 6 ||
           ccontext->rejected_triangles != rejected + 4 ||
           !smoke_guard_pages_match(ctarget) ||
           !smoke_guard_pages_match(ctexture) ||
