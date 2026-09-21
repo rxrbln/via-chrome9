@@ -373,6 +373,54 @@ chrome9_fs_is_texcoord(nir_def *def, unsigned unit, unsigned depth)
    return false;
 }
 
+/* Glamor's simplest solid shader is an unmodified vec4 from the first
+ * fragment constant.  Keep this deliberately narrower than general uniform
+ * support: one full 32-bit vec4, buffer zero, byte/vec4 offset zero. */
+static bool
+chrome9_fs_is_constant_color(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 8 || def->num_components != 4 || def->bit_size != 32)
+      return false;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_uniform:
+         return !nir_intrinsic_base(intr) &&
+                nir_src_is_const(intr->src[0]) &&
+                !nir_src_as_uint(intr->src[0]);
+      case nir_intrinsic_load_ubo:
+         return nir_src_is_const(intr->src[0]) &&
+                !nir_src_as_uint(intr->src[0]) &&
+                nir_src_is_const(intr->src[1]) &&
+                !nir_src_as_uint(intr->src[1]);
+      case nir_intrinsic_load_ubo_vec4:
+         return !nir_intrinsic_base(intr) &&
+                !nir_intrinsic_component(intr) &&
+                nir_src_is_const(intr->src[0]) &&
+                !nir_src_as_uint(intr->src[0]) &&
+                nir_src_is_const(intr->src[1]) &&
+                !nir_src_as_uint(intr->src[1]);
+      default:
+         return false;
+      }
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+         for (unsigned c = 0; c < 4; c++)
+            if (alu->src[0].swizzle[c] != c)
+               return false;
+         return chrome9_fs_is_constant_color(alu->src[0].src.ssa,
+                                             depth + 1);
+      }
+   }
+   return false;
+}
+
 static bool
 chrome9_fs_is_texture(nir_def *def, unsigned unit)
 {
@@ -408,6 +456,7 @@ chrome9_fs_is_texture(nir_def *def, unsigned unit)
 #define CHROME9_FS_FACTOR_TEXTURE0 (1u << 0)
 #define CHROME9_FS_FACTOR_TEXTURE1 (1u << 1)
 #define CHROME9_FS_FACTOR_PRIMARY  (1u << 2)
+#define CHROME9_FS_FACTOR_CONSTANT0 (1u << 3)
 
 static unsigned
 chrome9_fs_factors(nir_def *def, unsigned depth)
@@ -422,6 +471,8 @@ chrome9_fs_factors(nir_def *def, unsigned depth)
       return CHROME9_FS_FACTOR_TEXTURE1;
    if (chrome9_fs_is_primary_color(def, depth))
       return CHROME9_FS_FACTOR_PRIMARY;
+   if (chrome9_fs_is_constant_color(def, depth))
+      return CHROME9_FS_FACTOR_CONSTANT0;
    if (instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
 
@@ -452,6 +503,8 @@ chrome9_fs_result(nir_def *def)
    switch (chrome9_fs_factors(def, 0)) {
    case CHROME9_FS_FACTOR_PRIMARY:
       return CHROME9_FS_PRIMARY_COLOR;
+   case CHROME9_FS_FACTOR_CONSTANT0:
+      return CHROME9_FS_CONSTANT_COLOR;
    case CHROME9_FS_FACTOR_TEXTURE0:
       return CHROME9_FS_TEXTURE_REPLACE;
    case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_PRIMARY:
@@ -468,6 +521,7 @@ chrome9_fs_classify(nir_shader *nir)
 {
    unsigned result = CHROME9_FS_UNSUPPORTED;
    unsigned texture_count = 0;
+   unsigned constant_count = 0;
    bool written = false, valid = true;
 
    nir_foreach_function_impl(impl, nir) {
@@ -496,6 +550,11 @@ chrome9_fs_classify(nir_shader *nir)
             }
             intr = nir_instr_as_intrinsic(instr);
             switch (intr->intrinsic) {
+            case nir_intrinsic_load_uniform:
+            case nir_intrinsic_load_ubo:
+            case nir_intrinsic_load_ubo_vec4:
+               constant_count++;
+               break;
             case nir_intrinsic_load_input:
             case nir_intrinsic_load_interpolated_input:
             case nir_intrinsic_load_barycentric_pixel:
@@ -531,6 +590,9 @@ chrome9_fs_classify(nir_shader *nir)
    }
    if (!valid || !written ||
        (result == CHROME9_FS_PRIMARY_COLOR && texture_count) ||
+       (result == CHROME9_FS_CONSTANT_COLOR &&
+        (texture_count || constant_count != 1)) ||
+       (result != CHROME9_FS_CONSTANT_COLOR && constant_count) ||
        ((result == CHROME9_FS_TEXTURE_REPLACE ||
          result == CHROME9_FS_TEXTURE_MODULATE) && texture_count != 1) ||
        (result == CHROME9_FS_TWO_TEXTURE_MODULATE && texture_count != 2))
@@ -719,8 +781,12 @@ chrome9_set_constant_buffer(struct pipe_context *pipe,
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
-   if (shader == MESA_SHADER_VERTEX && index < PIPE_MAX_CONSTANT_BUFFERS)
+   if (index >= PIPE_MAX_CONSTANT_BUFFERS)
+      return;
+   if (shader == MESA_SHADER_VERTEX)
       util_copy_constant_buffer(&ctx->vs_constants[index], buffer);
+   else if (shader == MESA_SHADER_FRAGMENT)
+      util_copy_constant_buffer(&ctx->fs_constants[index], buffer);
 }
 
 static struct pipe_sampler_view *
@@ -999,7 +1065,7 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!ctx->vs || !ctx->fs || !ctx->fs->supported) {
       chrome9_warn_once(ctx, CHROME9_WARN_DRAW_STATE,
-                        "draw rejected: only primary-color fragment output is supported");
+                        "draw rejected: unsupported bounded fragment program");
       return;
    }
 
@@ -1114,8 +1180,10 @@ chrome9_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->render_target, NULL);
    util_set_vertex_buffers_count(ctx->vertex_buffers,
                                  &ctx->num_vertex_buffers, NULL, 0);
-   for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++)
+   for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++) {
       util_copy_constant_buffer(&ctx->vs_constants[i], NULL);
+      util_copy_constant_buffer(&ctx->fs_constants[i], NULL);
+   }
    for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
       pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
    FREE(ctx);

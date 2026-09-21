@@ -102,6 +102,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    crender->layout_valid = position >= 0 &&
                            (color0 >= 0 ||
                             crender->ctx->fs->fragment_program ==
+                               CHROME9_FS_CONSTANT_COLOR ||
+                            crender->ctx->fs->fragment_program ==
                                CHROME9_FS_TEXTURE_REPLACE ||
                             crender->ctx->fs->fragment_program ==
                                CHROME9_FS_TWO_TEXTURE_MODULATE) &&
@@ -112,6 +114,41 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                            crender->vinfo.size ==
                               6 + 4 * crender->texture_count;
    return &crender->vinfo;
+}
+
+static bool
+chrome9_fragment_constant_color(struct chrome9_context *ctx, uint32_t *color)
+{
+   const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
+   const uint8_t *map;
+   float rgba[4];
+
+   if (!ctx->fs ||
+       ctx->fs->fragment_program != CHROME9_FS_CONSTANT_COLOR ||
+       cb->buffer_size < sizeof(rgba) ||
+       cb->buffer_offset > UINT32_MAX - sizeof(rgba))
+      return false;
+   if (cb->user_buffer) {
+      map = (const uint8_t *)cb->user_buffer + cb->buffer_offset;
+   } else if (cb->buffer && cb->buffer->target == PIPE_BUFFER &&
+              cb->buffer->width0 >= sizeof(rgba) &&
+              cb->buffer_offset <= cb->buffer->width0 - sizeof(rgba)) {
+      map = chrome9_resource(cb->buffer)->bo.map;
+      if (!map)
+         return false;
+      map += cb->buffer_offset;
+   } else {
+      return false;
+   }
+   memcpy(rgba, map, sizeof(rgba));
+   for (unsigned i = 0; i < ARRAY_SIZE(rgba); i++)
+      if (!isfinite(rgba[i]))
+         return false;
+   *color = (uint32_t)float_to_ubyte(rgba[2]) |
+            (uint32_t)float_to_ubyte(rgba[1]) << 8 |
+            (uint32_t)float_to_ubyte(rgba[0]) << 16 |
+            (uint32_t)float_to_ubyte(rgba[3]) << 24;
+   return true;
 }
 
 static bool
@@ -436,6 +473,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct drm_chrome9_scissor_state scissor = { 0 };
    const unsigned indices[3] = { ia, ib, ic };
    int32_t x[3], y[3];
+   uint32_t constant_color = 0;
    bool blend_successor;
    bool depth_active;
 
@@ -454,6 +492,11 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                          "color/D16 draw state\n");
          ctx->warnings |= CHROME9_WARN_DRAW_STATE;
       }
+      return;
+   }
+   if (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR &&
+       !chrome9_fragment_constant_color(ctx, &constant_color)) {
+      ctx->rejected_triangles++;
       return;
    }
    if (ctx->rasterizer && ctx->rasterizer->scissor) {
@@ -482,6 +525,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
+      if (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR)
+         color = constant_color;
       x[i] = chrome9_coord_16_16(position[0], target->base.width0);
       y[i] = chrome9_coord_16_16(position[1], target->base.height0);
       if (crender->textured) {

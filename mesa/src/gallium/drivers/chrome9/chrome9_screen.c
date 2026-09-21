@@ -135,6 +135,10 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       3 : 2;
    fs->max_outputs = 1;
    fs->max_temps = 8;
+   /* Runtime execution currently accepts exactly one full vec4 at c0 for
+    * the bounded solid-color fragment program. */
+   fs->max_const_buffer0_size = 4 * sizeof(float);
+   fs->max_const_buffers = 1;
    /* Mesa's compatibility context requires at least one logical unit. */
    fs->max_texture_samplers =
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?

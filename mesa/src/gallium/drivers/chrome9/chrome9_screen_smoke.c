@@ -221,6 +221,56 @@ make_ff_primary_color_fs(struct pipe_screen *screen,
    return context->create_fs_state(context, &state);
 }
 
+static void *
+make_solid_vertex_shader(struct pipe_screen *screen,
+                         struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
+      "chrome9-glamor-solid-vertex");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *position = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_POS);
+
+   nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_vs_state(context, &state);
+}
+
+static void *
+make_constant_color_fs(struct pipe_screen *screen,
+                       struct pipe_context *context, unsigned offset)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-glamor-solid-fragment");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *color = nir_load_ubo(
+      &b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, offset),
+      .align_mul = 16, .range_base = offset, .range = 16);
+
+   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
 static bool
 run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                   struct pipe_resource *depth_resource)
@@ -310,6 +360,24 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       .start = 0,
       .count = 4,
    };
+   const float solid_color[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+   const float solid_buffer_color[4] = { 1.0f, 0.0f, 0.5f, 1.0f };
+   struct pipe_constant_buffer solid_constant = {
+      .buffer_size = sizeof(solid_color),
+      .user_buffer = solid_color,
+   };
+   struct pipe_constant_buffer solid_buffer_constant = {
+      .buffer_size = sizeof(solid_buffer_color),
+   };
+   const struct pipe_resource solid_buffer_template = {
+      .target = PIPE_BUFFER,
+      .format = PIPE_FORMAT_R8_UNORM,
+      .width0 = sizeof(solid_buffer_color),
+      .height0 = 1,
+      .depth0 = 1,
+      .array_size = 1,
+      .bind = PIPE_BIND_CONSTANT_BUFFER,
+   };
    union pipe_color_union clear_color = { 0 };
    union pipe_color_union green = { .f = { 0, 1, 0, 0 } };
    union pipe_color_union alpha_mask_base = {
@@ -329,8 +397,13 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *rasterizer_handle = NULL;
    void *scissor_rasterizer_handle = NULL;
    void *elements_handle = NULL;
+   void *solid_elements_handle = NULL;
    void *vs = NULL;
    void *fs = NULL;
+   void *solid_vs = NULL;
+   void *solid_fs = NULL;
+   void *unsupported_solid_fs = NULL;
+   struct pipe_resource *solid_buffer = NULL;
    bool passed = false;
 
    context = screen->context_create(screen, NULL, 0);
@@ -394,6 +467,14 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                                                             elements);
    vs = make_ff_vertex_shader(screen, context);
    fs = make_ff_primary_color_fs(screen, context);
+   if (!depth_resource) {
+      solid_buffer = screen->resource_create(screen, &solid_buffer_template);
+      solid_elements_handle =
+         context->create_vertex_elements_state(context, 1, elements);
+      solid_vs = make_solid_vertex_shader(screen, context);
+      solid_fs = make_constant_color_fs(screen, context, 0);
+      unsupported_solid_fs = make_constant_color_fs(screen, context, 16);
+   }
    if (!blend_handle ||
        (!depth_resource &&
         chrome9_screen_has_capability(
@@ -408,8 +489,18 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
        !dsa_handle || !rasterizer_handle ||
        (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_ALPHA_TEST) &&
         !alpha_dsa_handle) ||
-       !elements_handle || !vs || !fs)
+       !elements_handle || !vs || !fs ||
+       (!depth_resource &&
+        (!solid_buffer || !solid_elements_handle || !solid_vs || !solid_fs ||
+         !((struct chrome9_shader *)solid_fs)->supported ||
+         !unsupported_solid_fs ||
+         ((struct chrome9_shader *)unsupported_solid_fs)->supported)))
       goto out;
+   if (solid_buffer) {
+      memcpy(chrome9_resource(solid_buffer)->bo.map, solid_buffer_color,
+             sizeof(solid_buffer_color));
+      solid_buffer_constant.buffer = solid_buffer;
+   }
 
    context->bind_blend_state(context, blend_handle);
    context->bind_depth_stencil_alpha_state(context, dsa_handle);
@@ -591,6 +682,75 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                  chrome9_context(context)->submitted_triangles - submitted,
                  chrome9_context(context)->rejected_triangles - rejected);
    }
+   if (passed && !depth_resource) {
+      uint64_t submitted = chrome9_context(context)->submitted_triangles;
+      uint64_t rejected = chrome9_context(context)->rejected_triangles;
+      uint32_t pixel;
+
+      context->bind_blend_state(context, blend_handle);
+      context->bind_depth_stencil_alpha_state(context, dsa_handle);
+      context->bind_rasterizer_state(context, rasterizer_handle);
+      context->set_scissor_states(context, 0, 1, &scissor);
+      context->bind_vertex_elements_state(context, solid_elements_handle);
+      context->bind_vs_state(context, solid_vs);
+      context->bind_fs_state(context, solid_fs);
+      vertex_buffer.buffer.user = vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0,
+                                   &solid_constant);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &clear_color, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush_resource(context, resource);
+      context->flush(context, NULL, 0);
+      pixel = pixels[32 * (surface->stride / 4) + 192];
+      passed = (pixel & 0xffffff) == 0x4080bf &&
+               (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                (pixel >> 24) == 0xff) &&
+               chrome9_context(context)->submitted_triangles ==
+                  submitted + 2 &&
+               chrome9_context(context)->rejected_triangles == rejected &&
+               smoke_guard_pages_match(draw_surface);
+      if (passed)
+         printf("Gallium c0 solid shader passed: sample=%08x\n", pixel);
+      else
+         fprintf(stderr,
+                 "Gallium c0 solid shader mismatch: sample=%08x "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                 pixel,
+                 chrome9_context(context)->submitted_triangles - submitted,
+                 chrome9_context(context)->rejected_triangles - rejected);
+      if (passed) {
+         submitted = chrome9_context(context)->submitted_triangles;
+         rejected = chrome9_context(context)->rejected_triangles;
+         context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0,
+                                      &solid_buffer_constant);
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &clear_color, 1.0, 0);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush_resource(context, resource);
+         context->flush(context, NULL, 0);
+         pixel = pixels[32 * (surface->stride / 4) + 192];
+         passed = (pixel & 0xffffff) == 0xff0080 &&
+                  (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                   (pixel >> 24) == 0xff) &&
+                  chrome9_context(context)->submitted_triangles ==
+                     submitted + 2 &&
+                  chrome9_context(context)->rejected_triangles == rejected &&
+                  smoke_guard_pages_match(draw_surface);
+         if (passed)
+            printf("Gallium resource c0 solid shader passed: sample=%08x\n",
+                   pixel);
+         else
+            fprintf(stderr,
+                    "Gallium resource c0 solid shader mismatch: sample=%08x "
+                    "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                    pixel,
+                    chrome9_context(context)->submitted_triangles - submitted,
+                    chrome9_context(context)->rejected_triangles - rejected);
+      }
+      context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0, NULL);
+   }
    if (!passed)
       fprintf(stderr,
               "Gallium quad-strip coverage/depth mismatch: %zu sample=%08x/%04x\n",
@@ -610,8 +770,17 @@ out:
          context->delete_vs_state(context, vs);
       if (fs)
          context->delete_fs_state(context, fs);
+      if (solid_vs)
+         context->delete_vs_state(context, solid_vs);
+      if (solid_fs)
+         context->delete_fs_state(context, solid_fs);
+      if (unsupported_solid_fs)
+         context->delete_fs_state(context, unsupported_solid_fs);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
+      if (solid_elements_handle)
+         context->delete_vertex_elements_state(context,
+                                               solid_elements_handle);
       if (rasterizer_handle)
          context->delete_rasterizer_state(context, rasterizer_handle);
       if (scissor_rasterizer_handle)
@@ -630,6 +799,8 @@ out:
          context->delete_blend_state(context, alpha_only_handle);
       context->destroy(context);
    }
+   if (solid_buffer)
+      screen->resource_destroy(screen, solid_buffer);
    return passed;
 }
 

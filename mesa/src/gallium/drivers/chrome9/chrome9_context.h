@@ -21,6 +21,7 @@ struct chrome9_shader {
    enum {
       CHROME9_FS_UNSUPPORTED,
       CHROME9_FS_PRIMARY_COLOR,
+      CHROME9_FS_CONSTANT_COLOR,
       CHROME9_FS_TEXTURE_REPLACE,
       CHROME9_FS_TEXTURE_MODULATE,
       CHROME9_FS_TWO_TEXTURE_MODULATE,
@@ -65,6 +66,7 @@ struct chrome9_context {
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
    struct pipe_constant_buffer vs_constants[PIPE_MAX_CONSTANT_BUFFERS];
+   struct pipe_constant_buffer fs_constants[PIPE_MAX_CONSTANT_BUFFERS];
    struct chrome9_sampler_state *sampler_states[PIPE_MAX_SAMPLERS];
    unsigned num_sampler_states;
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
