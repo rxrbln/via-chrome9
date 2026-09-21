@@ -22,6 +22,12 @@ syscall time.  It still does not attribute the time among GART publication,
 cache ownership, hardware execution, guard readback, and teardown; the kernel
 phase counters proposed below remain necessary.
 
+The cross-workload counts and implementation priority are recorded in
+[batching-workload-priority.md](batching-workload-priority.md).  The measured
+order is the untextured RHW run first, then the one-texture run, then the
+two-texture run; 1,498 of 1,500 accepted triangles in the retained ioquake
+trace require a one-texture blend envelope.
+
 ## Existing batch and command cost
 
 Mesa's `chrome9_vbuf_draw_arrays()` and `chrome9_vbuf_draw_elements()` collect
