@@ -561,6 +561,162 @@ chrome9_fs_is_one(nir_def *def, unsigned depth)
 }
 
 static bool
+chrome9_fs_is_generic0(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (!def->num_components || def->num_components > 4 ||
+       def->bit_size != 32 || instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   nir_variable *var;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_load_interpolated_input:
+      return nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_VAR0 &&
+             !nir_intrinsic_component(intr);
+   case nir_intrinsic_load_deref:
+      var = nir_intrinsic_get_var(intr, 0);
+      return var && var->data.mode == nir_var_shader_in &&
+             var->data.location == VARYING_SLOT_VAR0 &&
+             !var->data.location_frac;
+   default:
+      return false;
+   }
+}
+
+static bool
+chrome9_fs_is_generic0_component(const nir_alu_src *src, unsigned component,
+                                 nir_def **base, unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+
+   if (depth > 8 || !def)
+      return false;
+   if (chrome9_fs_is_generic0(def)) {
+      if (component >= def->num_components || src->swizzle[0] != component)
+         return false;
+      *base = def;
+      return true;
+   }
+   if (def->num_components != 1 || src->swizzle[0])
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   return alu->op == nir_op_mov &&
+          chrome9_fs_is_generic0_component(&alu->src[0], component, base,
+                                           depth + 1);
+}
+
+static bool
+chrome9_fs_is_generic0_rgbx(nir_def *def, nir_def **base, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *found = NULL;
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_generic0_rgbx(alu->src[0].src.ssa, base,
+                                         depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++) {
+      nir_def *source = NULL;
+
+      if (!chrome9_fs_is_generic0_component(&alu->src[c], 0, &source,
+                                            depth + 1) ||
+          (found && source != found))
+         return false;
+      found = source;
+   }
+   if (alu->src[3].swizzle[0] ||
+       !chrome9_fs_is_one(alu->src[3].src.ssa, depth + 1))
+      return false;
+   *base = found;
+   return found != NULL;
+}
+
+static bool
+chrome9_fs_is_packed_texcoord(nir_def *def, nir_def **base, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *first = NULL, *second = NULL;
+
+   if (depth > 8 || def->num_components != 2 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_vec2 ||
+       !chrome9_fs_is_generic0_component(&alu->src[0], 1, &first,
+                                         depth + 1) ||
+       !chrome9_fs_is_generic0_component(&alu->src[1], 2, &second,
+                                         depth + 1) ||
+       first != second)
+      return false;
+   *base = first;
+   return true;
+}
+
+static bool
+chrome9_fs_is_packed_texture(nir_def *def, nir_def **base)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_tex_instr *tex;
+   int coord;
+
+   if (def->num_components != 4 || instr->type != nir_instr_type_tex)
+      return false;
+   tex = nir_instr_as_tex(instr);
+   coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   return tex->op == nir_texop_tex &&
+          tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+          !tex->is_shadow && !tex->texture_index && !tex->sampler_index &&
+          tex->coord_components == 2 && coord >= 0 && tex->num_srcs == 1 &&
+          chrome9_fs_is_packed_texcoord(tex->src[coord].src.ssa, base, 0);
+}
+
+static bool
+chrome9_fs_is_packed_gray_modulate(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *texture_base = NULL, *color_base = NULL;
+   bool texture_first;
+
+   if (def->num_components != 4 || instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_fmul)
+      return false;
+   for (unsigned source = 0; source < 2; source++)
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[source].swizzle[c] != c)
+            return false;
+   texture_first = chrome9_fs_is_packed_texture(alu->src[0].src.ssa,
+                                                &texture_base);
+   if (texture_first) {
+      if (!chrome9_fs_is_generic0_rgbx(alu->src[1].src.ssa, &color_base, 0))
+         return false;
+   } else {
+      if (!chrome9_fs_is_packed_texture(alu->src[1].src.ssa, &texture_base) ||
+          !chrome9_fs_is_generic0_rgbx(alu->src[0].src.ssa, &color_base, 0))
+         return false;
+   }
+   return texture_base == color_base && texture_base &&
+          texture_base->num_components == 3;
+}
+
+static bool
 chrome9_fs_is_texture_component(const nir_alu_src *src, unsigned component,
                                 unsigned depth)
 {
@@ -617,8 +773,14 @@ chrome9_fs_result(nir_def *def)
 {
    nir_instr *instr;
    nir_alu_instr *alu;
+   nir_def *generic = NULL;
    unsigned a, b;
 
+   if (chrome9_fs_is_generic0_rgbx(def, &generic, 0) &&
+       generic->num_components == 1)
+      return CHROME9_FS_PRIMARY_SCALAR_RGBX;
+   if (chrome9_fs_is_packed_gray_modulate(def))
+      return CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE;
    if (chrome9_fs_is_rgbx(def, 0))
       return CHROME9_FS_TEXTURE_RGBX;
    switch (chrome9_fs_leaf(def, 0)) {
@@ -678,9 +840,12 @@ chrome9_fs_classify(nir_shader *nir)
 
             if (instr->type == nir_instr_type_tex) {
                nir_tex_instr *tex = nir_instr_as_tex(instr);
+               nir_def *packed_base = NULL;
 
                texture_count++;
-               if (!chrome9_fs_is_texture(&tex->def, tex->texture_index) ||
+               if ((!chrome9_fs_is_texture(&tex->def, tex->texture_index) &&
+                    !chrome9_fs_is_packed_texture(&tex->def,
+                                                  &packed_base)) ||
                    tex->texture_index > 1)
                   valid = false;
                continue;
@@ -737,6 +902,7 @@ chrome9_fs_classify(nir_shader *nir)
       return CHROME9_FS_UNSUPPORTED;
    switch (result) {
    case CHROME9_FS_PRIMARY_COLOR:
+   case CHROME9_FS_PRIMARY_SCALAR_RGBX:
       valid = !texture_count && !constant_count;
       break;
    case CHROME9_FS_CONSTANT_COLOR:
@@ -750,6 +916,7 @@ chrome9_fs_classify(nir_shader *nir)
    case CHROME9_FS_TEXTURE_REPLACE:
    case CHROME9_FS_TEXTURE_RGBX:
    case CHROME9_FS_TEXTURE_MODULATE:
+   case CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE:
       valid = texture_count == 1 && !constant_count;
       break;
    case CHROME9_FS_TEXTURE_CONSTANT_MODULATE:

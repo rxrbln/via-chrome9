@@ -256,6 +256,119 @@ make_texture_rgbx_fragment_shader(struct pipe_screen *screen,
 }
 
 static void *
+make_scalar_generic_vertex_shader(struct pipe_screen *screen,
+                                  struct pipe_context *context,
+                                  bool packed_texture)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
+      packed_texture ? "chrome9-packed-gray-uv-vertex" :
+                       "chrome9-scalar-gray-vertex");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *position = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_POS);
+   nir_def *color = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_COLOR0);
+   nir_def *varying = nir_channel(&b, color, 0);
+   if (packed_texture) {
+      nir_def *coord = nir_load_input(
+         &b, 2, 32, nir_imm_int(&b, 0),
+         .io_semantics.location = VERT_ATTRIB_TEX0);
+
+      varying = nir_vec3(&b, varying, nir_channel(&b, coord, 0),
+                         nir_channel(&b, coord, 1));
+   }
+   nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_store_output(&b, varying, nir_imm_int(&b, 0),
+                    .write_mask = BITFIELD_MASK(varying->num_components),
+                    .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_vs_state(context, &state);
+}
+
+static nir_def *
+make_generic0_load(nir_builder *b, const struct glsl_type *type,
+                   const char *name)
+{
+   nir_variable *varying = nir_variable_create(b->shader, nir_var_shader_in,
+                                                type, name);
+
+   varying->data.location = VARYING_SLOT_VAR0;
+   varying->data.interpolation = INTERP_MODE_SMOOTH;
+   return nir_load_var(b, varying);
+}
+
+static void *
+make_scalar_rgbx_fragment_shader(struct pipe_screen *screen,
+                                 struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-scalar-gray-rgbx-fragment");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *gray = make_generic0_load(&b, glsl_float_type(), "Color");
+   nir_def *result = nir_vec4(&b, gray, gray, gray,
+                              nir_imm_float(&b, 1.0f));
+
+   nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static void *
+make_packed_gray_texture_fragment_shader(struct pipe_screen *screen,
+                                         struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-packed-gray-uv-fragment");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *varying = make_generic0_load(
+      &b, glsl_vector_type(GLSL_TYPE_FLOAT, 3), "ColorTexcoord");
+   nir_def *coord = nir_vec2(&b, nir_channel(&b, varying, 1),
+                             nir_channel(&b, varying, 2));
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_def *gray = nir_channel(&b, varying, 0);
+   nir_def *diffuse = nir_vec4(&b, gray, gray, gray,
+                               nir_imm_float(&b, 1.0f));
+   nir_store_output(&b, nir_fmul(&b, &tex->def, diffuse),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static void *
 make_two_texture_vertex_shader(struct pipe_screen *screen,
                                struct pipe_context *context)
 {
@@ -510,6 +623,12 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       { {  1, -1, 0, 1 }, { 1, 0, 0, 0.5 } },
       { {  1,  1, 0, 1 }, { 1, 0, 0, 0.5 } },
    };
+   static const struct smoke_vertex scalar_gray_vertices[] = {
+      { { -1, -1, 0, 1 }, { 0.25, 0, 0, 0 } },
+      { { -1,  1, 0, 1 }, { 0.25, 0, 0, 0 } },
+      { {  1, -1, 0, 1 }, { 0.25, 0, 0, 0 } },
+      { {  1,  1, 0, 1 }, { 0.25, 0, 0, 0 } },
+   };
    static const struct smoke_vertex alpha_near_kill_vertices[] = {
       { { -1, -1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
       { { -1,  1, -0.5, 1 }, { 1, 0, 0, 0.75 } },
@@ -618,6 +737,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *unsupported_solid_fs = NULL;
    void *product_fs[3] = { NULL };
    void *unsupported_product_fs = NULL;
+   void *scalar_gray_vs = NULL, *scalar_gray_fs = NULL;
    struct pipe_resource *solid_buffer = NULL;
    bool passed = false;
 
@@ -693,6 +813,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          product_fs[i] = make_constant_product_fs(screen, context, i, 16);
       unsupported_product_fs =
          make_constant_product_fs(screen, context, 0, 32);
+      scalar_gray_vs =
+         make_scalar_generic_vertex_shader(screen, context, false);
+      scalar_gray_fs = make_scalar_rgbx_fragment_shader(screen, context);
    }
    if (!blend_handle ||
        (!depth_resource &&
@@ -722,7 +845,10 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          ((struct chrome9_shader *)product_fs[2])->fragment_program !=
             CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE ||
          !unsupported_product_fs ||
-         ((struct chrome9_shader *)unsupported_product_fs)->supported)))
+         ((struct chrome9_shader *)unsupported_product_fs)->supported ||
+         !scalar_gray_vs || !scalar_gray_fs ||
+         ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=
+            CHROME9_FS_PRIMARY_SCALAR_RGBX)))
       goto out;
    if (solid_buffer) {
       memcpy(chrome9_resource(solid_buffer)->bo.map, solid_buffer_color,
@@ -1020,6 +1146,37 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                     chrome9_context(context)->rejected_triangles - rejected);
       }
       context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0, NULL);
+      if (passed) {
+         submitted = chrome9_context(context)->submitted_triangles;
+         rejected = chrome9_context(context)->rejected_triangles;
+         context->bind_vertex_elements_state(context, elements_handle);
+         context->bind_vs_state(context, scalar_gray_vs);
+         context->bind_fs_state(context, scalar_gray_fs);
+         vertex_buffer.buffer.user = scalar_gray_vertices;
+         context->set_vertex_buffers(context, 1, &vertex_buffer);
+         context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff,
+                        NULL, &clear_color, 1.0, 0);
+         context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+         context->flush_resource(context, resource);
+         context->flush(context, NULL, 0);
+         pixel = pixels[32 * (surface->stride / 4) + 192];
+         passed = (pixel & 0xffffff) == 0x404040 &&
+                  (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                   (pixel >> 24) == 0xff) &&
+                  chrome9_context(context)->submitted_triangles ==
+                     submitted + 2 &&
+                  chrome9_context(context)->rejected_triangles == rejected &&
+                  smoke_guard_pages_match(draw_surface);
+         if (passed)
+            printf("Gallium scalar VAR0 RGBX passed: sample=%08x\n", pixel);
+         else
+            fprintf(stderr,
+                    "Gallium scalar VAR0 RGBX mismatch: sample=%08x "
+                    "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                    pixel,
+                    chrome9_context(context)->submitted_triangles - submitted,
+                    chrome9_context(context)->rejected_triangles - rejected);
+      }
    }
    if (!passed)
       fprintf(stderr,
@@ -1051,6 +1208,10 @@ out:
             context->delete_fs_state(context, product_fs[i]);
       if (unsupported_product_fs)
          context->delete_fs_state(context, unsupported_product_fs);
+      if (scalar_gray_vs)
+         context->delete_vs_state(context, scalar_gray_vs);
+      if (scalar_gray_fs)
+         context->delete_fs_state(context, scalar_gray_fs);
       if (elements_handle)
          context->delete_vertex_elements_state(context, elements_handle);
       if (solid_elements_handle)
@@ -1093,6 +1254,12 @@ run_pipe_texture(struct pipe_screen *screen)
       { { -1,  1, 0, 1 }, { 1, 0, 0, 1 }, { 0, 1 } },
       { {  1, -1, 0, 1 }, { 1, 0, 0, 1 }, { 1, 0 } },
       { {  1,  1, 0, 1 }, { 1, 0, 0, 1 }, { 1, 1 } },
+   };
+   static const struct smoke_texture_vertex packed_gray_vertices[] = {
+      { { -1, -1, 0, 1 }, { 0.5, 0, 0, 0 }, { 0, 0 } },
+      { { -1,  1, 0, 1 }, { 0.5, 0, 0, 0 }, { 0, 1 } },
+      { {  1, -1, 0, 1 }, { 0.5, 0, 0, 0 }, { 1, 0 } },
+      { {  1,  1, 0, 1 }, { 0.5, 0, 0, 0 }, { 1, 1 } },
    };
    static const struct smoke_texture_vertex rhw_replace_vertices[] = {
       { { -1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0.5 } },
@@ -1201,6 +1368,7 @@ run_pipe_texture(struct pipe_screen *screen)
    void *replace_vs = NULL, *modulate_vs = NULL;
    void *replace = NULL, *modulate = NULL, *constant_modulate = NULL;
    void *constant_alpha_modulate = NULL, *rgbx = NULL;
+   void *packed_gray_vs = NULL, *packed_gray_fs = NULL;
    void *samplers[1];
    uint32_t source_copy[4], mip_copy = 0x5aa55aa5, *source, *pixels;
    uint32_t *mip_pixel;
@@ -1329,6 +1497,10 @@ run_pipe_texture(struct pipe_screen *screen)
    constant_alpha_modulate =
       make_texture_constant_fragment_shader(screen, context, true);
    rgbx = make_texture_rgbx_fragment_shader(screen, context);
+   packed_gray_vs =
+      make_scalar_generic_vertex_shader(screen, context, true);
+   packed_gray_fs =
+      make_packed_gray_texture_fragment_shader(screen, context);
    if (!blend_handle ||
        (chrome9_screen_has_capability(
            screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND) &&
@@ -1339,25 +1511,28 @@ run_pipe_texture(struct pipe_screen *screen)
        !replace_vs ||
        !modulate_vs || !replace || !modulate || !constant_modulate ||
        !constant_alpha_modulate || !rgbx ||
+       !packed_gray_vs || !packed_gray_fs ||
        ((struct chrome9_shader *)constant_modulate)->fragment_program !=
           CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
        ((struct chrome9_shader *)constant_alpha_modulate)->fragment_program !=
           CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE ||
        ((struct chrome9_shader *)rgbx)->fragment_program !=
-          CHROME9_FS_TEXTURE_RGBX) {
+          CHROME9_FS_TEXTURE_RGBX ||
+       ((struct chrome9_shader *)packed_gray_fs)->fragment_program !=
+          CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE) {
       fprintf(stderr,
               "texture setup failed: target=%p texture=%p context=%p "
               "blend=%p dsa=%p rasterizer=%p elements=%p "
               "replace_elements=%p sampler=%p "
               "view=%p rhw_view=%p replace_vs=%p modulate_vs=%p "
               "replace=%p modulate=%p constant_modulate=%p "
-              "constant_alpha_modulate=%p rgbx=%p\n",
+              "constant_alpha_modulate=%p rgbx=%p packed=%p/%p\n",
               (void *)target, (void *)texture, (void *)context, blend_handle,
               dsa_handle, rasterizer_handle, elements_handle,
               replace_elements_handle, sampler_handle,
               (void *)view, (void *)rhw_view, replace_vs, modulate_vs,
               replace, modulate, constant_modulate,
-              constant_alpha_modulate, rgbx);
+              constant_alpha_modulate, rgbx, packed_gray_vs, packed_gray_fs);
       goto out;
    }
 
@@ -1423,6 +1598,49 @@ run_pipe_texture(struct pipe_screen *screen)
                  expect[program][3]);
          goto out;
       }
+   }
+   {
+      const uint32_t expect[4] = {
+         0x800000, 0x008000, 0x000080, 0x808080,
+      };
+      const unsigned at[4][2] = { { 8, 8 }, { 24, 8 },
+                                  { 8, 24 }, { 24, 24 } };
+      uint64_t submitted = ccontext->submitted_triangles;
+      uint64_t rejected = ccontext->rejected_triangles;
+      bool pixels_match = true;
+
+      vertex_buffer.buffer.user = packed_gray_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->bind_vertex_elements_state(context, elements_handle);
+      context->bind_vs_state(context, packed_gray_vs);
+      context->bind_fs_state(context, packed_gray_fs);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &clear, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      pixels = (uint32_t *)((uint8_t *)ctarget->bo.map +
+                            ctarget->data_offset);
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++) {
+         uint32_t pixel =
+            pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] & 0xffffff;
+
+         for (unsigned shift = 0; shift <= 16; shift += 8)
+            pixels_match &=
+               abs((int)(pixel >> shift & 0xff) -
+                   (int)(expect[i] >> shift & 0xff)) <= 1;
+      }
+      if (!pixels_match || ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(ctexture)) {
+         fprintf(stderr,
+                 "packed VAR0 gray+UV mismatch: submitted=+%" PRIu64
+                 " rejected=+%" PRIu64 "\n",
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected);
+         goto out;
+      }
+      puts("Gallium packed VAR0 gray+UV MODULATE passed");
    }
    {
       const uint32_t expect[4] = {
@@ -1807,6 +2025,10 @@ out:
          context->delete_fs_state(context, constant_alpha_modulate);
       if (rgbx)
          context->delete_fs_state(context, rgbx);
+      if (packed_gray_vs)
+         context->delete_vs_state(context, packed_gray_vs);
+      if (packed_gray_fs)
+         context->delete_fs_state(context, packed_gray_fs);
       if (view) pipe_sampler_view_reference(&view, NULL);
       if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
       if (sampler_handle)

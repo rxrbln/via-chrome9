@@ -38,6 +38,7 @@ struct chrome9_vbuf_render {
    unsigned batch_count;
    bool batch_failed;
    uint8_t texture_count;
+   uint8_t packed_generic;
    bool textured;
    bool layout_valid;
 };
@@ -81,7 +82,8 @@ static const struct vertex_info *
 chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
-   int position, color0, color1, texcoord[2] = { -1, -1 };
+   int position, color0, color1, generic0 = -1;
+   int texcoord[2] = { -1, -1 };
 
    position = draw_find_shader_output(crender->ctx->draw,
                                       TGSI_SEMANTIC_POSITION, 0);
@@ -92,10 +94,17 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    unsigned program = crender->ctx->fs ?
       crender->ctx->fs->fragment_program : CHROME9_FS_UNSUPPORTED;
 
+   crender->packed_generic =
+      program == CHROME9_FS_PRIMARY_SCALAR_RGBX ? 1 :
+      program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ? 2 : 0;
+   if (crender->packed_generic)
+      generic0 = draw_find_shader_output(crender->ctx->draw,
+                                         TGSI_SEMANTIC_GENERIC, 0);
    crender->texture_count = program == CHROME9_FS_TWO_TEXTURE_MODULATE ? 2 :
       (program == CHROME9_FS_TEXTURE_REPLACE ||
        program == CHROME9_FS_TEXTURE_RGBX ||
        program == CHROME9_FS_TEXTURE_MODULATE ||
+       program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ||
        program == CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
        program == CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE) ? 1 : 0;
    crender->textured = crender->texture_count != 0;
@@ -109,25 +118,31 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    }
    memset(&crender->vinfo, 0, sizeof(crender->vinfo));
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, position);
-   draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color0);
+   draw_emit_vertex_attr(&crender->vinfo,
+                         crender->packed_generic ? EMIT_4F : EMIT_4UB_BGRA,
+                         crender->packed_generic ? generic0 : color0);
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
    /* Keep R/Q visible to the validated userspace boundary.  The first
     * hardware ABI implements ordinary 2D coordinates only, so draw-time
     * validation below accepts Q==1 and rejects projective texturing instead
     * of silently discarding it. */
-   for (unsigned unit = 0; unit < crender->texture_count; unit++)
-      draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, texcoord[unit]);
+   if (crender->packed_generic != 2)
+      for (unsigned unit = 0; unit < crender->texture_count; unit++)
+         draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, texcoord[unit]);
    draw_compute_vertex_size(&crender->vinfo);
    crender->layout_valid = position >= 0 &&
-                           (color0 >= 0 ||
-                            (program != CHROME9_FS_PRIMARY_COLOR &&
-                             program != CHROME9_FS_TEXTURE_MODULATE)) &&
+                           (crender->packed_generic ? generic0 >= 0 :
+                            (color0 >= 0 ||
+                             (program != CHROME9_FS_PRIMARY_COLOR &&
+                              program != CHROME9_FS_TEXTURE_MODULATE))) &&
                            (!crender->textured ||
-                            (texcoord[0] >= 0 &&
+                            ((crender->packed_generic == 2 ||
+                              texcoord[0] >= 0) &&
                              (crender->texture_count == 1 ||
                               texcoord[1] >= 0))) &&
                            crender->vinfo.size ==
-                              6 + 4 * crender->texture_count;
+                              (crender->packed_generic ?
+                               9 : 6 + 4 * crender->texture_count);
    return &crender->vinfo;
 }
 
@@ -209,7 +224,8 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    size_t size;
 
-   if (vertex_size != (6 + 4 * crender->texture_count) * sizeof(uint32_t))
+   if (vertex_size != (crender->packed_generic ? 9 :
+                       6 + 4 * crender->texture_count) * sizeof(uint32_t))
       return false;
    size = (size_t)vertex_size * nr_vertices;
 
@@ -560,6 +576,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    for (unsigned i = 0; i < 3; i++) {
       const uint8_t *vertex;
       const float *position;
+      const float *packed = NULL;
       uint32_t color;
 
       if (indices[i] >= crender->vertex_count ||
@@ -575,18 +592,32 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          ctx->rejected_triangles++;
          return;
       }
-      memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
+      if (crender->packed_generic) {
+         unsigned gray;
+
+         packed = (const float *)(vertex + 4 * sizeof(float));
+         if (!isfinite(packed[0])) {
+            ctx->rejected_triangles++;
+            return;
+         }
+         gray = float_to_ubyte(packed[0]);
+         color = gray | gray << 8 | gray << 16 | 0xff000000;
+      } else {
+         memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
+      }
       if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program))
          color = constant_color;
       x[i] = chrome9_coord_16_16(position[0], target->base.width0);
       y[i] = chrome9_coord_16_16(position[1], target->base.height0);
       if (crender->textured) {
-         const float *texcoord = (const float *)(vertex + 6 * sizeof(uint32_t));
+         const float *texcoord = crender->packed_generic == 2 ? packed + 1 :
+            (const float *)(vertex + 6 * sizeof(uint32_t));
 
          if (!isfinite(position[2]) || !isfinite(position[3]) ||
              position[3] <= 0.0f || !isfinite(texcoord[0]) ||
-             !isfinite(texcoord[1]) || !isfinite(texcoord[2]) ||
-             texcoord[3] != 1.0f ||
+             !isfinite(texcoord[1]) ||
+             (crender->packed_generic != 2 &&
+              (!isfinite(texcoord[2]) || texcoord[3] != 1.0f)) ||
              (crender->texture_count == 2 &&
               (texcoord[0] < 0.0f || texcoord[0] > 1.0f ||
                texcoord[1] < 0.0f || texcoord[1] > 1.0f))) {
@@ -600,8 +631,12 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          memcpy(&texture_args.vertices[i].rhw_float, &position[3],
                 sizeof(position[3]));
          texture_args.vertices[i].color = color;
-         memcpy(&texture_args.vertices[i].specular,
-                vertex + 5 * sizeof(uint32_t), sizeof(uint32_t));
+         if (crender->packed_generic == 2) {
+            texture_args.vertices[i].specular = 0;
+         } else {
+            memcpy(&texture_args.vertices[i].specular,
+                   vertex + 5 * sizeof(uint32_t), sizeof(uint32_t));
+         }
          memcpy(&texture_args.vertices[i].s_float, &texcoord[0],
                 sizeof(texcoord[0]));
          memcpy(&texture_args.vertices[i].t_float, &texcoord[1],
