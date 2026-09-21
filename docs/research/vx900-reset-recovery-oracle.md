@@ -1025,6 +1025,42 @@ released, and refused.  Validate without injecting a real GPU hang:
    though `published` is set.  This is the regression test for the current
    boolean ambiguity.
 
+### Follow-up: late PID10 STOP, not part of the first tranche
+
+`RING_STOP` is also potentially recoverable, but through a different proof.
+`chrome9_append_segment()` has not copied or installed the pending job at this
+point.  The only published operation is PID10 for the *old* ring, whose old
+PID00 PAUSE and non-CR idle were proved immediately before A64/A65 changed.
+The immutable bytes between that PAUSE and `engine->active_stop` are only the
+prebuilt legal dummy/STOP trailer.  Thus the pending job's BO can never have
+been referenced by this command transition.
+
+Do not fold this into `JOB_TIMEOUT`.  A future second tranche may:
+
+1. retain an engine-level `STOP_PENDING` record containing the old
+   `ring_epoch`, `active_pause`, `active_stop`, and an immutable-trailer
+   generation/checksum; never use the pending job's zero/uninitialized
+   `ring_pause`;
+2. under a new bounded deadline require the exact vendor STOP predicate
+   `!(0400 & 00101ff3)`, with unchanged epoch/tuple and no intervening CR write;
+   PID10 is not qualified by `0444.bit31`, so requiring PAUSE here is wrong;
+3. mark the reader `STOPPED` and make teardown skip a second
+   `chrome9_stop_active_ring()` call; an already stopped PID10 reader is not an
+   owned PID00 PAUSE and cannot satisfy that helper's precondition;
+4. transition the never-executed pending BO roles back to CPU if
+   `device_owned`, invalidate their transient PTEs through the complete GTI
+   proof, signal their error fence, and release them; and
+5. invalidate the persistent ring PTEs and restore the saved GART only after
+   the late full-idle proof.  No replacement ring, A68 trigger, or new epoch is
+   needed when the goal is quiesce/teardown.
+
+Until that `STOPPED` teardown branch has its own fault injection and a live
+delayed-STOP oracle, the first tranche must continue refusing `RING_STOP`.
+Never invalidate the pending BO while PID10 is still active merely because its
+payload was not published: issuing SR6F concurrently with an active CR fetch
+has no recovered vendor safety proof, even though the fetch should touch only
+the separate ring PTEs.
+
 For a later lab-only destructive recovery, the reusable pieces already in the
 tree are the exact H6 2D initializer, the H5S2VP1 3D replay,
 `chrome9_gart_set()`/GTI flush, `chrome9_build_prime()`, and
