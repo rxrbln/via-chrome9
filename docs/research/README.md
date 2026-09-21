@@ -43,6 +43,10 @@ targets.
   practical RT stride/extent limits, linear mip allocation and the exact
   eight-entry mip table, guarded clear derivatives, and the render-to-texture
   cache-invalidation protocol.
+- [npot-2d-capability-gate.md](npot-2d-capability-gate.md) cross-checks both
+  Windows UMDs, Linux, Xorg, and the manual; it gives the exact A20/A22,
+  pitch, wrap/filter/mip contract and separates the immediately testable
+  level-zero glamor path from the requirements for a truthful Gallium cap.
 - [fixed-function-texture-sync.md](fixed-function-texture-sync.md) records
   exact texture channel order, cube/volume addressing, color-mask, logic-op,
   alpha-test, stencil and fog words, plus 2D/3D/present synchronization.
