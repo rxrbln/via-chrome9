@@ -829,8 +829,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		0x34000150, 0x35000114, 0x36000500, 0x37000200,
 	};
 	static const u32 config[] = {
-		0x00000011, 0x01002521, 0x08010101, 0x05000000,
-		0x0d810000,
+		0x00000011, 0x01002521, 0x08010101, 0x04000000,
+		0x05000000, 0x0d810000,
 	};
 	static const u32 raster_fvf[] = {
 		0x00000308, 0x010000c2, 0x020041d1, 0x030052d0,
@@ -913,7 +913,8 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16_BLEND;
 	unsigned int common_count = 8;
 	unsigned int i;
-	u32 log_size = 0;
+	u32 log_size = ilog2(request->texture_height) << 4 |
+		       ilog2(request->texture_width);
 
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
@@ -948,8 +949,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	}
 	if (is_power_of_2(request->texture_width) &&
 	    is_power_of_2(request->texture_height))
-		log_size = BIT(15) | ilog2(request->texture_height) << 4 |
-			   ilog2(request->texture_width);
+		log_size |= BIT(15);
 	texture_state[0] = texture >> 8;
 	texture_state[1] = 0x18001101;
 	texture_state[2] = 0x20000000 | request->texture_height << 12 |
@@ -1050,6 +1050,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	    body[32 + delta] != 0x30000000 ||
 	    body[33 + delta] != sampler[1] ||
 	    body[34 + delta] != sampler[2] ||
+	    body[55 + delta + depth_delta] != 0x04000000 ||
 	    (blend &&
 	     (body[7] != 0x38000000 || body[14] != 0x3f000000 ||
 	      body[15] != blend_words.a34 || body[16] != blend_words.a35 ||
@@ -1098,8 +1099,8 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		0x34000150, 0x35000114, 0x36000500, 0x37000200,
 	};
 	static const u32 config[] = {
-		0x00000021, 0x01002521, 0x08010102, 0x05000000,
-		0x0d810000,
+		0x00000021, 0x01002521, 0x08010102, 0x04000000,
+		0x05000000, 0x0d810000,
 	};
 	static const u32 raster_fvf[] = {
 		0x0000040a, 0x010000c2, 0x020041d1, 0x030052d0,
@@ -1243,11 +1244,10 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		destination_count = 3 + ARRAY_SIZE(destination_tail);
 	}
 	for (i = 0; i < 2; i++) {
-		u32 log_size = 0;
+		u32 log_size = ilog2(heights[i]) << 4 | ilog2(widths[i]);
 
 		if (is_power_of_2(widths[i]) && is_power_of_2(heights[i]))
-			log_size = BIT(15) | ilog2(heights[i]) << 4 |
-				   ilog2(widths[i]);
+			log_size |= BIT(15);
 
 		image[i][0] = addresses[i] >> 8;
 		image[i][1] = 0x18001101;
@@ -1366,6 +1366,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		(tex0_alpha_primary ? 0x01ce1540 : 0x01c01540)) ||
 	    body[72 + delta + depth_delta] != 0x00000021 ||
 	    body[74 + delta + depth_delta] != 0x08010102 ||
+	    body[75 + delta + depth_delta] != 0x04000000 ||
 	    body[84 + delta + depth_delta] != 0x0000040a ||
 	    body[89 + delta + depth_delta] != 0x05008442 ||
 	    body[92 + delta + depth_delta] != 0x624081ff ||
