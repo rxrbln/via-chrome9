@@ -1,11 +1,17 @@
 # ioquake3 live lightmap and masked-surface successors
 
-Status: live NIR capture, renderer/source audit, Linux/Windows compiler
+Status: live NIR capture, renderer/source audit, fixed-Linux/Windows compiler
 differentials, and current command-12/13 packet audit, 2026-09-21.  The
-three-factor fragment object is compiler-exact but has not yet run on VX900.
+three-factor fragment object is packet-exact but has not yet run on VX900.
 The alpha-test registers and state-complete one-/two-texture packets are
 independently live; this note does not claim that their combination with the
 new three-factor object has passed silicon.
+
+The special-source Linux four-ALU rows below came from the historical
+validator/processor callback swap, not the production register manager.  They
+remain complete fixed-program candidates.  Production r0--r3 equivalents are
+recorded in
+[`chrome9-production-four-alu-provenance.md`](chrome9-production-four-alu-provenance.md).
 
 ## Live order and exact linked programs
 
@@ -149,10 +155,10 @@ is lowered to ordinary TEXLD only under that identity-projector proof.
 
 ### Exact partial-alpha compiler differentials
 
-The proprietary Linux configuration-two compiler was also run on explicit
-four-ALU programs which compute common RGB and separately select texture 0
+The historical callback-swapped Linux configuration-two wrapper was also run
+on explicit four-ALU programs which compute common RGB and separately select texture 0
 or texture 1 alpha.  They are not required for correctly translated XRGB and
-BGRA views, but they prove the physical source swizzles and provide closed
+BGRA views, but they preserve complete fixed source swizzles and provide closed
 fallback objects if a future view path cannot express alpha one in A30.
 
 Texture-0-alpha times primary alpha:

@@ -6,6 +6,13 @@ full-RGBA MODULATE objects are live on VX900.  The newly recovered ADD,
 missing-alpha REPLACE, and mixed-stage programs have not run on silicon and
 must remain behind distinct capability bits until their guarded tests pass.
 
+**Two-texture provenance correction.**  Any multi-ALU Linux object below
+whose controls begin `90000000` and whose TAUs begin `a010...` was reproduced
+with the historical swapped validator/processor callbacks.  Such bytes remain
+complete fixed-program candidates, but are not generic production compiler
+output.  Production objects must be regenerated as in
+[`chrome9-production-four-alu-provenance.md`](chrome9-production-four-alu-provenance.md).
+
 This note covers the fixed-function texture-environment subset needed around
 the ioquake3 GL1 path.  It deliberately separates API channel semantics from
 native storage channels.  In particular, classic `GL_ADD` is not generally a
@@ -201,7 +208,8 @@ ALU       0140b6d0 30202053 00f20005 0000007f  # r1=T0*T1
           01c00000 301c0000 00f20105 000d083f  # oC0=r1
 ```
 
-The fixed schedule is cross-checked by both proprietary compilers and exact
+The fixed schedule is cross-checked by the Windows compiler, fixed Xorg
+construction, and exact
 known operand words, but the complete three-factor result is not yet live.
 It is four dwords longer than the two-ALU two-texture object and otherwise
 uses the existing two-texture resource/state closure.
@@ -220,7 +228,7 @@ ALU       003f0050 50140924 00700005 00001820  # sat oC0.xyz=r0.xyz+r1.xyz
           0140b6d0 b003fb68 008200b6 00000820  # oC0.w=r0.w*r1.w
 ```
 
-Do not substitute the full-MUL object's TAUs.  The Linux finalizer selected
+Do not substitute the full-MUL object's TAUs.  The callback-swapped Linux wrapper selected
 `a01001b0 b11001b1` for this instruction order.  The Windows dynamic
 semantic differential emitted:
 
@@ -241,8 +249,8 @@ MODULATE, but its controls, TAUs, and both ALUs must be selected atomically.
 
 This mixed mode is the first useful proof that sequential texture stages
 cannot be reduced to an unordered two-sample expression.  For
-`Q=T0*v0; out.rgb=T1.rgb+Q.rgb; out.a=T1.a*Q.a`, Linux configuration two
-emits:
+`Q=T0*v0; out.rgb=T1.rgb+Q.rgb; out.a=T1.a*Q.a`, the callback-swapped Linux
+configuration-two wrapper emits:
 
 ```text
 A90..A93 90000000 91000001 92020003 93000002

@@ -1,12 +1,19 @@
 # Chrome9 projected two-texture-primary draw design
 
-Status: implementation-grade static design plus executable Linux/Windows
+Status: implementation-grade static design plus fixed-Xorg and Windows
 compiler differentials, 2026-09-21. The existing two-texture,
 two-texture+D16, and state-complete two-texture+D16+blend ioctls are merged;
 the two-factor RGBA program is live. The full-RGBA three-factor and
-primary-alpha-bypass programs in this note are compiler-exact but not yet
+primary-alpha-bypass programs in this note are complete fixed objects but not yet
 executed on VX900 silicon. No new program UAPI or capability described here
 is currently advertised.
+
+**Compiler-provenance correction.**  The special-source Linux objects below
+were reproduced only with the historical probe's swapped validator/processor
+callbacks.  They remain indivisible fixed/Xorg-style silicon candidates, but
+are not output of the production Linux register manager.  The independently
+regenerated production r0--r3 family is in
+[`chrome9-production-four-alu-provenance.md`](chrome9-production-four-alu-provenance.md).
 
 ## Exact bounded operation
 
@@ -123,7 +130,8 @@ scheduled words above are the packet source.
 ### Exact primary-alpha-bypass object
 
 The alpha-bypass expression is no longer merely a desired classifier. The
-Linux 5.75 compiler was run with configuration-two post-translation on:
+historical Linux 5.75 wrapper was run with configuration-two post-translation
+and the now-reproduced swapped callback order on:
 
 ```text
 texld r0,t0,s0; texld r1,t1,s1
@@ -133,7 +141,7 @@ mov r3.a,v0.a
 mov oC0,r3
 ```
 
-It produced this indivisible physical object:
+It reproduced this indivisible fixed physical object:
 
 ```text
 A90..A9a 90000000 91000001 92020004 93000002
@@ -149,7 +157,7 @@ ALU       0140b6d0 3003f000 00f20005 000003e0
 The second ALU writes RGB only, the third writes alpha only, and the fourth
 moves the completed temporary. Do not splice either partial instruction into
 the Xorg full-RGBA allocation: the controls, TAUs, temporary allocation and
-all four ALUs are one compiler-finalized object.
+all four ALUs are one fixed object.
 
 The dynamically executed Windows D3D backend independently returned four
 ALUs and two TAUs for the same token stream:
@@ -167,8 +175,8 @@ Its finalized ALU SHA-256 is
 the ordinary two-TAU hash is
 `503b8f32ba1eebb0dedaa1e89b0cb06b56f80f710cb1f8db94d988ba9f0d854f`.
 The Windows allocator is deliberately virtual/identity, so its words prove
-the operation, masks, count and scheduling while the Linux physical object
-above is the upload candidate. The OpenGL ICD has the byte-matched tokenizer,
+the operation, masks, count and scheduling while the fixed physical object
+above remains a guarded upload candidate. The OpenGL ICD has the byte-matched tokenizer,
 dispatcher and finalizer at `0x244530`, `0x245280` and `0x256550`, providing
 the second Windows-driver static cross-check.
 
@@ -181,14 +189,14 @@ zero. Primary color comes only from normalized packed D1.
 
 Changing both D3D sample opcodes from TEXLD to TEXLDP leaves every ALU and
 control count unchanged and changes only the two texture-address words. The
-configuration-two Linux physical pair is:
+callback-swapped Linux fixed pair is:
 
 ```text
 ordinary TEXLD   a01001b0 311001b1
 projected TEXLDP a07001b0 317001b1
 ```
 
-For full RGBA, pair either TAU row with the Linux-finalized controls
+For full RGBA, pair either TAU row with the same fixed-object controls
 `90000000 91000001 92020003 93000002` (A94--A9a zero) and ALUs:
 
 ```text
@@ -198,7 +206,7 @@ For full RGBA, pair either TAU row with the Linux-finalized controls
 ```
 
 For alpha bypass use the four-ALU physical object above and change only its
-TAU row. This gives complete compiler-finalized fragment objects for both
+TAU row. This gives complete fixed fragment objects for both
 ordinary and TEXLDP sampling; the missing native-projective evidence is in
 the vertex/output and general-texture state, not the fragment compiler.
 
@@ -619,8 +627,9 @@ projective fallback admits only one projected unit.
 
 The scheduled Chrome9 full-RGBA program and result-scale derivatives are
 recorded in `xorg-one-texture-oracle.md` under “Three-factor fixed-function
-successor.” The Linux physical objects above were produced by executing the
-5.75 configuration-two translator/finalizer. The Windows virtual objects and
+successor.” The Linux physical objects above were reproduced by executing the
+5.75 configuration-two translator/finalizer with the historical
+nonproduction callback swap. The Windows virtual objects and
 TEXLD/TEXLDP differentials were produced by executing the supplied Windows 7
 D3D UMD under headless Wine; the supplied OpenGL ICD contains byte-matched
 tokenizer, dispatcher and finalizer implementations. The two Windows files

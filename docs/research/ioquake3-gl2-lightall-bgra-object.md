@@ -1,6 +1,6 @@
 # Chrome9 ioquake3 packed-lightall BGRA-unit1 object
 
-Status: implementation-ready static packet design and exact Linux/Windows
+Status: implementation-ready static packet design and exact fixed-Linux/Windows
 compiler differential, 2026-09-21.  The two-texture resource path, D16,
 blend, alpha test, and the shorter XRGB-unit1 three-factor object have
 independent evidence.  This four-ALU object has not yet executed on VX900
@@ -55,8 +55,8 @@ program.
 
 ## Indivisible physical program
 
-The proprietary Linux 5.75 compiler plus configuration-two finalizer emitted
-this complete object:
+The historical Linux 5.75 wrapper plus configuration-two finalizer reproduced
+this complete object only with its validator/processor callbacks swapped:
 
 ```text
 A90..A9a  90000000 91000001 92020004 93000002
@@ -75,7 +75,7 @@ and the fourth moves the completed temporary to oC0.  The physical ALU-store
 SHA-256 is
 `d8af75a0c403ff40be0c98d40584f8af9ba5652ed6ead1afa7ae448abce268c3`.
 
-These words are one compiler-finalized allocation and schedule.  In
+These words are one indivisible fixed allocation and schedule.  In
 particular, do not append the third ALU to the current Xorg-scheduled object,
 retain its `301001b0 311211b1` TAUs, or change only A92 to four.  A90/A91,
 both TAUs, all four ALUs, masks, temporary ids, transition word A93, and the
@@ -88,11 +88,14 @@ finalized virtual-ALU SHA-256 is
 Those virtual words prove instruction count, operation, masks, and alpha
 source, but are not uploadable physical allocation words.
 
-The Linux oracle is
+The fixed-object Linux oracle is
 `binary/5.75.32.87a-u910-55689/bin/via_chrome9_dri.so`, SHA-256
 `fddb4dea85319c76cac3354e43aa9bcb12a8b7f178cee0f70f6c7efe14a69af4`,
 executed through `stmPPSCompile_invi` and
-`stmPPS_PostTranslationSetting_invi(..., 2)`.  The Windows oracle is
+`stmPPS_PostTranslationSetting_invi(..., 2)` with the historical nonproduction
+callback order.  The production-callback replacement family is documented in
+[`chrome9-production-four-alu-provenance.md`](chrome9-production-four-alu-provenance.md).
+The Windows oracle is
 `VTGUModeDX32A.dll`, SHA-256
 `8ac6959fc3ab21b73fcf37ae4615e87ab285f3a56bc27623f3094d82cee49b45`,
 executed under Wine through tokenizer `0x101dbd30`, dispatcher `0x101dca80`,
