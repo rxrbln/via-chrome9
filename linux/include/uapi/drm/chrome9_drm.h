@@ -118,6 +118,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
 /* Two level-zero textures can be multiplied with D16 test/write. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16	(1ULL << 20)
+/* Every D16 draw can test depth without updating the depth surface. */
+#define DRM_CHROME9_CAP_DEPTH_READ_ONLY	(1ULL << 23)
 /* Blend state accepts the proven source/destination color/alpha factors. */
 #define DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS	(1ULL << 29)
 
@@ -409,6 +411,7 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_DEPTH_FUNC_MASK	(7U << DRM_CHROME9_DEPTH_FUNC_SHIFT)
 #define DRM_CHROME9_DEPTH_FUNC(func) \
 	((__u32)(func) << DRM_CHROME9_DEPTH_FUNC_SHIFT)
+#define DRM_CHROME9_DEPTH_READ_ONLY	(1U << 11)
 
 #define DRM_CHROME9_COLOR_MASK_R	(1U << 0)
 #define DRM_CHROME9_COLOR_MASK_G	(1U << 1)
