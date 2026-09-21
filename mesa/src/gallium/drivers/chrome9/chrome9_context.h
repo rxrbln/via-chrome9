@@ -43,6 +43,8 @@ struct chrome9_shader {
       CHROME9_FS_TEXTURE_CONSTANT_MODULATE,
       CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE,
       CHROME9_FS_TWO_TEXTURE_MODULATE,
+      CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA,
+      CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY,
    } fragment_program;
    bool supported;
 };
@@ -95,6 +97,8 @@ struct chrome9_context {
    bool draw_triangle_d16;
    bool draw_triangle_d16_blend;
    bool depth_func_supported;
+   bool depth_equal_supported;
+   bool depth_always_supported;
    bool depth_read_only_supported;
    bool draw_triangle_batch;
    bool draw_triangle_d16_rhw_batch;
@@ -105,6 +109,7 @@ struct chrome9_context {
    bool textured_d16_source_over;
    bool draw_two_textured_triangle;
    bool draw_two_textured_triangle_d16;
+   bool draw_two_textured_triangle_d16_blend;
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;

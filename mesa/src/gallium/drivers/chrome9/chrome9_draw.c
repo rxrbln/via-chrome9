@@ -109,7 +109,10 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    if (crender->packed_generic)
       generic0 = draw_find_shader_output(crender->ctx->draw,
                                          TGSI_SEMANTIC_GENERIC, 0);
-   crender->texture_count = program == CHROME9_FS_TWO_TEXTURE_MODULATE ? 2 :
+   crender->texture_count =
+      (program == CHROME9_FS_TWO_TEXTURE_MODULATE ||
+       program == CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA ||
+       program == CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY) ? 2 :
       (program == CHROME9_FS_TEXTURE_REPLACE ||
        program == CHROME9_FS_TEXTURE_RGBX ||
        program == CHROME9_FS_TEXTURE_MODULATE ||
@@ -149,7 +152,11 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                               program != CHROME9_FS_TEXTURE_MODULATE &&
                               program != CHROME9_FS_TEXTURE_PROJECTED_MODULATE &&
                               program !=
-                                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA))) &&
+                                 CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA &&
+                              program !=
+                                 CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA &&
+                              program !=
+                                 CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY))) &&
                            (!crender->textured ||
                             ((crender->packed_generic == 2 ||
                               texcoord[0] >= 0) &&
@@ -509,7 +516,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
            !ctx->depth_read_only_supported) ||
           (ctx->dsa->depth_func != PIPE_FUNC_LESS &&
            !(ctx->depth_func_supported &&
-             ctx->dsa->depth_func == PIPE_FUNC_LEQUAL)) || !*depth ||
+             ctx->dsa->depth_func == PIPE_FUNC_LEQUAL) &&
+           !(ctx->depth_equal_supported &&
+             ctx->dsa->depth_func == PIPE_FUNC_EQUAL) &&
+           !(ctx->depth_always_supported &&
+             ctx->dsa->depth_func == PIPE_FUNC_ALWAYS)) || !*depth ||
           surface->format != PIPE_FORMAT_Z16_UNORM || surface->level ||
           surface->first_layer || surface->last_layer ||
           ((*depth)->base.target != PIPE_TEXTURE_2D &&
@@ -522,19 +533,28 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
       *depth_active = true;
    }
    *reason = "two-texture-successor";
-   if (texture_count == 2 &&
-       (!ctx->draw_two_textured_triangle ||
-        (*depth_active && !ctx->draw_two_textured_triangle_d16) ||
-        *blend_successor ||
-        (*depth_active && resource->format != PIPE_FORMAT_B8G8R8X8_UNORM)))
-      return false;
+   if (texture_count == 2) {
+      const bool depth_blend = *depth_active && *blend_successor;
+
+      if (!ctx->draw_two_textured_triangle ||
+          (*blend_successor && !*depth_active) ||
+          (*depth_active &&
+           !(depth_blend ? ctx->draw_two_textured_triangle_d16_blend :
+                           ctx->draw_two_textured_triangle_d16)) ||
+          (*depth_active && !depth_blend &&
+           resource->format != PIPE_FORMAT_B8G8R8X8_UNORM))
+         return false;
+   }
    if (texture_count && *depth_active && *blend_successor) {
       *reason = "texture-depth-target";
-      if (texture_count != 1 ||
-          (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
-           !ctx->textured_d16_bgra8888))
+      if (texture_count == 2) {
+         if (!ctx->draw_two_textured_triangle_d16_blend)
+            return false;
+      } else if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+                 !ctx->textured_d16_bgra8888) {
          return false;
-      if (!ctx->draw_textured_triangle_d16_blend) {
+      }
+      if (texture_count == 1 && !ctx->draw_textured_triangle_d16_blend) {
          if (blend->color_mask != (DRM_CHROME9_COLOR_MASK_R |
                                    DRM_CHROME9_COLOR_MASK_G |
                                    DRM_CHROME9_COLOR_MASK_B |
@@ -550,7 +570,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    *reason = "successor-capability";
    if (*blend_successor &&
        (*depth_active ?
-        (texture_count ? !ctx->draw_textured_triangle_d16_blend :
+        (texture_count == 2 ?
+           !ctx->draw_two_textured_triangle_d16_blend :
+         texture_count ? !ctx->draw_textured_triangle_d16_blend :
                          !ctx->draw_triangle_d16_blend) :
         !(texture_count ? ctx->draw_textured_triangle_blend :
                      ctx->draw_triangle_blend)))
@@ -558,14 +580,19 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    if (texture_count) {
       *reason = "texture-count/depth";
       if (!(texture_count == 2 ?
-             (*depth_active ? ctx->draw_two_textured_triangle_d16 :
+             (*depth_active ?
+                (*blend_successor ?
+                   ctx->draw_two_textured_triangle_d16_blend :
+                   ctx->draw_two_textured_triangle_d16) :
                               ctx->draw_two_textured_triangle) :
              (*depth_active ?
                 (*blend_successor ?
                    ctx->draw_textured_triangle_d16_blend :
                    ctx->draw_textured_triangle_d16) :
                               ctx->draw_textured_triangle)) ||
-          ctx->num_sampler_states != texture_count ||
+          /* Gallium may retain an unused trailing sampler after unbinding
+           * the corresponding view.  Only active view units are encoded. */
+          ctx->num_sampler_states < texture_count ||
           ctx->num_sampler_views != texture_count)
          return false;
       for (unsigned unit = 0; unit < texture_count; unit++) {
@@ -605,6 +632,16 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
               ctx->fs->fragment_program ==
                  CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA) &&
              source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
+            return false;
+         *reason = "two-projected-source-format";
+         if (ctx->fs->fragment_program ==
+                CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA &&
+             source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
+            return false;
+         if (ctx->fs->fragment_program ==
+                CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY &&
+             source->format != (unit ? PIPE_FORMAT_B8G8R8X8_UNORM :
+                                      PIPE_FORMAT_B8G8R8A8_UNORM))
             return false;
       }
       *reason = "texture-alias";
@@ -683,6 +720,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    struct drm_chrome9_draw_two_textured_triangle two_texture_args = { 0 };
    struct drm_chrome9_draw_two_textured_triangle_d16
       two_texture_depth_args = { 0 };
+   struct drm_chrome9_draw_two_textured_triangle_d16_blend
+      two_texture_depth_blend_args = { 0 };
    struct drm_chrome9_blend_state blend_state;
    struct drm_chrome9_scissor_state scissor = { 0 };
    const unsigned indices[3] = { ia, ib, ic };
@@ -692,6 +731,11 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    bool blend_successor = false;
    bool depth_active = false;
    bool perspective_batch;
+   const bool two_projected_primary = ctx->fs &&
+      (ctx->fs->fragment_program ==
+          CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA ||
+       ctx->fs->fragment_program ==
+          CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY);
    uint32_t depth_flags = 0;
 
    if (!crender->textured && ctx->draw_triangle_batch &&
@@ -745,7 +789,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    }
    perspective_batch = depth_active && ctx->draw_triangle_d16_rhw_batch;
    if (depth_active) {
-      if (ctx->depth_func_supported)
+      if (ctx->depth_func_supported || ctx->depth_equal_supported ||
+          ctx->depth_always_supported)
          depth_flags = DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
       if (!ctx->dsa->depth_writemask)
          depth_flags |= DRM_CHROME9_DEPTH_READ_ONLY;
@@ -817,6 +862,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program))
          color = constant_color;
+      if (two_projected_primary && color != 0xffffffff) {
+         ctx->rejected_triangles++;
+         return;
+      }
       x[i] = chrome9_coord_16_16(position[0], target->base.width0);
       y[i] = chrome9_coord_16_16(position[1], target->base.height0);
       if (crender->textured) {
@@ -831,7 +880,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
              ctx->fs->fragment_program ==
                 CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA ||
              ctx->fs->fragment_program ==
-                CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA)
+                CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
+             two_projected_primary)
             memcpy(&texcoord_q, &texcoord[3], sizeof(texcoord_q));
 
          if (!isfinite(position[2]) || !isfinite(position[3]) ||
@@ -844,7 +894,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                ctx->fs->fragment_program ==
                   CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA ||
                ctx->fs->fragment_program ==
-                  CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA) &&
+                  CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA ||
+               two_projected_primary) &&
               texcoord_q != 0x3f800000) ||
              (crender->texture_count == 2 &&
               (texcoord[0] < 0.0f || texcoord[0] > 1.0f ||
@@ -876,10 +927,15 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             struct drm_chrome9_two_textured_vertex *two_vertex =
                &two_texture_args.vertices[i];
             const float *texcoord1 = texcoord + 4;
+            uint32_t texcoord1_q = 0;
+
+            if (two_projected_primary)
+               memcpy(&texcoord1_q, &texcoord1[3], sizeof(texcoord1_q));
 
             if (!isfinite(texcoord1[0]) || !isfinite(texcoord1[1]) ||
                 texcoord1[0] < 0.0f || texcoord1[0] > 1.0f ||
-                texcoord1[1] < 0.0f || texcoord1[1] > 1.0f) {
+                texcoord1[1] < 0.0f || texcoord1[1] > 1.0f ||
+                (two_projected_primary && texcoord1_q != 0x3f800000)) {
                ctx->rejected_triangles++;
                return;
             }
@@ -894,6 +950,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             memcpy(&two_vertex->s1_float, &texcoord1[0], sizeof(float));
             memcpy(&two_vertex->t1_float, &texcoord1[1], sizeof(float));
             two_texture_depth_args.vertices[i] = *two_vertex;
+            two_texture_depth_blend_args.vertices[i] = *two_vertex;
          }
       } else if (depth_active) {
          depth_args.vertices[i].x_16_16 = x[i];
@@ -959,6 +1016,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          state->wrap_s = samplers[unit]->wrap_s;
          state->wrap_t = samplers[unit]->wrap_t;
          two_texture_depth_args.textures[unit] = *state;
+         two_texture_depth_blend_args.textures[unit] = *state;
       }
       if (depth_active) {
          two_texture_depth_args.destination_handle =
@@ -971,6 +1029,23 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             two_texture_args.destination_pitch;
          two_texture_depth_args.depth_pitch = depth->stride;
          two_texture_depth_args.scissor = two_texture_args.scissor;
+         if (blend_successor) {
+            two_texture_depth_blend_args.destination_handle =
+               two_texture_args.destination_handle;
+            two_texture_depth_blend_args.depth_handle = depth->bo.handle;
+            two_texture_depth_blend_args.flags = depth_flags;
+            two_texture_depth_blend_args.width = two_texture_args.width;
+            two_texture_depth_blend_args.height = two_texture_args.height;
+            two_texture_depth_blend_args.destination_pitch =
+               two_texture_args.destination_pitch;
+            two_texture_depth_blend_args.depth_pitch = depth->stride;
+            two_texture_depth_blend_args.blend = blend_state;
+            two_texture_depth_blend_args.scissor = two_texture_args.scissor;
+            two_texture_depth_blend_args.destination_format =
+               target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+               DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+               DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+         }
       }
    } else if (crender->textured) {
       texture_args.destination_handle = target->bo.handle;
@@ -1205,7 +1280,11 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       return;
    }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
-   const bool submitted = crender->texture_count == 2 && depth_active ?
+   const bool submitted = crender->texture_count == 2 && depth_active &&
+                          blend_successor ?
+      chrome9_draw_two_textured_triangle_d16_blend(
+         fd, &two_texture_depth_blend_args) :
+      crender->texture_count == 2 && depth_active ?
       chrome9_draw_two_textured_triangle_d16(fd, &two_texture_depth_args) :
       crender->texture_count == 2 ?
       chrome9_draw_two_textured_triangle(fd, &two_texture_args) :

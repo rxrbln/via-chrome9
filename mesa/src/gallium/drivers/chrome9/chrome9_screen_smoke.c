@@ -41,8 +41,9 @@ struct smoke_texture_vertex {
 
 struct smoke_two_texture_vertex {
    float position[4];
-   float texcoord0[2];
-   float texcoord1[2];
+   float color[4];
+   float texcoord0[4];
+   float texcoord1[4];
 };
 
 struct smoke_projected_texture_vertex {
@@ -715,6 +716,100 @@ make_two_texture_fragment_shader(struct pipe_screen *screen,
    }
    nir_store_output(&b, nir_fmul(&b, sample[0], sample[1]),
                     nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static void *
+make_two_projected_texture_vertex_shader(struct pipe_screen *screen,
+                                         struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, screen->nir_options[MESA_SHADER_VERTEX],
+      "chrome9-two-projected-texture-primary-vertex");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *position = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_POS);
+   nir_def *color = nir_load_input(
+      &b, 4, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_COLOR0);
+
+   nir_store_output(&b, position, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_COL0);
+   for (unsigned unit = 0; unit < 2; unit++) {
+      nir_def *coord = nir_load_input(
+         &b, 4, 32, nir_imm_int(&b, 0),
+         .io_semantics.location = VERT_ATTRIB_TEX0 + unit);
+
+      nir_store_output(&b, coord, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .io_semantics.location = VARYING_SLOT_TEX0 + unit);
+   }
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_vs_state(context, &state);
+}
+
+static void *
+make_two_projected_texture_fragment_shader(struct pipe_screen *screen,
+                                           struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-two-projected-texture-primary-rgb-alpha");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *sample[2];
+
+   b.shader->info.io_lowered = true;
+   nir_def *barycentric = nir_load_barycentric_pixel(&b, 32);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   for (unsigned unit = 0; unit < 2; unit++) {
+      nir_def *texcoord = nir_load_interpolated_input(
+         &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+         .io_semantics.location = VARYING_SLOT_TEX0 + unit);
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+
+      tex->op = nir_texop_tex;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->coord_components = 2;
+      tex->dest_type = nir_type_float32;
+      tex->texture_index = unit;
+      tex->sampler_index = unit;
+      tex->src[0] = nir_tex_src_for_ssa(
+         nir_tex_src_coord, nir_trim_vector(&b, texcoord, 2));
+      tex->src[1] = nir_tex_src_for_ssa(
+         nir_tex_src_projector, nir_channel(&b, texcoord, 3));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      sample[unit] = &tex->def;
+   }
+   nir_def *first_product = nir_fmul(&b, sample[0], color);
+   nir_def *first_rgb_primary_alpha = nir_vec4(
+      &b, nir_channel(&b, first_product, 0),
+      nir_channel(&b, first_product, 1),
+      nir_channel(&b, first_product, 2), nir_channel(&b, color, 3));
+   nir_def *product = nir_fmul(&b, sample[1], first_rgb_primary_alpha);
+   nir_def *result = nir_vec4(
+      &b, nir_channel(&b, product, 0), nir_channel(&b, product, 1),
+      nir_channel(&b, product, 2), nir_channel(&b, color, 3));
+
+   nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
                     .io_semantics.location = FRAG_RESULT_COLOR);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader,
@@ -3153,6 +3248,11 @@ run_pipe_textured_depth(struct pipe_screen *screen,
       .depth_writemask = false,
       .depth_func = PIPE_FUNC_LEQUAL,
    };
+   struct pipe_depth_stencil_alpha_state equal_read_only_dsa = {
+      .depth_enabled = true,
+      .depth_writemask = false,
+      .depth_func = PIPE_FUNC_EQUAL,
+   };
    struct pipe_rasterizer_state rasterizer = {
       .half_pixel_center = true,
       .bottom_edge_rule = true,
@@ -3184,6 +3284,7 @@ run_pipe_textured_depth(struct pipe_screen *screen,
    void *blend_handle = NULL, *dsa_handle = NULL;
    void *multiply_handle = NULL;
    void *read_only_dsa_handle = NULL;
+   void *equal_read_only_dsa_handle = NULL;
    void *rasterizer_handle = NULL, *elements_handle = NULL;
    void *vs = NULL, *fs = NULL, *sampler_handle = NULL;
    struct chrome9_resource *ctarget, *ctexture, *cdepth;
@@ -3241,6 +3342,10 @@ run_pipe_textured_depth(struct pipe_screen *screen,
           screen, DRM_CHROME9_CAP_DEPTH_READ_ONLY))
       read_only_dsa_handle =
          context->create_depth_stencil_alpha_state(context, &read_only_dsa);
+   if (!source_over && chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DEPTH_EQUAL))
+      equal_read_only_dsa_handle = context->create_depth_stencil_alpha_state(
+         context, &equal_read_only_dsa);
    if (!source_over &&
        chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16_BLEND) &&
@@ -3268,6 +3373,9 @@ run_pipe_textured_depth(struct pipe_screen *screen,
        (!source_over && chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DEPTH_READ_ONLY) &&
         !read_only_dsa_handle) ||
+       (!source_over && chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DEPTH_EQUAL) &&
+        !equal_read_only_dsa_handle) ||
        (!source_over &&
         chrome9_screen_has_capability(
            screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16_BLEND) &&
@@ -3406,6 +3514,42 @@ run_pipe_textured_depth(struct pipe_screen *screen,
                  ccontext->rejected_triangles - read_only_rejected);
       context->bind_depth_stencil_alpha_state(context, dsa_handle);
    }
+   if (passed && multiply_handle && equal_read_only_dsa_handle) {
+      uint64_t equal_submitted = ccontext->submitted_triangles;
+      uint64_t equal_rejected = ccontext->rejected_triangles;
+      uint32_t *pixels = (uint32_t *)
+         ((uint8_t *)ctarget->bo.map + ctarget->data_offset);
+      uint16_t *depth_pixels = (uint16_t *)
+         ((uint8_t *)cdepth->bo.map + cdepth->data_offset);
+
+      context->bind_blend_state(context, multiply_handle);
+      context->bind_depth_stencil_alpha_state(context,
+                                              equal_read_only_dsa_handle);
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &multiply_destination,
+                     0.5, 0);
+      vertex_buffer.buffer.user = multiply_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      uint32_t pixel = pixels[16 * (ctarget->stride / 4) + 16];
+      uint16_t depth_pixel = depth_pixels[16 * (cdepth->stride / 2) + 16];
+
+      passed = abs((int)(pixel >> 16 & 0xff) - 0x1a) <= 1 &&
+               abs((int)(pixel >> 8 & 0xff) - 0x22) <= 1 &&
+               abs((int)(pixel & 0xff) - 0x1a) <= 1 &&
+               depth_pixel >= 0x7ffe && depth_pixel <= 0x8001 &&
+               ccontext->submitted_triangles == equal_submitted + 2 &&
+               ccontext->rejected_triangles == equal_rejected &&
+               smoke_guard_pages_match(ctarget) &&
+               smoke_guard_pages_match(ctexture) &&
+               smoke_guard_pages_match(cdepth);
+      if (passed)
+         printf("Gallium textured D16 EQUAL read-only blend passed: "
+                "sample=%08x/%04x\n", pixel, depth_pixel);
+      context->bind_blend_state(context, blend_handle);
+      context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   }
    if (passed && multiply_handle && read_only_dsa_handle) {
       uint64_t blend_submitted = ccontext->submitted_triangles;
       uint64_t blend_rejected = ccontext->rejected_triangles;
@@ -3500,6 +3644,9 @@ out:
       if (read_only_dsa_handle)
          context->delete_depth_stencil_alpha_state(context,
                                                    read_only_dsa_handle);
+      if (equal_read_only_dsa_handle)
+         context->delete_depth_stencil_alpha_state(
+            context, equal_read_only_dsa_handle);
       if (blend_handle) context->delete_blend_state(context, blend_handle);
       if (multiply_handle)
          context->delete_blend_state(context, multiply_handle);
@@ -3833,7 +3980,8 @@ out:
 }
 
 static bool
-run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
+run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
+                           bool projected_blend)
 {
    const struct pipe_resource target_template = {
       .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -3860,10 +4008,14 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
       0x800000, 0x000080, 0x008000, 0x808080,
    };
    struct smoke_two_texture_vertex vertices[4] = {
-      { { -1, -1, 0, 1 }, { 0, 0 }, { 0, 0 } },
-      { { -1,  1, 0, 1 }, { 0, 1 }, { 0, 1 } },
-      { {  1, -1, 0, 1 }, { 1, 0 }, { 1, 0 } },
-      { {  1,  1, 0, 1 }, { 1, 1 }, { 1, 1 } },
+      { { -1, -1, 0, 1 }, { 1, 1, 1, 1 },
+        { 0, 0, 0, 1 }, { 0, 0, 0, 1 } },
+      { { -1,  1, 0, 1 }, { 1, 1, 1, 1 },
+        { 0, 1, 0, 1 }, { 0, 1, 0, 1 } },
+      { {  1, -1, 0, 1 }, { 1, 1, 1, 1 },
+        { 1, 0, 0, 1 }, { 1, 0, 0, 1 } },
+      { {  1,  1, 0, 1 }, { 1, 1, 1, 1 },
+        { 1, 1, 0, 1 }, { 1, 1, 0, 1 } },
    };
    struct pipe_resource *target = NULL, *textures[2] = { NULL, NULL };
    struct pipe_resource *depth = NULL;
@@ -3894,7 +4046,7 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
       .depth_func = PIPE_FUNC_LEQUAL,
    };
    struct pipe_rasterizer_state rasterizer = { 0 };
-   struct pipe_vertex_element elements[3] = { 0 };
+   struct pipe_vertex_element elements[4] = { 0 };
    struct pipe_vertex_buffer vertex_buffer = {
       .is_user_buffer = true, .buffer.user = vertices,
    };
@@ -3911,7 +4063,9 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
       .instance_count = 1, .min_index = 0, .max_index = 3,
    };
    const struct pipe_draw_start_count_bias draw = { .count = 4 };
-   const union pipe_color_union clear = { 0 };
+   const union pipe_color_union clear = {
+      .f = { 1.0f, 1.0f, 1.0f, 1.0f },
+   };
    struct chrome9_resource *ctarget, *ctextures[2], *cdepth = NULL;
    struct chrome9_context *ccontext;
    void *blend_handle = NULL, *dsa_handle = NULL, *less_dsa_handle = NULL;
@@ -3953,6 +4107,15 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
          source1[y * (ctextures[1]->stride / 4) + x] = 0x00808080;
 
    blend.rt[0].colormask = PIPE_MASK_RGBA;
+   if (projected_blend) {
+      blend.rt[0].blend_enable = true;
+      blend.rt[0].rgb_func = PIPE_BLEND_ADD;
+      blend.rt[0].rgb_src_factor = PIPE_BLENDFACTOR_DST_COLOR;
+      blend.rt[0].rgb_dst_factor = PIPE_BLENDFACTOR_ZERO;
+      blend.rt[0].alpha_func = PIPE_BLEND_ADD;
+      blend.rt[0].alpha_src_factor = PIPE_BLENDFACTOR_DST_COLOR;
+      blend.rt[0].alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
+   }
    blend_handle = context->create_blend_state(context, &blend);
    if (depth_test) {
       dsa.depth_enabled = true;
@@ -3974,14 +4137,24 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
    rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
    elements[0].src_offset = offsetof(struct smoke_two_texture_vertex, position);
    elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
-   elements[1].src_offset = offsetof(struct smoke_two_texture_vertex, texcoord0);
-   elements[1].src_format = PIPE_FORMAT_R32G32_FLOAT;
-   elements[2].src_offset = offsetof(struct smoke_two_texture_vertex, texcoord1);
-   elements[2].src_format = PIPE_FORMAT_R32G32_FLOAT;
-   for (unsigned i = 0; i < 3; i++)
+   unsigned element_count = projected_blend ? 4 : 3;
+   unsigned texcoord_element = projected_blend ? 2 : 1;
+   if (projected_blend) {
+      elements[1].src_offset = offsetof(struct smoke_two_texture_vertex, color);
+      elements[1].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   }
+   elements[texcoord_element].src_offset =
+      offsetof(struct smoke_two_texture_vertex, texcoord0);
+   elements[texcoord_element].src_format = projected_blend ?
+      PIPE_FORMAT_R32G32B32A32_FLOAT : PIPE_FORMAT_R32G32_FLOAT;
+   elements[texcoord_element + 1].src_offset =
+      offsetof(struct smoke_two_texture_vertex, texcoord1);
+   elements[texcoord_element + 1].src_format = projected_blend ?
+      PIPE_FORMAT_R32G32B32A32_FLOAT : PIPE_FORMAT_R32G32_FLOAT;
+   for (unsigned i = 0; i < element_count; i++)
       elements[i].src_stride = sizeof(struct smoke_two_texture_vertex);
    elements_handle =
-      context->create_vertex_elements_state(context, 3, elements);
+      context->create_vertex_elements_state(context, element_count, elements);
    for (unsigned unit = 0; unit < 2; unit++) {
       sampler_handles[unit] = context->create_sampler_state(context, &sampler);
       u_sampler_view_default_template(&view_template, textures[unit],
@@ -3989,8 +4162,12 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
       views[unit] =
          context->create_sampler_view(context, textures[unit], &view_template);
    }
-   vs = make_two_texture_vertex_shader(screen, context);
-   fs = make_two_texture_fragment_shader(screen, context);
+   vs = projected_blend ?
+      make_two_projected_texture_vertex_shader(screen, context) :
+      make_two_texture_vertex_shader(screen, context);
+   fs = projected_blend ?
+      make_two_projected_texture_fragment_shader(screen, context) :
+      make_two_texture_fragment_shader(screen, context);
    if (!blend_handle || !dsa_handle || !rasterizer_handle || !elements_handle ||
        !sampler_handles[0] || !sampler_handles[1] || !views[0] || !views[1] ||
        (depth_test && !less_dsa_handle) ||
@@ -3999,7 +4176,9 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
         !read_only_dsa_handle) ||
        !vs || !fs ||
        ((struct chrome9_shader *)fs)->fragment_program !=
-          CHROME9_FS_TWO_TEXTURE_MODULATE)
+          (projected_blend ?
+             CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA :
+             CHROME9_FS_TWO_TEXTURE_MODULATE))
       goto out;
 
    framebuffer.cbufs[0].texture = target;
@@ -4040,6 +4219,19 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
          if (abs((int)(pixel >> shift & 0xff) -
                  (int)(expected[i] >> shift & 0xff)) > 1)
             goto out;
+   }
+   if (projected_blend) {
+      if (!depth_test ||
+          ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(ctextures[0]) ||
+          !smoke_guard_pages_match(ctextures[1]) ||
+          !smoke_guard_pages_match(cdepth))
+         goto out;
+      puts("Gallium two projected XRGB textures D16+blend passed");
+      passed = true;
+      goto out;
    }
    if (depth_test) {
       uint16_t *depth_pixels = (uint16_t *)((uint8_t *)cdepth->bo.map +
@@ -4383,7 +4575,8 @@ main(int argc, char **argv)
           ioctl(foreign_screen ? foreign_screen->get_screen_fd(foreign_screen) :
                                  -1,
                 DRM_IOCTL_GEM_CLOSE, &close_probe) == 0) {
-         fputs("foreign dma-buf handle lifetime failed\n", stderr);
+         fputs("same-device second-DRM-fd dma-buf handle lifetime failed\n",
+               stderr);
          if (foreign_screen)
             foreign_screen->destroy(foreign_screen);
          close(whandle.handle);
@@ -4394,7 +4587,7 @@ main(int argc, char **argv)
          return 1;
       }
       foreign_screen->destroy(foreign_screen);
-      puts("Gallium foreign dma-buf handle release passed");
+      puts("Gallium same-device second-DRM-fd dma-buf handle release passed");
    }
    close(whandle.handle);
    if (!shared_resource) {
@@ -4563,7 +4756,7 @@ main(int argc, char **argv)
          return 1;
       }
       if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers >= 2 &&
-          !run_pipe_two_npot_textures(screen, false)) {
+          !run_pipe_two_npot_textures(screen, false, false)) {
          fputs("Chrome9 Gallium two-unit NPOT texture draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -4571,8 +4764,18 @@ main(int argc, char **argv)
       }
       if (chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16) &&
-          !run_pipe_two_npot_textures(screen, true)) {
+          !run_pipe_two_npot_textures(screen, true, false)) {
          fputs("Chrome9 Gallium two-unit textured D16 draw failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (chrome9_screen_has_capability(
+             screen,
+             DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND) &&
+          !run_pipe_two_npot_textures(screen, true, true)) {
+         fputs("Chrome9 Gallium two-unit projected D16 blend draw failed\n",
+               stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;

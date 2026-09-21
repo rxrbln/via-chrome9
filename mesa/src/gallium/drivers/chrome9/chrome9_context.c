@@ -462,7 +462,7 @@ chrome9_fs_is_texcoord_q(nir_def *def, unsigned unit, unsigned depth)
 }
 
 static bool
-chrome9_fs_is_projected_texture(nir_def *def)
+chrome9_fs_is_projected_texture(nir_def *def, unsigned unit)
 {
    nir_instr *instr = nir_def_instr(def);
    nir_tex_instr *tex;
@@ -475,11 +475,12 @@ chrome9_fs_is_projected_texture(nir_def *def)
    projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
    return tex->op == nir_texop_tex &&
           tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
-          !tex->is_shadow && !tex->texture_index && !tex->sampler_index &&
+          !tex->is_shadow && tex->texture_index == unit &&
+          tex->sampler_index == unit &&
           tex->coord_components == 2 && coord >= 0 && projector >= 0 &&
           tex->num_srcs == 2 &&
-          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, 0, 0) &&
-          chrome9_fs_is_texcoord_q(tex->src[projector].src.ssa, 0, 0);
+          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, unit, 0) &&
+          chrome9_fs_is_texcoord_q(tex->src[projector].src.ssa, unit, 0);
 }
 
 enum chrome9_fs_leaf {
@@ -922,10 +923,10 @@ chrome9_fs_is_projected_primary_product(nir_def *def)
       for (unsigned c = 0; c < 4; c++)
          if (alu->src[source].swizzle[c] != c)
             return false;
-   texture_first = chrome9_fs_is_projected_texture(alu->src[0].src.ssa);
+   texture_first = chrome9_fs_is_projected_texture(alu->src[0].src.ssa, 0);
    return texture_first ?
       chrome9_fs_is_primary_color(alu->src[1].src.ssa, 0) :
-      (chrome9_fs_is_projected_texture(alu->src[1].src.ssa) &&
+      (chrome9_fs_is_projected_texture(alu->src[1].src.ssa, 0) &&
        chrome9_fs_is_primary_color(alu->src[0].src.ssa, 0));
 }
 
@@ -943,10 +944,10 @@ chrome9_fs_is_projected_constant_product(nir_def *def)
       for (unsigned c = 0; c < 4; c++)
          if (alu->src[source].swizzle[c] != c)
             return false;
-   texture_first = chrome9_fs_is_projected_texture(alu->src[0].src.ssa);
+   texture_first = chrome9_fs_is_projected_texture(alu->src[0].src.ssa, 0);
    return texture_first ?
       chrome9_fs_is_constant_color(alu->src[1].src.ssa, 0, 0) :
-      (chrome9_fs_is_projected_texture(alu->src[1].src.ssa) &&
+      (chrome9_fs_is_projected_texture(alu->src[1].src.ssa, 0) &&
        chrome9_fs_is_constant_color(alu->src[0].src.ssa, 0, 0));
 }
 
@@ -1100,6 +1101,210 @@ chrome9_fs_is_projected_primary_rgb_alpha(nir_def *def, unsigned depth)
 }
 
 static bool
+chrome9_fs_is_two_projected_primary_product(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_alu_instr *alu;
+   bool texture_first;
+
+   if (def->num_components != 4 || instr->type != nir_instr_type_alu ||
+       (alu = nir_instr_as_alu(instr))->op != nir_op_fmul)
+      return false;
+   for (unsigned source = 0; source < 2; source++)
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[source].swizzle[c] != c)
+            return false;
+   texture_first = chrome9_fs_is_projected_texture(alu->src[0].src.ssa, 1);
+   return texture_first ?
+      chrome9_fs_is_projected_primary_rgb_alpha(alu->src[1].src.ssa, 0) :
+      (chrome9_fs_is_projected_texture(alu->src[1].src.ssa, 1) &&
+       chrome9_fs_is_projected_primary_rgb_alpha(alu->src[0].src.ssa, 0));
+}
+
+static bool
+chrome9_fs_is_two_projected_product_component(const nir_alu_src *src,
+                                              unsigned component,
+                                              nir_def **base,
+                                              unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+
+   if (depth > 8 || !def)
+      return false;
+   if (def->num_components == 4) {
+      if (src->swizzle[0] != component ||
+          !chrome9_fs_is_two_projected_primary_product(def))
+         return false;
+      *base = def;
+      return true;
+   }
+   if (def->num_components != 1 || src->swizzle[0])
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   return alu->op == nir_op_mov &&
+          chrome9_fs_is_two_projected_product_component(
+             &alu->src[0], component, base, depth + 1);
+}
+
+static bool
+chrome9_fs_is_two_projected_primary_rgb_alpha(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *product = NULL;
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_two_projected_primary_rgb_alpha(
+         alu->src[0].src.ssa, depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++) {
+      nir_def *component_product = NULL;
+
+      if (!chrome9_fs_is_two_projected_product_component(
+             &alu->src[c], c, &component_product, depth + 1) ||
+          (product && product != component_product))
+         return false;
+      product = component_product;
+   }
+   return product &&
+          chrome9_fs_is_primary_component(&alu->src[3], 3, depth + 1);
+}
+
+static bool
+chrome9_fs_is_two_projected_full_primary_product(nir_def *def,
+                                                 nir_def **inner_product)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_alu_instr *alu;
+   bool texture_first;
+
+   if (def->num_components != 4 || instr->type != nir_instr_type_alu ||
+       (alu = nir_instr_as_alu(instr))->op != nir_op_fmul)
+      return false;
+   for (unsigned source = 0; source < 2; source++)
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[source].swizzle[c] != c)
+            return false;
+   texture_first = chrome9_fs_is_projected_texture(alu->src[0].src.ssa, 1);
+   nir_def *inner = texture_first ? alu->src[1].src.ssa :
+                                    alu->src[0].src.ssa;
+
+   if (!(texture_first ?
+         chrome9_fs_is_projected_primary_product(inner) :
+         (chrome9_fs_is_projected_texture(alu->src[1].src.ssa, 1) &&
+          chrome9_fs_is_projected_primary_product(inner))))
+      return false;
+   if (inner_product)
+      *inner_product = inner;
+   return true;
+}
+
+static bool
+chrome9_fs_is_two_projected_full_product_component(const nir_alu_src *src,
+                                                   unsigned component,
+                                                   nir_def **base,
+                                                   unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+
+   if (depth > 8 || !def)
+      return false;
+   if (def->num_components == 4) {
+      if (src->swizzle[0] != component ||
+          !chrome9_fs_is_two_projected_full_primary_product(def, NULL))
+         return false;
+      *base = def;
+      return true;
+   }
+   if (def->num_components != 1 || src->swizzle[0])
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   return alu->op == nir_op_mov &&
+          chrome9_fs_is_two_projected_full_product_component(
+             &alu->src[0], component, base, depth + 1);
+}
+
+static bool
+chrome9_fs_is_def_component(const nir_alu_src *src, nir_def *base,
+                            unsigned component, unsigned depth)
+{
+   nir_def *def = src->src.ssa;
+   nir_instr *instr;
+
+   if (depth > 8 || !def)
+      return false;
+   if (def == base)
+      return def->num_components == 4 && src->swizzle[0] == component;
+   if (def->num_components != 1 || src->swizzle[0])
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   return alu->op == nir_op_mov &&
+          chrome9_fs_is_def_component(&alu->src[0], base, component,
+                                      depth + 1);
+}
+
+static bool
+chrome9_fs_is_two_projected_texture0_alpha_primary(nir_def *def,
+                                                   unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *product = NULL;
+   nir_def *inner_product = NULL;
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_two_projected_texture0_alpha_primary(
+         alu->src[0].src.ssa, depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++) {
+      nir_def *component_product = NULL;
+
+      if (!chrome9_fs_is_two_projected_full_product_component(
+             &alu->src[c], c, &component_product, depth + 1) ||
+          (product && product != component_product))
+         return false;
+      product = component_product;
+   }
+   return product &&
+          chrome9_fs_is_two_projected_full_primary_product(
+             product, &inner_product) &&
+          chrome9_fs_is_def_component(&alu->src[3], inner_product, 3,
+                                      depth + 1);
+}
+
+static bool
 chrome9_fs_is_rgbx(nir_def *def, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
@@ -1154,6 +1359,10 @@ chrome9_fs_result(nir_def *def)
       return CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA;
    if (chrome9_fs_is_projected_primary_rgb_alpha(def, 0))
       return CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA;
+   if (chrome9_fs_is_two_projected_primary_rgb_alpha(def, 0))
+      return CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA;
+   if (chrome9_fs_is_two_projected_texture0_alpha_primary(def, 0))
+      return CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY;
    if (chrome9_fs_is_projected_primary_product(def))
       return CHROME9_FS_TEXTURE_PROJECTED_MODULATE;
    if (chrome9_fs_is_rgbx(def, 0))
@@ -1219,7 +1428,8 @@ chrome9_fs_classify(nir_shader *nir)
 
                texture_count++;
                if ((!chrome9_fs_is_texture(&tex->def, tex->texture_index) &&
-                    !chrome9_fs_is_projected_texture(&tex->def) &&
+                    !chrome9_fs_is_projected_texture(&tex->def,
+                                                     tex->texture_index) &&
                     !chrome9_fs_is_packed_texture(&tex->def,
                                                   &packed_base)) ||
                    tex->texture_index > 1)
@@ -1310,6 +1520,8 @@ chrome9_fs_classify(nir_shader *nir)
       valid = texture_count == 1 && constant_count == 1;
       break;
    case CHROME9_FS_TWO_TEXTURE_MODULATE:
+   case CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA:
+   case CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY:
       valid = texture_count == 2 && !constant_count;
       break;
    default:
@@ -2048,6 +2260,10 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND);
    ctx->depth_func_supported =
       !!(capabilities & DRM_CHROME9_CAP_DEPTH_FUNC);
+   ctx->depth_equal_supported =
+      !!(capabilities & DRM_CHROME9_CAP_DEPTH_EQUAL);
+   ctx->depth_always_supported =
+      !!(capabilities & DRM_CHROME9_CAP_DEPTH_ALWAYS);
    ctx->depth_read_only_supported =
       !!(capabilities & DRM_CHROME9_CAP_DEPTH_READ_ONLY);
    ctx->draw_triangle_batch =
@@ -2069,6 +2285,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE);
    ctx->draw_two_textured_triangle_d16 =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16);
+   ctx->draw_two_textured_triangle_d16_blend =
+      !!(capabilities &
+         DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND);
    ctx->draw_triangle_blend =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND);
    ctx->draw_textured_triangle_blend =
