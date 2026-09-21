@@ -98,57 +98,65 @@ from the proprietary GL image; D16 adds only bits 3/2.  Type-02/FE A01 remains
 finite reciprocal W.  D16 changes no H6 FVF, VS, PS, TAU, ALU, or vertex
 stride word.
 
-### Complete state-complete index maps
+### Complete compact-builder index maps
 
-The common suffix through program activation is identical for REPLACE and
-MODULATE:
+The implementation in kernel commit `2e78ad0` retains the compact non-blend
+destination image.  Alignment pads are part of the native body and must be
+counted; the common prefix is:
 
 | dwords | block |
 |---:|---|
-| `0..19` | destination, constants, equations, optional A33 |
-| `20..31` | texture image state |
-| `32..39` | sampler state |
-| `40..55` | common render and D16 state |
-| `56..67` | type-02/FE one-texture configuration |
-| `68..99` | H6 FVF, raster, viewport linkage |
-| `100..107` | PS constants |
-| `108..119` | VS float constants |
-| `120..127` | VS integer constants |
-| `128..135` | color/scissor windows |
-| `136..159` | five-instruction VS |
-| `160..167` | VS activation |
-| `168..187` | PS controls |
-| `188..195` | one TAU |
+| `0..14` | destination header/image, including A52 at `6` |
+| `15` | alignment pad |
+| `16..25` | texture image header/state; image A30 at `25` |
+| `26..27` | alignment pads |
+| `28..35` | sampler header/state; sampler A30 at `32` |
+| `36..51` | common render and D16 state |
+| `52..60` | type-02/FE one-texture configuration |
+| `61..63` | alignment pads |
+| `64..93` | H6 FVF, raster, viewport linkage |
+| `94..95` | alignment pads |
+| `96..103` | PS constants |
+| `104..115` | VS float constants |
+| `116..123` | VS integer constants |
+| `124..131` | color/scissor windows |
+| `132..155` | five-instruction VS |
+| `156..160` | VS activation |
+| `161..163` | alignment pads |
+| `164..180` | PS controls |
+| `181..183` | alignment pads |
+| `184..188` | one TAU |
+| `189..191` | alignment pads |
 
-The tails differ only in the existing program size:
+The tails differ only in program size:
 
 ```text
-REPLACE: body[196..203] ALU packet; body[204..231] H6 immediate header + 3*8 vertices
-MODULATE: body[196..207] ALU packet; body[208..235] H6 immediate header + 3*8 vertices
+REPLACE:  body[192..199] ALU packet; body[200..227] H6 header + 3*8 vertices
+MODULATE: body[192..203] ALU packet; body[204..231] H6 header + 3*8 vertices
 ```
 
 High-value construction assertions are:
 
 ```text
-[19]      A33 or cc000000
-[24]      texture_base >> 8
-[25]      18001101                         # SF image location
-[26]      texture dimensions in image A20
-[27]      21000001
-[28]      image A22 logical-size word
-[29]      30980000 (BGRX) or 30990000 (BGRA)
-[36]      30000000                         # sampler A30, explicit level zero
-[47]      A00
-[48]      01c0154c or 01ce154c
-[51..55]  A10, A11, A12, A13, A20
+[6]       5298pppp                         # BGRX target A52; 5299pppp for BGRA
+[20]      texture_base >> 8
+[21]      18001101                         # SF image location
+[22]      texture dimensions in image A20
+[23]      21000001
+[24]      image A22 logical-size word
+[25]      30980000 (BGRX) or 30990000 (BGRA)
+[32]      30000000                         # sampler A30, explicit level zero
+[43]      A00
+[44]      01c0154c or 01ce154c
+[47..51]  A10, A11, A12, A13, A20
 [80..82]  20000000 23004f02 24000003
-[188]     FE020440                         # TAU header
-[196]     FE020440                         # ALU header
-[204/208] FE020440                         # REPLACE/MODULATE vertex header
+[184]     FE020440                         # TAU header
+[192]     FE020440                         # ALU header
+[200/204] FE020440                         # REPLACE/MODULATE vertex header
 ```
 
-Type-01 A20 at body 55 is the high-byte near/far Z clip word.  Type-02 image
-A20 at body 26 contains texture dimensions, and type-04 A20 at body 80 is the
+Type-01 A20 at body 51 is the high-byte near/far Z clip word.  Type-02 image
+A20 at body 22 contains texture dimensions, and type-04 A20 at body 80 is the
 primitive-reuse word.  The validator and diagnostic decoder must keep the H2
 selector/type with every repeated subaddress.
 
@@ -297,3 +305,70 @@ For a diagnostic only, switching one retired BGRA BO between A52=`99` and
 A30=`99` can prove render-to-texture ownership.  It still requires producer
 retirement, the texture-cache clear, and a different destination BO; never
 bind that BO simultaneously as source and target in the bounded successor.
+
+## Default-alpha visual and textured-D16 successor
+
+The source and destination alpha choices are independent.  A normal GL RGB
+texture stored as BGRX needs image A30=`30980000`; the decoder supplies alpha
+one and the existing REPLACE or RGBA MODULATE program needs no repair
+instruction.  An RGBA texture needs `30990000` and contributes its stored
+alpha.  A default GLX alpha-8 drawable is a different decision: its render
+target needs A52 format `99` so fragment alpha is retained.  Selecting A52
+`98` for that drawable silently forces/discards target alpha even if the
+sampler and fragment program are otherwise correct.
+
+The Windows D3D UMD makes the separation executable.  Its RT-only lookup at
+`VTGUModeDX32A.dll:0x1020a4c0` reads the surface format at `+0x34` and maps
+private `2030/2031` to `99/98`; its broader texture lookup at `0x1020a660`
+maps the same values to the same bytes.  Neither lookup receives a shader or
+view-swizzle argument.  The Linux ICD supplies an independent semantic
+check: `__glExtractTexelARGB8:0x3293f7..0x3293fc` copies the stored high byte,
+whereas `__glExtractTexelXRGB8:0x329667` writes output alpha `ff`; the XRGB
+border path repeats that constant at `0x3296cc`.
+
+The first textured-D16 ABI deliberately fixes destination format zero/BGRX.
+Extending it for an alpha-8 visual changes exactly one native word:
+
+```text
+body[6] BGRX  = 52980000 | (destination_pitch >> 5)
+body[6] BGRA  = 52990000 | (destination_pitch >> 5)
+body[43] A00  = 00000011                  # no blend or alpha test
+body[44] A01  = 01c0154c / 01ce154c       # REPLACE / MODULATE plus D16
+body[50] A13  = 13010000 / 13030000       # LESS / LEQUAL
+```
+
+No FVF, TAU, ALU, texture format, packet count, or BO mapping changes.  A53
+stays `53010c0f`, so all four channels are written.  In particular, do not
+route this through framebuffer blending merely because the target has alpha.
+
+A binary-compatible bounded UAPI extension can consume the first reserved
+dword of `drm_chrome9_draw_textured_triangle_d16` as
+`destination_format`, using the existing enum (`0` BGRX, `1` BGRA) and a new
+capability bit.  Old kernels continue to accept format zero and reject the
+new nonzero word.  New kernels must reject values above one, pairwise BO
+aliasing, blending, alpha test, and partial color masks; the three-object
+reservation, READ/WRITE fences, guard verification, and timeout quarantine
+remain byte-for-byte unchanged.  Mesa should require the new capability only
+for a BGRA target and must not treat the existing overloaded
+`blend_successor` Boolean as proof that actual blending is enabled.  The
+allow condition is full RGBA mask, blend disabled, alpha test disabled, one
+texture, guarded BGRA target, guarded Z16, and LESS or LEQUAL.
+
+The smallest silicon discriminator uses a 32-square format-99 target, a 2x2
+format-99 texture containing opaque white, and D16 prefilled to `8000`:
+
+1. MODULATE a vertex color `80402010` at incoming depth `4000`; require the
+   covered target dword `80402010` and D16 `4000`.
+2. Draw a different color at depth `c000`; require both target and D16 to
+   remain unchanged.
+3. Repeat step 1 with target A52=`98`; require RGB `00402010` and use the
+   existing XRGB readback convention rather than asserting its stored high
+   byte.
+
+For the sampler discriminator, use a format-99 destination and identical
+source dwords `00ff0000/40ff0000/80ff0000/ffff0000`.  A30=`99` must preserve
+the four alpha values; A30=`98` must produce `ffff0000` four times.  Sequence
+`99 -> 98 -> 99` without a context reset and require the first result again;
+this proves format closure rather than a fortunate power-on default.  All
+tests use separate guarded source/target/depth BOs and check all six guards
+after retirement.
