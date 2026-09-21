@@ -37,6 +37,12 @@ targets.
   and SUB validators, live pixel oracles, and rounding-independent SUB bound.
 - [chrome9-max-sub-rung-corpus.tsv](chrome9-max-sub-rung-corpus.tsv) records
   the matching Windows/Linux MAX/SUB swizzle and NEG differentials.
+- [chrome9-mad-dot-rung.md](chrome9-mad-dot-rung.md) closes the one-record
+  MAD/DP3/DP4 source-slot mapping, conservative constant bounds, the current
+  two-source UAPI limit, and a fail-closed DP3 endpoint oracle.
+- [chrome9-mad-dot-rung-corpus.tsv](chrome9-mad-dot-rung-corpus.tsv) retains
+  all 16 Windows/Linux byte-matched v0/c0 MAD and dot-product records,
+  including every duplicated MAD source topology.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
