@@ -41,7 +41,8 @@ static bool
 smoke_guard_pages_match(const struct chrome9_resource *resource)
 {
    const uint32_t *first = resource->bo.map;
-   const uint32_t *last;
+   const uint32_t *level0_last;
+   const uint32_t *final;
    size_t page_size = resource->data_offset;
    size_t aligned_data_size;
 
@@ -52,11 +53,15 @@ smoke_guard_pages_match(const struct chrome9_resource *resource)
    if (aligned_data_size < resource->data_size ||
        aligned_data_size > resource->bo.size - 2 * page_size)
       return false;
-   last = (const uint32_t *)((const uint8_t *)resource->bo.map + page_size +
-                            aligned_data_size);
+   level0_last =
+      (const uint32_t *)((const uint8_t *)resource->bo.map + page_size +
+                         aligned_data_size);
+   final = (const uint32_t *)((const uint8_t *)resource->bo.map +
+                              resource->bo.size - page_size);
    for (size_t i = 0; i < page_size / sizeof(uint32_t); i++)
       if (first[i] != CHROME9_SMOKE_GUARD_WORD ||
-          last[i] != CHROME9_SMOKE_GUARD_WORD)
+          level0_last[i] != CHROME9_SMOKE_GUARD_WORD ||
+          final[i] != CHROME9_SMOKE_GUARD_WORD)
          return false;
    return true;
 }
@@ -660,6 +665,7 @@ run_pipe_texture(struct pipe_screen *screen)
       .target = PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8A8_UNORM,
       .width0 = 2, .height0 = 2, .depth0 = 1, .array_size = 1,
+      .last_level = 1,
       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
    };
    struct pipe_resource bgra_target_templ = target_templ;
@@ -680,7 +686,11 @@ run_pipe_texture(struct pipe_screen *screen)
    struct pipe_resource *rhw_target = NULL, *rhw_texture = NULL;
    struct pipe_context *context = NULL;
    struct pipe_sampler_view view_templ, rhw_view_templ;
-   struct pipe_sampler_view *view = NULL, *rhw_view = NULL;
+   struct pipe_sampler_view *view = NULL, *mip_view = NULL, *rhw_view = NULL;
+   struct pipe_transfer *mip_transfer = NULL;
+   struct pipe_box mip_box = {
+      .x = 0, .width = 1, .y = 0, .height = 1, .z = 0, .depth = 1,
+   };
    struct pipe_sampler_state sampler = {
       .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
       .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
@@ -730,7 +740,8 @@ run_pipe_texture(struct pipe_screen *screen)
    void *replace_vs = NULL, *modulate_vs = NULL;
    void *replace = NULL, *modulate = NULL;
    void *samplers[1];
-   uint32_t source_copy[4], *source, *pixels;
+   uint32_t source_copy[4], mip_copy = 0x5aa55aa5, *source, *pixels;
+   uint32_t *mip_pixel;
    bool bgra_render;
    bool passed = false;
 
@@ -755,6 +766,21 @@ run_pipe_texture(struct pipe_screen *screen)
       cbgra_target = chrome9_resource(bgra_target);
    crhw_target = chrome9_resource(rhw_target);
    crhw_texture = chrome9_resource(rhw_texture);
+   if (ctexture->level_stride[0] != 32 ||
+       ctexture->level_offset[0] != ctexture->data_offset ||
+       ctexture->level_size[0] != ctexture->data_size ||
+       ctexture->level_stride[1] != 32 || ctexture->level_size[1] != 32 ||
+       (ctexture->level_offset[1] & 0xff) ||
+       ctexture->level_offset[1] !=
+          ctexture->data_offset +
+             ALIGN_POT(ctexture->data_size, ctexture->data_offset) +
+             ctexture->data_offset ||
+       ctexture->bo.size <
+          ctexture->level_offset[1] + ctexture->level_size[1] +
+             ctexture->data_offset) {
+      fputs("guarded mip resource layout mismatch\n", stderr);
+      goto out;
+   }
    memset(ctarget->bo.map, 0x5a, ctarget->bo.size);
    memset(ctexture->bo.map, 0xa5, ctexture->bo.size);
    if (cbgra_target)
@@ -767,6 +793,20 @@ run_pipe_texture(struct pipe_screen *screen)
    source_copy[0] = source[0]; source_copy[1] = source[1];
    source_copy[2] = source[ctexture->stride / 4];
    source_copy[3] = source[ctexture->stride / 4 + 1];
+   mip_pixel = context->texture_map(context, texture, 1, PIPE_MAP_WRITE,
+                                    &mip_box, &mip_transfer);
+   if (!mip_pixel || !mip_transfer ||
+       mip_transfer->stride != ctexture->level_stride[1] ||
+       (uint8_t *)mip_pixel !=
+          (uint8_t *)ctexture->bo.map + ctexture->level_offset[1]) {
+      fputs("guarded mip level transfer mismatch\n", stderr);
+      if (mip_transfer)
+         context->texture_unmap(context, mip_transfer);
+      goto out;
+   }
+   *mip_pixel = mip_copy;
+   context->texture_unmap(context, mip_transfer);
+   mip_transfer = NULL;
 
    blend.rt[0].colormask = PIPE_MASK_RGBA;
    blend_handle = context->create_blend_state(context, &blend);
@@ -805,6 +845,14 @@ run_pipe_texture(struct pipe_screen *screen)
       context, 2, replace_elements);
    sampler_handle = context->create_sampler_state(context, &sampler);
    u_sampler_view_default_template(&view_templ, texture, texture->format);
+   mip_view = context->create_sampler_view(context, texture, &view_templ);
+   if (mip_view) {
+      fputs("multi-level sampler view unexpectedly accepted\n", stderr);
+      pipe_sampler_view_reference(&mip_view, NULL);
+      goto out;
+   }
+   view_templ.u.tex.first_level = 0;
+   view_templ.u.tex.last_level = 0;
    view = context->create_sampler_view(context, texture, &view_templ);
    u_sampler_view_default_template(&rhw_view_templ, rhw_texture,
                                    rhw_texture->format);
@@ -905,6 +953,7 @@ run_pipe_texture(struct pipe_screen *screen)
       source[ctexture->stride / 4] == source_copy[2] &&
       source[ctexture->stride / 4 + 1] == source_copy[3];
    bool source_padding_match = true;
+   bool mip_tail_match;
    const uint8_t *texture_data =
       (const uint8_t *)ctexture->bo.map + ctexture->data_offset;
    size_t texture_aligned_size =
@@ -917,15 +966,23 @@ run_pipe_texture(struct pipe_screen *screen)
    source_padding_match &= smoke_bytes_match(
       texture_data + ctexture->data_size,
       texture_aligned_size - ctexture->data_size, 0xa5);
+   mip_tail_match =
+      *(const uint32_t *)((const uint8_t *)ctexture->bo.map +
+                          ctexture->level_offset[1]) == mip_copy &&
+      smoke_bytes_match((const uint8_t *)ctexture->bo.map +
+                           ctexture->level_offset[1] + sizeof(mip_copy),
+                        ctexture->bo.size - ctexture->data_offset -
+                           ctexture->level_offset[1] - sizeof(mip_copy),
+                        0xa5);
    bool target_guards_match = smoke_guard_pages_match(ctarget);
    bool texture_guards_match = smoke_guard_pages_match(ctexture);
 
-   if (!source_pixels_match || !source_padding_match ||
+   if (!source_pixels_match || !source_padding_match || !mip_tail_match ||
        !target_guards_match || !texture_guards_match) {
       fprintf(stderr,
-              "texture preservation mismatch: pixels=%u padding=%u "
+              "texture preservation mismatch: pixels=%u padding=%u mip=%u "
               "target_guards=%u texture_guards=%u\n",
-              source_pixels_match, source_padding_match,
+              source_pixels_match, source_padding_match, mip_tail_match,
               target_guards_match, texture_guards_match);
       goto out;
    }
@@ -1199,6 +1256,7 @@ main(int argc, char **argv)
    struct pipe_resource *shared_resource;
    struct pipe_resource *depth_resource = NULL;
    struct winsys_handle whandle = { .type = WINSYS_HANDLE_TYPE_FD };
+   struct winsys_handle kms_handle = { .type = WINSYS_HANDLE_TYPE_KMS };
    struct pipe_screen *screen;
    uint32_t *pixels;
    long page_size;
@@ -1306,6 +1364,19 @@ main(int argc, char **argv)
        ((uint8_t *)surface->bo.map)[0] != 0x5a ||
        ((uint8_t *)surface->bo.map)[surface->bo.size - 1] != 0x5a) {
       fputs("guarded XRGB8888 mmap round trip failed\n", stderr);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+
+   if (!screen->resource_get_handle(
+          screen, NULL, resource, &kms_handle,
+          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE) ||
+       kms_handle.handle != surface->bo.handle ||
+       kms_handle.stride != surface->stride ||
+       kms_handle.offset != surface->data_offset ||
+       kms_handle.modifier != DRM_FORMAT_MOD_LINEAR) {
+      fputs("XRGB8888 same-fd KMS handle failed\n", stderr);
       screen->resource_destroy(screen, resource);
       screen->destroy(screen);
       return 1;

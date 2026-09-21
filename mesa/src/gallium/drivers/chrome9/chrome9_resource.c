@@ -357,19 +357,31 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
                             struct winsys_handle *whandle, unsigned usage)
 {
    struct chrome9_resource *resource = chrome9_resource(pres);
+   bool kms;
    int prime_fd;
 
    (void)context;
    (void)usage;
+   kms = whandle && whandle->type == WINSYS_HANDLE_TYPE_KMS;
    if (!whandle || pres->target == PIPE_BUFFER ||
        pres->last_level ||
        pres->format != PIPE_FORMAT_B8G8R8X8_UNORM || whandle->plane ||
-       whandle->layer || whandle->type != WINSYS_HANDLE_TYPE_FD ||
-       !chrome9_bo_export_fd(screen->get_screen_fd(screen), &resource->bo,
-                             &prime_fd))
+       whandle->layer ||
+       (!kms && whandle->type != WINSYS_HANDLE_TYPE_FD) ||
+       !resource->bo.handle)
       return false;
 
-   whandle->handle = prime_fd;
+   if (kms) {
+      /* KMS handles stay owned by this resource and are valid only on the
+       * screen's DRM file.  PRIME FD export retains its separate ownership
+       * transfer below. */
+      whandle->handle = resource->bo.handle;
+   } else {
+      if (!chrome9_bo_export_fd(screen->get_screen_fd(screen), &resource->bo,
+                                &prime_fd))
+         return false;
+      whandle->handle = prime_fd;
+   }
    whandle->stride = resource->stride;
    whandle->offset = resource->data_offset;
    whandle->modifier = DRM_FORMAT_MOD_LINEAR;
