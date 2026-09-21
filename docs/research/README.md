@@ -288,6 +288,11 @@ targets.
   packet headers, relocation formats, fence candidates, and capture controls.
 - [shader-isa.md](shader-isa.md) records the statically recovered program-upload
   ABI, common OpenGL/Direct3D compiler backend, and partial instruction fields.
+- [ioquake3-signed-repeat-command15.md](ioquake3-signed-repeat-command15.md)
+  measures q3dm1's real base/lightmap coordinate ranges, proves that Chrome9
+  transports raw float S/T and applies wrap in sampler A32, specifies a
+  conservative two-unit signed-repeat capability and no-wedge oracle, and
+  separates command 15's depth/blend flags from its semantic program selector.
 - [`../../tools/chrome9_alu_decode.py`](../../tools/chrome9_alu_decode.py)
   decodes the established fields from a four-dword pixel-ALU instruction while
   keeping unresolved fields visible.

@@ -109,11 +109,14 @@ The two-texture record is ten dwords:
 X Y Z RHW diffuse specular S0 T0 S1 T1
 ```
 
-The current fixed RGBA-MODULATE body is 262 dwords for one triangle, of
-which 30 are vertex payload.  The state-complete derivative is:
+The legacy fixed RGBA-MODULATE body is 262 dwords for one triangle, of which
+30 are vertex payload.  Primary-color successors add one or two four-dword
+ALUs.  The state-complete derivatives are:
 
 ```text
-body_dw = 232 + 4*BLEND + 4*DEPTH + 30*T
+program 0, two factor:         body_dw = 232 + 4*BLEND + 4*DEPTH + 30*T
+program 1, full primary:       body_dw = 236 + 4*BLEND + 4*DEPTH + 30*T
+program 2, TEX0-alpha primary: body_dw = 240 + 4*BLEND + 4*DEPTH + 30*T
 ```
 
 The 262/266 no-depth/depth rows come directly from the current executable
@@ -122,16 +125,17 @@ builder.  The additional four-dword BLEND closure is the separately audited
 evidence.  Keeping it in the worst-case proof prevents that successor from
 silently reducing the list margin when implemented.
 
-At `T=18`, body length ranges from 772 through 780 dwords.  Every variant
+At `T=18`, body length ranges from 772 through 788 dwords.  Every variant
 again lands at PAUSE `0x0cf0`, STOP `0x0d70`, and read-ahead end `0x0f90`.
-At `T=19`, the range is 802 through 810 dwords and STOP becomes `0x0df0`,
+At `T=19`, the range is 802 through 818 dwords and STOP becomes `0x0df0`,
 ending the read-ahead at `0x1010`.  Eighteen is therefore the exact maximum.
 
 Use the same direct-to-staging conversion and local FVF copy as the
-one-texture builder.  The first ABI keeps the currently proved two-texture
-RGBA MODULATE program.  A future primary-color or different combine shader
-adds state/program dwords and must regenerate this table; it must not inherit
-18 as an unchecked constant.
+one-texture builder.  The program-specific fixed size is part of the
+immutable builder key and must be asserted.  A future stage-0 H3 mip table
+adds 12 dwords; the largest program-2 depth+blend+mip key is then 800 dwords
+at T=18 and must reduce its segment maximum to 17.  The first command-15 ABI
+carries no mip metadata.
 
 ### Generated bounds table
 
@@ -144,8 +148,10 @@ than a loose limit:
 | one MODULATE | 8 | 204 | 24 | 780 | `0xcf0` | `0xd70` |
 | one REPLACE + depth + blend | 8 | 208 | 24 | 784 | `0xcf0` | `0xd70` |
 | one MODULATE + depth + blend | 8 | 212 | 24 | 788 | `0xcf0` | `0xd70` |
-| two texture | 10 | 232 | 18 | 772 | `0xcf0` | `0xd70` |
-| two texture + depth + blend | 10 | 240 | 18 | 780 | `0xcf0` | `0xd70` |
+| two texture, program 0 | 10 | 232 | 18 | 772 | `0xcf0` | `0xd70` |
+| two texture, program 0 + depth + blend | 10 | 240 | 18 | 780 | `0xcf0` | `0xd70` |
+| two texture, program 1 + depth + blend | 10 | 244 | 18 | 784 | `0xcf0` | `0xd70` |
+| two texture, program 2 + depth + blend | 10 | 248 | 18 | 788 | `0xcf0` | `0xd70` |
 
 All rows start the aligned 3D body at byte `0x20`.  The common post-body
 status, flush, cookie, PAUSE/STOP framing is unchanged.  The builder must
@@ -160,6 +166,10 @@ The flags are deliberately common to both requests:
 ```c
 #define DRM_CHROME9_TEXTURE_RUN_DEPTH       (1U << 0)
 #define DRM_CHROME9_TEXTURE_RUN_BLEND       (1U << 1)
+
+#define DRM_CHROME9_TWO_TEXTURE_PROGRAM_MODULATE            0U
+#define DRM_CHROME9_TWO_TEXTURE_PROGRAM_PRIMARY_MODULATE    1U
+#define DRM_CHROME9_TWO_TEXTURE_PROGRAM_TEX0_ALPHA_PRIMARY  2U
 
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_RUN      0x14
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_RUN  0x15
@@ -198,7 +208,7 @@ struct drm_chrome9_draw_two_textured_triangle_run {
         __u32 destination_pitch;        /* 24 */
         __u32 depth_pitch;              /* 28: zero without DEPTH */
         __u32 destination_format;       /* 32 */
-        __u32 reserved0;                /* 36: zero */
+        __u32 program;                  /* 36: semantic program enum */
         struct drm_chrome9_texture_state textures[2]; /* 40..111 */
         struct drm_chrome9_blend_state blend;     /* 112..151 */
         struct drm_chrome9_scissor_state scissor; /* 152..163 */
@@ -225,7 +235,9 @@ All public values and all copied vertices must validate before GEM lookup,
 PTE publication, or command construction:
 
 1. Reject unknown flags and all nonzero reserved/pad words.  The allowed
-   mask is `DEPTH | BLEND | DEPTH_FUNC_MASK | DEPTH_READ_ONLY`.
+   mask is `DEPTH | BLEND | DEPTH_FUNC_MASK | DEPTH_READ_ONLY`.  For the
+   two-texture request validate the separate `program` enum as described in
+   step 5; never interpret flags bits 0/1 as a program selector.
 2. Require `triangle_count` in `1..192` or `1..144` and a nonzero
    `vertices_ptr`.  Check multiplication by three and by the exact record
    size before `memdup_array_user()`.
@@ -243,8 +255,10 @@ PTE publication, or command construction:
 5. Reuse the current level-zero texture validator independently for every
    source: nonzero distinct native handle, `1..2048` dimensions, canonical
    `ALIGN(width * 4, 32)` pitch, BGRX/BGRA, nearest/linear, and
-   clamp/repeat/mirrored-repeat.  One texture accepts REPLACE or MODULATE;
-   two textures initially accept only the fixed RGBA MODULATE program.
+   clamp/repeat/mirrored-repeat.  One texture accepts REPLACE or MODULATE.
+   Two-texture `program` accepts 0 unconditionally, 1 only with cap25, and 2
+   only with cap39 and the initial BGRA-unit-1 gate; reject every other value.
+   Program bits never share the command-15 flags word.
 6. Validate the half-open scissor with the existing helper and destination
    dimensions.
 7. Reject every object alias and imported object.  Check each exact guarded
@@ -255,9 +269,11 @@ PTE publication, or command construction:
    `chrome9_rhw_valid()`.  That helper excludes zero, subnormal, infinity,
    NaN, and negative RHW.  One-texture S/T need only be finite because wrap
    modes intentionally accept coordinates outside `[0,1]`; retain the
-   currently narrower `[0,1]` two-texture rule until its wrap oracle is
-   broadened deliberately.  Reject every degenerate three-record group with
-   the checked 64-bit cross product.
+   currently narrower `[0,1]` two-texture rule unless cap40 applies: any axis
+   set to REPEAT accepts finite magnitude at most 32, while CLAMP and MIRROR
+   axes remain in `[0,1]`.  Reject every degenerate three-record group with
+   the checked 64-bit cross product.  See
+   [ioquake3-signed-repeat-command15.md](ioquake3-signed-repeat-command15.md).
 
 The public copy maxima are:
 
@@ -365,7 +381,7 @@ mix them with the untextured RHW array.  The complete immutable run key is:
 destination handle, dimensions, pitch, and format
 optional D16 handle, pitch, compare function, and write mask
 texture count and every handle/dimension/pitch/format/filter/wrap/view level
-one-texture program, or exact two-texture fixed classifier
+one-texture program, or exact two-texture program enum
 complete blend/alpha-test/color-mask state
 scissor enable and rectangle
 ```
@@ -545,19 +561,21 @@ structures have named pad/reserved storage.  The key consequently contains:
 - destination handle, dimensions, pitch, and BGRX/BGRA format;
 - DEPTH/BLEND/depth-function/read-only flags, D16 handle and pitch;
 - one-texture REPLACE/MODULATE selection;
+- separate two-texture program enum 0/1/2;
 - every texture handle, level-zero dimension, pitch, format, min/mag filter,
   and S/T wrap mode;
 - all ten blend/alpha-test/color-mask words; and
 - the complete half-open scissor state.
 
-Do not key on the high-level fragment classifier, `packed_generic`, constant
-color, diffuse/specular, or texture coordinates.  The accepted classifiers
-collapse to the same REPLACE/MODULATE hardware program, while constants and
-varyings have already been materialized in each copied native record.  The
-key should compare equal throughout one outer draw.  A mismatch is an
-internal invariant violation: flush the valid prefix to preserve ordering,
-mark the draw failed, and warn once rather than silently starting a second
-state envelope.
+Do not key on the high-level fragment-classifier identity, `packed_generic`,
+constant color, diffuse/specular, or texture coordinates.  Classifiers that
+lower to the same enumerated native program share the key; the program enum
+itself must differ for the two-factor, full-primary, and TEX0-alpha-primary
+objects.  Constants and varyings have already been materialized in each
+copied native record.  The key should compare equal throughout one outer
+draw.  A mismatch is an internal invariant violation: flush the valid prefix
+to preserve ordering, mark the draw failed, and warn once rather than
+silently starting a second state envelope.
 
 The existing draw-limit test must use
 `submitted_triangles + batch_count + texture_run_count`.  A capacity flush

@@ -89,8 +89,9 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 37 | reserved | `DRAW_FOGPASS` |
 | 38 | reserved | `D24S8_TWO_SIDED_STENCIL` |
 | 39 | reserved | `TWO_TEXTURE_PRIMARY_TEX0_ALPHA` |
+| 40 | reserved, live-proven | `TWO_TEXTURE_SIGNED_REPEAT_COORDS` |
 
-The next unreserved capability bit is 40.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 41.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -156,3 +157,10 @@ uses a BGRA unit 1 but does not consume its alpha.  Program flag bit 0 retains
 the bit-25 full-RGBA object; bits 0 and 1 are mutually exclusive.  The packet,
 format gate, and silicon oracle are specified in
 [ioquake3-gl2-lightall-bgra-object.md](ioquake3-gl2-lightall-bgra-object.md).
+
+Capability bit 40 adds no command or request field.  For either texture it
+permits a signed/out-of-range coordinate on an axis set to REPEAT, with finite
+magnitude at most 32; CLAMP and MIRROR axes retain the normalized rule.  The
+unchanged IEEE float payload, sampler ordering, command-15 selector
+separation, and passed guarded silicon gate are specified in
+[ioquake3-signed-repeat-command15.md](ioquake3-signed-repeat-command15.md).
