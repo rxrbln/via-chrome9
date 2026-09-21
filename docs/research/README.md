@@ -190,8 +190,8 @@ targets.
   stream was only an incomplete-harness artifact.
 - [chrome9-flr-production-corpus.tsv](chrome9-flr-production-corpus.tsv)
   retains three exact terminal byte matches and two bounded explicit-TEMP
-  timeout negatives; FLR remains rejected pending scratch ABI and numerical
-  silicon proof.
+  timeout negatives; FLR remains rejected pending a dedicated semantic ABI
+  and numerical silicon proof.
 - [chrome9-dst-one-record-audit.md](chrome9-dst-one-record-audit.md) closes
   DST source-slot packing and defines normalized `DST(v0,v0)` as the safest
   bounded one-record key after a guarded pixel oracle.
