@@ -5,6 +5,12 @@ field and configuration-2 lifetime markers.  This closes a correctness gap in
 the proposed Mesa encoder: the three source flags previously called
 "dependency bits" are not producer-edge flags.
 
+This result supersedes the older A/B/C wording in
+`general-shader-runtime-contract.md`, `shader-upload-oracles.md`, and
+`via-5.75-shader-re.md`.  It does **not** rename TAU phase/order fields or
+claim that every bit historically called a dependency is a lifetime marker;
+the correction is limited to ALU d0.bit25, d1.bit21, and d2.bit17.
+
 ## Result
 
 The exact physical TEMP destination is:
@@ -53,6 +59,12 @@ This is consistent with the finalizer scanning B, then C, then A and replacing
 the saved last-use location for an equal physical id.  The scan-order
 explanation is an inference; the emitted winner and the requirement to mark
 only one slot are exact.
+
+Lifetime is per physical vec4, not per component.  A partial-write program
+that reads r0.x into oC0.x and then r0.y into oC0.y leaves the first read
+unmarked and puts A.bit17 only on the second.  This is one more reason for the
+first backend to reject partial temporary merging: component SSA does not
+remove the need to preserve whole-register liveness after packing.
 
 Do not replace this pass with either of the tempting shortcuts:
 
