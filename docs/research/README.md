@@ -115,6 +115,11 @@ targets.
   cross-checks both Windows UMDs, proprietary Linux, the VX900 manual, and old
   Mesa for ioquake's next sampler formats; it gives the complete min/mag/mip
   and wrap words plus standardized level-zero and guarded two-level vectors.
+- [sampler-next-implementation-audit.md](sampler-next-implementation-audit.md)
+  reconciles Windows/Linux sampler builders with the current guarded layout,
+  closes mirror-once and signed-LOD conversion details, separates ordinary
+  filtering from coefficient-backed anisotropy, and ranks executable mip and
+  packed-format promotion gates.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
