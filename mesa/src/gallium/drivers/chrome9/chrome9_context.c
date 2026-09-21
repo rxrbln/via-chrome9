@@ -1413,6 +1413,10 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
       chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
                            height);
       chrome9_context_render_target_written(ctx);
+      /* Imported drawable targets render through a guarded shadow.  Clears
+       * are synchronous CPU writes, so publish the completed image now even
+       * when the state tracker keeps this framebuffer bound. */
+      chrome9_flush_render_target(ctx);
    }
    if (buffers & PIPE_CLEAR_DEPTH)
       chrome9_clear_depth_target(chrome9_context_depth_target(ctx), depth,
@@ -1460,8 +1464,10 @@ chrome9_clear_render_target(struct pipe_context *pipe,
       target = ctx->render_target;
    chrome9_clear_target(chrome9_resource(target), color,
                         x, y, width, height);
-   if (target == ctx->render_target)
+   if (target == ctx->render_target) {
       chrome9_context_render_target_written(ctx);
+      chrome9_flush_render_target(ctx);
+   }
 }
 
 static void
@@ -1543,6 +1549,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
+   /* Every accepted Chrome9 submission has retired synchronously.  Publish
+    * a guarded render-target shadow once per Gallium draw; glamor may keep
+    * the framebuffer bound and does not otherwise promise a pipe flush
+    * before the scanout or GetImage consumer reads the external BO. */
+   chrome9_flush_render_target(ctx);
 
 unmap:
    for (unsigned i = 0; i < ctx->num_vertex_buffers; i++)
