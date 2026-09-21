@@ -16,6 +16,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -26,6 +27,7 @@
 
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
+#include "chrome9_vx900_display.h"
 
 #define CHROME9_FIXED_WIDTH		1024U
 #define CHROME9_FIXED_HEIGHT		768U
@@ -37,20 +39,6 @@ static bool chrome9_direct_flips;
 module_param_named(direct_flips, chrome9_direct_flips, bool, 0400);
 MODULE_PARM_DESC(direct_flips,
 		 "Enable experimental direct IGA1 SF page flips");
-
-static const struct drm_display_mode chrome9_fixed_mode = {
-	.clock = 65000,
-	.hdisplay = 1024,
-	.hsync_start = 1048,
-	.hsync_end = 1184,
-	.htotal = 1344,
-	.vdisplay = 768,
-	.vsync_start = 771,
-	.vsync_end = 777,
-	.vtotal = 806,
-	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
-	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
-};
 
 /* Every indexed register written by chrome9_iga1_program(). */
 static const u8 chrome9_saved_sr[] = {
@@ -86,6 +74,8 @@ struct chrome9_kms_state {
 	bool flip_blocked;
 	/* Owns a second SF pin until a complete IGA1 restore stops fetch. */
 	struct drm_framebuffer *active_fb;
+	/* A blanked old scanout remains pinned through the next base takeover. */
+	struct drm_framebuffer *retired_fb;
 	/* A failed post-publication flip retains every possibly fetched BO. */
 	struct drm_framebuffer *blocked_fb;
 	struct drm_pending_vblank_event *blocked_event;
@@ -195,6 +185,8 @@ static void chrome9_iga1_restore(struct chrome9_kms_state *kms)
 	chrome9_cr_mask(0x11, BIT(7), 0);
 	chrome9_cr_mask(0x47, BIT(4) | BIT(0), 0);
 	chrome9_cr_mask(0x36, GENMASK(5, 4), GENMASK(5, 4));
+	chrome9_cr_mask(0x17, BIT(7), 0);
+	vga_io_rcrt(0x17);
 	for (i = 0; i < ARRAY_SIZE(chrome9_saved_cr); i++) {
 		index = chrome9_saved_cr[i];
 		if (index != 0x11 && index != 0x17 && index != 0x36 &&
@@ -237,11 +229,12 @@ static void chrome9_iga1_restore(struct chrome9_kms_state *kms)
 	kms->snapshot_valid = false;
 }
 
-static void chrome9_iga1_program(struct chrome9_device *cdev, u32 address,
-				 bool system_framebuffer)
+static int chrome9_iga1_program(struct chrome9_device *cdev,
+				const struct drm_display_mode *mode, u32 pitch,
+				u32 address, bool system_framebuffer)
 {
 	u32 base = address >> 1;
-	u8 misc;
+	int ret;
 
 	/* Blank first, power off VGA, select IGA1, and disable IGA2. */
 	chrome9_sr_mask(0x01, BIT(5), BIT(5));
@@ -249,6 +242,9 @@ static void chrome9_iga1_program(struct chrome9_device *cdev, u32 address,
 	chrome9_cr_mask(0x11, BIT(7), 0);
 	chrome9_cr_mask(0x47, BIT(4) | BIT(0), 0);
 	chrome9_cr_mask(0x36, GENMASK(5, 4), GENMASK(5, 4));
+	chrome9_cr_mask(0x17, BIT(7), 0);
+	if (vga_io_rcrt(0x17) & BIT(7))
+		return -EIO;
 	chrome9_sr_mask(0x16, BIT(6), 0);
 	chrome9_cr_mask(0x6a, BIT(6), 0);
 	chrome9_cr_mask(0x6a, BIT(7), 0);
@@ -257,10 +253,8 @@ static void chrome9_iga1_program(struct chrome9_device *cdev, u32 address,
 	/* viafb marks this bit as required for correct VX900 IGA1 modes. */
 	chrome9_cr_mask(0x45, BIT(0), 0);
 
-	/* XRGB8888 uses viafb's depth-24 selector and a 4096-byte pitch. */
+	/* XRGB8888 uses viafb's depth-24 selector. */
 	chrome9_sr_mask(0x15, GENMASK(7, 1), 0xae);
-	vga_io_wcrt(0x13, 0x00);
-	vga_io_wcrt(0x35, 0x50);
 
 	/* IGA1 uses two-byte units; CR48[7:6]=01 selects translated SF. */
 	chrome9_cr_mask(0x48, GENMASK(7, 6),
@@ -269,89 +263,68 @@ static void chrome9_iga1_program(struct chrome9_device *cdev, u32 address,
 	vga_io_wcrt(0x0c, base >> 8);
 	vga_io_wcrt(0x34, base >> 16);
 	chrome9_cr_mask(0x48, GENMASK(4, 0), base >> 24);
+	if (vga_io_rcrt(0x0d) != (u8)base ||
+	    vga_io_rcrt(0x0c) != (u8)(base >> 8) ||
+	    vga_io_rcrt(0x34) != (u8)(base >> 16) ||
+	    (vga_io_rcrt(0x48) & (GENMASK(7, 6) | GENMASK(4, 0))) !=
+		((system_framebuffer ? BIT(6) : 0) |
+		 ((base >> 24) & GENMASK(4, 0))))
+		return -EIO;
 
-	/* 1024x768@60 timing, including narrow common-VGA prerequisites. */
-	vga_io_wcrt(0x00, 0xa3);
-	vga_io_wcrt(0x01, 0x7f);
-	vga_io_wcrt(0x02, 0x7f);
-	chrome9_cr_mask(0x03, 0x9f, 0x87);
-	vga_io_wcrt(0x04, 0x83);
-	chrome9_cr_mask(0x05, 0x9f, 0x94);
-	vga_io_wcrt(0x06, 0x24);
-	vga_io_wcrt(0x07, 0xf5);
+	/* Common VGA prerequisites not derived from the requested mode. */
 	vga_io_wcrt(0x08, 0x00);
-	vga_io_wcrt(0x09, 0x60);
+	chrome9_cr_mask(0x09, 0xdf, 0x40);
 	vga_io_wcrt(0x0a, 0x1e);
 	vga_io_wcrt(0x0b, 0x00);
 	vga_io_wcrt(0x0e, 0x00);
 	vga_io_wcrt(0x0f, 0x00);
-	vga_io_wcrt(0x10, 0x02);
-	chrome9_cr_mask(0x11, 0x0f, 0x08);
-	vga_io_wcrt(0x12, 0xff);
 	vga_io_wcrt(0x14, 0x00);
-	vga_io_wcrt(0x15, 0xff);
-	vga_io_wcrt(0x16, 0x25);
 	vga_io_wcrt(0x18, 0xff);
-	chrome9_cr_mask(0x33, 0x37, 0x06);
+	chrome9_cr_mask(0x33, 0x07, 0x06);
 	/* Direct 0214 base updates latch by frame, never by scan line. */
 	chrome9_cr_mask(CHROME9_CR_IGA1_FLIP_MODE,
 			CHROME9_CR_IGA1_FLIP_BY_LINE, 0);
-	chrome9_cr_mask(0x36, BIT(3), 0);
-	chrome9_cr_mask(0x11, BIT(7), BIT(7));
-	vga_io_wcrt(0x17, 0x63);
-	vga_io_wcrt(0x17, 0xe3);
-
-	/* Fetch count 0x104 and VX900 FIFO tuple 400/320/320/160. */
-	vga_io_wseq(0x1c, 0x04);
-	chrome9_sr_mask(0x1d, GENMASK(1, 0), 0x01);
-	vga_io_wseq(0x17, 0xc7);
-	chrome9_sr_mask(0x16, 0xbf, 0x90);
-	chrome9_sr_mask(0x18, 0xbf, 0x90);
-	chrome9_sr_mask(0x22, GENMASK(4, 0), 0x08);
-
-	/* 64.998 MHz request: M=109, D=3, R=3, encoded 0x030c6d. */
-	chrome9_sr_mask(0x40, BIT(1), BIT(1));
-	vga_io_wseq(0x44, 0x6d);
-	vga_io_wseq(0x45, 0x0c);
-	vga_io_wseq(0x46, 0x03);
-	chrome9_sr_mask(0x40, BIT(1), 0);
-	misc = vga_io_r(VGA_MIS_R);
-	vga_io_w(VGA_MIS_W, (misc & ~0xcc) | 0xcc);
-	chrome9_cr_mask(0x6c, 0xf0, 0x00);
-	chrome9_sr_mask(0x2d, 0x30, 0x20);
-	chrome9_sr_mask(0x1b, 0x30, 0x20);
+	ret = chrome9_vx900_iga1_program_mode(mode, pitch);
+	if (ret)
+		return ret;
 
 	/* Turn CRT on only after base, fetch, timing, and clocks are complete. */
 	chrome9_cr_mask(0x36, GENMASK(5, 4), 0);
 	vga_io_wcrt(0x47, cdev->kms_state->cr[0x47]);
 	vga_io_wseq(0x10, cdev->kms_state->sr[0x10]);
 	chrome9_sr_mask(0x01, BIT(5), 0);
+	return 0;
 }
 
-static bool chrome9_fixed_state_valid(struct chrome9_device *cdev,
-				      const struct drm_plane_state *plane_state,
-				      const struct drm_crtc_state *crtc_state)
+static bool chrome9_state_valid(struct chrome9_device *cdev,
+				const struct drm_plane_state *plane_state,
+				const struct drm_crtc_state *crtc_state)
 {
 	const struct drm_framebuffer *fb = plane_state->fb;
 
 	if (!cdev->kms_state->fixed_iga1 ||
-	    !drm_mode_equal(&crtc_state->mode, &chrome9_fixed_mode) ||
+	    READ_ONCE(cdev->kms_state->flip_blocked) ||
+	    !chrome9_vx900_iga1_mode_valid(&crtc_state->adjusted_mode) ||
 	    !fb ||
 	    plane_state->crtc != &cdev->display_pipe.crtc)
 		return false;
 	if (fb->format->format != DRM_FORMAT_XRGB8888 ||
 	    fb->modifier != DRM_FORMAT_MOD_LINEAR ||
-	    fb->width != CHROME9_FIXED_WIDTH ||
-	    fb->height != CHROME9_FIXED_HEIGHT ||
-	    fb->pitches[0] != CHROME9_FIXED_PITCH ||
+	    fb->width < crtc_state->adjusted_mode.hdisplay ||
+	    fb->height < crtc_state->adjusted_mode.vdisplay ||
+	    fb->pitches[0] < fb->width * 4 ||
+	    !IS_ALIGNED(fb->pitches[0], 32) || fb->pitches[0] / 8 > 0x7ff ||
 	    (fb->offsets[0] && fb->offsets[0] != PAGE_SIZE))
 		return false;
+	if (cdev->kms_state->staging_scanout &&
+	    (u64)fb->pitches[0] * fb->height > cdev->scanout_size)
+		return false;
 	if (plane_state->src_x || plane_state->src_y ||
-	    plane_state->src_w != CHROME9_FIXED_WIDTH << 16 ||
-	    plane_state->src_h != CHROME9_FIXED_HEIGHT << 16 ||
+	    plane_state->src_w != crtc_state->adjusted_mode.hdisplay << 16 ||
+	    plane_state->src_h != crtc_state->adjusted_mode.vdisplay << 16 ||
 	    plane_state->crtc_x || plane_state->crtc_y ||
-	    plane_state->crtc_w != CHROME9_FIXED_WIDTH ||
-	    plane_state->crtc_h != CHROME9_FIXED_HEIGHT ||
+	    plane_state->crtc_w != crtc_state->adjusted_mode.hdisplay ||
+	    plane_state->crtc_h != crtc_state->adjusted_mode.vdisplay ||
 	    plane_state->rotation != DRM_MODE_ROTATE_0)
 		return false;
 	return true;
@@ -438,15 +411,19 @@ static int chrome9_connector_get_modes(struct drm_connector *connector)
 {
 	struct chrome9_device *cdev = to_chrome9(connector->dev);
 	struct drm_display_mode *mode;
+	int count;
 
 	if (!cdev->kms_state->fixed_iga1)
 		return 0;
-	mode = drm_mode_duplicate(connector->dev, &chrome9_fixed_mode);
-	if (!mode)
-		return 0;
-	drm_mode_set_name(mode);
-	drm_mode_probed_add(connector, mode);
-	return 1;
+	count = drm_add_modes_noedid(connector, 2048, 2048);
+	list_for_each_entry(mode, &connector->probed_modes, head)
+		if (mode->hdisplay == CHROME9_FIXED_WIDTH &&
+		    mode->vdisplay == CHROME9_FIXED_HEIGHT &&
+		    drm_mode_vrefresh(mode) == 60) {
+			mode->type |= DRM_MODE_TYPE_PREFERRED;
+			break;
+		}
+	return count;
 }
 
 static const struct drm_connector_helper_funcs chrome9_connector_helper_funcs = {
@@ -468,10 +445,9 @@ chrome9_pipe_mode_valid(struct drm_simple_display_pipe *pipe,
 {
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
 
-	if (!cdev->kms_state->fixed_iga1 ||
-	    !drm_mode_equal(mode, &chrome9_fixed_mode))
+	if (!cdev->kms_state->fixed_iga1)
 		return MODE_BAD;
-	return MODE_OK;
+	return chrome9_vx900_iga1_mode_valid(mode) ? MODE_OK : MODE_BAD;
 }
 
 static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
@@ -482,7 +458,7 @@ static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
 	struct drm_plane_state *old_plane_state = pipe->plane.state;
 
 	if (crtc_state->enable &&
-	    !chrome9_fixed_state_valid(cdev, plane_state, crtc_state))
+	    !chrome9_state_valid(cdev, plane_state, crtc_state))
 		return -EINVAL;
 	if (crtc_state->async_flip)
 		return -EINVAL;
@@ -537,13 +513,14 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
 	struct chrome9_kms_state *kms = cdev->kms_state;
 	struct drm_framebuffer *display_fb = NULL;
+	struct drm_framebuffer *retired_fb = NULL;
 	u32 scanout_base = 0;
 	bool system_framebuffer;
 	bool enabled = false;
 	int ret;
 
-	if (!chrome9_fixed_state_valid(cdev, plane_state, crtc_state)) {
-		dev_err(&cdev->pdev->dev, "refusing invalid fixed IGA1 enable\n");
+	if (!chrome9_state_valid(cdev, plane_state, crtc_state)) {
+		dev_err(&cdev->pdev->dev, "refusing invalid IGA1 enable\n");
 		return;
 	}
 	if (kms->staging_scanout) {
@@ -596,8 +573,17 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 		goto out_unlock_engine;
 	}
-	chrome9_iga1_save(kms);
-	chrome9_iga1_program(cdev, scanout_base, system_framebuffer);
+	/* Preserve firmware state only once, for final ownership handoff. */
+	if (!kms->snapshot_valid)
+		chrome9_iga1_save(kms);
+	ret = chrome9_iga1_program(cdev, &crtc_state->adjusted_mode,
+				  plane_state->fb->pitches[0], scanout_base,
+				  system_framebuffer);
+	if (ret) {
+		kms->flip_blocked = true;
+		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+		goto out_unlock_engine;
+	}
 	kms->iga1_enabled = true;
 	enabled = true;
 	if (system_framebuffer) {
@@ -605,10 +591,17 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 		kms->active_fb = display_fb;
 		display_fb = NULL;
 	}
+	/* Base readback occurred while blanked; CR17 has now latched new timing. */
+	retired_fb = kms->retired_fb;
+	kms->retired_fb = NULL;
 	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	dev_info(&cdev->pdev->dev,
-		 "lab-only IGA1 1024x768@60 output enabled at %s %#x\n",
-		 system_framebuffer ? "SF" : "BAR2", scanout_base);
+		 "IGA1 %ux%u@%u kHz output enabled at %s %#x pitch=%u\n",
+		 crtc_state->adjusted_mode.hdisplay,
+		 crtc_state->adjusted_mode.vdisplay,
+		 crtc_state->adjusted_mode.clock,
+		 system_framebuffer ? "SF" : "BAR2", scanout_base,
+		 plane_state->fb->pitches[0]);
 
 out_unlock_engine:
 	mutex_unlock(&kms->lock);
@@ -618,6 +611,10 @@ out_put_display:
 		chrome9_gem_fb_unpin(display_fb);
 		drm_framebuffer_put(display_fb);
 	}
+	if (retired_fb) {
+		chrome9_gem_fb_unpin(retired_fb);
+		drm_framebuffer_put(retired_fb);
+	}
 	if (enabled)
 		chrome9_pipe_complete_event(pipe);
 }
@@ -626,10 +623,8 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
 	struct chrome9_device *cdev = to_chrome9(pipe->crtc.dev);
 	struct chrome9_kms_state *kms = cdev->kms_state;
-	struct drm_framebuffer *display_fb = NULL;
-	struct drm_framebuffer *blocked_fb = NULL;
 	struct drm_pending_vblank_event *blocked_event = NULL;
-	bool restored = false;
+	bool disabled = false;
 	int ret;
 
 	if (!READ_ONCE(kms->iga1_enabled))
@@ -637,7 +632,7 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	ret = chrome9_engine_display_begin(cdev);
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
-			"cannot serialize IGA1 restore with command reader: %d\n",
+			"cannot serialize IGA1 disable with command reader: %d\n",
 			ret);
 		return;
 	}
@@ -647,34 +642,48 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
-			"cannot lock VGA I/O to restore IGA1: %d\n", ret);
+			"cannot lock VGA I/O to disable IGA1: %d\n", ret);
 		goto out_unlock_engine;
 	}
-	chrome9_iga1_restore(kms);
+	/*
+	 * Atomic disable keeps driver ownership and never revives firmware
+	 * scanout.  VX900 CR17[7]=0 holds both timing generators in hardware
+	 * reset; keep the old SF mapping until a new base is read back and timing
+	 * is re-enabled by chrome9_iga1_program().
+	 */
+	chrome9_cr_mask(0x45, BIT(5), BIT(5));
+	chrome9_sr_mask(0x01, BIT(5), BIT(5));
+	chrome9_cr_mask(0x36, GENMASK(5, 4), GENMASK(5, 4));
+	chrome9_cr_mask(0x17, BIT(7), 0);
+	vga_io_rseq(0x01);
+	if (vga_io_rcrt(0x17) & BIT(7)) {
+		kms->flip_blocked = true;
+		dev_crit(&cdev->pdev->dev,
+			 "IGA1 timing reset did not latch; scanout mapping retained\n");
+		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+		goto out_unlock_engine;
+	}
 	kms->iga1_enabled = false;
-	display_fb = kms->active_fb;
-	kms->active_fb = NULL;
-	blocked_fb = kms->blocked_fb;
-	kms->blocked_fb = NULL;
-	blocked_event = kms->blocked_event;
-	kms->blocked_event = NULL;
-	kms->flip_blocked = false;
-	restored = true;
+	if (kms->active_fb) {
+		if (WARN_ON(kms->retired_fb)) {
+			kms->flip_blocked = true;
+		} else {
+			kms->retired_fb = kms->active_fb;
+			kms->active_fb = NULL;
+		}
+	}
+	if (!kms->blocked_fb) {
+		blocked_event = kms->blocked_event;
+		kms->blocked_event = NULL;
+	}
+	disabled = true;
 	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
-	dev_info(&cdev->pdev->dev, "restored pre-KMS IGA1 VGA state\n");
+	dev_info(&cdev->pdev->dev, "driver-owned IGA1 output disabled\n");
 
 out_unlock_engine:
 	mutex_unlock(&kms->lock);
 	chrome9_engine_display_end(cdev);
-	if (display_fb) {
-		chrome9_gem_fb_unpin(display_fb);
-		drm_framebuffer_put(display_fb);
-	}
-	if (blocked_fb) {
-		chrome9_gem_fb_unpin(blocked_fb);
-		drm_framebuffer_put(blocked_fb);
-	}
-	if (restored) {
+	if (disabled) {
 		chrome9_pipe_send_event(pipe, blocked_event);
 		/* A full modeset which remains enabled completes after re-enable. */
 		if (!pipe->crtc.state->enable)
@@ -845,6 +854,7 @@ static int chrome9_atomic_check(struct drm_device *drm,
 {
 	struct chrome9_device *cdev = to_chrome9(drm);
 	struct drm_crtc_state *crtc_state;
+	const struct drm_plane_state *old_plane_state;
 	struct drm_plane_state *plane_state;
 	int ret;
 
@@ -854,10 +864,22 @@ static int chrome9_atomic_check(struct drm_device *drm,
 	plane_state = drm_atomic_get_plane_state(state, &cdev->display_pipe.plane);
 	if (IS_ERR(plane_state))
 		return PTR_ERR(plane_state);
+	old_plane_state = drm_atomic_get_old_plane_state(
+		state, &cdev->display_pipe.plane);
+	/*
+	 * A DRM client takeover may replace fbdev's buffer at the same mode.
+	 * Turn only ALLOW_MODESET commits into a full blank/program/unblank;
+	 * ordinary Present flips remain rejected by chrome9_pipe_check().
+	 */
+	if (crtc_state->enable && !cdev->kms_state->staging_scanout &&
+	    !chrome9_direct_flips && state->allow_modeset && old_plane_state &&
+	    old_plane_state->fb != plane_state->fb &&
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		crtc_state->mode_changed = true;
 	ret = drm_atomic_helper_check(drm, state);
 	if (ret || !crtc_state->enable)
 		return ret;
-	return chrome9_fixed_state_valid(cdev, plane_state, crtc_state) ? 0 :
+	return chrome9_state_valid(cdev, plane_state, crtc_state) ? 0 :
 		-EINVAL;
 }
 
@@ -929,6 +951,10 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	mutex_init(&kms->lock);
 	cdev->kms_state = kms;
 	kms->staging_scanout = staging_scanout;
+	ret = chrome9_vx900_display_selftest();
+	if (ret)
+		return dev_err_probe(&cdev->pdev->dev, ret,
+			"VX900 IGA1 mode builder failed the 1024x768 oracle\n");
 	if (fixed_iga1 && !staging_scanout && !chrome9_engine_ready(cdev))
 		return dev_err_probe(&cdev->pdev->dev, -ENODEV,
 			"direct IGA1 requires a ready SF engine\n");
@@ -981,33 +1007,34 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	if (fixed_iga1) {
 		if (!staging_scanout && chrome9_direct_flips)
 			dev_warn(&cdev->pdev->dev,
-				 "lab-only fixed IGA1 driving armed with direct SF scanout and experimental polled flips; no vblank IRQ support\n");
+				 "native IGA1 modesetting armed with direct SF scanout and experimental polled flips; no vblank IRQ support\n");
 		else
-			dev_warn(&cdev->pdev->dev,
-				 "lab-only fixed IGA1 driving armed with %s scanout; direct flips disabled\n",
+			dev_info(&cdev->pdev->dev,
+				 "native IGA1 modesetting armed with %s scanout; direct flips disabled\n",
 				 staging_scanout ? "BAR2 staging" : "direct SF");
 	}
 	return 0;
 }
 
-void chrome9_kms_fini(struct chrome9_device *cdev)
+int chrome9_kms_fini(struct chrome9_device *cdev)
 {
 	struct chrome9_kms_state *kms = cdev->kms_state;
 	struct drm_framebuffer *display_fb = NULL;
+	struct drm_framebuffer *retired_fb = NULL;
 	struct drm_framebuffer *blocked_fb = NULL;
 	struct drm_pending_vblank_event *blocked_event = NULL;
 	int ret;
 
 	if (!kms)
-		return;
+		return 0;
 	if (!READ_ONCE(kms->snapshot_valid))
-		return;
+		return 0;
 	ret = chrome9_engine_display_begin(cdev);
 	if (ret) {
 		if (kms->snapshot_valid)
 			dev_crit(&cdev->pdev->dev,
 				 "cannot serialize final IGA1 restore: %d\n", ret);
-		return;
+		return ret;
 	}
 	mutex_lock(&kms->lock);
 	if (!kms->snapshot_valid)
@@ -1022,6 +1049,8 @@ void chrome9_kms_fini(struct chrome9_device *cdev)
 	kms->iga1_enabled = false;
 	display_fb = kms->active_fb;
 	kms->active_fb = NULL;
+	retired_fb = kms->retired_fb;
+	kms->retired_fb = NULL;
 	blocked_fb = kms->blocked_fb;
 	kms->blocked_fb = NULL;
 	blocked_event = kms->blocked_event;
@@ -1036,9 +1065,14 @@ out_unlock:
 		chrome9_gem_fb_unpin(display_fb);
 		drm_framebuffer_put(display_fb);
 	}
+	if (retired_fb) {
+		chrome9_gem_fb_unpin(retired_fb);
+		drm_framebuffer_put(retired_fb);
+	}
 	if (blocked_fb) {
 		chrome9_gem_fb_unpin(blocked_fb);
 		drm_framebuffer_put(blocked_fb);
 	}
 	chrome9_pipe_send_event(&cdev->display_pipe, blocked_event);
+	return ret;
 }

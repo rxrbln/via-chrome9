@@ -121,6 +121,7 @@ struct chrome9_device {
 	struct mutex scanout_lock;
 	struct chrome9_kms_state *kms_state;
 	struct chrome9_engine *engine;
+	bool kms_shutdown;
 	struct drm_simple_display_pipe display_pipe;
 	struct drm_connector display_connector;
 };
@@ -148,7 +149,7 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 		     unsigned long scanout_offset,
 		     unsigned long scanout_size, bool fixed_iga1,
 		     bool staging_scanout);
-void chrome9_kms_fini(struct chrome9_device *cdev);
+int chrome9_kms_fini(struct chrome9_device *cdev);
 
 /* Live-verified H5S2VP1/H6 sequences shared with the fixed engine path. */
 void chrome9_init_2d_h6(struct chrome9_device *cdev);

@@ -5460,10 +5460,16 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	for (i = 0; i < ARRAY_SIZE(invalid); i++)
 		invalid[i] = CHROME9_GART_INVALID;
 	mutex_lock(&engine->submit_lock);
+	/* KMS must retire every persistent display pin before engine teardown. */
+	if (!list_empty(&engine->scanout_mappings)) {
+		dev_crit(&cdev->pdev->dev,
+			 "refusing engine teardown with live scanout mappings\n");
+		mutex_unlock(&engine->submit_lock);
+		return;
+	}
 	engine->stopping = true;
 	engine->ready = false;
-	if (engine->wedged || !list_empty(&engine->quarantine) ||
-	    !list_empty(&engine->scanout_mappings)) {
+	if (engine->wedged || !list_empty(&engine->quarantine)) {
 		chrome9_take_quarantine_hold(engine);
 		dev_crit(&cdev->pdev->dev,
 			 "refusing unsafe engine teardown with live/quarantined mappings; reboot required\n");

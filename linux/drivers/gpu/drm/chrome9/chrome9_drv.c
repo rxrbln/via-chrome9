@@ -16,9 +16,12 @@
 #include <asm/cacheflush.h>
 #endif
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_file.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_ioctl.h>
@@ -33,12 +36,12 @@
 static bool chrome9_enable;
 module_param_named(enable, chrome9_enable, bool, 0400);
 MODULE_PARM_DESC(enable,
-		 "Bind the experimental discovery/GEM-only driver (default: false)");
+		 "Bind the experimental Chrome9 DRM driver (default: false)");
 
 static bool chrome9_kms;
 module_param_named(kms, chrome9_kms, bool, 0400);
 MODULE_PARM_DESC(kms,
-		 "Expose the preparatory disconnected KMS skeleton (default: false)");
+		 "Expose the Chrome9 DRM/KMS device (default: false)");
 
 static unsigned long chrome9_scanout_offset = ULONG_MAX;
 module_param_named(scanout_offset, chrome9_scanout_offset, ulong, 0400);
@@ -53,7 +56,7 @@ MODULE_PARM_DESC(scanout_size,
 static bool chrome9_fixed_iga1;
 module_param_named(fixed_iga1, chrome9_fixed_iga1, bool, 0400);
 MODULE_PARM_DESC(fixed_iga1,
-		 "Drive the lab-only fixed 1024x768@60 IGA1 VGA mode");
+		 "Enable native VX900 IGA1 VGA modesetting (compatibility option name)");
 
 bool chrome9_two_texture_signed_repeat;
 module_param_named(two_texture_signed_repeat,
@@ -2476,6 +2479,7 @@ static const struct drm_driver chrome9_kms_drm_driver = {
 	.num_ioctls = ARRAY_SIZE(chrome9_ioctls),
 	.gem_prime_import = drm_gem_shmem_prime_import_no_map,
 	.dumb_create = chrome9_gem_dumb_create,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
 	.name = CHROME9_DRIVER_NAME,
 	.desc = CHROME9_DRIVER_DESC,
 	.major = 0,
@@ -2501,7 +2505,7 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	/*
 	 * vgaarb only serializes legacy-port accesses.  It does not stop vgacon
 	 * from rewriting the IGA1 timing and base after a KMS update, so take
-	 * exclusive display ownership before the first fixed-mode operation.
+	 * exclusive display ownership before the first IGA1 operation.
 	 * Keep render-only and disconnected staging probes non-destructive.
 	 */
 	if (chrome9_fixed_iga1) {
@@ -2574,17 +2578,20 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = drm_dev_register(&cdev->drm, 0);
 	if (ret) {
 		if (chrome9_kms)
-			chrome9_kms_fini(cdev);
+			(void)chrome9_kms_fini(cdev);
 		chrome9_engine_fini(cdev);
 		return ret;
 	}
 
 	pci_set_drvdata(pdev, &cdev->drm);
+	if (chrome9_fixed_iga1)
+		drm_client_setup_with_fourcc(&cdev->drm, DRM_FORMAT_XRGB8888);
 	dev_info(&pdev->dev, "VX900 revision %02x: shmem GEM%s%s\n",
 		 pdev->revision,
 		 chrome9_engine_ready(cdev) ? ", validated 3D engine ready" : "",
 		 chrome9_kms ? (chrome9_fixed_iga1 ?
-		 ", lab-only fixed IGA1 KMS" : ", disconnected KMS scaffold") : "");
+		 ", native IGA1 KMS with DRM fbdev" :
+		 ", disconnected KMS scaffold") : "");
 	return 0;
 }
 
@@ -2595,9 +2602,9 @@ static void chrome9_pci_remove(struct pci_dev *pdev)
 
 	if (!drm_dev_is_unplugged(drm))
 		drm_dev_unplug(drm);
-	if (chrome9_kms) {
+	if (chrome9_kms && !cdev->kms_shutdown) {
 		drm_atomic_helper_shutdown(drm);
-		chrome9_kms_fini(cdev);
+		(void)chrome9_kms_fini(cdev);
 	}
 	chrome9_engine_fini(cdev);
 }
@@ -2627,12 +2634,19 @@ static ssize_t engine_quiesce_store(struct device *dev,
 		return -ENODEV;
 	cdev = to_chrome9(drm);
 	mutex_lock(&chrome9_quiesce_lock);
-	if (!drm_dev_is_unplugged(drm))
-		drm_dev_unplug(drm);
 	if (atomic_read(&drm->open_count)) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
+	if (chrome9_kms && !cdev->kms_shutdown) {
+		drm_atomic_helper_shutdown(drm);
+		ret = chrome9_kms_fini(cdev);
+		if (ret)
+			goto out_unlock;
+		cdev->kms_shutdown = true;
+	}
+	if (!drm_dev_is_unplugged(drm))
+		drm_dev_unplug(drm);
 	chrome9_engine_fini(cdev);
 	ret = cdev->engine ? -EBUSY : count;
 
