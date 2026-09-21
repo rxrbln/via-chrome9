@@ -119,6 +119,11 @@ targets.
   to ONE, while keeping its statically derived bytes fail-closed.
 - [chrome9-dph-static-corpus.tsv](chrome9-dph-static-corpus.tsv) records the
   emitter masks/call sites and four mechanically derived v0/c0 candidates.
+- [chrome9-pixel-swz-static-audit.md](chrome9-pixel-swz-static-audit.md)
+  proves internal pixel SWZ is one record only for uniform lane signs and
+  expands mixed per-lane negate to two complementary-mask records.
+- [chrome9-pixel-swz-static.tsv](chrome9-pixel-swz-static.tsv) retains exact
+  Windows/Linux selector, append, loop, and return control-flow anchors.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
