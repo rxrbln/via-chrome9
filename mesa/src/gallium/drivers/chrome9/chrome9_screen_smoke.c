@@ -3069,7 +3069,7 @@ out:
 }
 
 static bool
-run_pipe_two_npot_textures(struct pipe_screen *screen)
+run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test)
 {
    const struct pipe_resource target_template = {
       .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -3084,6 +3084,11 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
         .width0 = 22, .height0 = 14, .depth0 = 1, .array_size = 1,
         .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR },
    };
+   const struct pipe_resource depth_template = {
+      .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_Z16_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
+   };
    static const unsigned sample_xy[4][2] = {
       { 16, 16 }, { 48, 16 }, { 16, 48 }, { 48, 48 },
    };
@@ -3097,6 +3102,7 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
       { {  1,  1, 0, 1 }, { 1, 1 }, { 1, 1 } },
    };
    struct pipe_resource *target = NULL, *textures[2] = { NULL, NULL };
+   struct pipe_resource *depth = NULL;
    struct pipe_context *context = NULL;
    struct pipe_sampler_view *views[2] = { NULL, NULL };
    struct pipe_sampler_view view_template;
@@ -3113,6 +3119,11 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
    };
    struct pipe_blend_state blend = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
+   struct pipe_depth_stencil_alpha_state less_dsa = {
+      .depth_enabled = true,
+      .depth_writemask = true,
+      .depth_func = PIPE_FUNC_LESS,
+   };
    struct pipe_rasterizer_state rasterizer = { 0 };
    struct pipe_vertex_element elements[3] = { 0 };
    struct pipe_vertex_buffer vertex_buffer = {
@@ -3132,9 +3143,10 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
    };
    const struct pipe_draw_start_count_bias draw = { .count = 4 };
    const union pipe_color_union clear = { 0 };
-   struct chrome9_resource *ctarget, *ctextures[2];
+   struct chrome9_resource *ctarget, *ctextures[2], *cdepth = NULL;
    struct chrome9_context *ccontext;
-   void *blend_handle = NULL, *dsa_handle = NULL, *rasterizer_handle = NULL;
+   void *blend_handle = NULL, *dsa_handle = NULL, *less_dsa_handle = NULL;
+   void *rasterizer_handle = NULL;
    void *elements_handle = NULL, *sampler_handles[2] = { NULL, NULL };
    void *vs = NULL, *fs = NULL;
    bool passed = false;
@@ -3142,11 +3154,16 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
    target = screen->resource_create(screen, &target_template);
    for (unsigned i = 0; i < 2; i++)
       textures[i] = screen->resource_create(screen, &texture_templates[i]);
+   if (depth_test)
+      depth = screen->resource_create(screen, &depth_template);
    context = screen->context_create(screen, NULL, 0);
-   if (!target || !textures[0] || !textures[1] || !context)
+   if (!target || !textures[0] || !textures[1] || !context ||
+       (depth_test && !depth))
       goto out;
    ctarget = chrome9_resource(target);
    ccontext = chrome9_context(context);
+   if (depth_test)
+      cdepth = chrome9_resource(depth);
    memset(ctarget->bo.map, 0x5a, ctarget->bo.size);
    for (unsigned unit = 0; unit < 2; unit++) {
       ctextures[unit] = chrome9_resource(textures[unit]);
@@ -3167,6 +3184,13 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
 
    blend.rt[0].colormask = PIPE_MASK_RGBA;
    blend_handle = context->create_blend_state(context, &blend);
+   if (depth_test) {
+      dsa.depth_enabled = true;
+      dsa.depth_writemask = true;
+      dsa.depth_func = PIPE_FUNC_LEQUAL;
+      less_dsa_handle =
+         context->create_depth_stencil_alpha_state(context, &less_dsa);
+   }
    dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
    rasterizer.half_pixel_center = true;
    rasterizer.bottom_edge_rule = true;
@@ -3194,12 +3218,17 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
    fs = make_two_texture_fragment_shader(screen, context);
    if (!blend_handle || !dsa_handle || !rasterizer_handle || !elements_handle ||
        !sampler_handles[0] || !sampler_handles[1] || !views[0] || !views[1] ||
+       (depth_test && !less_dsa_handle) ||
        !vs || !fs ||
        ((struct chrome9_shader *)fs)->fragment_program !=
           CHROME9_FS_TWO_TEXTURE_MODULATE)
       goto out;
 
    framebuffer.cbufs[0].texture = target;
+   if (depth_test) {
+      framebuffer.zsbuf.format = depth->format;
+      framebuffer.zsbuf.texture = depth;
+   }
    context->bind_blend_state(context, blend_handle);
    context->bind_depth_stencil_alpha_state(context, dsa_handle);
    context->bind_rasterizer_state(context, rasterizer_handle);
@@ -3213,8 +3242,11 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
    context->set_framebuffer_state(context, &framebuffer);
    context->set_viewport_states(context, 0, 1, &viewport);
    context->set_scissor_states(context, 0, 1, &scissor);
-   context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
-                  &clear, 1.0, 0);
+   context->clear(context,
+                  PIPE_CLEAR_COLOR0 |
+                  (depth_test ? PIPE_CLEAR_DEPTH : 0),
+                  PIPE_MASK_RGBA, 0xff, NULL, &clear,
+                  depth_test ? 0.5 : 1.0, 0);
    uint64_t submitted = ccontext->submitted_triangles;
    uint64_t rejected = ccontext->rejected_triangles;
    context->draw_vbo(context, &info, 0, NULL, &draw, 1);
@@ -3230,6 +3262,53 @@ run_pipe_two_npot_textures(struct pipe_screen *screen)
          if (abs((int)(pixel >> shift & 0xff) -
                  (int)(expected[i] >> shift & 0xff)) > 1)
             goto out;
+   }
+   if (depth_test) {
+      uint16_t *depth_pixels = (uint16_t *)((uint8_t *)cdepth->bo.map +
+                                            cdepth->data_offset);
+      const unsigned center = 32 * (ctarget->stride / 4) + 32;
+      const unsigned depth_center = 32 * (cdepth->stride / 2) + 32;
+      const uint32_t equal_pixel = pixels[center] & 0xffffff;
+      const uint16_t equal_depth = depth_pixels[depth_center];
+
+      for (unsigned y = 0; y < textures[1]->height0; y++)
+         for (unsigned x = 0; x < textures[1]->width0; x++)
+            source1[y * (ctextures[1]->stride / 4) + x] = 0x00404040;
+      context->bind_depth_stencil_alpha_state(context, less_dsa_handle);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      if ((pixels[center] & 0xffffff) != equal_pixel ||
+          depth_pixels[depth_center] != equal_depth)
+         goto out;
+
+      for (unsigned i = 0; i < ARRAY_SIZE(vertices); i++)
+         vertices[i].position[2] = -0.5f;
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      for (unsigned i = 0; i < ARRAY_SIZE(sample_xy); i++) {
+         uint32_t pixel =
+            pixels[sample_xy[i][1] * (ctarget->stride / 4) + sample_xy[i][0]] &
+            0xffffff;
+         uint32_t near_expected = expected[i] >> 1;
+
+         for (unsigned shift = 0; shift <= 16; shift += 8)
+            if (abs((int)(pixel >> shift & 0xff) -
+                    (int)(near_expected >> shift & 0xff)) > 1)
+               goto out;
+      }
+      if (equal_depth < 0x7ffe || equal_depth > 0x8001 ||
+          depth_pixels[depth_center] < 0x3ffe ||
+          depth_pixels[depth_center] > 0x4001 ||
+          ccontext->submitted_triangles != submitted + 6 ||
+          ccontext->rejected_triangles != rejected ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(ctextures[0]) ||
+          !smoke_guard_pages_match(ctextures[1]) ||
+          !smoke_guard_pages_match(cdepth))
+         goto out;
+      puts("Gallium two-unit NPOT MODULATE D16 LEQUAL/LESS passed");
+      passed = true;
+      goto out;
    }
    for (unsigned y = 0; y < textures[0]->height0; y++) {
       for (unsigned x = 0; x < textures[0]->width0; x++) {
@@ -3269,12 +3348,15 @@ out:
          context->delete_rasterizer_state(context, rasterizer_handle);
       if (dsa_handle)
          context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (less_dsa_handle)
+         context->delete_depth_stencil_alpha_state(context, less_dsa_handle);
       if (blend_handle)
          context->delete_blend_state(context, blend_handle);
       context->destroy(context);
    }
    for (unsigned i = 0; i < 2; i++)
       if (textures[i]) screen->resource_destroy(screen, textures[i]);
+   if (depth) screen->resource_destroy(screen, depth);
    if (target) screen->resource_destroy(screen, target);
    return passed;
 }
@@ -3625,8 +3707,16 @@ main(int argc, char **argv)
          return 1;
       }
       if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers >= 2 &&
-          !run_pipe_two_npot_textures(screen)) {
+          !run_pipe_two_npot_textures(screen, false)) {
          fputs("Chrome9 Gallium two-unit NPOT texture draw failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16) &&
+          !run_pipe_two_npot_textures(screen, true)) {
+         fputs("Chrome9 Gallium two-unit textured D16 draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;
