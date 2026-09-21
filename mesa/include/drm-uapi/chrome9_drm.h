@@ -20,6 +20,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_BLEND	0x08
 #define DRM_CHROME9_DRAW_TRIANGLE_BATCH	0x09
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE	0x0a
+#define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16	0x0b
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -54,6 +55,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE, \
 		struct drm_chrome9_draw_two_textured_triangle)
+#define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_D16 \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16, \
+		struct drm_chrome9_draw_textured_triangle_d16)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -95,6 +99,12 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE	(1ULL << 14)
 /* D16 draw flags can select a validated depth comparison function. */
 #define DRM_CHROME9_CAP_DEPTH_FUNC	(1ULL << 15)
+/* One level-zero texture can be combined with linear D16 test/write. */
+#define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16	(1ULL << 16)
+/* Textured D16 draws can retain alpha in an A8R8G8B8 destination. */
+#define DRM_CHROME9_CAP_TEXTURED_D16_BGRA8888	(1ULL << 17)
+/* Textured D16 draws can use one canonical source-over blend equation. */
+#define DRM_CHROME9_CAP_TEXTURED_D16_SOURCE_OVER	(1ULL << 18)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -292,6 +302,40 @@ struct drm_chrome9_draw_textured_triangle {
 	struct drm_chrome9_scissor_state scissor;
 	__u32 reserved;
 };
+
+/*
+ * Draw one single-textured triangle with linear D16 test/write.  This
+ * successor is deliberately narrow: X8R8G8B8 or A8R8G8B8 destination, one
+ * level-zero 32-bit texture, optional canonical source-over, no alpha test,
+ * and an explicit LESS or LEQUAL comparison in flags.  All three BOs are
+ * distinct native guarded shmem objects.  The depth pitch is
+ * ALIGN(width * 2, 32).
+ */
+struct drm_chrome9_draw_textured_triangle_d16 {
+	__u32 destination_handle;
+	__u32 texture_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 program;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 texture_width;
+	__u32 texture_height;
+	__u32 texture_pitch;
+	__u32 texture_format;
+	__u32 min_filter;
+	__u32 mag_filter;
+	__u32 wrap_s;
+	__u32 wrap_t;
+	struct drm_chrome9_textured_vertex vertices[3];
+	struct drm_chrome9_scissor_state scissor;
+	__u32 destination_format;
+	__u32 reserved[3];
+};
+
+#define DRM_CHROME9_TEXTURED_D16_SOURCE_OVER	(1U << 0)
 
 #define DRM_CHROME9_BLEND_ENABLE		(1U << 0)
 #define DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE	(1U << 1)
