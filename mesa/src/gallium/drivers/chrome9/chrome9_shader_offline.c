@@ -212,6 +212,12 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
    static const uint32_t tex1[4] = {
       0x0008814c, 0x00000000, 0x00000000, 0x00080293
    };
+   static const uint32_t tex0_v2[4] = {
+      0x0008814c, 0x00000000, 0x00000000, 0x00080283
+   };
+   static const uint32_t tex1_v3[4] = {
+      0x0008c14c, 0x00000000, 0x00000000, 0x00080293
+   };
    static const uint32_t mvp[4][4] = {
       { 0x0008014c, 0x0040014c, 0x00000000, 0x00060801 },
       { 0x0008014c, 0x0040414c, 0x00000000, 0x00060802 },
@@ -220,7 +226,7 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
    };
    unsigned i;
 
-   if (!p || (unsigned)key > CHROME9_VS_MVP_COLOR_TEX0_XY)
+   if (!p || (unsigned)key > CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY)
       return false;
    memset(p, 0, sizeof(*p));
 
@@ -245,10 +251,17 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
          p->a62_low = 6;
       } else if (key == CHROME9_VS_MVP_COLOR_TEX0_XY) {
          append_vs(p, color);
-         append_vs(p, tex0);
+         append_vs(p, tex0_v2);
          p->output_metadata = 0x00000144;
          p->input_mask |= 0x0006;
          p->a62_low = 6;
+      } else if (key == CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY) {
+         append_vs(p, color);
+         append_vs(p, tex0_v2);
+         append_vs(p, tex1_v3);
+         p->output_metadata = 0x00000244;
+         p->input_mask |= 0x000e;
+         p->a62_low = 7;
       }
    } else {
       append_vs(p, pos);
@@ -276,6 +289,7 @@ chrome9_compile_vs_offline(enum chrome9_vs_key key,
    case 0x00000104: p->a25 = 0x25f0c000; break;
    case 0x00000204: p->a25 = 0x25f0cc00; break;
    case 0x00000144: p->a25 = 0x25f4c000; break;
+   case 0x00000244: p->a25 = 0x25f4cc00; break;
    default: return false;
    }
    p->a26 = 0x26000000;

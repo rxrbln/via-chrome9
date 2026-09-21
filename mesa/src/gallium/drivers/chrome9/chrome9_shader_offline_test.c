@@ -141,6 +141,16 @@ check_vs(void)
       { 0x0008414c, 0x00000000, 0x00000000, 0x00080283 },
       { 0x0008814c, 0x00000000, 0x00000000, 0x00080293 },
    };
+   static const uint32_t mvp_color_tex2[8][4] = {
+      { 0x0008014c, 0x0040014c, 0x00000000, 0x00060801 },
+      { 0x0008014c, 0x0040414c, 0x00000000, 0x00060802 },
+      { 0x0008014c, 0x0040814c, 0x00000000, 0x00060804 },
+      { 0x0008014c, 0x0040c14c, 0x0000014c, 0x0034010f },
+      { 0x0010014c, 0x00000000, 0x00000000, 0x00080a0f },
+      { 0x0008414c, 0x00000000, 0x00000000, 0x0008422f },
+      { 0x0008814c, 0x00000000, 0x00000000, 0x00080283 },
+      { 0x0008c14c, 0x00000000, 0x00000000, 0x00080293 },
+   };
    struct chrome9_vs_program p;
 
    assert(chrome9_compile_vs_offline(CHROME9_VS_POSITION, &p));
@@ -180,7 +190,16 @@ check_vs(void)
    assert(p.a25 == 0x25f4c000 && p.a60 == 0x60800009);
    assert(p.constant_mask[0] == 0x0f && p.input_mask == 0x07);
    assert(p.instruction[3][1] == 0x0040c14c);
+   assert(p.instruction[6][0] == 0x0008814c);
    assert(p.instruction[6][3] == 0x00080283);
+
+   assert(chrome9_compile_vs_offline(
+             CHROME9_VS_MVP_COLOR_TEX0_TEX1_XY, &p));
+   assert(p.upload_count == 13 && p.active_count == 11);
+   assert(p.output_metadata == 0x00000244 && p.a62_low == 7);
+   assert(p.a25 == 0x25f4cc00 && p.a60 == 0x6080000a);
+   assert(p.constant_mask[0] == 0x0f && p.input_mask == 0x0f);
+   assert(!memcmp(p.instruction, mvp_color_tex2, sizeof(mvp_color_tex2)));
    assert(!chrome9_compile_vs_offline((enum chrome9_vs_key)-1, &p));
 }
 
@@ -189,6 +208,6 @@ main(void)
 {
    check_fs();
    check_vs();
-   puts("Chrome9 offline shader corpus: 15 PS + 7 VS templates passed");
+   puts("Chrome9 offline shader corpus: 15 PS + 8 VS templates passed");
    return 0;
 }
