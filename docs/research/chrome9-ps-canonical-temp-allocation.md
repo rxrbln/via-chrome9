@@ -154,6 +154,21 @@ with SHA-256
 This mirrors Linux `stmPPSValidatePS20_invi`'s exact collect, `(8,12)` table
 setup, and configured-callback order.
 
+The H5 remap callbacks are independently exact as well:
+
+| binary | installed at | callback VA / RVA / file offset | size |
+|---|---:|---|---:|
+| D3D | `101ddaf4` (`manager+0x139c`) | `1020ef50` / `0020ef50` / `0020e350` | `0x52` |
+| OpenGL | `10246294` (`manager+0x139c`) | `1026f120` / `0026f120` / `0026e520` | `0x52` |
+
+The callback bodies are byte-for-byte identical, SHA-256
+`2cbd216052542684c389c2b0c41c9894a36def7ed95d4937ca8bb4ac7991fc74`.
+For requested id below `manager+0x1360` (12 on H5), they search the dense
+`+0x1288` table and return its index; absence returns `ffffffff`.  Requested
+ids 12 through 31 return unchanged, and ids at least 32 go through the table
+search.  Therefore the initial ordinary-TEMP validator must require ids below
+12 before compaction and must not use the direct special-id branch.
+
 ## Patch-ready rule for the bounded structured compiler
 
 For the proposed at-most-three-record MOV/MUL path, the safest policy is:
