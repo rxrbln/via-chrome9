@@ -181,13 +181,15 @@ so the concrete non-colliding definition is:
 
 ```text
 DRM_CHROME9_DEPTH_READ_ONLY = 1U << 11
-DRM_CHROME9_CAP_DEPTH_READ_ONLY = 1ULL << 21   # next free cap at this snapshot
+DRM_CHROME9_CAP_DEPTH_READ_ONLY = 1ULL << 23
 ```
 
-Allocate a different capability bit if another merge consumes 21 first; the
-request flag bit must remain 11 once published.  Capability absence keeps the
-existing unknown-bit rejection and guarantees old kernels fail with EINVAL
-rather than execute a write-enabled approximation.
+Capability bit 23 is reserved in the canonical
+[UAPI allocation ledger](chrome9-uapi-allocation.md); bits 21 and 22 belong to
+the mip and RHW-run successors.  The request flag bit remains 11 once
+published.  Capability absence keeps the existing unknown-bit rejection and
+guarantees old kernels fail with EINVAL rather than execute a write-enabled
+approximation.
 
 One helper should derive the A01 word so emission and assertions cannot
 diverge:

@@ -20,13 +20,15 @@ without reinterpreting reserved fields after the clip-space path is proven.
 
 ## Proposed UAPI
 
-The next free command number is currently `0x0b` and the next capability bit
-is 15.  Reserve them only when implementing this ABI; do not advertise the
-capability until the guarded draw gates below have passed on the device.
+The canonical [UAPI allocation ledger](chrome9-uapi-allocation.md) reserves
+command `0x10` and capability bit 24 for this proposal.  Earlier values
+`0x0b`/15 are now occupied by textured D16 and depth-function support.  Do
+not advertise the clip capability until the guarded draw gates below have
+passed on the device.
 
 ```c
-#define DRM_CHROME9_DRAW_CLIP_TRIANGLE 0x0b
-#define DRM_CHROME9_CAP_DRAW_CLIP_TRIANGLE (1ULL << 15)
+#define DRM_CHROME9_DRAW_CLIP_TRIANGLE 0x10
+#define DRM_CHROME9_CAP_DRAW_CLIP_TRIANGLE (1ULL << 24)
 
 #define DRM_CHROME9_CLIP_OP_VALIDATE          0
 #define DRM_CHROME9_CLIP_OP_PROBE_PROGRAM     1

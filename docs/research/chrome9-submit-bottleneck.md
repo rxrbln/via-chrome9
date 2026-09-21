@@ -274,7 +274,8 @@ batching is proven would add avoidable front-end risk.
 
 The safest concrete aggregation change is a new capability and ioctl, leaving
 the proven `0x4c` ABI untouched.  Initially accept at most eight current
-segments:
+segments.  The field-, lifetime-, failure-, and test-exact implementation is
+specified in [d16-rhw-run-ioctl-design.md](d16-rhw-run-ioctl-design.md):
 
 ```text
 maximum triangles       8 * 34 = 272

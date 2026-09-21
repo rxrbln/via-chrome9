@@ -49,8 +49,10 @@ accepts only the already-converted signed s5.5 integer.
 
 ## New UAPI, not reinterpretation of an old field
 
-At the current header snapshot, ioctl command `0x0e` and capability bit 21
-are the next unused values:
+The canonical allocation ledger reserves ioctl command `0x0e` and capability
+bit 21 for this successor.  See
+[chrome9-uapi-allocation.md](chrome9-uapi-allocation.md); later proposals must
+not reuse them:
 
 ```c
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_MIP       0x0e
@@ -93,9 +95,7 @@ struct drm_chrome9_draw_textured_triangle_mip {
 
 The structure is exactly 192 bytes with no architecture-dependent pointer or
 padding.  Add a compile-time size assertion.  The new command number itself
-versions the ABI; no old `pad` or `reserved` member changes meaning.  If an
-intervening UAPI consumes command `0x0e` or capability bit 21, reassign both
-before implementation rather than creating an alias.
+versions the ABI; no old `pad` or `reserved` member changes meaning.
 
 The first capability does not expose arbitrary minimum/maximum levels.
 Minimum is zero and maximum is exactly one.  A later view-range successor can

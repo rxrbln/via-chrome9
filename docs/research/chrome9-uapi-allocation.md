@@ -1,0 +1,77 @@
+# Chrome9 private UAPI allocation ledger
+
+This is the canonical command-number and capability-bit ledger for the
+bring-up driver.  The two namespaces are independent: a feature can consume a
+capability without adding an ioctl, and several semantic capabilities can
+describe one ioctl.  Update this table in the same commit that reserves a new
+number; design notes must link here rather than independently claiming the
+"next free" value.
+
+## Ioctl command numbers
+
+| command | state | public name |
+|---:|---|---|
+| `00` | merged | `GET_PARAM` |
+| `01` | merged | `GEM_CREATE` |
+| `02` | merged | `FIXED_QUAD` |
+| `03` | merged | `DRAW_TRIANGLE` |
+| `04` | merged | `DRAW_TRIANGLE_D16` |
+| `05` | merged | `DRAW_TEXTURED_TRIANGLE` |
+| `06` | merged | `DRAW_TRIANGLE_BLEND` |
+| `07` | merged | `DRAW_TEXTURED_TRIANGLE_BLEND` |
+| `08` | merged | `DRAW_TRIANGLE_D16_BLEND` |
+| `09` | merged | `DRAW_TRIANGLE_BATCH` |
+| `0a` | merged | `DRAW_TWO_TEXTURED_TRIANGLE` |
+| `0b` | merged | `DRAW_TEXTURED_TRIANGLE_D16` |
+| `0c` | merged | `DRAW_TRIANGLE_D16_RHW_BATCH` |
+| `0d` | merged | `DRAW_TWO_TEXTURED_TRIANGLE_D16` |
+| `0e` | reserved | `DRAW_TEXTURED_TRIANGLE_MIP` |
+| `0f` | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
+| `10` | reserved | `DRAW_CLIP_TRIANGLE` |
+
+The next unreserved command is `0x11`.  A reservation is not an advertised
+ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
+userspace must still require the associated capability.
+
+On x86, the proposed 128-byte RHW-run request at private command `0x0f` has
+ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
+`DRM_COMMAND_BASE + 0x0f = 0x4f`, and payload size `0x80`.
+
+## Capability bits
+
+| bit | state | public name |
+|---:|---|---|
+| 0 | merged | `GEM` |
+| 1 | historical, not advertised | `GEM_DMA` |
+| 2 | merged | `GEM_SHMEM_CACHED` |
+| 3 | merged | `FIXED_QUAD` |
+| 4 | merged | `DRAW_TRIANGLE` |
+| 5 | merged | `DRAW_TRIANGLE_D16` |
+| 6 | merged | `DRAW_TEXTURED_TRIANGLE` |
+| 7 | merged | `DRAW_TRIANGLE_BLEND` |
+| 8 | merged | `DRAW_TEXTURED_TRIANGLE_BLEND` |
+| 9 | merged | `BLEND_BGRA8888` |
+| 10 | merged | `ALPHA_TEST` |
+| 11 | merged | `SCISSOR` |
+| 12 | merged | `DRAW_TRIANGLE_D16_BLEND` |
+| 13 | merged | `DRAW_TRIANGLE_BATCH` |
+| 14 | merged | `DRAW_TWO_TEXTURED_TRIANGLE` |
+| 15 | merged | `DEPTH_FUNC` |
+| 16 | merged | `DRAW_TEXTURED_TRIANGLE_D16` |
+| 17 | merged | `TEXTURED_D16_BGRA8888` |
+| 18 | merged | `TEXTURED_D16_SOURCE_OVER` |
+| 19 | merged | `DRAW_TRIANGLE_D16_RHW_BATCH` |
+| 20 | merged | `DRAW_TWO_TEXTURED_TRIANGLE_D16` |
+| 21 | reserved | `DRAW_TEXTURED_TRIANGLE_MIP` |
+| 22 | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
+| 23 | reserved | `DEPTH_READ_ONLY` |
+| 24 | reserved | `DRAW_CLIP_TRIANGLE` |
+
+The next unreserved capability bit is 25.  `DEPTH_READ_ONLY` deliberately has
+no command allocation: it adds request flag bit 11 to existing structured D16
+successors only when capability bit 23 is present.
+
+The merged boundary in this table is kernel Chrome9 commit
+`f39a90d6a16b16066dfbd53ee1674f9336d12069` and kernel UAPI commit
+`b623464ba08e02e39475e8cd67ccc31eeb75a67e`.  The reservations describe
+reviewed designs, not code present in those commits.

@@ -111,6 +111,13 @@ targets.
 - [chrome9-submit-bottleneck.md](chrome9-submit-bottleneck.md) accounts for
   the synchronous batch path's exact PTE, cache-ownership, guard-readback and
   retirement costs, and orders the fail-closed performance work.
+- [chrome9-uapi-allocation.md](chrome9-uapi-allocation.md) is the canonical
+  private command-number and capability-bit ledger for merged and reserved
+  structured ABIs.
+- [d16-rhw-run-ioctl-design.md](d16-rhw-run-ioctl-design.md) specifies the
+  bounded eight-segment D16/RHW run, including checked UAPI bounds, one-fence
+  resource lifetime, per-segment cookies, quarantine rules, Mesa integration,
+  and no-wedge gates.
 - [vx900-kms-next-oracles.md](vx900-kms-next-oracles.md) defines the exact
   primary ARGB cursor, scanout format/pitch limits, conservative IGA2 bring-up,
   DDC/hotplug, DPMS, and VX900 pixel-PLL sequences and restore rules.
