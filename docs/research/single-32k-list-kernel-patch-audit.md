@@ -316,8 +316,9 @@ sized-finisher refactor; their complete copied byte ranges must be identical.
 
 ## Live oracle update
 
-Extend the standalone batch tool with a distinct command-`0x0f` mode; do not
-make the old command silently use the new maximum.  Generate a 17-by-16 grid
+[`../../tools/chrome9_rhw_run.c`](../../tools/chrome9_rhw_run.c) is the
+standalone command-`0x0f` oracle; it does not make the old batch tool silently
+use the new maximum.  It generates a 17-by-16 grid
 of 272 nonoverlapping right triangles, each with a deterministic per-index
 color, Z=0.5, RHW=1.0, and alternating far/near D16 prefill cells.  Sample one
 interior pixel per triangle, an uncovered pixel, all four guard pages, and

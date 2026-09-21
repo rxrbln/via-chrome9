@@ -26,7 +26,7 @@ number; design notes must link here rather than independently claiming the
 | `0c` | merged | `DRAW_TRIANGLE_D16_RHW_BATCH` |
 | `0d` | merged | `DRAW_TWO_TEXTURED_TRIANGLE_D16` |
 | `0e` | reserved | `DRAW_TEXTURED_TRIANGLE_MIP` |
-| `0f` | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
+| `0f` | implemented, live-proven | `DRAW_TRIANGLE_D16_RHW_RUN` |
 | `10` | reserved | `DRAW_CLIP_TRIANGLE` |
 | `11` | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
 | `12` | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
@@ -45,6 +45,13 @@ userspace must still require the associated capability.
 On x86, the proposed 128-byte RHW-run request at private command `0x0f` has
 ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 `DRM_COMMAND_BASE + 0x0f = 0x4f`, and payload size `0x80`.
+
+Command `0x0f` has a complete render-node handler, a separate 32-KiB CPU-only
+staging allocation, and the audited one-list 272-triangle builder.  On VX900
+it passed counts 1/34/35/64/128/272, rejected 273, verified alternating D16
+cells and all guards, survived four consecutive maximum lists and ring wrap,
+then passed the full legacy/cmd19 smoke.  Capability bit 22 is therefore
+advertised; Mesa keeps the old 34-triangle fallback for older kernels.
 
 ## Capability bits
 
@@ -72,7 +79,7 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 19 | merged | `DRAW_TRIANGLE_D16_RHW_BATCH` |
 | 20 | merged | `DRAW_TWO_TEXTURED_TRIANGLE_D16` |
 | 21 | reserved | `DRAW_TEXTURED_TRIANGLE_MIP` |
-| 22 | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
+| 22 | implemented, live-proven | `DRAW_TRIANGLE_D16_RHW_RUN` |
 | 23 | merged | `DEPTH_READ_ONLY` |
 | 24 | reserved | `DRAW_CLIP_TRIANGLE` |
 | 25 | reserved | `TWO_TEXTURE_PRIMARY_MODULATE` |
