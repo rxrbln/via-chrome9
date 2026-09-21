@@ -2625,9 +2625,12 @@ main(int argc, char **argv)
    struct chrome9_resource *surface;
    struct chrome9_resource *shared_surface;
    struct pipe_resource *shared_resource;
+   struct pipe_resource *offset_source = NULL;
+   struct pipe_resource *offset_resource = NULL;
    struct pipe_resource *depth_resource = NULL;
    struct winsys_handle whandle = { .type = WINSYS_HANDLE_TYPE_FD };
    struct winsys_handle kms_handle = { .type = WINSYS_HANDLE_TYPE_KMS };
+   struct winsys_handle offset_handle = { .type = WINSYS_HANDLE_TYPE_FD };
    struct pipe_screen *screen;
    uint32_t *pixels;
    long page_size;
@@ -2778,6 +2781,16 @@ main(int argc, char **argv)
       return 1;
    }
    shared_surface = chrome9_resource(shared_resource);
+   if (!shared_surface->guarded ||
+       shared_surface->stride != surface->stride ||
+       shared_surface->data_offset != surface->data_offset ||
+       shared_surface->bo.size != surface->bo.size) {
+      fputs("canonical Chrome9 PRIME import lost guarded layout\n", stderr);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
    ((uint32_t *)((uint8_t *)shared_surface->bo.map +
                  shared_surface->data_offset))[1] = 0x0055aa77;
    if (pixels[1] != 0x0055aa77) {
@@ -2787,6 +2800,36 @@ main(int argc, char **argv)
       screen->destroy(screen);
       return 1;
    }
+   offset_source = screen->resource_create(screen, &surface_templ);
+   if (!offset_source ||
+       !screen->resource_get_handle(
+          screen, NULL, offset_source, &offset_handle,
+          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE)) {
+      fputs("noncanonical PRIME import setup failed\n", stderr);
+      if (offset_source)
+         screen->resource_destroy(screen, offset_source);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   offset_handle.offset = 0;
+   offset_resource = screen->resource_from_handle(
+      screen, &surface_templ, &offset_handle,
+      PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   close(offset_handle.handle);
+   if (!offset_resource || chrome9_resource(offset_resource)->guarded) {
+      fputs("noncanonical offset PRIME import treated as guarded\n", stderr);
+      if (offset_resource)
+         screen->resource_destroy(screen, offset_resource);
+      screen->resource_destroy(screen, offset_source);
+      screen->resource_destroy(screen, shared_resource);
+      screen->resource_destroy(screen, resource);
+      screen->destroy(screen);
+      return 1;
+   }
+   screen->resource_destroy(screen, offset_resource);
+   screen->resource_destroy(screen, offset_source);
    if (!run_pipe_triangle(screen, shared_resource, NULL)) {
       fputs("Chrome9 imported-shadow Gallium triangle failed\n", stderr);
       screen->resource_destroy(screen, shared_resource);

@@ -352,13 +352,24 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
-   resource->stride = whandle->stride;
-   resource->data_offset = whandle->offset;
-   resource->data_size = data_size;
-   resource->level_stride[0] = resource->stride;
-   resource->level_offset[0] = resource->data_offset;
-   resource->level_size[0] = resource->data_size;
-   resource->guarded = false;
+   /* A native Chrome9 DRI3 export retains the complete canonical guarded
+    * allocation.  Preserve that fact after same-device PRIME import so the
+    * consumer can submit the BO directly and share its reservation object;
+    * this avoids a stale userspace sampler copy.  Every tuple which is not
+    * exact remains an ordinary unguarded external resource. */
+   if (whandle->stride == layout.level_stride[0] &&
+       whandle->offset == layout.level_offset[0] &&
+       resource->bo.size == layout.allocation_size) {
+      chrome9_resource_apply_layout(resource, &layout);
+   } else {
+      resource->stride = whandle->stride;
+      resource->data_offset = whandle->offset;
+      resource->data_size = data_size;
+      resource->level_stride[0] = resource->stride;
+      resource->level_offset[0] = resource->data_offset;
+      resource->level_size[0] = resource->data_size;
+      resource->guarded = false;
+   }
    return &resource->base;
 
 fail_bo:
