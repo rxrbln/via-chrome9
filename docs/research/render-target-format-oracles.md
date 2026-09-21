@@ -57,6 +57,38 @@ An X format supplies 1.0 when the destination alpha value is read by blending;
 it is not a stored-alpha target.  Use `99` or `b9` when alpha writes,
 destination-alpha factors, or later sampling of stored alpha must be real.
 
+### Additional executable render-target formats
+
+The complete RT-only lookup exposes the following additional mappings.  They
+are cross-checked between Windows `0x1020a4c0..0x1020a57d` and proprietary
+Linux `stmLookupRenderTargetFormat_invi:0x1a6c20..0x1a6d53`; the D3D names are
+also fixed by Windows' public-format conversion at
+`0x100c7590..0x100c7965`.
+
+| A52 byte | private format | D3D9 format | hardware packing | tentative Gallium format | status |
+|---:|---:|---|---|---|---|
+| `88` | `1017`/`101a` | `X1R5G5B5` for `101a` | RGB555, implicit alpha 1 | `B5G5R5X1_UNORM` | static |
+| `89` | `1018` | `R5G6B5` | RGB565 | `B5G6R5_UNORM` | static |
+| `8a` | `1019` | `A1R5G5B5` | ARGB1555 | `B5G5R5A1_UNORM` | static |
+| `8b` | `101b` | `A4R4G4B4` | ARGB4444 | `B4G4R4A4_UNORM` | static |
+| `9a` | `203a` | `A2R10G10B10` | ARGB2:10:10:10 | `B10G10R10A2_UNORM` | static |
+| `ba` | `203b` | `A2B10G10R10` | ABGR2:10:10:10 | `R10G10B10A2_UNORM` | static |
+| `bb` | `203c` | `G16R16` | two unsigned 16-bit channels | `R16G16_UNORM` | static |
+| `15` | `1029` | `A8L8` | AL88 | legacy luminance-alpha | static |
+| `16` | `1028` | none in the color path | L16 | `L16_UNORM`/`R16_UNORM` view requires proof | static |
+| `f0` | `102c` | `R16F` | R16F | `R16_FLOAT` | static |
+| `f4` | `203d` | `G16R16F` | two 16-bit float channels | component order requires proof | static |
+| `f5` | `203e` | `R32F` | R32F | `R32_FLOAT` | static |
+
+These are format-decoder facts, not capability claims.  In particular the
+manual requires post-rendering to be disabled for `L16`, `G16R16`, and every
+floating-color format.  The exact post-render-disable state and float blend,
+mask, clear, and readback behavior have not been recovered live.  Keep them
+rejected until that state is closed.  The four 16-bit normalized RGB(A)
+formats are the safest next extension because they retain the ordinary UNORM
+post-render path; validate channel order, alpha fill/storage, pitch, and guard
+extent one format at a time.
+
 The manual also describes `d8/d9` (RGBA8880/8888) and `e8/e9`
 (BGRA8880/8888).  Neither proprietary RT lookup below exposes them, and the
 Xorg table does not contain them.  They must not be inferred from the manual
