@@ -93,9 +93,10 @@ Validation should happen before BO lookup, vertex copying, or ring mutation:
 8. Count all reads first, then assign release bits on the last read in a
    second pass. For the present A/C operand set, if both slots make the last
    read of the same temporary, set A only. This is the vendor A-over-C rule.
-9. Require all four c0 words finite if any instruction reads c0. Require all
-   four words zero otherwise. Retain the existing destination/depth/vertex,
-   blend, and scissor checks unchanged.
+9. If any instruction reads c0, require every lane's sign-cleared IEEE word
+   to be at most `0x3f800000` (`abs(c0) <= 1.0`). Require all four words zero
+   otherwise. Retain the existing destination/depth/vertex, blend, and
+   scissor checks unchanged.
 10. Rebuild every native word in kernel memory. Never accept A90--A9b,
     destination bits, source file numbers, temporary-release bits, or a native
     instruction blob from userspace.
@@ -149,6 +150,25 @@ multi-record builder.
 
 The c0 H2 store stays four dwords and byte-identical to command 19. Keeping
 that store unchanged is a safety property of this first successor.
+
+### Why finite-only c0 is unsafe here
+
+Command 19's single `v0*c0` cannot overflow when normalized v0 is in `[0,1]`
+and c0 is finite. That argument does not extend to an arbitrary three-record
+DAG. For example:
+
+```text
+r0  = c0*c0
+r1  = r0*r0
+oC0 = r1*r1
+```
+
+forms `c0^8`, which can overflow even though every input c0 lane is finite.
+The fixed `abs(c0)<=1` bound makes every MOV/MUL intermediate finite with
+magnitude at most one for every accepted topology because D3DColor v0 is
+normalized. This also admits signed zero and finite subnormals. A wider bound
+requires kernel-side interval/exponent propagation and a separate numerical
+gate; do not infer it merely from command 19's finite check.
 
 ## Golden encoder rows
 
@@ -219,9 +239,11 @@ timeout quarantine:
    r0-before-r1 rule on compiler output.
 4. The branch row checks simultaneous A/C release without a wedge.
 5. A duplicate-temp row checks A-over-C release precedence.
-6. Negative ioctls cover count 0/4, early COLOR, final TEMP, undefined/dead
-   temps, WAW, nonidentity swizzle, nonzero modifier/reserved, NaN/Inf c0, and
-   a nonzero unused c0.
+6. A `c0*c0; square; square` negative ioctl with any lane just above 1.0
+   checks that finite-but-unsafe constants fail before publication.
+7. Other negative ioctls cover count 0/4, early COLOR, final TEMP,
+   undefined/dead temps, WAW, nonidentity swizzle, nonzero modifier/reserved,
+   NaN/Inf c0, and a nonzero unused c0.
 
 Each positive oracle must verify exact pixels, untouched outside pixels,
 color/depth guards, cookie retirement, 0400/040c idle state, and a clean
