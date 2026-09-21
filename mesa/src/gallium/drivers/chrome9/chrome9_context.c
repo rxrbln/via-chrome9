@@ -2541,8 +2541,9 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
  * Lower the canonical NIR output expression to the first native backend IR.
  * Unlike the compatibility program classifier, this follows the output DAG
  * and derives opcode and operands directly.  The bounded initial scheduler
- * accepts one full-vector MOV or FMUL; later ISA work extends this same IR
- * rather than adding more application-shaped program enums.
+ * accepts a straight-line DAG of up to three full-vector MOV or FMUL ALUs and
+ * two temporaries; later ISA work extends this same IR rather than adding more
+ * application-shaped program enums.
  */
 static bool
 chrome9_fs_key_from_nir(nir_shader *nir, struct chrome9_fs_key *key)
