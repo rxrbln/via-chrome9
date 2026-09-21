@@ -174,6 +174,26 @@ smoke_copy_rect(struct pipe_screen *screen)
          goto out;
       }
    if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_COPY_RECT_PRESERVE_ALPHA)) {
+      for (unsigned i = 0; i < 32 * 32; i++)
+         destination_pixels[i] = 0x44000000 | (i & 0x00ffffff);
+      copy.flags = DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA;
+      if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+         goto out;
+      for (unsigned i = 0; i < 32 * 32; i++) {
+         uint32_t expected = 0x44000000 |
+                             (source_pixels[i] & 0x00ffffff);
+
+         if (destination_pixels[i] != expected) {
+            fprintf(stderr,
+                    "copy preserve-alpha mismatch pixel=%u got=%08x "
+                    "expected=%08x source=%08x\n", i,
+                    destination_pixels[i], expected, source_pixels[i]);
+            goto out;
+         }
+      }
+   }
+   if (chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION)) {
       struct pipe_resource external_templ = templ;
       uint32_t *unguarded_pixels;
@@ -199,6 +219,23 @@ smoke_copy_rect(struct pipe_screen *screen)
       for (unsigned i = 0; i < 32 * 32; i++)
          if (unguarded_pixels[i] != (source_pixels[i] | 0xff000000))
             goto out;
+      if (chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_COPY_RECT_PRESERVE_ALPHA)) {
+         for (unsigned i = 0; i < 32 * 32; i++)
+            unguarded_pixels[i] = 0x55000000 | (i & 0x00ffffff);
+         copy.flags =
+            DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA |
+            DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED;
+         if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+            goto out;
+         for (unsigned i = 0; i < 32 * 32; i++) {
+            uint32_t expected = 0x55000000 |
+                                (source_pixels[i] & 0x00ffffff);
+
+            if (unguarded_pixels[i] != expected)
+               goto out;
+         }
+      }
    }
    passed = smoke_guard_pages_match(cdestination) &&
             smoke_guard_pages_match(csource);

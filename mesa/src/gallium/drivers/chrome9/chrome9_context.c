@@ -3503,6 +3503,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->copy_rect = !!(capabilities & DRM_CHROME9_CAP_COPY_RECT);
    ctx->copy_rect_unguarded_destination =
       !!(capabilities & DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION);
+   ctx->copy_rect_preserve_alpha =
+      !!(capabilities & DRM_CHROME9_CAP_COPY_RECT_PRESERVE_ALPHA);
    ctx->draw_textured_triangle_d16 =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16);
    ctx->draw_textured_triangle_d16_blend =
