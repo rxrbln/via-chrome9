@@ -322,6 +322,12 @@ targets.
   and specifies the smallest counters and staged hardware bisect needed to
   distinguish resource pressure, CPU-side waiting, GART failure, and a true
   post-publication GPU stall.
+- [persistent-batched-submit-performance-plan.md](persistent-batched-submit-performance-plan.md)
+  replaces the earlier eight-page run execution with one exact 32-KiB
+  immediate list, then defines a separately gated persistent SF/GART object
+  cache, batched PTE invalidation, eviction/quarantine rules, counters, and
+  deployment order aimed at removing measured per-triangle submission cost
+  without weakening hang containment.
 - [`../../tools/chrome9_alu_decode.py`](../../tools/chrome9_alu_decode.py)
   decodes the established fields from a four-dword pixel-ALU instruction while
   keeping unresolved fields visible.
