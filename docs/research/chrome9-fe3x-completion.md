@@ -272,6 +272,16 @@ record id, slot, publish_epoch in chrome9_job
 publish A64/A65
 ```
 
+The coherent slot is part of the job's reachability set.  On any timeout,
+retain it with the ring/job quarantine: do not poison, reuse, or free it merely
+because the transient SF PTEs are retained or the userspace fence carries an
+error.  FE3x is a direct system-memory write and can arrive late independently
+of those PTEs.  Non-destructive recovery may reuse the slot only after the
+exact memory ID and full release proof below.  Destructive reset must assign a
+new software epoch and retain/rotate the old slot until the reset's full-idle,
+PCI/GART/ring proofs exclude every pre-reset write.  A stale old-epoch ID must
+never satisfy a new Linux fence even when its low 32 bits match after wrap.
+
 Completion has two levels:
 
 * **notification completion:** after `dma_rmb()`, the coherent slot exactly
