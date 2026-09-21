@@ -431,31 +431,18 @@ chrome9_fs_is_texture(nir_def *def, unsigned unit)
 {
    nir_instr *instr = nir_def_instr(def);
    nir_tex_instr *tex;
-   int coord, projector;
+   int coord;
 
    if (def->num_components != 4 || instr->type != nir_instr_type_tex)
       return false;
    tex = nir_instr_as_tex(instr);
    coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
    return tex->op == nir_texop_tex &&
           tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
           !tex->is_shadow && tex->texture_index == unit &&
           tex->sampler_index == unit && tex->coord_components == 2 &&
-          coord >= 0 && tex->num_srcs == (projector >= 0 ? 2 : 1) &&
-          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, unit, 0) &&
-          (projector < 0 ||
-           (tex->src[projector].src.ssa->num_components == 1 &&
-            nir_def_instr(tex->src[projector].src.ssa)->type ==
-               nir_instr_type_alu &&
-            nir_instr_as_alu(nir_def_instr(
-               tex->src[projector].src.ssa))->op == nir_op_mov &&
-            nir_instr_as_alu(nir_def_instr(
-               tex->src[projector].src.ssa))->src[0].swizzle[0] == 3 &&
-            chrome9_fs_is_texcoord(
-               nir_instr_as_alu(nir_def_instr(
-                  tex->src[projector].src.ssa))->src[0].src.ssa,
-               unit, 0)));
+          coord >= 0 && tex->num_srcs == 1 &&
+          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, unit, 0);
 }
 
 enum chrome9_fs_leaf {
