@@ -18,6 +18,10 @@ targets.
 - [via-5.75-kmd.md](via-5.75-kmd.md) is the bit-anchored audit of the supplied
   Chrome9 KMD source: translated submission, packets, fences, verifier hazards,
   interrupts, initialization, and recovery gaps.
+- [vx900-reset-recovery-oracle.md](vx900-reset-recovery-oracle.md) recovers the
+  Windows destructive reset/replay/restart chain, separates late retirement
+  and GTI retry from a real wedge, and defines exact fence, epoch, translation,
+  and quarantine-release ordering for reboot-free recovery.
 - [via-5.75-dri-state.md](via-5.75-dri-state.md) records exact H5/H6 state,
   target, 2D/3D synchronization, and draw packets recovered from the symbol-rich
   proprietary Linux DRI and Xorg binaries.

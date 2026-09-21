@@ -196,6 +196,122 @@ stopping CR or invalidating PTEs.  That is a source bug, not corroborating
 evidence.  The old DRM/Xorg sources likewise provide idle waits and a 2D reset
 experiment but no full Chrome9-HD recovery sequence.
 
+## Cross-generation idle and fence semantics
+
+The older drivers expose several mechanisms called `idle`, `fence`, or
+`reset`, but none can replace the VX900 proof used by the current driver:
+
+| source | exact completion test | what it proves / does not prove |
+|---|---|---|
+| current Chrome9 job | exact alternating `DST_POS` cookie, then `0444.bit31`, then `0400 & 00101fe3 == 0` | the owned body reached its final H0, the reader stopped at its PID00 PAUSE, and all non-CR work drained; lone `0400.bit4` is legal |
+| current Chrome9 STOP | `0400 & 00101ff3 == 0` after publishing PID10 | full reader plus engine idle for ring replacement; valid only when the old owned PID00 PAUSE was proved first |
+| proprietary 5.75 Chrome9 | `0400 & 00001ff3 == 0`, at most 50,000 reads | omits the current driver's upper `00100000` work class; `WAIT_CHIP_IDLE` discards the helper's `-1` result and always returns success |
+| classic DRM `via_wait_idle()` | first waits for `0400.bit17`, then for only `0400 & 00000083 == 0` | older VQ/CR model; excludes Chrome9 `bit4` and most 3D busy bits and cannot be copied to VX900 |
+| Mesa 7.11.2 `viaCheckIdle()` | `(0400 & fffeffff) == 00020000` | same older assumption that VQ bit 17 is the idle sentinel; its waits are unbounded |
+| Windows reset entry | pre-reset hang mask `00161fff`, post-pulse idle mask `00101ff3` | broad device-wide reset decision followed by full idle; it is not ordinary job retirement |
+
+The classic DRM function named `via_cmdbuf_reset()` is especially misleading:
+it appends a STOP and calls `via_wait_idle()` without checking the return.  It
+does not pulse a hardware reset, replay state, invalidate translations, or
+error fences.  It is evidence only for the old ring's normal STOP protocol.
+
+The completion packets are equally generation-specific:
+
+- Mesa 7.11.2 breadcrumbs are ordered 2D writes to mapped memory.  The light
+  wait accepts the breadcrumb alone; the heavy wait separately spins on the
+  old status predicate.  A breadcrumb therefore orders prior commands but is
+  not, by itself, full engine idle.
+- The proprietary H5/H6 fence uses T11 A04--A07, the `Idle` bit, optional
+  interrupt-wait and optional system-memory write.  Its H5S2VP1/VX900 path
+  instead emits the new FE30 packet with a **zero** engine-wait mask.  The
+  source comment acknowledges this as a fence for a CR-busy issue, but zero
+  wait does not prove arbitrary 3D retirement.
+- Windows emits engine-specific FE3x wait masks: 3D uses FE33/`00200000`, 2D
+  uses FE30/`00300000`, DMA uses FE37/`0031e000`, and the no-engine sentinel
+  is `003fe000`.  This is the strongest fence-ordering evidence, but the
+  current cookie plus owned PAUSE plus status drain remains safer until FE3x
+  receives an independent live oracle.
+- Windows `QueryCurrentFence` reading `0494` proves scheduler progress in the
+  current hardware epoch.  It cannot prove that old DMA translations are
+  unreachable after reset, and a stale pre-reset value must never complete a
+  new Linux fence.
+
+Always record `040c` as an error discriminator, but `040c=0` is not a
+completion condition.  Likewise `043c/0440` are fetch/request cursors with
+read-ahead and are diagnostic only.
+
+## Recovery classes before destructive reset
+
+Classify a timeout by independently sampling the ordered cookie, owned PAUSE,
+non-CR work mask, full mask, and GTI flush result.  This gives four materially
+different recovery actions:
+
+1. **Late ordinary retirement.** A second bounded deadline observes the exact
+   job cookie, `0444.bit31`, and `0400 & 00101fe3 == 0`.  Complete CPU
+   ownership and guards, invalidate its PTEs with a successful SR6F
+   pre/post-wait, remove its node, and release it without resetting the GPU.
+   Preserve the fence's original timeout error; late completion is not a
+   successful ioctl.
+2. **Retired body, reader still active.** The exact cookie and non-CR idle are
+   proved, but `0444.bit31` is absent.  Because the immutable stream after the
+   final cookie contains only PAUSE/dummy padding, the job's data mappings may
+   be CPU-synchronized and invalidated after a successful GTI flush.  The
+   persistent ring mapping, ring contents, device/module lifetime and engine
+   wedge remain quarantined.  Do not reuse its epoch or signal any success.
+3. **Translation-only quarantine.** Command retirement is already proved but
+   PTE invalidation or the SR6F post-wait timed out.  Retry that exact
+   invalidation under the existing locks and a new deadline.  If it succeeds,
+   the job can be released without an engine reset; if it fails, retain it.
+4. **Unretired work.** A wrong/missing cookie, active non-CR busy bit, unknown
+   fault, or pre-cookie active reader has no selective recovery proof.  Keep
+   every reachable object and use only the fully gated destructive reset or a
+   reboot.
+
+This classification avoids resetting a healthy GPU merely because a 100-ms
+deadline was too short, while retaining the no-late-DMA invariant.  PID10 is
+not a rescue command for classes 2 or 4: both Linux and Windows publish a new
+STOP only after the previous reader boundary is known.
+
+## Preemption is not hang recovery
+
+Windows `S3gPreemptCommand` at `0x837d0..0x83ac0` programs the documented T10
+A08--A0B completion record, but its complete control flow rules it out as a
+first Linux recovery mechanism:
+
+- when multi-engine mode is active, `0x838b0..0x83942` spins without a
+  timeout until pairs of driver bookkeeping fields become equal;
+- only then does `0x83944..0x83a3b` select T10 and write A08, A09, A0A and the
+  triggering A0B;
+- after the writes it records the requested fence in software and returns;
+  it does not poll `0400`, prove an owned PAUSE, invalidate GTI, or establish
+  that the preempted command can no longer write memory.
+
+The callback is a WDDM scheduler protocol for a responsive command reader,
+not evidence that A0B can interrupt a wedged VP/PS/3D stage.  Even a delivered
+preemption completion would order scheduler state, not prove every old SF PTE
+safe to remove.  Keep A08--A0B disabled until normal FE3x fences, IRQ/ack, and
+the completion-buffer domain have independent guarded tests.
+
+## Reset and containment mechanism ranking
+
+Use the narrowest mechanism whose precondition is already proved:
+
+| mechanism | justified use | release authority |
+|---|---|---|
+| bounded late cookie/PAUSE/work poll | recover a job that retired after the normal deadline | yes, after CPU sync, guards and GTI invalidation |
+| retry the same SR6F invalidation | recover a translation-only timeout after command retirement | yes, only if the post-wait self-clear succeeds |
+| PID10 STOP | normal ring wrap/teardown from an owned PID00 PAUSE | yes for the old ring only after full `00101ff3` idle |
+| clear PCI bus master | emergency containment before remote reboot | no; it neither resets internal stages nor proves posted/in-flight work drained |
+| `SR4E.bit2` 2D engine reset | already-live lab recovery of an isolated 2D fault followed by complete 2D reinit | no authority over CR, 3D, GTI, or arbitrary job BOs |
+| T10 A68 clear/restore bits | none yet | no; shipping Windows/Linux paths do not use them for recovery |
+| T10 A08--A0B preemption | none yet | no; completion and memory reachability are unproved |
+| vendor `SR4E`/`SR1A`/`SRC7` sequence plus full replay/rebuild | future device-wide destructive recovery | yes only after every bounded post-reset proof succeeds |
+| generic PCI function/bus reset | prohibited | no VX900 evidence; this integrated display/chipset function has collateral scope outside the render engine |
+
+Clock gating through `SR3F` is not a reset.  Turning a busy clock off can
+freeze an in-flight transaction and make status less informative; recovery
+must preserve or force-on required clocks until full idle is proved.
+
 ## Safe Linux implementation boundary
 
 For a stream timeout where CR is paused but a 3D stage remains busy, the only
@@ -232,14 +348,85 @@ release quarantined mappings only after the preceding proof
 If the reset or post-reset proof times out, the quarantine remains.  A remote
 reboot is safer than freeing resources still reachable by CR or GTI.
 
+### Fence failure and reset-epoch ordering
+
+Reset must not signal quarantined reservation fences merely because the reset
+pulse was issued.  Fence signaling permits waiters to free or repurpose the
+BO, so the exact safe order is:
+
+```text
+block submissions; detach/disable completion IRQ handling
+set -EIO on every affected fence, but leave it unsignaled
+perform reset and prove 0400 & 00101ff3 == 0
+invalidate every old transient PTE; complete the SR6F post-wait
+perform CPU ownership transition for each retained DMA mapping
+remove old SF nodes and make every old command address unreachable
+signal the error fences
+drop vmaps, GEM references, DMA-map roles and initial fence references
+```
+
+A job whose PTE invalidation still fails remains quarantined with an unsignaled
+error fence.  For an already-retired, already-signaled error fence, recovery
+must not signal it twice; it still cannot drop the mapping until invalidation
+succeeds.
+
+Keep `dma_fence_context` and its `atomic64` sequence monotonic across a
+successful reset.  Add a separate `reset_epoch` for diagnostics/ring
+ownership and increment it before accepting new work; do not recycle fence
+sequence numbers or infer completion from the pre-reset `0494` value.  The
+alternating H0 cookie also needs a new baseline: after the destructive proof,
+read the current `DST_POS` and choose a next cookie unequal to that value.
+Only the new owned ring may then write it.  This prevents a stale pre-reset
+cookie from satisfying the first post-reset poll.
+
+The first rebuilt ring should contain a harmless ordered H0 cookie write plus
+the normal dummy/PID00 tail, not only dummy words.  Require the new cookie,
+`0444.bit31`, and non-CR idle before declaring the reset epoch operational.
+This proves fetching and H0 execution from the reinstalled SF ring; PAUSE
+alone proves less.  Restore the saved `DST_POS` only during final engine
+teardown, never between the recovery prime and the first real job.
+
+### Translation and display ordering
+
+The vendor reset assumes its existing GART survives, but Linux should not
+resume on that assumption.  After reset/full-idle proof and before installing
+the recovery ring:
+
+1. read back `SR6A`, `SR6B`, `SR6C`, `SR7B` and every ring PTE;
+2. reprogram the owned GART aperture and ring PTEs if any differ;
+3. invalidate quarantined transient data PTEs rather than republishing them;
+4. preserve and, if necessary, rewrite active scanout PTEs because IGA fetch
+   is independent of CR;
+5. issue one barrier plus bounded `SR6F.bit7` flush and require self-clear;
+6. only then install and prove the new ring epoch.
+
+An initial destructive-reset oracle should run with KMS disabled.  A later
+production path must save the interrupt-enable policy before Windows' global
+`0200=0`, acknowledge stale owned `0204` status, restore only driver-owned
+enable bits, and restore both LUT controls changed by the reset helper.  It
+must not raw-restore pending/RW1C status or enable Windows' DMA interrupt bits
+unless Linux has handlers for them.
+
 ## Current `engine_quiesce` and recoverable-timeout audit
 
-The current sysfs quiesce entry first unplugs DRM, requires zero open files,
-and calls `chrome9_engine_fini()` (`chrome9_drv.c:2458..2490`).  The engine
-teardown holds `submit_lock`, stops admission, then refuses every already
-wedged or quarantined engine before touching its mappings
-(`chrome9_engine.c:2693..2727` in the pre-two-texture tree).  That refusal is
-correct for reachability but means the entry is not yet a recovery path.
+The audit was refreshed against committed Chrome9 kernel
+`b6b6a1921d4421f02c13a22188b244c890e1b4d1`.  The sysfs quiesce entry first
+unplugs DRM, requires zero open files, and calls `chrome9_engine_fini()`.
+Engine teardown holds `submit_lock`, stops admission, then refuses every
+already wedged/quarantined engine or live scanout mapping before touching its
+GART/ring allocation.  That refusal is correct for reachability but means the
+entry is not yet a recovery path.
+
+The timeout lifetime is deliberately asymmetric.  A cookie/PAUSE/work timeout
+sets `-ETIME`, links the job into `engine->quarantine`, and leaves its fence
+unsignaled plus all GEM references, vmaps, SGT roles, PTE image and SF node
+retained.  A post-retirement PTE-invalidation timeout quarantines the same
+mapping but may signal its error fence because rendering and CPU ownership
+were already proved.  `chrome9_fence_release()` frees only the PTE array and
+job allocation; a recovery path must explicitly perform the missing DMA
+sync, unmaps, GEM puts, SF-node removal, quarantine-list removal and initial
+fence put in the appropriate case.  Merely deleting the list entry would leak
+or prematurely free resources.
 
 There are two importantly different timeout classes:
 
