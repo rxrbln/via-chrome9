@@ -49,6 +49,9 @@
 #define CHROME9_TARGET_DIM		32U
 #define CHROME9_DEP_TIMEOUT		msecs_to_jiffies(5000)
 #define CHROME9_HW_TIMEOUT_US		100000
+#define CHROME9_DRAW_CACHE_MAX_ENTRIES	64U
+#define CHROME9_DRAW_CACHE_MAX_PAGES	(CHROME9_GART_ENTRIES - \
+					 CHROME9_RING_PAGES)
 
 static bool chrome9_engine_enable;
 module_param_named(engine, chrome9_engine_enable, bool, 0400);
@@ -74,6 +77,8 @@ struct chrome9_fence {
 	spinlock_t lock;
 };
 
+struct chrome9_sf_mapping;
+
 struct chrome9_job {
 	struct chrome9_fence fence;
 	struct drm_gem_shmem_object *destination;
@@ -88,14 +93,9 @@ struct chrome9_job {
 	struct iosys_map depth_map;
 	struct iosys_map texture2_map;
 	struct iosys_map texture3_map;
-	struct drm_mm_node sf_node;
+	struct chrome9_sf_mapping *sf_mappings[4];
 	struct list_head quarantine_link;
-	u32 *ptes;
-	unsigned int page_count;
-	unsigned int destination_page_count;
-	unsigned int depth_page_count;
-	unsigned int texture2_page_count;
-	unsigned int texture3_page_count;
+	unsigned int sf_mapping_count;
 	u32 cookie;
 	u32 flags;
 	u32 segment_pause;
@@ -107,8 +107,6 @@ struct chrome9_job {
 	bool depth_mapped;
 	bool texture2_mapped;
 	bool texture3_mapped;
-	bool node_allocated;
-	bool sf_bound;
 	bool fence_attached;
 	bool published;
 	bool retirement_proven;
@@ -223,6 +221,7 @@ struct chrome9_engine {
 	struct drm_mm sf_mm;
 	struct list_head quarantine;
 	struct list_head scanout_mappings;
+	struct list_head draw_mappings;
 	void *ring_cpu;
 	dma_addr_t ring_dma;
 	void *staging_cpu;
@@ -243,6 +242,16 @@ struct chrome9_engine {
 	u32 ring_epoch;
 	u64 append_count;
 	u64 wrap_count;
+	u64 draw_cache_hits;
+	u64 draw_cache_misses;
+	u64 draw_cache_evictions;
+	u64 draw_cache_scanout_hits;
+	u64 gart_update_count;
+	u64 gart_pte_write_count;
+	u64 gart_vga_acquire_count;
+	u64 gart_flush_count;
+	unsigned int draw_cache_entries;
+	unsigned int draw_cache_pages;
 	u32 last_cookie;
 	bool mm_initialized;
 	bool gart_programmed;
@@ -264,9 +273,11 @@ struct chrome9_sf_mapping {
 	struct list_head link;
 	u32 *ptes;
 	unsigned int page_count;
+	unsigned int users;
 	bool node_allocated;
 	bool bound;
 	bool quarantined;
+	bool draw_cached;
 };
 
 static const char *chrome9_fence_get_driver_name(struct dma_fence *fence)
@@ -281,10 +292,6 @@ static const char *chrome9_fence_get_timeline_name(struct dma_fence *fence)
 
 static void chrome9_fence_release(struct dma_fence *fence)
 {
-	struct chrome9_job *job =
-		container_of(fence, struct chrome9_job, fence.base);
-
-	kfree(job->ptes);
 	dma_fence_free(fence);
 }
 
@@ -1834,9 +1841,11 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	if (first >= CHROME9_GART_ENTRIES ||
 	    count > CHROME9_GART_ENTRIES - first)
 		return -ERANGE;
+	engine->gart_update_count++;
 	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
 	if (ret)
 		return ret;
+	engine->gart_vga_acquire_count++;
 	saved_index = readb(cdev->mmio + CHROME9_SEQ_INDEX);
 	ret = chrome9_gart_wait_idle(cdev);
 	if (ret)
@@ -1846,9 +1855,11 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	for (i = 0; i < count; i++)
 		writel(ptes ? ptes[i] : CHROME9_GART_INVALID,
 		       engine->gart + (first + i) * sizeof(u32));
+	engine->gart_pte_write_count += count;
 	readl(engine->gart + (first + count - 1) * sizeof(u32));
 	/* Make every PTE visible before requesting the GTI translation flush. */
 	wmb();
+	engine->gart_flush_count++;
 	ret = chrome9_gart_flush(cdev);
 	chrome9_seq_write(cdev, 0x6c, saved_6c);
 out_restore_index:
@@ -1994,6 +2005,269 @@ static void chrome9_sf_mapping_free(struct chrome9_sf_mapping *mapping)
 	drm_gem_object_put(mapping->object);
 	kfree(mapping->ptes);
 	kfree(mapping);
+}
+
+static struct chrome9_sf_mapping *
+chrome9_draw_mapping_find_locked(struct chrome9_engine *engine,
+				 struct drm_gem_object *object)
+{
+	struct chrome9_sf_mapping *mapping;
+
+	lockdep_assert_held(&engine->submit_lock);
+	list_for_each_entry(mapping, &engine->draw_mappings, link) {
+		if (mapping->object == object && mapping->bound &&
+		    !mapping->quarantined)
+			return mapping;
+	}
+	return NULL;
+}
+
+static int
+chrome9_draw_mapping_evict_locked(struct chrome9_engine *engine,
+				  struct chrome9_sf_mapping *mapping)
+{
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (WARN_ON_ONCE(!mapping->draw_cached || mapping->users ||
+			 mapping->quarantined || !mapping->bound ||
+			 !mapping->node_allocated))
+		return -EBUSY;
+
+	mutex_lock(&engine->vm_lock);
+	ret = chrome9_gart_set(engine, mapping->node.start >> PAGE_SHIFT,
+			       NULL, mapping->page_count);
+	if (ret) {
+		engine->wedged = true;
+		mapping->quarantined = true;
+		chrome9_take_quarantine_hold(engine);
+		mutex_unlock(&engine->vm_lock);
+		dev_crit(&engine->cdev->pdev->dev,
+			 "SF draw-cache eviction failed; mapping retained for reboot\n");
+		return -EIO;
+	}
+	mapping->bound = false;
+	drm_mm_remove_node(&mapping->node);
+	mapping->node_allocated = false;
+	list_del_init(&mapping->link);
+	engine->draw_cache_entries--;
+	engine->draw_cache_pages -= mapping->page_count;
+	engine->draw_cache_evictions++;
+	mutex_unlock(&engine->vm_lock);
+	dev_dbg(&engine->cdev->pdev->dev,
+		"draw SF cache evict base=%#llx pages=%u evictions=%llu\n",
+		(unsigned long long)mapping->node.start, mapping->page_count,
+		engine->draw_cache_evictions);
+	chrome9_sf_mapping_free(mapping);
+	return 0;
+}
+
+static int chrome9_draw_mapping_evict_lru_locked(struct chrome9_engine *engine)
+{
+	struct chrome9_sf_mapping *mapping;
+
+	lockdep_assert_held(&engine->submit_lock);
+	list_for_each_entry(mapping, &engine->draw_mappings, link) {
+		if (!mapping->users && !mapping->quarantined)
+			return chrome9_draw_mapping_evict_locked(engine, mapping);
+	}
+	return -ENOSPC;
+}
+
+static int
+chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
+				    struct drm_gem_object *object,
+				    struct sg_table *sgt,
+				    struct chrome9_sf_mapping **out_mapping,
+				    u32 *out_base)
+{
+	struct chrome9_sf_mapping *mapping;
+	unsigned int page_count;
+	int cleanup_ret;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (!out_mapping || !out_base || !object || !sgt ||
+	    object->dev != &engine->cdev->drm || drm_gem_is_imported(object) ||
+	    !object->size || !IS_ALIGNED(object->size, PAGE_SIZE) ||
+	    object->size > U32_MAX)
+		return -EINVAL;
+	if (engine->stopping || engine->wedged || !engine->ready)
+		return -EIO;
+
+	/* A KMS pin already supplies a stable mapping for this local object. */
+	list_for_each_entry(mapping, &engine->scanout_mappings, link) {
+		if (mapping->object != object || !mapping->bound ||
+		    mapping->quarantined)
+			continue;
+		engine->draw_cache_scanout_hits++;
+		dev_dbg(&engine->cdev->pdev->dev,
+			"draw SF scanout hit base=%#llx pages=%u hits=%llu\n",
+			(unsigned long long)mapping->node.start,
+			mapping->page_count, engine->draw_cache_scanout_hits);
+		*out_mapping = NULL;
+		*out_base = mapping->node.start;
+		return 0;
+	}
+
+	mapping = chrome9_draw_mapping_find_locked(engine, object);
+	if (mapping) {
+		mapping->users++;
+		list_move_tail(&mapping->link, &engine->draw_mappings);
+		engine->draw_cache_hits++;
+		dev_dbg(&engine->cdev->pdev->dev,
+			"draw SF cache hit base=%#llx pages=%u hits=%llu\n",
+			(unsigned long long)mapping->node.start,
+			mapping->page_count, engine->draw_cache_hits);
+		*out_mapping = mapping;
+		*out_base = mapping->node.start;
+		return 0;
+	}
+
+	engine->draw_cache_misses++;
+	page_count = object->size >> PAGE_SHIFT;
+	if (page_count > CHROME9_DRAW_CACHE_MAX_PAGES)
+		return -E2BIG;
+	while (engine->draw_cache_entries >= CHROME9_DRAW_CACHE_MAX_ENTRIES ||
+	       engine->draw_cache_pages >
+	       CHROME9_DRAW_CACHE_MAX_PAGES - page_count) {
+		ret = chrome9_draw_mapping_evict_lru_locked(engine);
+		if (ret)
+			return ret;
+	}
+
+	mapping = kzalloc_obj(*mapping);
+	if (!mapping)
+		return -ENOMEM;
+	mapping->engine = engine;
+	mapping->object = object;
+	drm_gem_object_get(object);
+	mapping->page_count = page_count;
+	mapping->users = 1;
+	mapping->draw_cached = true;
+	INIT_LIST_HEAD(&mapping->link);
+	mapping->ptes = kcalloc(page_count, sizeof(*mapping->ptes), GFP_KERNEL);
+	if (!mapping->ptes) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
+	mapping->sgt = sgt;
+	ret = chrome9_collect_sgt_ptes(mapping->sgt, mapping->ptes,
+				       page_count);
+	if (ret)
+		goto err_free;
+
+	for (;;) {
+		mutex_lock(&engine->vm_lock);
+		ret = drm_mm_insert_node_generic(&engine->sf_mm, &mapping->node,
+						 object->size, PAGE_SIZE, 0,
+						 DRM_MM_INSERT_LOW);
+		mutex_unlock(&engine->vm_lock);
+		if (ret != -ENOSPC)
+			break;
+		ret = chrome9_draw_mapping_evict_lru_locked(engine);
+		if (ret)
+			goto err_free;
+	}
+	if (ret)
+		goto err_free;
+	mapping->node_allocated = true;
+	mapping->bound = true;
+	mutex_lock(&engine->vm_lock);
+	ret = chrome9_gart_set(engine, mapping->node.start >> PAGE_SHIFT,
+			       mapping->ptes, mapping->page_count);
+	if (ret) {
+		cleanup_ret = chrome9_gart_set(engine,
+					       mapping->node.start >> PAGE_SHIFT,
+					       NULL, mapping->page_count);
+		if (cleanup_ret) {
+			engine->wedged = true;
+			mapping->quarantined = true;
+			mapping->users = 0;
+			list_add_tail(&mapping->link, &engine->draw_mappings);
+			engine->draw_cache_entries++;
+			engine->draw_cache_pages += mapping->page_count;
+			chrome9_take_quarantine_hold(engine);
+			mutex_unlock(&engine->vm_lock);
+			dev_crit(&engine->cdev->pdev->dev,
+				 "SF draw-cache bind cleanup failed; mapping retained for reboot\n");
+			return -EIO;
+		}
+		mapping->bound = false;
+		drm_mm_remove_node(&mapping->node);
+		mapping->node_allocated = false;
+		mutex_unlock(&engine->vm_lock);
+		goto err_free;
+	}
+	list_add_tail(&mapping->link, &engine->draw_mappings);
+	engine->draw_cache_entries++;
+	engine->draw_cache_pages += mapping->page_count;
+	mutex_unlock(&engine->vm_lock);
+	dev_dbg(&engine->cdev->pdev->dev,
+		"draw SF cache miss base=%#llx pages=%u misses=%llu entries=%u cached_pages=%u\n",
+		(unsigned long long)mapping->node.start, mapping->page_count,
+		engine->draw_cache_misses, engine->draw_cache_entries,
+		engine->draw_cache_pages);
+	*out_mapping = mapping;
+	*out_base = mapping->node.start;
+	return 0;
+
+err_free:
+	chrome9_sf_mapping_free(mapping);
+	return ret;
+}
+
+static int chrome9_job_acquire_mapping_locked(struct chrome9_engine *engine,
+					      struct chrome9_job *job,
+					      struct drm_gem_object *object,
+					      struct sg_table *sgt,
+					      u32 *base)
+{
+	struct chrome9_sf_mapping *mapping;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (WARN_ON_ONCE(job->sf_mapping_count >= ARRAY_SIZE(job->sf_mappings)))
+		return -E2BIG;
+	ret = chrome9_draw_mapping_acquire_locked(engine, object, sgt, &mapping,
+						  base);
+	if (ret)
+		return ret;
+	if (mapping)
+		job->sf_mappings[job->sf_mapping_count++] = mapping;
+	return 0;
+}
+
+static void chrome9_job_release_mappings_locked(struct chrome9_engine *engine,
+						struct chrome9_job *job)
+{
+	lockdep_assert_held(&engine->submit_lock);
+	while (job->sf_mapping_count) {
+		struct chrome9_sf_mapping *mapping =
+			job->sf_mappings[--job->sf_mapping_count];
+
+		if (WARN_ON_ONCE(!mapping->users))
+			continue;
+		mapping->users--;
+		job->sf_mappings[job->sf_mapping_count] = NULL;
+	}
+}
+
+static int chrome9_draw_cache_purge_locked(struct chrome9_engine *engine)
+{
+	struct chrome9_sf_mapping *mapping;
+	struct chrome9_sf_mapping *next;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	list_for_each_entry_safe(mapping, next, &engine->draw_mappings, link) {
+		if (mapping->users || mapping->quarantined)
+			return -EBUSY;
+		ret = chrome9_draw_mapping_evict_locked(engine, mapping);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
@@ -2204,15 +2478,6 @@ void chrome9_engine_display_end(struct chrome9_device *cdev)
 
 	lockdep_assert_held(&engine->submit_lock);
 	mutex_unlock(&engine->submit_lock);
-}
-
-static int chrome9_collect_ptes(struct chrome9_job *job)
-{
-	job->ptes = kcalloc(job->page_count, sizeof(*job->ptes), GFP_KERNEL);
-	if (!job->ptes)
-		return -ENOMEM;
-	return chrome9_collect_sgt_ptes(job->sgt, job->ptes,
-					job->page_count);
 }
 
 static bool chrome9_verify_target(struct chrome9_job *job, u32 flags)
@@ -2486,6 +2751,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	mutex_init(&engine->vm_lock);
 	INIT_LIST_HEAD(&engine->quarantine);
 	INIT_LIST_HEAD(&engine->scanout_mappings);
+	INIT_LIST_HEAD(&engine->draw_mappings);
 	engine->fence_context = dma_fence_context_alloc(1);
 	atomic64_set(&engine->fence_seqno, 0);
 	engine->gart = cdev->vram + chrome9_engine_gart_offset;
@@ -2638,15 +2904,11 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	}
 	INIT_LIST_HEAD(&job->quarantine_link);
 	job->destination = to_drm_gem_shmem_obj(obj);
-	job->page_count = obj->size >> PAGE_SHIFT;
 	job->sgt = drm_gem_shmem_get_pages_sgt(job->destination);
 	if (IS_ERR(job->sgt)) {
 		ret = PTR_ERR(job->sgt);
 		goto out_free_job;
 	}
-	ret = chrome9_collect_ptes(job);
-	if (ret)
-		goto out_free_job;
 	spin_lock_init(&job->fence.lock);
 	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
 			 &job->fence.lock, engine->fence_context,
@@ -2683,19 +2945,8 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	job->flags = request->flags;
 	job->cookie = engine->last_cookie == 0x00010001 ?
 		      0x00020002 : 0x00010001;
-	mutex_lock(&engine->vm_lock);
-	ret = drm_mm_insert_node_generic(&engine->sf_mm, &job->sf_node,
-					 request->object_size, PAGE_SIZE, 0,
-					 DRM_MM_INSERT_LOW);
-	if (ret) {
-		mutex_unlock(&engine->vm_lock);
-		goto out_unlock_submit;
-	}
-	job->node_allocated = true;
-	job->sf_bound = true;
-	ret = chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
-			       job->ptes, job->page_count);
-	mutex_unlock(&engine->vm_lock);
+	ret = chrome9_job_acquire_mapping_locked(engine, job, obj, job->sgt,
+						 &target);
 	if (ret)
 		goto out_prepublication;
 
@@ -2717,7 +2968,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 				    DMA_BIDIRECTIONAL);
 	dma_resv_add_fence(resv, &job->fence.base, DMA_RESV_USAGE_WRITE);
 	job->fence_attached = true;
-	target = job->sf_node.start + PAGE_SIZE;
+	target += PAGE_SIZE;
 	if (request->kind == CHROME9_DRAW_FIXED) {
 		if (request->flags == DRM_CHROME9_FIXED_QUAD_DEPTH_ORACLE)
 			ret = chrome9_build_depth_oracle(engine, job, target,
@@ -2778,25 +3029,8 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 		dma_fence_set_error(&job->fence.base, ret);
 	}
 	chrome9_sf_resync_object_locked(engine, obj);
-	mutex_lock(&engine->vm_lock);
-	if (chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
-			     NULL, job->page_count)) {
-		if (!ret)
-			ret = -EIO;
-		dma_fence_set_error(&job->fence.base, -EIO);
-		chrome9_quarantine_job_locked(engine, job);
-		quarantine = true;
-	} else {
-		job->sf_bound = false;
-		drm_mm_remove_node(&job->sf_node);
-		job->node_allocated = false;
-		engine->last_cookie = job->cookie;
-	}
-	mutex_unlock(&engine->vm_lock);
-	if (quarantine) {
-		signal = true;
-		goto out_unlock_submit;
-	}
+	engine->last_cookie = job->cookie;
+	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 	drm_gem_shmem_vunmap_locked(job->destination, &job->map);
 	job->mapped = false;
@@ -2810,22 +3044,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 
 out_prepublication:
 	dma_fence_set_error(&job->fence.base, ret ?: -EIO);
-	if (job->sf_bound) {
-		mutex_lock(&engine->vm_lock);
-		if (chrome9_gart_set(engine,
-				     job->sf_node.start >> PAGE_SHIFT,
-				     NULL, job->page_count)) {
-			ret = -EIO;
-			dma_fence_set_error(&job->fence.base, ret);
-			chrome9_quarantine_job_locked(engine, job);
-			quarantine = true;
-		} else {
-			job->sf_bound = false;
-			drm_mm_remove_node(&job->sf_node);
-			job->node_allocated = false;
-		}
-		mutex_unlock(&engine->vm_lock);
-	}
+	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 out_unlock_submit:
 	mutex_unlock(&engine->submit_lock);
@@ -2852,7 +3071,6 @@ out_put_fence:
 	goto out_dev_exit;
 
 out_free_job:
-	kfree(job->ptes);
 	kfree(job);
 out_put_object:
 	drm_gem_object_put(obj);
@@ -2976,14 +3194,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		job->texture2 = to_drm_gem_shmem_obj(texture2_obj);
 	if (four_objects)
 		job->texture3 = to_drm_gem_shmem_obj(texture3_obj);
-	job->destination_page_count = obj->size >> PAGE_SHIFT;
-	job->depth_page_count = depth_obj->size >> PAGE_SHIFT;
-	job->texture2_page_count = three_objects ?
-		texture2_obj->size >> PAGE_SHIFT : 0;
-	job->texture3_page_count = four_objects ?
-		texture3_obj->size >> PAGE_SHIFT : 0;
-	job->page_count = job->destination_page_count + job->depth_page_count +
-			  job->texture2_page_count + job->texture3_page_count;
 	job->sgt = drm_gem_shmem_get_pages_sgt(job->destination);
 	if (IS_ERR(job->sgt)) {
 		ret = PTR_ERR(job->sgt);
@@ -3008,38 +3218,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 			goto out_free_job;
 		}
 	}
-	job->ptes = kcalloc(job->page_count, sizeof(*job->ptes), GFP_KERNEL);
-	if (!job->ptes) {
-		ret = -ENOMEM;
-		goto out_free_job;
-	}
-	ret = chrome9_collect_sgt_ptes(job->sgt, job->ptes,
-					 job->destination_page_count);
-	if (ret)
-		goto out_free_job;
-	ret = chrome9_collect_sgt_ptes(job->depth_sgt,
-					 job->ptes + job->destination_page_count,
-					 job->depth_page_count);
-	if (ret)
-		goto out_free_job;
-	if (three_objects) {
-		ret = chrome9_collect_sgt_ptes(job->texture2_sgt,
-			job->ptes + job->destination_page_count +
-			job->depth_page_count, job->texture2_page_count);
-		if (ret)
-			goto out_free_job;
-	}
-	if (four_objects) {
-		u32 *texture3_ptes = job->ptes + job->destination_page_count +
-			job->depth_page_count + job->texture2_page_count;
-
-		ret = chrome9_collect_sgt_ptes(job->texture3_sgt,
-					       texture3_ptes,
-					       job->texture3_page_count);
-		if (ret)
-			goto out_free_job;
-	}
-
 	spin_lock_init(&job->fence.lock);
 	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
 			 &job->fence.lock, engine->fence_context,
@@ -3148,21 +3326,31 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	job->flags = request->flags;
 	job->cookie = engine->last_cookie == 0x00010001 ?
 		      0x00020002 : 0x00010001;
-	mutex_lock(&engine->vm_lock);
-	ret = drm_mm_insert_node_generic(&engine->sf_mm, &job->sf_node,
-					 mapped_size,
-					 PAGE_SIZE, 0, DRM_MM_INSERT_LOW);
-	if (ret) {
-		mutex_unlock(&engine->vm_lock);
-		goto out_unlock_submit;
-	}
-	job->node_allocated = true;
-	job->sf_bound = true;
-	ret = chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
-			       job->ptes, job->page_count);
-	mutex_unlock(&engine->vm_lock);
+	ret = chrome9_job_acquire_mapping_locked(engine, job, obj, job->sgt,
+						 &target);
 	if (ret)
 		goto out_prepublication;
+	ret = chrome9_job_acquire_mapping_locked(engine, job, depth_obj,
+						 job->depth_sgt,
+						 &depth_target);
+	if (ret)
+		goto out_prepublication;
+	if (three_objects) {
+		ret = chrome9_job_acquire_mapping_locked(engine, job,
+							 texture2_obj,
+							 job->texture2_sgt,
+							 &texture2_target);
+		if (ret)
+			goto out_prepublication;
+	}
+	if (four_objects) {
+		ret = chrome9_job_acquire_mapping_locked(engine, job,
+							 texture3_obj,
+							 job->texture3_sgt,
+							 &texture3_target);
+		if (ret)
+			goto out_prepublication;
+	}
 
 	/* Structured BO contents are already CPU-owned on ioctl entry. */
 	chrome9_prepare_map_guards(&job->map, request->object_size);
@@ -3218,12 +3406,12 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		dma_resv_add_fence(texture3_obj->resv, &job->fence.base,
 				   DMA_RESV_USAGE_WRITE);
 	job->fence_attached = true;
-	target = job->sf_node.start + PAGE_SIZE;
-	depth_target = job->sf_node.start + obj->size + PAGE_SIZE;
-	texture2_target = job->sf_node.start + obj->size + depth_obj->size +
-			  PAGE_SIZE;
-	texture3_target = job->sf_node.start + obj->size + depth_obj->size +
-			  (three_objects ? texture2_obj->size : 0) + PAGE_SIZE;
+	target += PAGE_SIZE;
+	depth_target += PAGE_SIZE;
+	if (three_objects)
+		texture2_target += PAGE_SIZE;
+	if (four_objects)
+		texture3_target += PAGE_SIZE;
 	if (request->kind == CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
 	    two_textured_depth)
 		ret = chrome9_build_two_textured_triangle(engine, request, job,
@@ -3318,42 +3506,14 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		chrome9_sf_resync_object_locked(engine, texture2_obj);
 	if (four_objects)
 		chrome9_sf_resync_object_locked(engine, texture3_obj);
-	mutex_lock(&engine->vm_lock);
-	if (chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
-			     NULL, job->page_count)) {
-		if (!ret)
-			ret = -EIO;
-		dma_fence_set_error(&job->fence.base, -EIO);
-		chrome9_quarantine_job_locked(engine, job);
-		quarantine = true;
-	} else {
-		job->sf_bound = false;
-		drm_mm_remove_node(&job->sf_node);
-		job->node_allocated = false;
-		engine->last_cookie = job->cookie;
-	}
-	mutex_unlock(&engine->vm_lock);
+	engine->last_cookie = job->cookie;
+	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 	goto out_unlock_submit;
 
 out_prepublication:
 	dma_fence_set_error(&job->fence.base, ret ?: -EIO);
-	if (job->sf_bound) {
-		mutex_lock(&engine->vm_lock);
-		if (chrome9_gart_set(engine,
-				     job->sf_node.start >> PAGE_SHIFT,
-				     NULL, job->page_count)) {
-			ret = -EIO;
-			dma_fence_set_error(&job->fence.base, ret);
-			chrome9_quarantine_job_locked(engine, job);
-			quarantine = true;
-		} else {
-			job->sf_bound = false;
-			drm_mm_remove_node(&job->sf_node);
-			job->node_allocated = false;
-		}
-		mutex_unlock(&engine->vm_lock);
-	}
+	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 out_unlock_submit:
 	mutex_unlock(&engine->submit_lock);
@@ -3431,7 +3591,6 @@ out_exec:
 	goto out_dev_exit;
 
 out_free_job:
-	kfree(job->ptes);
 	kfree(job);
 out_put_objects:
 	if (texture3_obj)
@@ -4976,6 +5135,15 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		mutex_unlock(&engine->submit_lock);
 		return;
 	}
+	ret = chrome9_draw_cache_purge_locked(engine);
+	if (ret) {
+		engine->wedged = true;
+		chrome9_take_quarantine_hold(engine);
+		dev_crit(&cdev->pdev->dev,
+			 "draw SF cache did not drain; retained for reboot\n");
+		mutex_unlock(&engine->submit_lock);
+		return;
+	}
 	mutex_lock(&engine->vm_lock);
 	ret = chrome9_gart_set(engine, 0, invalid, ARRAY_SIZE(invalid));
 	mutex_unlock(&engine->vm_lock);
@@ -4999,8 +5167,12 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (!engine->was_master)
 		pci_clear_master(cdev->pdev);
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u\n",
-		 engine->append_count, engine->wrap_count, engine->ring_epoch);
+		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu\n",
+		 engine->append_count, engine->wrap_count, engine->ring_epoch,
+		 engine->draw_cache_hits, engine->draw_cache_misses,
+		 engine->draw_cache_scanout_hits, engine->draw_cache_evictions,
+		 engine->gart_update_count, engine->gart_pte_write_count,
+		 engine->gart_vga_acquire_count, engine->gart_flush_count);
 	mutex_unlock(&engine->submit_lock);
 	cdev->engine = NULL;
 	vfree(engine->run_staging_cpu);
