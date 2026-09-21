@@ -248,10 +248,9 @@ It does not consult `bo->used_modifiers` for that decision.  Chrome9 currently
 advertises the capability because `mode_config.fb_modifiers_not_supported` is
 unset.  Mesa's DRI image query asks Chrome9 `resource_get_handle()` for a KMS
 handle, and the driver returns `modifier=LINEAR`, `stride=resource->stride`,
-and `offset=resource->data_offset`.  Do not infer the live front-buffer offset
-from the guarded render-resource layout: the 2026-09-21 Xorg capture below
-proved that the modesetting front buffer was instead an exact three-MiB dumb
-GEM object submitted at offset zero.
+and `offset=resource->data_offset`.  The authoritative 2026-09-21 live Xorg
+capture below proves that this path exported the guarded allocation and its
+page offset; it did not fall back to a three-MiB offset-zero dumb buffer.
 
 Legacy `drmModeAddFB()` cannot describe the page offset and must not be the
 final direct-scanout path.  During a live Xorg run the quickest authoritative,
@@ -279,15 +278,15 @@ framebuffer[40]:
         modifier=0x0
         size=1024x768
         pitch[0]=4096
-        offset[0]=0
-        obj[0]: size=3145728 imported=no
+        offset[0]=4096
+        obj[0]: size=3153920 imported=no
 ```
 
 The corresponding atomic state had plane 36 on CRTC 38 with FB 40 and both
-`enable=1` and `active=1`.  Thus current Xorg uses a native Chrome9 GEM object;
-there is no second GPU and no PRIME/offload scanout.  The offset-zero result is
-valid for the current front buffer but does not remove the kernel requirement
-to accept offset `PAGE_SIZE` for guarded scanout resources.
+`enable=1` and `active=1`.  Thus current Xorg uses one native Chrome9 GEM
+object with exactly 770 pages; there is no second GPU and no PRIME/offload
+scanout.  The direct path must map the complete object and add offset
+`PAGE_SIZE` exactly once.
 
 ## Current kernel audit and patch boundary
 

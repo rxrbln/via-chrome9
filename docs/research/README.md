@@ -72,6 +72,9 @@ targets.
 - [iga1-vblank-flip-oracle.md](iga1-vblank-flip-oracle.md) gives the exact
   VX900 IGA1 IRQ enable/RW1C sequence, the `0204[1]` direct-base latch proof,
   and failure-safe atomic-flip ownership and teardown rules.
+- [direct-sf-scanout-review.md](direct-sf-scanout-review.md) audits the first
+  persistent SF scanout implementation, gives its exact no-reboot live gate,
+  and defines the modern DRM IRQ/event/page-flip integration boundary.
 - [vx900-kms-next-oracles.md](vx900-kms-next-oracles.md) defines the exact
   primary ARGB cursor, scanout format/pitch limits, conservative IGA2 bring-up,
   DDC/hotplug, DPMS, and VX900 pixel-PLL sequences and restore rules.
