@@ -123,6 +123,16 @@ the coherent word plus the existing cookie/PAUSE/work predicates.  Keep bits
 are each validated.  Windows' `FE330036` is a useful final policy reference,
 not the safe bring-up value.
 
+Queue-skip clear is safe only with a strict one-outstanding invariant.  The
+open manual's corresponding traditional bit says a full fence queue pauses CR
+until space is available.  Before publishing the next FE33, the synchronous
+path must have consumed the exact memory ID and drained a pending
+`0204.bit5` with the one-bit RW1C write.  The masked-IRQ oracle must also ack
+the pending status in process context before unmasking or submitting again.
+This prevents repeated lost notifications from silently filling the queue and
+turning `FE330006` into a later CR stall.  Do not add a second outstanding
+fence until queue capacity and dequeue-on-ack have a live counter oracle.
+
 ## Four-stage hardware oracle
 
 Allocate one coherent page and initially use one 16-byte slot.  Use an ID
@@ -141,7 +151,8 @@ or fixed 3D oracle.  At every stage retain the ordinary cookie and PAUSE polls.
 3. **Intentionally masked IRQ, still no wait:** use `FE330006` with the global
    gate masked for this controlled test.  The IRQ wait must time out, but the
    memory record, cookie and PAUSE must complete.  Poll recovery must classify
-   this as lost notification rather than engine busy.
+   this as lost notification rather than engine busy; write exactly
+   `0204=BIT(5)` and prove it clear before restoring the gate.
 4. **Optional interrupt-wait:** only after the first three pass, test
    `FE330016` once per boot with a remote recovery path.  The handler must ack
    before the deadline and the reader must subsequently reach PID00 PAUSE.
