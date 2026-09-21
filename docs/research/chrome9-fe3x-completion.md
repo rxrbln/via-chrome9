@@ -224,13 +224,15 @@ documented masks are:
 ```
 
 For a gate update, read once for diagnostics, then write
-`(old & ~0800f3fd) | 80000000`; all pending status positions are deliberately
-written as zero while every enable field is retained.  Disabling follows the
-same rule and clears bit 31 only when the driver's central IRQ-user accounting
-proves no display/video consumer still needs the global gate.  Do not copy the
-old Linux `0200=80000000` (destroys other enables) or Windows' unmasked OR
-(can clear sampled RW1C events).  Serialize every `0200` update through one
-driver helper so KMS and render IRQ users cannot race.
+`(old & f7ff0800) | 80000000`; all status, read-only and reserved positions are
+deliberately written as zero while every documented enable field is retained.
+Masking only `~0800f3fd` would avoid known RW1C acknowledgements but needlessly
+echo read-only/reserved positions.  Disabling writes `old & 77ff0800` only when
+the driver's central IRQ-user accounting proves no display/video consumer
+still needs the global gate.  Do not copy the old Linux `0200=80000000`
+(destroys other enables) or Windows' unmasked OR (can clear sampled RW1C
+events).  Serialize every `0200` update through one driver helper so KMS and
+render IRQ users cannot race.
 
 ## Kernel lifetime and completion state machine
 
