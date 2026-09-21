@@ -768,6 +768,57 @@ chrome9_fs_is_generic0(nir_def *def)
    }
 }
 
+static bool
+chrome9_fs_is_flat_generic0(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_intrinsic_instr *intr;
+   nir_variable *var;
+
+   if (def->num_components != 1 || def->bit_size != 32 ||
+       instr->type != nir_instr_type_intrinsic)
+      return false;
+   intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   var = nir_intrinsic_get_var(intr, 0);
+   return var && var->data.mode == nir_var_shader_in &&
+          var->data.location == VARYING_SLOT_VAR0 && !var->data.index &&
+          !var->data.location_frac && !var->data.centroid &&
+          !var->data.sample && !var->data.patch && !var->data.compact &&
+          !var->data.per_primitive && !var->data.per_vertex &&
+          var->data.interpolation == INTERP_MODE_FLAT;
+}
+
+static bool
+chrome9_fs_is_flat_generic0_rgbx(nir_def *def, unsigned depth)
+{
+   nir_instr *instr;
+
+   if (depth > 8 || def->num_components != 4 || def->bit_size != 32)
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_flat_generic0_rgbx(alu->src[0].src.ssa,
+                                               depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   nir_def *source = alu->src[0].src.ssa;
+   for (unsigned c = 0; c < 3; c++)
+      if (alu->src[c].src.ssa != source || alu->src[c].swizzle[0])
+         return false;
+   return alu->src[3].swizzle[0] == 0 &&
+          chrome9_fs_is_one(alu->src[3].src.ssa, depth + 1) &&
+          chrome9_fs_is_flat_generic0(source);
+}
+
 /* GLSL user varyings are linked to VAR0 rather than the legacy COL0 slot.
  * Accept only a complete, identity-ordered vec4 so it can be represented by
  * the same normalized D1 diffuse attribute as the proven COL0 program. */
@@ -901,6 +952,47 @@ chrome9_fs_is_generic0_vec3_rgbx(nir_def *def, nir_def **base,
    return found != NULL;
 }
 
+/* glmark2 ideas uses a two-component vertex result as
+ * vec4(VAR0.x, VAR0.x, VAR0.y, 1).  Preserve that exact component mapping in
+ * the post-TNL D1 packing path; this is not permission to accept a general
+ * varying swizzle. */
+static bool
+chrome9_fs_is_generic0_xxy_rgbx(nir_def *def, nir_def **base,
+                                unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_def *found = NULL;
+   static const unsigned component[3] = { 0, 0, 1 };
+
+   if (depth > 8 || def->num_components != 4 ||
+       instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
+      for (unsigned c = 0; c < 4; c++)
+         if (alu->src[0].swizzle[c] != c)
+            return false;
+      return chrome9_fs_is_generic0_xxy_rgbx(alu->src[0].src.ssa, base,
+                                              depth + 1);
+   }
+   if (alu->op != nir_op_vec4)
+      return false;
+   for (unsigned c = 0; c < 3; c++) {
+      nir_def *source = NULL;
+
+      if (!chrome9_fs_is_generic0_component(&alu->src[c], component[c],
+                                             &source, depth + 1) ||
+          source->num_components != 2 || (found && source != found))
+         return false;
+      found = source;
+   }
+   if (alu->src[3].swizzle[0] ||
+       !chrome9_fs_is_one(alu->src[3].src.ssa, depth + 1))
+      return false;
+   *base = found;
+   return found != NULL;
+}
+
 /* glmark2's default Gouraud material is (0, 0, 1, 1).  Linking therefore
  * reduces Color to one user varying and reconstructs blue in the FS. */
 static bool
@@ -931,6 +1023,31 @@ chrome9_fs_is_generic0_blue_rgbx(nir_def *def, nir_def **base,
       return false;
    *base = source;
    return source && source->num_components == 1;
+}
+
+static bool
+chrome9_fs_is_literal_color(nir_def *def, uint32_t *color)
+{
+   nir_instr *instr;
+   nir_load_const_instr *load;
+   float rgba[4];
+
+   if (!def || def->num_components != 4 || def->bit_size != 32)
+      return false;
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_load_const)
+      return false;
+   load = nir_instr_as_load_const(instr);
+   for (unsigned c = 0; c < 4; c++) {
+      rgba[c] = uif(load->value[c].u32);
+      if (!isfinite(rgba[c]))
+         return false;
+   }
+   *color = (uint32_t)float_to_ubyte(rgba[2]) |
+            (uint32_t)float_to_ubyte(rgba[1]) << 8 |
+            (uint32_t)float_to_ubyte(rgba[0]) << 16 |
+            (uint32_t)float_to_ubyte(rgba[3]) << 24;
+   return true;
 }
 
 static bool
@@ -1998,7 +2115,7 @@ chrome9_fs_pair(unsigned a, unsigned b, unsigned x, unsigned y)
 }
 
 static unsigned
-chrome9_fs_result(nir_def *def)
+chrome9_fs_result(nir_def *def, uint32_t *literal_color)
 {
    nir_instr *instr;
    nir_alu_instr *alu;
@@ -2008,12 +2125,20 @@ chrome9_fs_result(nir_def *def)
    if (chrome9_fs_is_flat_primary_color(def, 0))
       return CHROME9_FS_PRIMARY_COLOR;
 
+   if (chrome9_fs_is_literal_color(def, literal_color))
+      return CHROME9_FS_LITERAL_COLOR;
+
+   if (chrome9_fs_is_flat_generic0_rgbx(def, 0))
+      return CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
+
    if (chrome9_fs_is_generic0_rgba(def, 0))
       return CHROME9_FS_PRIMARY_GENERIC_RGBA;
    if (chrome9_fs_is_generic0_blue_rgbx(def, &generic, 0))
       return CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX;
    if (chrome9_fs_is_generic0_vec3_rgbx(def, &generic, 0))
       return CHROME9_FS_PRIMARY_GENERIC_RGBX;
+   if (chrome9_fs_is_generic0_xxy_rgbx(def, &generic, 0))
+      return CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX;
    if (chrome9_fs_is_generic0_rgbx(def, &generic, 0) &&
        generic->num_components == 1)
       return CHROME9_FS_PRIMARY_SCALAR_RGBX;
@@ -2074,7 +2199,7 @@ chrome9_fs_result(nir_def *def)
 }
 
 static unsigned
-chrome9_fs_classify(nir_shader *nir)
+chrome9_fs_classify(nir_shader *nir, uint32_t *literal_color)
 {
    unsigned result = CHROME9_FS_UNSUPPORTED;
    unsigned texture_count = 0;
@@ -2143,7 +2268,8 @@ chrome9_fs_classify(nir_shader *nir)
                if ((location != FRAG_RESULT_COLOR &&
                     location != FRAG_RESULT_DATA0) ||
                    written ||
-                   !(result = chrome9_fs_result(intr->src[0].ssa)))
+                   !(result = chrome9_fs_result(intr->src[0].ssa,
+                                                literal_color)))
                   valid = false;
                written = true;
                break;
@@ -2153,7 +2279,8 @@ chrome9_fs_classify(nir_shader *nir)
                    (var->data.location != FRAG_RESULT_COLOR &&
                     var->data.location != FRAG_RESULT_DATA0) ||
                    written ||
-                   !(result = chrome9_fs_result(intr->src[1].ssa)))
+                   !(result = chrome9_fs_result(intr->src[1].ssa,
+                                                literal_color)))
                   valid = false;
                written = true;
                break;
@@ -2170,8 +2297,11 @@ chrome9_fs_classify(nir_shader *nir)
    case CHROME9_FS_PRIMARY_COLOR:
    case CHROME9_FS_PRIMARY_GENERIC_RGBA:
    case CHROME9_FS_PRIMARY_GENERIC_RGBX:
+   case CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX:
    case CHROME9_FS_PRIMARY_SCALAR_RGBX:
+   case CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX:
    case CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX:
+   case CHROME9_FS_LITERAL_COLOR:
       valid = !texture_count && !constant_count;
       break;
    case CHROME9_FS_CONSTANT_COLOR:
@@ -2858,10 +2988,13 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);
       shader->fragment_program = straight_line ?
-         chrome9_fs_classify(state->ir.nir) : CHROME9_FS_UNSUPPORTED;
+         chrome9_fs_classify(state->ir.nir, &shader->literal_color) :
+         CHROME9_FS_UNSUPPORTED;
       shader->flat_primary =
          shader->fragment_program == CHROME9_FS_PRIMARY_COLOR &&
          chrome9_fs_has_flat_primary(state->ir.nir);
+      shader->flat_generic = shader->fragment_program ==
+         CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
       shader->native_fs_valid = straight_line &&
          chrome9_compile_native_fs(shader, state->ir.nir);
       if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&

@@ -28,8 +28,11 @@ struct chrome9_shader {
       CHROME9_FS_PRIMARY_COLOR,
       CHROME9_FS_PRIMARY_GENERIC_RGBA,
       CHROME9_FS_PRIMARY_GENERIC_RGBX,
+      CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX,
       CHROME9_FS_PRIMARY_SCALAR_RGBX,
+      CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX,
       CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX,
+      CHROME9_FS_LITERAL_COLOR,
       CHROME9_FS_CONSTANT_COLOR,
       CHROME9_FS_CONSTANT_MODULATE,
       CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE,
@@ -52,12 +55,14 @@ struct chrome9_shader {
       /* Generic one-instruction NIR backend result, not an app-shaped key. */
       CHROME9_FS_COMPILED_ALU,
    } fragment_program;
+   uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
    struct chrome9_ps_ir native_fs_ir;
    struct chrome9_ps_program native_fs;
    bool native_fs_valid;
    bool native_fs_from_nir;
    bool flat_primary;
+   bool flat_generic;
    bool supported;
 };
 

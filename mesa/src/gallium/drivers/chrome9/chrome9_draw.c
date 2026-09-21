@@ -198,11 +198,13 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       (crender->ctx->fs->native_fs.varying_mask & 1);
 
    crender->packed_generic =
-      program == CHROME9_FS_PRIMARY_SCALAR_RGBX ? 1 :
+      (program == CHROME9_FS_PRIMARY_SCALAR_RGBX ||
+       program == CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX) ? 1 :
       program == CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE ? 2 :
       program == CHROME9_FS_PRIMARY_GENERIC_RGBA ? 3 :
       program == CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX ? 4 :
-      program == CHROME9_FS_PRIMARY_GENERIC_RGBX ? 5 :
+      (program == CHROME9_FS_PRIMARY_GENERIC_RGBX ||
+       program == CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX) ? 5 :
       program == CHROME9_FS_IOQUAKE3_GENERIC_PACKED ? 6 :
       program == CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED ? 7 : 0;
    if (crender->packed_generic)
@@ -260,6 +262,7 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                             crender->packed_generic ? generic0 >= 0 :
                             (color0 >= 0 || (!compiled_primary &&
                              (program != CHROME9_FS_PRIMARY_COLOR &&
+                              program != CHROME9_FS_LITERAL_COLOR &&
                               program != CHROME9_FS_TEXTURE_MODULATE &&
                               program != CHROME9_FS_TEXTURE_PROJECTED_MODULATE &&
                               program !=
@@ -1259,6 +1262,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    uint32_t depth_flags = 0;
    const bool flat_primary = ctx->fs && ctx->fs->flat_primary &&
       ctx->fs->fragment_program == CHROME9_FS_PRIMARY_COLOR;
+   const bool flat_generic = ctx->fs && ctx->fs->flat_generic &&
+      ctx->fs->fragment_program == CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
 
    if (((!crender->textured &&
          (ctx->draw_triangle_batch ||
@@ -1374,6 +1379,27 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                 4 * sizeof(float),
              sizeof(flat_color));
    }
+   if (flat_generic) {
+      float gray_float;
+      unsigned gray;
+
+      if (provoking >= crender->vertex_count ||
+          (size_t)(provoking + 1) * crender->vertex_size >
+             crender->capacity) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      memcpy(&gray_float,
+             crender->vertices + (size_t)provoking * crender->vertex_size +
+                4 * sizeof(float),
+             sizeof(gray_float));
+      if (!isfinite(gray_float)) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      gray = float_to_ubyte(gray_float);
+      flat_color = gray | gray << 8 | gray << 16 | 0xff000000;
+   }
    for (unsigned i = 0; i < 3; i++) {
       const uint8_t *vertex;
       const float *position;
@@ -1417,15 +1443,18 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                        (uint32_t)float_to_ubyte(packed[5]) << 24;
          } else if (crender->packed_generic == 3 ||
              crender->packed_generic == 5) {
-            unsigned components = crender->packed_generic == 3 ? 4 : 3;
+            const bool xxy = ctx->fs->fragment_program ==
+               CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX;
+            unsigned components = crender->packed_generic == 3 ? 4 :
+                                  xxy ? 2 : 3;
 
             for (unsigned c = 0; c < components; c++)
                if (!isfinite(packed[c])) {
                   ctx->rejected_triangles++;
                   return;
                }
-            color = (uint32_t)float_to_ubyte(packed[2]) |
-                    (uint32_t)float_to_ubyte(packed[1]) << 8 |
+            color = (uint32_t)float_to_ubyte(packed[xxy ? 1 : 2]) |
+                    (uint32_t)float_to_ubyte(packed[xxy ? 0 : 1]) << 8 |
                     (uint32_t)float_to_ubyte(packed[0]) << 16 |
                     (crender->packed_generic == 3 ?
                      (uint32_t)float_to_ubyte(packed[3]) << 24 :
@@ -1445,10 +1474,12 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       } else {
          memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
       }
-      if (flat_primary)
+      if (flat_primary || flat_generic)
          color = flat_color;
       if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program))
          color = constant_color;
+      if (ctx->fs->fragment_program == CHROME9_FS_LITERAL_COLOR)
+         color = ctx->fs->literal_color;
       if (ctx->fs->fragment_program ==
              CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA &&
           color != 0xffffffff) {
