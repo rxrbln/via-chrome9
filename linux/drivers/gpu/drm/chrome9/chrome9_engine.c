@@ -552,6 +552,9 @@ static bool chrome9_draw_has_blend(const struct chrome9_draw_request *request)
 	return request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_BLEND ||
 	       request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BLEND ||
 	       request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
+	       (request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16 &&
+		(request->flags & DRM_CHROME9_TEXTURED_D16_SOURCE_OVER)) ||
 	       (request->triangle_count &&
 		(request->flags & DRM_CHROME9_TRIANGLE_BATCH_BLEND));
 }
@@ -3787,7 +3790,8 @@ int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	if (!(args->flags & DRM_CHROME9_DEPTH_FUNC_MASK) ||
-	    chrome9_validate_depth_flags(args->flags, 0) ||
+	    chrome9_validate_depth_flags(
+		args->flags, DRM_CHROME9_TEXTURED_D16_SOURCE_OVER) ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->destination_handle || !args->texture_handle ||
 	    !args->depth_handle ||
@@ -3857,6 +3861,21 @@ int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,
 					    args->vertices[2].x_16_16,
 					    args->vertices[2].y_16_16))
 		return -EINVAL;
+	if (args->flags & DRM_CHROME9_TEXTURED_D16_SOURCE_OVER) {
+		request.blend.flags = DRM_CHROME9_BLEND_ENABLE;
+		request.blend.rgb_src_factor =
+			DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA;
+		request.blend.rgb_dst_factor =
+			DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA;
+		request.blend.alpha_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+		request.blend.alpha_dst_factor =
+			DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA;
+		request.blend.rgb_func = DRM_CHROME9_BLEND_FUNC_ADD;
+		request.blend.alpha_func = DRM_CHROME9_BLEND_FUNC_ADD;
+		request.blend.color_mask = DRM_CHROME9_COLOR_MASK_R |
+			DRM_CHROME9_COLOR_MASK_G | DRM_CHROME9_COLOR_MASK_B |
+			DRM_CHROME9_COLOR_MASK_A;
+	}
 	return chrome9_submit_depth_triangle(drm, file, &request);
 }
 
