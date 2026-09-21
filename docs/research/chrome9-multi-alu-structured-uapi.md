@@ -299,6 +299,42 @@ color/depth guards, cookie retirement, 0400/040c idle state, and a clean
 follow-up command-19 one-record draw. Keep the feature disabled by default
 until the full transition sequence passes on VX900.
 
+## Patch touch points
+
+Keep version one and version two mechanically separate until both have passed
+their own tests:
+
+1. In `include/uapi/drm/chrome9_drm.h`, add the fixed-size v2 structures and a
+   newly coordinated ioctl/capability. Do not add TEMP or destination fields
+   to the meaning accepted by command 19.
+2. In `chrome9_engine.c`, retain `chrome9_ps_source_valid()` and
+   `chrome9_encode_ps_instruction()` as the v1 validator. Add a distinct v2
+   whole-program validator/encoder with two passes and compile-time size
+   assertions.
+3. Extend the internal `chrome9_draw_request` to carry 12 kernel-built ALU
+   words plus `ps_program_count`; zero the unused tail. Do not infer count by
+   scanning words.
+4. Thread that explicit count through `chrome9_draw_triangle_batch()`. The v1
+   ioctl passes one; v2 passes its validated 1..3 count. Validation errors
+   return before `memdup_array_user()`, BO reservation, or publication.
+5. In `chrome9_build_depth_triangle()`, replay the normal complete state,
+   patch `body[142+delta]`, shift the immediate-vertex header, copy exactly
+   `count*4` ALU dwords, and adjust every following offset by
+   `program_extra`. The per-draw replay ensures a following v1 draw restores
+   A92=one; never rely on inherited program count.
+6. Advertise the new capability from `chrome9_drv.c` only behind a distinct
+   default-off module gate until all live oracles pass. Timeout quarantine and
+   teardown ownership remain unchanged.
+7. In Mesa `chrome9_drm.c`, add a wrapper for the new fixed-size request. In
+   `chrome9_draw.c`, select it only through the submission gate above and
+   perform explicit enum translation. Preserve command 19 as the preferred
+   one-record route until the v2 capability is present and proven.
+
+The maximum 544-triangle run grows by only eight dwords at three ALUs. Each
+extra record is four dwords, so all following H2 headers retain 16-byte
+alignment. The builder must still use its existing staging-capacity and
+read-ahead checks rather than relying on this arithmetic informally.
+
 ## Explicit exclusions
 
 This design does not admit textures, more than one constant, partial writes,
