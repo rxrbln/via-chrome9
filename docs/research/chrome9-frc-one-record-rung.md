@@ -53,8 +53,10 @@ silicon.
 ## Why FRC is the next fail-closed operation
 
 The intended PS 2.0/NIR relation is `fract(x) = x - floor(x)`. For finite
-input its mathematical result is bounded to `[0,1)`, so it cannot create an
-infinity or NaN. The normalized D1 v0 input is already finite and in `[0,1]`.
+input its mathematical result is bounded to `[0,1)`, while FP32 evaluation
+may round a small negative fraction to exactly 1.0.  Thus a finite input stays
+finite in `[0,1]` and cannot create an infinity or NaN. The normalized D1 v0
+input is already finite and in `[0,1]`.
 That makes terminal identity-swizzle `ffract(v0)` the narrowest new semantic
 key: it consumes no user float constant and has no overflow surface.
 

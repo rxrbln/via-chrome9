@@ -60,6 +60,12 @@ targets.
   fail-closed NIR key, and D16-mandatory numerical oracles.
 - [chrome9-frc-one-record-corpus.tsv](chrome9-frc-one-record-corpus.tsv)
   retains the six byte-matched Windows/Linux FRC records.
+- [chrome9-frc-static-finalizer-audit.md](chrome9-frc-static-finalizer-audit.md)
+  audits both FRC emitters, proves the compiler has no magnitude validation,
+  aligns NIR/TGSI floor semantics, and defines exact precision-edge oracles.
+- [chrome9-frc-dependency-corpus.tsv](chrome9-frc-dependency-corpus.tsv)
+  retains three producer/consumer chains showing only the generic ALU
+  dependency rewrite and no FRC-specific finalizer control.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
