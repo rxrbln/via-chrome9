@@ -30,6 +30,10 @@ targets.
 - [xorg-one-texture-oracle.md](xorg-one-texture-oracle.md) records the exact
   232-dword normal one-texture successor, including sampler state, texture
   instruction, five-instruction VS, PS, and normalized quad coordinates.
+- [glamor-copy-raster-contract.md](glamor-copy-raster-contract.md) maps Xorg
+  `copy_area_` through Gallium draw to the proven native texture packet,
+  identifies every sampler-without-triangle exit, and defines the minimal
+  viewport/scissor/cull boundary trace for the current black-window failure.
 - [mesa-texture-bringup.md](mesa-texture-bringup.md) turns that live oracle
   into the smallest truthful one-unit Gallium/UAPI path, records the exact
   REPLACE and MODULATE programs, and lists the remaining GL 1.3 state gates.
