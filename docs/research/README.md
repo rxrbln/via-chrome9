@@ -108,6 +108,10 @@ targets.
 - [game-raster-depth-stencil-oracles.md](game-raster-depth-stencil-oracles.md)
   gives packet-exact depth, stencil, culling, polygon-offset, color-mask,
   clear, native-line, and point oracles plus state-transition closure rules.
+- [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
+  cross-checks Linux and both Windows fixed-state builders, defines the
+  structured depth/cull/stencil lowering boundary, records Gallium's stencil
+  operation remap, and keeps compatibility alpha test on fixed A33.
 - [render-to-scanout-ownership.md](render-to-scanout-ownership.md) defines the
   same-device, same-BO 3D-to-IGA1 ownership boundary and separates producer
   drain, display latch, GTI invalidation, and CPU cache transitions.
