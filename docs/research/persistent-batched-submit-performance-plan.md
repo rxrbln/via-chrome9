@@ -204,11 +204,22 @@ Implement this tranche without changing GART lifetimes:
    run: one `drm_exec`, one fence, one transient SF mapping, one guard/cache
    ownership interval, one append, and one `chrome9_wait_job()`.
 
-The largest `0x7f10` copy is less than half the 64-KiB ring.  A second
-maximum-size command will usually force the current bounded PID10/full
-reinstall path; that is safe and intentional.  Do not enlarge the ring or
-enable vendor circular byte reuse in this tranche.  Ring size can be raised
-independently after the list packet is proven.
+The largest `0x7f10` copy is less than half the 64-KiB ring.  The append
+cursor advances to `PAUSE + 0x10`, not to the copied read-ahead end, so exact
+maximum-run packing per ring epoch is:
+
+| path | next append after one | successful starts | wrap before |
+|---|---:|---|---:|
+| D16 RHW 272 | `0x5000` | `0x0000,0x5000,0xa000` | fourth run |
+| one texture 256 | `0x6400` | `0x0000,0x6400` | third run |
+| two texture 256 | `0x7c80` | `0x0000,0x7c80` | third run |
+
+For the limiting two-texture row, the second copied end is `0xfb90` and the
+next append is `0xf900`; the third fails the append-space check and takes the
+current bounded PID10/full reinstall path.  This is safe and intentional.
+Do not enlarge the ring or enable vendor circular byte reuse in this tranche.
+Ring size can be raised independently after the list packet is proven and
+wrap counters show that it matters.
 
 ### Mesa state lifetime
 
@@ -264,7 +275,8 @@ Promote each path independently in this order:
 4. 272 triangles for D16 RHW;
 5. every supported depth/blend/program endpoint, with the highest-size
    two-texture program-2 row last;
-6. two consecutive maximum runs to force a monotonic-ring wrap.
+6. three consecutive maximum textured runs and four consecutive maximum D16
+   runs to force their respective monotonic-ring wraps.
 
 Each gate requires exact interior samples, unchanged guard pages, cookie and
 PAUSE retirement, engine error register `040c=0`, safe unload/reload, and a
