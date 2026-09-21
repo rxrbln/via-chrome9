@@ -1004,6 +1004,177 @@ stage 1, expected RGBA modulation is again red/black/blue/yellow.  Validate
 this before compressed formats: it exercises non-four-byte pitch/range logic
 without block addressing or alpha ambiguity.
 
+### Ordered ioquake3 follow-on gates: wrap, alpha test, then fog
+
+After two-texture+D16, the first game-visible limitation is the coordinate
+validator, not another fragment program.  Tiled base images routinely need
+coordinates outside `[0,1]`, while atlas/lightmap coordinates ordinarily stay
+inside it.  Alpha-tested lightmapped surfaces are the next bounded state
+combination.  Fixed fog is third: its register map is known, but the W/Z
+choice and LINEAR/EXP/EXP2 numeric conventions have not retired on silicon.
+Do not advertise fixed fog merely because its enable words can be emitted.
+
+#### Gate 1: independent wrapping with out-of-range D3/D4
+
+The existing wrap discriminator above is already the exact first test.  It
+changes no packet count, relocation, shader, FVF, or BO lifetime:
+
+```text
+stage 0 A32 = 32000052              # repeat
+stage 1 A32 = 32000049              # clamp to edge
+D3 at all vertices = bec00000 3f000000   # (-0.375, 0.5)
+D4 at all vertices = 3fb00000 3f000000   # (+1.375, 0.5)
+```
+
+With the blue/red/green/white vertical bands in both 32x32 sources, stage 0
+repeats to green and stage 1 clamps to white, so the final RGBA product is
+exactly `0000ff00`.  The deliberately small excursions are only twelve texels
+past an edge if wrap is accidentally bypassed, keeping a failed linear access
+inside the adjacent mapped guard.  Check both complete source data ranges and
+all six guards after retirement.  Run the converse state as a second job
+(stage 0 clamp at `+1.375`, stage 1 repeat at `-0.375`) and require green
+again; this prevents one working sampler from hiding an aliased selector.
+
+The kernel interface must expose normalized per-stage modes and lower them,
+not accept raw A32 words.  The exact established encodings are:
+
+| API mode | A32 |
+|---|---:|
+| clamp to edge | `32000049` |
+| repeat | `32000052` |
+| mirrored repeat | `3200005b` |
+| border | `32000040` |
+
+Keep the first public loosening finite and bounded to `[-0.5,1.5]` independently
+for S/T and D3/D4.  This admits the guarded repeat/clamp discriminator without
+immediately accepting large arbitrary values.  The one-page failure
+containment above additionally depends on that oracle's fixed 32x32 images;
+the coordinate bound alone is not a memory-safety substitute for proving the
+sampler on larger images.  Mesa must fall back for a draw outside the bound;
+clamping the submitted coordinate would silently change REPEAT semantics.
+Expand it only after guarded size/coordinate sweeps retire.  MIRROR and BORDER
+need their own capability bits and exact oracles and must not become implicit
+side effects of proving REPEAT.  In particular, BORDER additionally depends
+on the separately documented A35/A36 border-color words.
+
+Follow the wrap draw immediately with the ordinary in-range clamp draw and
+then repeat the wrap draw.  Each packet still has the base 262-dword body
+(`266` with D16), A20/A23/A24 and the vertex header stay at their existing
+indices, and the later clamp packet must write both A32 words explicitly.
+There is no new reservation or fence rule: retain both source BOs and the
+target through the one job exactly as for the base two-texture ioctl.
+
+#### Gate 2: lightmap product alpha test, then framebuffer blend
+
+Alpha test consumes the RGBA MODULATE program's resulting alpha.  For the
+base 262-dword two-texture packet, the common type-01 block has one alignment
+slot, so the first no-depth test is size preserving:
+
+```text
+body[63]  00100011                  # A00 bit 20, alpha test on RT0
+body[67]  33001202                  # A33 LESS, reference 0x80
+```
+
+All following indices remain unchanged: A20/A23/A24 are `93/94/95`, the
+RGBA source-C word is body 217, and the vertex header is body 228.  Use an
+opaque-white stage 0 and submit uniform stage-1 BGRA `40ff0000`, then (only
+after retirement) uniform `c000ff00` over the same pixels.  Correct LESS
+leaves the first red result.  Disabled alpha test leaves green, reversed
+comparison also leaves green, both killed leaves the sentinel, and a missing
+second stage leaves the opaque stage-0 alpha and kills both draws.  Both
+texture ranges and all guards must remain intact after each submit.
+
+The first alpha-plus-D16 gate should use the already-defined state-complete
+270-dword map rather than invent another placement.  Close the destination
+group with A38--A3F and the canonical COPY words
+`34000150 35000114 36000590 37000224`, and A33 at body 19.  Put D16 state in
+common body 71..75 and enable alpha through A00 at body 67.  The important
+fixed indices are therefore:
+
+```text
+body[19]      33001202              # A33 LESS/ref 0x80
+body[67]      00100011              # A00 alpha enable
+body[71..75]  A10, A11, A12, A13, A20
+body[102..103] A23, A24
+body[225]     30202053              # RGBA-by-RGBA
+body[236]     immediate vertex header
+```
+
+Clear color to zero and D16 to `ffff`.  With opaque-white stage 0, first draw
+stage-1 `c0ff0000` at Z=`4000` (killed), then stage-1 `4000ff00` at Z=`8000`
+(passes).  The exact covered result is XRGB green with depth approximately
+`8000`.  Red/`4000` diagnoses disabled or reversed alpha; zero/`4000`
+diagnoses a killed color whose depth write escaped.  This proves that the
+dual-sampler product alpha is tested before the depth update.
+
+Opaque lightmapping itself does not require framebuffer blending: the pixel
+program has already multiplied base and lightmap.  Add source-over only for
+transparent dual-texture surfaces, after the alpha+D16 kill is live.  Use the
+same 270-dword state-complete packet, format-99 target, and the established
+independent-alpha source-over words:
+
+```text
+A34..A37 = 34000020 35000148 36000590 37000244
+A00      = 00100011                 # retain RT0 blend; add alpha-test bit 20
+```
+
+The existing combined vector—textures `80ff8040` and `80ffff80`, LESS/ref
+`80`, Z=`4000`, transparent-black target—must store approximately
+`40402008` and depth `4000` (one RGB LSB tolerance).  Keep blend enable,
+compare function/reference, and destination format as normalized UAPI fields;
+userspace never supplies A00/A33/A34--A37 words.  This extension adds no BO:
+the four target/texture0/texture1/depth reservations, mappings, fences,
+guards, and timeout quarantine remain one indivisible job.  If alpha or blend
+validation fails before publication, unwind the same four-object job; after
+publication, quarantine all four on timeout.
+
+Mesa may expose fixed alpha test only when the exact fragment classifier
+guarantees a defined output alpha and the corresponding kernel capability is
+present.  Otherwise the state tracker can lower alpha test to a discard in
+NIR, which this fixed shader path does not implement and must reject.  Test
+closure in both directions with an alpha-disabled D16 draw and a one-texture
+COPY draw before enabling the path for applications.
+
+#### Gate 3: fixed-fog endpoint experiment only
+
+The lowest-risk fog test avoids every unproved table/range conversion and
+uses secondary-color alpha as an explicit interpolated factor.  Append A70--
+A72 to the base common group and let the next header align naturally:
+
+```text
+body[56..59] common type-01 header
+body[60..66] existing A86,A87,A53,A00,A01,A88,A89
+body[63]     00000f11               # all proprietary RT fog enables
+body[67]     70000020               # secondary alpha, local mode
+body[68]     71400000               # fog color red: R=0x400, G=0
+body[69]     72000000               # B=0
+body[70..71] cc000000               # alignment
+```
+
+This moves config to body 72 and makes the packet 266 dwords.  Every later
+index shifts by four: the FVF A03 word is body 91 and must change from
+`030052d0` to normalized COLOR1 `030052d1`; A20/A23/A24 become `97/98/99`,
+the RGBA source-C word becomes 221, and the vertex header becomes 232.  The
+ten-dword vertex stride is unchanged and its packed D2 word supplies the fog
+factor.  With D16 but no alpha/blend, append A10--A20 before A70--A72; the
+common block then ends at 75 and total body length is 270.
+
+Use solid white times solid blue so the PS result is blue, red fog, in-range
+coordinates, no blend, and no depth.  Submit two disjoint guarded triangles,
+one with D2=`00ffffff` and one with D2=`ffffffff`.  Under the conventional
+fog equation factor zero yields exact red and factor one exact blue; exchanged
+results identify the opposite convention without being a failure.  First run
+a red-product/red-fog no-visible-change control, and follow every fog submit
+with a normal two-texture COPY/MODULATE draw that restores A00=`00000011` and
+A03=`030052d0` and must produce its unfogged color.
+
+Passing this endpoint proves only A00/A70 enable and source selection, packed
+D2 normalization, A71/A72 channel packing, and fog composition after the
+known pixel shader.  It does **not** prove eye-Z versus W, A73/A75/A76/A77
+linear-range encoding, A78 density, EXP, or EXP2.  Keep it behind an internal
+diagnostic cap and do not expose generic Gallium/GL fog until those cases have
+guarded numeric sweeps and explicit state-closure tests.
+
 ### Bounded immediate triangle-list batching
 
 Invariant H6 state can be shared by consecutive triangles.  The Windows
