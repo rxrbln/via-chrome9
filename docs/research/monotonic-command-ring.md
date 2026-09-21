@@ -122,14 +122,17 @@ cross-checking, but it strengthens the reason to defer byte reuse until Linux
 has a bounded silicon oracle for `043c`.
 
 The adjacent VX900 128-byte rewind implementation at
-`VTGKModeDX32A.sys:0xc7f80..0xc817a` exposes a generation-sensitive conflict
+`VTGKModeDX32A.sys:0xc7f80..0xc817a` exposes a direct same-device conflict
 which makes reuse still less suitable for initial bring-up.  It emits the
 dummy H2 prefix, pads the tail with `ccccccc7` through a 128-byte cursor,
 sets A66/A67 JUMP to translated tail cursor minus **16**, resets its software
 cursor to the CPU base, sets PID00 A64/A65 to translated base minus 16, and
 writes A66, A67, A64, A65 in that order without A68.  The old Linux H5S2VP1
-path instead subtracts **64** for its JUMP address.  Both use PID00 in A65;
-neither proves that one tail offset is safe for the other subgeneration.
+path instead subtracts **64** for its JUMP address.  This is not explained by
+a different chip mapping: `via_chrome9_drm.h:170` identifies H5S2VP1 as PCI
+device `0x7122`, the same VX900 device selected by the Windows path.  Both use
+PID00 in A65, so the two shipping drivers genuinely disagree on the safe
+A66/A67 tail address for VX900.
 
 This identification is not based only on code adjacency.  The chip dispatch
 tuple in `.data` at image address `0x1084b0` is exactly
