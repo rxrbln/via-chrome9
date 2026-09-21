@@ -67,14 +67,15 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 20 | merged | `DRAW_TWO_TEXTURED_TRIANGLE_D16` |
 | 21 | reserved | `DRAW_TEXTURED_TRIANGLE_MIP` |
 | 22 | reserved | `DRAW_TRIANGLE_D16_RHW_RUN` |
-| 23 | reserved | `DEPTH_READ_ONLY` |
+| 23 | merged | `DEPTH_READ_ONLY` |
 | 24 | reserved | `DRAW_CLIP_TRIANGLE` |
 | 25 | reserved | `TWO_TEXTURE_PRIMARY_MODULATE` |
 | 26 | reserved | `DRAW_CLIP_TRIANGLE_LIST` |
 | 27 | reserved | `DRAW_TEXTURED_TRIANGLE_D16_BLEND` |
 | 28 | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND` |
+| 29 | merged | `BLEND_EXTENDED_FACTORS` |
 
-The next unreserved capability bit is 29.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 30.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -85,6 +86,5 @@ extension documented by commit `a8589b4`; that extension reuses existing
 two-texture commands and therefore consumes no ioctl ordinal.
 
 The merged boundary in this table is kernel Chrome9 commit
-`f39a90d6a16b16066dfbd53ee1674f9336d12069` and kernel UAPI commit
-`b623464ba08e02e39475e8cd67ccc31eeb75a67e`.  The reservations describe
+`f56ac02` and kernel UAPI commit `940be59`.  The reservations describe
 reviewed designs, not code present in those commits.

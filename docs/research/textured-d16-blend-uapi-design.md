@@ -11,11 +11,11 @@ silicon gates below.
 This successor combines the existing normalized
 `drm_chrome9_blend_state` with the established one- and two-texture D16
 draws. “Arbitrary blend” here means every ADD equation composed from the
-currently public ZERO, ONE, SRC_ALPHA and INV_SRC_ALPHA factors, independent
-RGB/alpha factors, any color mask, and an independent fixed alpha test. It
-does **not** silently add destination-color/alpha factors or non-ADD
-operations. Those need a separate capability when their enum validation is
-extended.
+current ZERO, ONE, source/destination color/alpha, inverse, and
+SRC_ALPHA_SATURATE factors, independent RGB/alpha factors, any color mask,
+and an independent fixed alpha test. Factors above INV_SRC_ALPHA require the
+live `CAP_BLEND_EXTENDED_FACTORS` bit 29. It does **not** silently add
+constant factors or non-ADD operations.
 
 The native state is cross-checked independently by:
 
@@ -82,7 +82,7 @@ struct drm_chrome9_draw_textured_triangle_d16_blend {
         __u32 destination_handle;       /* 0 */
         __u32 texture_handle;           /* 4 */
         __u32 depth_handle;             /* 8 */
-        __u32 flags;                    /* 12: DEPTH_FUNC field only */
+        __u32 flags;                    /* 12: DEPTH_FUNC | READ_ONLY */
         __u32 program;                  /* 16: REPLACE or MODULATE */
         __u32 width;
         __u32 height;
@@ -112,7 +112,7 @@ the blend state:
 struct drm_chrome9_draw_two_textured_triangle_d16_blend {
         __u32 destination_handle;       /* 0 */
         __u32 depth_handle;             /* 4 */
-        __u32 flags;                    /* 8: DEPTH_FUNC field only */
+        __u32 flags;                    /* 8: DEPTH_FUNC | READ_ONLY */
         __u32 width;
         __u32 height;
         __u32 destination_pitch;
@@ -127,23 +127,27 @@ struct drm_chrome9_draw_two_textured_triangle_d16_blend {
 };                                     /* size 296 */
 ```
 
-Both use an explicit nonzero depth-function field. The first implementation
-accepts LESS and LEQUAL exactly as the live D16 predecessor does. Bit zero of
-the old request (`TEXTURED_D16_SOURCE_OVER`) is invalid here: source-over is
-spelled out in `blend`, and accepting both encodings would create two sources
-of truth. Read-only depth and EQUAL remain a later capability-gated flag
-extension.
+Both accept the depth-function field plus live `DEPTH_READ_ONLY` bit 11 when
+capability bit 23 is present. A zero compare field retains legacy LESS; the
+first implementation accepts LESS and LEQUAL exactly as the live D16
+predecessor does. Bit zero of the old request
+(`TEXTURED_D16_SOURCE_OVER`) is invalid here: source-over is spelled out in
+`blend`, and accepting both encodings would create two sources of truth.
+EQUAL and the remaining compares remain later capability-gated extensions.
 
 ## Normalized validation
 
 Validation completes before GEM lookup or packet construction:
 
-1. Reject all `flags` bits outside `DEPTH_FUNC_MASK`; reject a zero field and
-   anything except LESS/LEQUAL. Require every reserved field to be zero.
+1. Reject all `flags` bits outside `DEPTH_FUNC_MASK|DEPTH_READ_ONLY` and any
+   explicit compare except LESS/LEQUAL. A zero field means legacy LESS. The
+   read-only bit is accepted only with cap 23. Require every reserved field
+   to be zero.
 2. Reuse `chrome9_validate_blend_state()`: flags may contain only BLEND and
-   ALPHA_TEST; the four current factors must be `0..3`; both functions must
-   be ADD; color mask is four bits; alpha function is `0..7`, reference is
-   `0..255`; disabled features carry their canonical zero/COPY dependents.
+   ALPHA_TEST; factors `0..3` are baseline, while `4..10` require live cap 29;
+   both functions must be ADD; color mask is four bits; alpha function is
+   `0..7`, reference is `0..255`; disabled features carry their canonical
+   zero/COPY dependents.
 3. Validate destination format BGRX/BGRA, dimensions `1..2048`, canonical
    `ALIGN(width*4,32)` color pitch, canonical `ALIGN(width*2,32)` D16 pitch,
    and the half-open scissor.
@@ -189,7 +193,7 @@ A33       = alpha_test ? 33000000 | func<<12 | encode_ref(ref)
 encode_ref(ff) = 400; encode_ref(x) = (x<<2) | (x>>6)
 ```
 
-The current factor codes are closed and exact:
+The live factor codes are closed and exact:
 
 | normalized factor | RGB code | alpha code |
 |---|---:|---:|
@@ -197,6 +201,13 @@ The current factor codes are closed and exact:
 | ONE | `15` | `19` |
 | SRC_ALPHA | `02` | `01` |
 | INV_SRC_ALPHA | `12` | `11` |
+| SRC_COLOR | `00` | `01` |
+| INV_SRC_COLOR | `10` | `11` |
+| DST_ALPHA | `03` | `02` |
+| INV_DST_ALPHA | `13` | `12` |
+| DST_COLOR | `01` | `02` |
+| INV_DST_COLOR | `11` | `12` |
+| SRC_ALPHA_SATURATE | `08` | `19` |
 
 Pack them as `A34=34000000|(rgb_src<<4)`,
 `A35=35000100|(rgb_dst<<2)`, `A36=36000400|(alpha_src<<4)`, and
@@ -254,9 +265,12 @@ body[15..18]  A34..A37
 body[19]      A33 (or canonical disabled A33)
 body[46]      A53
 body[47]      A00
-body[48]      A01 = 01c0154c REPLACE, 01ce154c MODULATE
+body[48]      A01 = 01c0154c/548 REPLACE, 01ce154c/548 MODULATE
 body[51..55]  A10,A11,A12,A13,A20
 ```
+
+The first A01 value in each pair is write-enabled; the `...548` form is
+read-only. Packet length and D16 object lifetime do not change.
 
 A13 is `13010000` for LESS or `13030000` for LEQUAL. The packet assertions
 must test both total lengths and all these fixed indices before publication.
@@ -296,7 +310,7 @@ Its common group is exact:
 ```text
 body[64..70]  A86,A87,A53,A00,A01,A88,A89
 body[71..75]  A10,A11,A12,A13,A20
-A01           01c0154c
+A01           01c0154c write, 01c01548 read-only
 ```
 
 The destination words use the same indices 6, 7--14, 15--18 and 19 as the
@@ -314,7 +328,7 @@ the fence usages are respectively:
 target   WRITE
 texture0 READ
 texture1 READ (two-texture only)
-D16      WRITE
+D16      WRITE (conservative even when DEPTH_READ_ONLY is set)
 ```
 
 Lock all three/four reservation objects in one `drm_exec`, wait for all
@@ -365,8 +379,13 @@ MMIO fault state.
    factor; and inject pre-publication and retirement failures. No invalid
    request may publish. A published timeout must quarantine all three/four
    objects and keep every guard/mapping alive.
+6. **Live ioquake filter tuple.** Prefill XRGB destination `004080c0` and D16
+   `8000`; draw equal/nearer source `00804020` with DST_COLOR,ZERO,
+   LEQUAL+READ_ONLY. Expect approximately `00202018` and depth still `8000`.
+   Follow it with opaque COPY plus write-enabled LEQUAL, then repeat. This
+   jointly proves factor value 8, A01 `...548`, and closure back to `...54c`.
 
-Only after all five pass should Mesa select these ioctls for texture+D16
+Only after all six pass should Mesa select these ioctls for texture+D16
 `blend_successor` state. Keep the old source-over ioctl as a compatibility
 fast path; it must not substitute its alpha equation for a different GL
 equation on BGRA.
