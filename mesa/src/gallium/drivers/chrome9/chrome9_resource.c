@@ -333,7 +333,8 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
         whandle->modifier != DRM_FORMAT_MOD_INVALID) ||
        !chrome9_resource_layout(templ, &layout) || templ->last_level ||
        templ->target == PIPE_BUFFER ||
-       templ->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        templ->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
        whandle->stride < templ->width0 * 4 ||
        whandle->stride > 16352 || (whandle->stride & 31))
       return NULL;
