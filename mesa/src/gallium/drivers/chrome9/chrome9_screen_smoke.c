@@ -2283,76 +2283,6 @@ out:
 }
 
 static bool
-run_pipe_partial_shadow_publish(struct pipe_screen *screen,
-                                struct pipe_resource *resource)
-{
-   const unsigned damage_x = 37, damage_y = 23;
-   const unsigned damage_width = 41, damage_height = 19;
-   const uint32_t outside = 0x0013579b;
-   const uint32_t inside = 0x00abcdef;
-   const uint32_t poison = 0x0055aa77;
-   struct chrome9_resource *external = chrome9_resource(resource);
-   struct pipe_context *context = NULL;
-   struct pipe_framebuffer_state framebuffer = {
-      .width = resource->width0,
-      .height = resource->height0,
-      .nr_cbufs = 1,
-   };
-   struct chrome9_resource *shadow;
-   uint32_t *external_pixels;
-   uint32_t *shadow_pixels;
-   bool passed = false;
-
-   if (resource->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
-       external->guarded || !external->bo.map ||
-       damage_x + damage_width > resource->width0 ||
-       damage_y + damage_height > resource->height0)
-      return false;
-   external_pixels = (uint32_t *)((uint8_t *)external->bo.map +
-                                  external->data_offset);
-   for (unsigned y = 0; y < resource->height0; y++)
-      for (unsigned x = 0; x < resource->width0; x++)
-         external_pixels[(size_t)y * external->stride / 4 + x] = outside;
-
-   context = screen->context_create(screen, NULL, 0);
-   if (!context)
-      return false;
-   framebuffer.cbufs[0].format = resource->format;
-   framebuffer.cbufs[0].texture = resource;
-   context->set_framebuffer_state(context, &framebuffer);
-   shadow = chrome9_context_render_target(chrome9_context(context));
-   if (!shadow || !shadow->guarded || shadow == external)
-      goto out;
-   shadow_pixels = (uint32_t *)((uint8_t *)shadow->bo.map +
-                                shadow->data_offset);
-   shadow_pixels[0] = poison;
-   for (unsigned y = damage_y; y < damage_y + damage_height; y++)
-      for (unsigned x = damage_x; x < damage_x + damage_width; x++)
-         shadow_pixels[(size_t)y * shadow->stride / 4 + x] = inside;
-   chrome9_context_render_target_written_region(chrome9_context(context),
-                                                damage_x, damage_y,
-                                                damage_width, damage_height);
-   context->flush_resource(context, resource);
-
-   passed = external_pixels[0] == outside &&
-            external_pixels[(size_t)damage_y * external->stride / 4 +
-                            damage_x] == inside &&
-            external_pixels[(size_t)(damage_y + damage_height - 1) *
-                            external->stride / 4 +
-                            damage_x + damage_width - 1] == inside &&
-            external_pixels[(size_t)(damage_y + damage_height) *
-                            external->stride / 4 + damage_x] == outside &&
-            smoke_guard_pages_match(shadow);
-out:
-   context->destroy(context);
-   if (passed)
-      puts("Gallium partial guarded-shadow publish passed");
-   else
-      fputs("Gallium partial guarded-shadow publish failed\n", stderr);
-   return passed;
-}
-
-static bool
 run_pipe_texture(struct pipe_screen *screen)
 {
    static const struct smoke_texture_vertex white_vertices[] = {
@@ -5267,7 +5197,6 @@ main(int argc, char **argv)
        chrome9_resource(shared_xrgb_import)->data_offset ||
        chrome9_resource(shared_xrgb_import)->bo.size !=
           chrome9_resource(shared_xrgb)->bo.size ||
-       !run_pipe_partial_shadow_publish(screen, shared_xrgb_import) ||
        !run_pipe_triangle(screen, shared_xrgb_import, NULL)) {
       fputs("shared XRGB8888 guarded-shadow contract failed\n", stderr);
       if (shared_xrgb_import)

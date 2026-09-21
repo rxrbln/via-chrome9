@@ -25,39 +25,19 @@
 #include "util/u_upload_mgr.h"
 
 static void
-chrome9_copy_surface_region(struct pipe_resource *destination,
-                            struct pipe_resource *source,
-                            unsigned x, unsigned y,
-                            unsigned width, unsigned height)
-{
-   struct chrome9_resource *dst = chrome9_resource(destination);
-   struct chrome9_resource *src = chrome9_resource(source);
-   unsigned max_width = MIN2(destination->width0, source->width0);
-   unsigned max_height = MIN2(destination->height0, source->height0);
-   uint8_t *dst_map;
-   const uint8_t *src_map;
-
-   if (x >= max_width || y >= max_height)
-      return;
-   width = MIN2(width, max_width - x);
-   height = MIN2(height, max_height - y);
-   dst_map = (uint8_t *)dst->bo.map + dst->data_offset +
-             (size_t)y * dst->stride + (size_t)x * 4;
-   src_map = (const uint8_t *)src->bo.map + src->data_offset +
-             (size_t)y * src->stride + (size_t)x * 4;
-
-   for (unsigned row = 0; row < height; row++)
-      memcpy(dst_map + (size_t)row * dst->stride,
-             src_map + (size_t)row * src->stride, (size_t)width * 4);
-}
-
-static void
 chrome9_copy_surface(struct pipe_resource *destination,
                      struct pipe_resource *source)
 {
-   chrome9_copy_surface_region(destination, source, 0, 0,
-                               MIN2(destination->width0, source->width0),
-                               MIN2(destination->height0, source->height0));
+   struct chrome9_resource *dst = chrome9_resource(destination);
+   struct chrome9_resource *src = chrome9_resource(source);
+   unsigned width = MIN2(destination->width0, source->width0) * 4;
+   unsigned height = MIN2(destination->height0, source->height0);
+   uint8_t *dst_map = (uint8_t *)dst->bo.map + dst->data_offset;
+   const uint8_t *src_map = (const uint8_t *)src->bo.map + src->data_offset;
+
+   for (unsigned y = 0; y < height; y++)
+      memcpy(dst_map + (size_t)y * dst->stride,
+             src_map + (size_t)y * src->stride, width);
 }
 
 static void
@@ -69,22 +49,8 @@ chrome9_flush_render_target(struct chrome9_context *ctx)
        !ctx->framebuffer.nr_cbufs ||
        !(external = ctx->framebuffer.cbufs[0].texture))
       return;
-   if (external != ctx->render_target) {
-      /* A windowed Present normally touches only the drawable rectangle in
-       * the root pixmap.  Publishing that union avoids copying the complete
-       * scanout shadow after every two-triangle composite. */
-      unsigned max_width = MIN2(external->width0, ctx->render_target->width0);
-      unsigned max_height = MIN2(external->height0,
-                                 ctx->render_target->height0);
-      unsigned x0 = MIN2(ctx->render_target_damage_x0, max_width);
-      unsigned y0 = MIN2(ctx->render_target_damage_y0, max_height);
-      unsigned x1 = MIN2(ctx->render_target_damage_x1, max_width);
-      unsigned y1 = MIN2(ctx->render_target_damage_y1, max_height);
-
-      if (x0 < x1 && y0 < y1)
-         chrome9_copy_surface_region(external, ctx->render_target, x0, y0,
-                                     x1 - x0, y1 - y0);
-   }
+   if (external != ctx->render_target)
+      chrome9_copy_surface(external, ctx->render_target);
    ctx->render_target_dirty = false;
 }
 
@@ -104,38 +70,7 @@ chrome9_context_depth_target(struct chrome9_context *ctx)
 void
 chrome9_context_render_target_written(struct chrome9_context *ctx)
 {
-   if (ctx->render_target)
-      chrome9_context_render_target_written_region(
-         ctx, 0, 0, ctx->render_target->width0, ctx->render_target->height0);
-}
-
-void
-chrome9_context_render_target_written_region(struct chrome9_context *ctx,
-                                             unsigned x, unsigned y,
-                                             unsigned width,
-                                             unsigned height)
-{
-   unsigned x1, y1;
-
-   if (!ctx->render_target || x >= ctx->render_target->width0 ||
-       y >= ctx->render_target->height0 || !width || !height)
-      return;
-   width = MIN2(width, ctx->render_target->width0 - x);
-   height = MIN2(height, ctx->render_target->height0 - y);
-   x1 = x + width;
-   y1 = y + height;
-   if (!ctx->render_target_dirty) {
-      ctx->render_target_damage_x0 = x;
-      ctx->render_target_damage_y0 = y;
-      ctx->render_target_damage_x1 = x1;
-      ctx->render_target_damage_y1 = y1;
-      ctx->render_target_dirty = true;
-      return;
-   }
-   ctx->render_target_damage_x0 = MIN2(ctx->render_target_damage_x0, x);
-   ctx->render_target_damage_y0 = MIN2(ctx->render_target_damage_y0, y);
-   ctx->render_target_damage_x1 = MAX2(ctx->render_target_damage_x1, x1);
-   ctx->render_target_damage_y1 = MAX2(ctx->render_target_damage_y1, y1);
+   ctx->render_target_dirty = true;
 }
 
 static void
@@ -2946,7 +2881,7 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
        (resource = ctx->render_target)) {
       chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
                            height);
-      chrome9_context_render_target_written_region(ctx, x, y, width, height);
+      chrome9_context_render_target_written(ctx);
       /* Imported drawable targets render through a guarded shadow.  Clears
        * are synchronous CPU writes, so publish the completed image now even
        * when the state tracker keeps this framebuffer bound. */
@@ -3001,7 +2936,7 @@ chrome9_clear_render_target(struct pipe_context *pipe,
    chrome9_clear_target(chrome9_resource(target), color,
                         x, y, width, height);
    if (target == ctx->render_target) {
-      chrome9_context_render_target_written_region(ctx, x, y, width, height);
+      chrome9_context_render_target_written(ctx);
       chrome9_flush_render_target(ctx);
    }
 }
