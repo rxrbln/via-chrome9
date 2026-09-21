@@ -641,8 +641,21 @@ the exact selected input back to `Z:\tmp\chrome9-shader-used.bin`, plus
 layouts are tied to the documented DLL hash.  Raw and final forms are retained
 separately so instruction rewriting can be distinguished from emitter output.
 
-The current wrapper builds as a PE32 console executable with SHA-256
-`332d9d7adfb2c6f66b20a000fb29bc691ebef06d21b0e1eb2233ed8946b798ec`.
+With LLD's PE timestamp disabled, the current wrapper builds reproducibly as a
+PE32 console executable with SHA-256
+`a87f9bf57008362bdfb8e616860b19dd8d8442d17b5c5f0e77edb4b2ec13d94c`:
+
+```sh
+clang --target=i686-w64-windows-gnu -fuse-ld=lld -nostdlib \
+  -Wall -Wextra -Werror -Wl,--no-insert-timestamp \
+  -Wl,-entry,mainCRTStartup -Wl,-subsystem,console \
+  -L/usr/lib64/wine/i386-windows tools/wine_shader_probe.c \
+  -lkernel32 -o /tmp/wine_shader_probe.exe
+```
+
+Two independent builds were byte-identical.  Omitting
+`--no-insert-timestamp` gives a different PE hash on each build even though
+the compiler behavior is unchanged.
 With no optional input present, its built-in `ps_2_0; mov r0,c0; end` returns
 zero and produces one ALU record, no TAU records.  Raw and finalized ALU are
 byte-identical, 16 bytes, SHA-256
@@ -664,6 +677,38 @@ Raw and final stores are also identical in this small sample; nontrivial
 programs must still use the finalized streams and metadata.  Compiler-object
 files contain process pointers and consequently are not suitable hash-stable
 golden blobs.
+
+The Windows command builder independently confirms every PS framing field at
+`0x1015b6d4..0x1015b909`.  Its `esi` is the compiled-object view at object
+`+10`, so these address expressions are normalized back to object offsets:
+
+| Command word | Compiled-object source |
+|---:|---|
+| `A90` | `+2c OR +6c` |
+| `A91` | `+70` |
+| `A92` | `+18 OR (+24 << 16)`; ALU/TAU counts |
+| `A93`,`A94` | `+60,+64`; TAU-to-ALU maps |
+| `A95`..`A9a` | `+48`..`+5c`; ALU-to-TAU maps |
+| `A9b` | low 24 bits of runtime state |
+
+It emits `fe020440,0000043c,00010000,cc000000` before those twelve words.
+When ALU count is nonzero, `0x1015b833..0x1015b890` emits selector
+`20030000`, payload count `ALU_count*4`, and copies `ALU_count*16` bytes from
+object `+14`.  When TAU count is nonzero, `0x1015b8b3..0x1015b909` emits
+selector `21030000`, payload count `TAU_count`, and copies `TAU_count*4` bytes
+from object `+20`.  Each type-03 packet is independently padded to a 16-byte
+boundary before its header.  This matches the symbolized Linux
+`stmUpdatePS_inv` path field-for-field.
+
+Two headless compiler differentials close the multi-store scheduling path.
+Two independent TEXLDs followed by one MUL produce ALU count 1, TAU count 2,
+T2A `object+60=2`, and no A2T bits; the exact controls are
+`90000000 91000000 92020001 93000002` followed by eight zero payloads through
+A9b.  Feeding the first result `r0` to the second TEXLD coordinate inserts an
+ALU move: counts become 2/2, T2A becomes 3, and A2T word zero becomes 1.  Its
+controls are `90000000 91000000 92020002 93000003 94000000 95000001` followed
+by six zero payloads.  The exact native streams and hashes are recorded in
+`shader-isa.md`; neither test opens an adapter, device, or kernel interface.
 
 This makes large differential sweeps of opcodes, indices, swizzles,
 writemasks, and modifiers possible entirely on Linux.  It does not replace
@@ -700,6 +745,13 @@ native instructions at object `+424`, stored at `+42c`, and writes a bounded
 `Z:\tmp\chrome9-vs-native.bin`.  It never calls OpenAdapter, creates a D3D
 device, submits commands, or loads `VtgKModeDX32A`; consequently it is a safe
 offline compiler oracle, not a GPU execution probe.
+
+The same reproducible link command with `tools/wine_vs_shader_probe.c`
+produces SHA-256
+`831d3d34b98f576e851ec8b5295c78d5aaec64e51cba7704fbf7c2e6fd62e9d2`.
+Its built-in native blob is SHA-256
+`76f05f6e944852a83b216ea015cc6748e4238e592b72f0d154af9913b38fb256`;
+two byte-identical wrapper builds both reproduced that output under Wine.
 
 The corresponding static upload path at `0x1015abb0` reads native count
 `+424`, copies `count * 16` bytes from `+42c`, and selects `31030000` at

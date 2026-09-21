@@ -230,6 +230,28 @@ exist or retire correctly on VX900.  The recovered vendor compiler reaches a
 stricter practical boundary first: 256 normalized source records and 295
 native-array records, both unchecked as described above.
 
+The Windows compiler object used by the headless wrapper has a separately
+allocated native array, so it exposes the nine-bit failure even when the
+Linux object's overlapping native area would already have overflowed.  A
+shader containing 169 NRM instructions followed by full oPos and oD0 writes
+parses as 171 source records (`parsed+0x2ea4=0xab`) and returns success with:
+
+```text
+native+0x14 = 00000202    # 514 active records
+native+0x424 = 00000204   # 516 uploaded records
+```
+
+`stmUpdateVS_inv:0x17c593..0x17c5b2` explicitly computes
+`(active_count - 1) & 0x1ff`, so last index 513 becomes A60 index one.  The
+compiler neither truncates nor rejects the program.  Input token SHA-256 is
+`5cc5add5e6cc504625285d609f3884e1c47e5b57834b93e6db03212feae1c85a`;
+the 516-record native blob SHA-256 is
+`0ca5e97c11dc630daffb0ec3ce51beccc22ed4fca9b7be8ff5673e7fe16c20d9`.
+This is a deterministic offline compiler result, not a hardware test.  Mesa
+must reject after native lowering/finalization unless both active count and
+total upload count fit the 512-record architectural store, and may choose a
+lower conservative cap until silicon execution bounds are tested.
+
 ## Vertex native instruction layout
 
 The following fields are established by direct emitter differentials and by
@@ -713,6 +735,252 @@ The main programmable path also has the known 256-`vec4` full upload and
 dirty-run updates in `stmPVSUpdateDirtyConst_H5` (`0x0017bc60`).  Integer
 and boolean details are given above.
 
+### Fixed-function lighting allocation
+
+The old OpenGL fixed-function builder statically unrolls at most eight lights.
+`stmFFVSLightCompute_H5i:0x1b00b8..0x1b0117` tests eight enable bits from
+builder byte `+1`, extracts two mode bits per light from word `+2`, and routes
+mode 1 to `stmFFVS_PointSpotLight_H5i(...,0)`, mode 2 to the same function
+with final argument one, and mode 3 to `stmFFVS_DirectionalLight_H5i`.
+Unsupported/zero mode emits no per-light body; there is no runtime native
+shader branch for the light type.
+
+`stmFFVS_UpdateLightConst_H5i:0x1afde0..0x1afedf` assigns light `i` ten
+private float constants in two runs:
+
+```text
+c(135 + 3*i) .. c(137 + 3*i)
+c(159 + 7*i) .. c(165 + 7*i)
+```
+
+Across `i=0..7`, the blocks are c135..c158 and c159..c214.  The producer at
+`stmFFVSUpdatePreCalcConst_H5i:0x176b58..0x176cae` makes the first run
+semantic rather than merely an allocator artifact.  For each `0x74`-byte
+D3D-style light record it writes three componentwise color products:
+
+| constant | light record | material/context | meaning |
+|---|---:|---:|---|
+| `c(135+3*i)` | `+0x24` | `+0x4f54` | ambient product |
+| `c(136+3*i)` | `+0x04` | `+0x4f44` | diffuse product |
+| `c(137+3*i)` | `+0x14` | `+0x4f64` | specular product |
+
+Each row is one four-float vector.  Two members of the second run are now
+assigned directly from the update code.  At `0x176d53..0x176db4`,
+`c(162+7*i)` is produced from the light direction at record `+0x40` using the
+matrix at driver context `+0x300`, followed by the vector-normalization
+callback.  At `0x1772c1..0x1772ff`, `c(163+7*i)` is produced from the light
+position at record `+0x34` using that same matrix.  Thus the seven-vector run
+is currently:
+
+```text
+c159..c161 + 7*i    alternate ambient/diffuse/specular color triplet
+c162       + 7*i    transformed, normalized light direction
+c163       + 7*i    transformed light position
+c164       + 7*i    point/spot distance-attenuation vector
+c165       + 7*i    spot-cone vector
+```
+
+The labels for c159..c161/c164/c165 come from exact emitter use, not guessed
+payload components: internal flags `ff` select c159..c161 in the same three
+color positions where flags `c0` use the pre-multiplied c135..c137 triplet;
+point and spot bodies consume c164 in their common distance path, while only
+spot consumes c165 in its eleven-record cone extension.  The per-component
+operand contract is partly visible too.  The common path reads c164 as
+`(y,z,w,0)` (`00690a74`) and separately as `xxxx` (`00690000`): X is the
+range/cutoff scalar and YZW are the three attenuation-coefficient slots,
+although any CPU-side numerical preprocessing remains unresolved.  The spot
+extension reads every c165 component separately: negated Z (`00695249`), W
+(`00695b6c`), Y (`00694924`), and X (`00694000`).  Setter differentials are
+still required to name their exact precomputed cone formulas.  This
+80-constant private layout is relevant to reproducing the vendor fixed
+function compiler, but it is not required by the current CPU draw-module TNL
+path.
+
+[`tools/re/chrome9_ffvs_light_probe.c`](../../tools/re/chrome9_ffvs_light_probe.c)
+calls either one per-light emitter or the complete light accumulator under
+`qemu-i386`.  It supplies the exact ten class/id pairs above and no GL, DRM,
+or hardware context.  The probe executable used here has SHA-256
+`df8bfca08baae4182a7f6e7daca9be77071ed7f6fe8d25b9858607282ea34ec0`.
+The minimal builder flag `0x80` emits these four native records:
+
+```text
+0061c14c 00206490 0010814c 0004012f
+00104154 00688155 00000000 00060141
+0011014c 00000000 00000000 0030016f
+0062014c 00118924 0010814c 0004012f
+```
+
+Their little-endian stream SHA-256 is
+`4ab828df4b487875c23e375390a9f7a6bd8acbd13afc489595ad217531874970`.
+Adding builder bit `0x40` (`flags=0xc0`) expands the exact body to 13 records:
+
+```text
+0061c14c 00206490 0010814c 0004012f
+00206d95 00000000 00000000 0008015f
+00114154 00206490 00688155 0004015f
+00114154 00114154 00000000 00060158
+00115b6c 00000000 00000000 002a0158
+00114154 00115b74 00206db4 0004015f
+00104154 00688155 00000000 00060141
+00104154 00114154 00000000 00060142
+0011014c 00000000 00000000 0030016f
+0062414c 00119248 00206db4 0004015f
+00110924 00618000 00000000 00140168
+0011414c 00119b6c 0010c14c 0004013f
+0062014c 00118924 0010814c 0004012f
+```
+
+That stream hashes to
+`db3bdb101aa051ee8551e13fcea0a450e27baf116fd9b342a27ff7f04cfb442b`.
+The same probe selects the point/spot emitter with its exact fourth argument.
+With internal flags zero, point mode emits ten records:
+
+```text
+0068c154 00206490 00100155 0004016f
+00118154 00118154 00000000 0006015f
+00115b6c 00000000 00000000 002a0158
+00116150 0011638c 00206db4 0004015f
+00114154 00690a74 00000000 00060144
+00111248 00000000 00000000 00280144
+00115248 00690000 00000000 00160151
+00111248 00114000 00206db4 00040144
+00118154 00115b74 00206db4 0004016f
+0061c14c 00111248 0010814c 0004012f
+```
+
+Its stream SHA-256 is
+`002c6e4e8a68af8b983b793fcc3cbb3816c8d6441238471a8e652864d4cb8fdc`.
+Spot mode retains those distance/attenuation records and inserts eleven cone
+records before the final dot/product:
+
+```text
+0068c154 00206490 00100155 0004016f
+00118154 00118154 00000000 0006015f
+00115b6c 00000000 00000000 002a0158
+00116150 0011638c 00206db4 0004015f
+00114154 00690a74 00000000 00060144
+00111248 00000000 00000000 00280144
+00115248 00690000 00000000 00160151
+00111248 00114000 00206db4 00040144
+00118154 00115b74 00206db4 0004016f
+00688155 00118154 00000000 00060151
+00114000 00206490 00695249 00040152
+00114924 00206db4 00000000 00100152
+00114924 00695b6c 00206db4 00040152
+00114000 00694924 00000000 00160154
+00115248 00114924 00206490 001a0152
+00114924 00000000 00000000 00240154
+00115248 00694000 00206db4 00040154
+00115248 00000000 00000000 00200154
+00114924 00115248 00206db4 001a0154
+00111248 00115248 00206db4 00040144
+0061c14c 00111248 0010814c 0004012f
+```
+
+The 21-record spot stream SHA-256 is
+`60971cb6d4b6ddbd61dc5dd5ee1e36106e3fa22d0f3434f954259d1f91835fae`.
+At flags `0x80`, the point and spot variants contain 14 and 25 records, with
+hashes `f5ea29c83a879aca78ca60f95eb5bd01627db521187da48a48b308824ae5251f`
+and `60080707718195b609f5c3a1a22e68b89bf8d11ab026c4d0b04f1b1abf02b5a2`.
+These flags are internal fixed-function-builder inputs, not API capability
+bits.  An isolated flag sweep, unified-register identities, and the complete
+`stmFFVSLightCompute_H5i` wrapper now assign the byte rather than merely
+bounding its structural effects:
+
+| bit | exact compiler effect |
+|---:|---|
+| `0x01` | lighting enable; tested by `stmFFVSCompile_UnTransform_H5i` before calling the complete light builder |
+| `0x02` | local-viewer specular; on a `0xc0` light it inserts DP3/RSQ/scale records which normalize the eye vector before constructing the half vector |
+| `0x04` | source emissive material from the per-vertex material temporary rather than the fixed material constant |
+| `0x08` | source ambient material from the per-vertex material temporary; changes c135 to raw light-ambient c159 and introduces the vertex multiply |
+| `0x10` | source diffuse material from the per-vertex material temporary; changes c136 to raw light-diffuse c160 and introduces the vertex multiply |
+| `0x20` | source specular material from the per-vertex material temporary; on the `0x40` path changes c137 to raw light-specular c161 and introduces the vertex multiply |
+| `0x40` | emit the specular/secondary-color light path |
+| `0x80` | emit the primary ambient/diffuse light path |
+
+The accumulator prologue is an independent proof for bits 2 and 3.  With
+flags `00`, it initializes the primary accumulator from c130.  Flags `04`
+use `c129 + vertex_emissive`; flags `08` use
+`global_ambient * vertex_ambient + c131`; flags `0c` use
+`global_ambient * vertex_ambient + vertex_emissive`.  The constant producer
+at `0x176a40..0x176b19` computes c129 as fixed-material ambient times global
+ambient and c130 as that value plus fixed-material emissive.  Thus the four
+forms are algebraically consistent, not labels inferred from record count.
+
+The complete one-directional-light streams for flags `00,04,08,0c,80,c0,c2,ff`
+contain `4,4,5,5,7,20,22,25` records and hash respectively to
+`215624b1`, `e802300d`, `af6f4a3f`, `0fcbf908`, `d0fe0172`, `b4d3371b`,
+`bb4db8aa`, and `8f3f9b65` (first eight SHA-256 digits).  At flags `c0`, the
+complete point and spot streams contain 31 and 42 records, hashes
+`9119ba1c` and `e83f8d08`; local viewer (`c2`) raises those to 33 and 44,
+hashes `00652403` and `3dd88e02`.  These wrapper results include accumulator
+initialization and output MOVs, so they are the appropriate whole-light
+goldens for a future Mesa fixed-function lowering.
+
+For the isolated directional emitter, the same mapping produces these exact
+structural deltas:
+
+| flag delta | effect in `stmFFVS_DirectionalLight_H5i` |
+|---:|---|
+| `0x02` | adds two local-viewer eye-vector records, but only on the `0x40` specular path |
+| `0x08` | selects the per-vertex ambient-material operands; count unchanged |
+| `0x80` | enables the four-record primary path instead of returning after ambient |
+| `0x40` | with `0x80`, expands four records to thirteen by adding specular |
+| `0x10` | adds one per-vertex diffuse-material record |
+| `0x20` | adds one per-vertex specular-material record, only with `0x40` |
+
+The corresponding isolated-emitter raw stream hashes for flags
+`80,88,90,a0,c0,c8,d0,e0,f0` are respectively
+`4ab828df`, `67a39939`, `fa655924`, `4ab828df`, `db3bdb10`, `9279a576`,
+`d73cde6b`, `ecc28540`, and `8a00d505` (first eight SHA-256 hex digits).
+This table and the complete-wrapper hashes above provide both narrow and
+whole-program regression vectors for the assigned state key.
+
+The fixed-function output object has a stricter storage hazard than the
+general 512-record A60 encoding ceiling.  Its native records begin at
+object `+0x454`, while the temporary/register map begins at `+0x1554`, leaving
+exactly `(0x1554-0x454)/16 = 272` records.  None of the three per-light
+emitters checks this bound.  The probe's repeat mode demonstrates the
+overflow without any GPU access:
+
+| repeated emitter | flags | returned count | stream SHA-256 |
+|---|---:|---:|---|
+| 8 directional | `c0` | 104 | `b3a064409767a0c044e27089eda1807af97d03404c893585218da873df00f597` |
+| 8 point | `c0` | 192 | `49725fa21bc3959fd207157915b6f7e8d2ff009bcceb4fd106695dadcaeebd3c` |
+| 8 spot | `c0` | 280 | `13db77f60a9eb9e59bcbc6a29612ac48659106e1e64c7fb68f0a27ee77f6d952` |
+| 8 spot | `ff` | 320 | `ff7177e5de8d9c11f54ea45260189969e7959a06c8936caa35a20c37718fcde2` |
+
+Record index 272 starts exactly at `+0x1554`; the eight-spot `c0` form
+therefore overwrites the first eight records' worth of allocator state and
+still returns success.  A complete fixed-function shader also emits transform,
+texture-coordinate, output, and optional fog records before/after the light
+bodies, so 272 is an object-storage ceiling, not a usable light-only budget.
+Any future Mesa native fixed-function compiler must count before every append
+and reject the whole shader before touching this boundary.  The present CPU
+draw-module TNL path avoids the vendor bug entirely.
+
+The probe's `full_MODE N` form also invokes the real wrapper once with `N`
+enabled lights, so it includes accumulator setup/output and exercises the
+allocator map after every light.  Eight-light results make the failure mode
+more concrete:
+
+| complete wrapper | flags | records/result |
+|---|---:|---:|
+| directional | `c0` | 111, SHA-256 `ceed8578...` |
+| directional + local viewer | `c2` | 127, SHA-256 `18daa8af...` |
+| point | `c0` | 199, SHA-256 `e196ad62...` |
+| point, all material-source bits | `ff` | 240, SHA-256 `bc2cf7d8...` |
+| spot, primary only | `80` | 203, SHA-256 `1b56a39b...` |
+| spot | `c0` | 287, returns after overwriting the allocator map, SHA-256 `a67ff726...` |
+| spot + local viewer | `c2` | 303, returns after a larger overwrite, SHA-256 `12c91c32...` |
+| spot, all flags | `ff` | process faults inside the wrapper after record storage crosses the map |
+
+Therefore even the vendor API maximum of eight lights is unsafe for a
+perfectly ordinary all-spot state key.  A replacement must preflight the
+whole shader, including prologue, every enabled light, transform/texcoord/fog,
+and epilogue; checking a per-light count after emission is too late because
+the allocator metadata has already been consumed or corrupted.
+
 ## Pixel program object, limits, and upload
 
 For the compiled pixel-program view, the Linux binary confirms the same
@@ -918,6 +1186,16 @@ produces `004305`, confirming the adjacent six-bit id.  Texture logical ids
 are register-manager remapped; their post-allocation native id is not
 guaranteed to equal the API id.
 
+The interpolated-input field is exactly six bits, but that is not a usable
+varying limit.  Offline Linux compiler sweeps produce source-A fields
+`004005`, `005f05`, `006005`, and `007f05` for `v0`, `v31`, `v32`, and
+`v63`.  `v64` aliases `v0`, `v127` aliases `v63`, and `v128` again aliases
+`v0`; the frontend merely masks the unchecked token id to six bits.  No
+corresponding 64-slot raster-linkage proof exists.  A new compiler must bound
+inputs to the VS/PS linkage actually emitted and tested rather than advertise
+64 varyings from this operand field; the first bounded subset uses only `v0`
+and the TAU's `t0`.
+
 Native destination class 0 is temporary.  Destination class 2 ids 0..3 are
 `oC0..oC3`, and id 4 is depth.  Their dword-3 values are `000d0820`,
 `000d0860`, `000d08a0`, `000d08e0`, and `000d0920`.  Compiled object `+0x30`
@@ -977,6 +1255,17 @@ python3 tools/re/chrome9_corpus_check.py
 | CRS | 2 | `0`, `0` |
 | NRM | 4 | `2`, `9`, `7`, `0` |
 | SINCOS | 3 | `d`, `0`, `f` |
+
+The two otherwise unnamed internal opcode holes are now resolved exactly.
+Linux `fp_parse` reduction-table entries 41/42 create internal opcode 105
+(`0x69`) for SIN and entries 31/32 create opcode 106 (`0x6a`) for COS.  Their
+position among the adjacent statically named scalar operations is
+`COS, EXP, LOG, RCP, RSQ, SIN, SINCOS`.  `stmPPSDispatcherPS20_invi` passes
+mode 1 for SIN and mode 0 for COS to `stmPPS_SIN_COS_ICD_PS20_invi`; Windows
+does the same at `VTGUModeDX32A.dll:0x101dccb4/0x101dccc7`.  The ordinary D3D
+SINCOS path remains a combined three-record lowering: x/y/xy destination-mask
+differentials only alter the last record's native writemask and do not select
+these internal modes.
 
 The Windows UMD lowers this same LRP token stream to one native sub-operation
 `11`; the Linux 5.75 compiler lowers it to two sub-operation-0 instructions.

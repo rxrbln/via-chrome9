@@ -450,10 +450,12 @@ sampler 1 onward moves by another 12.  Keep that wider case gated separately;
 the minimum ioquake3-style base-times-lightmap path needs only the 284-dword
 stage-0-mip form.
 
-The current kernel submits a three-vertex triangle instead of the Xorg
-oracle's four-vertex quad.  Dropping only the fourth ten-dword vertex gives
-these exact no-blend / blend body lengths (the blend form has the established
-four-dword destination-tail delta):
+The current kernel submits a three-vertex independent-list triangle instead
+of the Xorg oracle's four-vertex fan.  Use the kernel's already-live topology
+tuple `A20=20000000, A23=23004F02, A24=24000003` instead of the Xorg fan tuple
+`201C5C00/23000F02/24000004`, and drop the fourth ten-dword vertex.  No packet
+index changes, so this gives these exact no-blend / blend body lengths (the
+blend form has the established four-dword destination-tail delta):
 
 ```text
 two single-level stages:       262 / 266 dwords

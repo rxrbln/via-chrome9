@@ -375,10 +375,19 @@ Thus the statically exact body is **272 dwords**.  Closed source-over blend
 state, if added by a successor path, is a separate four-dword destination
 delta and must not be confused with this 272-dword Xorg body.
 
-The current kernel draw path streams one triangle rather than Xorg's
-four-vertex rectangle.  Its silicon-safe two-texture translation keeps every
-block and index above through the vertex header at 228, then supplies three
-ten-dword vertices instead of four.  The exact triangle body is therefore
+The current kernel draw path streams one independent-list triangle rather
+than Xorg's four-vertex fan rectangle.  Its silicon-safe two-texture
+translation keeps every block and index above through the vertex header at
+228 except for the already live topology tuple in the H6 group:
+
+```text
+Xorg fan:    A20=201C5C00 A23=23000F02 A24=24000004
+kernel list: A20=20000000 A23=23004F02 A24=24000003
+```
+
+It then supplies three ten-dword vertices instead of four.  D4 linkage comes
+from `0000040A`, `05008442`, and `624081FF`; it does not require the fan's A20
+reuse fields.  The exact triangle body is therefore
 **262 dwords**, or **266** with the closed four-dword blend destination delta.
 Do not drop the pixel ALU's `CCCCCCCC/DDDDDDDD` terminators: they occupy body
 224/225 (plus the blend delta), followed by the two alignment words at
@@ -387,6 +396,163 @@ body dword `217 + blend_delta`; a later stage-0 mip table moves it to
 `229 + blend_delta`.  These assertions translate the vendor oracle directly
 to the existing three-vertex builder without treating the fourth rectangle
 vertex as required hardware state.
+
+### State-complete one-texture blend plus D16 map
+
+Closing the destination constants adds four dwords before texture state, and
+adding A10--A13/A20 to the common type-01 group adds four more before general
+texture state.  For the three-vertex MODULATE path the exact combined body is
+therefore **236 dwords**:
+
+| dwords | block |
+|---:|---|
+| `0..19` | destination, closed A38--A3F, blend equations, A33/pad |
+| `20..31` | texture-0 image state |
+| `32..39` | texture-0 sampler state |
+| `40..55` | common render state plus D16 A10--A13/A20 |
+| `56..67` | general one-texture state |
+| `68..99` | one-texture H6 FVF/linkage |
+| `100..107` | PS constants |
+| `108..127` | VS float and integer constants |
+| `128..135` | clip A80--A83 |
+| `136..159` | five-instruction VS |
+| `160..167` | VS activation |
+| `168..187` | one-texture PS controls |
+| `188..195` | one TAU |
+| `196..207` | MODULATE ALUs |
+| `208..235` | immediate header plus three eight-dword vertices |
+
+In particular, body 120--127 is not clip state:
+
+```text
+FE020440 0000043C 33030000 CC000000
+00000000 00000000 00000000 00000000
+```
+
+It is the unchanged VS integer-constant H2 packet.  Clip immediately follows
+as `FE020440 0000043C 00010000 CC000000` plus A80--A83.  With the kernel's
+six-dword leading H0 and two alignment pads, body zero is at slot offset
+`0x20`; body 120 is therefore exactly offset `0x200`.  A `043c` readback equal
+to slot base plus `0x200` points at this packet in fetch accounting, not at
+the clip header and not necessarily at decoder retirement.  The original
+one-texture predecessor already put its clip header at the same absolute
+offset, so the address alone does not justify padding or changing H2 framing.
+
+### State-complete two-texture plus blend, alpha test, and D16
+
+The two-texture successor can remain compact while closing all state needed by
+the current blend and depth paths.  Always expand the destination group to all
+eight A38--A3F constant words, even when blending is disabled.  Its final
+alignment slot can carry A33 because type-01 words are independently
+subaddressed and the proprietary A33 builders establish no ordering dependency
+on A00.  The first block is consequently:
+
+```text
+body[0..3]    type-01 destination header
+body[4..6]    A50, A51, A52
+body[7..14]   A38..A3F closed blend constants
+body[15..18]  A34..A37 blend equations
+body[19]      A33 when alpha test is enabled; cc000000 otherwise
+```
+
+This placement writes the comparison before the later common group enables
+alpha test.  It avoids growing a 12-word common payload to the next four-dword
+alignment boundary solely for A33.
+
+Insert D16 A10--A13 and the established wide-open A20 after A89 in the common
+type-01 group.  The old seven-word payload plus those five words is exactly 12
+dwords and needs no padding:
+
+```text
+body[60..63]  type-01 common-state header
+body[64..70]  A86, A87, A53, A00, A01, A88, A89
+body[71..75]  A10, A11, A12, A13, A20
+```
+
+Here A00 is the render-target blend/alpha-test register and A01 enables D16
+test/write.  Do not confuse it with the later subtype-FE general-texture A00:
+that word must remain `00000021` for two active stages plus the one-shot
+texture-cache clear.  Likewise keep general A08=`08010102`.
+
+The resulting exact single-level, three-vertex map is:
+
+| dwords | block |
+|---:|---|
+| `0..19` | closed destination/blend state, optional A33 |
+| `20..31` | texture image 0 |
+| `32..39` | sampler 0 |
+| `40..51` | texture image 1 |
+| `52..59` | sampler 1 |
+| `60..75` | common render/depth state |
+| `76..87` | general two-texture state |
+| `88..119` | two-texture H6 FVF/linkage |
+| `120..127` | PS constants |
+| `128..147` | VS constants |
+| `148..155` | clip |
+| `156..183` | six-instruction VS |
+| `184..191` | VS activation |
+| `192..211` | two-texture PS controls |
+| `212..219` | two TAUs |
+| `220..233` | two ALUs and terminators |
+| `234..235` | alignment before vertex H2 |
+| `236..269` | header plus three ten-dword vertices |
+
+The complete body is therefore **270 dwords**: four for closed blend constants
+and four for depth beyond the 262-dword triangle.  A23/A24 are at 102/103, the
+RGBA-by-RGBA source-C swizzle is at 225, and the vertex header begins at 236.
+Adding only the stage-0 mip table makes 282 dwords and moves those later
+indices by 12; mip tables for both stages make 294 dwords.
+
+An exact combined discriminator uses format-99 textures and target, nearest
+filtering, clamp, the RGBA-by-RGBA program, canonical source-over, alpha
+LESS/ref `80`, and D16 LESS/write.  Clear the target to transparent black and
+depth to `ffff`; use uniform texture 0=`80ff8040`, texture 1=`80ffff80`, and
+draw at Z=`4000`.  Correct two-texture multiplication produces approximately
+`40ff8020` before tests/blending.  It passes alpha test, blends over black, and
+stores approximately:
+
+```text
+color = 40402008  (allow one LSB per multiplied RGB component)
+depth = 4000       (allow the established conversion tolerance)
+```
+
+A missing second stage leaves alpha `80` and fails LESS, preserving
+zero/`ffff`.  The vendor mask-only `r2.wwww` swizzle instead produces about
+`40201008` after blending.  A killed color with depth `4000` exposes alpha
+kill after the depth write.  Thus one guarded vector discriminates stage
+count, RGBA swizzle, alpha-before-depth ordering, source-over, stored alpha,
+and D16 relocation without any out-of-range sample.
+
+Follow it, without reinitializing the engine, by the proven one-texture
+REPLACE path drawing opaque blue to a BGRX target.  It must store `000000ff`
+and leave the old D16 contents byte-for-byte unchanged.  That transition
+requires the one-texture packet to restore subtype-FE A00/A08 to
+`00000011/08010101`, upload the one-TAU program, clear type-01 alpha/depth
+enables, and restore full-mask format-98 COPY.  Then repeat the combined draw
+to prove the two-stage/depth state is restored in the other direction.
+
+The corresponding submit path needs four independently guarded GEM objects,
+not reuse of the present `depth` slot for a texture.  A simple contiguous SF
+mapping order is target, texture 0, texture 1, depth; each relocation points
+one page into its own object:
+
+```text
+target = sf_base + PAGE_SIZE
+tex0   = sf_base + target_object_size + PAGE_SIZE
+tex1   = sf_base + target_object_size + tex0_object_size + PAGE_SIZE
+depth  = sf_base + target_object_size + tex0_object_size +
+         tex1_object_size + PAGE_SIZE
+```
+
+Range-check every addition, concatenate each object's PTEs in exactly that
+order, and reject all pairwise object aliases for the first ABI.  Lock all four
+reservations together.  The target and depth receive write fences; textures
+receive read fences and TO_DEVICE ownership transitions.  Initialize and
+verify first/last-page guards for all four objects, and retain every reference,
+mapping, PTE array, and SF node through retirement or quarantine.  A timeout
+must quarantine the complete four-object mapping just like the current
+two-object depth/texture paths; partial early unbind is a GPU-use-after-free
+hazard rather than merely a failed draw.
 
 A guard-safe live discriminator uses separate, page-backed 32x32 linear
 textures and reads only interior pixels away from quadrant boundaries.  Fill
@@ -404,6 +570,327 @@ wrong `r2` destination, and a broken D4 vertex stride without any out-of-range
 sample.  Keep the target and both textures in distinct guarded allocations,
 run the normal texture-cache invalidation, and leave this feature gated until
 the full vector and guards pass on silicon.
+
+### Kernel-builder-ready three-vertex RGBA packet
+
+The current `chrome9_build_textured_triangle()` can grow into this path
+without changing its emitter conventions.  The exact meaningful payload
+arrays (alignment remains the responsibility of `chrome9_emit_header2`) are:
+
+```text
+two_config[5] =
+  00000021 01002521 08010102 05000000 0D810000
+
+two_raster_fvf[27] =
+  0000040A 010000C2 020041D1 030052D0
+  04006342 05008442 1200001F 61800000
+  624081FF 20000000 23004F02 24000003
+  25F6CC00 28FFCC00 40800000 41400000
+  4200493F 43800000 44400000 4500493F
+  46800000 47400000 4800003F 49000000
+  50000000 51000000 52147FFF
+
+two_vs[24] =
+  00380150 00000000 00000000 0008010F
+  0008014C 00100150 00384154 0004021F
+  0008414C 00000000 00000000 0008422F
+  0008814C 00000000 00000000 0008423F
+  0008C14C 00000000 00000000 0008028F
+  0009014C 00000000 00000000 0008029F
+
+two_vs_control[1] = 60800005
+
+two_ps_control[13] =
+  90018000 91000003 92020002 93000002
+  94000000 95000000 96000000 97000000
+  98000000 99000000 9A000000 CCCCCCCC DDDDDDDD
+
+two_tau[4] = 301001B0 311211B1 CCCCCCCC DDDDDDDD
+
+two_rgba_program[10] =
+  0140B6D0 30202053 00F20005 0000007F
+  01C00000 301C0000 00F20105 000D083F
+  CCCCCCCC DDDDDDDD
+```
+
+The corresponding H2 paratypes are exact and match the current emitter call
+shape `(transspace=440, transset=0000043c)`: config `fe020000`, raster/FVF
+`00040000`, VS `31030000`, VS control `00040000`, PS control `00010000`, TAU
+`21030000`, ALU `20030000`, and immediate vertices `00000000`.  Keep the
+existing H3 VS-float constants header and all unchanged H2 headers verbatim.
+
+`020041D1` deliberately retains the kernel's live-proven normalized packed
+D1 declaration.  The unmodified Xorg program uses `D0` because it ignores
+D1; either value is inert for this exact two-sample shader, while `D1` avoids
+reintroducing the already diagnosed unnormalized-color trap when a later
+program consumes primary color.  The independent-list A20/A23/A24 values are
+mandatory for three submitted vertices and are unrelated to D4 linkage.
+
+Each texture image payload has six meaningful words and each sampler has four:
+
+```text
+image0: base0>>8 18001101 A20_0 21000001 A22_0 A30_format_0
+sampler0: 30000000 A31_0 A32_0 CCCCCCCC
+image1: base1>>8 18001101 A20_1 21000001 A22_1 A30_format_1
+sampler1: 30000000 A31_1 A32_1 CCCCCCCC
+```
+
+Emit them with H2 selectors `00020000`, `20020000`, `01020000`, and
+`21020000` respectively.  `A20_n = 20000000 | height_n<<12 | width_n`;
+the initial path should retain the existing POT-only A22 calculation and
+canonical 32-byte-aligned pitch validation independently for both images.
+The format words are `30980000` for XRGB and `30990000` for BGRA.  Sampler
+A30 is a different register despite the repeated subaddress.
+
+With the unchanged destination/common/constant/clip blocks, emit calls occur
+in exactly this order:
+
+```text
+destination, image0, sampler0, image1, sampler1, common, two_config,
+two_raster_fvf, PS constants, VS float constants, VS integer constants,
+clip, two_vs, two_vs_control, two_ps_control, two_tau, two_rgba_program,
+3 * ten-dword vertices
+```
+
+The no-blend, no-mip body is exactly 262 dwords:
+
+| dwords | block |
+|---:|---|
+| `0..15` | destination |
+| `16..27` | image 0 |
+| `28..35` | sampler 0 |
+| `36..47` | image 1 |
+| `48..55` | sampler 1 |
+| `56..67` | common |
+| `68..79` | `two_config` |
+| `80..111` | `two_raster_fvf` plus one emitter pad |
+| `112..147` | PS/VS constants and clip |
+| `148..175` | `two_vs` |
+| `176..183` | VS control |
+| `184..203` | PS control plus emitter padding |
+| `204..211` | two TAUs and terminators |
+| `212..225` | two ALUs and terminators |
+| `226..227` | emitter padding before vertices |
+| `228..261` | vertex header plus `3 * 10` dwords |
+
+In that body `base0>>8` is index 20, `base1>>8` is index 40, the RGBA
+swizzle is index 217, and the immediate header is index 228.  Closed blend
+state adds four dwords after the destination format, so add four to every
+index from image 0 onward and expect 266 total; target A50 remains index 4.
+
+Useful pre-publication assertions for the no-blend/no-mip body are:
+
+```text
+[20]=base0>>8   [32]=sampler0 A30   [40]=base1>>8   [52]=sampler1 A30
+[72]=00000021   [74]=08010102
+[84]=0000040A   [89]=05008442       [92]=624081FF
+[93]=20000000   [94]=23004F02       [95]=24000003
+[172]=0009014C  [175]=0008029F      [180]=60800005
+[190]=92020002  [208]=301001B0      [209]=311211B1
+[216]=0140B6D0  [217]=30202053       [219]=0000007F
+[220]=01C00000  [223]=000D083F      [224]=CCCCCCCC [225]=DDDDDDDD
+[228]=FE020440  [230]=00000000
+```
+
+For blend add four to every listed index except destination/target words; for
+the stage-0 mip form add another twelve to assertions at sampler 0 and later.
+The mip header itself is `[28+B]=FE03043C`, `[29+B]=8`, `[30+B]=10030000`,
+with entries at `[32+B..39+B]`.
+
+For the stage-0 mip successor, insert exactly one call
+`chrome9_emit_header3(..., 10030000, mip0, 8)` between image 0 and sampler 0.
+For every used L1--L8 slot, `mip0[l-1]` is
+`40000000 | ((level_offset[l] >> 8) & 00ffffff)`; clear every unused slot.
+Set sampler-0 A30 max/min/bias explicitly and keep image-0 A18=`18001101`.
+The exact no-blend map then has image 0 at `16..27`, mip table `28..39`,
+sampler 0 `40..47`, image 1 `48..59`, sampler 1 `60..67`, and all later
+blocks shifted by 12.  Total length is 274, base1 is index 52, RGBA swizzle
+is 229, and the vertex header is 240.  Blend gives 278 and adds four to those
+post-destination indices.
+
+The current submission path treats its second object (`depth_obj`) as the one
+texture.  A second texture therefore requires a real third GEM object in the
+job rather than a second address into an unreserved BO: lookup and validate
+all three, reserve all three in `drm_exec`, collect all three SG tables into
+the contiguous PTE list, include all sizes in the `drm_mm` node, map/guard/
+flush/sync all three, attach the completion fence to all three reservations,
+and mirror all three through normal cleanup and quarantine ownership.  With
+the existing `[guard,data,guard]` object convention:
+
+```text
+target = sf_start + PAGE_SIZE
+base0  = sf_start + destination_object_size + PAGE_SIZE
+base1  = sf_start + destination_object_size + texture0_object_size + PAGE_SIZE
+```
+
+Initially requiring three distinct objects keeps reservation and guard
+ownership unambiguous.  Sum sizes with checked overflow and retain the current
+GART/ring bound.
+
+#### Three-BO lifetime and error-unwind audit
+
+The present shared submit routine names the one texture `depth_obj` and stores
+it in `job->depth`.  A safe successor may rename those fields or add explicit
+texture names, but it must extend every phase below; changing only the builder
+address creates an unreserved, unpinned fetch:
+
+| phase | exact three-object obligation |
+|---|---|
+| request validation | compute destination, texture-0, and texture-1 guarded object sizes independently; use checked additions for the three-size total and enforce the existing GART/ring limit |
+| lookup | hold three `drm_gem_object_lookup()` references; reject NULL, foreign-device, imported, wrong-size, and any pairwise alias for the first ABI |
+| job construction | add texture-1 shmem object, SG table, map, mapped flag, and page count; include all three counts in `job->page_count` |
+| PTE collection | allocate one total PTE array; append destination, texture 0, then texture 1 at offsets 0, `destination_page_count`, and `destination_page_count + texture0_page_count` |
+| reservation | initialize `drm_exec` for three objects and prepare all three inside the retry loop; wait for `DMA_RESV_USAGE_WRITE` on all three before writing their guard pages |
+| CPU maps | vmap destination, texture 0, then texture 1; reject `is_iomem` for each and unwind only maps which succeeded |
+| SF binding | allocate one node of the checked three-object total, install the complete PTE array, and derive the three data addresses using full guarded object sizes |
+| device handoff | prepare both guards, cache-flush the full object, and call `dma_sync_sgtable_for_device(..., DMA_BIDIRECTIONAL)` for each object |
+| fences | attach the same initialized job fence to all three reservations with WRITE usage before publishing the ring |
+| retirement | sync all three SG tables for CPU, flush all three CPU maps, execute `dma_rmb()`, then validate both guards for each object before unbinding PTEs |
+| normal unwind | if device-owned, reverse DMA ownership/cache state for all three; vunmap texture 1, texture 0, destination in reverse-success order; finish `drm_exec`, signal when required, put all three GEM references, then drop the fence |
+| pre-fence failures | before `dma_fence_init64`, free the total PTE/job allocation and put every successfully looked-up object; do not enter the fence-release path |
+| quarantine | on timeout or failed PTE invalidation, finish `drm_exec` and signal the error fence but deliberately retain **all three** maps, GEM references, PTEs, SF node, and DMA ownership in the quarantined job; never unwind only texture 1 while hardware may still fetch it |
+
+In particular, a failure of texture-1 lookup must still put destination and
+texture 0; a failure of its SG-table acquisition or PTE collection must free
+the total PTE/job state and put all three lookup references; a failure of its
+vmap must unmap the two earlier successful maps.  After fence initialization,
+all errors converge through the existing `out_exec`/fence lifetime rather
+than directly freeing the job.  Extend both successful and `device_owned`
+cache/DMA reversal blocks symmetrically—missing the latter leaves a partial
+builder failure with texture 1 still device-owned.
+
+#### Exact first raw RGBA oracle
+
+Use three distinct guarded BOs.  The 64x64 XRGB target has pitch 256 and
+`0x4000` useful bytes; initialize every useful dword to sentinel `005A5A5A`.
+Each 32x32 XRGB texture has pitch 128 and `0x1000` useful bytes.  Fill texture
+0's TL/TR/BL/BR quadrants red/green/blue/white and texture 1's quadrants
+red/red/blue/yellow:
+
+```text
+texture 0: 00FF0000 0000FF00 000000FF 00FFFFFF
+texture 1: 00FF0000 00FF0000 000000FF 00FFFF00
+expected : 00FF0000 00000000 000000FF 00FFFF00
+```
+
+With 4-KiB guards the exact object sizes are `0x6000,0x3000,0x3000`, total
+`0xc000`.  If this job's SF node begins at `S`, assert target=`S+1000`,
+base0=`S+7000`, and base1=`S+a000`; their shifted values occupy body dwords
+4, 20, and 40 respectively in the no-blend/no-mip packet.
+
+Submit the already-live top-right independent-list triangle with the same
+coordinates on both stages:
+
+```text
+v0: x/y=-0.5/-0.5, z=0, rhw=1, D1/D2=FFFFFFFF, s0/t0=0/0, s1/t1=0/0
+v1: x/y=63.5/-0.5, z=0, rhw=1, D1/D2=FFFFFFFF, s0/t0=1/0, s1/t1=1/0
+v2: x/y=63.5/63.5, z=0, rhw=1, D1/D2=FFFFFFFF, s0/t0=1/1, s1/t1=1/1
+```
+
+Use nearest filtering and clamp-to-edge independently for both stages.  The
+following target samples are far from texture quadrant and triangle edges:
+
+| target pixel | region | exact expected dword |
+|---:|---|---:|
+| `(8,4)` | covered TL: red times red | `00FF0000` |
+| `(48,16)` | covered TR: green times red | `00000000` |
+| `(56,48)` | covered BR: white times yellow | `00FFFF00` |
+| `(8,48)` | outside the triangle | sentinel `005A5A5A` |
+
+The nonzero sentinel is essential: a zero-initialized target cannot
+distinguish the expected black TR sample from a missing draw.  Also require a
+covered-pixel count near one half of the 4096-pixel target, exact preservation
+of both `0x1000` source ranges, and all six guard pages unchanged.  For the
+lowest-risk two-step execution, first use the vendor alpha-mask swizzle
+`302026DB` and make texture 1 BGRA with magenta RGB poison and quadrant alpha
+`00/ff/80/40` (dwords `00FF00FF/FFFF00FF/80FF00FF/40FF00FF`).  The three
+covered samples above must then be black, green, and gray `00404040` while
+the outside remains sentinel.  After that retires, refill texture 1 with the
+XRGB RGBA vector, change only body dword 217 to `30202053`, and require the
+RGBA results above.
+
+The exact stage-0-mip raw successor keeps this geometry and target.  Texture
+0 contains 32x32 black L0 (`0x1000` bytes) followed by 16x16 white L1
+(`0x400` bytes), so its useful range is `0x1400`, page-rounded data range is
+`0x2000`, and guarded object size is `0x4000`.  Texture 1 remains the XRGB
+red/red/blue/yellow `0x3000` object.  The three-object total becomes `0xd000`;
+for SF node start S, base0 remains `S+7000` while base1 becomes `S+b000` at
+body dword 52.  Emit H3 entry 0=`40000010`, clear entries 1--7, and set
+sampler-0 A30=`30020040` to force L1.  Exact samples `(8,4)/(48,16)/(56,48)`
+must then be red/red/yellow, with `(8,48)` still sentinel.  All-black covered
+samples isolate a missing/ignored L1 table or LOD word; corrupt but nonblack
+colors isolate the second fetch or RGBA shader.  Verify texture 0's complete
+`0x2000` data allocation (including padding), texture 1, and all guards.
+
+For the first public two-texture ABI, validate all four S/T words as finite
+and keep them in `[0,1]`.  A merely finite but enormous coordinate is not
+made safe by one guard page if a sampler/address-mode regression bypasses
+wrap.  Run the small `-0.375/+1.375` wrap discriminator only through a
+dedicated guarded validation path with 32-square sources; loosen public
+coordinate bounds only after the addressing modes retire safely.  Apply the
+same rule independently to D3 and D4.
+
+Finally, state closure must be explicit in both directions.  Every two-stage
+draw emits both image/sampler groups, A00=`21`, A08=`08010102`, both TAUs,
+PS count `92020002`, six-instruction VS, and ten-dword vertices.  Every later
+one-stage draw must continue emitting A00=`11`, A08=`08010101`, one-stage
+controls/TAU/VS/FVF, and sampler A30=`30000000`; that disables stale stage 1
+and stale mip addresses without depending on old register contents.  Retain
+the dual-stage `CC/DD` words, pre/post texture-cache transition, guarded
+readback, timeout quarantine, and assertion of the exact body length and
+relocation/index words before publication.
+
+Exercise closure as an ordered sequence, not only isolated draws.  First
+submit two-stage red-times-black (black expected), then a one-stage green
+REPLACE into a disjoint target region (green expected); this catches a stale
+stage count, PS, D4 stride, or six-instruction VS.  Next submit forced-L1
+green from a red/green mip resource, immediately followed by single-level red
+with sampler A30 zero (red expected); this catches retained LOD selection.
+Keep both old source objects reserved through each draw's retirement even
+when the following draw disables their stage, and verify every source and
+target guard after the sequence.
+
+Two follow-ups distinguish per-stage coordinates and sampler state after the
+basic same-coordinate nearest test passes.  For the wrap test, fill both
+32-square textures with vertical blue/red/green/white eight-column bands.
+Use nearest filtering, stage-0 repeat A32=`32000052`, and stage-1 clamp A32=
+`32000049`.  Give every vertex D3 S/T=`-0.375,0.5`
+(`bec00000,3f000000`) and D4 S/T=`+1.375,0.5`
+(`3fb00000,3f000000`).  Stage 0 must repeat to green, stage 1 must clamp to
+white, and RGBA multiplication must return green.  Reusing D3 for D4, aliasing
+both sampler selectors, or exchanging the two sampler groups produces black
+or another primary.  Both hypothetical failed linear fetches are only twelve
+texels outside the logical row and remain inside the adjacent mapped guards.
+
+For the filter test, make stage 0's left/right halves red/green and stage 1's
+left/right halves blue/white.  Set both coordinates to exactly `0.5`, both
+samplers to A31=`31102490` and clamp A32=`32000049`.  Each source is averaged
+at the center boundary; their product must have R/G in `0x3f..0x41` and B
+zero (nominal XRGB `00404000`).  A nearest or wrong-stage filter yields black,
+half-yellow, or a much larger single channel, leaving wide rounding margins.
+These tests alter only D3/D4 and the two sampler payloads; packet counts and
+all relocation indices remain those of the 262-dword body.
+
+DXT1 can then enter the same two-stage path without a new shader or packet.
+Use the documented constant-color DXT1 quadrant blocks for stage 0, set its
+image-format word to `30290000`, and retain the 32x32 logical image state;
+its compressed useful range is `0x200` bytes.  Use an ordinary XRGB stage 1
+with red/red/blue/yellow quadrants.  Nearest RGBA modulation must return
+red/black/blue/yellow.  In the no-mip body only image-0 dword 25 changes from
+`30980000` to `30290000`; image-1 format remains body 45 (or `45+B+12*M` for
+blend delta B and a preceding stage-0 mip table M).  This combined test proves
+that compressed block-row addressing and the second fetch coexist, while a
+decoder error remains isolated by the already-passing uncompressed version.
+
+R5G6B5 is the lower-risk game-format predecessor to DXT1.  For a 32-square
+stage 0 use format word `30890000`, canonical pitch 64, useful range `0x800`,
+and quadrant words `f800/07e0/001f/ffff`.  Page rounding still gives the same
+`0x3000` guarded object size as the 32-bit raw oracle, so every relocation and
+body index remains identical; only image-0 body dword `25+B`, derived cpp,
+pitch, and source contents change.  Against the same XRGB red/red/blue/yellow
+stage 1, expected RGBA modulation is again red/black/blue/yellow.  Validate
+this before compressed formats: it exercises non-four-byte pitch/range logic
+without block addressing or alpha ambiguity.
 
 ### One-word RGBA-by-RGBA successor for game lightmaps
 
@@ -505,6 +992,166 @@ the two source guards and target guards.  Because this one-instruction form
 scales alpha together with RGB, initially expose it only for the opaque
 lightmap path; exact independent `GL_ALPHA_SCALE` lowering needs a separate
 two-write shader before it can be advertised generally.
+
+### Three-factor fixed-function successor
+
+Compatibility fixed-function modulation can also consume primary vertex
+color: `texture0 * texture1 * D1`.  The smallest bounded derivative of the
+two-texture RGBA program adds one in-place MUL of physical `r1` by input
+`v0`, then leaves the existing output MOV in place:
+
+```text
+0140B6D0 30202053 00F20005 0000007F   # r1 = r0 * r2
+0140B6D0 30040053 00F20105 0000007F   # r1 = r1 * v0
+01C00000 301C0000 00F20105 000D083F   # oC0 = r1
+CCCCCCCC DDDDDDDD
+```
+
+Change the PS control count from `92020002` to `92020003`.  The second
+instruction combines the exact input-v0 identity operand from the proven
+one-texture MODULATE shader with the exact scheduled r1 identity source used
+by the output MOV.  The proprietary Linux compiler independently accepts
+`texld r0,t0,s0; texld r1,t1,s1; mul r2,r0,r1; mul r3,r2,v0; mov oC0,r3`
+and emits two TAUs plus three ALUs, confirming the semantic operation and
+count.  Its virtual registers and unscheduled dependency fields are not used
+as packet words here.  The in-place scheduled instruction above remains a
+bounded synthesis and must pass the guarded live test before exposure.
+
+The headless Windows backend supplies a second, dynamically executed schedule
+check without opening an adapter.  Compiling the equivalent direct-output
+form
+
+```text
+texld r0,t0,s0
+texld r1,t1,s1
+mul   r0,r0,r1
+mul   oC0,r0,v0
+```
+
+produces byte-identical raw and finalized stores:
+
+```text
+TAU 201001B0 211111B1
+ALU 0140B6D0 00001000 00F00000 00000020
+    0140B6D0 00040053 00F00000 00000820
+A90..A9B:
+    90000000 91000000 92020002 93000002
+    94000000 95000000 96000000 97000000
+    98000000 99000000 9A000000 9B000000
+```
+
+The finalized ALU and TAU SHA-256 values are respectively
+`f23e3572537905862c0c9a3fcfb69159236c8476e8d2834825c7ace4002ea0f6`
+and `503b8f32ba1eebb0dedaa1e89b0cb06b56f80f710cb1f8db94d988ba9f0d854f`.
+This proves that two independent fetches followed by two dependent ALUs need
+only the same T2A switch value 2 and no A2T switch.  It does not replace the
+packet words above: the probe's deliberately identity/zero allocator uses
+virtual `r0/r1`, while the Xorg stream has physical `r0/r1/r2` dependencies
+and retains its explicit output MOV.  Therefore the fixed successor still
+uses ALU count three and `A93=93000002`; only a future general compiler may
+legally lower this expression to the direct-output two-ALU form.
+
+Keeping explicit temporaries and the final MOV in the same Wine probe closes
+the fixed successor's count/control invariant more directly.  For
+`mul r2,r0,r1; mul r3,r2,v0; mov oC0,r3` after the two TEXLDs, raw and final
+stores are again identical:
+
+```text
+TAU 201001B0 211111B1
+ALU 0140B6D0 00001000 00F00000 000000A0
+    0140B6D0 00040053 00F00200 000000E0
+    01C00530 001C0053 00F00300 000D0820
+A92 92020003
+A93 93000002
+```
+
+All remaining A90--A9B payloads are zero in the compiler's empty runtime
+context.  The ALU hash is
+`a1c36fe48cd05541f14b752b3c29bc9b46d4781aea7c207f8e4ee9c079d5085a`;
+the TAU hash is unchanged.  This independently proves the exact three-ALU
+count and the unchanged two-TAU-to-ALU switch used by the fixed scheduled
+packet, while its virtual register words remain non-substitutable.
+
+This path also requires the two state changes which the source-only shader
+could ignore: retain the live-proven FVF declaration `020041D1`, not the
+Xorg mask stream's unnormalized `020041D0`, and use proprietary-GL default
+type-01 A01=`01CE1540` so diffuse interpolation is perspective-correct.
+Vertex stride stays ten dwords and D1 remains its word 4.
+
+Keeping the dual-texture `CC/DD` terminators adds four dwords for the new
+instruction.  With `H` mip-table packets before common state (`H=0,1,2`),
+closed-blend delta `B=0 or 4`, and common-group D16 delta `D=0 or 4`, the
+triangle body is `266 + 12*H + B + D` dwords.  D16 is inserted after A89, so
+the earlier common A01 index does not receive `D`; every subsequent group
+does.  Key indices are:
+
+```text
+common A01       = 64  + 12*H + B
+FVF A02          = 86  + 12*H + B + D
+PS A92           = 190 + 12*H + B + D
+first MUL        = 216 + 12*H + B + D
+second MUL       = 220 + 12*H + B + D
+output MOV       = 224 + 12*H + B + D
+vertex header    = 232 + 12*H + B + D
+```
+
+The state-complete single-level form with closed blend and D16 therefore has
+`B=D=4`, totals **274 dwords**, places normalized D1 declaration A02 at 94,
+and begins its vertex packet at 240.  Alpha test still uses the otherwise
+aligned destination slot at body 19; it does not add a third delta.
+
+For a single discriminator, reuse the RGBA two-texture quadrant vector and
+give every vertex packed primary color `ff808080`.  The prior red/black/blue/
+yellow product must become XRGB `00800000/00000000/00000080/00808000` within
+normal one-LSB normalized-multiply rounding.  Ignoring D1 returns full-scale
+colors; using FVF `d0` produces the already observed unnormalized saturation
+failure.  Preserve both texture guards, target guards, finite RHW, and the
+full-state one-stage transition after this test.
+
+For the ioquake3-style overbright combination, apply result-scale x2 to the
+**second**, final MUL:
+
+```text
+0140B6D0 30202053 00F20005 0000007F   # r1 = texture0 * texture1
+0140B6D0 30040053 00F20105 0000207F   # r1 = (r1 * primary) * 2
+01C00000 301C0000 00F20105 000D083F
+CCCCCCCC DDDDDDDD
+```
+
+Only body dword `223 + 12*H + B + D` changes.  The first MUL's scale word at
+`219 + ...` remains zero: placing the API's final combine scale there would
+rely on reassociation and on the temporary never gaining stage-local clamp or
+precision semantics.  Reuse primary `ff808080` and the red/black/blue/yellow
+two-texture product.  Correct final x2 restores full-scale
+red/black/blue/yellow, while no scale leaves nonblack results near half
+intensity.  This vector proves x2 versus identity; because the current temp
+write has saturation clear, it does not by itself distinguish an incorrectly
+reassociated first-MUL scale.  Packet length, A92=`92020003`, transition bits,
+and all resource state remain unchanged.
+
+`GL_RGB_SCALE=4` is the adjacent proved native scale code 2, so the same
+final word is `0000407F`; scale 1/2/4 therefore selects
+`0000007F/0000207F/0000407F` with no other delta.  A scale-4 discriminator
+uses packed primary `ff404040`: correct output again approaches the original
+full-scale nonblack product, while identity remains near quarter intensity.
+Do not expose native x8 merely because code 3 exists; fixed-function GL
+texture environment accepts only 1, 2, and 4.
+
+These one-word scale forms multiply alpha as well as RGB.  Gate them to the
+opaque-lightmap case (both sampled alphas and primary alpha equal one) until a
+separate RGB-only write plus unscaled-alpha write is scheduled and validated;
+they are not a general implementation of independent `GL_RGB_SCALE` and
+`GL_ALPHA_SCALE` for translucent material.
+
+After that color-only test passes, combine it with the state-complete oracle
+above: texture0=`80ff8040`, texture1=`80ffff80`, vertex D1=`ff808080`,
+transparent-black BGRA destination, source-over, alpha LESS/ref `80`, and D16
+LESS/write at Z=`4000`.  The three-factor fragment is approximately
+`40804010`; correct post-test blending stores approximately
+`40201004`/depth=`4000`.  Omitting primary color returns `40402008`, while a
+failed alpha test leaves zero/`ffff`.  This is the final bounded interaction
+gate before routing ordinary two-unit fixed-function GL draws through the
+274-dword successor.
 
 ## Exact texture-image state
 
@@ -830,6 +1477,72 @@ Use RGB factors `SRC_ALPHA, INV_SRC_ALPHA` and alpha factors
 not just that A35/A36 RGB and BORDER address mode work.  The same body indices
 and 232-dword blend+border REPLACE length apply; A52=`99` is destination state
 at body index 6 and must not be confused with any sampler-format byte.
+
+## Mesa two-texture integration audit
+
+The current Gallium path cannot reach the packet above by changing only the
+kernel ioctl.  Its NIR classifier, draw-vbuf layout, state validator, ioctl
+marshalling, and advertised limits each encode exactly one texture.  The
+smallest bounded Mesa successor is as follows; this deliberately keeps mip
+levels, texture/RT aliasing, depth, and blended two-texture draws out of the
+first capability.
+
+1. Add a distinct `CHROME9_FS_TWO_TEXTURE_RGBA` program and a distinct kernel
+   capability/ioctl.  Do not reinterpret either one-texture UAPI structure:
+   its size and its eight-dword vertex are already ABI.  The new vertex is ten
+   dwords in the hardware order
+   `X,Y,Z,RHW,D1,D2,S0,T0,S1,T1`, and the new request carries two handles plus
+   independent width, height, pitch, format, min/mag filter, and S/T wrap
+   fields.
+2. Replace `chrome9_fs_is_texcoord(def,depth)` with a unit-aware matcher for
+   `VARYING_SLOT_TEX0 + unit`, and replace the Boolean texture matcher with one
+   which returns the exact unit.  Require `texture_index == sampler_index ==
+   unit`, unit 0 or 1, one 2D coordinate source, no array/shadow state, and the
+   matching varying.  `chrome9_context.c:331..391` currently hard-codes unit
+   zero in all three places.
+3. Preserve factor identity while walking component-wise `fmul`.  A plain
+   enum result is insufficient because it cannot distinguish `tex0*tex1`
+   from `tex0*tex0`.  A three-bit factor mask (`T0`, `T1`, `D1`) is enough:
+   pass identity `mov`/`fsat`, combine only disjoint masks, and map exactly
+   `T0|T1` to the new program.  Track per-unit texture-instruction counts and
+   require one instruction for each referenced bit and none for any other
+   unit.  This also prepares, without exposing it, the later
+   `T0|T1|D1` three-factor program.
+4. In `chrome9_vbuf_get_vertex_info()` find GENERIC/TEXCOORD 0 and 1
+   separately and emit two `EMIT_2F` attributes after the two packed colors.
+   The exact two-texture size is ten dwords.  Require both coordinates and
+   position; D1 may be absent only for pure `T0*T1`.  Change allocation and
+   layout assertions from the present textured/nontextured `8/6` choice to an
+   exact per-program `10/8/6` choice (`chrome9_draw.c:51..105`).
+5. Generalize draw-state selection to two resource/sampler pairs.  For the
+   new path require the highest bound sampler and view count to be exactly two
+   **and** slots 0 and 1 both non-NULL/supported.  Validate each resource with
+   the existing native guarded, aligned-data, canonical-pitch and level-zero
+   rules.  Initially reject every pairwise alias by handle: target/texture 0,
+   target/texture 1, and texture 0/texture 1.  Preserve the current rejection
+   of depth and reject any state requiring the blend successor until a
+   two-texture blend ioctl exists.  The current single-slot choke points are
+   `chrome9_draw.c:326..342`.
+6. Marshal vertex words 6/7 to S0/T0 and 8/9 to S1/T1, then populate both
+   texture descriptions and submit only the new ioctl.  Add a matching thin
+   wrapper in `chrome9_drm.[ch]`.  Do not silently fall back to two
+   one-texture draws: multiplication is not representable by that sequence.
+7. Gate all advertisement on the new kernel capability.  Set fragment
+   `max_texture_samplers`, `max_sampler_views`, `max_tex_instructions`, and
+   `max_tex_indirections` to two only with that bit; otherwise retain the
+   current one.  The present limits are at `chrome9_screen.c:133..143`.
+   Continue accepting only level-zero views: the current rejection at
+   `chrome9_context.c:696..705` is correct until the mip-table ABI is live.
+
+The first Mesa-side regression should use the same three raw-oracle pixels,
+not a visually uniform quad.  Target is guarded 64x64 XRGB with pitch 256 and
+sentinel `005a5a5a`; both sources are guarded 32x32 XRGB with pitch 128.
+Texture 0 quadrants are red/green/blue/white and texture 1 quadrants are
+red/red/blue/yellow.  At `(8,4)`, `(48,16)`, and `(56,48)` the exact expected
+XRGB words are `00ff0000`, `00000000`, and `00ffff00`; outside at `(8,48)`
+must remain `005a5a5a`.  Verify all six source/target guard pages and both
+unchanged source images.  Only after that smoke test passes should the screen
+advertise two samplers to the state tracker.
 
 ## Measured live result
 

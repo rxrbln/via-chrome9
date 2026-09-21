@@ -166,6 +166,97 @@ case as a separate guarded submission followed by a legacy COPY closure draw.
 Only ADD is currently live; the remaining four rows are static packet-derived
 test vectors until silicon execution.
 
+### Size-preserving nonconstant factor/function completion
+
+All nonconstant core GL factors fit the existing blend-state ABI: append enum
+values for `SRC_COLOR`, `INV_SRC_COLOR`, `DST_ALPHA`, `INV_DST_ALPHA`,
+`DST_COLOR`, `INV_DST_COLOR`, and `SRC_ALPHA_SATURATE`, and append functions
+`SUBTRACT`, `REVERSE_SUBTRACT`, `MIN`, and `MAX`.  No ioctl structure or packet
+length changes.  `SRC1_*` remains unsupported because the recovered hardware
+path and bounded shaders expose only one fragment output.
+
+Lowering must distinguish API source/destination from physical equation
+operand A/B:
+
+- ADD and SUBTRACT: A is source with the API source factor; B is destination
+  with the API destination factor.
+- REVERSE_SUBTRACT: A is destination with the API destination factor; B is
+  source with the API source factor.  Swap both operand selectors **and**
+  factor codes.
+- MIN/MAX: A is destination, B is source, both factors are forced to ONE;
+  Gallium already canonicalizes them, but the kernel should not rely on that.
+
+The same transform is applied independently to RGB and alpha.  On the alpha
+lane, `SRC_COLOR` is `SRC_ALPHA`, `DST_COLOR` is `DST_ALPHA`, and their inverse
+forms follow the same rule; the recovered alpha factor-code table implements
+exactly this GL semantic.  `SRC_ALPHA_SATURATE` is legal only as the RGB source
+factor and its alpha-lane equivalent is ONE.  Reject it in either destination
+field rather than accepting a table encoding which the API cannot generate.
+
+A compact guarded factor sweep can use source `60c04020` and prefilled
+destination `e02080e0`.  For each RGB **source** factor, use destination factor
+ZERO and alpha COPY ONE/ZERO.  With round-to-nearest multiplication the
+expected BGRA dwords are:
+
+| source factor | expected |
+|---|---:|
+| ZERO | `60000000` |
+| ONE | `60c04020` |
+| SRC_COLOR | `60911004` |
+| INV_SRC_COLOR | `602f301c` |
+| SRC_ALPHA | `6048180c` |
+| INV_SRC_ALPHA | `60782814` |
+| DST_ALPHA | `60a9381c` |
+| INV_DST_ALPHA | `60170804` |
+| DST_COLOR | `6018201c` |
+| INV_DST_COLOR | `60a82004` |
+| SRC_ALPHA_SATURATE | `60170804` |
+
+Allow one LSB per multiplied RGB component while first characterizing silicon
+rounding.  The chosen high destination alpha makes SATURATE select
+`1-DST_ALPHA`; repeat it with destination alpha `20` to make SATURATE select
+`SRC_ALPHA`.  Both cases are required to validate the native minimum rather
+than accidentally aliasing either ordinary factor.
+
+For each RGB **destination** factor, use source factor ZERO and alpha
+destination-preserve ZERO/ONE.  The same input pair gives:
+
+| destination factor | expected |
+|---|---:|
+| ZERO | `e0000000` |
+| ONE | `e02080e0` |
+| SRC_COLOR | `e018201c` |
+| INV_SRC_COLOR | `e00860c4` |
+| SRC_ALPHA | `e00c3054` |
+| INV_SRC_ALPHA | `e014508c` |
+| DST_ALPHA | `e01c70c5` |
+| INV_DST_ALPHA | `e004101b` |
+| DST_COLOR | `e00440c5` |
+| INV_DST_COLOR | `e01c401b` |
+
+Do not include SRC_ALPHA_SATURATE in that destination sweep.  Follow every
+new factor/function submission with canonical COPY so a bad word cannot leave
+an inherited factor or operand order hidden for the next test.
+
+Exercise the alpha table separately on format 99 with an A-only write mask;
+RGB must remain the destination `2080e0`.  With source alpha `60` and
+destination alpha `e0`, source-factor/alpha-destination-ZERO results are
+ZERO=`00`, ONE=`60`, SRC_COLOR/SRC_ALPHA=`24`,
+INV_SRC_COLOR/INV_SRC_ALPHA=`3c`, DST_COLOR/DST_ALPHA=`54`, and their inverse
+forms=`0c`.  Source-ZERO/destination-factor results are ZERO=`00`, ONE=`e0`,
+SRC_COLOR/SRC_ALPHA=`54`, inverse=`8c`, DST_COLOR/DST_ALPHA=`c5`, and
+inverse=`1b`.  These paired aliases are required GL alpha-lane behavior, not
+missing hardware distinctions.  Keep SRC_ALPHA_SATURATE rejected in alpha
+factor fields.
+
+Constant factors are the only core factor family that does **not** fit the
+current ABI because `drm_chrome9_blend_state` contains no blend-color value.
+They need a new size/versioned successor (or a separately versioned immutable
+state object), not reinterpretation of alpha-test or draw-tail fields.  A
+normalized four-component value must be lowered independently into the
+physical A-side or B-side constant registers; REVERSE_SUBTRACT swaps which
+side receives the API source and destination constants.
+
 ### Constant-factor state and closure
 
 The factor constants use unsigned 1.10 fixed point.  For an API blend color
@@ -209,6 +300,17 @@ Preserve both halves in a general state tracker.  A first implementation that
 exposes no operand constants can safely emit all of A38--A3F as zero on every
 blend-state change.  That makes ZERO/ONE self-contained and matches the
 clearing performed by the proprietary builders.
+
+`CONST_COLOR` and `CONST_ALPHA` share the same native selector but require
+different population of these registers.  For CONST_COLOR, put q(R/G/B) in
+the RGB factor lanes and q(A) in the alpha factor lane.  For CONST_ALPHA, put
+q(A) in **all three** RGB factor lanes as well as the alpha lane.  The inverse
+forms use the same stored values and select the inverse native factor code;
+do not pre-invert the constants in software.  Populate the physical A-side
+lanes for the equation's A operand and B-side lanes for its B operand.  This
+means REVERSE_SUBTRACT places the API destination factor on A and the API
+source factor on B, matching its operand swap.  Leave all Ca/Cb/Aa/Ab operand
+constant halves zero until a shader path actually selects constant operands.
 
 For blend color `(R,G,B,A)=(0.25,0.5,0.75,1.0)`, both A- and B-factor copies
 are exactly:
@@ -322,7 +424,7 @@ contains its own subaddress.  The byte-identical Windows builders
 `STM_AlphaFunc_INV:0x194ad0`, update the ordinary A33 state-image slot; none
 establishes an ordering dependency relative to A10--A20.
 
-The first combined alpha/depth discriminator should keep blending disabled
+The now-live combined alpha/depth discriminator keeps blending disabled
 with canonical COPY words and use LESS for both tests.  Clear XRGB to zero and
 D16 to `ffff`, then cover the same interior pixels twice:
 
@@ -337,8 +439,9 @@ farther green draw still passes against the clear value.  If alpha test is
 disabled or reversed, draw 1 stores red/depth `4000` and rejects draw 2.  If
 the color kill occurs but a killed fragment incorrectly writes depth, the
 final pair is zero/`4000`.  This therefore validates the A33 slot, A00 bit 20,
-and alpha-test ordering relative to D16 writes in one guarded test.  Run the
-ALWAYS and NEVER controls first, exactly as for the color-only discriminator.
+and alpha-test ordering relative to D16 writes in one guarded test.  ALWAYS
+and NEVER controls also passed before this LESS case; all guards remained
+intact.
 
 Submit two otherwise-identical overlapping COPY draws against a zero target:
 
@@ -810,9 +913,8 @@ alpha test consumes fragment alpha before the format-98 XRGB store, so it can
 be validated on the already-live target.
 
 One more exposure boundary is important: setting the Gallium cap true claims
-the fixed test for every otherwise supported draw.  The current D16 ioctl has
-no alpha state and the textured path cannot yet be combined with D16.  A
-truthful desktop cap therefore also needs an alpha-aware D16 successor (and
-the driver's existing unsupported texture+depth combination remains a
-separate fallback/rejection problem).  Until then, keep the cap false and use
-the new state only in explicitly labelled direct-pipe/raw validation.
+the fixed test for every otherwise supported draw.  The alpha-aware D16
+successor is now live, and both raw and Gallium alpha-plus-D16 tests passed.
+The driver's texture+depth combination remains explicitly unsupported and is
+rejected before submission, so it does not invalidate the cap for the bounded
+draw combinations which the driver accepts.

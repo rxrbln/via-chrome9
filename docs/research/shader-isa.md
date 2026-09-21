@@ -150,6 +150,215 @@ an offline differential oracle for VS opcodes, operands, flow fixups, and
 compiler metadata; it does not establish execution behavior or make the
 vendor compiler safe for untrusted bytecode.
 
+### Gears-critical vertex and fragment forms
+
+The current Gallium bring-up executes arbitrary vertex NIR in the draw module
+and feeds post-transform vertices to the proven Xorg-style hardware shader, so
+a general native VS is not required for the first gears path.  The Windows
+oracle nevertheless supplies exact records for the subset needed by a later
+hardware lowering.
+
+The clip-position plus clamped primary-color form
+`MOV oPos,v0; MOV[_SAT] oD0,v1` emits these two user records:
+
+```text
+0008014c 00000000 00000000 00080a0f
+0008414c 00000000 00000000 0008422f
+```
+
+SAT and non-SAT D3D destination tokens produce a byte-identical native object.
+The color-output finalizer therefore owns the clamp on oD0; a fixed-function
+`fsat(COL0)` can use this same record instead of requiring a separate ALU
+instruction.  Output metadata is `+4=00000044`, active-count metadata is
+`+14=7`, and upload count `+424=9`.  Token SHA-256 is
+`74dbbfac59fb791e8cf4ce4d67d6f73658b3a4b5ff65e12f6d200716605dde05`;
+the bounded native blob SHA-256 is
+`b4f52ed17680c34fcc8b66f49b8a06a9e0ed9a95df2e60b5fcb49ac86594a52d`.
+
+A four-row clip transform followed by primary-color output uses four DP4s,
+then the same two MOVs:
+
+```text
+0008014c 0040014c 00000000 00060101
+0008014c 0040414c 00000000 00060102
+0008014c 0040814c 00000000 00060104
+0008014c 0040c14c 00000000 00060108
+0010014c 00000000 00000000 00080a0f
+0008414c 00000000 00000000 0008422f
+```
+
+Its token/native hashes are
+`3deb752119a2905cce83a8d54a7488acbe26957376687db3e327259fe4e570f6` and
+`d79c1ab5de36194062b34429273cb0409a9d0c7152a106c164a3ecdccd1f00c0`;
+metadata `+14=0b`, upload count `+424=0d`.
+
+Both programs append this exact seven-record color/position finalizer.  The
+first five records are inside A60's active range and the repeated final two are
+uploaded but inactive:
+
+```text
+00201248 003a6d54 003a6db4 00040804
+00201b6c 003a6d54 00201248 00040a04
+00201b6c 00000000 00000000 00280108
+00200150 00101b6c 00201b6c 001c0107
+0010014c 00380150 00384154 0004021f
+0020014c 00000000 00000000 0008020f
+0020014c 00000000 00000000 0008020f
+```
+
+A representative one-directional-light lowering was also compiled entirely
+offline.  It performs M4x4 position, M3x3 normal, DP3 light dot, MAX with zero,
+MUL diffuse, MAD ambient, and the two output MOVs.  Its 13 semantic native
+records, before the same seven-record tail, are:
+
+```text
+0008014c 0040014c 00000000 00060801
+0008014c 0040414c 00000000 00060802
+0008014c 0040814c 00000000 00060804
+0008014c 0040c14c 0020014c 0034010f
+00084154 00410154 00000000 00060801
+00084154 00414154 00000000 00060802
+00084154 00418154 0020014c 00340117
+00104154 0041c154 00000000 00060121
+00108000 00420000 00000000 00100121
+0042414c 00108000 00206db4 0004011f
+0042814c 0042c14c 0010414c 0004011f
+0010014c 00000000 00000000 00080a0f
+0010414c 00000000 00000000 0008422f
+```
+
+The complete 20-record blob has `+0=3`, `+4=44`, `+10=6`, `+14=12`,
+`+28=11`, `+424=14` (all values hexadecimal), token SHA-256
+`9db4b090dd56c5512a6054d5e9abc6c287fec005aa7d88ac3d157d063ab536fd`,
+and native SHA-256
+`a91278efd965fa905c59dbc12a40a11b434f5ffb402b111fa4cc85785525f19f`.
+This is an ISA/compiler golden vector, not a claim that it is byte-for-byte
+Mesa's full fixed-function lighting shader; two-sided lighting, attenuation,
+specular, rescale/normalize, color-material, and multiple lights require more
+lowering and constants.
+
+The Linux 5.75 compiler independently reproduces all 13 semantic records
+byte-for-byte (prefix SHA-256
+`c1e7685e30c0f83290a85167e40a2edf3b0150649fcaf319f7f8efd62c672ee1`).
+Its zero-context H5 path appends only the final five records of the seven-word
+Windows tail, for 18 uploads instead of 20.  This is a target/finalizer
+difference, not an ALU encoding disagreement: do not mix a semantic prefix
+from one compiler with finalizer records or A60 metadata from the other.  The
+Windows blob above is the complete VT3410 oracle; the Linux comparison is the
+independent instruction-field witness.
+
+The matching untextured fragment program remains the proven one-record
+`MOV oC0,v0` (`01c00000 301c0000 00f04005 000d083f`).  Gouraud versus flat
+interpolation and front/back culling do not select different VS/PS records:
+Gouraud is A23 shading state, perspective-correct diffuse is A01 bit 17, and
+culling uses A01 bit 7 plus A23 bit 8.  Keep those raster controls outside the
+shader compiler rather than inventing shader branches or discard operations.
+
+The proprietary fixed-function builder independently confirms the final
+lighting linkage.  `stmFFVSLightCopy_H5i` at
+`via_chrome9_dri.so:0x1b07d0` tests fixed-function state flags `0x40` and
+`0x80`.  Flag `0x40` emits a full-mask native MOV to oD0 (`...0008422f`)
+from the allocated diffuse temporary at compiler-object `+1568` and ORs
+output metadata bit `0x40` at `+2c`; flag `0x80` does the same for oD1
+(`...0008423f`), source `+156c`, metadata bit `0x80`.  This is the exact
+one-sided diffuse/specular path used with ordinary culling.  It does not prove
+an oBFD/back-color output mapping, so A23 bit 7 and two-sided lighting must
+remain disabled until a separate back-color oracle exists.
+
+Compiler success is not sufficient validation for a native VS.  Two
+hardware-free Windows probes deliberately omitted or incompletely defined
+clip position, and both returned success:
+
+* `MOV oD0,v1` alone produces eight uploads and metadata `+4=00000044`, even
+  though no user instruction defines oPos.  The compiler still appends its
+  full position/color finalizer; the bounded native blob SHA-256 is
+  `54625220dcf723cffde5ac2360f402116d260312930aba3b19be8e8d4db8418d`.
+* `MOV oPos.x,v0; MOV oD0,v1` preserves the partial position mask in its first
+  record (`0008014c 00000000 00000000 00080a01`), then appends the same
+  finalizer.  It produces nine uploads, `+4=44`, `+10=1`, `+14=7`, `+28=6`,
+  `+424=9`, and native SHA-256
+  `2f14c389123295b156ee2e302e8489aacfb29df842fd56ba4ea1b2e2f228c8fc`.
+
+The first Mesa native-VS subset must therefore require a dominating full
+XYZW oPos definition on every path rather than trusting the proprietary
+compiler's return code or output flags.  A conservative initial straight-line
+validator should require exactly one full oPos and one full oD0 definition,
+reject partial writes, and reject control flow until path-sensitive output
+validation exists.
+
+Output register acceptance is similarly broader than valid linkage.  A single
+offline program writing oPos and ATTROUT indices 0 through 3 emits native
+destinations 32, 34, 35, 36, and 37, but its output metadata is only
+`+4=000000c4`: position, oD0, and oD1.  The oD2/oD3 records
+(`...0008024f`/`...0008025f`) are not represented in linkage metadata and do
+not establish back-face color outputs.  The compiler nevertheless returns
+success (12 uploads; native SHA-256
+`b4e68cc67ae50c155fe5aec544a4ec8154a12386ed5de55b1f7d4602ebb85cd2`).
+Reject ATTROUT indices above one; do not use this permissive alias as an
+oBFD/oBFS implementation.
+
+The fixed-function light builder also gives an exact constant-allocation map.
+`stmFFVSLightCompute_H5i:0x1b00b8..0x1b0117` walks exactly eight enable bits
+from result byte `+1`; each light has a two-bit mode in result word `+2`.
+Mode 1 calls `stmFFVS_PointSpotLight_H5i(...,0)`, mode 2 calls it with final
+argument one, and mode 3 calls `stmFFVS_DirectionalLight_H5i`.  Other modes
+emit no per-light body.  Therefore point/spot/directional selection is a
+compile-time unrolled path, not a runtime shader branch.
+
+Before that call, `stmFFVS_UpdateLightConst_H5i:0x1afde0` assigns light `i`
+two disjoint constant runs:
+
+```text
+c(135 + 3*i) .. c(137 + 3*i)     # three color products
+c(159 + 7*i) .. c(165 + 7*i)     # seven geometric/attenuation vectors
+```
+
+For all eight lights these occupy c135..c158 and c159..c214.  The upload-side
+producer at `stmFFVSUpdatePreCalcConst_H5i:0x176b58..0x176cae` proves the
+first run's contents componentwise: light `+0x24` ambient times material
+`+0x4f54`, light `+0x04` diffuse times material `+0x4f44`, and light `+0x14`
+specular times material `+0x4f64`, each four floats.  It advances the
+destination by three vec4s and the D3D-style light record by `0x74` bytes for
+eight lights.
+The same function constructs `c(162+7*i)` from light direction `+0x40` and
+normalizes it after transforming by context matrix `+0x300`; it constructs
+`c(163+7*i)` from light position `+0x34` with that matrix.  Exact emitter use
+assigns c159..c161 as an alternate ambient/diffuse/specular triplet selected
+by the color-material-style path, c164 as the common point/spot distance
+attenuation vector, and c165 as the spot-only cone vector.  The component
+operand map is exact: the common point/spot path reads c164 as `(y,z,w,0)`
+and separately `xxxx`; the spot extension reads negated c165.z plus c165.w,
+c165.y, and c165.x individually.  CPU-side precomputation of those scalars
+remains unresolved.
+
+The builder flag byte is now assigned by complete-emitter differentials.  Bit
+0 enables lighting, bit 1 selects a local viewer for specular, bits 2/3/4/5
+select per-vertex emissive/ambient/diffuse/specular material respectively,
+bit 6 emits the specular/secondary path, and bit 7 emits the primary
+ambient/diffuse path.  The operand substitutions prove the four material
+bits: ambient changes precomputed c135 to raw light color c159 times the
+vertex-material temporary, diffuse changes c136 to c160 times its temporary,
+and specular changes c137 to c161 times its temporary.  The complete
+accumulator similarly changes among fixed `c130`,
+`c129 + vertex_emissive`, `global_ambient * vertex_ambient + c131`, and the
+fully per-vertex combination.  Local viewer inserts a bounded DP3/RSQ/scale
+normalization of the eye vector only when the specular path is present.
+
+This closes an important Mesa translation rule: material-source selection is
+compile-time native code selection, not a raster-state bit or a dynamic
+branch.  A native fixed-function shader key must include all eight flag bits,
+the enabled-light mask, and two-bit light type for every light.  Reusing a
+program across any of those differences gives the wrong constant/temporary
+contract even if the uploaded constants themselves are current.
+The complete vendor wrapper remains unsafe at its nominal eight-light API
+limit: eight spot lights at ordinary primary+specular flags `c0` emit 287
+records and overwrite the allocator map beginning at record 272; `ff` reaches
+the corrupted map and faults in the offline process.  A Mesa lowering must
+preflight the complete program before appending any native records.
+This exact allocation is useful for a future native fixed-function lowering,
+but the present draw-module TNL path should continue to supply already-lit
+oD0/oD1 values and avoid these 80 private constants.
+
 ## Direct3D semantic-to-emitter map
 
 The Direct3D frontend provides a static semantic oracle.  The compiler at
@@ -210,15 +419,26 @@ and symbolized dispatcher:
 | 102 | `STM_DPH_ICD` | `0x101dcb1c` | `0x102163b0` |
 | 103 | `STM_FLR_ICD` | `0x101dcb60` | `0x10216a10` |
 | 104 | `STM_SWZ_ICD` | `0x101dcb71` | `0x10216c20` |
-| 105 | split SINCOS component, mode 1 | `0x101dccb4` | `0x10219be0(...,1)` |
-| 106 | split SINCOS component, mode 0 | `0x101dccc7` | `0x10219be0(...,0)` |
+| 105 | SIN, split SINCOS component, mode 1 | `0x101dccb4` | `0x10219be0(...,1)` |
+| 106 | COS, split SINCOS component, mode 0 | `0x101dccc7` | `0x10219be0(...,0)` |
 | 107 | `STM_SLT_ICD` | `0x101dcb2d` | `0x10216550` |
 
-Opcodes 105 and 106 are deliberately not labelled SIN versus COS yet.  Linux
-`stmPPSDispatcherPS20_invi` proves that both call
-`stmPPS_SIN_COS_ICD_PS20_invi` with the final argument one or zero, while the
-Windows emitter uses that argument to select an extra `0x249` immediate.  The
-component-to-mode direction still needs a controlled frontend differential.
+The component-to-mode direction is now fixed by the symbolized Linux parser,
+not by guessing from the polynomial constants.  `fp_parse`'s reduction jump
+table is at virtual address `0x3efa80`: reductions 31/32 create opcode `0x6a`
+in the scalar-operation sequence before EXP/LOG/RCP/RSQ, while reductions
+41/42 create opcode `0x69` after RSQ and before combined SINCOS.  This is the
+exact COS ... EXP, LOG, RCP, RSQ ... SIN, SINCOS grammar ordering.  The Linux
+dispatcher then passes mode 1 for `0x69` and mode 0 for `0x6a`; the Windows
+dispatcher makes the same calls at `0x101dccb4` and `0x101dccc7`.
+
+A hardware-free Wine differential provides a useful negative check.  D3D
+SINCOS with x-only, y-only, and xy destination masks always emits the same
+three ALU records and changes only the final record's native writemask:
+`00100005`, `00200005`, or `00300005`.  The public D3D SINCOS emitter is a
+combined operation; it does not expose the split mode argument.  Reproducible
+cases `sincos_x`, `sincos_y`, and `sincos_xy` are retained in
+`tools/chrome9_shader_corpus.py`.
 
 The programmable MOV wrapper delegates an unmodified MOV
 to `0x10218b70`; modifiers take a separate lowering path.  This makes MOV the
@@ -239,7 +459,7 @@ For an ALU-only program with `N` native instructions, the compiler-derived
 control tuple is:
 
 ```text
-90040000 91000000 920000NN 93000000
+90040000 91000000 9200nnnn 93000000
 94000000 95000000 96000000 97000000
 98000000 99000000 9a000000 9b000000
 ```
@@ -247,13 +467,13 @@ control tuple is:
 For one leading texture instruction followed by `N` ALU instructions, it is:
 
 ```text
-90000000 91000000 920100NN 93000001
+90000000 91000000 9201nnnn 93000001
 94000000 95000000 96000000 97000000
 98000000 99000000 9a000000 9b000000
 ```
 
-Here `NN` is the ALU count in the low 16 bits, not an eight-bit textual
-substitution.  The second tuple starts in TAU and switches to ALU after TAU
+Here `nnnn` is the four-hex-digit ALU count in the low 16 bits.  The second
+tuple starts in TAU and switches to ALU after TAU
 index zero; it never switches back.  Both tuples precede ordinary type-03
 uploads: `N*4` dwords under `20030000`, then zero or one dword under
 `21030000`.  Runtime integration must preserve the normal H2 packet builder
@@ -296,6 +516,62 @@ discard, depth output, dependent texture reads, and additional samplers can be
 enabled independently after numerical and scheduling tests.  The vendor
 compiler's successful return is not validation: it silently truncates ALU and
 TAU stores and accepts several invalid register/modifier encodings.
+
+The next scheduling rung is independently reproduced by the hardware-free
+Windows oracle.  For
+`texld r0,t0,s0; texld r1,t1,s1; mul oC0,r0,r1`, the exact finalized streams
+and controls are:
+
+```text
+TAU 201001b0 211111b1
+ALU 0140b6d0 00001000 00f00000 00000820
+A90..A9b:
+90000000 91000000 92020001 93000002
+94000000 95000000 96000000 97000000
+98000000 99000000 9a000000 9b000000
+```
+
+Making the second coordinate dependent on `r0` inserts an ALU move before the
+second TAU and therefore requires both switch directions:
+
+```text
+TAU 201001b0 211101b1
+ALU 01c00530 001c0053 00f00000 000d0420
+    0140b6d0 00001000 00f00000 00000820
+A90..A9b:
+90000000 91000000 92020002 93000003
+94000000 95000001 96000000 97000000
+98000000 99000000 9a000000 9b000000
+```
+
+These tuples validate `A93.bit1` as the final TAU-to-ALU switch for two
+independent samples, and `A93.bits1:0` plus `A95.bit0` for the dependent
+TAU-to-ALU-to-TAU-to-ALU schedule.  The stream SHA-256 values are respectively
+`d66da5c6ad057e098c7cf6b6c1b874d357be979f56568148ab191f126d794bbe` /
+`503b8f32ba1eebb0dedaa1e89b0cb06b56f80f710cb1f8db94d988ba9f0d854f`
+and `fbdfecbcc11f9d3eab924189cb38157e1b13d73a1f6f09f819a0a3809294c72f` /
+`b22a3fb214b16cdad7219b7501ec760d5b17d38fa35409c32300996ccb0f2079`
+for ALU / TAU.  Reproducible cases are `tex2_independent` and
+`tex2_dependent` in `tools/chrome9_shader_corpus.py`.  This proves the compiler
+mechanism but does not promote two samplers in Mesa before texture-state and
+linkage tests pass on silicon.
+
+The same headless path bounds three later fixed-function combine operations.
+After the same two independent TEXLDs, direct output ADD, MAD, and LRP each
+remain one ALU record after finalization, retain TAUs
+`201001b0 211111b1`, and use ALU/TAU count `92020001` with T2A
+`93000002` and no A2T bits:
+
+```text
+add oC0,r0,r1:     00010000 00140924 00f00000 00000820
+mad oC0,r0,r1,v0: 00400530 00001000 00f00000 00000820
+lrp oC0,r0,r1,v0: 00000000 00040053 00f00100 00110820
+```
+
+These are compiler-semantic templates for eventual `GL_ADD`, multiply-add,
+and `GL_INTERPOLATE` lowering.  They use the probe's virtual identity/zero
+allocator and have no silicon proof, so they must not be copied into the
+current Xorg-allocated fixed packet or advertised as texture-env support.
 
 ## Direct3D operand normalization
 
@@ -451,6 +727,23 @@ does not enforce.  These belong in the Mesa validator, before packet emission:
   128-record tokenizer crashes on record 129.
 - VS float constants stop at `c255`; invalid `c256` wraps computed unified
   index 512 to register zero.  `i16` aliases `b0` and `b16` aliases `i0`.
+- VS program length must be checked after lowering and finalization.  A
+  hardware-free program containing 169 NRM operations followed by full oPos
+  and oD0 writes returns success with parsed source count `+2ea4=000000ab`,
+  active count `+14=00000202`, and upload count `+424=00000204` (516 native
+  records).  `stmUpdateVS_inv:0x17c593..0x17c5b2` forms A60 as
+  `(active_count - 1) & 0x1ff`, so intended last index 513 silently becomes
+  one.  Token/native SHA-256 values are
+  `5cc5add5e6cc504625285d609f3884e1c47e5b57834b93e6db03212feae1c85a`
+  and `0ca5e97c11dc630daffb0ec3ce51beccc22ed4fca9b7be8ff5673e7fe16c20d9`.
+  Require both active and total-upload counts to fit the 512-record store;
+compiler success is not a bound check.
+- The separate fixed-function VS builder has only 272 record slots between
+  object `+0x454` and its allocator map at `+0x1554`.  Repeating its exact
+  spot-light `flags=c0` body for eight lights returns count 280 and overwrites
+  the map; `flags=ff` returns 320.  This is an offline object-layout overflow,
+  not extra hardware capacity.  Count the complete transform/light/fog/output
+  program before emitting any record.
 - PS `c32..c47` collide with native internal/gap ids 48..63 and `c48..c63`
   wrap to native ids 0..15.
 - Native TEXLD intentionally carries sampler ids 0..15, but an unchecked s16

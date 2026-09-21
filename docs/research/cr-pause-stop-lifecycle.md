@@ -269,3 +269,33 @@ Expected transition samples are PID00 `c0000000` or `80000000`, transient
 active `60000000`, then full `0400` idle at PID10.  No correctness decision
 should depend on the final PID10 value of `0444`; the authoritative STOP proof
 is the full engine mask used by the Windows KMD.
+
+## Live VX900 validation (2026-09-21)
+
+The conservative two-slot implementation was validated on PCI 1106:7122,
+revision 00, with Linux 7.2.5-t2.  Each slot contains an immutable PID00
+PAUSE and a PID10 STOP trailer separated by 128 bytes.  Before every slot
+replacement the driver changes only A64/A65 to the STOP address, requires
+`0400 & 00101ff3 == 0`, and only then installs the other A60--A68 tuple.
+
+The following tests completed without a timeout or guard corruption:
+
+* 1,000 consecutive fixed-quad submissions / slot replacements;
+* the complete Gallium color, D16, texture, blend, alpha-test, scissor and
+  PRIME-sharing smoke suite;
+* one complete depth-enabled fixed-function gear, then all three gears;
+* ten animated three-gear frames, followed by engine quiesce, module unload,
+  module reload and four more verified hardware submissions.
+
+The stable post-job sample was an exact `00010001` or `00020002` cookie,
+`0444=c0000000`, and `0400=00000000`.  Crucially, unload after the real gears
+workload succeeded without reboot.  The prior implementation, which replaced
+A60--A68 directly from PID00 PAUSE, had stalled active at `0444=60000000`.
+This live result is strong evidence that the illegal replacement lifecycle,
+not the D16 state packet, caused that recurring wedge.
+
+The implementation is deliberately correctness-first.  A STOP plus full
+ring reinstall for every immediate triangle is too expensive for production;
+the measured ten-frame three-gear run took 11.183 seconds.  The next
+performance step is a monotonic multi-command ring that advances only PID00
+A64/A65 during ordinary appends and uses PID10 solely for wrap/replacement.

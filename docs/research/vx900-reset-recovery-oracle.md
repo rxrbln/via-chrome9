@@ -219,6 +219,66 @@ correct for reachability but means the entry is not yet a recovery path.
 
 There are two importantly different timeout classes:
 
+* `0444` must be decoded before treating a reader as quiescent.  The local
+  VX800/VX820 Chrome9 HC3 manual's CR readback register `44--47h` names bit 31
+  `HRAGPCYCPause`, bit 30 `AGP_CYC` (command-cycle flag), and bit 29
+  `AGP_SEL` (command-cycle active).  Bits 28/27/26 report same pause/end/jump
+  addresses, bit 25 is the internal pause-cycle flag, bits 24/23 are request
+  and acknowledge, and bits 18:10 count requests without returned data.  This
+  matches the VX900 Windows test of bit 31 and every live VX900 PAUSE sample.
+  Consequently `0444=60000000` is an active command cycle (`AGP_CYC|AGP_SEL`),
+  explicitly **not** an owned PAUSE.  Paired with `0400=00000010`, it means
+  the reader remains active while all non-CR engines are idle.
+  The same manual identifies readback `3c--3fh` as the current executed AGP
+  command.  For the current one-texture MODULATE+blend builder in slot 1,
+  the six-dword leading H0 plus alignment put body dword zero at `1020`.
+  `043c=00001200` therefore maps to body dword 120, the final four zero words
+  of the VS-integer group; the blend delta moves the clip H2 header to body
+  124 at `1210`.  The final cookie H0 begins at `1410` and the owned PAUSE is
+  `1470`, so this sample is about `0x210` bytes before the cookie and
+  `0x270` before PAUSE, not a reader which narrowly missed its PAUSE poll.
+  This address conclusion is conditional on A60 naming slot 1; record A60--A65
+  and the expected/current cookie with every such diagnostic.
+
+For the later **one-texture plus blend plus D16** successor, both closed-state
+deltas precede the constant/clip groups, so the corresponding map is eight
+dwords later than the original 232-dword Xorg body:
+
+```text
+body[120..127] = FE020440 0000043C 33030000 CC000000
+                 00000000 00000000 00000000 00000000
+body[128..135] = FE020440 0000043C 00010000 CC000000
+                 80000020 81000020 82000020 83000020
+```
+
+The first group is the unchanged VS integer-constant upload and the second is
+the clip group.  Because the leading H0 and alignment make the body begin at
+slot offset `20`, slot-1 `043c=1200` names body dword 120, the start of the
+integer-constant H2 header.  Its four-zero payload begins at `1210` and the
+clip header begins at `1220`; the combined body's final cookie begins at
+`1420` and its PAUSE remains `1470`.  The clip header is byte-for-byte the
+Windows/Xorg form and the old 5.75 KMD's
+`addcmdheader2_invi()` construction: `FE02|(043c+4)`, `043c`, parameter type
+`00010000`, software flag/pad, followed by A80, A81, A82, A83 in order.  Do
+not reorder or rewrite it based on this cursor.
+
+The manual calls `043c` the current executed-command address, but live PAUSE
+samples let it advance as much as the request FIFO's read-ahead beyond the
+decoded PAUSE.  Operationally it is only a fetch-cursor bound: data through
+the indicated 16-byte block have reached the CR side, while decoding may lag.
+Capture `0440` (current request address) with `043c` to bracket memory fetch;
+neither proves the instruction at that address executed.  The open 5.75 KMD
+uses `043c` only as `CurHW` for ring-overwrite bounds and deliberately repeats
+every decisive read because, in its words, the value is sometimes unreliable.
+A one-sample cursor is therefore weaker still.  The smallest safe
+correction is therefore diagnostic, not a clip-state delta: assert/dump actual
+ring dwords 120--135 plus A60--A65 and both cursor registers.  If those words
+match, gate the unvalidated blend+D16 combination back to its separately
+live-proven predecessors rather than perturbing the proven H2 framing.  A
+generic “header cannot start at slot offset `200`” theory is already
+contradicted by the live one-texture predecessor: its clip H2 header occupies
+body dword 120 at exactly that address.  Do not add speculative padding on the
+basis of this cursor alone.
 * An owned reader at PAUSE may leave only command-reader bit 4 set.  The
   proven readiness predicate is `0444.bit31 && !(0400 & 00101fe3)`, not the
   full `00101ff3` STOP/idle predicate.  The fixed self-test already makes
@@ -230,6 +290,28 @@ There are two importantly different timeout classes:
   PAUSE proves that the command reader stopped delivering new work, but does
   not prove already delivered 2D/3D/DMA work retired.  This class still needs
   the device-wide reset state machine above; freeing anything is unsafe.
+
+There is a narrower split-retirement fact for the active-reader sample, but it
+must not weaken the quiesce predicate.  If `DST_POS` equals the exact
+quarantined job's alternating cookie, and the owned immutable stream is known
+to contain only its aligned PAUSE and dummy padding after that final H0 write,
+then `0400 & 00101fe3 == 0` proves the preceding 2D/3D body has drained.  That
+can justify a device-to-CPU cache transition and, after a successful GTI
+invalidation, release of only the job's data mappings.  It does **not** prove
+that command fetching stopped: retain the current ring page, its PTE, the CR
+state, and the engine lifetime, do not reuse either ping-pong slot, and keep
+the engine unavailable until `0444.bit31` arrives or a proved replacement or
+reset succeeds.  A late snapshot of `DST_POS` alone is weaker than observing
+the ordered poll: first confirm that it equals this job's cookie rather than a
+prior alternating value.
+
+The `60000000`/pre-cookie instance is not eligible for that split recovery.
+Nor may the normal PID00-to-PID10 replacement helper be applied: both open
+Linux and Windows paths first require the old reader at PAUSE before changing
+A64/A65.  Retargeting STOP while this slot is active and prefetched would
+mutate CR ownership without a proven boundary.  If it does not naturally
+reach PAUSE under the late deadline, only the separately validated destructive
+reset state machine or reboot can make its ring storage releasable.
 
 Before attempting destructive reset, add a bounded late-retirement recovery.
 It can recover work which completed just after the ordinary 100-ms deadline:

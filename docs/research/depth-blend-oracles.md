@@ -1,10 +1,13 @@
 # Guarded H6 depth and alpha-blend oracles
 
-Status: both packet-exact derivatives have executed successfully on the live
-VX900.  The D16 LESS/write case retained the first red triangle and the
-source-alpha case produced the exact two-pass `00408000` result.  They use CPU
-clears and linear translated-SF resources so that depth/blend behavior is not
-confounded with an unverified GPU clear or tiling path.
+Status: the packet-exact D16, source-alpha, and combined alpha-before-D16
+derivatives have executed successfully on the live VX900.  The D16 LESS/write
+case retained the first red triangle, the source-alpha case produced the exact
+two-pass `00408000` result, and the combined successor killed the near
+alpha-`c0` fragment before its depth write then stored the farther alpha-`40`
+green fragment as `0000ff00/8000`.  They use CPU clears and linear translated-
+SF resources so depth/blend behavior is not confounded with an unverified GPU
+clear or tiling path.
 
 The common 188-dword source body and its measured result are in
 [vp-stall-analysis.md](vp-stall-analysis.md).  Topology, shading, automatic
