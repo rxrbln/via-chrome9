@@ -55,6 +55,11 @@ targets.
   safest terminal MOV replication gate.
 - [chrome9-swizzle-neg-corpus.tsv](chrome9-swizzle-neg-corpus.tsv) retains the
   complete 72-case Windows/Linux differential and its two reject rows.
+- [chrome9-frc-one-record-rung.md](chrome9-frc-one-record-rung.md) defines the
+  bounded terminal FRC candidate, exact identity/alpha-replicate/NEG records,
+  fail-closed NIR key, and D16-mandatory numerical oracles.
+- [chrome9-frc-one-record-corpus.tsv](chrome9-frc-one-record-corpus.tsv)
+  retains the six byte-matched Windows/Linux FRC records.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
