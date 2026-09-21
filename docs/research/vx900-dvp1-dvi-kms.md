@@ -15,8 +15,10 @@ known-good board routing:
 - No VT1632 responds at any of the viafb candidate addresses `0x08..0x0f` on
   the `SR26`, `SR31`, or `SR2C` buses. This board therefore needs no VT1632
   register programming.
-- Active DVI routing is `SR1E=0x31` and `CR9B=0x60`: DVP1 pads on, IGA1 source,
-  negative H/V sync for the 1024x768 oracle.
+- `SR1E=0x31` powers the DVP1 pads and `CR9B[6:4]` selects sync polarity and
+  IGA1.  The viafb result `CR9B=0x60` produced a stable DVI signal, but its
+  pixels had swapped colors and a mostly black frame; it was not a valid
+  display oracle.
 - `CR91=0x80` leaves the LVDS data path off and clears viafb's display-period
   gating bit.
 
@@ -33,18 +35,42 @@ pads only after timing/base setup, and turns them off during atomic disable.
 Every newly touched indexed register participates in the existing final VGA
 state restore.
 
-Live validation on 2026-09-21:
+Initial software validation on 2026-09-21 established the following:
 
 - I2C electrical self-test: `Chrome9 DVP1 DDC (SR31): Test OK`.
 - EDID: 128 bytes, NEC vendor bytes `38 a3`, native 1920x1200 mode selected by
   DRM fbdev at a 154 MHz pixel clock and 7680-byte pitch.
-- Xorg modesetting/glamor selected `DVI-I-1` and its configured 1024x768 mode.
-- X root FB 43 is XR24, 1024x768, pitch 4096, offset zero.
-- KMS logged the corresponding direct SF base `0xbdc000`; indexed IGA1 base
-  registers decode to the same byte address.
-- Accelerated GLX identifies `1106:7122` and Chrome9, and glxgears produced
-  77.6 and 83.5 FPS samples in the first final run (75.5 FPS in the capture
-  run).
-- A root-window capture shows correctly positioned, unwrapped glxgears at
-  `artifacts/chrome9-dvi-glxgears-root.png`.
+- Xorg modesetting/glamor selected `DVI-I-1` and accelerated GLX identified
+  `1106:7122` and Chrome9.
+- Captures of the X root were correct in memory. Direct SF display fetch was
+  nevertheless physically corrupt with both cached and plain PTE variants,
+  so those captures did not validate the physical DVI image.
 
+## Physical DVP1 correction
+
+An exact 1024x768 XR24 SMPTE buffer was visually verified in a software PNG,
+then written through both Chrome9 BAR2 staging and stock viafb. Both produced
+the same physical color/black corruption while preserving geometry. This
+excluded framebuffer base, pitch, format, X, glamor, and the VGA LUT.
+
+The unstripped vendor Linux `via_drv.so` contains
+`VIADVIPatchSkew_DVP1()`. Its affected-hardware path writes
+`CR9B[3:0]=0x0a`, selecting the opposite DVP1 clock polarity and phase step 2.
+A live output-only change from `CR9B=0x60` to `0x6a` immediately made the
+stock viafb framebuffer colors and complete frame correct. Chrome9 KMS now
+combines `0x0a` with the mode's H/V polarity bits every time it programs
+DVP1.
+
+Until direct SF display fetch is understood, the validated physical path uses
+the fixed BAR2 interval at `0x06000000`. Xorg's modesetting driver reports
+front-buffer damage with `DIRTYFB`; the Chrome9 framebuffer callback copies
+only those clipped rectangles from the active shmem framebuffer into BAR2.
+The callback ignores inactive framebuffers and falls back to a full copy for
+annotated-copy requests.
+
+Final live validation used Chrome9 KMS, 1024x768 XR24, glamor, and direct
+Chrome9 GLX. A 300x300 glxgears window rendered with correct red, green, and
+blue gears and no wrap. Full-frame publication initially achieved 18 FPS;
+damage-rectangle publication achieved 55.753 FPS for the first five-second
+sample and 61.921 FPS for the second. The persistent target screenshot is
+`/root/tmp/chrome9-dvi-damage/glxgears-root.png`.
