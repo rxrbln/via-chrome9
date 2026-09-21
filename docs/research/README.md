@@ -114,6 +114,11 @@ targets.
   the vertex-only one-record SGN from the rejected/faulting pixel opcode.
 - [chrome9-pixel-sgn-rejection.tsv](chrome9-pixel-sgn-rejection.tsv) records
   the exact Windows tokenizer fault and Linux rejection boundary.
+- [chrome9-dph-static-audit.md](chrome9-dph-static-audit.md) proves the
+  internal pixel DPH emitter is one DP4-family record with source0.W forced
+  to ONE, while keeping its statically derived bytes fail-closed.
+- [chrome9-dph-static-corpus.tsv](chrome9-dph-static-corpus.tsv) records the
+  emitter masks/call sites and four mechanically derived v0/c0 candidates.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
