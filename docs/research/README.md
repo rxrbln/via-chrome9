@@ -95,6 +95,11 @@ targets.
   dependency deltas while keeping both outside the one-record runtime.
 - [chrome9-nrm-pow-expansion-corpus.tsv](chrome9-nrm-pow-expansion-corpus.tsv)
   preserves the exact Windows and Linux terminal streams and control tuples.
+- [chrome9-sincos-rejection-audit.md](chrome9-sincos-rejection-audit.md)
+  closes the public three-record terminal SINCOS masks and separates them
+  from static-only internal SIN/COS emitters.
+- [chrome9-sincos-terminal-corpus.tsv](chrome9-sincos-terminal-corpus.tsv)
+  retains four terminal Windows/Linux SINCOS streams and dependency deltas.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
