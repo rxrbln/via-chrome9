@@ -1057,3 +1057,34 @@ This is a live application/submission and stability gate for the RGBX varying
 classifier plus the RHW D16 successor.  The timing line alone is not a pixel
 oracle; visual/pixel correctness remains bounded by the corresponding smoke
 readback rather than inferred from FPS.
+
+## Two-texture D16 composition gate
+
+The combined two-texture plus D16 successor passed the complete live suite on
+VX900 with:
+
+```text
+kernel Chrome9       f39a90d6a16b16066dfbd53ee1674f9336d12069
+kernel UAPI          b623464ba08e02e39475e8cd67ccc31eeb75a67e
+Mesa Chrome9         91cd42a783ce8770ce23bcc6312c7550cd62951b
+Mesa UAPI copy       56147856e9da72ea2e876d532731176a3ec08db9
+Mesa parent          216159ca624c072a855ac5fb2dc68a2e42cd127c
+module SHA-256       4b1544c328d729157a392541849c7a92ae66e2e05563322e30a9489ddacef5b0
+libgallium SHA-256   ed26e97a12ea6030a370d7e4740ed9c2046ca228f43b9715333622e03b241bf6
+```
+
+`/root/tmp/chrome9/smoke-two-texture-d16-v1.log` completed with status zero;
+its SHA-256 is
+`f67fc2bb21c1a9b2886ae4718545be428e96e51a53502e8b4700d0e9f4638660`.
+The decisive line was:
+
+```text
+Gallium two-unit NPOT MODULATE D16 LEQUAL/LESS passed
+```
+
+Both texture sources, the color target, and D16 target retained their guard
+pages.  Engine-error MMIO `040c` remained zero.  Direct flips remained gated
+off, Xorg was stopped cleanly at PID 9585, and the VGA state was restored.
+This closes the combined level-zero two-sampler, NPOT, MODULATE, D16 LESS and
+LEQUAL execution path; it does not close mip selection, additional shader
+forms, or the direct-flip gate.
