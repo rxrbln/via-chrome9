@@ -72,6 +72,13 @@ therefore needs only these A31 values:
 | nearest-mip-linear | `31100002` | `31102082` |
 | linear-mip-linear | `31100412` | `31102492` |
 
+The manual names A31 D-filter code 4 as dither, but both proprietary builders
+replace every incoming mip-filter value 3 or greater with code 2 before the
+word is dirtied (`Windows 0x101d9402..0x101d9415`, Linux
+`0x1b336a..0x1b3385`).  Therefore dither has register-table evidence only and
+must not be accepted as an alias for trilinear or advertised as a hidden
+seventh GL filter combination.
+
 The shipping builders also maintain A32 high bits while changing filter
 modes.  The manual resolves them: A32[21:19] and A32[18:16] are R enlargement
 and R shrinking, respectively.  Thus their ordinary linear/linear path sets
