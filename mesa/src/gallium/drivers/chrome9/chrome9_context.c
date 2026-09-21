@@ -332,6 +332,7 @@ static bool
 chrome9_fs_is_texcoord(nir_def *def, unsigned unit, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
+   unsigned location;
 
    if (depth > 8 || def->num_components < 2)
       return false;
@@ -342,13 +343,15 @@ chrome9_fs_is_texcoord(nir_def *def, unsigned unit, unsigned depth)
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_interpolated_input:
-         return nir_intrinsic_io_semantics(intr).location ==
-                   VARYING_SLOT_TEX0 + unit &&
+         location = nir_intrinsic_io_semantics(intr).location;
+         return (location == VARYING_SLOT_TEX0 + unit ||
+                 location == VARYING_SLOT_VAR0 + unit) &&
                 !nir_intrinsic_component(intr);
       case nir_intrinsic_load_deref:
          var = nir_intrinsic_get_var(intr, 0);
          return var && var->data.mode == nir_var_shader_in &&
-                var->data.location == VARYING_SLOT_TEX0 + unit &&
+                (var->data.location == VARYING_SLOT_TEX0 + unit ||
+                 var->data.location == VARYING_SLOT_VAR0 + unit) &&
                 !var->data.location_frac;
       default:
          return false;

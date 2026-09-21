@@ -118,7 +118,8 @@ make_texture_vertex_shader(struct pipe_screen *screen,
                        .io_semantics.location = VARYING_SLOT_COL0);
    }
    nir_store_output(&b, texcoord, nir_imm_int(&b, 0), .write_mask = 0xf,
-                    .io_semantics.location = VARYING_SLOT_TEX0);
+                    .io_semantics.location = emit_color ?
+                       VARYING_SLOT_TEX0 : VARYING_SLOT_VAR0);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
    return context->create_vs_state(context, &state);
@@ -142,7 +143,8 @@ make_texture_fragment_shader(struct pipe_screen *screen,
    barycentric = nir_load_barycentric_pixel(&b, 32);
    texcoord = nir_load_interpolated_input(
       &b, 2, 32, barycentric, nir_imm_int(&b, 0),
-      .io_semantics.location = VARYING_SLOT_TEX0);
+      .io_semantics.location = modulate ?
+         VARYING_SLOT_TEX0 : VARYING_SLOT_VAR0);
    tex = nir_tex_instr_create(b.shader, 1);
    tex->op = nir_texop_tex;
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
