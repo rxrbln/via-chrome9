@@ -53,6 +53,9 @@ targets.
 - [chrome9-semantic-min-successor.md](chrome9-semantic-min-successor.md)
   maps the smallest patch-ready NIR/native operation after MOV/MUL while
   retaining a mandatory guarded numerical silicon gate.
+- [chrome9-semantic-add-sub-successor.md](chrome9-semantic-add-sub-successor.md)
+  defines the source-B packer, ADD finite-domain key, and mandatory physical-
+  slot lifetime refactor before noncommutative SUB.
 - [chrome9-cmd19-fp-contract.md](chrome9-cmd19-fp-contract.md) separates
   value-independent Linux/Windows MOV/MUL compiler evidence from numerical
   silicon behavior, defines the finite/exceptional-value gate, a guarded
