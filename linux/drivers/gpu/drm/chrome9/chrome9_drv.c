@@ -2269,7 +2269,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 				       DRM_CHROME9_CAP_SCISSOR |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH |
-				       DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE;
+				       DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE |
+				       DRM_CHROME9_CAP_DEPTH_FUNC;
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:

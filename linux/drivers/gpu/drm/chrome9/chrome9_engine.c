@@ -1174,12 +1174,16 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	u32 delta = 0;
 	u32 triangle_count = request->triangle_count ?: 1;
 	u32 vertex_count = triangle_count * 3;
+	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	bool blend = chrome9_draw_has_blend(request);
 	unsigned int i;
 
 	if (!triangle_count ||
 	    triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES)
 		return -E2BIG;
+	if (!depth_func)
+		depth_func = DRM_CHROME9_COMPARE_LESS;
 
 	memset(base, 0xcc, PAGE_SIZE);
 	p = base;
@@ -1219,7 +1223,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	body[23 + delta] = 0x11000001 |
 		((request->depth_pitch >> 5) << 13);
 	body[24 + delta] = 0x12380000;
-	body[25 + delta] = 0x13010000;
+	body[25 + delta] = 0x13000000 | depth_func << 16;
 	body[26 + delta] = 0x20007fff;
 	body[27 + delta] = blend &&
 		(request->blend.flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
@@ -3227,6 +3231,20 @@ int chrome9_draw_triangle_blend_ioctl(struct drm_device *drm, void *data,
 	return chrome9_submit_draw(drm, file, &request);
 }
 
+static int chrome9_validate_depth_flags(u32 flags, u32 allowed)
+{
+	u32 depth_func;
+
+	if (flags & ~(allowed | DRM_CHROME9_DEPTH_FUNC_MASK))
+		return -EINVAL;
+	depth_func = (flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+		     DRM_CHROME9_DEPTH_FUNC_SHIFT;
+	if (!depth_func)
+		depth_func = DRM_CHROME9_COMPARE_LESS;
+	return depth_func == DRM_CHROME9_COMPARE_LESS ||
+	       depth_func == DRM_CHROME9_COMPARE_LEQUAL ? 0 : -EINVAL;
+}
+
 int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
 				    struct drm_file *file)
 {
@@ -3235,6 +3253,7 @@ int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
 		.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16,
 		.destination_handle = args->destination_handle,
 		.depth_handle = args->depth_handle,
+		.flags = args->flags,
 		.width = args->width,
 		.height = args->height,
 		.pitch = args->destination_pitch,
@@ -3246,7 +3265,8 @@ int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
 	unsigned int i;
 	int ret;
 
-	if (args->flags || args->pad || args->reserved ||
+	if (chrome9_validate_depth_flags(args->flags, 0) ||
+	    args->pad || args->reserved ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
 	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
@@ -3295,6 +3315,7 @@ int chrome9_draw_triangle_d16_blend_ioctl(struct drm_device *drm, void *data,
 		.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BLEND,
 		.destination_handle = args->destination_handle,
 		.depth_handle = args->depth_handle,
+		.flags = args->flags,
 		.width = args->width,
 		.height = args->height,
 		.pitch = args->destination_pitch,
@@ -3308,7 +3329,8 @@ int chrome9_draw_triangle_d16_blend_ioctl(struct drm_device *drm, void *data,
 	unsigned int i;
 	int ret;
 
-	if (args->flags || args->pad || args->reserved[0] ||
+	if (chrome9_validate_depth_flags(args->flags, 0) ||
+	    args->pad || args->reserved[0] ||
 	    args->reserved[1] ||
 	    args->destination_format >
 		DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
@@ -3378,11 +3400,13 @@ int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
 	u32 vertex_count;
 	bool depth = args->flags & DRM_CHROME9_TRIANGLE_BATCH_DEPTH;
 	bool blend = args->flags & DRM_CHROME9_TRIANGLE_BATCH_BLEND;
+	u32 state_flags = DRM_CHROME9_TRIANGLE_BATCH_DEPTH |
+			  DRM_CHROME9_TRIANGLE_BATCH_BLEND;
 	unsigned int i;
 	int ret;
 
-	if (args->flags & ~(DRM_CHROME9_TRIANGLE_BATCH_DEPTH |
-			    DRM_CHROME9_TRIANGLE_BATCH_BLEND) ||
+	if (chrome9_validate_depth_flags(args->flags, state_flags) ||
+	    (!depth && (args->flags & DRM_CHROME9_DEPTH_FUNC_MASK)) ||
 	    !args->triangle_count ||
 	    args->triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES ||
 	    !args->vertices_ptr || args->reserved0 || args->pad ||
