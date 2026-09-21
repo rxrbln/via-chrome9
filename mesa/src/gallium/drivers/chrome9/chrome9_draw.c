@@ -771,7 +771,9 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
    }
    if (submitted) {
       ctx->submitted_triangles += count;
+      ctx->submitted_batches++;
       chrome9_context_render_target_written(ctx);
+      crender->batch_failed = false;
    } else {
       ctx->rejected_triangles += count;
       crender->batch_failed = true;
@@ -1324,51 +1326,62 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
    }
    if (!crender->textured && ctx->draw_triangle_batch) {
+      struct drm_chrome9_draw_triangle_batch next = { 0 };
+      struct drm_chrome9_draw_triangle_d16_rhw_batch next_rhw = { 0 };
+
+      if (perspective_batch) {
+         next_rhw.destination_handle = target->bo.handle;
+         next_rhw.depth_handle = depth->bo.handle;
+         next_rhw.flags = DRM_CHROME9_TRIANGLE_BATCH_DEPTH | depth_flags;
+         next_rhw.width = target->base.width0;
+         next_rhw.height = target->base.height0;
+         next_rhw.destination_pitch = target->stride;
+         next_rhw.depth_pitch = depth->stride;
+         next_rhw.scissor = scissor;
+         if (blend_successor) {
+            next_rhw.flags |= DRM_CHROME9_TRIANGLE_BATCH_BLEND;
+            next_rhw.blend = blend_state;
+            next_rhw.destination_format =
+               target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+               DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+               DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+         }
+      } else {
+         next.destination_handle = target->bo.handle;
+         next.width = target->base.width0;
+         next.height = target->base.height0;
+         next.destination_pitch = target->stride;
+         next.scissor = scissor;
+         if (depth_active) {
+            next.flags |= DRM_CHROME9_TRIANGLE_BATCH_DEPTH | depth_flags;
+            next.depth_handle = depth->bo.handle;
+            next.depth_pitch = depth->stride;
+         }
+         if (blend_successor) {
+            next.flags |= DRM_CHROME9_TRIANGLE_BATCH_BLEND;
+            next.blend = blend_state;
+            next.destination_format =
+               target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+               DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+               DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+         }
+      }
+      if (crender->batch_count &&
+          (crender->batch_perspective != perspective_batch ||
+           (perspective_batch ?
+              memcmp(&crender->batch_rhw, &next_rhw, sizeof(next_rhw)) :
+              memcmp(&crender->batch, &next, sizeof(next)))))
+         chrome9_flush_triangle_batch(crender);
+      if (crender->batch_failed) {
+         ctx->rejected_triangles++;
+         return;
+      }
       if (!crender->batch_count) {
          crender->batch_perspective = perspective_batch;
-         if (perspective_batch) {
-            struct drm_chrome9_draw_triangle_d16_rhw_batch *batch =
-               &crender->batch_rhw;
-
-            memset(batch, 0, sizeof(*batch));
-            batch->destination_handle = target->bo.handle;
-            batch->depth_handle = depth->bo.handle;
-            batch->flags = DRM_CHROME9_TRIANGLE_BATCH_DEPTH | depth_flags;
-            batch->width = target->base.width0;
-            batch->height = target->base.height0;
-            batch->destination_pitch = target->stride;
-            batch->depth_pitch = depth->stride;
-            batch->scissor = scissor;
-            if (blend_successor) {
-               batch->flags |= DRM_CHROME9_TRIANGLE_BATCH_BLEND;
-               batch->blend = blend_state;
-               batch->destination_format =
-                  target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
-                  DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
-                  DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
-            }
-         } else {
-            memset(&crender->batch, 0, sizeof(crender->batch));
-            crender->batch.destination_handle = target->bo.handle;
-            crender->batch.width = target->base.width0;
-            crender->batch.height = target->base.height0;
-            crender->batch.destination_pitch = target->stride;
-            crender->batch.scissor = scissor;
-            if (depth_active) {
-               crender->batch.flags |=
-                  DRM_CHROME9_TRIANGLE_BATCH_DEPTH | depth_flags;
-               crender->batch.depth_handle = depth->bo.handle;
-               crender->batch.depth_pitch = depth->stride;
-            }
-            if (blend_successor) {
-               crender->batch.flags |= DRM_CHROME9_TRIANGLE_BATCH_BLEND;
-               crender->batch.blend = blend_state;
-               crender->batch.destination_format =
-                  target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
-                  DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
-                  DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
-            }
-         }
+         if (perspective_batch)
+            crender->batch_rhw = next_rhw;
+         else
+            crender->batch = next;
       }
       const unsigned base = crender->batch_count * 3;
       for (unsigned i = 0; i < 3; i++) {
@@ -1402,6 +1415,13 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (crender->batch_count ==
           DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES)
          chrome9_flush_triangle_batch(crender);
+      return;
+   }
+   /* Preserve API ordering when a non-batch draw follows retained triangles
+    * from earlier Gallium draws. */
+   chrome9_flush_triangle_batch(crender);
+   if (crender->batch_failed) {
+      ctx->rejected_triangles++;
       return;
    }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
@@ -1453,8 +1473,6 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    unsigned end;
 
-   crender->batch_count = 0;
-   crender->batch_failed = false;
    if (start > crender->vertex_count || nr > crender->vertex_count - start)
       return;
    end = start + nr;
@@ -1491,7 +1509,6 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
       crender->ctx->rejected_triangles++;
       break;
    }
-   chrome9_flush_triangle_batch(crender);
 }
 
 static void
@@ -1500,8 +1517,6 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
 
-   crender->batch_count = 0;
-   crender->batch_failed = false;
    if (!indices)
       return;
    switch (crender->prim) {
@@ -1545,7 +1560,6 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
       crender->ctx->rejected_triangles++;
       break;
    }
-   chrome9_flush_triangle_batch(crender);
 }
 
 static void
@@ -1564,6 +1578,9 @@ chrome9_vbuf_destroy(struct vbuf_render *render)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
 
+   chrome9_flush_triangle_batch(crender);
+   if (crender->ctx->vbuf_render == crender)
+      crender->ctx->vbuf_render = NULL;
    FREE(crender->vertices);
    FREE(crender);
 }
@@ -1576,6 +1593,7 @@ chrome9_vbuf_create(struct chrome9_context *ctx)
    if (!render)
       return NULL;
    render->ctx = ctx;
+   ctx->vbuf_render = render;
    render->base.max_indices = UINT16_MAX;
    render->base.max_vertex_buffer_bytes = UINT16_MAX * 8 * sizeof(uint32_t);
    render->base.need_pipeline = chrome9_vbuf_need_pipeline;
@@ -1606,4 +1624,17 @@ chrome9_draw_vbuf_stage(struct chrome9_context *ctx)
    }
    draw_set_render(ctx->draw, render);
    return stage;
+}
+
+void
+chrome9_draw_flush_batch(struct chrome9_context *ctx)
+{
+   if (ctx && ctx->vbuf_render) {
+      struct chrome9_vbuf_render *render = ctx->vbuf_render;
+
+      chrome9_flush_triangle_batch(render);
+      /* Match the former per-vbuf-draw recovery boundary: one rejected batch
+       * does not permanently disable later frames after an explicit flush. */
+      render->batch_failed = false;
+   }
 }

@@ -7,5 +7,6 @@ struct chrome9_context;
 struct draw_stage;
 
 struct draw_stage *chrome9_draw_vbuf_stage(struct chrome9_context *ctx);
+void chrome9_draw_flush_batch(struct chrome9_context *ctx);
 
 #endif

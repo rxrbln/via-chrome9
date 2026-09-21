@@ -1113,6 +1113,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    uint32_t *pixels;
    size_t changed = 0;
    uint16_t sample_depth = 0;
+   uint64_t initial_batches = 0;
    void *blend_handle = NULL;
    void *source_over_handle = NULL;
    void *multiply_handle = NULL;
@@ -1338,6 +1339,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                              (depth_resource ? PIPE_CLEAR_DEPTH : 0),
                   PIPE_MASK_RGBA, 0xff, NULL,
                   &clear_color, 1.0, 0);
+   initial_batches = chrome9_context(context)->submitted_batches;
    context->draw_vbo(context, &info, 0, NULL, &draw, 1);
    if (depth_resource) {
       vertex_buffer.buffer.user = near_vertices;
@@ -1356,7 +1358,10 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    for (unsigned y = 0; y < resource->height0; y++)
       for (unsigned x = 0; x < resource->width0; x++)
          changed += pixels[(size_t)y * surface->stride / 4 + x] != 0;
-   passed = changed >= 30000 && changed <= 257U * 129U;
+   passed = changed >= 30000 && changed <= 257U * 129U &&
+            (!chrome9_context(context)->draw_triangle_batch ||
+             chrome9_context(context)->submitted_batches ==
+                initial_batches + 1);
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       passed = passed &&
                (pixels[32 * (surface->stride / 4) + 192] >> 24) == 0xff;
@@ -1940,9 +1945,11 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    }
    if (!passed)
       fprintf(stderr,
-              "Gallium quad-strip coverage/depth mismatch: %zu sample=%08x/%04x\n",
+              "Gallium quad-strip coverage/depth mismatch: %zu "
+              "sample=%08x/%04x batches=+%" PRIu64 "\n",
               changed, pixels[32 * (surface->stride / 4) + 192],
-              sample_depth);
+              sample_depth,
+              chrome9_context(context)->submitted_batches - initial_batches);
    else if (depth_resource)
       printf("Gallium D16 quad strip passed: changed=%zu sample=%08x/%04x\n",
              changed, pixels[32 * (surface->stride / 4) + 192],

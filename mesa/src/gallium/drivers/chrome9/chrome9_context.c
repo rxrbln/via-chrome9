@@ -2491,6 +2491,7 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
    struct pipe_resource *color = surface ? surface->texture : NULL;
    bool shadow_attempted = false;
 
+   chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
    pipe_resource_reference(&ctx->render_target, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
@@ -2627,6 +2628,7 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
 
    (void)stencil_mask;
    (void)stencil;
+   chrome9_draw_flush_batch(ctx);
    if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH)))
       return;
    if (((buffers & PIPE_CLEAR_COLOR0) && (color_mask & 0xf) != 0xf) ||
@@ -2670,6 +2672,7 @@ chrome9_clear_depth_stencil(struct pipe_context *pipe,
 
    (void)stencil;
    (void)render_condition;
+   chrome9_draw_flush_batch(ctx);
    if (!surface || !surface->texture || clear_flags != PIPE_CLEAR_DEPTH) {
       chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
                         "stencil clears are not implemented");
@@ -2690,6 +2693,7 @@ chrome9_clear_render_target(struct pipe_context *pipe,
    struct pipe_resource *target;
 
    (void)render_condition;
+   chrome9_draw_flush_batch(ctx);
    if (!surface || !surface->texture)
       return;
    target = surface->texture;
@@ -2715,8 +2719,12 @@ chrome9_refresh_sampler_shadows(struct chrome9_context *ctx)
       if (!view)
          continue;
       cview = chrome9_sampler_view(view);
-      if (cview->shadow)
+      if (cview->shadow) {
+         /* A texture may be the result of an earlier untextured pass.  Retire
+          * retained triangles before refreshing its CPU-visible shadow. */
+         chrome9_draw_flush_batch(ctx);
          chrome9_copy_surface(cview->shadow, view->texture);
+      }
    }
 }
 
@@ -2784,11 +2792,9 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
-   /* Every accepted Chrome9 submission has retired synchronously.  Publish
-    * a guarded render-target shadow once per Gallium draw; glamor may keep
-    * the framebuffer bound and does not otherwise promise a pipe flush
-    * before the scanout or GetImage consumer reads the external BO. */
-   chrome9_flush_render_target(ctx);
+   /* Keep compatible immediate triangles across Gallium draw calls.  The
+    * flush/present boundary retires them and publishes a guarded drawable
+    * shadow once rather than copying a full image after every draw. */
 
 unmap:
    for (unsigned i = 0; i < ctx->num_vertex_buffers; i++)
@@ -2804,7 +2810,10 @@ static void
 chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
               unsigned flags)
 {
-   chrome9_flush_render_target(chrome9_context(pipe));
+   struct chrome9_context *ctx = chrome9_context(pipe);
+
+   chrome9_draw_flush_batch(ctx);
+   chrome9_flush_render_target(ctx);
    (void)flags;
    /* DRAW_TRIANGLE completes synchronously. */
    if (fence)
@@ -2820,6 +2829,7 @@ chrome9_flush_resource(struct pipe_context *pipe,
     * Rendering is synchronous, but an imported DRI3 render target may use a
     * guarded shadow.  Presenting it still requires the shadow copy-back.
     */
+   chrome9_draw_flush_batch(chrome9_context(pipe));
    chrome9_flush_render_target(chrome9_context(pipe));
 }
 
@@ -2859,6 +2869,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
+   chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
    if (ctx->draw)
       draw_destroy(ctx->draw);

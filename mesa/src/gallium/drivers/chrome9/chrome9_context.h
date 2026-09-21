@@ -94,6 +94,7 @@ struct chrome9_vertex_elements {
 struct chrome9_context {
    struct pipe_context base;
    struct draw_context *draw;
+   void *vbuf_render;
 
    struct pipe_framebuffer_state framebuffer;
    /* DRAW_TRIANGLE requires a native guarded BO.  Imported DRI3 images use
@@ -143,6 +144,7 @@ struct chrome9_context {
    bool scissor_valid;
 
    uint64_t submitted_triangles;
+   uint64_t submitted_batches;
    uint64_t rejected_triangles;
    uint64_t draw_limit;
    bool debug_draws;
