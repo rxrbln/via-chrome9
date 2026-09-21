@@ -58,6 +58,23 @@ id   = ((d2 & 00ff_ffff) << 8) | (d1 >> 24)
 addr = (d3 << 12) | ((d2 >> 24) << 4)
 ```
 
+An encoder/decoder unit vector which exercises both shared fields is:
+
+```text
+id       = 12345678
+dma_addr = 01088120
+mode     = system write only
+
+d0 = fe330004
+d1 = 78200000
+d2 = 12123456
+d3 = 00001088
+```
+
+Decoding must return ID `12345678` and address `01088120` exactly.  Assert the
+16-byte address alignment and upper-32-bit zero before encoding; assert the
+round trip in the helper's offline/KUnit test before enabling the packet.
+
 Mode bits are interrupt generate `00000002`, system-memory write `00000004`,
 interrupt-wait `00000010`, and queue-skip `00000020`.  The address has four
 implicit zero bits and only 32 encoded bits.  The completion allocation must
