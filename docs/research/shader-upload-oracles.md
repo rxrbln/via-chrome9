@@ -670,8 +670,8 @@ output.  Those are separate compiler gates, not aliases of the full-vector
 MUL path.
 
 The offline-only Mesa-side compiler in
-`chrome9_shader_offline.[ch]` now recognizes exactly eight finalized fragment
-forms:
+`chrome9_shader_offline.[ch]` now recognizes exactly fifteen finalized
+fragment forms:
 
 | normalized expression | constants | samplers | execution shape |
 |---|---:|---:|---|
@@ -683,12 +683,54 @@ forms:
 | `tex0*v0` | none | s0 | TAU0, ALU |
 | `tex0*c0` | c0 | s0 | TAU0, ALU |
 | `tex0*tex1` | none | s0,s1 | TAU0, TAU1, ALU |
+| `v0*v1.aaaa`, `v0.aaaa*v1` | none | none | ALU-only |
+| `c0*c1.aaaa`, `c0.aaaa*c1` | c0,c1 | none | ALU-only |
+| `tex0*c0.aaaa`, `tex0.aaaa*c0` | c0 | s0 | TAU0, ALU |
+| `vec4(tex0.rgb,1)` | driver c0.x=1 | s0 | TAU0, two partial ALUs |
 
 Every table entry is the exact Linux compiler result after configuration-2
 post-translation, including A90..A9b and the per-record dependency fields.
 MUL inputs are canonicalized only for commutativity.  The compiler reports
 the constant, varying, and sampler masks needed to cross-check draw state; it
-has no raw-native-input entry point.
+has no raw-native-input entry point.  The RGBX form additionally marks c0.x
+as driver-owned one; accepting a user value there would turn alpha forcing
+into ordinary partial output.
+
+The component-alpha differentials are exact and useful beyond the template
+table.  Replicated alpha changes both halves of the split operand encoding;
+it is not merely low swizzle `6db`:
+
+```text
+v0      * v1.aaaa : 0140b6d0 300416db 00f04005 00000820
+v0.aaaa * v1      : 0140b6d0 b0041053 00f0406d 00000820
+c0      * c1.aaaa : 0140b6d0 300816db 00f08005 00000820
+c0.aaaa * c1      : 0140b6d0 b0081053 00f0806d 00000820
+tex0    * c0.aaaa : 0140b6d0 b0200053 00f0806d 00000820
+tex0.aaaa * c0    : 0140b6d0 b0080053 00f2006d 00000820
+```
+
+The ALU-only cases use `90058000/92000001`; one-texture cases use the normal
+`90018000/91000001/92010001/93000001` tuple and TAU `301001b0`.  Direct
+`tex0*tex1.aaaa` is deliberately absent: the generic Linux compiler erases
+that temporary swizzle in its direct-output optimization.  The Xorg fixed
+program has an exact scheduled `r0*r2.wwww` instruction, but its allocation
+and two-ALU control image must remain an indivisible separate oracle rather
+than being spliced into the generic program.
+
+The exact RGBX execution candidate is:
+
+```text
+A90..A93 90018000 91000001 92010002 93000001
+TAU       301001b0
+ALU       01c00530 501c0053 00720005 000d0820  # oC0.rgb = tex0.rgb
+          01c00530 801c0053 008080b6 000d0820  # oC0.a = c0.x
+```
+
+It is a compiler-exact partial-output sequence, not yet a silicon result.
+The live discriminator must sample an XRGB texture whose stored alpha bytes
+are deliberately non-one, bind c0.x=`3f800000`, and require unchanged RGB
+plus output alpha `ff`.  Repeat with c0.x=zero to prove the second write is
+active rather than an implicit render-target alpha fill.
 
 The same file carries four exact Linux vertex templates: clip position;
 position plus T0.xy; position plus T0/T1.xy; and M4x4 position plus color and
@@ -717,7 +759,7 @@ cc -std=c11 -Wall -Wextra -Werror -O2 \
 /tmp/chrome9-shader-offline-test
 ```
 
-It checks eight PS and all four VS templates, exact instruction words,
+It checks fifteen PS and all four VS templates, exact instruction words,
 controls, metadata, active/upload counts, resource masks, and a rejected
 unsupported form.  This code is intentionally absent from `meson.build` and
 does not change caps or submission.
@@ -730,8 +772,54 @@ T1/S1; no source swizzle, partial write, projection, bias/LOD, offset, shadow,
 array, derivative, discard, depth, system value, integer, or indirect access.
 The texture coordinate must be the matching full `Tn.xy` input.  Any unused
 instruction or resource is rejection.  In particular, glamor's `.a` mask,
-RGBX, repeat-repair, gradient, stipple, glyph, and dual-source variants stay
-on fallback until they receive their own native corpus and silicon gate.
+repeat-repair, gradient, stipple, glyph, and dual-source variants stay on
+fallback until they receive their own native corpus and silicon gate.  The
+now-encoded component-alpha and RGBX forms remain offline-only until their
+varying/partial-write tests pass.
+
+### Repeat math and discard boundary
+
+Configuration-two finalization gives exact one-record semantic candidates
+for three operations used inside glamor's coordinate-repair code:
+
+```text
+frc oC0,v0:       01c00530 301c0053 00f04005 000e0820
+abs oC0,v0:       00400538 30040053 00f04005 00090820
+cmp oC0,v0,c0,c1: 00810530 30080053 00f04005 00090820
+```
+
+All use the ALU-only `90058000/92000001` control shape.  These records prove
+encoding only.  Glamor's repair helper also needs floor/modulo, comparisons,
+integer repeat-mode selection, and conditional out-of-range zero, so accepting
+FRC/ABS/CMP alone would miscompile it.  Ordinary normalized coordinates with
+the already mapped sampler repeat/clamp/mirror state avoid that shader path;
+large-pixmap `RepeatFix` remains software fallback.
+
+The Linux compiler's target-finalized `texkill r0; mov oC0,v0` form is an
+ALU-to-TAU-to-ALU schedule:
+
+```text
+A90..A95 90058000 91000001 92010002 93000001 94000000 95000001
+TAU       314001b1
+ALU       01c00530 301c0053 00f20005 000d0420
+          01c00530 301c0053 00f04005 000d0820
+```
+
+Adding a leading `texld r0,t0,s0` produces two TAUs and controls
+`90018000 91000001 92020002 93000003 94000000 95000001`; its stores are:
+
+```text
+TAU 201001b0 314001b1
+ALU 01c00530 301c0053 00f00005 000d0420
+    01c00530 301c0053 00f20005 000d0820
+```
+
+Neither form has silicon proof, and TEXKILL has side effects which make a
+bad schedule riskier than ordinary color ALU.  Keep discard rejected.  For
+the narrow stipple case where the fragment output alpha itself is the tested
+texture/mask alpha, prefer the already live fixed alpha-test state and prove
+`alpha > 0` under guards; it avoids enabling a new shader side effect.  This
+does not implement discard based on a value different from output alpha.
 
 This milestone still does not justify GL 2.0, ES 2.0, or glamor enablement.
 It supplies compiler truth for solid/copy/full-RGBA composite only; NPOT,
