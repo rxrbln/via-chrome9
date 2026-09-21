@@ -92,8 +92,12 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, position);
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color0);
    draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color1);
+   /* Keep R/Q visible to the validated userspace boundary.  The first
+    * hardware ABI implements ordinary 2D coordinates only, so draw-time
+    * validation below accepts Q==1 and rejects projective texturing instead
+    * of silently discarding it. */
    for (unsigned unit = 0; unit < crender->texture_count; unit++)
-      draw_emit_vertex_attr(&crender->vinfo, EMIT_2F, texcoord[unit]);
+      draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, texcoord[unit]);
    draw_compute_vertex_size(&crender->vinfo);
    crender->layout_valid = position >= 0 &&
                            (color0 >= 0 ||
@@ -106,7 +110,7 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                              (crender->texture_count == 1 ||
                               texcoord[1] >= 0))) &&
                            crender->vinfo.size ==
-                              6 + 2 * crender->texture_count;
+                              6 + 4 * crender->texture_count;
    return &crender->vinfo;
 }
 
@@ -117,7 +121,7 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    size_t size;
 
-   if (vertex_size != (6 + 2 * crender->texture_count) * sizeof(uint32_t))
+   if (vertex_size != (6 + 4 * crender->texture_count) * sizeof(uint32_t))
       return false;
    size = (size_t)vertex_size * nr_vertices;
 
@@ -484,7 +488,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
 
          if (!isfinite(position[2]) || !isfinite(position[3]) ||
              position[3] <= 0.0f || !isfinite(texcoord[0]) ||
-             !isfinite(texcoord[1]) ||
+             !isfinite(texcoord[1]) || !isfinite(texcoord[2]) ||
+             texcoord[3] != 1.0f ||
              (crender->texture_count == 2 &&
               (texcoord[0] < 0.0f || texcoord[0] > 1.0f ||
                texcoord[1] < 0.0f || texcoord[1] > 1.0f))) {
@@ -508,9 +513,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          if (crender->texture_count == 2) {
             struct drm_chrome9_two_textured_vertex *two_vertex =
                &two_texture_args.vertices[i];
-            const float *texcoord1 = texcoord + 2;
+            const float *texcoord1 = texcoord + 4;
 
             if (!isfinite(texcoord1[0]) || !isfinite(texcoord1[1]) ||
+                !isfinite(texcoord1[2]) || texcoord1[3] != 1.0f ||
                 texcoord1[0] < 0.0f || texcoord1[0] > 1.0f ||
                 texcoord1[1] < 0.0f || texcoord1[1] > 1.0f) {
                ctx->rejected_triangles++;

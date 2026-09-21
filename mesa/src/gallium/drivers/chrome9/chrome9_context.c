@@ -378,18 +378,31 @@ chrome9_fs_is_texture(nir_def *def, unsigned unit)
 {
    nir_instr *instr = nir_def_instr(def);
    nir_tex_instr *tex;
-   int coord;
+   int coord, projector;
 
    if (def->num_components != 4 || instr->type != nir_instr_type_tex)
       return false;
    tex = nir_instr_as_tex(instr);
    coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
    return tex->op == nir_texop_tex &&
           tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
           !tex->is_shadow && tex->texture_index == unit &&
           tex->sampler_index == unit && tex->coord_components == 2 &&
-          coord >= 0 && tex->num_srcs == 1 &&
-          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, unit, 0);
+          coord >= 0 && tex->num_srcs == (projector >= 0 ? 2 : 1) &&
+          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, unit, 0) &&
+          (projector < 0 ||
+           (tex->src[projector].src.ssa->num_components == 1 &&
+            nir_def_instr(tex->src[projector].src.ssa)->type ==
+               nir_instr_type_alu &&
+            nir_instr_as_alu(nir_def_instr(
+               tex->src[projector].src.ssa))->op == nir_op_mov &&
+            nir_instr_as_alu(nir_def_instr(
+               tex->src[projector].src.ssa))->src[0].swizzle[0] == 3 &&
+            chrome9_fs_is_texcoord(
+               nir_instr_as_alu(nir_def_instr(
+                  tex->src[projector].src.ssa))->src[0].src.ssa,
+               unit, 0)));
 }
 
 #define CHROME9_FS_FACTOR_TEXTURE0 (1u << 0)
@@ -609,6 +622,8 @@ chrome9_create_fs_state(struct pipe_context *pipe,
    }
    if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
       shader->nir = state->ir.nir;
+      if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
+         nir_print_shader(state->ir.nir, stderr);
       shader->fragment_program = chrome9_fs_classify(state->ir.nir);
       shader->supported =
          shader->fragment_program != CHROME9_FS_UNSUPPORTED;
