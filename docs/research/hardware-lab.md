@@ -980,3 +980,25 @@ that the application is already reaching hardware rather than merely swapping
 empty buffers: all first 50 transformed primitives were accepted as
 `color+d16` Chrome9 triangle submissions.  Correct window presentation still
 depends on resolving the RECT-versus-2D EGL-image mismatch above.
+
+The default-off `CHROME9_FORCE_NPOT=1` diagnostic at nested commit `b35e560`
+then isolated that dependency on the complete live stack.  With the override
+in both Xorg and the GLX client, every `st_bind_egl_image` and FBO-creation
+error disappeared.  `glxgears` continued for the bounded run at 20.45 FPS.
+The only new Chrome9 runtime diagnostic was one rejected, still-unrecognized
+fragment program; the known glamor gradient shader also remained above the
+current fragment-uniform limit.
+
+The active framebuffer changed from the earlier exact dumb object to the
+guarded GBM object expected by the final design:
+
+```text
+framebuffer[40]: XR24 1024x768 pitch=4096 offset=4096
+obj[0]: size=3153920 imported=no
+```
+
+The primary plane and CRTC were active.  This proves that real level-zero NPOT
+support selects the correct DRI 2-D import path and that Xorg can hand KMS the
+same native guarded Chrome9 GEM object.  It does not make the diagnostic cap
+production-ready: mip-level selection and the L9--L11 tail remain mandatory
+before enabling `npot_textures` by default.
