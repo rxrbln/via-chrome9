@@ -2363,6 +2363,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	u32 target;
 	u32 depth_target;
 	u32 texture2_target;
+	u64 mapped_size;
 	long wait;
 	bool exec_initialized = false;
 	bool device_owned = false;
@@ -2400,10 +2401,20 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	    drm_gem_is_imported(obj) || drm_gem_is_imported(depth_obj) ||
 	    (three_objects && drm_gem_is_imported(texture2_obj)) ||
 	    obj->size != request->object_size ||
-	    depth_obj->size != request->depth_object_size ||
+	    (texture_objects ?
+	     depth_obj->size < request->depth_object_size :
+	     depth_obj->size != request->depth_object_size) ||
 	    (three_objects &&
-	     texture2_obj->size != request->texture2_object_size)) {
+	     texture2_obj->size < request->texture2_object_size)) {
 		ret = -EINVAL;
+		goto out_put_objects;
+	}
+	if (check_add_overflow(obj->size, depth_obj->size, &mapped_size) ||
+	    (three_objects &&
+	     check_add_overflow(mapped_size, texture2_obj->size,
+				&mapped_size)) ||
+	    mapped_size > SZ_64M - CHROME9_RING_SIZE) {
+		ret = -E2BIG;
 		goto out_put_objects;
 	}
 
@@ -2547,9 +2558,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		      0x00020002 : 0x00010001;
 	mutex_lock(&engine->vm_lock);
 	ret = drm_mm_insert_node_generic(&engine->sf_mm, &job->sf_node,
-					 request->object_size +
-					 request->depth_object_size +
-					 request->texture2_object_size,
+					 mapped_size,
 					 PAGE_SIZE, 0, DRM_MM_INSERT_LOW);
 	if (ret) {
 		mutex_unlock(&engine->vm_lock);
@@ -2567,14 +2576,24 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	chrome9_prepare_map_guards(&job->map, request->object_size);
 	chrome9_prepare_map_guards(&job->depth_map,
 				   request->depth_object_size);
+	/*
+	 * A mip-capable texture keeps the canonical L0 guard at the requested
+	 * size and adds a final guard at the end of its larger allocation.
+	 */
+	if (texture_objects && depth_obj->size > request->depth_object_size)
+		chrome9_prepare_map_guards(&job->depth_map, depth_obj->size);
 	if (three_objects)
 		chrome9_prepare_map_guards(&job->texture2_map,
 					   request->texture2_object_size);
+	if (three_objects &&
+	    texture2_obj->size > request->texture2_object_size)
+		chrome9_prepare_map_guards(&job->texture2_map,
+					   texture2_obj->size);
 	chrome9_cache_flush(job->map.vaddr, request->object_size);
-	chrome9_cache_flush(job->depth_map.vaddr, request->depth_object_size);
+	chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
 	if (three_objects)
 		chrome9_cache_flush(job->texture2_map.vaddr,
-				    request->texture2_object_size);
+				    texture2_obj->size);
 	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->sgt,
 				    DMA_BIDIRECTIONAL);
 	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->depth_sgt,
@@ -2594,9 +2613,9 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 				   DMA_RESV_USAGE_READ);
 	job->fence_attached = true;
 	target = job->sf_node.start + PAGE_SIZE;
-	depth_target = job->sf_node.start + request->object_size + PAGE_SIZE;
-	texture2_target = job->sf_node.start + request->object_size +
-			  request->depth_object_size + PAGE_SIZE;
+	depth_target = job->sf_node.start + obj->size + PAGE_SIZE;
+	texture2_target = job->sf_node.start + obj->size + depth_obj->size +
+			  PAGE_SIZE;
 	if (three_objects)
 		ret = chrome9_build_two_textured_triangle(engine, request, job,
 						   target, depth_target,
@@ -2640,18 +2659,25 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->texture2_sgt,
 					 DMA_BIDIRECTIONAL);
 	chrome9_cache_flush(job->map.vaddr, request->object_size);
-	chrome9_cache_flush(job->depth_map.vaddr, request->depth_object_size);
+	chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
 	if (three_objects)
 		chrome9_cache_flush(job->texture2_map.vaddr,
-				    request->texture2_object_size);
+				    texture2_obj->size);
 	dma_rmb();
 	device_owned = false;
 	if (!chrome9_verify_map_guards(&job->map, request->object_size) ||
 	    !chrome9_verify_map_guards(&job->depth_map,
 				       request->depth_object_size) ||
+	    (texture_objects &&
+	     depth_obj->size > request->depth_object_size &&
+	     !chrome9_verify_map_guards(&job->depth_map, depth_obj->size)) ||
 	    (three_objects &&
 	     !chrome9_verify_map_guards(&job->texture2_map,
-					 request->texture2_object_size))) {
+					 request->texture2_object_size)) ||
+	    (three_objects &&
+	     texture2_obj->size > request->texture2_object_size &&
+	     !chrome9_verify_map_guards(&job->texture2_map,
+					 texture2_obj->size))) {
 		ret = -EIO;
 		dma_fence_set_error(&job->fence.base, ret);
 	}
@@ -2712,11 +2738,10 @@ out_unmap:
 						 job->texture2_sgt,
 						 DMA_BIDIRECTIONAL);
 		chrome9_cache_flush(job->map.vaddr, request->object_size);
-		chrome9_cache_flush(job->depth_map.vaddr,
-				    request->depth_object_size);
+		chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
 		if (three_objects)
 			chrome9_cache_flush(job->texture2_map.vaddr,
-					    request->texture2_object_size);
+					    texture2_obj->size);
 	}
 	if (job->texture2_mapped) {
 		drm_gem_shmem_vunmap_locked(job->texture2, &job->texture2_map);
