@@ -56,6 +56,22 @@ A64/A65 depend on the staged initial pause.  Start, end, pause, and stop are
 16-byte aligned.  The ring allocation and all of its PTEs remain live until a
 PID10 STOP has cleared the full engine wait mask.
 
+The VX900 manual, Part II pages 77--78, also fixes the boundary semantics and
+priority order:
+
+* PAUSE has priority over JUMP, which has priority over END when addresses
+  coincide;
+* reaching either A66/A67 JUMP or A62/A63 END automatically returns CR to the
+  A60/A61 start;
+* the minimum distance from the previous pause is two quadwords;
+* address bits 3:0 are ignored, so the register requirement called
+  "128-bit alignment" is 16 **bytes**, not 128 bytes.
+
+The vendor H5S2/VX900 software's 128-byte cursor padding is a separate,
+stronger implementation rule.  The monotonic design keeps that stronger rule
+and ensures every active PAUSE plus its measured read-ahead closure lies before
+END, so the automatic END wrap is never part of ordinary submission.
+
 ### Ordinary append changes only A64/A65
 
 Old Linux `kickoff_dma_ring_inv()` pads the new CPU cursor to 128 bytes for
