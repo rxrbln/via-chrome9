@@ -906,3 +906,39 @@ VGA pipe without hardware writes.  Dumb-buffer and framebuffer validation
 rejects current shmem BOs rather than presenting them as SL/BAR2 scanout.
 Real enablement still requires an explicit, proven BAR2 scanout reservation
 plus the narrowly translated VX900 IGA1 timing/FIFO/PLL sequence.
+
+## First live Xorg and GLX gears execution
+
+On 2026-09-21, nested Mesa commit `2af31bf` exposed the already silicon-proven
+mixed 32-bit-color/Z16 combination.  Its complete Chrome9 screen smoke passed,
+including untextured and textured draws, D16, blend, alpha test, scissor,
+BGRA, perspective interpolation, guarded resources, KMS handles, and the
+optional same-device dma-buf sharing regression.
+
+With `MESA_GL_VERSION_OVERRIDE=2.1` still explicitly set, Xorg modesetting and
+glamor created a direct Chrome9 GLX context and `glxgears` ran for the complete
+15-second bounded interval rather than failing visual selection:
+
+```text
+GL_RENDERER = VIA Chrome9 HD (validated triangle bring-up)
+VisualID 112, 0x70
+92 frames in 5.0 seconds = 18.327 FPS
+96 frames in 5.0 seconds = 19.054 FPS
+```
+
+This is execution evidence, not a truthful GL 2.1 capability claim.  With the
+override removed, the current truthful GL 1.3 advertisement still produced no
+usable RGB GLX visual and `glxgears` stopped before context creation.  Xorg
+also logged `GL_INVALID_OPERATION in st_bind_egl_image` while trying to bind
+some dma-buf-backed pixmaps as glamor FBOs; present/copy correctness is not yet
+proved.
+
+The live DRM debugfs capture during the gears run showed Xorg FB 40 as native
+Chrome9 GEM (`imported=no`), XR24, linear, 1024x768, pitch 4096, offset zero,
+and exact size 3,145,728 bytes.  The primary plane and CRTC were active.  This
+rules out PRIME offload: rendering, GEM allocation, and KMS all belong to the
+same Chrome9 DRM device.  The kernel nevertheless still copied that GEM into
+the temporary BAR2 `0x6000000` staging surface.  The required next milestone
+is to retain one SF/GART mapping for the same framebuffer and make IGA1 scan
+it out directly; dma-buf remains only an optional DRI3 process-sharing
+transport, never the presentation architecture.

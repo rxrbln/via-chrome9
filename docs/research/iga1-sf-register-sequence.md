@@ -248,8 +248,10 @@ It does not consult `bo->used_modifiers` for that decision.  Chrome9 currently
 advertises the capability because `mode_config.fb_modifiers_not_supported` is
 unset.  Mesa's DRI image query asks Chrome9 `resource_get_handle()` for a KMS
 handle, and the driver returns `modifier=LINEAR`, `stride=resource->stride`,
-and `offset=resource->data_offset`; the guarded front buffer therefore reaches
-AddFB2 with offset `4096`.
+and `offset=resource->data_offset`.  Do not infer the live front-buffer offset
+from the guarded render-resource layout: the 2026-09-21 Xorg capture below
+proved that the modesetting front buffer was instead an exact three-MiB dumb
+GEM object submitted at offset zero.
 
 Legacy `drmModeAddFB()` cannot describe the page offset and must not be the
 final direct-scanout path.  During a live Xorg run the quickest authoritative,
@@ -265,9 +267,27 @@ format, modifier, pitch, offset, GEM size, and import status.  `GETFB2` is an
 equally authoritative alternative after discovering the FB id.  Attaching
 `strace` after Xorg startup cannot recover the already completed AddFB ioctl;
 it is useful only when starting the server under tracing.  A capture made
-after the reported Xorg run had already exited showed Chrome9 with no active
-framebuffer and only vkms fbcon FB 54 at offset zero; that is not evidence
-about Xorg's earlier front buffer.
+after an earlier Xorg run had already exited showed Chrome9 with no active
+framebuffer and only vkms fbcon FB 54 at offset zero; that was not evidence
+about Xorg's earlier front buffer.  The later live capture, taken two seconds
+after starting Xorg while `glxgears` was active, is authoritative:
+
+```text
+framebuffer[40]:
+        allocated by = Xorg
+        format=XR24 little-endian
+        modifier=0x0
+        size=1024x768
+        pitch[0]=4096
+        offset[0]=0
+        obj[0]: size=3145728 imported=no
+```
+
+The corresponding atomic state had plane 36 on CRTC 38 with FB 40 and both
+`enable=1` and `active=1`.  Thus current Xorg uses a native Chrome9 GEM object;
+there is no second GPU and no PRIME/offload scanout.  The offset-zero result is
+valid for the current front buffer but does not remove the kernel requirement
+to accept offset `PAGE_SIZE` for guarded scanout resources.
 
 ## Current kernel audit and patch boundary
 
