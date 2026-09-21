@@ -259,14 +259,21 @@ coincident green triangle at Z=0.5 with LESS.  With zero A16--A18, red remains;
 with the negative constant bias, green must replace it.  Verify depth changes
 in the expected direction as well as color.
 
-The public `factor` maps directly to `scale`, but the proprietary driver
-multiplies API `units` by one of two constants (`0x38000080` or `0x34000001`)
-selected through an unresolved resource semantic.  Fill, line, and point
-offset enables are also selected independently from context fields at
-`+0x3c40/+0x3c44/+0x3c48`.  Until the format-dependent units conversion and
-polygon-mode selection are measured, expose only zero offset or the guarded
-raw constant-offset diagnostic.  Always close the disabled state by emitting
-zero in A16--A18.
+The public `factor` maps directly to `scale`.  The proprietary driver
+multiplies API `units` by `0x38000080` for a 16-bit depth allocation and by
+`0x34000001` for a 32-bit allocation.  This resource test is now closed:
+`STM_DepthBias_INV:0x195a10` compares surface field `+0x158` with `0x10`, and
+`sfmGetPatchColorKey:0xb6afc..0xb6b52` independently branches on the same
+field values `8/16/32` before performing byte/word/dword loads.  The field is
+therefore bits per pixel, not an opaque format class.  The constants decode
+to approximately `3.0518044e-5` for D16 and `1.1920930e-7` for the 32-bpp
+D24/D32 family.
+
+Fill, line, and point offset enables are selected independently from context
+fields at `+0x3c40/+0x3c44/+0x3c48`.  A structured ABI may now lower units
+according to the bound depth format, but it must still carry those three
+polygon-mode enables independently.  Always close the disabled state by
+emitting zero in A16--A18.
 
 ## Color masks
 

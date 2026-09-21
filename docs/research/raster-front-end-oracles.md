@@ -373,12 +373,16 @@ A18 = 0x18000000 | (scale_bits & 0x00ffffff)
 ```
 
 The API `factor` at context `+0x1de4` is copied bit-for-bit to `scale`.
-`units` at `+0x1de8` is multiplied by one of the two format/resource-dependent
-floats `0x38000080` and `0x34000001` before becoming `offset`.  The branch is
-controlled by bound-resource field `+0x158 == 0x10`; that field's semantic
-name is not yet proved, so do not assign either constant to D16 or D24 solely
-from this comparison.  Fill/line/point enables are independently selected by
-context `+0x3c40/+0x3c44/+0x3c48` and current polygon mode `+0x1dfc`.
+`units` at `+0x1de8` is multiplied by `0x38000080` when the bound resource is
+16 bits per pixel and by `0x34000001` otherwise before becoming `offset`.
+The branch at `STM_DepthBias_INV:0x195a10` tests resource field
+`+0x158 == 0x10`.  Its meaning is independently proved by
+`sfmGetPatchColorKey:0xb6afc..0xb6b52`: values `8`, `16`, and `32` select a
+byte, word, or dword load from the surface, respectively.  Thus D16 uses
+`0x38000080` (approximately `3.0518044e-5`) and the 32-bpp D24S8/D24X8/D32
+allocations use `0x34000001` (approximately `1.1920930e-7`).
+Fill/line/point enables are independently selected by context
+`+0x3c40/+0x3c44/+0x3c48` and current polygon mode `+0x1dfc`.
 
 The chip initializer proves the adjacent clamp defaults:
 

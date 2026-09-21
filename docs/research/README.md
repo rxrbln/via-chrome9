@@ -127,6 +127,10 @@ targets.
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil
   operation remap, and keeps compatibility alpha test on fixed A33.
+- [ioquake-fixed-function-state-plan.md](ioquake-fixed-function-state-plan.md)
+  integrates every recovered blend/depth/alpha/stencil/color-mask encoding,
+  closes polygon-offset units by depth allocation, gives exact packet-growth
+  formulas and ranks the safest structured ABI successors for ioquake-era GL.
 - [textured-d16-format-contract.md](textured-d16-format-contract.md) gives the
   exact one-texture-plus-D16 packet lengths and indices, three-BO lifetime,
   X-versus-alpha sampler semantics, and strict render-target reinterpretation
