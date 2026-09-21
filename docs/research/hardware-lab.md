@@ -964,3 +964,19 @@ both RECT render/sampler and 2D sampler, ruling out format support as the
 failure.  The aligned fix is real NPOT 2D texture support—including mip and
 repeat semantics—rather than falsely setting the cap merely to change the DRI
 import target.
+
+The first resulting NPOT discriminator passed immediately on VX900 at nested
+Mesa commit `fe4f05b`.  A guarded 30x18 BGRX image with normalized S/T sampled
+the expected quadrant colors for clamp, repeat, and mirrored repeat under both
+nearest and linear filtering; the repeat/mirror linear center produced the
+expected `0x7f/0x80` four-color average.  Twelve submitted triangles, source
+padding, and every guard remained exact.  This promotes single-unit,
+level-zero NPOT dimensions plus those wrap/filter combinations to measured
+silicon behavior.  Two-unit NPOT and actual mip-level selection remain gates
+before advertising full `npot_textures`.
+
+An independent bounded `glxgears` trace with `CHROME9_DRAW_LIMIT=50` proved
+that the application is already reaching hardware rather than merely swapping
+empty buffers: all first 50 transformed primitives were accepted as
+`color+d16` Chrome9 triangle submissions.  Correct window presentation still
+depends on resolving the RECT-versus-2D EGL-image mismatch above.
