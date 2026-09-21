@@ -43,16 +43,16 @@ A92 = 92000000 | (tau_count << 16) | alu_count
 Termination is exhausted count plus final phase. Hard limits are 96 ALUs, 32
 TAUs, and 128 normalized inputs before expansion. Preflight expanded counts.
 The following are closed tuples, not formulas for arbitrary programs. The
-ALU-only form is reproduced for one and two ordinary records. The textured
+ALU-only form is reproduced for one through three ordinary records. The textured
 forms are proven only at the stated count and shape:
 
 ```text
-# one or two ordinary ALUs, no TAU
+# one to three proven ordinary ALUs, no TAU
 90058000 91000000 (92000000|alu_count) 93000000 94000000 95000000
 96000000 97000000 98000000 99000000 9a000000 9b000000
 
-# one leading TAU, then one direct-output ALU
-90018000 91000001 92010001 93000001 94000000 95000000
+# one leading TAU, then one or two proven ALUs
+90018000 91000001 (92010000|alu_count) 93000001 94000000 95000000
 96000000 97000000 98000000 99000000 9a000000 9b000000
 
 # two independent TAUs, then one direct-output ALU
@@ -141,13 +141,28 @@ ALU ... ... 00f20005 ...
 ```
 
 High TAU bits depend on phase order. Never implement `tau |= 10000000`.
-Until an SSA-edge finalizer byte-matches the corpus, emit only the exact three
-schedule patterns above.
+Until an SSA-edge finalizer byte-matches the corpus, emit only the exact
+shapes and bounded counts above.
 
-### Why textured record count is not enough
+### Production callback selection and multi-ALU allocation
 
-A two-ALU temporary chain disproves a tempting control-word formula. Linux
-configuration-2 compilation of
+The offline wrapper must use the same callback setup as
+`stmCreatePixelShader_inv`. For PS 2.0 and chip id 5 the exact sequence is:
+
+```text
+stmPPSSetFunctionsPS20_invi(context, instance)  # void cdecl(void *, void *)
+stmPPSSetRegManager_invi(context, instance)     # void cdecl(void *, void *)
+stmPPSCompile_invi(context, input, instance)    # int cdecl(void *, void *, void *)
+```
+
+Both setup calls read `context+0x240 -> +0x0c -> chip_id`. The production
+function-selector table is `+137c=0x1b6e10` token parser,
+`+1380=0x1b5870` validator, and `+1384=0x1b8b80` processor/emitter. An older
+probe manually installed the processor at `+1380` and validator at `+1384`.
+That swap compiled simple records by accident but did not initialize normal
+multi-record allocation.
+
+With the production selectors, configuration-2 compilation of
 
 ```text
 texld r0,t0,s0
@@ -155,57 +170,56 @@ add   r1,r0,c0
 mul   oC0,r1,c1
 ```
 
-produces:
+produces an ordinary r0/r1 chain:
 
 ```text
-A90..A9b 90000000 91000001 92010002 93000001 94000000 95000000
+A90..A9b 90018000 91000001 92010002 93000001 94000000 95000000
           96000000 97000000 98000000 99000000 9a000000 9b000000
 TAU       301001b0
-ALU       00800530 30140924 00f20005 200003e0
-          0140b6d0 00081053 00f03f00 00000820
+ALU       00800530 30140924 00f20005 00000060
+          0140b6d0 30081053 00f20105 00000820
 ```
 
-The equivalent first SUB produces `82000530 30140924 00f08005 200003e0`.
-This object uses A90=`90000000`, a special intermediate destination ending
-`200003e0`, and native id `3f` in the consumer. Static allocator tracing
-shows this is not a proven bypass: the special allocation branch returns
-physical 12--15 and the destination masks that to four bits, but a subsequent
-ordinary logical-temp lookup misses, returns -1, and the source encoder masks
-it to six-bit id `3f`. This is an unchecked not-found sentinel. The existing
-closed RGBX two-ALU object instead uses A90=`90018000` and has no such failed
-remap. Therefore V1 must reject this general multi-ALU chain even though the
-vendor compiler reports success.
+The equivalent first SUB is
+`82000530 30140924 00f08005 00000060`. Allocator tracing and
+`stmGetActiveTexTmpNum` report tuple `(1,2,1,1)`, with logical r0/r1 mapped to
+physical 0/1. This makes the two-ALU textured chain valid compiler evidence;
+it is still not silicon proof for every possible chain.
 
 Bit d2.17 is not texture-specific. The ALU-only chain
 `add r0,c0,c1; mul oC0,r0,c2` emits its consumer as
 `0140b6d0 30082053 00f20005 00000820`; it marks an ordinary earlier-ALU
-producer in the same source-A field. In contrast, the id-3f path above is a
-failed remap and invalid as executable evidence. Dependency metadata must
-come from the complete producer graph and phase finalizer, never merely from
-source register class.
+producer in the same source-A field. Dependency metadata must come from the
+complete producer graph and phase finalizer, never merely from source
+register class.
 
 The raw/final differential separates scheduler allocation from dependency
-finalization. Before the explicit configuration-2 pass, the textured chain
-already contains destination id 15 and consumer id 63:
+finalization. Before the explicit configuration-2 pass, the production
+textured chain already contains ordinary destination/source id 1:
 
 ```text
-raw ALU0   00800530 30140924 00f00005 000003e0
-raw ALU1   0140b6d0 00081053 00f03f00 00000820
+raw ALU0   00800530 30140924 00f00005 00000060
+raw ALU1   0140b6d0 30081053 00f00105 00000820
 raw TAU    201001b0
 raw A90    90000000
 
-config2 ALU0 00800530 30140924 00f20005 200003e0
-config2 ALU1 0140b6d0 00081053 00f03f00 00000820
+config2 ALU0 00800530 30140924 00f20005 00000060
+config2 ALU1 0140b6d0 30081053 00f20105 00000820
 config2 TAU  301001b0
-config2 A90  90000000
+config2 A90  90018000
 ```
 
-Thus compilation exposes the allocation/remap failure before the explicit
-dependency pass; configuration-2 merely adds ALU0 d2.bit17, destination
-d3.bit29, and TAU bit28 and does not repair id `3f`. For the valid ALU-only
-two-record chain the raw consumer's d2 is `00f00005` and configuration-2
-changes it to `00f20005`, while A90 changes from `90040000` to `90058000`.
-Ids 15/63 are negative validation evidence, not 16/64 general temporaries.
+Configuration-2 adds dependency bits to both records, changes TAU bit28, and
+updates A90. The historical destination-id-15/source-id-63 object is retained
+in the corpus only as `NONPROD_CALLBACK_SWAP_*`: it is reproduced by swapping
+the validator and processor callback slots and is not hardware evidence.
+
+The H5 register manager exposes 12 ordinary plus four high temporary slots;
+the native destination field is four bits. Production compilation maps r0
+through r15 without the id-63 miss. The vendor frontend nevertheless accepts
+r16: its destination wraps to native id 0 while its source remains id 16.
+Mesa must therefore allocate at most 16 simultaneously addressable physical
+fragment temporaries and reject or spill anything beyond that boundary.
 
 The Windows backend before configuration-2 and the Linux production
 finalizer give exact one-texture dependency deltas for every v1 source slot:
