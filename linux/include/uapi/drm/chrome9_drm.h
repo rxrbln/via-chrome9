@@ -23,6 +23,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16	0x0b
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH	0x0c
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16	0x0d
+#define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN	0x0f
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND	0x12
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
 #define DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	0x19
@@ -69,6 +70,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16 \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16, \
 		struct drm_chrome9_draw_two_textured_triangle_d16)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN, \
+		struct drm_chrome9_draw_triangle_d16_rhw_run)
 #define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND, \
 		struct drm_chrome9_draw_textured_triangle_d16_blend)
@@ -132,6 +136,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
 /* Two level-zero textures can be multiplied with D16 test/write. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16	(1ULL << 20)
+/* Up to 272 perspective D16 triangles share one state-complete command. */
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_RUN	(1ULL << 22)
 /* Every D16 draw can test depth without updating the depth surface. */
 #define DRM_CHROME9_CAP_DEPTH_READ_ONLY	(1ULL << 23)
 /* One texture, D16 and the complete normalized blend state can coexist. */
@@ -623,6 +629,32 @@ struct drm_chrome9_vertex_d16_rhw {
  * and vertex record remain unchanged.
  */
 struct drm_chrome9_draw_triangle_d16_rhw_batch {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	__u32 reserved0;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 pad;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
+};
+
+#define DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES	272U
+
+/*
+ * Large-list successor to DRAW_TRIANGLE_D16_RHW_BATCH.  It is byte-identical
+ * only in version one so that each command retains an immutable count limit:
+ * the old batch remains capped at 34 while this request accepts up to 272
+ * post-viewport RHW triangles under one complete state envelope.
+ */
+struct drm_chrome9_draw_triangle_d16_rhw_run {
 	__u32 destination_handle;
 	__u32 depth_handle;
 	__u32 flags;
