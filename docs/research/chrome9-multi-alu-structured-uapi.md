@@ -96,6 +96,7 @@ becoming an undocumented raw-program ABI.
 Validation should happen before BO lookup, vertex copying, or ring mutation:
 
 1. Require `instruction_count` in 1..3.
+   Require every byte of `instruction[instruction_count..2]` to be zero.
 2. Accept only MOV and MUL. MOV requires an all-zero second source.
 3. Accept only identity XYZW, modifier zero, and source reserved zero.
 4. VARYING must be `v0`; CONSTANT must be `c0`; TEMP must be `r0` or `r1`.
