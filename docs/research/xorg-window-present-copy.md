@@ -136,6 +136,134 @@ physical output is instead the unchanged-front-buffer cache/device-ownership
 bridge; the render-retirement `chrome9_sf_resync_object_locked()` path should
 then be audited by exact GEM-object identity.
 
+## Accepted draw but black external pixmap: localization gate
+
+Mesa `067bf9f` fixes the sampler-view gate.  The live Xorg process now reports
+one non-null BGRX view (`format=281`, `resulting=1`), the glamor texture draw is
+accepted, and the bounded kernel submission retires without an engine error.
+Nevertheless both the 300x300 window XWD and the complete root XWD remain
+RGB-zero.  Render-target shadow lifetime was a plausible driver-local cause,
+but the direct discriminator has now rejected it as the sole cause.
+
+When `set_framebuffer_state()` receives an unguarded external color resource,
+it creates a canonical guarded `ctx->render_target` and copies external pixels
+into it once.  Successful draw submissions and clears set
+`ctx->render_target_dirty`.  The reverse copy is performed only by:
+
+```text
+set_framebuffer_state() before replacing the binding
+pipe_context::flush()
+pipe_context::flush_resource()
+context destruction
+```
+
+Keeping the same glamor framebuffer bound does not exercise the first path.
+`chrome9_transfer_map()` ignores its pipe context and returns the external
+BO mapping directly, so an XWD/readback map does not publish the dirty shadow
+either.  If this frontend path does not call `flush` or `flush_resource` at
+the Present boundary, the guarded shadow contains the completed hardware
+draw forever while the X pixmap and scanout object stay black.  That behavior
+was consistent with the symptom but not unique to it.  A direct guarded target
+does not need a byte copy, but uses the same dirty flag.
+
+The discriminator added immediate publication at the outer Gallium-operation
+boundary, not in the per-triangle callback:
+
+```c
+draw_vbo(...);
+draw_flush(ctx->draw);               /* all Chrome9 ioctls are synchronous */
+chrome9_flush_render_target(ctx);    /* one shadow copy per Gallium draw */
+```
+
+Placing the call after `draw_flush()` includes every internal triangle while
+avoiding a full-surface copy per triangle or ioctl batch.  The test also
+published immediately after `chrome9_clear()` and
+`chrome9_clear_render_target()`.  The complete Chrome9 smoke suite passed, but
+the live root and named-window XWD RGB payloads remained byte-for-byte
+identical and all zero.  Therefore delayed target-shadow copyback is not the
+remaining black-window cause.  Keep the publication fix for correct resource
+semantics, but do not use it as evidence that the sampled source or Present
+destination ever contained rendered pixels.
+
+A `transfer_map` flush is useful but not sufficient for Present: it guarantees
+CPU readback only when a map happens and does not make the X pixmap visible to
+display/composite consumers which never map it.  For complete map semantics,
+the later implementation should also:
+
+* call `chrome9_flush_render_target()` before mapping the currently bound
+  external color resource, so reads and partial writes start from current
+  pixels; and
+* after unmapping that resource with a write usage, copy external back into
+  the still-bound guarded shadow, otherwise a later hardware draw can restore
+  stale pre-map pixels in untouched regions.
+
+Keep the existing `flush`, `flush_resource`, rebind, and destroy publication
+points as redundant ordering boundaries.  The next run must checksum each
+side of the cross-process Present chain rather than infer contents from a
+successful ioctl.
+
+### One-run pixel provenance instrumentation
+
+Install the same opt-in diagnostic in both the GL client and Xorg Chrome9
+processes.  Every record needs PID, context pointer, resource pointer, BO
+handle and size, format, width/height, stride, data offset, guarded flag, a
+64-bit hash of useful rows, RGB-nonzero pixel count, and the coordinate/value
+of the first RGB-nonzero pixel.  A count of arbitrary nonzero bytes is not a
+color test: the measured black XR24 window already has one nonzero X/alpha
+byte per pixel.  Handles are local to each DRM file, so geometry, layout and
+hash -- not numerical handle equality -- correlate the client export with the
+Xorg import.
+
+Record these ordered stages after the synchronous producer has retired:
+
+| stage | resource to checksum |
+|---|---|
+| client `draw-target-after` | effective guarded render target immediately after `draw_flush()` |
+| client `render-external-after` | public/exported resource immediately after shadow publication |
+| Xorg `sampler-external` | `view->texture` before any source-shadow refresh |
+| Xorg `sampler-effective` | refreshed shadow when one exists, otherwise the direct `view->texture` |
+| Xorg `draw-target-before` | effective destination immediately before the accepted glamor draw |
+| Xorg `draw-target-after` | effective destination immediately after `draw_flush()` |
+| Xorg `target-external-after` | public destination immediately after target publication |
+
+The direct sampler case is essential.  A canonical guarded same-device import
+has no `cview->shadow`; instrumentation placed only inside
+`if (cview->shadow)` silently omits exactly the likely DRI3 source.  Always
+report `view->texture`, then report either the refreshed shadow or an explicit
+`sampler-direct` record.
+
+Do not use one small global line budget: repeated client clear/draw operations
+can exhaust it before Xorg reaches the relevant copy.  Bound output per
+PID/stage/resource, preserving at least the first zero observation and the
+first RGB-nonzero transition.  This provides a deterministic split:
+
+| first failed transition | conclusion |
+|---|---|
+| client draw target is RGB-zero | failure remains in client rendering/state |
+| client target is nonzero, exported external stays zero | client target publication failure |
+| client external is nonzero, Xorg sampler external is zero | stale/wrong DRI3 pixmap, handle lifetime, or producer-fence ordering |
+| sampler external is nonzero, effective sampler is zero | sampler shadow/layout refresh failure |
+| effective sampler is nonzero, Xorg draw target remains zero | glamor geometry, viewport/scissor, blend, or destination state failure |
+| Xorg draw target is nonzero, public destination stays zero | Xorg target publication failure |
+| public destination is nonzero, named XWD is zero | the draw targeted a different/offscreen window pixmap |
+| 300x300 destination becomes nonzero but 1024x768 root stays zero | missing later window-to-root composite/damage path |
+
+The final two cases distinguish an offscreen redirected window pixmap from the
+root scanout pixmap without guessing.  Width and height in every record are
+therefore part of the correctness evidence, not merely diagnostic decoration.
+
+This follows the exact Xorg 21.1.24 call chain.  `present_execute_copy()` calls
+`present_copy_region(&window->drawable, source, ...)`, whose scratch GC invokes
+`CopyArea(source, window drawable, ...)` and only then calls the screen flush.
+Glamor's FBO copy resolves both drawables with
+`glamor_get_drawable_pixmap()`; a window resolves through
+`Screen::GetWindowPixmap(window)`.  It does not unconditionally select the
+screen pixmap.  Thus the effective destination is the 1024x768 root/front BO
+for an ordinary unredirected window, but can be a 300x300 offscreen BO for a
+redirected window.  The source references are Xorg 21.1.24
+`present/present_execute.c:65-90`, `present/present.c:65-95`,
+`glamor/glamor.c:57-75`, and `glamor/glamor_copy.c:358-475`.
+
 ## No-reboot containment and fallback
 
 On a normal run, stop the GL client and Xorg and require
