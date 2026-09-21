@@ -100,6 +100,11 @@ targets.
   from static-only internal SIN/COS emitters.
 - [chrome9-sincos-terminal-corpus.tsv](chrome9-sincos-terminal-corpus.tsv)
   retains four terminal Windows/Linux SINCOS streams and dependency deltas.
+- [chrome9-flr-expansion-audit.md](chrome9-flr-expansion-audit.md) proves that
+  pixel FLR is an internal two-record FRC-plus-subop-9 lowering, not a safe
+  one-record reuse of the FRC key.
+- [chrome9-flr-expansion-static.tsv](chrome9-flr-expansion-static.tsv) records
+  exact Windows/Linux allocator, append, and release call-site provenance.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
