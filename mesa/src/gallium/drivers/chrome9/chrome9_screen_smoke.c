@@ -1560,8 +1560,20 @@ run_pipe_texture(struct pipe_screen *screen)
    view_templ.u.tex.first_level = 0;
    view_templ.u.tex.last_level = 0;
    view = context->create_sampler_view(context, texture, &view_templ);
+   view_templ.swizzle_a = PIPE_SWIZZLE_1;
+   mip_view = context->create_sampler_view(context, texture, &view_templ);
+   if (mip_view) {
+      fputs("BGRA constant-one-alpha sampler view unexpectedly accepted\n",
+            stderr);
+      pipe_sampler_view_reference(&mip_view, NULL);
+      goto out;
+   }
+   view_templ.swizzle_a = PIPE_SWIZZLE_W;
    u_sampler_view_default_template(&rhw_view_templ, rhw_texture,
                                    rhw_texture->format);
+   /* Glamor presents XRGB images as identity RGB with constant-one alpha.
+    * The native BGRX sampler implements exactly that fourth component. */
+   rhw_view_templ.swizzle_a = PIPE_SWIZZLE_1;
    rhw_view = context->create_sampler_view(context, rhw_texture,
                                            &rhw_view_templ);
    replace_vs = make_texture_vertex_shader(screen, context, false);

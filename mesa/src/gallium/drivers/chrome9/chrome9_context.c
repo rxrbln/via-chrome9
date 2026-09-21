@@ -1143,7 +1143,9 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                     templ->swizzle_r == PIPE_SWIZZLE_X &&
                     templ->swizzle_g == PIPE_SWIZZLE_Y &&
                     templ->swizzle_b == PIPE_SWIZZLE_Z &&
-                    templ->swizzle_a == PIPE_SWIZZLE_W;
+                    (templ->swizzle_a == PIPE_SWIZZLE_W ||
+                     (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM &&
+                      templ->swizzle_a == PIPE_SWIZZLE_1));
 
    if (!supported) {
       if (!(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_CREATE)) {
