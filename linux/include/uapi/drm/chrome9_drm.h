@@ -30,6 +30,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	0x19
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH	0x1a
 #define DRM_CHROME9_COPY_RECT	0x1b
+#define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_CHAIN	0x1c
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -96,6 +97,10 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_COPY_RECT \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_COPY_RECT, \
 		struct drm_chrome9_copy_rect)
+#define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_CHAIN \
+	DRM_IOW(DRM_COMMAND_BASE + \
+		DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_CHAIN, \
+		struct drm_chrome9_draw_triangle_d16_rhw_chain)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -182,6 +187,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION	(1ULL << 45)
 /* GEM_CREATE can keep scanout pages directly addressable by the 32-bit GPU. */
 #define DRM_CHROME9_CAP_GEM_DMA32_SCANOUT	(1ULL << 46)
+/* One immutable RHW draw is internally split into proven 544-triangle runs. */
+#define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_CHAIN	(1ULL << 47)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -777,6 +784,34 @@ struct drm_chrome9_draw_triangle_d16_rhw_batch {
  * post-viewport RHW triangles under one complete state envelope.
  */
 struct drm_chrome9_draw_triangle_d16_rhw_run {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	__u32 reserved0;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 pad;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
+};
+
+#define DRM_CHROME9_TRIANGLE_CHAIN_MAX_TRIANGLES	16384U
+
+/*
+ * State-complete successor to DRAW_TRIANGLE_D16_RHW_RUN.  The kernel copies
+ * and validates the complete immutable vertex array before taking any GEM
+ * reservation or submitting work, then emits consecutive packets containing
+ * at most TRIANGLE_RUN_MAX triangles while retaining one state envelope,
+ * mapping lifetime and fence.  The request layout is deliberately distinct
+ * even though version one has the same fields as the run request.
+ */
+struct drm_chrome9_draw_triangle_d16_rhw_chain {
 	__u32 destination_handle;
 	__u32 depth_handle;
 	__u32 flags;
