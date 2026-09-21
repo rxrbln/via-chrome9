@@ -634,6 +634,16 @@ static u32 chrome9_scissor_x(const struct chrome9_draw_request *request)
 		request->scissor.max_x;
 }
 
+static u32 chrome9_depth_control_word(
+	const struct chrome9_draw_request *request, bool perspective)
+{
+	u32 word = perspective ? 0x01ce1548 : 0x01c01548;
+
+	if (!(request->flags & DRM_CHROME9_DEPTH_READ_ONLY))
+		word |= BIT(2);
+	return word;
+}
+
 static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
 				struct chrome9_blend_words *words)
 {
@@ -909,7 +919,9 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	if (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE)
 		common[4] = 0x01ce1540;
 	if (depth_active) {
-		common[4] |= 0x0000000c;
+		common[4] = chrome9_depth_control_word(
+			request, request->texture_program ==
+			DRM_CHROME9_TEXTURE_PROGRAM_MODULATE);
 		common[7] = 0x10000000 | (depth >> 8);
 		common[8] = 0x11000001 |
 			((request->depth_pitch >> 5) << 13);
@@ -998,8 +1010,9 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	      body[47 + delta] != common[7])) ||
 	    (depth_active &&
 	     (body[44 + delta] !=
-		(request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ?
-		 0x01ce154c : 0x01c0154c) ||
+		chrome9_depth_control_word(
+			request, request->texture_program ==
+			DRM_CHROME9_TEXTURE_PROGRAM_MODULATE) ||
 	      body[47 + delta] != (0x10000000 | (depth >> 8)) ||
 	      body[48 + delta] != (0x11000001 |
 		((request->depth_pitch >> 5) << 13)) ||
@@ -1146,7 +1159,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		sampler[i][3] = 0xcccccccc;
 	}
 	if (depth_active) {
-		common[4] = 0x01c0154c;
+		common[4] = chrome9_depth_control_word(request, false);
 		common[7] = 0x10000000 | (depth >> 8);
 		common[8] = 0x11000001 |
 			((request->depth_pitch >> 5) << 13);
@@ -1222,7 +1235,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	    body[44] != image[1][4] || body[45] != image[1][5] ||
 	    body[52] != 0x30000000 ||
 	    (depth_active &&
-	     (body[64] != 0x01c0154c ||
+	     (body[64] != chrome9_depth_control_word(request, false) ||
 	      body[67] != (0x10000000 | (depth >> 8)) ||
 	      body[68] != (0x11000001 |
 		((request->depth_pitch >> 5) << 13)) ||
@@ -1323,7 +1336,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 		(request->destination_format ==
 		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
 		 0x00980000) | (request->pitch >> 5);
-	body[19 + delta] = perspective ? 0x01ce154c : 0x01c0154c;
+	body[19 + delta] = chrome9_depth_control_word(request, perspective);
 	body[22 + delta] = 0x10000000 | (depth >> 8);
 	body[23 + delta] = 0x11000001 |
 		((request->depth_pitch >> 5) << 13);
@@ -1365,7 +1378,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	p = body + 170 + delta + vertex_count * 6;
 	if ((!blend &&
 	     (p - body != 170 + vertex_count * 6 ||
-	      body[19] != (perspective ? 0x01ce154c : 0x01c0154c) ||
+	      body[19] != chrome9_depth_control_word(request, perspective) ||
 	      body[22] != (0x10000000 | (depth >> 8)) ||
 	      body[27] != 0xcc000000 || body[52] != 0x20000000 ||
 	      body[53] != 0x23004f02 ||
@@ -1378,7 +1391,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	      body[14] != 0x3f000000 || body[15] != blend_words.a34 ||
 	      body[18] != blend_words.a37 || body[21] != blend_words.a53 ||
 	      body[22] != blend_words.a00 ||
-	      body[23] != (perspective ? 0x01ce154c : 0x01c0154c) ||
+	      body[23] != chrome9_depth_control_word(request, perspective) ||
 	      body[26] != (0x10000000 | (depth >> 8)) ||
 	      body[31] !=
 		((request->blend.flags &
@@ -3472,7 +3485,8 @@ static int chrome9_validate_depth_flags(u32 flags, u32 allowed)
 {
 	u32 depth_func;
 
-	if (flags & ~(allowed | DRM_CHROME9_DEPTH_FUNC_MASK))
+	if (flags & ~(allowed | DRM_CHROME9_DEPTH_FUNC_MASK |
+		      DRM_CHROME9_DEPTH_READ_ONLY))
 		return -EINVAL;
 	depth_func = (flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 		     DRM_CHROME9_DEPTH_FUNC_SHIFT;
@@ -3649,7 +3663,8 @@ static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 
 	if (chrome9_validate_depth_flags(args->flags, state_flags) ||
 	    (perspective && !depth) ||
-	    (!depth && (args->flags & DRM_CHROME9_DEPTH_FUNC_MASK)) ||
+	    (!depth && (args->flags & (DRM_CHROME9_DEPTH_FUNC_MASK |
+				      DRM_CHROME9_DEPTH_READ_ONLY))) ||
 	    !args->triangle_count ||
 	    args->triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES ||
 	    !args->vertices_ptr || args->reserved0 || args->pad ||
