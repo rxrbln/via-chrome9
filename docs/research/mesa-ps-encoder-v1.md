@@ -167,20 +167,22 @@ ALU       00800530 30140924 00f20005 200003e0
 
 The equivalent first SUB produces `82000530 30140924 00f08005 200003e0`.
 This object uses A90=`90000000`, a special intermediate destination ending
-`200003e0`, and native id `3f` in the consumer. The existing closed RGBX
-two-ALU object instead uses A90=`90018000`. Therefore A90 low bits and the
-temporary rewrite depend on compiler/finalizer metadata, not merely
-`tau_count` and `alu_count`. V1 may encode one-record arithmetic and retain
-closed multi-record objects, but must not emit a general multi-ALU chain until
-the special temporary/dependency rewrite is decoded and validated.
+`200003e0`, and native id `3f` in the consumer. Static allocator tracing
+shows this is not a proven bypass: the special allocation branch returns
+physical 12--15 and the destination masks that to four bits, but a subsequent
+ordinary logical-temp lookup misses, returns -1, and the source encoder masks
+it to six-bit id `3f`. This is an unchecked not-found sentinel. The existing
+closed RGBX two-ALU object instead uses A90=`90018000` and has no such failed
+remap. Therefore V1 must reject this general multi-ALU chain even though the
+vendor compiler reports success.
 
 Bit d2.17 is not texture-specific. The ALU-only chain
 `add r0,c0,c1; mul oC0,r0,c2` emits its consumer as
 `0140b6d0 30082053 00f20005 00000820`; it marks an ordinary earlier-ALU
-producer in the same source-A field. The special id-3f path above is a
-different producer/consumer representation associated with the textured
-multi-ALU rewrite. Dependency metadata must come from the complete producer
-graph and phase finalizer, never merely from source register class.
+producer in the same source-A field. In contrast, the id-3f path above is a
+failed remap and invalid as executable evidence. Dependency metadata must
+come from the complete producer graph and phase finalizer, never merely from
+source register class.
 
 The raw/final differential separates scheduler allocation from dependency
 finalization. Before the explicit configuration-2 pass, the textured chain
@@ -198,12 +200,12 @@ config2 TAU  301001b0
 config2 A90  90000000
 ```
 
-Thus the compiler scheduler chooses the matched 15/63 bypass encoding; the
-explicit dependency pass adds ALU0 d2.bit17, destination d3.bit29, and TAU
-bit28. For the ALU-only two-record chain the raw consumer's d2 is `00f00005`
-and configuration-2 changes it to `00f20005`, while A90 changes from
-`90040000` to `90058000`. Ids 15/63 are special dependency encodings, not
-evidence for 16 or 64 general temporaries.
+Thus compilation exposes the allocation/remap failure before the explicit
+dependency pass; configuration-2 merely adds ALU0 d2.bit17, destination
+d3.bit29, and TAU bit28 and does not repair id `3f`. For the valid ALU-only
+two-record chain the raw consumer's d2 is `00f00005` and configuration-2
+changes it to `00f20005`, while A90 changes from `90040000` to `90058000`.
+Ids 15/63 are negative validation evidence, not 16/64 general temporaries.
 
 The Windows backend before configuration-2 and the Linux production
 finalizer give exact one-texture dependency deltas for every v1 source slot:
