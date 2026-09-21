@@ -955,6 +955,16 @@ The transaction is:
 1. Under `submit_lock`, freeze the engine and take a temporary fence reference
    for the sole quarantined job.  A first wedge prevents subsequent submits,
    so more than one job is an invariant failure and must return `-EUCLEAN`.
+   Before dropping the lock require `sf_bound`, `node_allocated`, nonzero
+   `page_count`, non-NULL `ptes`, page-aligned `sf_node.start/size`,
+   `sf_node.size == page_count * PAGE_SIZE` without overflow, and a complete
+   range inside `[CHROME9_RING_SIZE, SZ_64M)`.  Sum the present role page counts
+   with checked arithmetic and require the same total; each retained object's
+   page-aligned GEM size must match its role count.  A partially initialized or
+   inconsistent record returns `-EUCLEAN` before any MMIO/PTE write.  The
+   current basic submitter fills only `page_count`; set its
+   `destination_page_count=page_count` when adding this validator rather than
+   special-casing an implicit zero destination role.
    Drop `submit_lock` before reservation locking.
 2. Lock every retained, distinct GEM reservation with `drm_exec`, in the same
    role order used by structured submit, using
