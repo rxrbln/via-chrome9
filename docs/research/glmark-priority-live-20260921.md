@@ -102,3 +102,41 @@ Target logs are retained in:
 
 - `/root/tmp/chrome9-live/validate-20260921-131735/`
 - `/root/tmp/chrome9-live/glmark-cmd14-20260921/`
+
+## D16 RHW chain live successor
+
+The bounded chain described in `d16-rhw-chain-submit.md` subsequently passed
+its opt-in live gate with kernel `19ccbc4`, UAPI `c83ea14`, Mesa Chrome9
+`62eff6c`, and Mesa parent `91bd8c6`.  The deployed module SHA-256 is
+`1645a59290900eb0e07bdf7d9de291821396447095350a7c459b533c755afdfe`;
+it was loaded with `rhw_chain=1` and advertised capability bit 47.
+
+Before X was started, the direct oracle passed counts 545, 8,160 and 16,384.
+The asset-sized 14,348 case passed later on the same boot.  Every case checked
+alternating LESS pass/reject cells, D16 results, color/depth guards and the
+over-limit rejection.  The complete Gallium smoke then passed.  Both texture
+filters and the Gouraud cat again reported glmark2 `Validation: Success`.
+
+A same-boot, same-256x256, 100-frame A/B comparison isolates the chain from
+clock and thermal variation:
+
+| Gouraud path | FPS | frame time |
+|---|---:|---:|
+| preserved Mesa `3543230`, 15 command-`0x0f` calls/frame | 24 | 41.857 ms |
+| Mesa `91bd8c6`, one command-`0x1c` call/frame | 29 | 35.019 ms |
+
+This is a 20.8% FPS increase and a 16.3% frame-time reduction.  A detailed
+five-frame trace contains exactly five command-`0x1c` ioctls and zero
+command-`0x0f` ioctls.  In otherwise identical 20-frame `strace -c -e ioctl`
+runs, total ioctls fell from 362 to 94 and time attributed to `ioctl` fell
+from 0.336941 to 0.183219 seconds.
+
+The linear texture cube measured 74 FPS / 13.526 ms with the new library and
+74 FPS / 13.626 ms with the preserved pre-chain library on this later boot.
+The variation from the earlier 83-FPS sample is therefore not caused by the
+Gouraud chain change.  It remains reference-image correct and above 60 FPS.
+
+After the full ladder and A/B runs, SWIOTLB remained 200 and MMIO `0x040c`
+remained zero.  Logs are retained in
+`/root/tmp/chrome9-live/glmark-chain-20260921/`; the full validation run is
+`/root/tmp/chrome9-live/validate-20260921-134426/`.
