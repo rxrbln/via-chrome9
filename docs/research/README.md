@@ -60,6 +60,9 @@ targets.
 - [fixed-function-state-transitions.md](fixed-function-state-transitions.md)
   combines blend, alpha-test, fog, scissor, and texture-format words into a
   transition-closed two-texture state image with exact body-index formulas.
+- [fixed-function-fog-alpha-shader-keys.md](fixed-function-fog-alpha-shader-keys.md)
+  separates fixed A33 alpha test from fog shader variants and records
+  Wine/Linux compiler differentials for bounded LRP and TEXKILL keys.
 - [mip-format-projective-oracles.md](mip-format-projective-oracles.md)
   defines bounded mip-level, format, software/native projection, and texture
   cache-transition gates for the post-two-texture implementation.
