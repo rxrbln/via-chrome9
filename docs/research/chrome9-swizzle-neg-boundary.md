@@ -7,7 +7,8 @@ ADD, SUB, and DP3 with identity files v0/c0.  For every source position it
 tests `.xxxx`, `.yyyy`, `.zzzz`, `.wwww`, and `.wzyx`; it also tests the two
 previously missing DP3 NEG positions.  All 70 swizzle rows byte-match between
 the proprietary Windows scheduler and Linux configuration-2 compiler.  Both
-DP3 NEG rows disagree and are hard rejects.  Exact tokens and records are in
+DP3 NEG rows disagree in instruction count and encoding and are hard rejects.
+Exact tokens and complete records are in
 [`chrome9-swizzle-neg-corpus.tsv`](chrome9-swizzle-neg-corpus.tsv).
 
 This is compiler evidence only.  No new swizzle or modifier enters the
@@ -75,19 +76,24 @@ The DP3 discrepancy is not the familiar bit-20 companion difference:
 ```text
 DP3 -v0,c0
 Windows  00962490 30140924 00f04005 00002020
+         01c00530 301c0053 00f08005 000d0020
+         00962490 30140924 00f00005 00002020
+         01c00530 30000053 00f00005 00020820
 Linux    01c00530 58080055 00f04005 00020820
 
 DP3 v0,-c0
-Windows  00962490 30140924 00f04005 00002020
+Windows  same four-record expansion
 Linux    81c00530 50080055 00f04005 00020820
 ```
 
-Windows emits the same subop-0 object for both positions, while Linux retains
-subop-2 and places NEG in the requested physical source.  Windows also changes
-its pretarget A92 count/control from `92000001` to `92000004`; Linux retains
-the ordinary executable `92000001`.  There is no closed cross-driver native
-or control-word contract.  Reject both forms before allocation and do not
-canonicalize one into the other based only on dot-product algebra.
+Windows emits the same four-record expansion for both positions: two subop-0
+records, an intermediate MOV, and a final subop-2 record.  Linux instead
+retains one subop-2 record and places NEG in the requested physical source.
+Windows changes its pretarget A92 count/control from `92000001` to
+`92000004`; Linux retains the ordinary executable `92000001`.  There is no
+closed cross-driver native, count, or control-word contract.  Reject both
+forms before allocation and do not canonicalize one into the other based only
+on dot-product algebra.
 
 ## Safest structured swizzle rung
 
