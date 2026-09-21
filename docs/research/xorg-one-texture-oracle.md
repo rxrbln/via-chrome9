@@ -2126,6 +2126,40 @@ larger GL textures require the separately tracked mip-capable resource-layout
 work before this is a general application path.  The raw oracle already proves
 independent D3/D4 interpolation for 32x32 sources.
 
+### Mip-capable BO container validation (2026-09-21)
+
+Mesa commits `120cdd9` and `4dbef4d` add a guarded linear mip container while
+leaving the sampled level-zero contract unchanged.  Level zero still begins
+after one page, and its page-rounded payload is immediately followed by the
+original internal guard.  Levels 1 through `last_level` follow that guard at
+256-byte-aligned offsets with 32-byte-aligned pitches, followed by a final
+page guard.  Only a sampler view selecting exactly level zero and no mip
+filter is eligible for the current ioctl; this resource work does not yet
+claim hardware mip selection.
+
+Kernel commit `1be84b1` maps the complete native texture BO, calculates every
+following source address from actual preceding GEM sizes, and independently
+prepares/verifies both the canonical level-zero guard and the final BO guard.
+Destinations and D16 buffers retain exact-size validation.  The raw oracle's
+`--mip-tail` mode allocates each 32x32 source as five pages: leading guard,
+level-zero payload, internal guard, untouched synthetic mip-tail page, and
+final guard.  This also forces texture 1's SF base to move by the enlarged
+texture-0 allocation.
+
+On the live VX900, 100 consecutive enlarged three-BO submissions plus a final
+reported run produced the exact established quadrant samples:
+
+```text
+RGBA two-texture triangle with mip tails passed: 00ff0000/00000000/00ffff00 outside=005a5a5a
+caps=0x7ffd, bounded two-texture path passed
+```
+
+Both internal guards, both final guards, both complete synthetic mip-tail
+pages, both level-zero images, the destination guards, and the outside
+sentinel remained exact.  This proves the larger-BO PTE span and inter-object
+address arithmetic without conflating it with the still-unvalidated hardware
+mip-table state.
+
 ## Measured live result
 
 The kernel-owned test used the oracle's exact local-VRAM addresses,
