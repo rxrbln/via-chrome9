@@ -117,6 +117,7 @@ struct chrome9_context {
    bool draw_triangle_batch;
    bool draw_triangle_d16_rhw_batch;
    bool draw_triangle_d16_rhw_run;
+   bool draw_triangle_d16_rhw_chain;
    bool draw_program_triangle_d16_rhw_batch;
    bool draw_textured_triangle;
    bool draw_textured_triangle_batch;
@@ -161,6 +162,7 @@ struct chrome9_context {
    uint64_t submitted_batches;
    uint64_t submitted_program_batches;
    uint64_t submitted_rhw_runs;
+   uint64_t submitted_rhw_chains;
    uint64_t rejected_triangles;
    uint64_t draw_limit;
    bool debug_draws;

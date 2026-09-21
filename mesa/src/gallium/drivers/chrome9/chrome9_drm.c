@@ -17,6 +17,8 @@
 
 _Static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128,
                "Chrome9 RHW run ABI size");
+_Static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_chain) == 128,
+               "Chrome9 RHW chain ABI size");
 _Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_batch) == 160,
                "Chrome9 textured batch ABI size");
 _Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_run) == 160,
@@ -146,6 +148,15 @@ chrome9_draw_triangle_d16_rhw_run(
    if (!draw)
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN, draw) == 0;
+}
+
+bool
+chrome9_draw_triangle_d16_rhw_chain(
+   int fd, const struct drm_chrome9_draw_triangle_d16_rhw_chain *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_CHAIN, draw) == 0;
 }
 
 bool

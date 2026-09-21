@@ -3558,6 +3558,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->draw_triangle_d16_rhw_run =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_RUN) ||
       debug_get_bool_option("CHROME9_FORCE_RHW_RUN", false);
+   ctx->draw_triangle_d16_rhw_chain =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_CHAIN);
    ctx->draw_program_triangle_d16_rhw_batch =
       !!(capabilities &
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);

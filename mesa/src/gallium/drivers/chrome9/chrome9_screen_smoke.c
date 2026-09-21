@@ -1391,6 +1391,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    uint64_t initial_batches = 0;
    uint64_t initial_program_batches = 0;
    uint64_t initial_rhw_runs = 0;
+   uint64_t initial_rhw_chains = 0;
    void *blend_handle = NULL;
    void *source_over_handle = NULL;
    void *multiply_handle = NULL;
@@ -1674,6 +1675,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    initial_program_batches =
       chrome9_context(context)->submitted_program_batches;
    initial_rhw_runs = chrome9_context(context)->submitted_rhw_runs;
+   initial_rhw_chains = chrome9_context(context)->submitted_rhw_chains;
    context->draw_vbo(context, &info, 0, NULL, &draw, 1);
    if (depth_resource) {
       vertex_buffer.buffer.user = near_vertices;
@@ -1697,7 +1699,14 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
              chrome9_context(context)->submitted_batches ==
                 initial_batches + 1) &&
             (!depth_resource ||
-             (chrome9_context(context)->draw_triangle_d16_rhw_run ?
+             (chrome9_context(context)->draw_triangle_d16_rhw_chain ?
+                 chrome9_context(context)->submitted_rhw_chains ==
+                       initial_rhw_chains + 1 &&
+                    chrome9_context(context)->submitted_rhw_runs ==
+                       initial_rhw_runs &&
+                    chrome9_context(context)->submitted_program_batches ==
+                       initial_program_batches :
+              chrome9_context(context)->draw_triangle_d16_rhw_run ?
                  chrome9_context(context)->submitted_rhw_runs ==
                        initial_rhw_runs + 1 &&
                     chrome9_context(context)->submitted_program_batches ==
@@ -2401,14 +2410,17 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       fprintf(stderr,
               "Gallium quad-strip coverage/depth mismatch: %zu "
               "sample=%08x/%04x batches=+%" PRIu64
-              " program-batches=+%" PRIu64 " rhw-runs=+%" PRIu64 "\n",
+              " program-batches=+%" PRIu64 " rhw-runs=+%" PRIu64
+              " rhw-chains=+%" PRIu64 "\n",
               changed, pixels[32 * (surface->stride / 4) + 192],
               sample_depth,
               chrome9_context(context)->submitted_batches - initial_batches,
               chrome9_context(context)->submitted_program_batches -
                  initial_program_batches,
               chrome9_context(context)->submitted_rhw_runs -
-                 initial_rhw_runs);
+                 initial_rhw_runs,
+              chrome9_context(context)->submitted_rhw_chains -
+                 initial_rhw_chains);
    else if (depth_resource)
       printf("Gallium D16 quad strip passed: changed=%zu sample=%08x/%04x\n",
              changed, pixels[32 * (surface->stride / 4) + 192],
