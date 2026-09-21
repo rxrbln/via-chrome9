@@ -1500,7 +1500,8 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
 	bool run = request->kind ==
-		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN;
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN ||
+		request->kind == CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH;
 	void *staging = run ? engine->run_staging_cpu : engine->staging_cpu;
 	size_t staging_size = run ? CHROME9_RUN_STAGING_SIZE : PAGE_SIZE;
 	u32 max_triangles = run ? DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES :
@@ -3579,7 +3580,8 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 					   depth_target, &pause);
 	if (ret)
 		goto out_prepublication;
-	if (request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN)
+	if (request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN ||
+	    request->kind == CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH)
 		ret = chrome9_append_segment(engine, job,
 					     engine->run_staging_cpu,
 					     CHROME9_RUN_STAGING_SIZE, pause,
@@ -4441,7 +4443,7 @@ int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
 		return ret;
 	return chrome9_draw_triangle_batch(
 		drm, &batch, file, true,
-		DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES,
+		DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES,
 		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH, program,
 		args->constant_c0);
 }
