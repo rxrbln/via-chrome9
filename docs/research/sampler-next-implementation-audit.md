@@ -158,7 +158,7 @@ the twelve-level selector range as evidence for the inferred L9--L11 packing.
 
 ## Layout contract and two address spaces
 
-The proprietary allocation helper uses the canonical linear formula:
+The proprietary allocation helper uses this canonical linear formula:
 
 ```text
 pitch[l] = max(32, align(max(width >> l, 1) * cpp, 32))
@@ -166,11 +166,14 @@ size[l]  = pitch[l] * max(8, align(max(height >> l, 1), 8))
 offset[l + 1] = offset[l] + size[l]
 ```
 
-Every uncompressed contribution is therefore 256-byte aligned.  The current
-Mesa oracle layout intentionally differs: it places a leading page before L0,
-keeps the historical guard page immediately after the page-rounded L0 range,
-then places L1 and later 256-byte-aligned levels, followed by a final guard.
-For a 32x32 XRGB texture this gives:
+Every uncompressed vendor contribution is therefore 256-byte aligned.  The
+current Mesa oracle layout intentionally differs in two ways: it places a
+leading page before L0 and the historical guard page immediately after the
+page-rounded L0 range; after that, it stores only each level's logical
+`pitch*height` bytes and aligns the start of the next level to 256 bytes.
+It does not round every level height to eight.  A final page-aligned guard
+terminates the BO.  For a 32x32 XRGB texture both size rules coincide and the
+layout is:
 
 ```text
 leading guard   0000..0fff
@@ -196,6 +199,17 @@ FE03043C 00000008 10030000 CC000000
 Stage 1 uses selector `10030008`, not `11030000`.  Always write all eight
 entries, zero unused slots, and rewrite A30/A31/A32 in the same draw.  A stale
 entry is unreachable only if the new A30 range proves it unreachable.
+
+For asymmetric NPOT chains the two layouts diverge.  At 30x18 XRGB through
+L2, vendor-contiguous `(offset,size)` pairs are
+`(0000,0c00),(0c00,0400),(1000,0100)`.  The current guarded Mesa pairs are
+`(1000,0900),(3000,0240),(3300,0080)`, so its exact SF-relative H3 entries
+are `40000020,40000023`.  The manual exposes explicit L1--L8 addresses and
+does not require a fixed inter-level stride, but that makes the Mesa layout a
+separate silicon question rather than proof by vendor allocation policy.
+Keep the first mip oracle POT, where the rules coincide; only then run this
+fully mapped 30x18 NPOT discriminator.  Do not use the compact Mesa rule for
+the implicit L9--L11 tail, whose only evidence is the vendor-canonical layout.
 
 Compressed DXT levels use block rows and a different size formula.  YUY2 has
 special A30 low bits and paired-pixel semantics.  Neither belongs in the
