@@ -1231,8 +1231,11 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		sampler[i][2] = 0x32000040 | wrap_t[i] << 3 | wrap_s[i];
 		sampler[i][3] = 0xcccccccc;
 	}
+	if (tex0_alpha_primary)
+		common[4] = 0x01ce1540;
 	if (depth_active) {
-		common[4] = chrome9_depth_control_word(request, false);
+		common[4] = chrome9_depth_control_word(request,
+					      tex0_alpha_primary);
 		common[7] = 0x10000000 | (depth >> 8);
 		common[8] = 0x11000001 |
 			((request->depth_pitch >> 5) << 13);
@@ -1319,13 +1322,15 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	    body[52 + delta] != 0x30000000 ||
 	    (depth_active &&
 	     (body[64 + delta] !=
-		chrome9_depth_control_word(request, false) ||
+		chrome9_depth_control_word(request, tex0_alpha_primary) ||
 	      body[67 + delta] != (0x10000000 | (depth >> 8)) ||
 	      body[68 + delta] != (0x11000001 |
 		((request->depth_pitch >> 5) << 13)) ||
 	      body[69 + delta] != 0x12380000 ||
 	      body[70 + delta] != (0x13000000 | depth_func << 16) ||
 	      body[71 + delta] != 0x20007fff)) ||
+	    (!depth_active && body[64 + delta] !=
+		(tex0_alpha_primary ? 0x01ce1540 : 0x01c01540)) ||
 	    body[72 + delta + depth_delta] != 0x00000021 ||
 	    body[74 + delta + depth_delta] != 0x08010102 ||
 	    body[84 + delta + depth_delta] != 0x0000040a ||
@@ -3879,12 +3884,16 @@ static bool chrome9_rhw_valid(u32 value)
 	       chrome9_float_finite(value);
 }
 
-static bool chrome9_safe_texcoord(u32 value)
+static bool chrome9_safe_texcoord(u32 value, u32 wrap)
 {
 	u32 magnitude = value & ~BIT(31);
 
-	return chrome9_float_finite(value) &&
-	       (!(value & BIT(31)) || !magnitude) && magnitude <= 0x3f800000;
+	if (!chrome9_float_finite(value))
+		return false;
+	if (chrome9_two_texture_signed_repeat &&
+	    wrap == DRM_CHROME9_TEXTURE_WRAP_REPEAT)
+		return magnitude <= 0x42000000; /* 32.0f */
+	return (!(value & BIT(31)) || !magnitude) && magnitude <= 0x3f800000;
 }
 
 static int chrome9_validate_two_texture_state(
@@ -3995,10 +4004,14 @@ int chrome9_draw_two_textured_triangle_ioctl(struct drm_device *drm,
 		    !chrome9_coordinate_valid(vertex->y_16_16, args->height) ||
 		    vertex->z_16_16 < 0 || vertex->z_16_16 > 0x10000 ||
 		    !chrome9_rhw_valid(vertex->rhw_float) ||
-		    !chrome9_safe_texcoord(vertex->s0_float) ||
-		    !chrome9_safe_texcoord(vertex->t0_float) ||
-		    !chrome9_safe_texcoord(vertex->s1_float) ||
-		    !chrome9_safe_texcoord(vertex->t1_float))
+		    !chrome9_safe_texcoord(vertex->s0_float,
+					  args->textures[0].wrap_s) ||
+		    !chrome9_safe_texcoord(vertex->t0_float,
+					  args->textures[0].wrap_t) ||
+		    !chrome9_safe_texcoord(vertex->s1_float,
+					  args->textures[1].wrap_s) ||
+		    !chrome9_safe_texcoord(vertex->t1_float,
+					  args->textures[1].wrap_t))
 			return -EINVAL;
 		request.two_textured_vertices[i] = *vertex;
 	}
@@ -4107,10 +4120,14 @@ int chrome9_draw_two_textured_triangle_d16_ioctl(struct drm_device *drm,
 		    !chrome9_coordinate_valid(vertex->y_16_16, args->height) ||
 		    vertex->z_16_16 < 0 || vertex->z_16_16 > 0x10000 ||
 		    !chrome9_rhw_valid(vertex->rhw_float) ||
-		    !chrome9_safe_texcoord(vertex->s0_float) ||
-		    !chrome9_safe_texcoord(vertex->t0_float) ||
-		    !chrome9_safe_texcoord(vertex->s1_float) ||
-		    !chrome9_safe_texcoord(vertex->t1_float))
+		    !chrome9_safe_texcoord(vertex->s0_float,
+					  args->textures[0].wrap_s) ||
+		    !chrome9_safe_texcoord(vertex->t0_float,
+					  args->textures[0].wrap_t) ||
+		    !chrome9_safe_texcoord(vertex->s1_float,
+					  args->textures[1].wrap_s) ||
+		    !chrome9_safe_texcoord(vertex->t1_float,
+					  args->textures[1].wrap_t))
 			return -EINVAL;
 		request.two_textured_vertices[i] = *vertex;
 	}
@@ -4225,10 +4242,14 @@ int chrome9_draw_two_textured_triangle_d16_blend_ioctl(
 		    !chrome9_coordinate_valid(vertex->y_16_16, args->height) ||
 		    vertex->z_16_16 < 0 || vertex->z_16_16 > 0x10000 ||
 		    !chrome9_rhw_valid(vertex->rhw_float) ||
-		    !chrome9_safe_texcoord(vertex->s0_float) ||
-		    !chrome9_safe_texcoord(vertex->t0_float) ||
-		    !chrome9_safe_texcoord(vertex->s1_float) ||
-		    !chrome9_safe_texcoord(vertex->t1_float))
+		    !chrome9_safe_texcoord(vertex->s0_float,
+					  args->textures[0].wrap_s) ||
+		    !chrome9_safe_texcoord(vertex->t0_float,
+					  args->textures[0].wrap_t) ||
+		    !chrome9_safe_texcoord(vertex->s1_float,
+					  args->textures[1].wrap_s) ||
+		    !chrome9_safe_texcoord(vertex->t1_float,
+					  args->textures[1].wrap_t))
 			return -EINVAL;
 		request.two_textured_vertices[i] = *vertex;
 	}

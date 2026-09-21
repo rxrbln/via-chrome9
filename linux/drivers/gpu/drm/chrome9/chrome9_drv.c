@@ -55,6 +55,12 @@ module_param_named(fixed_iga1, chrome9_fixed_iga1, bool, 0400);
 MODULE_PARM_DESC(fixed_iga1,
 		 "Drive the lab-only fixed 1024x768@60 IGA1 VGA mode");
 
+bool chrome9_two_texture_signed_repeat;
+module_param_named(two_texture_signed_repeat,
+		   chrome9_two_texture_signed_repeat, bool, 0400);
+MODULE_PARM_DESC(two_texture_signed_repeat,
+		 "Expose the bounded two-texture signed REPEAT path (default: false)");
+
 static bool chrome9_staging_scanout;
 module_param_named(staging_scanout, chrome9_staging_scanout, bool, 0400);
 MODULE_PARM_DESC(staging_scanout,
@@ -2339,7 +2345,7 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 	case DRM_CHROME9_PARAM_CAPABILITIES:
 		args->value = DRM_CHROME9_CAP_GEM |
 			DRM_CHROME9_CAP_GEM_SHMEM_CACHED;
-		if (chrome9_engine_ready(cdev))
+		if (chrome9_engine_ready(cdev)) {
 			args->value |= DRM_CHROME9_CAP_FIXED_QUAD |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE_D16 |
@@ -2366,6 +2372,10 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			       DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32 |
 			       DRM_CHROME9_CAP_DEPTH_ALWAYS |
 			       DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY;
+			if (chrome9_two_texture_signed_repeat)
+				args->value |=
+					DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS;
+		}
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
