@@ -73,6 +73,10 @@ targets.
 - [texture-coordinate-lod-contract.md](texture-coordinate-lod-contract.md)
   recovers the exact A04/A08 coordinate controls, cross-checks Windows and
   Linux projective state, and defines bounded rectangle/derivative/LOD gates.
+- [two-level-mip-abi-oracle.md](two-level-mip-abi-oracle.md) resolves the
+  A18 versus reserved A19--A1F namespace, cross-checks the fixed eight-entry
+  table and LOD/filter words in both Windows UMDs, and specifies a bounded
+  two-level kernel/Mesa successor ABI and silicon sequence.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.
