@@ -1412,7 +1412,7 @@ the first ALU's source-C swizzle at body dword 217:
 # vendor alpha-mask instruction
 0140B6D0 302026DB 00F20005 0000007F   # r0.xyzw * r2.wwww
 
-# RGBA-by-RGBA candidate
+# RGBA-by-RGBA vendor instruction
 0140B6D0 30202053 00F20005 0000007F   # r0.xyzw * r2.xyzw
 ```
 
@@ -1422,16 +1422,24 @@ swizzle is low 12 bits `053` (`x=0,y=1,z=2,w=3`), while replicated W is
 `6db`.  The second, output-MOV instruction and every TAU/control word remain
 unchanged.  The complete body therefore remains 272 dwords.
 
-This is a tightly bounded synthesis rather than an unmodified vendor shader,
-but it has two independent binary cross-checks.  Calling
-`Modulate_H5_src_comp_Aa_Ca2` with mode 6 emits the scheduled instruction
+This word is also emitted verbatim by the unmodified vendor helper
+`Modulate_H5_src_comp_Aa_Ca2` (`via_drv.so:0x33290`) with mode 6.  An isolated
+call of that helper produced the complete 40-dword control/TAU/ALU packet and
+the scheduled instruction
 
 ```text
-0140B6D0 30202013 00F20005 0000007F   # r0.xyzw * r2.xxzw
+0140B6D0 30202053 00F20005 0000007F   # r0.xyzw * r2.xyzw
 ```
 
-which proves the same physical `r2`, dependencies, and scheduling with a
-different component-alpha swizzle.  Separately, the Linux proprietary PS 2.0
+Mode 5 of the same helper emits the independently useful source-alpha form
+
+```text
+0140B6D0 B0202053 00F2006D 0000007F   # r0.wwww * r2.xyzw
+```
+
+The earlier `30202013` transcription was wrong; the helper's byte stores at
+`0x3355d..0x338e2` and the direct call agree on `30202053`.  Separately, the
+Linux proprietary PS 2.0
 compiler accepts
 
 ```text

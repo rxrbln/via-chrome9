@@ -89,6 +89,10 @@ targets.
   constants, ALU/TEX, varying linkage, activation and termination as one
   bounded runtime contract, and prioritizes the glamor forms beyond the
   current fixed fragment classes.
+- [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
+  records reproducible Wine compiler differentials for the next closed
+  fragment keys, exact Xorg two-texture alpha objects in both orientations,
+  and their fail-closed resource/control validation contract.
 - [gl-feature-matrix.md](gl-feature-matrix.md) reconstructs the exact Linux and
   Windows OpenGL extension sets, raw limits, texture/render/depth formats,
   framebuffer/query support, and conservative Gallium/NIR capability envelope.
@@ -117,6 +121,9 @@ targets.
 - [via-5.75-shader-corpus.tsv](via-5.75-shader-corpus.tsv) is the replay-checked
   Linux/Windows native shader corpus used to assign ISA fields and expose
   generation-dependent lowerings.
+- [windows-closed-key-shader-corpus.tsv](windows-closed-key-shader-corpus.tsv)
+  pairs each bounded D3D compiler differential with its executable
+  Linux/Xorg words, control tuple, and exact resource masks.
 - [`../../tools/chrome9_drm_smoke.c`](../../tools/chrome9_drm_smoke.c) validates
   the provisional discovery/GEM UAPI without sending commands to the GPU.
 - [driver-architecture.md](driver-architecture.md) proposes the modern kernel
