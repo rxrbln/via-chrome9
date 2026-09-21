@@ -43,6 +43,9 @@ targets.
   practical RT stride/extent limits, linear mip allocation and the exact
   eight-entry mip table, guarded clear derivatives, and the render-to-texture
   cache-invalidation protocol.
+- [mip-tail-l9-l11-oracle.md](mip-tail-l9-l11-oracle.md) closes the vendor
+  resource layout through L11 and defines bounded POT/NPOT silicon tests for
+  the implicit L8-rooted hardware tail.
 - [npot-2d-capability-gate.md](npot-2d-capability-gate.md) cross-checks both
   Windows UMDs, Linux, Xorg, and the manual; it gives the exact A20/A22,
   pitch, wrap/filter/mip contract and separates the immediately testable

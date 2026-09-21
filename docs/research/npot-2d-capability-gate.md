@@ -239,12 +239,15 @@ Gallium currently advertises `max_texture_2d_size=2048`. A complete 2048
 chain has twelve levels, L0--L11. A30 can select through L11, while the H3
 palette explicitly names only L1--L8. The manual selects the L8 location for
 levels 8--11, and both proprietary builders accept twelve resource levels but
-write only eight table entries. This proves an implicit L8-rooted tail exists;
-it does not prove its exact byte packing.
+write only eight table entries. Direct execution of the proprietary Linux
+allocator now proves the canonical linear 32-bit packing: L9, L10, and L11
+are consecutive 256-byte blocks after L8. This proves the intended resource
+layout, but not yet that silicon applies that implicit addition during a
+fetch.
 
-The guarded L9 discriminator in
-[resource-layout-clear-cache.md](resource-layout-clear-cache.md) must pass,
-then be extended through L11, before the 2048-wide NPOT cap is complete. An
+The exact guarded POT and asymmetric NPOT sequences in
+[mip-tail-l9-l11-oracle.md](mip-tail-l9-l11-oracle.md) must pass before the
+2048-wide NPOT cap is complete. An
 alternative is lowering `max_texture_2d_size` to 256, for which L0--L8 are
 sufficient, but that is unsuitable for large desktop pixmaps and would not
 solve the intended glamor workload.
@@ -315,5 +318,5 @@ remains behind the full checklist above.
 | one-unit level-zero NPOT execution | high measured | 30x18 wrap/filter silicon oracle |
 | two-unit level-zero NPOT execution | high measured | 30x18 by 22x14 MODULATE, `040c=0` |
 | NPOT L1--L8 addressing | high static, unmeasured | manual + both UMD table builders |
-| L9--L11 packing | unresolved | only L8 location/root behavior is documented |
+| L9--L11 resource packing | high executable, GPU unmeasured | direct proprietary allocator execution; exact bounded silicon oracle pending |
 | truthful Gallium NPOT cap today | no | mip/view/tail execution gates remain |

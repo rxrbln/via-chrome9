@@ -4,8 +4,9 @@ Status: the linear render-target and mip-address fields below are exact static
 recoveries from the VX900 manual and both proprietary UMD families.  The
 32-by-32 color-clear oracle is a derivative of a measured draw; the depth,
 stencil, mip, and render-to-texture cases are packet-exact but have not yet
-been run on silicon.  Tiled modifiers, the mip tail beyond level 8, fast Z, and
-read-color/read-Z cache pulses remain deliberately unexposed.
+been run on silicon.  Tiled modifiers, execution of the statically recovered
+mip tail beyond level 8, fast Z, and read-color/read-Z cache pulses remain
+deliberately unexposed.
 
 ## Linear render-target extent and stride
 
@@ -177,11 +178,12 @@ rest.  This corrects the earlier wording that called them “nine additional”
 levels.
 
 The hardware level-control word A30 can select maximum levels 0 through 11,
-and A18 uses the level-8 location for levels 8 through 11.  The likely design
-is a packed tail rooted at the explicit L8 address, but neither UMD builder
-encodes distinct L9--L11 addresses.  Until that derivation is measured, expose
-`last_level <= 8`; a 2048 base image is still legal if the API does not require
-levels 9--11.
+and A18 uses the level-8 location for levels 8 through 11.  Neither UMD
+builder encodes distinct L9--L11 addresses.  Direct execution of the Linux
+allocator establishes consecutive 256-byte L9--L11 blocks for canonical
+linear 32-bit images; [mip-tail-l9-l11-oracle.md](mip-tail-l9-l11-oracle.md)
+records the exact layouts and bounded tests.  Hardware use of that implicit
+layout remains unmeasured, so expose `last_level <= 8` until those tests pass.
 
 The level-control builder itself is independently located in all three UMDs:
 Linux `STM_MipMapLOD_INV:0x1b1a50`, Windows D3D
@@ -565,7 +567,9 @@ green result proves that the hardware derives L9 from the L8 root; red proves
 clamping at the last explicit table entry.  Any poison color identifies a
 different implicit packing rule.  Every plausible level and the complete
 vendor-contiguous tail are mapped and guarded, so this is an address-bounded
-discriminator, but no L9 capability should be exposed until it passes.
+discriminator, but no L9 capability should be exposed until it passes.  The
+complete 2048-square L9--L11 sequence and asymmetric NPOT cross-check are in
+[mip-tail-l9-l11-oracle.md](mip-tail-l9-l11-oracle.md).
 
 ### Combined texture packet/index invariants
 
