@@ -365,6 +365,179 @@ only saved A61[15:0].  Both Linux and Windows shift the stored Boolean byte
 without masking it, so Mesa must canonicalize every `bN` to 0 or 1 before
 building the A61 mask.
 
+## Generic VS output linkage, bit for bit
+
+The hand-written Xorg shader deliberately leaves type-04 A62's low nine bits
+at `1ff`.  That is a valid rectangle oracle but it is **not** the value used by
+the generic compiler path.  Linux `stmUpdateVS_inv:0x17c5b9..0x17c5d1` masks
+native-object `+0x10` into saved `A62[8:0]`.  The 2015 Windows updater performs
+the same masked replacement at
+`VTGUModeDX32A.dll:0x1015aca0..0x1015acb7`, then emits saved words in the exact
+order A61, A62, A60 at `0x1015aeff..0x1015af27`.
+
+Controlled, hardware-free Linux compiler differentials assign `+0x10`: it is
+the number of non-position output vectors.  The results are independent of
+which class contributes the vectors:
+
+| complete outputs | object `+4` | object `+0x10` |
+|---|---:|---:|
+| oPos only | `00000004` | `0` |
+| oPos + oD0 | `00000044` | `1` |
+| oPos + oD0 + oD1 | `000000c4` | `2` |
+| oPos + oT0.xy | `00000104` | `1` |
+| oPos + oT0.xy + oT1.xy | `00000204` | `2` |
+| oPos + oD0 + oT0.xy | `00000144` | `2` |
+
+The last case returns eight uploads and metadata
+`+0,+4,+8,+c,+10,+14 = 1,00000144,0,0,2,6`.  Its three user records are
+followed by three active finalizer records and two inactive uploaded sentinels.
+Therefore a generic oPos/oD0/oT0 program must use the initialized A62 control
+word with low nine bits replaced by two; copying `...81ff` from the fixed
+rectangle path is not compiler-equivalent.
+
+`stmUpdateFVFOut_H5i:0x1ba550..0x1baa87` converts object `+4` into the
+corresponding type-04 output format.  With point sprites disabled, the exact
+construction is:
+
+```text
+A25.low24 = 00f00000
+            | (oPts ? 00080000 : 0)
+            | (oD0  ? 00040000 : 0)
+            | (oD1  ? 00020000 : 0)
+            | (oFog ? 00010000 : 0)
+            | tc0_format << 12 | tc1_format << 8
+            | tc2_format << 4  | tc3_format
+
+A26.low16 = tc4_format << 12 | tc5_format << 8
+            | tc6_format << 4 | tc7_format
+
+dimension metadata 3,0,1,2 -> format nibble 8,c,e,f
+                               # 1D,2D,3D,4D
+A28[18:17] = A25[18:17]        # every other A28 bit is preserved
+```
+
+The routine takes the active texture-coordinate count from metadata bits
+`11:8`, caps A25's first loop at four, and places the remaining four formats
+in A26.  It also updates internal per-coordinate component counts to 1, 2, 3,
+or 4.  The separate point-sprite branch repacks the linkage and is not part of
+the safe initial subset.
+
+Concrete ordinary values are consequently:
+
+```text
+oPos + oD0                  A25=25f40000 A26=26000000
+oPos + oD0 + oT0.xy         A25=25f4c000 A26=26000000
+oPos + oD0 + oT0.xyzw       A25=25f4f000 A26=26000000
+oPos + oD0 + oD1 + T0/T1.xy A25=25f6cc00 A26=26000000
+```
+
+These are complete A25/A26 words because the updater replaces all of their
+low 24 bits.  A28 is different: only bits `18:17` may be derived from the VS
+metadata.  Preserve all other bits from the current pixel-input/raster image.
+For example, applying the oD0+oT0 rule to the proven `28ffcc00` base gives
+`28fdcc00`; inventing the remaining A28 fields from A25 would overwrite
+pixel-input linkage.
+
+The generic activation transaction is now bounded exactly:
+
+```text
+# subtype 32 constants needed by the compiler finalizer, then any user runs
+FE03043C 0000000C 32030400 CC000000
+<12 finalizer-owned dwords>
+
+# type-04 control, in vendor order
+FE020440 0000043C 00040000 CC000000
+A61_with_bool_mask  A62_with_output_count  A60_with_active_last
+CC000000
+
+# upload count is independent of A60.active-last
+FE03043C (upload_count * 4) 31030000 CC000000
+<upload_count native records>
+```
+
+A60 is `0x60800000 | (active_count - 1)` for the initial absolute,
+straight-line form.  A61 starts from the initialized control image, replaces
+only Boolean bits `15:0`, and derives bits `23`, `22:20`, and `19` from object
+`+0`, `+8`, and `+c` exactly as described above.  A62 preserves its initialized
+upper bits and replaces only `8:0`.  Do not construct any of these words from
+zero.  The vendor packet places A60 before the H3 upload, so retain that order;
+the safety boundary is to emit no vertex/primitive packet until constants,
+control words, and the complete program upload have all retired in the same
+ordered command stream.
+
+## Mesa implementation gates for glmark2 and ioquake3
+
+The present Mesa driver executes the vertex NIR in Gallium `draw` and submits
+post-transform vertices.  That path already covers matrix transforms,
+lighting, clipping, culling, and arbitrary vertex ALU for gears.  A native VS
+is therefore an optimization, not a prerequisite for the next application
+milestone.  ioquake3's nearer functional blocker is two-texture
+base-times-lightmap fragment state; its exact fixed program, x2/x4 overbright
+derivatives, and guarded tests are in
+[xorg-one-texture-oracle.md](xorg-one-texture-oracle.md).  General glmark2
+scenes additionally require fragment expressions beyond REPLACE/MODULATE, so
+enabling a native VS must not be used to advertise a general GLSL fragment
+compiler.
+
+The first hardware VS lowerer can nevertheless be implementation-ready and
+safe if it is an optional fast path with deterministic fallback to `draw`:
+
+1. Accept NIR only after scalar/vector lowering into a single straight-line
+   block.  Initially allow `mov`, `fadd`, `fsub`, `fmul`, `ffma`, `fdot3`,
+   `fdot4`, `fmin`, `fmax`, `frcp`, `frsq`, `ffract`, `flt`, and `fge`.
+   Their native selectors and ADD/MUL literal lowerings are already in the
+   golden corpus.  Lower matrix products to DP4/DP3 sequences.  Keep LIT,
+   EXP/LOG/POW, normalization, and SINCOS behind separate corpus and live
+   gates even though their encodings are statically recovered.
+2. Permit only source NONE/NEG and destination NONE/SAT.  Reject relative
+   constants, address registers, integer/Boolean ALU, flow, predication,
+   coissue, indirect input/output, vertex texture fetch, and every unresolved
+   NIR intrinsic.  Rejection selects the existing software VS; it must not
+   become a draw failure.
+3. Allocate only `r0..r11`, `v0..v15`, `c0..c255`, and full 32-bit float
+   values.  Require one dominating full-XYZW oPos write.  Initially accept at
+   most oD0 and oT0.xy; reject partial position, oD1, fog, point size,
+   two-sided colors, and extra generic varyings until their complete consumer
+   state is enabled.
+4. Count records after all lowering and after appending the position finalizer
+   and two inactive sentinels.  The non-negotiable encoding checks are
+   `1 <= active_count <= 512`, `active_count <= upload_count <= 512`, and
+   `(active_count - 1) == A60[8:0]`; reject rather than mask on overflow.
+   Use a conservative policy cap of 256 active and 256 uploaded records for
+   the first Mesa path.  That cap is not a silicon claim; it stays below both
+   the unchecked 512-wrap case and the vendor Linux object's 295-record
+   overlap boundary.  Raise it only after bounded silicon sweeps.
+5. Derive output metadata from the final NIR writes, build A25/A26 with the
+   exact table above, patch only A28 bits `18:17`, set A62.low9 to the
+   non-position output-vector count, and retain independent active/upload
+   counts.  For the first textured path require exactly oD0 plus oT0.xy, so
+   the expected metadata/A25/A26/A62-low tuple is
+   `00000144 / 25f4c000 / 26000000 / 002`.
+6. Keep the current proven H6 input declaration and post-viewport convention
+   for the existing fixed-shader regression only.  A generic compiled shader
+   writes raw oPos destination 32, after which its three active finalizer
+   records read internal source 128, compute reciprocal W, and write raster
+   position destination 33 using internal sources 224/225.  The Xorg
+   post-transform shader instead writes destination 33 directly.  Feeding
+   Gallium `draw`'s screen-space X/Y/Z and reciprocal-W tuple through the
+   generic finalizer would therefore transform it twice.  A real object-space
+   fast path needs a new bounded clip-space vertex-buffer ABI and declaration
+   builder; the Windows declaration map proves float1/2/3/4 bytes
+   `02/42/82/c2`, but this must not be smuggled into the current immediate
+   post-TNL ioctl.
+
+Use four explicit rollout gates.  Gate 0 compiles and validates only, dumping
+the native records through
+[`../../tools/chrome9_vs_decode.py`](../../tools/chrome9_vs_decode.py).  Gate
+1 uploads constants, A25/A26/A28, A61/A62, and the native store but leaves
+A60 invalid and launches no primitive; it must retire idle.  Gate 2 adds the
+new clip-space input ABI and executes only full oPos/oD0 with W=1 under
+guards, while retaining the 188-word post-transform path as an independent
+regression rather than passing its vertices to the generic finalizer.  Gate 3
+adds oT0.xy and a one-texture REPLACE draw with the exact tuple above.  Only
+after all four pass should a qualifying NIR shader bypass `draw`; every other
+shader continues on the already working software path.
+
 ## Compiler feature limits and safe Mesa exposure
 
 The Windows pixel frontend recognizes `ps_1_0` through `ps_1_4` and `ps_2_0`;

@@ -146,6 +146,13 @@ upload path at `stmUpdateVS_inv` (`0x0017c4c0`) calculates
 `native_count * 4` dwords, emits selector `0x31030000`, and copies
 `native_count * 16` bytes from object offset `0x42c`.
 
+[`../../tools/chrome9_vs_decode.py`](../../tools/chrome9_vs_decode.py) is the
+executable decoder for these records.  It names only the source, destination,
+operation, saturation, and relative-address fields proved below and reports
+every remaining set bit as unassigned.  Use it as the compile-only gate before
+putting a newly lowered record in a packet; an unexplained set bit is a
+validation failure, not an optimization hint.
+
 The upload count is deliberately distinct from the active-program end index.
 `stmUpdateVS_inv+0xbd..+0x2d0` reads `object+0x424` for the H3 payload length,
 but reads `object+0x14 - 1` for type-04 `A60[8:0]`.  Offline VS 2.0 compiler
@@ -191,6 +198,24 @@ are directly observed.  Retain them when reproducing compiler output.  The
 three active finalizer records use the internal constant/register namespace,
 so the fixed subtype-32 internal-constant upload is part of a generic compiled
 VS transaction, not merely optional Xorg state.
+
+The position destinations on the two paths are not interchangeable.  A user
+`MOV oPos,v0` targets native destination 32 (`...00080a0f`).  The three active
+finalizer records then read internal unified source 128, issue an RCP of W,
+and finish with a MAD to native destination 33 (`...0004021f`) using internal
+sources 224 and 225.  By contrast, the silicon-proven Xorg post-transform
+shader's position MAD writes destination 33 directly.  This proves the
+pipeline boundary even though selector 14 in the middle finalizer record is
+not yet named numerically: destination 32 is pre-finalizer clip position and
+destination 33 is the raster-facing position.
+
+Consequently Gallium `draw` output cannot be fed to a generic compiled VS.
+Its immediate tuple already contains viewport-transformed X/Y/Z and reciprocal
+clip W; the generic finalizer would apply its reciprocal-W/viewport sequence a
+second time.  Native NIR execution needs a clip-space vertex ABI plus the
+matching internal constant and type-04 viewport image.  Until that exists,
+generic VS compilation is a hardware-free validation target and the proven
+Xorg shader remains the only execution path for post-transform vertices.
 
 The object is larger than the hardware store because it also contains parsed
 instructions, dependency/fixup tables, and metadata.  The normalized array is
@@ -665,6 +690,15 @@ The three control words are constructed from compiler metadata:
 - object `+0 <= 8` controls `state[0x2242].bit7`;
 - object `+0x08 & 7` controls `state[0x2242].bits6:4`;
 - object `+0x0c != 0` controls `state[0x2242].bit3`.
+
+Hardware-free full-compiler differentials now assign native object `+0x10`
+as the number of non-position output vectors.  oPos only gives zero; adding
+one of oD0 or oT0 gives one; oD0+oD1, oT0+oT1, and oD0+oT0 each give two.
+The Windows uploader at `VTGUModeDX32A.dll:0x1015aca0..0x1015acb7`
+independently performs the same masked A62-low-nine update.  This means the
+hand-built rectangle value `A62.low9=1ff` is not a valid generic-compiler
+default.  The complete A25/A26 dimension packing and implementation gates are
+recorded in [shader-upload-oracles.md](shader-upload-oracles.md).
 
 `stmUpdateIntBoolConst_inv` at `0x17baa0` closes the independent integer and
 boolean upload contracts.  Sixteen vertex integer constants are stored as
