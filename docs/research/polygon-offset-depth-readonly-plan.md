@@ -311,6 +311,24 @@ Do not alter the fixed depth oracle's hard-coded write-enabled word; it is a
 regression reference, not a general UAPI path.  No memmove, body-length, A10,
 A12, A13, A14, A15, or A20 assertion changes are needed for read-only.
 
+The capability is all-or-nothing across these six public entry paths:
+
+| ioctl/path | validator/emitter requirement |
+|---|---|
+| `DRAW_TRIANGLE_D16` | allow bit 11 through `chrome9_validate_depth_flags()`, lower A01 |
+| `DRAW_TRIANGLE_D16_BLEND` | same; blend flags remain independent |
+| `DRAW_TRIANGLE_BATCH` with `TRIANGLE_BATCH_DEPTH` | allow bit 11 only when the depth bit and BO are present; copy it into the retained batch flags |
+| `DRAW_TRIANGLE_D16_RHW_BATCH` | require the depth bit as today; lower perspective A01 |
+| `DRAW_TEXTURED_TRIANGLE_D16` | preserve the explicit nonzero comparison requirement and `SOURCE_OVER`; lower A01 in the common group |
+| `DRAW_TWO_TEXTURED_TRIANGLE_D16` | preserve the explicit nonzero comparison requirement; lower A01 in the common group |
+
+`chrome9_validate_depth_flags()` is the one common unknown-bit gate, but the
+generic batch needs the additional `READ_ONLY && !TRIANGLE_BATCH_DEPTH`
+rejection beside its existing function-without-depth check.  Mesa must OR bit
+11 into both immediate argument structs and the persistent `crender->batch`
+or `batch_rhw` template before triangles accumulate; adding it only to the
+non-batched draw loses the state on the highest-volume path.
+
 Kernel validation must accept bit 11 only on a D16 request.  In the generic
 batch ABI, reject `READ_ONLY` when `TRIANGLE_BATCH_DEPTH` is clear, exactly as
 for a depth-function field without a depth BO.  If the capability is global,
@@ -321,6 +339,16 @@ cache ownership, and post-retirement synchronization even for read-only
 requests.  A later read-only reservation optimization is not worth weakening
 serialization during the first gate, and the full-payload immutability oracle
 below depends on a coherent CPU readback.
+
+Be careful with the current submitter's role-based object aliases.  For an
+untextured draw, `job->depth` is the D16 BO and receives a WRITE fence.  For a
+one-texture D16 draw, `job->depth` is actually the sampled texture and receives
+a READ fence, while `job->texture2` is the D16 BO and receives WRITE.  For a
+two-texture D16 draw, `job->depth`/`job->texture2` are texture 0/1 with READ
+fences and `job->texture3` is D16 with WRITE.  The first read-only
+implementation intentionally leaves all of those fence uses unchanged.  Any
+later optimization must identify the semantic D16 role by draw kind; testing
+the C member name would downgrade the wrong object.
 
 Mesa needs one cached capability boolean.  Its draw-state gate changes from
 requiring `depth_writemask` to requiring either the writemask or that cap, and
