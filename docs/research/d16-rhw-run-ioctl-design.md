@@ -18,10 +18,13 @@ existing batch remains the compatibility and fallback path.
 
 The original design was based on kernel Chrome9 commit `f39a90d`, UAPI
 commit `b623464`, and Mesa Chrome9 commit `91cd42a`.  The patch-ready audit
-below was repeated against kernel Chrome9 `f56ac02` and Mesa Chrome9
-`d7c2570` on 2026-09-21.  In particular it includes the subsequently merged
-read-only-depth and extended-blend-factor state.  The private-number
-assignments come from
+below was repeated against clean committed kernel Chrome9
+`b6b6a1921d4421f02c13a22188b244c890e1b4d1` and Mesa Chrome9
+`7f435bcacfc30b5f746ad4bccc9c80bd827c24b6` (parent Mesa
+`eb673ba3a0f75a20f7e7fe91f1e83da19bfb451d`) on 2026-09-21.  In particular
+it includes the subsequently merged read-only-depth, extended-blend-factor,
+and textured-D16-blend state without depending on uncommitted worktree
+changes.  The private-number assignments come from
 [chrome9-uapi-allocation.md](chrome9-uapi-allocation.md).
 
 ## Exact UAPI
@@ -406,6 +409,86 @@ refilled and reinstalled.  If that STOP publication cannot be proved retired,
 `must_quarantine` is authoritative even though the draw cookie for the prior
 chunk was observed.
 
+### Current read-only-depth and extended-blend interaction
+
+The current committed state does not require another run structure or a
+larger packet:
+
+- `chrome9_depth_control_word(request, true)` returns `0x01ce1548` for
+  `DEPTH_READ_ONLY` and `0x01ce154c` for writable D16.  Bit 2 is the only
+  difference.  The run must call the existing builder once per chunk and
+  assert the selected A01 in every chunk; it must not lower read-only depth
+  only in the first packet.
+- The D16 object remains reservation-locked, device-synchronized, fenced with
+  WRITE usage, CPU-synchronized and guard-checked even when depth writes are
+  disabled.  That is deliberately conservative and makes the lifetime
+  identical to the live writable path.  A later READ-fence optimization must
+  be a separate ABI-neutral proof.
+- `chrome9_validate_blend_state()` accepts the exact merged factor interval
+  ZERO through SRC_ALPHA_SATURATE, ADD for RGB and alpha, the bounded channel
+  mask and alpha test.  `chrome9_lower_blend()` changes A00/A33--A37/A53
+  values, never the four-dword blend length delta.  Therefore the proven
+  34-triangle staging bound is unchanged for every accepted factor.
+- Capability bit 22 does not imply bit 29.  Mesa must continue passing
+  `ctx->blend_extended_factors` to `chrome9_translate_blend()` before choosing
+  the run; an unadvertised factor remains a state rejection and may not become
+  accepted merely because the run cap exists.  Likewise a false
+  `depth_read_only_supported` must reject a false Gallium depth write mask
+  before batching.
+- Current Mesa sets the batch BLEND envelope only when `blend_successor` is
+  true.  BGRA destination, alpha test, channel mask or non-default blend can
+  make that true.  The run copies the resulting canonical structure exactly;
+  it does not infer blend state again in the winsys wrapper.
+
+The packet assertions should include the two A01 values above and, for a
+blend-enabled chunk, the existing destination-state length and lowered A00,
+A33--A37 and A53 words.  This catches state being emitted only for chunk zero
+without creating a second lowering path.
+
+## Reviewable implementation sequence
+
+Keep every commit buildable and keep capability bit 22 hidden until the
+direct oracle has proved the complete kernel path.  The recommended sequence
+is:
+
+1. **No-ABI kernel refactor.** Add `chrome9_next_cookie()`, a predicate which
+   classifies both perspective kinds, and current-segment diagnostics in
+   `chrome9_job`.  Factor the current batch fixed-envelope/vertex validation
+   behind parameters for maximum count and draw kind.  The existing command
+   `0x0c` remains its only caller with maximum 34, and its generated packet
+   corpus and full smoke must remain byte-identical.
+2. **Unadvertised kernel run command.** Add the 128-byte UAPI request,
+   command `0x0f`, the render-node ioctl descriptor, the bounded copied-array
+   handler, the eight-segment loop, and the counters below.  Define cap bit 22
+   but do not OR it into `GET_PARAM` yet.  The ioctl is intentionally callable
+   by the lab oracle by number, while ordinary Mesa continues to use `0x0c`.
+   This tranche must contain the complete lifetime and quarantine handling;
+   do not land a handler which repeats lookup/bind/sync per segment.
+3. **Kernel live gate and promotion.** Exercise invalid counts/pointers, then
+   counts 1, 34, 35, 271 and 272, writable LESS/LEQUAL, read-only D16,
+   extended source-over/masks, ring wrap, and injected failure paths.  Only
+   after these pass, advertise cap bit 22 in the existing engine-ready branch.
+   The one-line capability promotion is separately revertible.
+4. **Mesa plumbing without selection.** Copy the UAPI, add the winsys wrapper,
+   context capability boolean, 816-record RHW storage and counters.  With
+   selection still false, compile and run the old-kernel smoke; command
+   `0x0c` behavior must be unchanged.
+5. **Mesa selection.** Define perspective batching as `run_cap || old_rhw_cap`.
+   Select count 272 and command `0x0f` only for the untextured D16 perspective
+   case when `run_cap` is true; otherwise retain the 34-record `0x0c`
+   fallback.  Preserve the normalized blend, scissor and depth envelope from
+   the first triangle.  A run error rejects the remainder of that callback
+   and is never replayed.
+6. **Performance promotion.** Compare checksums plus the Mesa/kernel counters
+   below on the same Gouraud frame.  First keep batching within each
+   `draw_arrays()`/`draw_elements()` callback.  Crossing vbuf callbacks is a
+   later optimization requiring the broader state-transition flush contract.
+
+The kernel UAPI header is shared ABI and must be committed with its handler;
+the Mesa-local UAPI copy belongs with the Mesa plumbing commit.  Do not
+advertise bit 22 in a commit where a successful `GET_PARAM` can select an
+unimplemented wrapper or handler.
+
 ## Mesa integration checklist
 
 - Copy command `0x0f`, capability bit 22, constants, and the 128-byte structure
@@ -468,22 +551,48 @@ segments per run, 30 calls is the theoretical floor
 `DIV_ROUND_UP(237, 8)`, not a guaranteed result: the actual count is the sum
 of `DIV_ROUND_UP(old_batches_in_callback, 8)` over vbuf callbacks.
 
-Add cheap counters before interpreting a benchmark:
+Add cheap counters before interpreting a benchmark.  Kernel counters are
+per-engine `u64` values changed only while `submit_lock` is held; they do not
+need atomics.  Define an *accepted run* as one which passed public-copy and
+vertex validation, reached the engine-ready check under `submit_lock`, and is
+about to allocate/publish resources.  Earlier GEM lookup, reservation and
+mapping errors are still visible to the Mesa attempt/failure counters but are
+not included in the kernel accepted totals.
 
 | layer | counter | update point |
 |---|---|---|
-| Mesa | `rhw_run_ioctls`, `rhw_run_triangles`, `rhw_run_failures` | once in the run flush wrapper |
-| Mesa | `rhw_run_full`, `rhw_run_callback_partial` | capacity flush versus draw-arrays/elements tail flush |
+| Mesa | `rhw_run_attempts`, `rhw_run_attempted_triangles` | immediately before each `0x0f`, whether it later succeeds or fails |
+| Mesa | `rhw_run_completed`, `rhw_run_failures` | exactly one at wrapper return |
+| Mesa | `rhw_run_full`, `rhw_run_callback_partial` | capacity flush at 272 versus callback-tail flush |
 | Mesa | exact `count[1..272]` histogram | immediately before the ioctl, including failed attempts |
-| kernel | `rhw_run_ioctls`, `rhw_run_requested_triangles` | after full UAPI/copy validation, under `submit_lock` |
-| kernel | `rhw_run_retired_segments`, `rhw_run_retired_triangles` | after each successful three-phase wait |
-| kernel | `rhw_run_failures`, `rhw_run_quarantines` | first run error and quarantine transition respectively |
+| kernel | `rhw_run_accepted`, `rhw_run_requested_triangles` | once after the engine-ready check under `submit_lock` |
+| kernel | `rhw_run_segments_built` | after the existing builder and all its assertions succeed |
+| kernel | `rhw_run_segments_published` | after `chrome9_append_segment()` returns success |
+| kernel | `rhw_run_segments_retired`, `rhw_run_triangles_retired` | after each successful cookie/PAUSE/non-CR wait, before the next chunk |
+| kernel | `rhw_run_completed` | after CPU ownership, guards and successful PTE invalidation |
+| kernel | `rhw_run_failures` | once for an accepted run which returns an error |
+| kernel | `rhw_run_quarantines` | once when the run job is put on the quarantine list |
+| kernel | `rhw_run_publication_uncertain` | append/STOP failure with `must_quarantine`, where append success cannot be counted |
+| kernel | `rhw_run_segment_count[1..8]` | once at acceptance, indexed by `DIV_ROUND_UP(count,34)` |
 
-Keep per-engine kernel totals under `submit_lock`; they require no atomics.
-Print them with the existing engine-stop append/wrap totals for the first
-oracle.  Keep Mesa counters per context and print only behind a new
-disabled-by-default `CHROME9_DEBUG_BATCH` option.  Do not add a telemetry
-ioctl or take VGA/VM/reservation locks to read counters.
+Snapshot `append_count` and `wrap_count` at run acceptance if a per-run debug
+line is desired; their deltas prove command publication and wrap behavior
+without duplicating global counters.  Print one engine-stop line of the form
+
+```text
+chrome9: rhw-run accepted=A requested=T complete=C failed=F quarantine=Q \
+built=B published=P retired=R retired_triangles=RT uncertain=U \
+segments=H1,H2,H3,H4,H5,H6,H7,H8
+```
+
+and keep Mesa counters per context, printed only at context destruction behind
+a new disabled-by-default `CHROME9_DEBUG_BATCH` option.  Do not print per
+triangle, add a telemetry ioctl, or take VGA/VM/reservation locks merely to
+read counters.  On error, `built >= published >= retired` normally holds;
+`publication_uncertain` records the one append-failure case for which that
+simple relation cannot describe hardware exposure.  `retired_triangles`
+records a safely retired prefix even if a later chunk fails, while
+`completed` remains false until all cleanup succeeds.
 
 Acceptance requires: old `0x0c` calls disappear on a run-capable kernel;
 Mesa and kernel requested triangle totals agree; kernel retired segments
@@ -492,6 +601,22 @@ unbind, ownership-round-trip and guard-scan counts become one per run rather
 than one per segment; and rendering, rejection totals and frame checksum stay
 unchanged.  Report both ioctl reduction and frame time—the first verifies the
 patch, while the second includes software VS/clipping and presentation costs.
+
+For the deterministic count oracle `1,34,35,271,272`, the exact clean totals
+are five accepted/completed runs, 613 requested and retired triangles, and
+`1+1+2+8+8 = 20` built/published/retired segments.  The segment histogram is
+`H1=2,H2=1,H8=2`, all other bins zero.  The append-count delta is 20, not
+five: this first optimization deliberately retains the proven packet per
+34-triangle segment while reducing ioctl, GEM lookup, reservation, SF bind,
+DMA ownership and guard-scan transactions to five.
+
+Likewise, the live Gouraud baseline of 237 old ioctls should approach 30 run
+ioctls only if callback boundaries permit full eight-segment aggregation.
+The number of retired hardware segments should remain close to the old 237;
+that is expected, not a batching failure.  The first performance decision is
+based on lower run calls and resource-ownership rounds with identical image
+checksum.  A later native multi-triangle packet is responsible for lowering
+the segment count itself.
 
 ## Legacy and proprietary batching cross-check
 
