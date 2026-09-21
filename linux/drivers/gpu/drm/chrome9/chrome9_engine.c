@@ -119,6 +119,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH,
+	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH,
 };
 
 struct chrome9_draw_request {
@@ -161,6 +162,7 @@ struct chrome9_draw_request {
 	struct drm_chrome9_textured_vertex textured_vertices[3];
 	struct drm_chrome9_two_textured_vertex two_textured_vertices[3];
 	const struct drm_chrome9_vertex_d16 *batch_vertices;
+	const struct drm_chrome9_vertex_d16_rhw *batch_vertices_rhw;
 	u32 triangle_count;
 };
 
@@ -173,6 +175,8 @@ static_assert(sizeof(struct drm_chrome9_draw_triangle_blend) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_blend) == 216);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_blend) == 144);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_batch) == 128);
+static_assert(sizeof(struct drm_chrome9_vertex_d16_rhw) == 20);
+static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_texture_state) == 36);
 static_assert(sizeof(struct drm_chrome9_two_textured_vertex) == 40);
 static_assert(sizeof(struct drm_chrome9_draw_two_textured_triangle) == 240);
@@ -1215,6 +1219,8 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	bool blend = chrome9_draw_has_blend(request);
+	bool perspective = request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH;
 	unsigned int i;
 
 	if (!triangle_count ||
@@ -1256,7 +1262,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 		(request->destination_format ==
 		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
 		 0x00980000) | (request->pitch >> 5);
-	body[19 + delta] = 0x01c0154c;
+	body[19 + delta] = perspective ? 0x01ce154c : 0x01c0154c;
 	body[22 + delta] = 0x10000000 | (depth >> 8);
 	body[23 + delta] = 0x11000001 |
 		((request->depth_pitch >> 5) << 13);
@@ -1274,16 +1280,23 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	body[106 + delta] = chrome9_scissor_y(request);
 	body[107 + delta] = chrome9_scissor_x(request);
 	for (i = 0; i < vertex_count; i++) {
-		const struct drm_chrome9_vertex_d16 *src =
-			request->batch_vertices ? &request->batch_vertices[i] :
-						  &request->depth_vertices[i];
+		const struct drm_chrome9_vertex_d16 *src = NULL;
+		const struct drm_chrome9_vertex_d16_rhw *src_rhw = NULL;
 		u32 *vertex = body + 168 + delta + i * 6;
 
-		vertex[0] = chrome9_q16_to_float(src->x_16_16);
-		vertex[1] = chrome9_q16_to_float(src->y_16_16);
-		vertex[2] = chrome9_q16_to_float(src->z_16_16);
-		vertex[3] = 0x3f800000;
-		vertex[4] = src->color;
+		if (perspective)
+			src_rhw = &request->batch_vertices_rhw[i];
+		else
+			src = request->batch_vertices ? &request->batch_vertices[i] :
+						      &request->depth_vertices[i];
+		vertex[0] = chrome9_q16_to_float(perspective ?
+						 src_rhw->x_16_16 : src->x_16_16);
+		vertex[1] = chrome9_q16_to_float(perspective ?
+						 src_rhw->y_16_16 : src->y_16_16);
+		vertex[2] = chrome9_q16_to_float(perspective ?
+						 src_rhw->z_16_16 : src->z_16_16);
+		vertex[3] = perspective ? src_rhw->rhw_float : 0x3f800000;
+		vertex[4] = perspective ? src_rhw->color : src->color;
 		vertex[5] = 0xffffffff;
 	}
 	body[168 + delta + vertex_count * 6] = 0xcc000000;
@@ -1291,7 +1304,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	p = body + 170 + delta + vertex_count * 6;
 	if ((!blend &&
 	     (p - body != 170 + vertex_count * 6 ||
-	      body[19] != 0x01c0154c ||
+	      body[19] != (perspective ? 0x01ce154c : 0x01c0154c) ||
 	      body[22] != (0x10000000 | (depth >> 8)) ||
 	      body[27] != 0xcc000000 || body[52] != 0x20000000 ||
 	      body[53] != 0x23004f02 ||
@@ -1303,7 +1316,8 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	      body[7] != 0x38000000 ||
 	      body[14] != 0x3f000000 || body[15] != blend_words.a34 ||
 	      body[18] != blend_words.a37 || body[21] != blend_words.a53 ||
-	      body[22] != blend_words.a00 || body[23] != 0x01c0154c ||
+	      body[22] != blend_words.a00 ||
+	      body[23] != (perspective ? 0x01ce154c : 0x01c0154c) ||
 	      body[26] != (0x10000000 | (depth >> 8)) ||
 	      body[31] !=
 		((request->blend.flags &
@@ -3425,11 +3439,13 @@ int chrome9_draw_triangle_d16_blend_ioctl(struct drm_device *drm, void *data,
 	return chrome9_submit_depth_triangle(drm, file, &request);
 }
 
-int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
-				       struct drm_file *file)
+static bool chrome9_rhw_valid(u32 value);
+
+static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
+				       struct drm_file *file, bool perspective)
 {
 	struct drm_chrome9_draw_triangle_batch *args = data;
-	struct drm_chrome9_vertex_d16 *vertices;
+	void *vertices;
 	struct chrome9_draw_request request = {
 		.destination_handle = args->destination_handle,
 		.depth_handle = args->depth_handle,
@@ -3445,6 +3461,9 @@ int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
 	};
 	u64 surface_size;
 	u64 total_size;
+	size_t vertex_size = perspective ?
+		sizeof(struct drm_chrome9_vertex_d16_rhw) :
+		sizeof(struct drm_chrome9_vertex_d16);
 	u32 vertex_count;
 	bool depth = args->flags & DRM_CHROME9_TRIANGLE_BATCH_DEPTH;
 	bool blend = args->flags & DRM_CHROME9_TRIANGLE_BATCH_BLEND;
@@ -3454,6 +3473,7 @@ int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	if (chrome9_validate_depth_flags(args->flags, state_flags) ||
+	    (perspective && !depth) ||
 	    (!depth && (args->flags & DRM_CHROME9_DEPTH_FUNC_MASK)) ||
 	    !args->triangle_count ||
 	    args->triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES ||
@@ -3500,36 +3520,71 @@ int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
 	if (check_mul_overflow(args->triangle_count, 3U, &vertex_count))
 		return -E2BIG;
 	vertices = memdup_array_user(u64_to_user_ptr(args->vertices_ptr),
-				      vertex_count, sizeof(*vertices));
+				      vertex_count, vertex_size);
 	if (IS_ERR(vertices))
 		return PTR_ERR(vertices);
 	for (i = 0; i < vertex_count; i++) {
-		if (!chrome9_coordinate_valid(vertices[i].x_16_16, args->width) ||
-		    !chrome9_coordinate_valid(vertices[i].y_16_16, args->height) ||
-		    (depth && (vertices[i].z_16_16 < 0 ||
-			       vertices[i].z_16_16 > 0x10000))) {
+		const struct drm_chrome9_vertex_d16 *vertex = vertices;
+		const struct drm_chrome9_vertex_d16_rhw *vertex_rhw = vertices;
+		s32 x = perspective ? vertex_rhw[i].x_16_16 : vertex[i].x_16_16;
+		s32 y = perspective ? vertex_rhw[i].y_16_16 : vertex[i].y_16_16;
+		s32 z = perspective ? vertex_rhw[i].z_16_16 : vertex[i].z_16_16;
+
+		if (!chrome9_coordinate_valid(x, args->width) ||
+		    !chrome9_coordinate_valid(y, args->height) ||
+		    (depth && (z < 0 || z > 0x10000)) ||
+		    (perspective && !chrome9_rhw_valid(vertex_rhw[i].rhw_float))) {
 			ret = -EINVAL;
 			goto out_free;
 		}
 	}
 	for (i = 0; i < vertex_count; i += 3) {
+		const struct drm_chrome9_vertex_d16 *vertex = vertices;
+		const struct drm_chrome9_vertex_d16_rhw *vertex_rhw = vertices;
+		s32 x0 = perspective ? vertex_rhw[i].x_16_16 : vertex[i].x_16_16;
+		s32 y0 = perspective ? vertex_rhw[i].y_16_16 : vertex[i].y_16_16;
+		s32 x1 = perspective ? vertex_rhw[i + 1].x_16_16 :
+							 vertex[i + 1].x_16_16;
+		s32 y1 = perspective ? vertex_rhw[i + 1].y_16_16 :
+							 vertex[i + 1].y_16_16;
+		s32 x2 = perspective ? vertex_rhw[i + 2].x_16_16 :
+							 vertex[i + 2].x_16_16;
+		s32 y2 = perspective ? vertex_rhw[i + 2].y_16_16 :
+							 vertex[i + 2].y_16_16;
+
 		if (!chrome9_triangle_nondegenerate(
-			vertices[i].x_16_16, vertices[i].y_16_16,
-			vertices[i + 1].x_16_16, vertices[i + 1].y_16_16,
-			vertices[i + 2].x_16_16, vertices[i + 2].y_16_16)) {
+			x0, y0, x1, y1, x2, y2)) {
 			ret = -EINVAL;
 			goto out_free;
 		}
 	}
-	request.batch_vertices = vertices;
-	request.kind = depth ? CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH :
-			       CHROME9_DRAW_IMMEDIATE_TRIANGLE_BATCH;
+	if (perspective) {
+		request.batch_vertices_rhw = vertices;
+		request.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH;
+	} else {
+		request.batch_vertices = vertices;
+		request.kind = depth ? CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH :
+				       CHROME9_DRAW_IMMEDIATE_TRIANGLE_BATCH;
+	}
 	ret = depth ? chrome9_submit_depth_triangle(drm, file, &request) :
 		      chrome9_submit_draw(drm, file, &request);
 
 out_free:
 	kfree(vertices);
 	return ret;
+}
+
+int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
+				       struct drm_file *file)
+{
+	return chrome9_draw_triangle_batch(drm, data, file, false);
+}
+
+int chrome9_draw_triangle_d16_rhw_batch_ioctl(struct drm_device *drm,
+					       void *data,
+					       struct drm_file *file)
+{
+	return chrome9_draw_triangle_batch(drm, data, file, true);
 }
 
 static bool chrome9_float_finite(u32 value)
