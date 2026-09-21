@@ -19,14 +19,18 @@ ffff0300 0300005c 000f0800 10e40000 0000ffff
 ```
 
 For every row, Windows has ALU=0, TAU=0, phase 0, color-output count 0,
-A90=`90000000`, and A92=`92000000`.  Linux configuration 2 also has no ALU or
-TAU records and phase 0; its empty-program control base is A90=`90018000`,
-A92=`92000000`.  The nonzero Linux A90 payload is not a derivative instruction.
+A90=`90018000`, and A92=`92000000`.  Linux configuration 2 also has no ALU or
+TAU records and phase 0 with the same empty-program controls.  The nonzero
+A90 payload is the production updater's default resource bucket, not a
+derivative instruction.
 
-The PS 2.0 differential JSON SHA-256 is
-`3440b309a74765e3c3eea13e4e7358fdfd881e801bfac39eae5fa66483924b91`;
-the PS 3.0-framed SHA-256 is
-`99ffc11f163d17e9b5f45cad32f6b6608ee7bdf44ea55757f888aa93e47b8f7f`.
+The corrected four-case production differential JSON SHA-256 is
+`ed78dcf8c24aa42e98d20fad7dfdd96ccf0e7bb3854be4ee4d86340cc3431f44`.
+It used Windows production-RegMgr wrapper SHA-256
+`c56637fad7bfaeb994595e3363d439b7f0e35bcf78138bdc0d2bfdc70fdfa4e1`,
+which collects usage and calls `stmSetRegMgr(instance,8,12)` before dispatch.
+The earlier PS 2.0/3.0 JSONs used the identity allocator; their zero-record
+result was accurate, but their Windows zero A90 payload was a harness artifact.
 The compact rows are in
 [`chrome9-dsx-dsy-negative-boundary.tsv`](chrome9-dsx-dsy-negative-boundary.tsv).
 
