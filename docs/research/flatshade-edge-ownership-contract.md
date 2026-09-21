@@ -72,6 +72,16 @@ but it does not turn every untouched primitive into three identical color
 records.  `need_pipeline=true` is therefore not by itself a flat-shading
 implementation.
 
+There is also a current capability bug.  `u_init_pipe_screen_caps()` defaults
+`pipe_caps::flatshade` to true, and `chrome9_restrict_generic_caps()` does not
+override it.  The state tracker therefore keeps fixed-function flat shading
+as rasterizer state instead of lowering it, even though the Chrome9 packet
+path neither selects FlatA/FlatC nor duplicates the provoking color.  The
+immediate fail-closed correction is `caps->flatshade = false`; this can make
+the present bounded fragment classifier reject the resulting explicit-flat
+NIR, which is preferable to silently rendering a gradient.  Re-enable the
+cap only after the D1/D2 lowering below passes.
+
 The smallest implementation does not require a new kernel ABI.  For the
 currently admitted fixed-function fragment classes, Mesa can select the
 provoking vertex after topology decomposition and copy its packed D1 primary
@@ -183,10 +193,12 @@ that physical rule before accepting the other value.
 
 ## Capability and validator boundary
 
-There is no useful screen capability to advertise for flat shading or the
-basic triangle fill convention: both are core correctness requirements.
-Do not allocate a private capability merely for software D1/D2 duplication.
-Keep these fail-closed checks instead:
+Gallium does have `pipe_caps::flatshade`, and Chrome9 currently inherits the
+unsafe true default.  Set it false while draws are rejected/lowered, then set
+it true only once the provoking-color oracle passes.  The basic triangle fill
+convention has no comparable opt-in cap.  Do not allocate a private kernel
+capability merely for software D1/D2 duplication.  Keep these fail-closed
+checks as well:
 
 * reject flat fragment inputs outside the explicitly packed D1/D2 map;
 * reject a flat topology for which the original provoking index is lost;
