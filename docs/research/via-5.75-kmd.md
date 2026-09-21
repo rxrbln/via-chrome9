@@ -895,7 +895,7 @@ fence memory.
 | new FE3x engine class | `FE30` 2D, `FE33` 3D, `FE35` HQV, `FE37` DMA, `FE3A` VD | S | use the class matching the submitted workload; vendor's VX900 path always uses 2D despite arbitrary branch payload |
 | new FE3x wait | `d1[21]` 3D, `[20]` 2D, `[19:18]` HQV, `[17]` VD, `[16:13]` DMA; `003fe000` means all listed engines | S | Linux vendor path sets zero; Windows uses `00200000` for 3D and composite `00300000`/`0031e000` for 2D/DMA dependencies |
 | new FE3x mode | `d0[5]` queue skip, `[4]` interrupt wait, `[2]` system write, `[1]` interrupt generate | S | stage each side effect independently before combining |
-| IRQ global | MMIO `0200[31]` global interrupt enable | D/S | read-modify-write; KMD's write of only `80000000` destroys display/video enables |
+| IRQ global | MMIO `0200[31]` global interrupt enable | D/S | preserve only documented enable fields with `(old & f7ff0800) | 80000000`; a literal RMW echoes mixed RW1C status, while the KMD's `80000000` destroys display/video enables |
 | IRQ status/ack | MMIO `0204[5]` CR interrupt, RW1C | D/S | ack only the sampled RW1C bit; do not OR unclassified status bits |
 | fence readback | MMIO `0494` for H6S1/H6S2/H5S2VP1 | S | fallback/debug observation, not enough to prove memory visibility |
 | interrupt wait | T11 A07 bit21 or new FE3x bit4 | D/S | handler and ack must be live first; lost IRQ otherwise leaves CR paused |
@@ -905,8 +905,12 @@ The KMD's IRQ acknowledgement writes `interrupt_status2 | 0x20`
 RO, so that happens to be benign on VX900, but the robust pattern is still to
 write only `0x20` after confirming it was asserted (Part II, internal p.11).
 The global-enable bug is more serious: branch setup writes `0200=80000000`
-instead of preserving bits 30:0 (`via_chrome9_dma.c:198-217`,
-`via_chrome9_mm.c:515-530`).
+instead of preserving other enable fields (`via_chrome9_dma.c:198-217`,
+`via_chrome9_mm.c:515-530`).  A naive read/OR/write is also wrong because
+`0200` interleaves enables with RW1C status.  VX900's documented enable mask is
+`f7ff0800` and its RW1C mask is `0800f3fd`; write
+`(old & f7ff0800) | 80000000`, not `old | 80000000`.  See
+`chrome9-fe3x-completion.md` for the serialized KMS/render ownership rule.
 
 Windows confirms the IRQ ordering and the VX900-specific acknowledgement.
 Its ISR at `0x00077a60` samples `0200`, `0204`, `1280`, and `c500`; on
