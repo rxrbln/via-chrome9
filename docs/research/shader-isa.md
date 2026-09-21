@@ -628,53 +628,56 @@ mechanism but does not promote two samplers in Mesa before texture-state and
 linkage tests pass on silicon.
 
 The Linux configuration-2 finalizer gives the execution-form counterpart.
-For the independent two-sample MUL it preserves the control tuple but changes
-the first/second TAUs to `a01001b0 311001b1` and sets the consuming ALU source
-word to `00f20005`:
+For the independent two-sample MUL, the production callback order emits:
 
 ```text
-TAU a01001b0 311001b1
-ALU 0140b6d0 3003f000 00f20005 00000820
-A90..A95 = 90000000 91000001 92020001 93000002 94000000 95000000
+TAU 301001b0 311111b1
+ALU 0140b6d0 30201053 00f20005 00000820
+A90..A95 = 90018000 91000003 92020001 93000002 94000000 95000000
 ```
 
 For the dependent-coordinate form it emits the complete alternating schedule:
 
 ```text
-TAU 201001b0 b11001b1
-ALU 01c00530 301c0053 00f00005 000d0420
-    0140b6d0 3003f000 00f20005 00000820
-A90..A95 = 90000000 91000001 92020002 93000003 94000000 95000001
+TAU 301001b0 311111b1
+ALU 01c00530 301c0053 00f00005 000d0460
+    0140b6d0 30201053 00f20005 00000820
+A90..A95 = 90018000 91000003 92020002 93000003 94000000 95000001
 ```
 
-Thus TAU bits 31 and 28 are per-record finalizer fields, not a single fixed
-class nibble.  Their pattern depends on the selected phase order; do not
-derive them merely by setting bit 28 on every TAU.  The final ALU consuming a
-TAU has source dependency bit 17, while the intervening ALU in the dependent
-form does not.  These exact words came from the normal Linux compiler followed
-by `stmPPS_PostTranslationSetting_invi(..., 2)` and are the first suitable
+Production marks both live two-sample results with TAU bit 28.  An unused
+single sample instead finalizes to `b01001b0`, so the high bits are lifetime
+and schedule fields rather than a fixed opcode nibble or blanket bit-28 OR.
+The final ALU's last use of a texture result has source-A bit 17; the
+intervening ALU in the dependent form does not.  These exact words came from
+the normal Linux compiler followed by
+`stmPPS_PostTranslationSetting_invi(..., 2)` and are the first suitable
 generic two-texture upload candidates.  They still require stage-1 texture
 state and varying linkage silicon gates.
 
+The formerly documented `a01001b0 311001b1` / `3003f000` independent tuple
+and `201001b0 b11001b1` dependent tuple reproduce only with
+`CHROME9_NONPRODUCTION_CALLBACK_ORDER=1`.  They remain valid as explicitly
+fixed/live Xorg silicon evidence, not as generic production-compiler goldens.
+
 The same finalized Linux path bounds later fixed-function combine operations.
 After two independent TEXLDs, direct output ADD and MAD each remain one ALU
-record, use TAUs `a01001b0 311001b1`, ALU/TAU count `92020001`, T2A
-`93000002`, and no A2T bits:
+record, use TAUs `301001b0 311111b1`, controls
+`90018000 91000003 92020001 93000002`, and no later transition words:
 
 ```text
-add oC0,r0,r1:     003f0000 30140924 00f20005 00000820
-mad oC0,r0,r1,v0: 00400530 3003f000 00f20005 00000820
+add oC0,r0,r1:     02010530 30140924 00f20005 00000820
+mad oC0,r0,r1,v0: 00400530 30201053 00f20005 00000820
 ```
 
 LRP is not one native ALU in the Linux backend.  It lowers to two records and
-causes the second TAU to carry the dependent form's high bits, while retaining
-the two-TAU-then-two-ALU control order:
+retains the two-TAU-then-two-ALU control order:
 
 ```text
-TAU a01001b0 b11001b1
-ALU 803f0000 30140924 00f04005 00000020
-    00400530 30000053 00f20005 00000820
-A92..A95 = 92020002 93000002 94000000 95000000
+TAU 301001b0 311111b1
+ALU 82010530 30140924 00f04005 000000a0
+    00400530 30202053 00f20005 00000820
+A90..A95 = 90018000 91000003 92020002 93000002 94000000 95000000
 ```
 
 These are compiler-semantic and scheduler goldens for eventual `GL_ADD`,

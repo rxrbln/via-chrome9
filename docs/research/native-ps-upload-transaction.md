@@ -113,9 +113,9 @@ zero to `90018000`, sets A91 to `91000001`, and retains T2A bit zero.  Two
 independent samples and a MUL instead finalize as:
 
 ```text
-A90..A95 90000000 91000001 92020001 93000002 94000000 95000000
-TAU       a01001b0 311001b1
-ALU       0140b6d0 3003f000 00f20005 00000820
+A90..A95 90018000 91000003 92020001 93000002 94000000 95000000
+TAU       301001b0 311111b1
+ALU       0140b6d0 30201053 00f20005 00000820
 ```
 
 Therefore neither transition words nor TAU dependency bits can be rebuilt by
@@ -132,8 +132,13 @@ A90=90058000 A91=91000000 A92=920000NN, all maps zero
 A90=90018000 A91=91000001 A92=920100NN A93=93000001
 
 # two independent TAUs followed by one ALU
-A90=90000000 A91=91000001 A92=92020001 A93=93000002
+A90=90018000 A91=91000003 A92=92020001 A93=93000002
 ```
+
+The former `90000000/91000001`, `a01001b0 311001b1`, and `3003f000`
+combination reproduces only with the probe's swapped non-production callback
+order.  It remains valid where cited as a fixed, live Xorg object; it is not a
+generic production-compiler transaction.
 
 These are safe only for the exact closed records which produced them.  For
 example, another ALU-only fog object has a different A90 low resource bit.

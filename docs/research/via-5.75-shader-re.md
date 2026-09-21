@@ -1156,15 +1156,19 @@ before this phase.
 
 The same target finalizer is now measured for both two-TAU schedule shapes.
 Two independent samples followed by one MUL produce TAUs
-`a01001b0 311001b1`, ALU
-`0140b6d0 3003f000 00f20005 00000820`, and controls
-`90000000 91000001 92020001 93000002`.  Making the second coordinate depend
-on the first result produces TAUs `201001b0 b11001b1`, ALUs
-`01c00530 301c0053 00f00005 000d0420` and
-`0140b6d0 3003f000 00f20005 00000820`, plus controls
-`90000000 91000001 92020002 93000003 94000000 95000001`.
-Consequently TAU bits 31/28 are schedule-dependent finalizer outputs, not
-fixed opcode bits, and finalizing every TAU by a constant OR is wrong.
+`301001b0 311111b1`, ALU
+`0140b6d0 30201053 00f20005 00000820`, and controls
+`90018000 91000003 92020001 93000002`.  Making the second coordinate depend
+on the first result produces the same TAU pair, ALUs
+`01c00530 301c0053 00f00005 000d0460` and
+`0140b6d0 30201053 00f20005 00000820`, plus controls
+`90018000 91000003 92020002 93000003 94000000 95000001`.
+Production therefore marks both live results with TAU bit 28, but an unused
+single sample finalizes to `b01001b0`, so finalizing every TAU by a constant OR
+is still wrong.  The older `a01001b0 311001b1`/`201001b0 b11001b1` and
+`3003f000` tuples reproduce only with
+`CHROME9_NONPRODUCTION_CALLBACK_ORDER=1`; fixed Xorg instances using them
+remain silicon evidence, but they are not generic production compiler output.
 
 Adjacent compiler metadata is also pinned down:
 

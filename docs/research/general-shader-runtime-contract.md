@@ -116,12 +116,12 @@ A90=90058000 A91=91000000 A92=920000NN
 A90=90018000 A91=91000001 A92=920100NN A93=93000001
 
 # two independent TAUs, then one ALU
-A90=90000000 A91=91000001 A92=92020001 A93=93000002
-TAU a01001b0 311001b1
+A90=90018000 A91=91000003 A92=92020001 A93=93000002
+TAU 301001b0 311111b1
 
-# TAU, ALU, dependent TAU, ALU
-A90=90000000 A91=91000001 A92=92020002 A93=93000003 A95=95000001
-TAU 201001b0 b11001b1
+# source-dependent second sample, two TAUs then two ALUs
+A90=90018000 A91=91000003 A92=92020002 A93=93000003 A95=95000001
+TAU 301001b0 311111b1
 ```
 
 Unused A94..A9a words are their subaddress with zero payload. A9b is never
@@ -191,7 +191,9 @@ The one-dword TAU layout is field-exact:
 
 Raw semantic words for `texld/texldb/texldp r0,t0,s0` are
 `201001b0/203001b0/207001b0`. The ordinary finalized one-sample word is
-`301001b0`. Independent two-sample words are `a01001b0 311001b1`.
+`301001b0`.  The production independent two-sample words are
+`301001b0 311111b1`.  The older `a01001b0 311001b1` pair is retained only for
+fixed Xorg objects and the explicitly non-production swapped-callback corpus.
 
 TEXLD is the only first-stage operation. TEXLDB and TEXLDP have exact opcode
 encodings but require LOD/projective live tests. TEXKILL changes scheduling
@@ -439,4 +441,3 @@ or higher-level fallback rather than silently dropping the draw.
 | PS branches | no supported encoding; forbidden |
 | VS branch fields | statically decoded, silicon behavior unmeasured; forbidden |
 | arbitrary interpolation qualifiers and generic varyings | unresolved; forbidden |
-

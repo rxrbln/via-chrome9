@@ -138,21 +138,25 @@ and the consuming ALU dependency field according to the phase schedule:
 
 ```text
 # texld r0,t0,s0; texld r1,t1,s1; mul oC0,r0,r1
-A90..A95  90000000 91000001 92020001 93000002 94000000 95000000
-TAU       a01001b0 311001b1
-ALU       0140b6d0 3003f000 00f20005 00000820
+A90..A95  90018000 91000003 92020001 93000002 94000000 95000000
+TAU       301001b0 311111b1
+ALU       0140b6d0 30201053 00f20005 00000820
 
 # texld r0,t0,s0; texld r1,r0,s1; mul oC0,r0,r1
-A90..A95  90000000 91000001 92020002 93000003 94000000 95000001
-TAU       201001b0 b11001b1
-ALU       01c00530 301c0053 00f00005 000d0420
-          0140b6d0 3003f000 00f20005 00000820
+A90..A95  90018000 91000003 92020002 93000003 94000000 95000001
+TAU       301001b0 311111b1
+ALU       01c00530 301c0053 00f00005 000d0460
+          0140b6d0 30201053 00f20005 00000820
 ```
 
-Do not implement finalization as `TAU |= 0x10000000`: the first independent
-TAU instead gains bit 31, and the dependent schedule gives the second TAU both
-bits 31 and 28.  The compiler/finalizer transaction or an exactly equivalent
-dependency analysis must own these words as a unit with A90..A9a.
+Production configuration two marks both used two-sample results with TAU bit
+28.  An unused single result instead finalizes to `b01001b0`, so this is still
+not a blanket `TAU |= 0x10000000` rule.  The older
+`a01001b0 311001b1`/`201001b0 b11001b1` tuples reproduce with
+`CHROME9_NONPRODUCTION_CALLBACK_ORDER=1`; fixed Xorg objects using those bytes
+remain silicon evidence, but they are not generic production compiler output.
+The production compiler/finalizer transaction or an exactly equivalent
+lifetime and schedule analysis must own these words as a unit with A90..A9a.
 
 ## Exact VS behavior and varying linkage
 

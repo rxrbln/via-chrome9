@@ -56,7 +56,7 @@ forms are proven only at the stated count and shape:
 96000000 97000000 98000000 99000000 9a000000 9b000000
 
 # two independent TAUs, then one direct-output ALU
-90000000 91000001 92020001 93000002 94000000 95000000
+90018000 91000003 92020001 93000002 94000000 95000000
 96000000 97000000 98000000 99000000 9a000000 9b000000
 ```
 
@@ -158,8 +158,8 @@ d2.bit17. Two independent
 samples followed by a consuming ALU use:
 
 ```text
-TAU a01001b0 311001b1
-ALU ... ... 00f20005 ...
+TAU 301001b0 311111b1
+ALU 0140b6d0 30201053 00f20005 00000820
 ```
 
 High TAU bits depend on phase order. Never implement `tau |= 10000000`.
@@ -313,12 +313,11 @@ replication feeding all four output lanes.  Scalar RCP/RSQ/EXP/LOG likewise
 must not be accepted merely because the native destination mask is XYZW; the
 native result broadcast remains a silicon gate.
 
-No generic multi-record NIR program is patch-ready yet.  The current Mesa
-builder's `source.dependency` boolean happens to reproduce d2.bit17 for a
-single A-slot temp consumer, but its name and semantics are wrong for reuse,
-B/C consumers, and same-record duplicate sources.  Rename it to a final-use
-property or replace it with a post-allocation pass before enabling any
-multi-record runtime path.
+No generic multi-record NIR program is patch-ready yet.  The Mesa builder now
+derives `source.last_use` after semantic validation for its current A/C-slot
+subset.  Keep a post-allocation finalizer boundary before admitting B-slot or
+general multi-record runtime paths; same-record duplicate sources additionally
+require the proved A-over-C-over-B release precedence.
 
 ## Cmd19 one-record operand boundary
 
@@ -372,9 +371,15 @@ tex0->oC0     ALU 01c00530 301c0053 00f20005 000d0820
                TAU 301001b0
 tex0*v0       ALU 0140b6d0 30040053 00f20005 00000820
                TAU 301001b0
-tex0*tex1     ALU 0140b6d0 3003f000 00f20005 00000820
-               TAU a01001b0 311001b1
+tex0*tex1     ALU 0140b6d0 30201053 00f20005 00000820
+               TAU 301001b0 311111b1
+               controls 90018000 91000003 92020001 93000002
 ```
+
+The older `a01001b0 311001b1` / `3003f000` tuple is a reproducible
+`CHROME9_NONPRODUCTION_CALLBACK_ORDER=1` artifact.  Fixed Xorg objects using
+those bytes remain separate silicon evidence, but they are not output from
+the production register manager and must not be used as its golden.
 
 A fresh Wine three-factor replay and exact hashes are recorded in
 [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md).
