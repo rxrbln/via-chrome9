@@ -23,6 +23,10 @@ targets.
   1,355-write VX900 replay, separates late retirement and GTI retry from a real
   wedge, and defines exact display, fence, epoch, translation, and
   quarantine-release ordering for reboot-free recovery.
+- [chrome9-fe3x-completion.md](chrome9-fe3x-completion.md) specifies the exact
+  FE33 3D completion packet, coherent record lifetime, staged polling/IRQ
+  oracle, mixed-register-safe `0200/0204` handling, and the proof which
+  distinguishes a lost notification from an engine timeout.
 - [via-5.75-dri-state.md](via-5.75-dri-state.md) records exact H5/H6 state,
   target, 2D/3D synchronization, and draw packets recovered from the symbol-rich
   proprietary Linux DRI and Xorg binaries.
