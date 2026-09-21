@@ -121,6 +121,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH,
+	CHROME9_DRAW_COPY_RECT,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16_BLEND,
@@ -180,6 +181,12 @@ struct chrome9_draw_request {
 	u32 ps_program[4];
 	u32 ps_constant_c0[4];
 	u32 triangle_count;
+	u32 destination_x;
+	u32 destination_y;
+	u32 source_x;
+	u32 source_y;
+	u32 copy_width;
+	u32 copy_height;
 };
 
 static_assert(sizeof(struct drm_chrome9_scissor_state) == 12);
@@ -192,6 +199,7 @@ static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_blend) == 216);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_blend) == 144);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_batch) == 160);
+static_assert(sizeof(struct drm_chrome9_copy_rect) == 96);
 static_assert(sizeof(struct drm_chrome9_vertex_d16_rhw) == 20);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128);
@@ -819,6 +827,73 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
+}
+
+static int chrome9_build_copy_rect(struct chrome9_engine *engine,
+		const struct chrome9_draw_request *request,
+		struct chrome9_job *job, u32 target, u32 source, u32 *pause)
+{
+	static const u32 pre_sync[] = { 0x6c, 0x00c00000 };
+	static const u32 post_sync[] = { 0x6c, 0x00400000 };
+	static const u32 clear_state[] = {
+		0x30, 0x00000000,
+		0x34, 0x00000000,
+		0x38, 0x00000000,
+		0x48, 0x00000000,
+	};
+	u32 copy[] = {
+		0x04, 0x00000300,
+		0x1c, source >> 3,
+		0x14, target >> 3,
+		0x08, 0x40001000 |
+		      ((request->pitch >> 3) << 16) |
+		      (request->texture_pitch >> 3),
+		0x18, request->source_y << 16 | request->source_x,
+		0x10, request->destination_y << 16 | request->destination_x,
+		0x0c, (request->copy_height - 1) << 16 |
+		      (request->copy_width - 1),
+		0x00, 0xcc000001,
+	};
+	u32 alpha_mask[] = {
+		0x48, 0x70000000,
+	};
+	u32 alpha_fill[] = {
+		0x04, 0x00000300,
+		0x14, target >> 3,
+		0x08, 0x40000000 | ((request->pitch >> 3) << 16),
+		0x10, request->destination_y << 16 | request->destination_x,
+		0x0c, (request->copy_height - 1) << 16 |
+		      (request->copy_width - 1),
+		0x58, 0xff000000,
+		0x00, 0xf0002001,
+	};
+	static const u32 reset_mask[] = { 0x48, 0x00000000 };
+	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
+	u32 *base = engine->staging_cpu;
+	u32 *p;
+
+	if (!request->copy_width || !request->copy_height ||
+	    !IS_ALIGNED(target, 16) || !IS_ALIGNED(source, 16))
+		return -EINVAL;
+	memset(base, 0xcc, PAGE_SIZE);
+	p = base;
+	chrome9_emit_header0(&p, pre_sync, 1);
+	chrome9_emit_header0(&p, clear_state, 4);
+	chrome9_emit_header0(&p, copy, 8);
+	chrome9_emit_header0(&p, post_sync, 1);
+	if (request->flags & DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE) {
+		/*
+		 * The Windows H6 builders use 48[31:28] as byte-inhibit bits.
+		 * Keep the copy and masked fill in separate, ordered H0 packets so
+		 * no address or geometry state is changed while the copy is live.
+		 */
+		chrome9_emit_header0(&p, alpha_mask, 1);
+		chrome9_emit_header0(&p, alpha_fill, 7);
+		chrome9_emit_header0(&p, post_sync, 1);
+		chrome9_emit_header0(&p, reset_mask, 1);
+	}
+	chrome9_emit_header0(&p, cookie, 1);
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
@@ -2590,6 +2665,43 @@ static bool chrome9_verify_map_guards(struct iosys_map *map, u64 size)
 	return true;
 }
 
+static void chrome9_copy_rect_cache_flush(struct chrome9_job *job,
+		const struct chrome9_draw_request *request)
+{
+	bool unguarded = request->flags &
+			 DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED;
+	u8 *destination = (u8 *)job->map.vaddr + (unguarded ? 0 : PAGE_SIZE);
+	u8 *source = (u8 *)job->depth_map.vaddr + PAGE_SIZE;
+	size_t row_bytes = request->copy_width * sizeof(u32);
+	unsigned int y;
+
+	/*
+	 * Only the validated source and destination rectangles participate in
+	 * this closed 2D operation.  Flush their cache-line-covering row ranges,
+	 * plus the two kernel-owned guard pages, under one ownership barrier.
+	 */
+	mb();
+#ifdef CONFIG_X86
+	if (!unguarded) {
+		clflush_cache_range(job->map.vaddr, PAGE_SIZE);
+		clflush_cache_range((u8 *)job->map.vaddr + request->object_size -
+				    PAGE_SIZE, PAGE_SIZE);
+	}
+	clflush_cache_range(job->depth_map.vaddr, PAGE_SIZE);
+	clflush_cache_range((u8 *)job->depth_map.vaddr +
+			    request->depth_object_size - PAGE_SIZE, PAGE_SIZE);
+	for (y = 0; y < request->copy_height; y++) {
+		clflush_cache_range(destination +
+			(request->destination_y + y) * request->pitch +
+			request->destination_x * sizeof(u32), row_bytes);
+		clflush_cache_range(source +
+			(request->source_y + y) * request->texture_pitch +
+			request->source_x * sizeof(u32), row_bytes);
+	}
+#endif
+	mb();
+}
+
 static void chrome9_prepare_depth_oracle(struct chrome9_job *job)
 {
 	u32 *words = job->map.vaddr;
@@ -3141,7 +3253,8 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	bool texture_objects = three_objects ||
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE ||
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
-		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH;
+		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH ||
+		request->kind == CHROME9_DRAW_COPY_RECT;
 	int dev_idx;
 	int ret;
 
@@ -3177,7 +3290,9 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	    (three_objects && drm_gem_is_imported(texture2_obj)) ||
 	    (four_objects && drm_gem_is_imported(texture3_obj)) ||
 	    obj->size != request->object_size ||
-	    (texture_objects ?
+	    (request->kind == CHROME9_DRAW_COPY_RECT ?
+	     depth_obj->size != request->depth_object_size :
+	     texture_objects ?
 	     depth_obj->size < request->depth_object_size :
 	     depth_obj->size != request->depth_object_size) ||
 	    (three_objects &&
@@ -3372,7 +3487,9 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	}
 
 	/* Structured BO contents are already CPU-owned on ioctl entry. */
-	chrome9_prepare_map_guards(&job->map, request->object_size);
+	if (request->kind != CHROME9_DRAW_COPY_RECT ||
+	    !(request->flags & DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED))
+		chrome9_prepare_map_guards(&job->map, request->object_size);
 	chrome9_prepare_map_guards(&job->depth_map,
 				   request->depth_object_size);
 	/*
@@ -3391,8 +3508,12 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	if (four_objects)
 		chrome9_prepare_map_guards(&job->texture3_map,
 					   request->texture3_object_size);
-	chrome9_cache_flush(job->map.vaddr, request->object_size);
-	chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
+	if (request->kind == CHROME9_DRAW_COPY_RECT)
+		chrome9_copy_rect_cache_flush(job, request);
+	else {
+		chrome9_cache_flush(job->map.vaddr, request->object_size);
+		chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
+	}
 	if (three_objects)
 		chrome9_cache_flush(job->texture2_map.vaddr,
 				    texture2_obj->size);
@@ -3425,13 +3546,19 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		dma_resv_add_fence(texture3_obj->resv, &job->fence.base,
 				   DMA_RESV_USAGE_WRITE);
 	job->fence_attached = true;
-	target += PAGE_SIZE;
+	if (request->kind != CHROME9_DRAW_COPY_RECT ||
+	    !(request->flags & DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED))
+		target += PAGE_SIZE;
 	depth_target += PAGE_SIZE;
 	if (three_objects)
 		texture2_target += PAGE_SIZE;
 	if (four_objects)
 		texture3_target += PAGE_SIZE;
-	if (request->kind == CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
+	if (request->kind == CHROME9_DRAW_COPY_RECT)
+		ret = chrome9_build_copy_rect(engine, request, job, target,
+					      depth_target, &pause);
+	else if (request->kind ==
+		 CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
 	    two_textured_depth)
 		ret = chrome9_build_two_textured_triangle(engine, request, job,
 						   target, depth_target,
@@ -3491,8 +3618,12 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	if (four_objects)
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->texture3_sgt,
 					 DMA_BIDIRECTIONAL);
-	chrome9_cache_flush(job->map.vaddr, request->object_size);
-	chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
+	if (request->kind == CHROME9_DRAW_COPY_RECT)
+		chrome9_copy_rect_cache_flush(job, request);
+	else {
+		chrome9_cache_flush(job->map.vaddr, request->object_size);
+		chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
+	}
 	if (three_objects)
 		chrome9_cache_flush(job->texture2_map.vaddr,
 				    texture2_obj->size);
@@ -3501,7 +3632,9 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 				    texture3_obj->size);
 	dma_rmb();
 	device_owned = false;
-	if (!chrome9_verify_map_guards(&job->map, request->object_size) ||
+	if ((!(request->kind == CHROME9_DRAW_COPY_RECT &&
+	       (request->flags & DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED)) &&
+	     !chrome9_verify_map_guards(&job->map, request->object_size)) ||
 	    !chrome9_verify_map_guards(&job->depth_map,
 				       request->depth_object_size) ||
 	    (texture_objects &&
@@ -4909,6 +5042,81 @@ int chrome9_draw_textured_triangle_batch_ioctl(struct drm_device *drm,
 out_free:
 	kfree(vertices);
 	return ret;
+}
+
+int chrome9_copy_rect_ioctl(struct drm_device *drm, void *data,
+			    struct drm_file *file)
+{
+	struct drm_chrome9_copy_rect *args = data;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_COPY_RECT,
+		.flags = args->flags,
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->source_handle,
+		.texture_handle = args->source_handle,
+		.width = args->destination_width,
+		.height = args->destination_height,
+		.pitch = args->destination_pitch,
+		.texture_width = args->source_width,
+		.texture_height = args->source_height,
+		.texture_pitch = args->source_pitch,
+		.texture_format = args->format,
+		.destination_format = args->format,
+		.destination_x = args->destination_x,
+		.destination_y = args->destination_y,
+		.source_x = args->source_x,
+		.source_y = args->source_y,
+		.copy_width = args->width,
+		.copy_height = args->height,
+	};
+	u64 surface_size;
+	u64 total_size;
+
+	if (args->flags & ~(DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE |
+			    DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED) ||
+	    ((args->flags & DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE) &&
+	     args->format != DRM_CHROME9_TEXTURE_FORMAT_BGRX8888) ||
+	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
+	    !args->destination_handle || !args->source_handle ||
+	    args->destination_handle == args->source_handle ||
+	    !args->width || !args->height ||
+	    !args->destination_width || args->destination_width > 2048 ||
+	    !args->destination_height || args->destination_height > 2048 ||
+	    !args->source_width || args->source_width > 2048 ||
+	    !args->source_height || args->source_height > 2048 ||
+	    args->destination_pitch !=
+		ALIGN(args->destination_width * sizeof(u32), 32) ||
+	    args->source_pitch != ALIGN(args->source_width * sizeof(u32), 32) ||
+	    !IS_ALIGNED(args->destination_pitch, 16) ||
+	    !IS_ALIGNED(args->source_pitch, 16) ||
+	    args->destination_x > args->destination_width ||
+	    args->width > args->destination_width - args->destination_x ||
+	    args->destination_y > args->destination_height ||
+	    args->height > args->destination_height - args->destination_y ||
+	    args->source_x > args->source_width ||
+	    args->width > args->source_width - args->source_x ||
+	    args->source_y > args->source_height ||
+	    args->height > args->source_height - args->source_y ||
+	    args->format > DRM_CHROME9_TEXTURE_FORMAT_BGRA8888)
+		return -EINVAL;
+	if (check_mul_overflow((u64)args->destination_pitch,
+			       (u64)args->destination_height, &surface_size))
+		return -E2BIG;
+	if (args->flags & DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED)
+		request.object_size = ALIGN(surface_size, PAGE_SIZE);
+	else if (check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+				    2ULL * PAGE_SIZE, &request.object_size))
+		return -E2BIG;
+	if (check_mul_overflow((u64)args->source_pitch,
+			       (u64)args->source_height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.texture_object_size) ||
+	    check_add_overflow(request.object_size, request.texture_object_size,
+			       &total_size) ||
+	    total_size > SZ_64M - CHROME9_RING_SIZE)
+		return -E2BIG;
+	request.depth_object_size = request.texture_object_size;
+	return chrome9_submit_depth_triangle(drm, file, &request);
 }
 
 int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,

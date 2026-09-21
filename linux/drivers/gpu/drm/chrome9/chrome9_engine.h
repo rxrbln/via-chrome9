@@ -46,6 +46,8 @@ int chrome9_draw_textured_triangle_ioctl(struct drm_device *drm, void *data,
 int chrome9_draw_textured_triangle_batch_ioctl(struct drm_device *drm,
 						void *data,
 						struct drm_file *file);
+int chrome9_copy_rect_ioctl(struct drm_device *drm, void *data,
+			    struct drm_file *file);
 int chrome9_draw_textured_triangle_d16_ioctl(struct drm_device *drm, void *data,
 					     struct drm_file *file);
 int chrome9_draw_textured_triangle_d16_blend_ioctl(struct drm_device *drm,
