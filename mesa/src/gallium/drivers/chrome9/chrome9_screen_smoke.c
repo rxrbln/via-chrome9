@@ -1697,14 +1697,14 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
              chrome9_context(context)->submitted_batches ==
                 initial_batches + 1) &&
             (!depth_resource ||
-             !chrome9_context(context)->draw_program_triangle_d16_rhw_batch ||
-             chrome9_context(context)->draw_triangle_d16_rhw_run ||
-             chrome9_context(context)->submitted_program_batches ==
-                initial_program_batches + 1) &&
-            (!depth_resource ||
-             !chrome9_context(context)->draw_triangle_d16_rhw_run ||
-             chrome9_context(context)->submitted_rhw_runs ==
-                initial_rhw_runs + 1);
+             (chrome9_context(context)->submitted_program_batches -
+                 initial_program_batches) +
+                (chrome9_context(context)->submitted_rhw_runs -
+                 initial_rhw_runs) ==
+                ((chrome9_context(context)->
+                     draw_program_triangle_d16_rhw_batch ||
+                  chrome9_context(context)->draw_triangle_d16_rhw_run) ?
+                    1 : 0));
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       passed = passed &&
                (pixels[32 * (surface->stride / 4) + 192] >> 24) == 0xff;
@@ -2320,11 +2320,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                depth_pixels[32 * (depth->stride / 2) + 192] <= 0x8001 &&
                chrome9_context(context)->submitted_triangles ==
                   submitted + 2 &&
-               (chrome9_context(context)->draw_triangle_d16_rhw_run ?
-                  chrome9_context(context)->submitted_rhw_runs ==
-                     rhw_runs + 1 :
-                  chrome9_context(context)->submitted_program_batches ==
-                     program_batches + 1) &&
+               chrome9_context(context)->submitted_program_batches ==
+                  program_batches + 1 &&
+               chrome9_context(context)->submitted_rhw_runs == rhw_runs &&
                chrome9_context(context)->rejected_triangles == rejected &&
                smoke_guard_pages_match(draw_surface) &&
                smoke_guard_pages_match(depth);
