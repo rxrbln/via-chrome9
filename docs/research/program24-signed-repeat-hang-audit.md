@@ -170,6 +170,32 @@ varying-primary, unequal-RHW triangle after activation succeeds.  The current
 interpolation rather than a command-reader or system hang.  It must still be
 fixed before treating a q3 world frame as semantically valid.
 
+The follow-up can remain a program24 plus signed-repeat test.  Reuse the
+64x64 triangle from `raster-front-end-oracles.md`:
+
+```text
+v0 position=(-0.5,-0.5), rhw=1.0,  primary=80000000
+v1 position=(63.5,-0.5), rhw=0.25, primary=80ff0000
+v2 position=(63.5,63.5), rhw=0.25, primary=80ff0000
+```
+
+Use constant stage-0 S=`+31.109375`, T=`0.5`, with selected TEX0 texel opaque
+white, and use a stage-1 texel whose RGB is white and alpha is zero.  At
+target pixel `(48,16)` the perspective red fraction is `97/221`, while affine
+interpolation gives `97/128`:
+
+```text
+required ce result: R = 255 * 97/221 = 111.9, A = 128
+current c0 result:  R = 255 * 97/128 = 193.2, A = 128
+```
+
+Accept red near `6f..74` and require packed BGRA near `806f0000..80740000` for
+the corrected path; `80c00000..80c40000` diagnoses the current affine word.
+Green and blue remain zero, and alpha must remain exactly `80`.  Because S/T
+are constant, this isolates D1 correction without confounding it with texture
+coordinate interpolation, while still exercising cap40 acceptance and the
+program24 object.
+
 ## Guard and retirement requirements
 
 The initial command-13 oracle owns four distinct objects: BGRA target, TEX0,
