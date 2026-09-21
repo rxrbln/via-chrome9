@@ -83,17 +83,38 @@ Start from the independently recovered neutral operation template and encode
 only named slots. D3 `19:16` is a sub-operation selector, not a complete
 opcode, so compare all four dwords in tests.
 
-| operation | slots | neutral compiler record |
+| operation | exact parallel-slot assignment | neutral compiler record |
 |---|---|---|
 | MOV | A=src | `01c00530 301c0053 00f08005 000d0020` |
-| ADD | A=src0, C=src1 | `00810530 30140924 00f08005 00000020` |
-| SUB | ADD, C.NEG | `80800530 30140924 00f08105 00000020` |
+| ADD | A=src0, B=src1, C=ONE | `00810530 30140924 00f08005 00000020` |
+| SUB | B=src0, A=src1, C=NEG_ONE | `80800530 30140924 00f08105 00000020` |
 | MUL | A=src0, C=src1, B=ZERO | `0140b6d0 30081053 00f08005 00000020` |
 | MAD | A=src0, C=src1, B=src2 | `00820530 30081053 00f08005 00000020` |
 
 Those examples target r0 and use c0/c1/c2. Encoding oC0 changes d3 to an
 `...0820` destination. MUL's `0140b6d0` and ADD's literal-one fields are
 functional parallel-ALU sources, not padding.
+
+The non-obvious SUB assignment is deliberate: the hardware parallel form is
+`B + A*C`. With B=src0, A=src1 and C=-1 it implements src0-src1. Recasting
+SUB as an ordinary ADD with an arbitrary negated operand would encode the
+wrong slots.
+
+Finalized `oC0` differentials extend the one-record table:
+
+| operation | exact finalized record for c0[,c1[,c2]] -> oC0 |
+|---|---|
+| DP3 | `01c00530 50081055 00f08005 00020820` |
+| DP4 | `01c00530 30081053 00f08005 00030820` |
+| MIN | `01c00530 30081053 00f08005 000c0820` |
+| MAX | `01c00530 30081053 00f08005 000b0820` |
+| RCP | `01c00530 b01c0053 00f080b6 00060820` |
+| RSQ | `01c00530 b01c0053 00f080b6 00070820` |
+| CMP | `00820530 30081053 00f08005 00090820` |
+
+DP3/DP4/MIN/MAX use A=src0 and C=src1. RCP/RSQ use A=src. CMP uses
+A=condition src0, C=true src1 and B=false src2. These assignments come from
+complete output records, not temporary-only opcode inference.
 
 ## Texture and dependency finalization
 
@@ -121,6 +142,23 @@ High TAU bits depend on phase order. Never implement `tau |= 10000000`.
 Until an SSA-edge finalizer byte-matches the corpus, emit only the exact three
 schedule patterns above.
 
+The Windows backend before configuration-2 and the Linux production
+finalizer give exact one-texture dependency deltas for every v1 source slot:
+
+| operation | Windows scheduled ALU | Linux configuration-2 ALU |
+|---|---|---|
+| ADD(tex0,c0) | `00800530 00140924 00f00000 00000820` | `00800530 30140924 00f20005 00000820` |
+| SUB(tex0,c0) | `80000000 30140924 00f08005 00000820` | `82000530 30140924 00f08005 00000820` |
+| MAD(tex0,c0,c1) | `00810530 00080053 00f00000 00000820` | `00810530 30080053 00f20005 00000820` |
+| DP3(tex0,c0) | `01c00530 50080055 00f00000 00020820` | `01c00530 50080055 00f20005 00020820` |
+| RCP(tex0) | `01c00530 801c0053 00f000b6 00060820` | `01c00530 b01c0053 00f200b6 00060820` |
+| CMP(tex0,c0,c1) | `00810530 00080053 00f00000 00090820` | `00810530 30080053 00f20005 00090820` |
+
+DP4, MIN, MAX and RSQ follow the same slot-specific delta as DP3 or RCP.
+SUB is the important exception: because the sampled value is in parallel
+source B, dependency finalization changes d0 rather than d2. A generic
+"sampled operand means d2.bit17" rule is therefore wrong.
+
 ## Golden acceptance corpus
 
 `via-5.75-shader-corpus.tsv` and `windows-closed-key-shader-corpus.tsv` are
@@ -141,6 +179,8 @@ tex0*tex1     ALU 0140b6d0 3003f000 00f20005 00000820
 
 A fresh Wine three-factor replay and exact hashes are recorded in
 [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md).
+The expanded finalized output and texture-consumer corpus is
+[chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv).
 
 Acceptance is stricter than byte generation:
 
@@ -157,4 +197,3 @@ Acceptance is stricter than byte generation:
 This removes duplicated operand combinations while preserving fail-closed
 execution. It does not enable flow, arbitrary varyings, dependent samples,
 explicit LOD, TEXKILL, depth output, or arbitrary native-code submission.
-

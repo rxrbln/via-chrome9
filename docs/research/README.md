@@ -12,6 +12,8 @@ targets.
 - [mesa-ps-encoder-v1.md](mesa-ps-encoder-v1.md) defines the first bounded
   Mesa NIR-to-native fragment encoder, operand packing, closed scheduler
   tuples, dependency constraints, and byte-exact golden tests.
+- [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
+  finalized oC0 and texture-consumer golden corpus for the bounded encoder.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
