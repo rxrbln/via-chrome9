@@ -95,6 +95,123 @@ smoke_bytes_match(const void *data, size_t size, uint8_t expected)
    return true;
 }
 
+static bool
+smoke_copy_rect(struct pipe_screen *screen)
+{
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .width0 = 32,
+      .height0 = 32,
+      .depth0 = 1,
+      .array_size = 1,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
+              PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource *destination = NULL;
+   struct pipe_resource *unguarded_destination = NULL;
+   struct pipe_resource *source = NULL;
+   struct chrome9_resource *cdestination;
+   struct chrome9_resource *cunguarded;
+   struct chrome9_resource *csource;
+   struct drm_chrome9_copy_rect copy = { 0 };
+   uint32_t *destination_pixels;
+   uint32_t *source_pixels;
+   bool passed = false;
+
+   if (!chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_COPY_RECT))
+      return true;
+   destination = screen->resource_create(screen, &templ);
+   source = screen->resource_create(screen, &templ);
+   if (!destination || !source)
+      goto out;
+   cdestination = chrome9_resource(destination);
+   csource = chrome9_resource(source);
+   if (!cdestination->guarded || !csource->guarded ||
+       cdestination->stride != 128 || csource->stride != 128)
+      goto out;
+   for (size_t i = 0; i < cdestination->bo.size / sizeof(uint32_t); i++)
+      ((uint32_t *)cdestination->bo.map)[i] = CHROME9_SMOKE_GUARD_WORD;
+   for (size_t i = 0; i < csource->bo.size / sizeof(uint32_t); i++)
+      ((uint32_t *)csource->bo.map)[i] = CHROME9_SMOKE_GUARD_WORD;
+   destination_pixels = (uint32_t *)((uint8_t *)cdestination->bo.map +
+                                     cdestination->data_offset);
+   source_pixels = (uint32_t *)((uint8_t *)csource->bo.map +
+                                csource->data_offset);
+   for (unsigned y = 0; y < 32; y++)
+      for (unsigned x = 0; x < 32; x++) {
+         destination_pixels[y * 32 + x] = 0xdeadbeef;
+         source_pixels[y * 32 + x] =
+            ((x + y) & 0xff) << 24 | x | y << 8 | (x ^ y) << 16;
+      }
+   copy.destination_handle = cdestination->bo.handle;
+   copy.source_handle = csource->bo.handle;
+   copy.width = 32;
+   copy.height = 32;
+   copy.destination_width = 32;
+   copy.destination_height = 32;
+   copy.destination_pitch = 128;
+   copy.source_width = 32;
+   copy.source_height = 32;
+   copy.source_pitch = 128;
+   copy.format = DRM_CHROME9_TEXTURE_FORMAT_BGRX8888;
+   if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+      goto out;
+   for (unsigned i = 0; i < 32 * 32; i++)
+      if (destination_pixels[i] != source_pixels[i])
+         goto out;
+   for (unsigned i = 0; i < 32 * 32; i++)
+      destination_pixels[i] = 0xdeadbeef;
+   copy.flags = DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE;
+   if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+      goto out;
+   for (unsigned i = 0; i < 32 * 32; i++)
+      if (destination_pixels[i] != (source_pixels[i] | 0xff000000)) {
+         fprintf(stderr,
+                 "copy alpha mismatch pixel=%u got=%08x expected=%08x "
+                 "source=%08x\n", i, destination_pixels[i],
+                 source_pixels[i] | 0xff000000, source_pixels[i]);
+         goto out;
+      }
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION)) {
+      struct pipe_resource external_templ = templ;
+      uint32_t *unguarded_pixels;
+
+      external_templ.bind |= PIPE_BIND_DISPLAY_TARGET |
+                             PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
+      unguarded_destination =
+         screen->resource_create(screen, &external_templ);
+      if (!unguarded_destination)
+         goto out;
+      cunguarded = chrome9_resource(unguarded_destination);
+      if (cunguarded->guarded || cunguarded->data_offset ||
+          cunguarded->stride != 128)
+         goto out;
+      unguarded_pixels = cunguarded->bo.map;
+      for (unsigned i = 0; i < 32 * 32; i++)
+         unguarded_pixels[i] = 0xdeadbeef;
+      copy.destination_handle = cunguarded->bo.handle;
+      copy.flags = DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE |
+                   DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED;
+      if (!chrome9_copy_rect(screen->get_screen_fd(screen), &copy))
+         goto out;
+      for (unsigned i = 0; i < 32 * 32; i++)
+         if (unguarded_pixels[i] != (source_pixels[i] | 0xff000000))
+            goto out;
+   }
+   passed = smoke_guard_pages_match(cdestination) &&
+            smoke_guard_pages_match(csource);
+out:
+   if (unguarded_destination)
+      screen->resource_destroy(screen, unguarded_destination);
+   if (source)
+      screen->resource_destroy(screen, source);
+   if (destination)
+      screen->resource_destroy(screen, destination);
+   return passed;
+}
+
 static void *
 make_texture_vertex_shader(struct pipe_screen *screen,
                            struct pipe_context *context, bool emit_color)
@@ -4988,6 +5105,13 @@ main(int argc, char **argv)
          return 1;
       }
    }
+   if (!smoke_copy_rect(screen)) {
+      fputs("bounded H6 SF copy rectangle failed\n", stderr);
+      screen->destroy(screen);
+      return 1;
+   }
+   if (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_COPY_RECT))
+      puts("Gallium bounded H6 SF copy rectangle passed");
 
    printf("name: %s\nvendor: %s\ndevice vendor: %s\n",
           screen->get_name(screen), screen->get_vendor(screen),

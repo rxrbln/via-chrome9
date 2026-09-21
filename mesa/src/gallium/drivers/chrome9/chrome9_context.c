@@ -73,6 +73,27 @@ chrome9_context_render_target_written(struct chrome9_context *ctx)
    ctx->render_target_dirty = true;
 }
 
+void
+chrome9_context_render_target_direct_written(struct chrome9_context *ctx)
+{
+   ctx->render_target_dirty = false;
+   ctx->render_target_stale = true;
+}
+
+void
+chrome9_context_prepare_render_target(struct chrome9_context *ctx)
+{
+   struct pipe_resource *external;
+
+   if (!ctx->render_target_stale || !ctx->render_target ||
+       !ctx->framebuffer.nr_cbufs ||
+       !(external = ctx->framebuffer.cbufs[0].texture))
+      return;
+   if (external != ctx->render_target)
+      chrome9_copy_surface(ctx->render_target, external);
+   ctx->render_target_stale = false;
+}
+
 static void
 chrome9_warn_once(struct chrome9_context *ctx, uint32_t warning,
                   const char *message)
@@ -2725,6 +2746,7 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
 
    chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
+   ctx->render_target_stale = false;
    pipe_resource_reference(&ctx->render_target, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
    if (color && surface->format == color->format && !surface->level &&
@@ -2879,6 +2901,7 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    }
    if ((buffers & PIPE_CLEAR_COLOR0) &&
        (resource = ctx->render_target)) {
+      chrome9_context_prepare_render_target(ctx);
       chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
                            height);
       chrome9_context_render_target_written(ctx);
@@ -2933,6 +2956,8 @@ chrome9_clear_render_target(struct pipe_context *pipe,
        surface->texture == ctx->framebuffer.cbufs[0].texture &&
        ctx->render_target)
       target = ctx->render_target;
+   if (target == ctx->render_target)
+      chrome9_context_prepare_render_target(ctx);
    chrome9_clear_target(chrome9_resource(target), color,
                         x, y, width, height);
    if (target == ctx->render_target) {
@@ -3160,6 +3185,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
    ctx->draw_textured_triangle_batch =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH);
+   ctx->copy_rect = !!(capabilities & DRM_CHROME9_CAP_COPY_RECT);
+   ctx->copy_rect_unguarded_destination =
+      !!(capabilities & DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION);
    ctx->draw_textured_triangle_d16 =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16);
    ctx->draw_textured_triangle_d16_blend =

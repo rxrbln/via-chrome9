@@ -105,6 +105,7 @@ struct chrome9_context {
     * this guarded shadow and are copied back on flush. */
    struct pipe_resource *render_target;
    bool render_target_dirty;
+   bool render_target_stale;
    bool draw_triangle_d16;
    bool draw_triangle_d16_blend;
    bool depth_func_supported;
@@ -117,6 +118,8 @@ struct chrome9_context {
    bool draw_program_triangle_d16_rhw_batch;
    bool draw_textured_triangle;
    bool draw_textured_triangle_batch;
+   bool copy_rect;
+   bool copy_rect_unguarded_destination;
    bool draw_textured_triangle_d16;
    bool draw_textured_triangle_d16_blend;
    bool textured_d16_bgra8888;
@@ -173,6 +176,8 @@ chrome9_context_render_target(struct chrome9_context *ctx);
 struct chrome9_resource *
 chrome9_context_depth_target(struct chrome9_context *ctx);
 void chrome9_context_render_target_written(struct chrome9_context *ctx);
+void chrome9_context_render_target_direct_written(struct chrome9_context *ctx);
+void chrome9_context_prepare_render_target(struct chrome9_context *ctx);
 
 struct pipe_context *
 chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags);
