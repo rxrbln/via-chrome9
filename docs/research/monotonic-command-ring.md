@@ -150,6 +150,13 @@ device `0x7122`, the same VX900 device selected by the Windows path.  Both use
 PID00 in A65, so the two shipping drivers genuinely disagree on the safe
 A66/A67 tail address for VX900.
 
+The Linux `-64` is present in the shipped module, not merely stale C source.
+`bin/via_chrome9.ko` is unstripped (build ID
+`f04693fb1c4733857910b7a4794a594a146639b0`); symbol
+`rewind_ring_agp_inv:0x3200` compares the chip index with 8 at `0x329e` and
+uses `lea ...-0x40` at `0x3354` before constructing A66/A67.  Its generic path
+uses `-0x10` at `0x32ac`.
+
 This identification is not based only on code adjacency.  The chip dispatch
 tuple in `.data` at image address `0x1084b0` is exactly
 `c7c00,a17a0,c7f80,c8190`: hardware ring install at callback `+0xdf0`, software
