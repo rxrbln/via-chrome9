@@ -919,6 +919,12 @@ fire word, or PLEND word between triangles.  For one texture the stride is
 eight dwords and for two textures it is ten, so every three-vertex triangle
 adds respectively 24 or 30 payload dwords.  The Type-00 header remains four
 dwords and emitter padding, if any, follows the complete A24-counted payload.
+Type-00 has no second payload-length field: A24 is the only delimiter.  It
+must equal exactly `3*N`, and exactly `3*N*stride` dwords must immediately
+follow the header.  A count that is too large can consume the post-draw sync
+as vertex attributes; a count that is too small can expose leftover attribute
+words to the command decoder.  Both failures are wedge-class, so assert the
+computed payload end as well as the final body/trailer size.
 
 Do not merely concatenate another Type-00 packet after an A24=`3` payload.
 The first list has already exhausted A24.  A genuinely separate primitive
@@ -1056,6 +1062,41 @@ second triangle and proves that the list continued past the first automatic
 fire; full target/source guards and the unchanged source prove bounded fetch
 and PLEND.  Follow it with the old one-triangle ioctl into a cleared target to
 prove the dynamic A24 batch did not alter closure for the legacy path.
+
+The first Mesa integration should keep a batch local to one
+`chrome9_vbuf_draw_arrays()` or `chrome9_vbuf_draw_elements()` callback and
+flush it before returning.  Gallium state and resource bindings are immutable
+for that callback, while these functions already expand strips, fans, quads,
+and quad strips to explicitly ordered independent triples.  Preserve that
+order (including the odd-triangle strip swap), append only successfully
+converted nondegenerate triples, duplicate shared vertices, and split at the
+kind-specific kernel cap.  This obtains the large reduction in ioctl,
+reservation, GART, cache, and fence work without needing pending-batch flushes
+on later state changes, clears, maps, or context teardown.  In particular, do
+not retain a first implementation across vbuf callbacks merely because the BO
+handles happen to compare equal.
+
+Validation remains per triangle even though shared draw-state translation can
+move to callback setup.  The draw limit is also a triangle limit, not an ioctl
+limit: restrict each chunk to the remaining
+`CHROME9_DRAW_LIMIT-submitted_triangles`.  On successful batch submission add
+the batch count to `submitted_triangles` and mark the render target written
+once.  On submission failure none of its triangles retired, so account the
+entire batch as rejected (and stop that callback rather than repeatedly
+submitting to a possibly wedged engine).  Empty batches, including callbacks
+whose triangles all collapse during fixed-point conversion, issue no ioctl.
+
+The count and exact body/trailer length must be rejected **before any ring
+write**.  The current builders fill the slot and only then call
+`chrome9_finish_ring()`; relying on its final PAUSE/STOP bound check would let
+an oversized variable payload overwrite beyond the 4-KiB slot before the
+error is discovered.  Check the kind/state-specific formula above at builder
+entry as defense in depth, in addition to the ioctl count cap, and bounds-check
+the direct vertex emitter against that precomputed end.  A successful batch
+otherwise uses the same BO lookup, reservation usage, map, GART binding,
+single fence, cache ownership transitions, guard preparation/verification,
+and error unwind as its corresponding single-triangle job.  Batch count does
+not require additional BOs or fences.
 
 ### One-word RGBA-by-RGBA successor for game lightmaps
 
