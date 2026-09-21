@@ -162,6 +162,10 @@ targets.
   closes ioquake3 GL2 fogpass as a five-ALU semantic program with exact
   float-varying linkage, packet indices, D16/source-over state and guarded
   zero/negative/square-root silicon oracles.
+- [ioquake3-gl2-eight-unit-linkage.md](ioquake3-gl2-eight-unit-linkage.md)
+  identifies ioquake3's exact default six-active/seven-logical sampler limit,
+  derives Chrome9 stages 2..7 FE/FVF/VS state, records stage-7 and five-sample
+  compiler objects, and orders guarded promotion without falsely exposing 8.
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
