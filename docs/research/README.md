@@ -186,6 +186,10 @@ targets.
   CW/CCW orientation swap, fixes every current D16 cull index, and gives
   exact D16/D24S8 bias words, packet growth, ownership rules, and live
   discriminators.
+- [two-sided-stencil-orientation.md](two-sided-stencil-orientation.md)
+  reconstructs the Windows mirror-then-exchange face builder, maps Gallium
+  front/back state and dynamic refs to physical CW/CCW A23--A26 payloads,
+  reserves the unequal-face capability, and defines the live winding matrix.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil

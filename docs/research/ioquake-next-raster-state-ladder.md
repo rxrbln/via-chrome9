@@ -115,11 +115,12 @@ new path must not apply the legacy zero-to-LESS default.  Read-only clears only
 the Z write bit.  It never suppresses stencil writes.
 
 `stencil_enable==0` requires both input face structures to be all zero and
-lowers the canonical disabled block.  With stencil enabled, version one may
-require `cw==ccw` and let Mesa mirror one-sided state.  Lifting that equality
-requires the opposite-winding oracle below; the UAPI fields already name
-physical screen-space winding, not API front/back, so no ABI change is then
-needed.
+lowers the canonical disabled block.  With stencil enabled, version one
+requires `cw==ccw` and lets Mesa mirror one-sided state.  Capability bit 38
+lifts that equality only after the opposite-winding oracle in
+[two-sided-stencil-orientation.md](two-sided-stencil-orientation.md) passes;
+the UAPI fields already name physical screen-space winding, not API
+front/back, so no request-layout change is needed.
 
 The public operation values deliberately follow Gallium:
 
