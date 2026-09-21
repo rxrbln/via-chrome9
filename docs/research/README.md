@@ -183,6 +183,10 @@ targets.
 - [textured-d16-blend-uapi-design.md](textured-d16-blend-uapi-design.md)
   defines capability-gated one-/two-texture D16 blend successors, resolves
   the A33/A10 collision at body 19, and fixes packet, lifetime and live gates.
+- [command13-two-texture-d16-blend-audit.md](command13-two-texture-d16-blend-audit.md)
+  audits the candidate 270-dword command-0x13 packet, exact masks and four-BO
+  role wiring against both proprietary driver families, and proves that its
+  object contract needs same-device aliases but no cross-device PRIME path.
 - [two-texture-primary-uapi-design.md](two-texture-primary-uapi-design.md)
   defines the flag-compatible no-depth/D16 three-factor ABI, exact full-RGBA
   and primary-alpha-bypass programs, TEXLD/TEXLDP Q boundaries, packet maps,

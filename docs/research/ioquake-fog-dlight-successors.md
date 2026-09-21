@@ -26,6 +26,29 @@ rows at `:578-604`. Neither pass sets `GLS_DEPTHMASK_TRUE`; ioquake's state
 manager consequently leaves D16 writes disabled. `GLS_DEPTHFUNC_EQUAL`
 selects EQUAL, while its absence retains the renderer's LEQUAL default.
 
+The ordering relative to the captured world-lightmap key is exact.  All
+material stages finish first.  `RB_StageIteratorLightmappedMultitexture()`
+then disables texture unit 1 and reselects unit 0.  If the surface has a
+matching `dlightBits` entry and sorts at or before opaque, it calls
+`ProjectDlightTexture()` once per affecting dynamic light.  Fog, when
+present, runs only after every dynamic-light pass.  The generic and
+vertex-lit iterators use the same material -> dlights -> fog order:
+
+```text
+base/lightmap draw
+  -> zero or more dlightImage * per-vertex-color EQUAL/read-only draws
+  -> optional fogImage * fog-color LEQUAL-or-EQUAL/read-only draw
+```
+
+`ProjectDlightTexture_scalar()` does not geometrically clip triangles.  It
+computes S/T for every original vertex, marks six outside half-spaces, and
+keeps a triangle unless all three vertices share an outside bit.  Retained
+vertices can therefore have finite S/T outside `[0,1]`; clamp-to-edge is part
+of correctness.  It emits a new `hitIndexes` triangle list, not a strip or
+fan, and every per-vertex color has alpha byte `ff`.  The existing Mesa draw
+module may deindex and submit individual triangles, while a future run ioctl
+must preserve independent three-vertex list assembly.
+
 The generated resources are unusually convenient bounded inputs:
 
 * `R_CreateDlightImage()` creates a 16x16 clamp-to-edge, non-mip image with
@@ -92,6 +115,55 @@ and TEXLDP packet is live; changing TAU alone is unsafe. S/T may extend beyond
 as finite and safe but do not impose a normalized-range restriction. The
 clamp sampler provides the intended edge behavior.
 
+## Exact immediate vertex and shader object
+
+The dlight and fog passes reuse the current one-texture post-TNL layout.  No
+new vertex-program selector is needed.  The packet must retain this complete
+object:
+
+```text
+config       00000011 01002521 08010101 05000000 0d810000
+FVF          00000308 010000c2 020041d1 030052d0
+             04006342 1200000f 61800000 623081ff
+             20000000 23004f02 24000003 25f6cc00
+             28ffcc00 40800000 41400000 4200493f
+             43800000 44400000 4500493f 46800000
+             47400000 4800003f 49000000 50000000
+             51000000 52147fff
+VS           00380150 00000000 00000000 0008010f
+             0008014c 00100150 00384154 0004021f
+             0008414c 00000000 00000000 0008422f
+             0008814c 00000000 00000000 0008423f
+             0008c14c 00000000 00000000 0008028f
+             0009014c 00000000 00000000 0008029f
+VS control   60800004
+```
+
+Each immediate vertex is eight dwords: transformed D0 `(x,y,z,rhw)`,
+normalized packed D1 primary color, packed D2 specular, and D3 `(s,t)`.
+`A02=020041d1` is mandatory; D0 would feed unnormalized 0..255 dlight color
+and saturate modulation.  D3 has only S/T because OpenGL fills missing R/Q
+with 0/1 and Mesa proves Q one before removing the NIR projector.
+
+The fragment object is equally closed:
+
+```text
+A90..A9a 90018000 91000001 92010002 93000001
+          94000000 95000000 96000000 97000000
+          98000000 99000000 9a000000
+TAU       301001b0
+ALU       0140b6d0 30040053 00f20005 0000007f
+          01c00000 301c0000 00f20105 000d083f
+```
+
+The image A30 format, not another shader object, supplies the base-format
+alpha rule: dlight format 98 makes full RGBA MODULATE equivalent to the live
+`vec4((texture*primary).rgb,primary.a)` NIR; fog format 99 preserves sampled
+fog alpha.  After a two-texture world draw, the command-12 packet's one image,
+one sampler, A93 `...1`, one TAU and two-ALU object must replace the complete
+two-unit state.  Validate transition `two-texture -> dlight -> two-texture`
+without a context reset.
+
 ## Exact state words
 
 Both use the 236-dword one-texture MODULATE form of private command `0x12`.
@@ -119,6 +191,39 @@ requires cap 29. Additive and fog factors are in the baseline set. All rows
 require cap 27 for command 12, cap 23 for read-only and cap 15 for explicit
 depth-function flags. Partial scissor remains orthogonal and uses cap 11;
 alpha test is disabled in these renderer-owned passes.
+
+### Complete bounded command-12 request
+
+The exact dlight request uses private command `0x12` with:
+
+```text
+program             DRM_CHROME9_TEXTURE_PROGRAM_MODULATE
+flags               DRM_CHROME9_DEPTH_FUNC(EQUAL) |
+                    DRM_CHROME9_DEPTH_READ_ONLY        # 00000a00
+texture             16x16, pitch 64, XRGB8888
+min/mag             LINEAR / LINEAR
+wrap S/T            CLAMP_TO_EDGE / CLAMP_TO_EDGE
+destination         guarded XRGB8888 or actual guarded BGRA8888
+depth               distinct guarded D16, canonical pitch
+blend.flags         DRM_CHROME9_BLEND_ENABLE
+blend.color_mask    RGBA
+alpha test          disabled
+vertices            three independent post-TNL records
+```
+
+The additive request selects factors ONE/ONE for both RGB and alpha.  The
+filter request selects RGB `DST_COLOR,ONE`; its alpha factors are
+`DST_ALPHA,ONE`, which are the normalized result of ioquake's single
+`glBlendFunc`.  Do not replace the latter with destination-color factors in
+the alpha equation or with `DST_COLOR,ZERO`, which belongs to the material
+lightmap/filter stage.
+
+No new shader-program capability or ioctl is justified.  Required gates are
+cap 27 (command 12), cap 23 (read-only), cap 15 plus cap 32 (explicit EQUAL),
+cap 29 for the filter dlight factors, cap 9 when the destination is BGRA, and
+cap 11 only when scissor is enabled.  Kernel vertex validation should retain
+finite S/T without a `[0,1]` restriction; the current structured one-texture
+path already has that property.
 
 ## Minimal EQUAL capability
 

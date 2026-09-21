@@ -128,9 +128,10 @@ struct drm_chrome9_draw_two_textured_triangle_d16_blend {
 ```
 
 Both accept the depth-function field plus live `DEPTH_READ_ONLY` bit 11 when
-capability bit 23 is present. A zero compare field retains legacy LESS; the
-first implementation accepts LESS and LEQUAL exactly as the live D16
-predecessor does. Bit zero of the old request
+capability bit 23 is present. Unlike the older D16 requests, these state-complete
+successors require an explicit nonzero compare field; the first implementation
+accepts LESS and LEQUAL exactly as the live D16 predecessor does. Bit zero of
+the old request
 (`TEXTURED_D16_SOURCE_OVER`) is invalid here: source-over is spelled out in
 `blend`, and accepting both encodings would create two sources of truth.
 EQUAL and the remaining compares remain later capability-gated extensions.
@@ -139,10 +140,10 @@ EQUAL and the remaining compares remain later capability-gated extensions.
 
 Validation completes before GEM lookup or packet construction:
 
-1. Reject all `flags` bits outside `DEPTH_FUNC_MASK|DEPTH_READ_ONLY` and any
-   explicit compare except LESS/LEQUAL. A zero field means legacy LESS. The
-   read-only bit is accepted only with cap 23. Require every reserved field
-   to be zero.
+1. Reject all `flags` bits outside `DEPTH_FUNC_MASK|DEPTH_READ_ONLY`, a zero
+   compare field, and every compare except LESS/LEQUAL. The read-only bit is
+   accepted only with cap 23. Require every reserved field to be zero. The
+   generic zero-means-LESS rule remains only for older D16 requests.
 2. Reuse `chrome9_validate_blend_state()`: flags may contain only BLEND and
    ALPHA_TEST; factors `0..3` are baseline, while `4..10` require live cap 29;
    both functions must be ADD; color mask is four bits; alpha function is
@@ -156,10 +157,11 @@ Validation completes before GEM lookup or packet construction:
    wraps. One texture accepts only REPLACE/MODULATE; two textures are fixed
    RGBA-by-RGBA MODULATE.
 5. Require three distinct nonzero handles for one texture and four for two.
-   Reject imported or foreign-device objects. Target and D16 allocation sizes
-   are exact canonical guarded sizes. A texture may be larger only under the
-   existing level-zero mip-allocation rule; its canonical L0 extent and both
-   applicable guards remain validated.
+   Reject true imported proxies or foreign-device objects. A same-device
+   dma-buf round trip returns the original GEM object and is therefore valid.
+   Target and D16 allocation sizes are exact canonical guarded sizes. A texture
+   may be larger only under the existing level-zero mip-allocation rule; its
+   canonical L0 extent and both applicable guards remain validated.
 6. Validate every X/Y against the target, Z in `[0,1]` 16.16, finite positive
    RHW, finite/safe S/T for every active unit, and a nondegenerate triangle.
    Packed color/specular are data, not native command words.
