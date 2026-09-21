@@ -14,6 +14,13 @@ targets.
   tuples, dependency constraints, and byte-exact golden tests.
 - [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
   finalized oC0 and texture-consumer golden corpus for the bounded encoder.
+- [chrome9-cmd19-fp-contract.md](chrome9-cmd19-fp-contract.md) separates
+  value-independent Linux/Windows MOV/MUL compiler evidence from numerical
+  silicon behavior, defines the finite/exceptional-value gate, a guarded
+  alpha-test denormal oracle, and the NIR FP-control admission policy.
+- [chrome9-cmd19-fp-compiler-corpus.tsv](chrome9-cmd19-fp-compiler-corpus.tsv)
+  records the exact signed-zero, denormal, finite-endpoint, NaN, and infinity
+  `DEF c0` differential across both proprietary compilers.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
