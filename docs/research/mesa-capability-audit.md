@@ -140,6 +140,7 @@ defaults for operations it neither implements nor safely lowers:
 | `buffer_map_persistent_coherent` | `false` until storage/map flag tests exist | otherwise advertises a stronger buffer-storage contract |
 | `dest_surface_srgb_control` | `false` | no sRGB target/sampler format is accepted |
 | `packed_stream_output` | `false` | no stream-output stage/callback exists |
+| `flatshade` | `false` until provoking D1/D2 is proven | the generic initializer defaults this true, but the current packet is always Gouraud and ordinary filled triangles bypass draw's flatshade-copy stage |
 | `two_sided_color` | `false` unless verified through draw-module lowering | current bounded submission has one primary-color linkage |
 | `clip_planes` | `0` unless verified through draw-module clipping | default one is not native evidence |
 | `dithering` | `false` until exact output tests pass | current draw validation does not represent controllable dither state |
@@ -151,6 +152,15 @@ rejects discard/compare NIR, while setting the cap true claims a fixed alpha
 test that draw validation also rejects.  Alpha test is therefore a real
 minimum-GL semantic blocker, not a cap-toggle solution.  The same principle
 applies to unsupported blend, stencil, fog, and texture-environment modes.
+
+`flatshade=false` has the same fail-closed character.  It asks the state
+tracker to make flat interpolation explicit in NIR; the bounded classifier
+may reject that form until its provoking-color path exists.  Leaving the
+initializer's true default is worse: the state tracker keeps only rasterizer
+flatshade state, while Chrome9 emits `A23=23004f02` and can silently Gouraud
+interpolate three different vertex colors.  Exact A23 words and the software
+D1/D2 lowering boundary are in
+[flatshade-edge-ownership-contract.md](flatshade-edge-ownership-contract.md).
 
 The exact alternative route is in `st_atom_depth.c`: with
 `screen->caps.alpha_test=true`, Mesa copies `AlphaEnabled`, the compare
