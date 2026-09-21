@@ -1655,6 +1655,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
    ctx->draw_textured_triangle_d16 =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16);
+   ctx->textured_d16_bgra8888 =
+      !!(capabilities & DRM_CHROME9_CAP_TEXTURED_D16_BGRA8888);
    ctx->draw_two_textured_triangle =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE);
    ctx->draw_triangle_blend =

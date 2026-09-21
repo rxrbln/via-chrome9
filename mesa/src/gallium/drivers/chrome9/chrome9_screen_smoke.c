@@ -2214,24 +2214,25 @@ out:
 }
 
 static bool
-run_pipe_textured_depth(struct pipe_screen *screen)
+run_pipe_textured_depth(struct pipe_screen *screen,
+                        enum pipe_format target_format)
 {
    static const struct smoke_texture_vertex vertices[3][4] = {
       {
-         { { -1, -1,  0.0, 1 }, { 0, 0, 1, 1 }, { 0, 0 } },
-         { { -1,  1,  0.0, 1 }, { 0, 0, 1, 1 }, { 0, 1 } },
-         { {  1, -1,  0.0, 1 }, { 0, 0, 1, 1 }, { 1, 0 } },
-         { {  1,  1,  0.0, 1 }, { 0, 0, 1, 1 }, { 1, 1 } },
+         { { -1, -1,  0.0, 1 }, { 0, 0, 1, 0.5 }, { 0, 0 } },
+         { { -1,  1,  0.0, 1 }, { 0, 0, 1, 0.5 }, { 0, 1 } },
+         { {  1, -1,  0.0, 1 }, { 0, 0, 1, 0.5 }, { 1, 0 } },
+         { {  1,  1,  0.0, 1 }, { 0, 0, 1, 0.5 }, { 1, 1 } },
       }, {
          { { -1, -1,  0.5, 1 }, { 0, 1, 0, 1 }, { 0, 0 } },
          { { -1,  1,  0.5, 1 }, { 0, 1, 0, 1 }, { 0, 1 } },
          { {  1, -1,  0.5, 1 }, { 0, 1, 0, 1 }, { 1, 0 } },
          { {  1,  1,  0.5, 1 }, { 0, 1, 0, 1 }, { 1, 1 } },
       }, {
-         { { -1, -1, -0.5, 1 }, { 1, 0, 0, 1 }, { 0, 0 } },
-         { { -1,  1, -0.5, 1 }, { 1, 0, 0, 1 }, { 0, 1 } },
-         { {  1, -1, -0.5, 1 }, { 1, 0, 0, 1 }, { 1, 0 } },
-         { {  1,  1, -0.5, 1 }, { 1, 0, 0, 1 }, { 1, 1 } },
+         { { -1, -1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 0, 0 } },
+         { { -1,  1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 0, 1 } },
+         { {  1, -1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 1, 0 } },
+         { {  1,  1, -0.5, 1 }, { 1, 0, 0, 0.25 }, { 1, 1 } },
       },
    };
    struct pipe_resource target_templ = {
@@ -2307,6 +2308,8 @@ run_pipe_textured_depth(struct pipe_screen *screen)
    uint64_t submitted, rejected;
    bool passed = false;
 
+   target_templ.format = target_format;
+
    target = screen->resource_create(screen, &target_templ);
    texture = screen->resource_create(screen, &texture_templ);
    depth = screen->resource_create(screen, &depth_templ);
@@ -2380,12 +2383,17 @@ run_pipe_textured_depth(struct pipe_screen *screen)
       context->set_vertex_buffers(context, 1, &vertex_buffer);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
-      samples[pass] = pixels[16 * (ctarget->stride / 4) + 16] & 0xffffff;
+      samples[pass] = pixels[16 * (ctarget->stride / 4) + 16];
       depth_samples[pass] = depth_pixels[16 * (cdepth->stride / 2) + 16];
    }
-   passed = samples[0] == 0x000000ff &&
-            samples[1] == samples[0] &&
-            samples[2] == 0x00ff0000 &&
+   passed = (target_format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+             samples[0] == 0x7f0000ff &&
+             samples[1] == samples[0] &&
+             samples[2] == 0x3fff0000 :
+             (samples[0] & 0xffffff) == 0x000000ff &&
+             (samples[1] & 0xffffff) ==
+                (samples[0] & 0xffffff) &&
+             (samples[2] & 0xffffff) == 0x00ff0000) &&
             depth_samples[0] >= 0x7ffe && depth_samples[0] <= 0x8001 &&
             depth_samples[1] >= 0x7ffe && depth_samples[1] <= 0x8001 &&
             depth_samples[2] >= 0x3ffe && depth_samples[2] <= 0x4001 &&
@@ -2398,17 +2406,17 @@ run_pipe_textured_depth(struct pipe_screen *screen)
             smoke_guard_pages_match(ctexture) &&
             smoke_guard_pages_match(cdepth);
    if (passed)
-      printf("Gallium textured D16 LEQUAL passed: "
+      printf("Gallium textured D16 LEQUAL format %u passed: "
              "equal=%08x/%04x far=%08x/%04x near=%08x/%04x\n",
-             samples[0], depth_samples[0], samples[1], depth_samples[1],
-             samples[2], depth_samples[2]);
+             target_format, samples[0], depth_samples[0], samples[1],
+             depth_samples[1], samples[2], depth_samples[2]);
    else
       fprintf(stderr,
-              "Gallium textured D16 LEQUAL mismatch: "
+              "Gallium textured D16 LEQUAL format %u mismatch: "
               "equal=%08x/%04x far=%08x/%04x near=%08x/%04x "
               "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
-              samples[0], depth_samples[0], samples[1], depth_samples[1],
-              samples[2], depth_samples[2],
+              target_format, samples[0], depth_samples[0], samples[1],
+              depth_samples[1], samples[2], depth_samples[2],
               ccontext->submitted_triangles - submitted,
               ccontext->rejected_triangles - rejected);
 
@@ -3192,8 +3200,18 @@ main(int argc, char **argv)
       }
       if (chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16) &&
-          !run_pipe_textured_depth(screen)) {
+          !run_pipe_textured_depth(screen,
+                                   PIPE_FORMAT_B8G8R8X8_UNORM)) {
          fputs("Chrome9 Gallium textured D16 draw failed\n", stderr);
+         screen->resource_destroy(screen, resource);
+         screen->destroy(screen);
+         return 1;
+      }
+      if (chrome9_screen_has_capability(
+             screen, DRM_CHROME9_CAP_TEXTURED_D16_BGRA8888) &&
+          !run_pipe_textured_depth(screen,
+                                   PIPE_FORMAT_B8G8R8A8_UNORM)) {
+         fputs("Chrome9 Gallium BGRA textured D16 draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
          return 1;

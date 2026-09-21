@@ -451,8 +451,20 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        (!ctx->draw_two_textured_triangle || *depth_active ||
         *blend_successor))
       return false;
-   if (texture_count && *depth_active && *blend_successor)
-      return false;
+   if (texture_count && *depth_active && *blend_successor) {
+      *reason = "texture-depth-target";
+      if (texture_count != 1 ||
+          resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+          !ctx->textured_d16_bgra8888 || blend->flags ||
+          blend->color_mask != (DRM_CHROME9_COLOR_MASK_R |
+                                DRM_CHROME9_COLOR_MASK_G |
+                                DRM_CHROME9_COLOR_MASK_B |
+                                DRM_CHROME9_COLOR_MASK_A))
+         return false;
+      /* BGRA storage alone selected the generic blend successor.  The
+       * textured-D16 ioctl carries A52 explicitly and still requires COPY. */
+      *blend_successor = false;
+   }
    *reason = "successor-capability";
    if (*blend_successor &&
        (*depth_active ? !ctx->draw_triangle_d16_blend :
@@ -839,6 +851,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          texture_depth_args.wrap_s = texture_args.wrap_s;
          texture_depth_args.wrap_t = texture_args.wrap_t;
          texture_depth_args.scissor = scissor;
+         texture_depth_args.destination_format =
+            target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+            DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+            DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    } else if (depth_active) {
       if (ctx->depth_func_supported)
