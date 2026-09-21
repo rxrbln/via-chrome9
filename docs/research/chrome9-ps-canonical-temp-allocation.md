@@ -54,6 +54,41 @@ One easily confused metadata field remains logical: the compiled object's
 lone logical r7 even though both executable records use physical r0.  It
 must not be used as a native-resource bitmap or as a source of encoded ids.
 
+## Linux static provenance
+
+The static code explains the differential exactly.  These are ELF virtual
+addresses in the Linux 5.75 `via_chrome9_dri.so`:
+
+| routine | address | relevant action |
+|---|---:|---|
+| `stmPPSCollectRegUsage_invi` | `001b3a90` | gathers logical TEMP use into the instance `+0x44` bitset |
+| `stmPPSValidatePS20_invi` | `001b5870` | calls collect, then `stmSetRegMgr_invi(instance,8,12)` |
+| `stmSetRegMgr_invi` | `001b3f20` | scans logical ids and builds the dense remap table |
+| `stmPPS_GetReMapTmpSlot_h5i` | `00162360` | searches that table and returns the physical table index |
+| `stmPPS_GetFreeTmpSlot_h5i` | `00162000` | allocates compiler-created scratch slots, a distinct path |
+| `stmPPS_ReleaseTmpSlot_h5i` | `00162280` | frees compiler-created scratch slots |
+
+At `001b4020..001b404e`, `stmSetRegMgr_invi` increments logical id `ecx`
+from zero to the supplied ordinary-TEMP limit, tests bit `ecx` in instance
+`+0x44`, and appends each set id to successive table entries.  Each entry is
+eight bytes: logical id at manager `+0x1288 + physical*8`, active flag at
+`+0x128c + physical*8`.  The insertion counter therefore is precisely the
+sorted rank recovered dynamically.  `001b4050..001b40aa` records the count
+and highest logical id; it does not perform interval coloring.
+
+`stmPPS_GetReMapTmpSlot_h5i` at `00162384..001623ac` linearly compares the
+requested logical id against those table entries and returns the matching
+entry index.  H5 ids at or above the ordinary/special boundary take the
+separate direct-id path at `0016236a..0016237a`; that path is outside the
+initial ordinary p0/p1 contract.
+
+The free/release routines do show that compiler-generated scratch values can
+reuse an available native slot.  They do not change the result for token
+TEMP values: the latter are prepopulated from the whole usage bitset before
+translation, so a dead early token TEMP still occupies its own table entry.
+This is why a new SSA backend should DCE and perform its own liveness-aware
+allocation instead of reproducing the vendor's token-id table literally.
+
 ## Windows boundary
 
 The D3D harness deliberately installs identity register callbacks so native
@@ -131,4 +166,3 @@ The vendor binary hashes remain:
 - D3D: `8ac6959fc3ab21b73fcf37ae4615e87ab285f3a56bc27623f3094d82cee49b45`
 - OpenGL: `a54e38ca7c038d7ce4937f9d940aa6e7d02886ef097730f4a1ae03979c9b4d2c`
 - Linux: `fddb4dea85319c76cac3354e43aa9bcb12a8b7f178cee0f70f6c7efe14a69af4`
-
