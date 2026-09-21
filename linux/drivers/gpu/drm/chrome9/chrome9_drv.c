@@ -544,7 +544,7 @@ void chrome9_init_3d_h5s2vp1(struct chrome9_device *cdev)
 {
 	static const u32 degamma[] = {
 		0x41e03c05, 0x07714434, 0x11b36ca5,
-		0x2176e565, 0x377bd680,
+		0x2176e565, 0x374bd680,
 	};
 	static const u32 gamma[] = {
 		0x40d0340d, 0x41a0681a, 0x42709c27, 0x0330cc33,

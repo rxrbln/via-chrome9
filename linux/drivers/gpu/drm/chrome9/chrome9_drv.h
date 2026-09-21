@@ -81,6 +81,8 @@ static inline u32 chrome9_iga2_base_pack(u32 old, u32 byte_address)
 }
 
 #define CHROME9_ENGINE_WAIT_MASK		0x00101ff3
+/* CR bit 4 may remain set while the owned reader is safely at PAUSE. */
+#define CHROME9_ENGINE_WORK_MASK		0x00101fe3
 
 #define CHROME9_2D_REG_COMMAND		0x0000
 #define CHROME9_2D_REG_MODE		0x0004
