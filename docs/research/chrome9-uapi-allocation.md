@@ -36,8 +36,9 @@ number; design notes must link here rather than independently claiming the
 | `16` | reserved | `DRAW_TEXTURED_PROGRAM_TRIANGLE` |
 | `17` | reserved | `DRAW_TRIANGLE_D24S8_STENCIL` |
 | `18` | reserved | `DRAW_FOG_TRIANGLE` |
+| `19` | implemented | `DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH` |
 
-The next unreserved command is `0x19`.  A reservation is not an advertised
+The next unreserved command is `0x1a`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -90,8 +91,9 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 38 | reserved | `D24S8_TWO_SIDED_STENCIL` |
 | 39 | reserved | `TWO_TEXTURE_PRIMARY_TEX0_ALPHA` |
 | 40 | reserved, live-proven | `TWO_TEXTURE_SIGNED_REPEAT_COORDS` |
+| 41 | implemented, awaiting silicon validation | `DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH` |
 
-The next unreserved capability bit is 41.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 42.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -164,3 +166,15 @@ magnitude at most 32; CLAMP and MIRROR axes retain the normalized rule.  The
 unchanged IEEE float payload, sampler ordering, command-15 selector
 separation, and passed guarded silicon gate are specified in
 [ioquake3-signed-repeat-command15.md](ioquake3-signed-repeat-command15.md).
+
+Private command `0x19` and capability bit 41 are the first path where Mesa's
+NIR compiler result controls the fragment program executed by a draw.  The
+144-byte request is a D16, perspective-correct triangle batch with one
+structured full-vector MOV or MUL instruction.  Version one exposes only
+primary varying `v0` and job-local constant `c0`; Mesa sends logical opcode,
+file, and identity swizzle fields, while the kernel validates them and
+rebuilds the exact four native ALU words.  The modifier byte must be zero.  No
+native control, instruction, TAU, temp, or
+packet word crosses the UAPI.  The kernel fixes the one-ALU resource controls,
+uploads only c0, and rejects unused or non-finite fields.  The guarded v0/c0
+exact-pixel test is the required silicon acceptance gate before deployment.
