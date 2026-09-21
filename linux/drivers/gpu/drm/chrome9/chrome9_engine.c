@@ -128,6 +128,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH,
+	CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
 };
 
 struct chrome9_draw_request {
@@ -173,6 +174,8 @@ struct chrome9_draw_request {
 	struct drm_chrome9_two_textured_vertex two_textured_vertices[3];
 	const struct drm_chrome9_vertex_d16 *batch_vertices;
 	const struct drm_chrome9_vertex_d16_rhw *batch_vertices_rhw;
+	u32 ps_program[4];
+	u32 ps_constant_c0[4];
 	u32 triangle_count;
 };
 
@@ -187,6 +190,10 @@ static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_blend) == 144);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_vertex_d16_rhw) == 20);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_batch) == 128);
+static_assert(sizeof(struct drm_chrome9_ps_source) == 8);
+static_assert(sizeof(struct drm_chrome9_ps_instruction) == 24);
+static_assert(sizeof(struct drm_chrome9_draw_program_triangle_d16_rhw_batch) ==
+	      144);
 static_assert(sizeof(struct drm_chrome9_texture_state) == 36);
 static_assert(sizeof(struct drm_chrome9_two_textured_vertex) == 40);
 static_assert(sizeof(struct drm_chrome9_draw_two_textured_triangle) == 240);
@@ -1382,7 +1389,9 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	bool blend = chrome9_draw_has_blend(request);
-	bool perspective = request->kind ==
+	bool compiled = request->kind ==
+		CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH;
+	bool perspective = compiled || request->kind ==
 		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH;
 	unsigned int i;
 
@@ -1435,6 +1444,13 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	body[27 + delta] = blend &&
 		(request->blend.flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
 		blend_words.a33 : 0xcc000000;
+	if (compiled) {
+		/* The ioctl carries semantics; these words were rebuilt in-kernel. */
+		memcpy(body + 76 + delta, request->ps_constant_c0,
+		       sizeof(request->ps_constant_c0));
+		memcpy(body + 160 + delta, request->ps_program,
+		       sizeof(request->ps_program));
+	}
 	body[52 + delta] = 0x20000000;
 	body[53 + delta] = 0x23004f02;
 	body[54 + delta] = 0x24000000 | vertex_count;
@@ -1465,7 +1481,12 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	body[168 + delta + vertex_count * 6] = 0xcc000000;
 	body[169 + delta + vertex_count * 6] = 0xcc000000;
 	p = body + 170 + delta + vertex_count * 6;
-	if ((!blend &&
+	if ((compiled &&
+	     (memcmp(body + 76 + delta, request->ps_constant_c0,
+		     sizeof(request->ps_constant_c0)) ||
+	      memcmp(body + 160 + delta, request->ps_program,
+		     sizeof(request->ps_program)))) ||
+	    (!blend &&
 	     (p - body != 170 + vertex_count * 6 ||
 	      body[19] != chrome9_depth_control_word(request, perspective) ||
 	      body[22] != (0x10000000 | (depth >> 8)) ||
@@ -3724,10 +3745,122 @@ int chrome9_draw_triangle_d16_blend_ioctl(struct drm_device *drm, void *data,
 	return chrome9_submit_depth_triangle(drm, file, &request);
 }
 
+static bool chrome9_float_finite(u32 value);
 static bool chrome9_rhw_valid(u32 value);
 
+static bool
+chrome9_ps_source_valid(const struct drm_chrome9_ps_source *source)
+{
+	bool identity = true;
+	unsigned int i;
+
+	if (source->file > DRM_CHROME9_PS_SOURCE_CONSTANT || source->index ||
+	    source->reserved || source->modifier)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(source->swizzle); i++)
+		identity &= source->swizzle[i] == i;
+	return identity;
+}
+
+static u32 chrome9_ps_source_file(const struct drm_chrome9_ps_source *source)
+{
+	return source->file == DRM_CHROME9_PS_SOURCE_VARYING ? 1 : 2;
+}
+
+static u32
+chrome9_ps_source_modifier(const struct drm_chrome9_ps_source *source)
+{
+	return source->modifier ? 8 : 0;
+}
+
+static void
+chrome9_encode_ps_source_a(u32 record[4],
+			   const struct drm_chrome9_ps_source *source)
+{
+	record[1] &= 0x00ffffff;
+	record[2] &= ~0x0003ffff;
+	record[1] |= chrome9_ps_source_modifier(source) << 24 |
+		     (u32)source->swizzle[3] << 28 |
+		     (u32)(source->swizzle[2] & 1) << 31;
+	record[2] |= (u32)source->swizzle[0] << 5 |
+		     (u32)source->swizzle[1] << 2 |
+		     (u32)source->swizzle[2] >> 1 |
+		     chrome9_ps_source_file(source) << 14;
+}
+
+static void
+chrome9_encode_ps_source_c(u32 record[4],
+			   const struct drm_chrome9_ps_source *source)
+{
+	record[0] &= 0x0fffffff;
+	record[1] &= ~0x003fffff;
+	record[3] &= ~0x00100000;
+	record[0] |= chrome9_ps_source_modifier(source) << 28;
+	record[1] |= (u32)source->swizzle[0] << 9 |
+		     (u32)source->swizzle[1] << 6 |
+		     (u32)source->swizzle[2] << 3 |
+		     (u32)source->swizzle[3] |
+		     chrome9_ps_source_file(source) << 18;
+	if (source->modifier)
+		record[3] |= 0x00100000;
+}
+
+static int chrome9_encode_ps_instruction(
+		const struct drm_chrome9_ps_instruction *instruction,
+		const u32 constant_c0[4], u32 record[4])
+{
+	static const u32 mov[4] = {
+		0x01c00530, 0x301c0053, 0x00f08005, 0x000d0820,
+	};
+	static const u32 mul[4] = {
+		0x0140b6d0, 0x30081053, 0x00f08005, 0x00000820,
+	};
+	bool constant;
+	unsigned int i;
+
+	if (instruction->reserved ||
+	    !chrome9_ps_source_valid(&instruction->src[0]))
+		return -EINVAL;
+	switch (instruction->op) {
+	case DRM_CHROME9_PS_OP_MOV:
+		if (memchr_inv(&instruction->src[1], 0,
+			       sizeof(instruction->src[1])))
+			return -EINVAL;
+		memcpy(record, mov, sizeof(mov));
+		chrome9_encode_ps_source_a(record, &instruction->src[0]);
+		constant = instruction->src[0].file ==
+			DRM_CHROME9_PS_SOURCE_CONSTANT;
+		break;
+	case DRM_CHROME9_PS_OP_MUL:
+		if (!chrome9_ps_source_valid(&instruction->src[1]))
+			return -EINVAL;
+		/* Version one closes only the independently compiled v0*c0 form. */
+		if (instruction->src[0].file == instruction->src[1].file)
+			return -EINVAL;
+		memcpy(record, mul, sizeof(mul));
+		chrome9_encode_ps_source_a(record, &instruction->src[0]);
+		chrome9_encode_ps_source_c(record, &instruction->src[1]);
+		constant = instruction->src[0].file ==
+			DRM_CHROME9_PS_SOURCE_CONSTANT ||
+			instruction->src[1].file ==
+			DRM_CHROME9_PS_SOURCE_CONSTANT;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (!constant)
+		return memchr_inv(constant_c0, 0, 4 * sizeof(*constant_c0)) ?
+			-EINVAL : 0;
+	for (i = 0; i < 4; i++)
+		if (!chrome9_float_finite(constant_c0[i]))
+			return -EINVAL;
+	return 0;
+}
+
 static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
-				       struct drm_file *file, bool perspective)
+				       struct drm_file *file, bool perspective,
+				       const u32 ps_program[4],
+				       const u32 ps_constant_c0[4])
 {
 	struct drm_chrome9_draw_triangle_batch *args = data;
 	void *vertices;
@@ -3844,7 +3977,14 @@ static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 			goto out_free;
 		}
 	}
-	if (perspective) {
+	if (ps_program) {
+		request.batch_vertices_rhw = vertices;
+		request.kind = CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH;
+		memcpy(request.ps_program, ps_program,
+		       sizeof(request.ps_program));
+		memcpy(request.ps_constant_c0, ps_constant_c0,
+		       sizeof(request.ps_constant_c0));
+	} else if (perspective) {
 		request.batch_vertices_rhw = vertices;
 		request.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH;
 	} else {
@@ -3863,14 +4003,45 @@ out_free:
 int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
-	return chrome9_draw_triangle_batch(drm, data, file, false);
+	return chrome9_draw_triangle_batch(drm, data, file, false, NULL, NULL);
 }
 
 int chrome9_draw_triangle_d16_rhw_batch_ioctl(struct drm_device *drm,
 					       void *data,
 					       struct drm_file *file)
 {
-	return chrome9_draw_triangle_batch(drm, data, file, true);
+	return chrome9_draw_triangle_batch(drm, data, file, true, NULL, NULL);
+}
+
+int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
+		struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct drm_chrome9_draw_program_triangle_d16_rhw_batch *args = data;
+	struct drm_chrome9_draw_triangle_batch batch = {
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->depth_handle,
+		.flags = args->flags,
+		.triangle_count = args->triangle_count,
+		.width = args->width,
+		.height = args->height,
+		.destination_pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+		.destination_format = args->destination_format,
+		.reserved0 = args->reserved0,
+		.blend = args->blend,
+		.scissor = args->scissor,
+		.pad = args->pad,
+		.vertices_ptr = args->vertices_ptr,
+	};
+	u32 program[4];
+	int ret;
+
+	ret = chrome9_encode_ps_instruction(&args->instruction,
+					    args->constant_c0, program);
+	if (ret)
+		return ret;
+	return chrome9_draw_triangle_batch(drm, &batch, file, true, program,
+					   args->constant_c0);
 }
 
 static bool chrome9_float_finite(u32 value)

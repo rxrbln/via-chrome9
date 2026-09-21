@@ -2371,7 +2371,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			       DRM_CHROME9_CAP_DEPTH_EQUAL |
 			       DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32 |
 			       DRM_CHROME9_CAP_DEPTH_ALWAYS |
-			       DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY;
+			       DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY |
+			       DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH;
 			if (chrome9_two_texture_signed_repeat)
 				args->value |=
 					DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS;
@@ -2435,6 +2436,9 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND,
 			  chrome9_draw_two_textured_triangle_d16_blend_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
+			  chrome9_draw_program_triangle_d16_rhw_batch_ioctl,
 			  DRM_RENDER_ALLOW),
 };
 
