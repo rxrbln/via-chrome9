@@ -172,6 +172,11 @@ targets.
 - [game-raster-depth-stencil-oracles.md](game-raster-depth-stencil-oracles.md)
   gives packet-exact depth, stencil, culling, polygon-offset, color-mask,
   clear, native-line, and point oracles plus state-transition closure rules.
+- [ioquake-next-raster-state-ladder.md](ioquake-next-raster-state-ladder.md)
+  turns the post-ALWAYS ioquake state sequence into an exact 208-byte
+  D24S8/stencil successor, 204-dword packet map, validators, capability
+  allocation, alpha-kill ordering checks, and guarded promotion suite while
+  retaining software cull and polygon offset.
 - [fixed-depth-cull-stencil-contract.md](fixed-depth-cull-stencil-contract.md)
   cross-checks Linux and both Windows fixed-state builders, defines the
   structured depth/cull/stencil lowering boundary, records Gallium's stencil

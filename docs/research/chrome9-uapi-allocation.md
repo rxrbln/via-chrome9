@@ -34,8 +34,9 @@ number; design notes must link here rather than independently claiming the
 | `14` | reserved | `DRAW_TEXTURED_TRIANGLE_RUN` |
 | `15` | reserved | `DRAW_TWO_TEXTURED_TRIANGLE_RUN` |
 | `16` | reserved | `DRAW_TEXTURED_PROGRAM_TRIANGLE` |
+| `17` | reserved | `DRAW_TRIANGLE_D24S8_STENCIL` |
 
-The next unreserved command is `0x17`.  A reservation is not an advertised
+The next unreserved command is `0x18`.  A reservation is not an advertised
 ABI: the command enters `chrome9_ioctls[]` only with its implementation, and
 userspace must still require the associated capability.
 
@@ -83,8 +84,9 @@ ioctl value `0x4080644f`: direction WRITE, DRM type `0x64`, command number
 | 33 | reserved | `DRAW_TEXTURED_PROGRAM` |
 | 34 | reserved | `FRAGMENT_CONSTANTS_32` |
 | 35 | reserved | `DEPTH_ALWAYS` |
+| 36 | reserved | `DRAW_TRIANGLE_D24S8_STENCIL` |
 
-The next unreserved capability bit is 36.  `DEPTH_READ_ONLY` deliberately has
+The next unreserved capability bit is 37.  `DEPTH_READ_ONLY` deliberately has
 no command allocation: it adds request flag bit 11 to existing structured D16
 successors only when capability bit 23 is present.
 
@@ -122,3 +124,11 @@ depth-function bits `[10:8]` accept `ALWAYS=7`, as specified in
 [ioquake-depth-always-mask-zero.md](ioquake-depth-always-mask-zero.md). The
 first observed consumer is an untextured D16 write with RT0 color mask zero;
 it still requires the existing state-complete command-08 capability.
+
+Private command `0x17` and capability bit 36 belong to the first structured
+untextured D24S8/stencil successor in
+[ioquake-next-raster-state-ladder.md](ioquake-next-raster-state-ladder.md).
+The 208-byte request carries semantic physical-CW/CCW stencil faces; the
+kernel translates operations and generates every native packet word. Native
+cull and polygon offset deliberately consume no allocation at this stage
+because Gallium draw already supplies both semantics in software.
