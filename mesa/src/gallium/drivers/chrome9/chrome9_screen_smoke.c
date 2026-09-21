@@ -169,6 +169,45 @@ make_texture_fragment_shader(struct pipe_screen *screen,
 }
 
 static void *
+make_texture_constant_fragment_shader(struct pipe_screen *screen,
+                                      struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-texture-constant-modulate");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_def *barycentric = nir_load_barycentric_pixel(&b, 32);
+   nir_def *coord = nir_load_interpolated_input(
+      &b, 2, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_TEX0);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_def *constant = nir_load_ubo(
+      &b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .align_mul = 16, .range = 16);
+   nir_store_output(&b, nir_fmul(&b, &tex->def, constant),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static void *
 make_two_texture_vertex_shader(struct pipe_screen *screen,
                                struct pipe_context *context)
 {
@@ -986,6 +1025,11 @@ run_pipe_texture(struct pipe_screen *screen)
       .instance_count = 1, .min_index = 0, .max_index = 3,
    };
    struct pipe_draw_start_count_bias draw = { .count = 4 };
+   const float texture_constant_color[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+   struct pipe_constant_buffer texture_constant = {
+      .buffer_size = sizeof(texture_constant_color),
+      .user_buffer = texture_constant_color,
+   };
    union pipe_color_union clear = { 0 };
    union pipe_color_union green = { .f = { 0, 1, 0, 0 } };
    struct chrome9_resource *ctarget, *ctexture, *cbgra_target = NULL;
@@ -996,7 +1040,7 @@ run_pipe_texture(struct pipe_screen *screen)
    void *elements_handle = NULL, *replace_elements_handle = NULL;
    void *sampler_handle = NULL;
    void *replace_vs = NULL, *modulate_vs = NULL;
-   void *replace = NULL, *modulate = NULL;
+   void *replace = NULL, *modulate = NULL, *constant_modulate = NULL;
    void *samplers[1];
    uint32_t source_copy[4], mip_copy = 0x5aa55aa5, *source, *pixels;
    uint32_t *mip_pixel;
@@ -1120,6 +1164,7 @@ run_pipe_texture(struct pipe_screen *screen)
    modulate_vs = make_texture_vertex_shader(screen, context, true);
    replace = make_texture_fragment_shader(screen, context, false);
    modulate = make_texture_fragment_shader(screen, context, true);
+   constant_modulate = make_texture_constant_fragment_shader(screen, context);
    if (!blend_handle ||
        (chrome9_screen_has_capability(
            screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND) &&
@@ -1128,18 +1173,20 @@ run_pipe_texture(struct pipe_screen *screen)
        !elements_handle || !replace_elements_handle || !sampler_handle ||
        !view || !rhw_view ||
        !replace_vs ||
-       !modulate_vs || !replace || !modulate) {
+       !modulate_vs || !replace || !modulate || !constant_modulate ||
+       ((struct chrome9_shader *)constant_modulate)->fragment_program !=
+          CHROME9_FS_TEXTURE_CONSTANT_MODULATE) {
       fprintf(stderr,
               "texture setup failed: target=%p texture=%p context=%p "
               "blend=%p dsa=%p rasterizer=%p elements=%p "
               "replace_elements=%p sampler=%p "
               "view=%p rhw_view=%p replace_vs=%p modulate_vs=%p "
-              "replace=%p modulate=%p\n",
+              "replace=%p modulate=%p constant_modulate=%p\n",
               (void *)target, (void *)texture, (void *)context, blend_handle,
               dsa_handle, rasterizer_handle, elements_handle,
               replace_elements_handle, sampler_handle,
               (void *)view, (void *)rhw_view, replace_vs, modulate_vs,
-              replace, modulate);
+              replace, modulate, constant_modulate);
       goto out;
    }
 
@@ -1205,6 +1252,52 @@ run_pipe_texture(struct pipe_screen *screen)
                  expect[program][3]);
          goto out;
       }
+   }
+   {
+      const uint32_t expect[4] = {
+         0x800000, 0x008000, 0x000080, 0x808080,
+      };
+      const unsigned at[4][2] = { { 8, 8 }, { 24, 8 },
+                                  { 8, 24 }, { 24, 24 } };
+      uint64_t submitted = ccontext->submitted_triangles;
+      uint64_t rejected = ccontext->rejected_triangles;
+      bool pixels_match = true;
+
+      vertex_buffer.buffer.user = white_vertices;
+      context->set_vertex_buffers(context, 1, &vertex_buffer);
+      context->bind_vertex_elements_state(context, replace_elements_handle);
+      context->bind_vs_state(context, replace_vs);
+      context->bind_fs_state(context, constant_modulate);
+      context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0,
+                                   &texture_constant);
+      context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
+                     &clear, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush(context, NULL, 0);
+      pixels = (uint32_t *)((uint8_t *)ctarget->bo.map +
+                            ctarget->data_offset);
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++) {
+         uint32_t pixel =
+            pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] & 0xffffff;
+
+         for (unsigned shift = 0; shift <= 16; shift += 8)
+            pixels_match &=
+               abs((int)(pixel >> shift & 0xff) -
+                   (int)(expect[i] >> shift & 0xff)) <= 1;
+      }
+      context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0, NULL);
+      if (!pixels_match || ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(ctexture)) {
+         fprintf(stderr,
+                 "texture*c0 MODULATE mismatch: submitted=+%" PRIu64
+                 " rejected=+%" PRIu64 "\n",
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected);
+         goto out;
+      }
+      puts("Gallium texture*c0 MODULATE passed");
    }
    bool source_pixels_match =
       source[0] == source_copy[0] && source[1] == source_copy[1] &&
@@ -1448,6 +1541,8 @@ out:
       if (modulate_vs) context->delete_vs_state(context, modulate_vs);
       if (replace) context->delete_fs_state(context, replace);
       if (modulate) context->delete_fs_state(context, modulate);
+      if (constant_modulate)
+         context->delete_fs_state(context, constant_modulate);
       if (view) pipe_sampler_view_reference(&view, NULL);
       if (rhw_view) pipe_sampler_view_reference(&rhw_view, NULL);
       if (sampler_handle)

@@ -77,7 +77,9 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       crender->ctx->fs->fragment_program == CHROME9_FS_TWO_TEXTURE_MODULATE ?
       2 : crender->ctx->fs &&
           (crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_REPLACE ||
-           crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_MODULATE) ?
+           crender->ctx->fs->fragment_program == CHROME9_FS_TEXTURE_MODULATE ||
+           crender->ctx->fs->fragment_program ==
+              CHROME9_FS_TEXTURE_CONSTANT_MODULATE) ?
           1 : 0;
    crender->textured = crender->texture_count != 0;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
@@ -104,6 +106,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
                             crender->ctx->fs->fragment_program ==
                                CHROME9_FS_CONSTANT_COLOR ||
                             crender->ctx->fs->fragment_program ==
+                               CHROME9_FS_TEXTURE_CONSTANT_MODULATE ||
+                            crender->ctx->fs->fragment_program ==
                                CHROME9_FS_TEXTURE_REPLACE ||
                             crender->ctx->fs->fragment_program ==
                                CHROME9_FS_TWO_TEXTURE_MODULATE) &&
@@ -124,7 +128,8 @@ chrome9_fragment_constant_color(struct chrome9_context *ctx, uint32_t *color)
    float rgba[4];
 
    if (!ctx->fs ||
-       ctx->fs->fragment_program != CHROME9_FS_CONSTANT_COLOR ||
+       (ctx->fs->fragment_program != CHROME9_FS_CONSTANT_COLOR &&
+        ctx->fs->fragment_program != CHROME9_FS_TEXTURE_CONSTANT_MODULATE) ||
        cb->buffer_size < sizeof(rgba) ||
        cb->buffer_offset > UINT32_MAX - sizeof(rgba))
       return false;
@@ -491,7 +496,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       return;
    }
-   if (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR &&
+   if ((ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR ||
+        ctx->fs->fragment_program ==
+           CHROME9_FS_TEXTURE_CONSTANT_MODULATE) &&
        !chrome9_fragment_constant_color(ctx, &constant_color)) {
       ctx->rejected_triangles++;
       return;
@@ -522,7 +529,9 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          return;
       }
       memcpy(&color, vertex + 4 * sizeof(float), sizeof(color));
-      if (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR)
+      if (ctx->fs->fragment_program == CHROME9_FS_CONSTANT_COLOR ||
+          ctx->fs->fragment_program ==
+             CHROME9_FS_TEXTURE_CONSTANT_MODULATE)
          color = constant_color;
       x[i] = chrome9_coord_16_16(position[0], target->base.width0);
       y[i] = chrome9_coord_16_16(position[1], target->base.height0);

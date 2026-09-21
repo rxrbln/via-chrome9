@@ -509,6 +509,8 @@ chrome9_fs_result(nir_def *def)
       return CHROME9_FS_TEXTURE_REPLACE;
    case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_PRIMARY:
       return CHROME9_FS_TEXTURE_MODULATE;
+   case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_CONSTANT0:
+      return CHROME9_FS_TEXTURE_CONSTANT_MODULATE;
    case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_TEXTURE1:
       return CHROME9_FS_TWO_TEXTURE_MODULATE;
    default:
@@ -592,9 +594,14 @@ chrome9_fs_classify(nir_shader *nir)
        (result == CHROME9_FS_PRIMARY_COLOR && texture_count) ||
        (result == CHROME9_FS_CONSTANT_COLOR &&
         (texture_count || constant_count != 1)) ||
-       (result != CHROME9_FS_CONSTANT_COLOR && constant_count) ||
+       (result == CHROME9_FS_TEXTURE_CONSTANT_MODULATE &&
+        (texture_count != 1 || constant_count != 1)) ||
+       (result != CHROME9_FS_CONSTANT_COLOR &&
+        result != CHROME9_FS_TEXTURE_CONSTANT_MODULATE && constant_count) ||
        ((result == CHROME9_FS_TEXTURE_REPLACE ||
-         result == CHROME9_FS_TEXTURE_MODULATE) && texture_count != 1) ||
+         result == CHROME9_FS_TEXTURE_MODULATE ||
+         result == CHROME9_FS_TEXTURE_CONSTANT_MODULATE) &&
+        texture_count != 1) ||
        (result == CHROME9_FS_TWO_TEXTURE_MODULATE && texture_count != 2))
       return CHROME9_FS_UNSUPPORTED;
    return result;

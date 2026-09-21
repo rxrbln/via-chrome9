@@ -24,6 +24,7 @@ struct chrome9_shader {
       CHROME9_FS_CONSTANT_COLOR,
       CHROME9_FS_TEXTURE_REPLACE,
       CHROME9_FS_TEXTURE_MODULATE,
+      CHROME9_FS_TEXTURE_CONSTANT_MODULATE,
       CHROME9_FS_TWO_TEXTURE_MODULATE,
    } fragment_program;
    bool supported;
