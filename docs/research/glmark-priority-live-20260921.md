@@ -73,8 +73,9 @@ requests: one command-`0x14` draw submit per cube frame.  Other ioctls are
 loader, allocation, PRIME, close, and presentation traffic.
 
 The cat does not use command `0x14`.  Its 20-frame trace remains 362 ioctls
-and 0.336566 seconds in ioctl, with about 15 maximum-size D16 RHW runs per
-frame.  The next safe performance rung is one structured userspace request
+and 0.336566 seconds in ioctl.  A separate five-frame trace contains exactly
+75 command-`0x0f` requests: 15 maximum-size D16 RHW runs per frame.  The next
+safe performance rung is one structured userspace request
 containing multiple internally segmented, state-identical 544-triangle lists;
 it must retain the existing per-request mapping, guard, fence, and quarantine
 rules.
