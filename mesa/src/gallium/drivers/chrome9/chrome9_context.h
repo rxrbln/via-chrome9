@@ -53,6 +53,7 @@ struct chrome9_context {
    bool render_target_dirty;
    bool draw_triangle_d16;
    bool draw_triangle_d16_blend;
+   bool draw_triangle_batch;
    bool draw_textured_triangle;
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;

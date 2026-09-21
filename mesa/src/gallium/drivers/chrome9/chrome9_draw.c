@@ -32,6 +32,11 @@ struct chrome9_vbuf_render {
    size_t capacity;
    uint16_t vertex_size;
    uint16_t vertex_count;
+   struct drm_chrome9_draw_triangle_batch batch;
+   struct drm_chrome9_vertex_d16
+      batch_vertices[DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES * 3];
+   unsigned batch_count;
+   bool batch_failed;
    bool textured;
    bool layout_valid;
 };
@@ -350,6 +355,34 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 }
 
 static void
+chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
+{
+   struct chrome9_context *ctx = crender->ctx;
+   const unsigned count = crender->batch_count;
+
+   if (!count)
+      return;
+   crender->batch.triangle_count = count;
+   crender->batch.vertices_ptr = (uintptr_t)crender->batch_vertices;
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   if (chrome9_draw_triangle_batch(fd, &crender->batch)) {
+      ctx->submitted_triangles += count;
+      chrome9_context_render_target_written(ctx);
+   } else {
+      ctx->rejected_triangles += count;
+      crender->batch_failed = true;
+      if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
+         fprintf(stderr,
+                 "chrome9: DRAW_TRIANGLE_BATCH failed after=%" PRIu64
+                 " count=%u: %s\n",
+                 ctx->submitted_triangles, count, strerror(errno));
+         ctx->warnings |= CHROME9_WARN_SUBMIT;
+      }
+   }
+   crender->batch_count = 0;
+}
+
+static void
 chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                       unsigned ia, unsigned ib, unsigned ic)
 {
@@ -371,6 +404,11 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    bool blend_successor;
    bool depth_active;
 
+   if (!crender->textured && ctx->draw_triangle_batch &&
+       crender->batch_failed) {
+      ctx->rejected_triangles++;
+      return;
+   }
    if (!crender->layout_valid ||
        !chrome9_draw_state_supported(ctx, &target, &depth, &texture, &sampler,
                                      crender->textured, &depth_active,
@@ -455,7 +493,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    if (!chrome9_triangle_nondegenerate(x, y))
       return;
 
-   if (ctx->draw_limit && ctx->submitted_triangles >= ctx->draw_limit) {
+   if (ctx->draw_limit &&
+       ctx->submitted_triangles + crender->batch_count >= ctx->draw_limit) {
       if (!ctx->draw_limit_reported) {
          fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
                          " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
@@ -469,7 +508,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       fprintf(stderr,
               "chrome9: submit triangle=%" PRIu64 " kind=%s%s%s "
               "xy=(%d,%d)(%d,%d)(%d,%d)\n",
-              ctx->submitted_triangles,
+              ctx->submitted_triangles + crender->batch_count,
               crender->textured ? "textured" : "color",
               depth_active ? "+d16" : "",
               blend_successor ? "+blend" : "",
@@ -565,6 +604,48 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
       }
    }
+   if (!crender->textured && ctx->draw_triangle_batch) {
+      if (!crender->batch_count) {
+         memset(&crender->batch, 0, sizeof(crender->batch));
+         crender->batch.destination_handle = target->bo.handle;
+         crender->batch.width = target->base.width0;
+         crender->batch.height = target->base.height0;
+         crender->batch.destination_pitch = target->stride;
+         crender->batch.scissor = scissor;
+         if (depth_active) {
+            crender->batch.flags |= DRM_CHROME9_TRIANGLE_BATCH_DEPTH;
+            crender->batch.depth_handle = depth->bo.handle;
+            crender->batch.depth_pitch = depth->stride;
+         }
+         if (blend_successor) {
+            crender->batch.flags |= DRM_CHROME9_TRIANGLE_BATCH_BLEND;
+            crender->batch.blend = blend_state;
+            crender->batch.destination_format =
+               target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+               DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+               DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+         }
+      }
+      const unsigned base = crender->batch_count * 3;
+      for (unsigned i = 0; i < 3; i++) {
+         struct drm_chrome9_vertex_d16 *dst =
+            &crender->batch_vertices[base + i];
+
+         if (depth_active) {
+            *dst = depth_args.vertices[i];
+         } else {
+            dst->x_16_16 = args.vertices[i].x_16_16;
+            dst->y_16_16 = args.vertices[i].y_16_16;
+            dst->z_16_16 = 0;
+            dst->color = args.vertices[i].color;
+         }
+      }
+      crender->batch_count++;
+      if (crender->batch_count ==
+          DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES)
+         chrome9_flush_triangle_batch(crender);
+      return;
+   }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
    const bool submitted = crender->textured && blend_successor ?
       chrome9_draw_textured_triangle_blend(fd, &texture_blend_args) :
@@ -601,6 +682,8 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    unsigned end;
 
+   crender->batch_count = 0;
+   crender->batch_failed = false;
    if (start > crender->vertex_count || nr > crender->vertex_count - start)
       return;
    end = start + nr;
@@ -637,6 +720,7 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
       crender->ctx->rejected_triangles++;
       break;
    }
+   chrome9_flush_triangle_batch(crender);
 }
 
 static void
@@ -645,6 +729,8 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
 
+   crender->batch_count = 0;
+   crender->batch_failed = false;
    if (!indices)
       return;
    switch (crender->prim) {
@@ -688,6 +774,7 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
       crender->ctx->rejected_triangles++;
       break;
    }
+   chrome9_flush_triangle_batch(crender);
 }
 
 static void
