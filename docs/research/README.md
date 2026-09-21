@@ -110,6 +110,10 @@ targets.
   bounded one-record key after a guarded pixel oracle.
 - [chrome9-dst-one-record-corpus.tsv](chrome9-dst-one-record-corpus.tsv)
   retains four byte-matched Windows/Linux v0/c0 DST topologies.
+- [chrome9-pixel-sgn-rejection.md](chrome9-pixel-sgn-rejection.md) separates
+  the vertex-only one-record SGN from the rejected/faulting pixel opcode.
+- [chrome9-pixel-sgn-rejection.tsv](chrome9-pixel-sgn-rejection.tsv) records
+  the exact Windows tokenizer fault and Linux rejection boundary.
 - [windows-umd-wine-entrypoint-boundary.md](windows-umd-wine-entrypoint-boundary.md)
   inventories public D3D/OGL entry points, proves the UMD's 208-byte KMD
   adapter-record dependency under Wine, and records the private compiler path
