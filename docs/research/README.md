@@ -132,6 +132,14 @@ targets.
   constants, ALU/TEX, varying linkage, activation and termination as one
   bounded runtime contract, and prioritizes the glamor forms beyond the
   current fixed fragment classes.
+- [ioquake3-gl2-fragment-constants.md](ioquake3-gl2-fragment-constants.md)
+  closes the split 32-vector fragment constant store, its H3 upload packets,
+  ioquake startup demand, structured job-local ABI, and guarded bank-boundary
+  tests.
+- [ioquake3-gl2-ps-next-rungs.md](ioquake3-gl2-ps-next-rungs.md) inventories
+  ioquake's post-constant GL2 shader families, records exact common ALU and
+  multi-phase sampler objects, proves fragment flow/derivatives are silently
+  unsupported, and defines fail-closed NIR keys and live promotion oracles.
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
