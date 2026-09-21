@@ -8,6 +8,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/swiotlb.h>
 #include <linux/vgaarb.h>
 
 #include <video/vga.h>
@@ -69,6 +70,18 @@ module_param_named(copy_rect_preserve_alpha,
 		   chrome9_copy_rect_preserve_alpha, bool, 0400);
 MODULE_PARM_DESC(copy_rect_preserve_alpha,
 		 "Expose the silicon-gated one-pass RGB copy preserving A/X");
+
+static bool chrome9_dma32_scanout;
+module_param_named(dma32_scanout, chrome9_dma32_scanout, bool, 0400);
+MODULE_PARM_DESC(dma32_scanout,
+		 "Allocate explicitly flagged scanout BOs below 4 GiB without SWIOTLB");
+
+bool chrome9_dma32_scanout_supported(struct chrome9_device *cdev)
+{
+	return chrome9_dma32_scanout && IS_ENABLED(CONFIG_ZONE_DMA32) &&
+	       dma_get_mask(&cdev->pdev->dev) == DMA_BIT_MASK(32) &&
+	       !is_swiotlb_force_bounce(&cdev->pdev->dev);
+}
 
 static bool chrome9_staging_scanout;
 module_param_named(staging_scanout, chrome9_staging_scanout, bool, 0400);
@@ -2354,6 +2367,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 	case DRM_CHROME9_PARAM_CAPABILITIES:
 		args->value = DRM_CHROME9_CAP_GEM |
 			DRM_CHROME9_CAP_GEM_SHMEM_CACHED;
+		if (chrome9_dma32_scanout_supported(cdev))
+			args->value |= DRM_CHROME9_CAP_GEM_DMA32_SCANOUT;
 		if (chrome9_engine_ready(cdev)) {
 			args->value |= DRM_CHROME9_CAP_FIXED_QUAD |
 				       DRM_CHROME9_CAP_DRAW_TRIANGLE |

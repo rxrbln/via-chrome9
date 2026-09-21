@@ -132,6 +132,8 @@ static inline struct chrome9_device *to_chrome9(struct drm_device *drm)
 	return container_of(drm, struct chrome9_device, drm);
 }
 
+bool chrome9_dma32_scanout_supported(struct chrome9_device *cdev);
+
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
 int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,

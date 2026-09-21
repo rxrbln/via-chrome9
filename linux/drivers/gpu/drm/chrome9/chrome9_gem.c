@@ -4,6 +4,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/pagemap.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 
 #include <drm/drm_dumb_buffers.h>
@@ -24,6 +26,8 @@
 #define CHROME9_SCANOUT_MAX_HEIGHT	2048U
 #define CHROME9_SCANOUT_PITCH_ALIGN	8U
 #define CHROME9_SCANOUT_PITCH_MAX	0x3ff8U
+#define CHROME9_DMA32_SCANOUT_MAX_SIZE \
+	((u64)CHROME9_SCANOUT_PITCH_MAX * CHROME9_SCANOUT_MAX_HEIGHT)
 
 struct chrome9_framebuffer {
 	struct drm_framebuffer base;
@@ -32,6 +36,17 @@ struct chrome9_framebuffer {
 	struct chrome9_sf_mapping *mapping;
 	unsigned int pin_count;
 };
+
+static void
+chrome9_gem_set_dma32(struct drm_gem_shmem_object *shmem_obj)
+{
+	struct address_space *mapping = shmem_obj->base.filp->f_mapping;
+	gfp_t mask = mapping_gfp_mask(mapping);
+
+	/* drm_gem_get_pages() requires this zone to remain stable thereafter. */
+	mapping_set_gfp_mask(mapping,
+			     (mask & ~GFP_ZONEMASK) | __GFP_DMA32);
+}
 
 static inline struct chrome9_framebuffer *
 to_chrome9_framebuffer(struct drm_framebuffer *fb)
@@ -102,6 +117,8 @@ int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 	shmem_obj = drm_gem_shmem_create(drm, args->size);
 	if (IS_ERR(shmem_obj))
 		return PTR_ERR(shmem_obj);
+	if (chrome9_dma32_scanout_supported(to_chrome9(drm)))
+		chrome9_gem_set_dma32(shmem_obj);
 	obj = &shmem_obj->base;
 	ret = drm_gem_handle_create(file, obj, &args->handle);
 	drm_gem_object_put(obj);
@@ -293,18 +310,29 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	struct drm_chrome9_gem_create *args = data;
 	struct drm_gem_shmem_object *shmem_obj;
 	struct drm_gem_object *obj;
+	struct scatterlist *sg;
 	struct sg_table *sgt;
+	unsigned int i;
 	int ret;
 
-	if (args->flags || !args->size || args->size > CHROME9_MAX_BO_SIZE)
+	if (args->flags & ~DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT ||
+	    !args->size || args->handle || args->mmap_offset)
 		return -EINVAL;
-	if (args->handle || args->mmap_offset)
-		return -EINVAL;
+	if ((args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT) &&
+	    args->size > CHROME9_DMA32_SCANOUT_MAX_SIZE)
+		return -E2BIG;
+	if (args->size > CHROME9_MAX_BO_SIZE)
+		return -E2BIG;
+	if ((args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT) &&
+	    !chrome9_dma32_scanout_supported(to_chrome9(drm)))
+		return -EOPNOTSUPP;
 
 	shmem_obj = drm_gem_shmem_create(drm, args->size);
 	if (IS_ERR(shmem_obj))
 		return PTR_ERR(shmem_obj);
 	obj = &shmem_obj->base;
+	if (args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT)
+		chrome9_gem_set_dma32(shmem_obj);
 
 	/*
 	 * Establish this device's DMA mapping before the object can be shared or
@@ -315,6 +343,20 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		goto out_put;
+	}
+	if (args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT) {
+		for (i = 0; i < obj->size >> PAGE_SHIFT; i++) {
+			if (page_to_phys(shmem_obj->pages[i]) >= BIT_ULL(32)) {
+				ret = -ERANGE;
+				goto out_put;
+			}
+		}
+		for_each_sgtable_sg(sgt, sg, i) {
+			if (sg_dma_is_swiotlb(sg)) {
+				ret = -ERANGE;
+				goto out_put;
+			}
+		}
 	}
 	dma_sync_sgtable_for_cpu(&to_chrome9(drm)->pdev->dev, sgt,
 				 DMA_BIDIRECTIONAL);
