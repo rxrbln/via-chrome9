@@ -89,6 +89,10 @@ targets.
   recovers A8/L8/L8A8 and RGB565/ARGB1555/ARGB4444 sampler and render-target
   encodings, channel and alpha semantics, guarded readback tests, and safe
   32-bit upload-expansion fallbacks.
+- [ioquake-texture-format-sampler-plan.md](ioquake-texture-format-sampler-plan.md)
+  cross-checks both Windows UMDs, proprietary Linux, the VX900 manual, and old
+  Mesa for ioquake's next sampler formats; it gives the complete min/mag/mip
+  and wrap words plus standardized level-zero and guarded two-level vectors.
 - [sf-2d-copy-present.md](sf-2d-copy-present.md) records the exact translated
   SF screen-copy packet, base/pitch/domain encoding, sticky-state reset,
   overlap directions, fence/cache ownership, and guarded copy-present oracle.

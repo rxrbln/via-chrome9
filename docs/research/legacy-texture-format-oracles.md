@@ -242,3 +242,9 @@ userspace pair a 1-byte cpp with a 16-bit selector.  Mesa's
 `is_format_supported` must return sampler, render-target, blendable, and
 scanout support independently; none of the static table rows justifies all
 four usages.
+
+[ioquake-texture-format-sampler-plan.md](ioquake-texture-format-sampler-plan.md)
+adds the exact full GL min/mag/mip matrix, measured level-zero wrap/filter
+status, common current-guarded L0--L1 layout, and an implementation order for
+the game path.  This document remains authoritative for the wider sampler and
+render-target format catalog.
