@@ -156,6 +156,15 @@ chrome9_draw_textured_triangle(
 }
 
 bool
+chrome9_draw_two_textured_triangle(
+   int fd, const struct drm_chrome9_draw_two_textured_triangle *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE, draw) == 0;
+}
+
+bool
 chrome9_draw_triangle_blend(
    int fd, const struct drm_chrome9_draw_triangle_blend *draw)
 {

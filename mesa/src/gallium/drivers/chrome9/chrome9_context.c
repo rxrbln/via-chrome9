@@ -329,7 +329,7 @@ chrome9_fs_is_primary_color(nir_def *def, unsigned depth)
 }
 
 static bool
-chrome9_fs_is_texcoord(nir_def *def, unsigned depth)
+chrome9_fs_is_texcoord(nir_def *def, unsigned unit, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
 
@@ -343,12 +343,12 @@ chrome9_fs_is_texcoord(nir_def *def, unsigned depth)
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_interpolated_input:
          return nir_intrinsic_io_semantics(intr).location ==
-                   VARYING_SLOT_TEX0 &&
+                   VARYING_SLOT_TEX0 + unit &&
                 !nir_intrinsic_component(intr);
       case nir_intrinsic_load_deref:
          var = nir_intrinsic_get_var(intr, 0);
          return var && var->data.mode == nir_var_shader_in &&
-                var->data.location == VARYING_SLOT_TEX0 &&
+                var->data.location == VARYING_SLOT_TEX0 + unit &&
                 !var->data.location_frac;
       default:
          return false;
@@ -360,21 +360,21 @@ chrome9_fs_is_texcoord(nir_def *def, unsigned depth)
       if (alu->op == nir_op_mov)
          return alu->src[0].swizzle[0] == 0 &&
                 alu->src[0].swizzle[1] == 1 &&
-                chrome9_fs_is_texcoord(alu->src[0].src.ssa, depth + 1);
+                chrome9_fs_is_texcoord(alu->src[0].src.ssa, unit, depth + 1);
       if (alu->op == nir_op_vec2) {
          nir_def *source = alu->src[0].src.ssa;
 
          return alu->src[1].src.ssa == source &&
                 alu->src[0].swizzle[0] == 0 &&
                 alu->src[1].swizzle[0] == 1 &&
-                chrome9_fs_is_texcoord(source, depth + 1);
+                chrome9_fs_is_texcoord(source, unit, depth + 1);
       }
    }
    return false;
 }
 
 static bool
-chrome9_fs_is_texture(nir_def *def)
+chrome9_fs_is_texture(nir_def *def, unsigned unit)
 {
    nir_instr *instr = nir_def_instr(def);
    nir_tex_instr *tex;
@@ -386,31 +386,37 @@ chrome9_fs_is_texture(nir_def *def)
    coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    return tex->op == nir_texop_tex &&
           tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
-          !tex->is_shadow && tex->texture_index == 0 &&
-          tex->sampler_index == 0 && tex->coord_components == 2 &&
+          !tex->is_shadow && tex->texture_index == unit &&
+          tex->sampler_index == unit && tex->coord_components == 2 &&
           coord >= 0 && tex->num_srcs == 1 &&
-          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, 0);
+          chrome9_fs_is_texcoord(tex->src[coord].src.ssa, unit, 0);
 }
 
+#define CHROME9_FS_FACTOR_TEXTURE0 (1u << 0)
+#define CHROME9_FS_FACTOR_TEXTURE1 (1u << 1)
+#define CHROME9_FS_FACTOR_PRIMARY  (1u << 2)
+
 static unsigned
-chrome9_fs_result(nir_def *def, unsigned depth)
+chrome9_fs_factors(nir_def *def, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
 
    if (depth > 8 || def->num_components != 4)
-      return CHROME9_FS_UNSUPPORTED;
-   if (chrome9_fs_is_texture(def))
-      return CHROME9_FS_TEXTURE_REPLACE;
+      return 0;
+   if (chrome9_fs_is_texture(def, 0))
+      return CHROME9_FS_FACTOR_TEXTURE0;
+   if (chrome9_fs_is_texture(def, 1))
+      return CHROME9_FS_FACTOR_TEXTURE1;
    if (chrome9_fs_is_primary_color(def, depth))
-      return CHROME9_FS_PRIMARY_COLOR;
+      return CHROME9_FS_FACTOR_PRIMARY;
    if (instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
 
       if (alu->op == nir_op_mov || alu->op == nir_op_fsat) {
          for (unsigned c = 0; c < 4; c++)
             if (alu->src[0].swizzle[c] != c)
-               return CHROME9_FS_UNSUPPORTED;
-         return chrome9_fs_result(alu->src[0].src.ssa, depth + 1);
+               return 0;
+         return chrome9_fs_factors(alu->src[0].src.ssa, depth + 1);
       }
       if (alu->op == nir_op_fmul) {
          unsigned a, b;
@@ -418,17 +424,30 @@ chrome9_fs_result(nir_def *def, unsigned depth)
          for (unsigned c = 0; c < 4; c++)
             if (alu->src[0].swizzle[c] != c ||
                 alu->src[1].swizzle[c] != c)
-               return CHROME9_FS_UNSUPPORTED;
-         a = chrome9_fs_result(alu->src[0].src.ssa, depth + 1);
-         b = chrome9_fs_result(alu->src[1].src.ssa, depth + 1);
-         if ((a == CHROME9_FS_TEXTURE_REPLACE &&
-              b == CHROME9_FS_PRIMARY_COLOR) ||
-             (b == CHROME9_FS_TEXTURE_REPLACE &&
-              a == CHROME9_FS_PRIMARY_COLOR))
-            return CHROME9_FS_TEXTURE_MODULATE;
+               return 0;
+         a = chrome9_fs_factors(alu->src[0].src.ssa, depth + 1);
+         b = chrome9_fs_factors(alu->src[1].src.ssa, depth + 1);
+         return a && b && !(a & b) ? a | b : 0;
       }
    }
-   return CHROME9_FS_UNSUPPORTED;
+   return 0;
+}
+
+static unsigned
+chrome9_fs_result(nir_def *def)
+{
+   switch (chrome9_fs_factors(def, 0)) {
+   case CHROME9_FS_FACTOR_PRIMARY:
+      return CHROME9_FS_PRIMARY_COLOR;
+   case CHROME9_FS_FACTOR_TEXTURE0:
+      return CHROME9_FS_TEXTURE_REPLACE;
+   case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_PRIMARY:
+      return CHROME9_FS_TEXTURE_MODULATE;
+   case CHROME9_FS_FACTOR_TEXTURE0 | CHROME9_FS_FACTOR_TEXTURE1:
+      return CHROME9_FS_TWO_TEXTURE_MODULATE;
+   default:
+      return CHROME9_FS_UNSUPPORTED;
+   }
 }
 
 static unsigned
@@ -449,7 +468,8 @@ chrome9_fs_classify(nir_shader *nir)
                nir_tex_instr *tex = nir_instr_as_tex(instr);
 
                texture_count++;
-               if (!chrome9_fs_is_texture(&tex->def))
+               if (!chrome9_fs_is_texture(&tex->def, tex->texture_index) ||
+                   tex->texture_index > 1)
                   valid = false;
                continue;
             }
@@ -475,7 +495,7 @@ chrome9_fs_classify(nir_shader *nir)
                if ((location != FRAG_RESULT_COLOR &&
                     location != FRAG_RESULT_DATA0) ||
                    written ||
-                   !(result = chrome9_fs_result(intr->src[0].ssa, 0)))
+                   !(result = chrome9_fs_result(intr->src[0].ssa)))
                   valid = false;
                written = true;
                break;
@@ -485,7 +505,7 @@ chrome9_fs_classify(nir_shader *nir)
                    (var->data.location != FRAG_RESULT_COLOR &&
                     var->data.location != FRAG_RESULT_DATA0) ||
                    written ||
-                   !(result = chrome9_fs_result(intr->src[1].ssa, 0)))
+                   !(result = chrome9_fs_result(intr->src[1].ssa)))
                   valid = false;
                written = true;
                break;
@@ -499,7 +519,8 @@ chrome9_fs_classify(nir_shader *nir)
    if (!valid || !written ||
        (result == CHROME9_FS_PRIMARY_COLOR && texture_count) ||
        ((result == CHROME9_FS_TEXTURE_REPLACE ||
-         result == CHROME9_FS_TEXTURE_MODULATE) && texture_count != 1))
+         result == CHROME9_FS_TEXTURE_MODULATE) && texture_count != 1) ||
+       (result == CHROME9_FS_TWO_TEXTURE_MODULATE && texture_count != 2))
       return CHROME9_FS_UNSUPPORTED;
    return result;
 }
@@ -1107,6 +1128,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH);
    ctx->draw_textured_triangle =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
+   ctx->draw_two_textured_triangle =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE);
    ctx->draw_triangle_blend =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND);
    ctx->draw_textured_triangle_blend =

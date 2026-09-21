@@ -130,14 +130,18 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
    fs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    fs->max_instructions = 32;
    fs->max_alu_instructions = 32;
-   fs->max_inputs = 2;
+   fs->max_inputs =
+      (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
+      3 : 2;
    fs->max_outputs = 1;
    fs->max_temps = 8;
    /* Mesa's compatibility context requires at least one logical unit. */
-   fs->max_texture_samplers = 1;
-   fs->max_sampler_views = 1;
+   fs->max_texture_samplers =
+      (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
+      2 : 1;
+   fs->max_sampler_views = fs->max_texture_samplers;
    if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) {
-      fs->max_tex_instructions = 1;
+      fs->max_tex_instructions = fs->max_texture_samplers;
       fs->max_tex_indirections = 1;
    }
 }

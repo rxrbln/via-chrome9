@@ -23,6 +23,7 @@ struct chrome9_shader {
       CHROME9_FS_PRIMARY_COLOR,
       CHROME9_FS_TEXTURE_REPLACE,
       CHROME9_FS_TEXTURE_MODULATE,
+      CHROME9_FS_TWO_TEXTURE_MODULATE,
    } fragment_program;
    bool supported;
 };
@@ -55,6 +56,7 @@ struct chrome9_context {
    bool draw_triangle_d16_blend;
    bool draw_triangle_batch;
    bool draw_textured_triangle;
+   bool draw_two_textured_triangle;
    bool draw_triangle_blend;
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;
