@@ -311,7 +311,9 @@ Thus a wrap costs one proven PID10 STOP and one full install, not another prime
 submission.  The pending segment is built before STOP, but it is copied into
 the active ring only after full idle.
 
-On a STOP timeout, retain the old epoch untouched and quarantine for reboot.
+On a STOP timeout, do not overwrite its command bytes or install a new epoch;
+retain the old ring and mappings in their uncertain PID10-transition state and
+quarantine for reboot.
 On a timeout after the new full install, retain the new epoch and all job
 mappings for reboot.  Never attempt A66/A67 tail-jump rewind or PID01 as a
 fallback.
