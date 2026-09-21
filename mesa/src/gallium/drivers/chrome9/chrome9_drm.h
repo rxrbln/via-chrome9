@@ -44,6 +44,8 @@ bool chrome9_draw_textured_triangle(
    int fd, const struct drm_chrome9_draw_textured_triangle *draw);
 bool chrome9_draw_textured_triangle_batch(
    int fd, const struct drm_chrome9_draw_textured_triangle_batch *draw);
+bool chrome9_draw_textured_triangle_run(
+   int fd, const struct drm_chrome9_draw_textured_triangle_run *draw);
 bool chrome9_copy_rect(int fd, const struct drm_chrome9_copy_rect *copy);
 bool chrome9_draw_textured_triangle_d16(
    int fd, const struct drm_chrome9_draw_textured_triangle_d16 *draw);

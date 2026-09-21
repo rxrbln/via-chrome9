@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -18,6 +19,11 @@ _Static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128,
                "Chrome9 RHW run ABI size");
 _Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_batch) == 160,
                "Chrome9 textured batch ABI size");
+_Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_run) == 160,
+               "Chrome9 textured run ABI size");
+_Static_assert(offsetof(struct drm_chrome9_draw_textured_triangle_run,
+                        vertices_ptr) == 128,
+               "Chrome9 textured run vertex pointer offset");
 _Static_assert(sizeof(struct drm_chrome9_copy_rect) == 96,
                "Chrome9 copy rectangle ABI size");
 _Static_assert(sizeof(struct drm_chrome9_gem_create) == 24,
@@ -169,6 +175,15 @@ chrome9_draw_textured_triangle_batch(
    if (!draw)
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_BATCH, draw) == 0;
+}
+
+bool
+chrome9_draw_textured_triangle_run(
+   int fd, const struct drm_chrome9_draw_textured_triangle_run *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_RUN, draw) == 0;
 }
 
 bool

@@ -120,6 +120,7 @@ struct chrome9_context {
    bool draw_program_triangle_d16_rhw_batch;
    bool draw_textured_triangle;
    bool draw_textured_triangle_batch;
+   bool draw_textured_triangle_run;
    bool copy_rect;
    bool copy_rect_unguarded_destination;
    bool copy_rect_preserve_alpha;
