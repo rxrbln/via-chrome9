@@ -538,6 +538,71 @@ adds oT0.xy and a one-texture REPLACE draw with the exact tuple above.  Only
 after all four pass should a qualifying NIR shader bypass `draw`; every other
 shader continues on the already working software path.
 
+## GL 2 / GLES 2 fragment path: bounded implementation order
+
+A native PS 2.0 compiler is useful before it is sufficient for either API.
+Mesa 26.2's desktop `compute_version()` requires the GL 1.5 chain (therefore
+`ARB_shadow`) plus vertex shader, fragment shader, NPOT textures, separate
+blend equations, and two-sided stencil for GL 2.0.  Its ES2 path requires the
+two shader stages, NPOT textures, and separate blend equations.  Chrome9
+currently clears both `texture_shadow_map` and `npot_textures`, so neither
+version gate can open accidentally.  Keep those caps false while developing
+the compiler; setting them to make a context appear is not shader validation.
+
+The current kernel interface is another hard boundary.  It accepts only the
+enumerated REPLACE and MODULATE fragment programs.  A Mesa NIR backend cannot
+submit an arbitrary native PS until there is a bounded UAPI which carries or
+constructs all of the following as one validated transaction:
+
+* finalized ALU and TAU stores, at most 96 and 32 records respectively;
+* the exact ordered ALU/TAU phase sequence from which the kernel can verify
+  A90 start phase and derive A93/A94 and A95..A9a transition maps;
+* one color output oC0, no depth output or TEXKILL in the first revision;
+* float constants c0..c31, uploaded through the two API banks beginning at
+  selectors `22030000` and `22030080` without exposing internal/gap banks;
+* the sampler ids and fragment-input linkage consumed by the program, checked
+  against the texture-state and VS-output transaction for the same draw.
+
+Do not accept raw A90..A9b words from userspace.  Counts must equal the store
+lengths, every transition bit must be below the corresponding count, unused
+bitmap bits must be zero, and A9b must remain kernel-owned runtime state.
+Likewise, a successful vendor compile is not validation: it silently
+truncates overlong stores and allows unmapped texture-register sources to
+become native id `3f`.
+
+The first NIR-to-native fragment lowerer should be deterministic and fall
+back to rejection, never to approximate execution:
+
+1. Run ordinary NIR scalarization/copy propagation/DCE, lower `fsub` to ADD
+   plus source NEG and `ffma` to MAD, then require a single acyclic block.
+   Reject remaining loops, branches, phi nodes, calls, indirect constants,
+   integer/Boolean ALU, derivatives, discard, depth output, and unsupported
+   system values.
+2. Initially allow full-precision MOV, ADD, MUL, and MAD with XYZW swizzles,
+   NONE/NEG sources, NONE/SAT destination, r0..r11, c0..c31, and oC0.  Add
+   DP3/DP4, MIN/MAX, RCP/RSQ, FRC, CMP/select, and every multi-record lowering
+   only after a numerical silicon vector for that operation.  Preflight the
+   expanded record count before building any packet.
+3. Gate inputs independently.  First use only proven primary color v0.  Then
+   add one ordinary TEXLD using TAU t0/s0 and its existing texture/linkage
+   oracle.  A direct ALU read of texture coordinate t0, secondary color v1,
+   or t1 is a new raster-linkage test even though its instruction field is
+   decoded.  Never infer 64 varyings from the six-bit source id.
+4. Gate scheduling shapes in increasing order: ALU-only; one leading TAU then
+   ALU; two independent TAUs then ALU; finally a dependent
+   TAU-to-ALU-to-TAU-to-ALU stream.  The exact control tuples for all four are
+   documented above.  TEXLDP, TEXLDB, and TEXKILL remain later gates because
+   only their compiler encodings, not their complete live state, are known.
+
+For ioquake3, the lower-risk next step remains a fixed two-texture
+base-times-lightmap enum using the already recovered two-stage state and
+shader oracle; it does not require exposing GL 2.0.  For glmark2's GLES2
+scenes, an internal allowlisted shader fast path can bring up individual
+tests, but truthful ES2 exposure must wait for the full ES2 minimum texture,
+blend, format, varying, shader-language, and draw semantics.  The proprietary
+ICDs themselves did not advertise GLSL, so their compiler is an encoding
+oracle rather than a conformance claim.
+
 ## Compiler feature limits and safe Mesa exposure
 
 The Windows pixel frontend recognizes `ps_1_0` through `ps_1_4` and `ps_2_0`;

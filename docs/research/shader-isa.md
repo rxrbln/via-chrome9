@@ -507,6 +507,38 @@ The first implementation should enforce all of these bounds before emission:
 | source modifiers | NONE and NEG only |
 | destination modifiers | NONE and SAT only |
 
+The fragment-input ABI needs its own allowlist; the six-bit operand field is
+not enough.  Four hardware-free MOV differentials through the 2015 Windows
+backend with identity allocation give the exact semantic encodings:
+
+```text
+mov oC0,v0: 01c00530 301c0053 00f04005 000d0820
+mov oC0,v1: 01c00530 301c0053 00f04105 000d0820
+mov oC0,t0: 01c00530 301c0053 00f0c005 000d0820
+mov oC0,t1: 01c00530 301c0053 00f0c105 000d0820
+```
+
+Thus D3D color inputs `v0/v1` are native class 1, ids 0/1, while texture
+coordinate registers `t0/t1` are class 3, ids 0/1.  The replay artifact is
+`/tmp/chrome9-varying-corpus.json`, SHA-256
+`b704e6bc9c017916668ad6dcb44dd72a59bfa6f7eaabe48b110998a823372229`;
+the probe and UMD hashes are
+`a87f9bf57008362bdfb8e616860b19dd8d8442d17b5c5f0e77edb4b2ec13d94c`
+and
+`8ac6959fc3ab21b73fcf37ae4615e87ab285f3a56bc27623f3094d82cee49b45`.
+
+That mapping is not permission to use arbitrary `tN`.  The Wine wrapper
+deliberately installs an identity remap callback.  The full Linux compiler,
+using the real H5 register manager, produces the same values for v0, v1, and
+t0 but maps a standalone unallocated t1 (and t7) to native id `3f`, giving
+`00f0ff05`; `object+0x40` still records the logical usage bit.  The `3f` is an
+unchecked not-found sentinel from `stmPPS_GetReMapTexSlot_invi`, not a sixty-
+fourth varying.  A Mesa backend must allocate/link every texture-class input
+before encoding it and reject a missing physical mapping.  Initial execution
+therefore remains bounded to the already proven `v0` color and TAU `t0`
+coordinate path; direct ALU reads of t0/t1 and v1 each need separate linkage
+tests.
+
 The safest first ALU allowlist is the one-native-record family `MOV`, `ADD`,
 `SUB`, `MUL`, and `MAD`, plus literal zero/one and normal XYZW swizzles.  Their
 exact templates and per-field differentials are in
