@@ -1512,14 +1512,28 @@ run_pipe_texture(struct pipe_screen *screen)
    }
    {
       const uint32_t expect[4] = {
-         0xff0000, 0x00ff00, 0x0000ff, 0xffffff,
+         0xff0000, 0xffffff, 0xff0000, 0xffffff,
+      };
+      static const uint32_t rgbx_texels[8] = {
+         0x00ff0000, 0x00ff0000, 0x00ff0000, 0x00ff0000,
+         0x00ffffff, 0x00ffffff, 0x00ffffff, 0x00ffffff,
       };
       const unsigned at[4][2] = { { 8, 8 }, { 24, 8 },
                                   { 8, 24 }, { 24, 24 } };
       uint64_t submitted = ccontext->submitted_triangles;
       uint64_t rejected = ccontext->rejected_triangles;
+      uint32_t *rgbx_source = (uint32_t *)
+         ((uint8_t *)crhw_texture->bo.map + crhw_texture->data_offset);
       bool pixels_match = true;
 
+      /* The main texture is deliberately BGRA for the sampled-alpha blend
+       * oracle below.  RGBX lowering is legal only for a true XRGB sampler,
+       * so exercise it with the separate XRGB source whose stored X bytes
+       * are all zero. */
+      memset(crhw_texture->bo.map, 0xa5, crhw_texture->bo.size);
+      memcpy(rgbx_source, rgbx_texels, sizeof(rgbx_texels));
+      context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                                 &rhw_view);
       context->bind_fs_state(context, rgbx);
       context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
                      &clear, 1.0, 0);
@@ -1532,7 +1546,8 @@ run_pipe_texture(struct pipe_screen *screen)
       if (!pixels_match || ccontext->submitted_triangles != submitted + 2 ||
           ccontext->rejected_triangles != rejected ||
           !smoke_guard_pages_match(ctarget) ||
-          !smoke_guard_pages_match(ctexture)) {
+          !smoke_guard_pages_match(crhw_texture) ||
+          memcmp(rgbx_source, rgbx_texels, sizeof(rgbx_texels))) {
          fprintf(stderr,
                  "texture RGBX mismatch: submitted=+%" PRIu64
                  " rejected=+%" PRIu64 "\n",
@@ -1540,6 +1555,8 @@ run_pipe_texture(struct pipe_screen *screen)
                  ccontext->rejected_triangles - rejected);
          goto out;
       }
+      context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                                 &view);
       puts("Gallium texture RGBX lowering passed");
    }
    bool source_pixels_match =
