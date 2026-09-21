@@ -153,6 +153,11 @@ that store unchanged is a safety property of this first successor.
 These rows were regenerated with the Mesa `e34de89` offline encoder and match
 the recovered proprietary A/C destination and last-use rules.
 
+They are also reproduced byte for byte by the proprietary Linux 5.75
+production configuration-two compiler. The four exact token streams and a
+Windows raw-stage comparison are retained in
+[chrome9-multi-alu-cross-driver-corpus.tsv](chrome9-multi-alu-cross-driver-corpus.tsv).
+
 Two records, one temporary:
 
 ```text
@@ -215,3 +220,26 @@ This design does not admit textures, more than one constant, partial writes,
 SAT, source modifiers, arbitrary swizzles, B-slot operations, control flow,
 discard, depth output, or raw native programs. It also does not reserve an ABI
 number. Those are separate successors with separate corpus and silicon gates.
+
+## Windows wrapper boundary
+
+The headless D3D Wine wrapper independently accepts all four programs above
+and produces the same operation and destination topology. Its injected
+identity/allocation callbacks do not reconstruct temporary source locations,
+however: for example its second record for the two-record case remains
+`0140b6d0 00080053 00f00000 00000820` before and after the wrapper's
+post-translation call. It is not an executable native record.
+
+Therefore the corpus keeps the Windows raw column separate. The executable
+golden is the byte-identical Linux configuration-two and Mesa result; no test
+may substitute the unresolved Windows wrapper row. This is a wrapper-context
+limit, not evidence that the shipped Windows KMD submits unresolved words.
+
+Reproduction identities:
+
+```text
+Wine wrapper PE32     a87f9bf57008362bdfb8e616860b19dd8d8442d17b5c5f0e77edb4b2ec13d94c
+Linux probe binary    a22c873536dc4b6c45c43a00a48dbc183e40ddb89ed5e1461890efad2d21e6ba
+Linux probe source    4299ac3cb182c9e26688dd40e63e9aed4fb86ce47c829717b2663b734f040c13
+Mesa encoder source   dabd63db42ad5939cdac2da6195556f6caa3c97b65a829e233797e36a927107e
+```

@@ -15,6 +15,9 @@ targets.
 - [chrome9-multi-alu-structured-uapi.md](chrome9-multi-alu-structured-uapi.md)
   defines an unallocated, fail-closed three-record MOV/MUL semantic successor
   with exact packet growth, validation, and native live-oracle rows.
+- [chrome9-multi-alu-cross-driver-corpus.tsv](chrome9-multi-alu-cross-driver-corpus.tsv)
+  retains matching Linux/Mesa finalized rows and the deliberately separate
+  unresolved Windows-wrapper raw rows for that successor.
 - [chrome9-ps-encoder-v1-corpus.tsv](chrome9-ps-encoder-v1-corpus.tsv) is the
   finalized oC0 and texture-consumer golden corpus for the bounded encoder.
 - [chrome9-ps-temp-lifetime-finalizer.md](chrome9-ps-temp-lifetime-finalizer.md)
