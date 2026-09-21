@@ -144,7 +144,7 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
 /* Two level-zero textures can be multiplied with D16 test/write. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16	(1ULL << 20)
-/* Up to 272 perspective D16 triangles share one state-complete command. */
+/* Up to 544 perspective D16 triangles share one state-complete command. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_RUN	(1ULL << 22)
 /* Every D16 draw can test depth without updating the depth surface. */
 #define DRM_CHROME9_CAP_DEPTH_READ_ONLY	(1ULL << 23)
@@ -166,6 +166,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS	(1ULL << 40)
 /* One compiler-generated MOV/MUL fragment instruction with D16 RHW runs. */
 #define DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH	(1ULL << 41)
+/* COPY_RECT can preserve destination A/X while copying BGR source bytes. */
+#define DRM_CHROME9_CAP_COPY_RECT_PRESERVE_ALPHA	(1ULL << 42)
 /* Up to 16 one-texture triangles share one validated state envelope. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH	(1ULL << 43)
 /* Same-format, linear 32-bpp SF rectangles can use bounded H6 GXcopy. */
@@ -659,12 +661,14 @@ struct drm_chrome9_draw_textured_triangle_batch {
 
 #define DRM_CHROME9_COPY_RECT_FORCE_ALPHA_ONE	(1U << 0)
 #define DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED	(1U << 1)
+#define DRM_CHROME9_COPY_RECT_PRESERVE_DESTINATION_ALPHA	(1U << 2)
 
 /*
  * Copy one integer rectangle between distinct linear SF objects.  Source is
  * guarded; destination is guarded unless DESTINATION_UNGUARDED is selected.
  * Source and destination use the same 32-bpp bit significance; no blend,
  * conversion, keying, scaling, tiling, clipping, or overlap is permitted.
+ * FORCE_ALPHA_ONE and PRESERVE_DESTINATION_ALPHA are mutually exclusive.
  */
 struct drm_chrome9_copy_rect {
 	__u32 destination_handle;
@@ -722,12 +726,12 @@ struct drm_chrome9_draw_triangle_d16_rhw_batch {
 	__u64 reserved[3];
 };
 
-#define DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES	272U
+#define DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES	544U
 
 /*
  * Large-list successor to DRAW_TRIANGLE_D16_RHW_BATCH.  It is byte-identical
  * only in version one so that each command retains an immutable count limit:
- * the old batch remains capped at 34 while this request accepts up to 272
+ * the old batch remains capped at 34 while this request accepts up to 544
  * post-viewport RHW triangles under one complete state envelope.
  */
 struct drm_chrome9_draw_triangle_d16_rhw_run {
