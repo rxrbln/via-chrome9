@@ -676,8 +676,13 @@ chrome9_fs_is_generic0_rgbx(nir_def *def, nir_def **base, unsigned depth)
       nir_def *source = NULL;
 
       if (!chrome9_fs_is_generic0_component(&alu->src[c], c, &source,
-                                            depth + 1) ||
-          (found && source != found))
+                                            depth + 1) &&
+          (!c ||
+           !chrome9_fs_is_generic0_component(&alu->src[c], 0, &source,
+                                             depth + 1) ||
+           source->num_components != 1))
+         return false;
+      if (found && source != found)
          return false;
       found = source;
    }

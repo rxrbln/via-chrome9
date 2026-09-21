@@ -972,6 +972,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
       generic_rgba_fs = make_generic_rgba_fragment_shader(screen, context);
       generic_rgbx_vs = make_generic_rgbx_vertex_shader(screen, context);
       generic_rgbx_fs = make_generic_rgbx_fragment_shader(screen, context);
+      if (!generic_rgbx_vs || !generic_rgbx_fs ||
+          ((struct chrome9_shader *)generic_rgbx_fs)->fragment_program !=
+             CHROME9_FS_PRIMARY_GENERIC_RGBX)
+         fprintf(stderr,
+                 "vec3 VAR0 RGBX setup failed: vs=%p fs=%p program=%u\n",
+                 generic_rgbx_vs, generic_rgbx_fs,
+                 generic_rgbx_fs ?
+                    ((struct chrome9_shader *)generic_rgbx_fs)->fragment_program :
+                    CHROME9_FS_UNSUPPORTED);
    }
    scalar_gray_vs = make_scalar_generic_vertex_shader(screen, context, false);
    scalar_gray_fs = make_scalar_rgbx_fragment_shader(screen, context);
@@ -1478,7 +1487,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          context->flush_resource(context, resource);
          context->flush(context, NULL, 0);
          pixel = pixels[32 * (surface->stride / 4) + 192];
-         passed = pixel == 0xff4080bf &&
+         passed = (pixel & 0xffffff) == 0x4080bf &&
+                  (resource->format != PIPE_FORMAT_B8G8R8A8_UNORM ||
+                   (pixel >> 24) == 0xff) &&
                   chrome9_context(context)->submitted_triangles ==
                      submitted + 2 &&
                   chrome9_context(context)->rejected_triangles == rejected &&
