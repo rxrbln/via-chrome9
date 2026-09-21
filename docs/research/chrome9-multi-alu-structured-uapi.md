@@ -88,6 +88,8 @@ Validation should happen before BO lookup, vertex copying, or ring mutation:
    last record must write COLOR.
 7. Earlier records must each define a previously undefined temporary. Reject
    read-before-definition, WAW, dead definitions, and any temporary not used.
+   Do not require numerical definition order: the recursive Mesa lowering can
+   validly define r1 before r0 for a three-level left-deep expression.
 8. Count all reads first, then assign release bits on the last read in a
    second pass. For the present A/C operand set, if both slots make the last
    read of the same temporary, set A only. This is the vendor A-over-C rule.
@@ -185,6 +187,16 @@ MUL oC0,r0,r1   0140b6d0 30201053 00f20005 00000820
 controls        90058000 91000000 92000003 93000000
 ```
 
+Three records in the reverse-id order produced by a left-deep recursive NIR
+tree are also byte-identical between Linux configuration two and Mesa:
+
+```text
+MUL r1,v0,c0    0140b6d0 30080053 00f04005 00000060
+MUL r0,r1,c0    0140b6d0 30080053 00f20105 00000020
+MUL oC0,r0,c0   0140b6d0 30080053 00f20005 00000820
+controls        90058000 91000000 92000003 93000000
+```
+
 The final row proves two different temporaries may be released together: A
 release is dword2 bit17 and C release is dword1 bit21. A separate duplicate
 source oracle sets only A's marker:
@@ -203,9 +215,11 @@ timeout quarantine:
 
 1. `MOV r0,v0; MUL oC0,r0,c0`, with c0=(0.5,1,1,1), checks two-record order.
 2. The linear three-record row checks r0 release before r1 consumption.
-3. The branch row checks simultaneous A/C release without a wedge.
-4. A duplicate-temp row checks A-over-C release precedence.
-5. Negative ioctls cover count 0/4, early COLOR, final TEMP, undefined/dead
+3. The reverse-id row checks that semantic validation does not impose a false
+   r0-before-r1 rule on compiler output.
+4. The branch row checks simultaneous A/C release without a wedge.
+5. A duplicate-temp row checks A-over-C release precedence.
+6. Negative ioctls cover count 0/4, early COLOR, final TEMP, undefined/dead
    temps, WAW, nonidentity swizzle, nonzero modifier/reserved, NaN/Inf c0, and
    a nonzero unused c0.
 
