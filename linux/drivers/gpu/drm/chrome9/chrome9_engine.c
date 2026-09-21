@@ -12,6 +12,7 @@
 #include <linux/sizes.h>
 #include <linux/uaccess.h>
 #include <linux/vgaarb.h>
+#include <linux/vmalloc.h>
 
 #include <video/vga.h>
 
@@ -35,6 +36,7 @@
 #define CHROME9_GART_CACHED		BIT(25)
 #define CHROME9_RING_PAGES		16U
 #define CHROME9_RING_SIZE		(CHROME9_RING_PAGES * PAGE_SIZE)
+#define CHROME9_RUN_STAGING_SIZE	SZ_32K
 #define CHROME9_CR_READ_AHEAD		0x220U
 #define CHROME9_SEQ_INDEX		0x83c4
 #define CHROME9_SEQ_DATA			0x83c5
@@ -128,6 +130,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH,
+	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN,
 	CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
 };
 
@@ -190,6 +193,7 @@ static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_blend) == 144);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_batch) == 128);
 static_assert(sizeof(struct drm_chrome9_vertex_d16_rhw) == 20);
 static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_batch) == 128);
+static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128);
 static_assert(sizeof(struct drm_chrome9_ps_source) == 8);
 static_assert(sizeof(struct drm_chrome9_ps_instruction) == 24);
 static_assert(sizeof(struct drm_chrome9_draw_program_triangle_d16_rhw_batch) ==
@@ -222,6 +226,7 @@ struct chrome9_engine {
 	void *ring_cpu;
 	dma_addr_t ring_dma;
 	void *staging_cpu;
+	void *run_staging_cpu;
 	void __iomem *gart;
 	void *gart_saved;
 	u64 fence_context;
@@ -433,12 +438,21 @@ static void chrome9_emit_header3(u32 **cursor, u32 paratype,
 	*cursor = p;
 }
 
-static int chrome9_finish_ring(u32 *base, u32 *p, u32 *pause, u32 *stop)
+static int chrome9_finish_ring_sized(u32 *base, u32 *p, size_t capacity,
+				     u32 *pause, u32 *stop)
 {
-	u32 *end = base + PAGE_SIZE / sizeof(*base);
+	u32 *end;
+	size_t used;
 
-	if ((u8 *)p - (u8 *)base > PAGE_SIZE - CHROME9_CR_READ_AHEAD)
+	if (!base || !p || p < base || !capacity ||
+	    !IS_ALIGNED(capacity, 2 * sizeof(*base)) ||
+	    capacity < CHROME9_CR_READ_AHEAD)
+		return -EINVAL;
+	used = (u8 *)p - (u8 *)base;
+	if (!IS_ALIGNED(used, 2 * sizeof(*base)) ||
+	    used > capacity - CHROME9_CR_READ_AHEAD)
 		return -E2BIG;
+	end = base + capacity / sizeof(*base);
 	do {
 		*p++ = 0xccccccc0;
 		*p++ = 0xddd00000;
@@ -459,13 +473,18 @@ static int chrome9_finish_ring(u32 *base, u32 *p, u32 *pause, u32 *stop)
 	} while (!IS_ALIGNED((unsigned long)p, 128));
 	*stop = (u8 *)p - (u8 *)base - 16;
 	if (*stop <= *pause || *stop - *pause < 0x20 ||
-	    *stop > PAGE_SIZE - CHROME9_CR_READ_AHEAD)
+	    *stop > capacity - CHROME9_CR_READ_AHEAD)
 		return -E2BIG;
 	while (p < end) {
 		*p++ = 0xccccccc0;
 		*p++ = 0xddd00000;
 	}
 	return 0;
+}
+
+static int chrome9_finish_ring(u32 *base, u32 *p, u32 *pause, u32 *stop)
+{
+	return chrome9_finish_ring_sized(base, p, PAGE_SIZE, pause, stop);
 }
 
 static int chrome9_build_prime(struct chrome9_engine *engine,
@@ -1380,7 +1399,13 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	};
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
-	u32 *base = engine->staging_cpu;
+	bool run = request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN;
+	void *staging = run ? engine->run_staging_cpu : engine->staging_cpu;
+	size_t staging_size = run ? CHROME9_RUN_STAGING_SIZE : PAGE_SIZE;
+	u32 max_triangles = run ? DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES :
+		DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES;
+	u32 *base = staging;
 	u32 *body;
 	u32 *p;
 	u32 delta = 0;
@@ -1392,16 +1417,16 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	bool compiled = request->kind ==
 		CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH;
 	bool perspective = compiled || request->kind ==
-		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH;
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH || run;
 	unsigned int i;
+	int ret;
 
-	if (!triangle_count ||
-	    triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES)
+	if (!base || !triangle_count || triangle_count > max_triangles)
 		return -E2BIG;
 	if (!depth_func)
 		depth_func = DRM_CHROME9_COMPARE_LESS;
 
-	memset(base, 0xcc, PAGE_SIZE);
+	memset(base, 0xcc, staging_size);
 	p = base;
 	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
 	body = PTR_ALIGN(p, 16);
@@ -1518,7 +1543,15 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
-	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
+	ret = chrome9_finish_ring_sized(base, p, staging_size, pause,
+				       &job->segment_stop);
+	if (ret)
+		return ret;
+	if (run && triangle_count == DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES &&
+	    (*pause != 0x4ff0 || job->segment_stop != 0x5070 ||
+	     body[54 + delta] != 0x24000330))
+		return -EINVAL;
+	return 0;
 }
 
 static int chrome9_emit_depth_body(u32 **cursor, u32 target, u32 depth,
@@ -1715,7 +1748,8 @@ static void chrome9_fill_ring_dummy(struct chrome9_engine *engine)
 }
 
 static int chrome9_append_segment(struct chrome9_engine *engine,
-				  struct chrome9_job *job, u32 segment_pause,
+				  struct chrome9_job *job, const void *source,
+				  size_t source_capacity, u32 segment_pause,
 				  bool *must_quarantine)
 {
 	struct chrome9_device *cdev = engine->cdev;
@@ -1728,11 +1762,11 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	lockdep_assert_held(&engine->submit_lock);
 	*must_quarantine = false;
 	job->segment_pause = segment_pause;
-	if (job->segment_stop <= segment_pause ||
+	if (!source || job->segment_stop <= segment_pause ||
 	    job->segment_stop - segment_pause < 0x20 ||
 	    check_add_overflow((size_t)job->segment_stop,
 			       (size_t)CHROME9_CR_READ_AHEAD, &copy_len) ||
-	    copy_len > PAGE_SIZE)
+	    copy_len > source_capacity || copy_len > CHROME9_RING_SIZE)
 		return -E2BIG;
 
 	status = readl(cdev->mmio + CHROME9_REG_CR_STATUS);
@@ -1750,7 +1784,7 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 			return ret;
 		}
 		chrome9_fill_ring_dummy(engine);
-		memcpy(engine->ring_cpu, engine->staging_cpu, copy_len);
+		memcpy(engine->ring_cpu, source, copy_len);
 		chrome9_cache_flush(engine->ring_cpu, CHROME9_RING_SIZE);
 		dma_wmb();
 		append = 0;
@@ -1761,7 +1795,7 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 		engine->ring_epoch++;
 		engine->wrap_count++;
 	} else {
-		memcpy((u8 *)engine->ring_cpu + append, engine->staging_cpu,
+		memcpy((u8 *)engine->ring_cpu + append, source,
 		       copy_len);
 		chrome9_cache_flush((u8 *)engine->ring_cpu + append, copy_len);
 		dma_wmb();
@@ -2479,6 +2513,11 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 		ret = -ENOMEM;
 		goto err_free_ring;
 	}
+	engine->run_staging_cpu = vzalloc(CHROME9_RUN_STAGING_SIZE);
+	if (!engine->run_staging_cpu) {
+		ret = -ENOMEM;
+		goto err_free_ring;
+	}
 	cdev->engine = engine;
 	engine->saved_dst_pos = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
 	ret = chrome9_gart_bind_ring(engine);
@@ -2547,6 +2586,7 @@ err_restore_gart:
 	}
 err_free_ring:
 	cdev->engine = NULL;
+	vfree(engine->run_staging_cpu);
 	if (engine->staging_cpu)
 		free_page((unsigned long)engine->staging_cpu);
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
@@ -2693,7 +2733,8 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	}
 	if (ret)
 		goto out_prepublication;
-	ret = chrome9_append_segment(engine, job, pause, &must_quarantine);
+	ret = chrome9_append_segment(engine, job, engine->staging_cpu, PAGE_SIZE,
+				     pause, &must_quarantine);
 	if (ret) {
 		if (!must_quarantine)
 			goto out_prepublication;
@@ -3203,7 +3244,14 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 					   depth_target, &pause);
 	if (ret)
 		goto out_prepublication;
-	ret = chrome9_append_segment(engine, job, pause, &must_quarantine);
+	if (request->kind == CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN)
+		ret = chrome9_append_segment(engine, job,
+					     engine->run_staging_cpu,
+					     CHROME9_RUN_STAGING_SIZE, pause,
+					     &must_quarantine);
+	else
+		ret = chrome9_append_segment(engine, job, engine->staging_cpu,
+					     PAGE_SIZE, pause, &must_quarantine);
 	if (ret) {
 		if (!must_quarantine)
 			goto out_prepublication;
@@ -3859,6 +3907,8 @@ static int chrome9_encode_ps_instruction(
 
 static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 				       struct drm_file *file, bool perspective,
+				       u32 max_triangles,
+				       enum chrome9_draw_kind perspective_kind,
 				       const u32 ps_program[4],
 				       const u32 ps_constant_c0[4])
 {
@@ -3895,7 +3945,7 @@ static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 	    (!depth && (args->flags & (DRM_CHROME9_DEPTH_FUNC_MASK |
 				      DRM_CHROME9_DEPTH_READ_ONLY))) ||
 	    !args->triangle_count ||
-	    args->triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES ||
+	    args->triangle_count > max_triangles ||
 	    !args->vertices_ptr || args->reserved0 || args->pad ||
 	    args->reserved[0] || args->reserved[1] || args->reserved[2] ||
 	    !args->width || args->width > 2048 ||
@@ -3986,7 +4036,7 @@ static int chrome9_draw_triangle_batch(struct drm_device *drm, void *data,
 		       sizeof(request.ps_constant_c0));
 	} else if (perspective) {
 		request.batch_vertices_rhw = vertices;
-		request.kind = CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH;
+		request.kind = perspective_kind;
 	} else {
 		request.batch_vertices = vertices;
 		request.kind = depth ? CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH :
@@ -4003,14 +4053,51 @@ out_free:
 int chrome9_draw_triangle_batch_ioctl(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
-	return chrome9_draw_triangle_batch(drm, data, file, false, NULL, NULL);
+	return chrome9_draw_triangle_batch(
+		drm, data, file, false,
+		DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES,
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH, NULL, NULL);
 }
 
 int chrome9_draw_triangle_d16_rhw_batch_ioctl(struct drm_device *drm,
 					       void *data,
 					       struct drm_file *file)
 {
-	return chrome9_draw_triangle_batch(drm, data, file, true, NULL, NULL);
+	return chrome9_draw_triangle_batch(
+		drm, data, file, true,
+		DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES,
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH, NULL, NULL);
+}
+
+int chrome9_draw_triangle_d16_rhw_run_ioctl(struct drm_device *drm,
+					    void *data,
+					    struct drm_file *file)
+{
+	struct drm_chrome9_draw_triangle_d16_rhw_run *args = data;
+	struct drm_chrome9_draw_triangle_batch batch = {
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->depth_handle,
+		.flags = args->flags,
+		.triangle_count = args->triangle_count,
+		.width = args->width,
+		.height = args->height,
+		.destination_pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+		.destination_format = args->destination_format,
+		.reserved0 = args->reserved0,
+		.blend = args->blend,
+		.scissor = args->scissor,
+		.pad = args->pad,
+		.vertices_ptr = args->vertices_ptr,
+		.reserved = {
+			args->reserved[0], args->reserved[1], args->reserved[2],
+		},
+	};
+
+	return chrome9_draw_triangle_batch(
+		drm, &batch, file, true,
+		DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES,
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN, NULL, NULL);
 }
 
 int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
@@ -4040,8 +4127,11 @@ int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
 					    args->constant_c0, program);
 	if (ret)
 		return ret;
-	return chrome9_draw_triangle_batch(drm, &batch, file, true, program,
-					   args->constant_c0);
+	return chrome9_draw_triangle_batch(
+		drm, &batch, file, true,
+		DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES,
+		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_BATCH, program,
+		args->constant_c0);
 }
 
 static bool chrome9_float_finite(u32 value)
@@ -4913,6 +5003,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		 engine->append_count, engine->wrap_count, engine->ring_epoch);
 	mutex_unlock(&engine->submit_lock);
 	cdev->engine = NULL;
+	vfree(engine->run_staging_cpu);
 	free_page((unsigned long)engine->staging_cpu);
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
 			  engine->ring_cpu, engine->ring_dma);
