@@ -100,6 +100,26 @@ the aligned tail because the 410 jump command requires `4*128` alignment
 (`:1145..1189`).  None of that protocol has been live-proven on this VX900.
 Do not import it into the first monotonic implementation.
 
+The Windows executable independently contains the same circular-space
+algorithm at `VTGKModeDX32A.sys:0xa1c50..0xa1f46`.  Its recovered ring fields
+are CPU base `+0x1c`, published/current CPU cursor `+0x30`, and CPU end `+0x34`.
+For a request count in dwords it computes:
+
+```text
+request_bytes = request_dwords * 4
+NextSW        = gpu(current_cpu + request_bytes + 0x40)
+BoundaryCheck = gpu(base_cpu + request_bytes + 0x400)
+```
+
+At `0xa1ced..0xa1d51`, `0xa1d7c..0xa1de0`, and
+`0xa1ebf..0xa1f33` it polls MMIO `043c` with the same range comparisons twice
+before permitting overwrite or invoking the rewind callback.  Every loop is
+unbounded.  Thus the 64-byte request reserve, 0x400-byte wrap reserve,
+double-read policy, and current-pointer dependency are not Linux-source
+accidents; they are also in the shipping Windows ring manager.  This is useful
+cross-checking, but it strengthens the reason to defer byte reuse until Linux
+has a bounded silicon oracle for `043c`.
+
 ## Implementation-ready layout
 
 Use two allocations with different lifetimes:
