@@ -228,6 +228,9 @@ They are also reproduced byte for byte by the proprietary Linux 5.75
 production configuration-two compiler. The four exact token streams and a
 Windows raw-stage comparison are retained in
 [chrome9-multi-alu-cross-driver-corpus.tsv](chrome9-multi-alu-cross-driver-corpus.tsv).
+Static D3D/OpenGL finalizer provenance, normalized body hashes, destination
+ids, active-resource tuples, and eight additional short-chain rows are in
+[chrome9-mov-mul-short-chain-three-driver.md](chrome9-mov-mul-short-chain-three-driver.md).
 
 Two records, one temporary:
 
