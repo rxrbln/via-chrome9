@@ -77,12 +77,15 @@ struct chrome9_job {
 	struct drm_gem_shmem_object *destination;
 	struct drm_gem_shmem_object *depth;
 	struct drm_gem_shmem_object *texture2;
+	struct drm_gem_shmem_object *texture3;
 	struct sg_table *sgt;
 	struct sg_table *depth_sgt;
 	struct sg_table *texture2_sgt;
+	struct sg_table *texture3_sgt;
 	struct iosys_map map;
 	struct iosys_map depth_map;
 	struct iosys_map texture2_map;
+	struct iosys_map texture3_map;
 	struct drm_mm_node sf_node;
 	struct list_head quarantine_link;
 	u32 *ptes;
@@ -90,6 +93,7 @@ struct chrome9_job {
 	unsigned int destination_page_count;
 	unsigned int depth_page_count;
 	unsigned int texture2_page_count;
+	unsigned int texture3_page_count;
 	u32 cookie;
 	u32 flags;
 	u32 segment_pause;
@@ -100,6 +104,7 @@ struct chrome9_job {
 	bool mapped;
 	bool depth_mapped;
 	bool texture2_mapped;
+	bool texture3_mapped;
 	bool node_allocated;
 	bool sf_bound;
 	bool fence_attached;
@@ -116,6 +121,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND,
 	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE,
+	CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16,
 	CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_BATCH,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_BATCH,
@@ -128,6 +134,7 @@ struct chrome9_draw_request {
 	u32 depth_handle;
 	u32 texture_handle;
 	u32 texture2_handle;
+	u32 texture3_handle;
 	u32 flags;
 	u32 width;
 	u32 height;
@@ -155,6 +162,7 @@ struct chrome9_draw_request {
 	u32 texture2_wrap_s;
 	u32 texture2_wrap_t;
 	u64 texture2_object_size;
+	u64 texture3_object_size;
 	struct drm_chrome9_scissor_state scissor;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_vertex vertices[3];
@@ -181,6 +189,7 @@ static_assert(sizeof(struct drm_chrome9_texture_state) == 36);
 static_assert(sizeof(struct drm_chrome9_two_textured_vertex) == 40);
 static_assert(sizeof(struct drm_chrome9_draw_two_textured_triangle) == 240);
 static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_d16) == 192);
+static_assert(sizeof(struct drm_chrome9_draw_two_textured_triangle_d16) == 256);
 
 struct chrome9_blend_words {
 	u32 a00;
@@ -1004,7 +1013,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		const struct chrome9_draw_request *request,
 		struct chrome9_job *job, u32 target, u32 texture0, u32 texture1,
-		u32 *pause)
+		u32 depth, u32 *pause)
 {
 	static const u32 destination_tail[] = {
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
@@ -1060,7 +1069,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	u32 destination_state[11];
 	u32 image[2][6];
 	u32 sampler[2][4];
-	u32 common[] = {
+	u32 common[12] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
 		0x01c01540, 0x88001ed0, 0x89000800, 0xcc000000,
 	};
@@ -1074,7 +1083,13 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
+	u32 depth_delta = 0;
+	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
+	unsigned int common_count = 8;
 	unsigned int i;
+	bool depth_active = request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16;
 	const u32 addresses[2] = { texture0, texture1 };
 	const u32 widths[2] = { request->texture_width,
 				 request->texture2_width };
@@ -1116,6 +1131,17 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		sampler[i][2] = 0x32000040 | wrap_t[i] << 3 | wrap_s[i];
 		sampler[i][3] = 0xcccccccc;
 	}
+	if (depth_active) {
+		common[4] = 0x01c0154c;
+		common[7] = 0x10000000 | (depth >> 8);
+		common[8] = 0x11000001 |
+			((request->depth_pitch >> 5) << 13);
+		common[9] = 0x12380000;
+		common[10] = 0x13000000 | depth_func << 16;
+		common[11] = 0x20007fff;
+		common_count = ARRAY_SIZE(common);
+		depth_delta = 4;
+	}
 	for (i = 0; i < ARRAY_SIZE(request->two_textured_vertices); i++) {
 		const struct drm_chrome9_two_textured_vertex *src =
 			&request->two_textured_vertices[i];
@@ -1148,7 +1174,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x21020000,
 			     sampler[1], ARRAY_SIZE(sampler[1]));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     common, ARRAY_SIZE(common));
+			     common, common_count);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0xfe020000,
 			     config, ARRAY_SIZE(config));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
@@ -1173,24 +1199,45 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 			     rgba_program, ARRAY_SIZE(rgba_program));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00000000,
 			     vertices, ARRAY_SIZE(vertices));
-	if (p - body != 262 || body[4] != destination_state[0] ||
+	if (p - body != 262 + depth_delta ||
+	    body[4] != destination_state[0] ||
 	    body[6] != destination_state[2] || body[20] != image[0][0] ||
 	    body[21] != 0x18001101 || body[24] != image[0][4] ||
 	    body[25] != image[0][5] || body[32] != 0x30000000 ||
 	    body[40] != image[1][0] || body[41] != 0x18001101 ||
 	    body[44] != image[1][4] || body[45] != image[1][5] ||
-	    body[52] != 0x30000000 || body[72] != 0x00000021 ||
-	    body[74] != 0x08010102 || body[84] != 0x0000040a ||
-	    body[89] != 0x05008442 || body[92] != 0x624081ff ||
-	    body[93] != 0x20000000 || body[94] != 0x23004f02 ||
-	    body[95] != 0x24000003 || body[172] != 0x0009014c ||
-	    body[175] != 0x0008029f || body[180] != 0x60800005 ||
-	    body[190] != 0x92020002 || body[208] != 0x301001b0 ||
-	    body[209] != 0x311211b1 || body[216] != 0x0140b6d0 ||
-	    body[217] != 0x30202053 || body[219] != 0x0000007f ||
-	    body[220] != 0x01c00000 || body[223] != 0x000d083f ||
-	    body[224] != 0xcccccccc || body[225] != 0xdddddddd ||
-	    body[228] != 0xfe020440 || body[230] != 0x00000000)
+	    body[52] != 0x30000000 ||
+	    (depth_active &&
+	     (body[64] != 0x01c0154c ||
+	      body[67] != (0x10000000 | (depth >> 8)) ||
+	      body[68] != (0x11000001 |
+		((request->depth_pitch >> 5) << 13)) ||
+	      body[69] != 0x12380000 ||
+	      body[70] != (0x13000000 | depth_func << 16) ||
+	      body[71] != 0x20007fff)) ||
+	    body[72 + depth_delta] != 0x00000021 ||
+	    body[74 + depth_delta] != 0x08010102 ||
+	    body[84 + depth_delta] != 0x0000040a ||
+	    body[89 + depth_delta] != 0x05008442 ||
+	    body[92 + depth_delta] != 0x624081ff ||
+	    body[93 + depth_delta] != 0x20000000 ||
+	    body[94 + depth_delta] != 0x23004f02 ||
+	    body[95 + depth_delta] != 0x24000003 ||
+	    body[172 + depth_delta] != 0x0009014c ||
+	    body[175 + depth_delta] != 0x0008029f ||
+	    body[180 + depth_delta] != 0x60800005 ||
+	    body[190 + depth_delta] != 0x92020002 ||
+	    body[208 + depth_delta] != 0x301001b0 ||
+	    body[209 + depth_delta] != 0x311211b1 ||
+	    body[216 + depth_delta] != 0x0140b6d0 ||
+	    body[217 + depth_delta] != 0x30202053 ||
+	    body[219 + depth_delta] != 0x0000007f ||
+	    body[220 + depth_delta] != 0x01c00000 ||
+	    body[223 + depth_delta] != 0x000d083f ||
+	    body[224 + depth_delta] != 0xcccccccc ||
+	    body[225 + depth_delta] != 0xdddddddd ||
+	    body[228 + depth_delta] != 0xfe020440 ||
+	    body[230 + depth_delta] != 0x00000000)
 		return -EINVAL;
 	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
@@ -2645,6 +2692,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		const struct chrome9_draw_request *request)
 {
 	struct chrome9_device *cdev = to_chrome9(drm);
+	struct drm_gem_object *texture3_obj = NULL;
 	struct drm_gem_object *texture2_obj = NULL;
 	struct drm_gem_object *depth_obj = NULL;
 	struct drm_gem_object *obj = NULL;
@@ -2655,6 +2703,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	u32 target;
 	u32 depth_target;
 	u32 texture2_target;
+	u32 texture3_target;
 	u64 mapped_size;
 	long wait;
 	bool exec_initialized = false;
@@ -2664,9 +2713,12 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	bool must_quarantine;
 	bool textured_depth =
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16;
+	bool two_textured_depth = request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16;
+	bool four_objects = two_textured_depth;
 	bool three_objects =
 		request->kind == CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
-		textured_depth;
+		textured_depth || four_objects;
 	bool texture_objects = three_objects ||
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE ||
 		request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND;
@@ -2685,16 +2737,25 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	if (three_objects)
 		texture2_obj = drm_gem_object_lookup(file,
 						     request->texture2_handle);
-	if (!obj || !depth_obj || (three_objects && !texture2_obj)) {
+	if (four_objects)
+		texture3_obj = drm_gem_object_lookup(file,
+						     request->texture3_handle);
+	if (!obj || !depth_obj || (three_objects && !texture2_obj) ||
+	    (four_objects && !texture3_obj)) {
 		ret = -ENOENT;
 		goto out_put_objects;
 	}
 	if (obj == depth_obj || (three_objects &&
 	    (obj == texture2_obj || depth_obj == texture2_obj)) ||
+	    (four_objects &&
+	     (obj == texture3_obj || depth_obj == texture3_obj ||
+	      texture2_obj == texture3_obj)) ||
 	    obj->dev != drm || depth_obj->dev != drm ||
 	    (three_objects && texture2_obj->dev != drm) ||
+	    (four_objects && texture3_obj->dev != drm) ||
 	    drm_gem_is_imported(obj) || drm_gem_is_imported(depth_obj) ||
 	    (three_objects && drm_gem_is_imported(texture2_obj)) ||
+	    (four_objects && drm_gem_is_imported(texture3_obj)) ||
 	    obj->size != request->object_size ||
 	    (texture_objects ?
 	     depth_obj->size < request->depth_object_size :
@@ -2702,13 +2763,18 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	    (three_objects &&
 	     (textured_depth ?
 	      texture2_obj->size != request->texture2_object_size :
-	      texture2_obj->size < request->texture2_object_size))) {
+	      texture2_obj->size < request->texture2_object_size)) ||
+	    (four_objects &&
+	     texture3_obj->size != request->texture3_object_size)) {
 		ret = -EINVAL;
 		goto out_put_objects;
 	}
 	if (check_add_overflow(obj->size, depth_obj->size, &mapped_size) ||
 	    (three_objects &&
 	     check_add_overflow(mapped_size, texture2_obj->size,
+				&mapped_size)) ||
+	    (four_objects &&
+	     check_add_overflow(mapped_size, texture3_obj->size,
 				&mapped_size)) ||
 	    mapped_size > SZ_64M - CHROME9_RING_SIZE) {
 		ret = -E2BIG;
@@ -2725,12 +2791,16 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	job->depth = to_drm_gem_shmem_obj(depth_obj);
 	if (three_objects)
 		job->texture2 = to_drm_gem_shmem_obj(texture2_obj);
+	if (four_objects)
+		job->texture3 = to_drm_gem_shmem_obj(texture3_obj);
 	job->destination_page_count = obj->size >> PAGE_SHIFT;
 	job->depth_page_count = depth_obj->size >> PAGE_SHIFT;
 	job->texture2_page_count = three_objects ?
 		texture2_obj->size >> PAGE_SHIFT : 0;
+	job->texture3_page_count = four_objects ?
+		texture3_obj->size >> PAGE_SHIFT : 0;
 	job->page_count = job->destination_page_count + job->depth_page_count +
-			  job->texture2_page_count;
+			  job->texture2_page_count + job->texture3_page_count;
 	job->sgt = drm_gem_shmem_get_pages_sgt(job->destination);
 	if (IS_ERR(job->sgt)) {
 		ret = PTR_ERR(job->sgt);
@@ -2745,6 +2815,13 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		job->texture2_sgt = drm_gem_shmem_get_pages_sgt(job->texture2);
 		if (IS_ERR(job->texture2_sgt)) {
 			ret = PTR_ERR(job->texture2_sgt);
+			goto out_free_job;
+		}
+	}
+	if (four_objects) {
+		job->texture3_sgt = drm_gem_shmem_get_pages_sgt(job->texture3);
+		if (IS_ERR(job->texture3_sgt)) {
+			ret = PTR_ERR(job->texture3_sgt);
 			goto out_free_job;
 		}
 	}
@@ -2769,13 +2846,23 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		if (ret)
 			goto out_free_job;
 	}
+	if (four_objects) {
+		u32 *texture3_ptes = job->ptes + job->destination_page_count +
+			job->depth_page_count + job->texture2_page_count;
+
+		ret = chrome9_collect_sgt_ptes(job->texture3_sgt,
+					       texture3_ptes,
+					       job->texture3_page_count);
+		if (ret)
+			goto out_free_job;
+	}
 
 	spin_lock_init(&job->fence.lock);
 	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
 			 &job->fence.lock, engine->fence_context,
 			 atomic64_inc_return(&engine->fence_seqno));
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT,
-		      three_objects ? 3 : 2);
+		      four_objects ? 4 : three_objects ? 3 : 2);
 	exec_initialized = true;
 	drm_exec_until_all_locked(&exec) {
 		ret = drm_exec_prepare_obj(&exec, obj, 1);
@@ -2788,6 +2875,12 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 			goto out_exec;
 		if (three_objects) {
 			ret = drm_exec_prepare_obj(&exec, texture2_obj, 1);
+			drm_exec_retry_on_contention(&exec);
+			if (ret)
+				goto out_exec;
+		}
+		if (four_objects) {
+			ret = drm_exec_prepare_obj(&exec, texture3_obj, 1);
 			drm_exec_retry_on_contention(&exec);
 			if (ret)
 				goto out_exec;
@@ -2807,6 +2900,15 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	}
 	if (three_objects) {
 		wait = dma_resv_wait_timeout(texture2_obj->resv,
+					     dma_resv_usage_rw(true), true,
+					     CHROME9_DEP_TIMEOUT);
+		if (wait <= 0) {
+			ret = wait < 0 ? wait : -ETIMEDOUT;
+			goto out_exec;
+		}
+	}
+	if (four_objects) {
+		wait = dma_resv_wait_timeout(texture3_obj->resv,
 					     dma_resv_usage_rw(true), true,
 					     CHROME9_DEP_TIMEOUT);
 		if (wait <= 0) {
@@ -2837,6 +2939,16 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 			goto out_unmap;
 		job->texture2_mapped = true;
 		if (job->texture2_map.is_iomem) {
+			ret = -EINVAL;
+			goto out_unmap;
+		}
+	}
+	if (four_objects) {
+		ret = drm_gem_shmem_vmap_locked(job->texture3, &job->texture3_map);
+		if (ret)
+			goto out_unmap;
+		job->texture3_mapped = true;
+		if (job->texture3_map.is_iomem) {
 			ret = -EINVAL;
 			goto out_unmap;
 		}
@@ -2886,11 +2998,17 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	    texture2_obj->size > request->texture2_object_size)
 		chrome9_prepare_map_guards(&job->texture2_map,
 					   texture2_obj->size);
+	if (four_objects)
+		chrome9_prepare_map_guards(&job->texture3_map,
+					   request->texture3_object_size);
 	chrome9_cache_flush(job->map.vaddr, request->object_size);
 	chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
 	if (three_objects)
 		chrome9_cache_flush(job->texture2_map.vaddr,
 				    texture2_obj->size);
+	if (four_objects)
+		chrome9_cache_flush(job->texture3_map.vaddr,
+				    texture3_obj->size);
 	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->sgt,
 				    DMA_BIDIRECTIONAL);
 	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->depth_sgt,
@@ -2898,6 +3016,10 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	if (three_objects)
 		dma_sync_sgtable_for_device(&cdev->pdev->dev,
 					    job->texture2_sgt,
+					    DMA_BIDIRECTIONAL);
+	if (four_objects)
+		dma_sync_sgtable_for_device(&cdev->pdev->dev,
+					    job->texture3_sgt,
 					    DMA_BIDIRECTIONAL);
 	device_owned = true;
 	dma_resv_add_fence(obj->resv, &job->fence.base,
@@ -2909,15 +3031,23 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		dma_resv_add_fence(texture2_obj->resv, &job->fence.base,
 				   textured_depth ? DMA_RESV_USAGE_WRITE :
 				   DMA_RESV_USAGE_READ);
+	if (four_objects)
+		dma_resv_add_fence(texture3_obj->resv, &job->fence.base,
+				   DMA_RESV_USAGE_WRITE);
 	job->fence_attached = true;
 	target = job->sf_node.start + PAGE_SIZE;
 	depth_target = job->sf_node.start + obj->size + PAGE_SIZE;
 	texture2_target = job->sf_node.start + obj->size + depth_obj->size +
 			  PAGE_SIZE;
-	if (request->kind == CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE)
+	texture3_target = job->sf_node.start + obj->size + depth_obj->size +
+			  (three_objects ? texture2_obj->size : 0) + PAGE_SIZE;
+	if (request->kind == CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE ||
+	    two_textured_depth)
 		ret = chrome9_build_two_textured_triangle(engine, request, job,
 						   target, depth_target,
-						   texture2_target, &pause);
+						   texture2_target,
+						   two_textured_depth ?
+						   texture3_target : 0, &pause);
 	else if (textured_depth)
 		ret = chrome9_build_textured_triangle(engine, request, job, target,
 						      depth_target,
@@ -2960,11 +3090,17 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	if (three_objects)
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->texture2_sgt,
 					 DMA_BIDIRECTIONAL);
+	if (four_objects)
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev, job->texture3_sgt,
+					 DMA_BIDIRECTIONAL);
 	chrome9_cache_flush(job->map.vaddr, request->object_size);
 	chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
 	if (three_objects)
 		chrome9_cache_flush(job->texture2_map.vaddr,
 				    texture2_obj->size);
+	if (four_objects)
+		chrome9_cache_flush(job->texture3_map.vaddr,
+				    texture3_obj->size);
 	dma_rmb();
 	device_owned = false;
 	if (!chrome9_verify_map_guards(&job->map, request->object_size) ||
@@ -2979,7 +3115,10 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	    (three_objects && !textured_depth &&
 	     texture2_obj->size > request->texture2_object_size &&
 	     !chrome9_verify_map_guards(&job->texture2_map,
-					 texture2_obj->size))) {
+					 texture2_obj->size)) ||
+	    (four_objects &&
+	     !chrome9_verify_map_guards(&job->texture3_map,
+					 request->texture3_object_size))) {
 		ret = -EIO;
 		dma_fence_set_error(&job->fence.base, ret);
 	}
@@ -2987,6 +3126,8 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	chrome9_sf_resync_object_locked(engine, depth_obj);
 	if (three_objects)
 		chrome9_sf_resync_object_locked(engine, texture2_obj);
+	if (four_objects)
+		chrome9_sf_resync_object_locked(engine, texture3_obj);
 	mutex_lock(&engine->vm_lock);
 	if (chrome9_gart_set(engine, job->sf_node.start >> PAGE_SHIFT,
 			     NULL, job->page_count)) {
@@ -3043,18 +3184,31 @@ out_unmap:
 			dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 						 job->texture2_sgt,
 						 DMA_BIDIRECTIONAL);
+		if (four_objects)
+			dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
+						 job->texture3_sgt,
+						 DMA_BIDIRECTIONAL);
 		chrome9_cache_flush(job->map.vaddr, request->object_size);
 		chrome9_cache_flush(job->depth_map.vaddr, depth_obj->size);
 		if (three_objects)
 			chrome9_cache_flush(job->texture2_map.vaddr,
 					    texture2_obj->size);
+		if (four_objects)
+			chrome9_cache_flush(job->texture3_map.vaddr,
+					    texture3_obj->size);
 		/* Preserve device ownership for any object currently scanned out. */
 		mutex_lock(&engine->submit_lock);
 		chrome9_sf_resync_object_locked(engine, obj);
 		chrome9_sf_resync_object_locked(engine, depth_obj);
 		if (three_objects)
 			chrome9_sf_resync_object_locked(engine, texture2_obj);
+		if (four_objects)
+			chrome9_sf_resync_object_locked(engine, texture3_obj);
 		mutex_unlock(&engine->submit_lock);
+	}
+	if (job->texture3_mapped) {
+		drm_gem_shmem_vunmap_locked(job->texture3, &job->texture3_map);
+		job->texture3_mapped = false;
 	}
 	if (job->texture2_mapped) {
 		drm_gem_shmem_vunmap_locked(job->texture2, &job->texture2_map);
@@ -3076,6 +3230,9 @@ out_exec:
 	job->destination = NULL;
 	job->depth = NULL;
 	job->texture2 = NULL;
+	job->texture3 = NULL;
+	if (texture3_obj)
+		drm_gem_object_put(texture3_obj);
 	if (texture2_obj)
 		drm_gem_object_put(texture2_obj);
 	drm_gem_object_put(depth_obj);
@@ -3087,6 +3244,8 @@ out_free_job:
 	kfree(job->ptes);
 	kfree(job);
 out_put_objects:
+	if (texture3_obj)
+		drm_gem_object_put(texture3_obj);
 	if (texture2_obj)
 		drm_gem_object_put(texture2_obj);
 	if (depth_obj)
@@ -3720,6 +3879,116 @@ int chrome9_draw_two_textured_triangle_ioctl(struct drm_device *drm,
 	}
 	if (!chrome9_triangle_nondegenerate(
 		args->vertices[0].x_16_16, args->vertices[0].y_16_16,
+		args->vertices[1].x_16_16, args->vertices[1].y_16_16,
+		args->vertices[2].x_16_16, args->vertices[2].y_16_16))
+		return -EINVAL;
+	return chrome9_submit_depth_triangle(drm, file, &request);
+}
+
+int chrome9_draw_two_textured_triangle_d16_ioctl(struct drm_device *drm,
+						 void *data,
+						 struct drm_file *file)
+{
+	struct drm_chrome9_draw_two_textured_triangle_d16 *args = data;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_IMMEDIATE_TWO_TEXTURED_TRIANGLE_D16,
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->textures[0].handle,
+		.texture_handle = args->textures[0].handle,
+		.texture2_handle = args->textures[1].handle,
+		.texture3_handle = args->depth_handle,
+		.flags = args->flags,
+		.width = args->width,
+		.height = args->height,
+		.pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+		.texture_width = args->textures[0].width,
+		.texture_height = args->textures[0].height,
+		.texture_pitch = args->textures[0].pitch,
+		.texture_format = args->textures[0].format,
+		.min_filter = args->textures[0].min_filter,
+		.mag_filter = args->textures[0].mag_filter,
+		.wrap_s = args->textures[0].wrap_s,
+		.wrap_t = args->textures[0].wrap_t,
+		.texture2_width = args->textures[1].width,
+		.texture2_height = args->textures[1].height,
+		.texture2_pitch = args->textures[1].pitch,
+		.texture2_format = args->textures[1].format,
+		.texture2_min_filter = args->textures[1].min_filter,
+		.texture2_mag_filter = args->textures[1].mag_filter,
+		.texture2_wrap_s = args->textures[1].wrap_s,
+		.texture2_wrap_t = args->textures[1].wrap_t,
+		.scissor = args->scissor,
+	};
+	u64 surface_size;
+	u64 total_size;
+	unsigned int i;
+	int ret;
+
+	if (!(args->flags & DRM_CHROME9_DEPTH_FUNC_MASK) ||
+	    chrome9_validate_depth_flags(args->flags, 0) || args->reserved0 ||
+	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
+	    !args->destination_handle || !args->depth_handle ||
+	    !args->textures[0].handle || !args->textures[1].handle ||
+	    args->destination_handle == args->depth_handle ||
+	    args->destination_handle == args->textures[0].handle ||
+	    args->destination_handle == args->textures[1].handle ||
+	    args->depth_handle == args->textures[0].handle ||
+	    args->depth_handle == args->textures[1].handle ||
+	    args->textures[0].handle == args->textures[1].handle ||
+	    !args->width || args->width > 2048 ||
+	    !args->height || args->height > 2048 ||
+	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
+	    args->depth_pitch != ALIGN(args->width * sizeof(u16), 32))
+		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
+	if (check_mul_overflow((u64)args->destination_pitch,
+			       (u64)args->height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.object_size))
+		return -E2BIG;
+	ret = chrome9_validate_two_texture_state(&args->textures[0],
+						 &request.texture_object_size);
+	if (ret)
+		return ret;
+	request.depth_object_size = request.texture_object_size;
+	ret = chrome9_validate_two_texture_state(&args->textures[1],
+						 &request.texture2_object_size);
+	if (ret)
+		return ret;
+	if (check_mul_overflow((u64)args->depth_pitch, (u64)args->height,
+			       &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE,
+			       &request.texture3_object_size) ||
+	    check_add_overflow(request.object_size,
+			       request.texture_object_size, &total_size) ||
+	    check_add_overflow(total_size, request.texture2_object_size,
+			       &total_size) ||
+	    check_add_overflow(total_size, request.texture3_object_size,
+			       &total_size) ||
+	    total_size > SZ_64M - CHROME9_RING_SIZE)
+		return -E2BIG;
+	for (i = 0; i < ARRAY_SIZE(args->vertices); i++) {
+		const struct drm_chrome9_two_textured_vertex *vertex =
+			&args->vertices[i];
+
+		if (!chrome9_coordinate_valid(vertex->x_16_16, args->width) ||
+		    !chrome9_coordinate_valid(vertex->y_16_16, args->height) ||
+		    vertex->z_16_16 < 0 || vertex->z_16_16 > 0x10000 ||
+		    !chrome9_rhw_valid(vertex->rhw_float) ||
+		    !chrome9_safe_texcoord(vertex->s0_float) ||
+		    !chrome9_safe_texcoord(vertex->t0_float) ||
+		    !chrome9_safe_texcoord(vertex->s1_float) ||
+		    !chrome9_safe_texcoord(vertex->t1_float))
+			return -EINVAL;
+		request.two_textured_vertices[i] = *vertex;
+	}
+	if (!chrome9_triangle_nondegenerate(args->vertices[0].x_16_16,
+					    args->vertices[0].y_16_16,
 		args->vertices[1].x_16_16, args->vertices[1].y_16_16,
 		args->vertices[2].x_16_16, args->vertices[2].y_16_16))
 		return -EINVAL;
