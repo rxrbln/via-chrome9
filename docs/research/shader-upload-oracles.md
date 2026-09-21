@@ -842,6 +842,11 @@ controls, metadata, active/upload counts, resource masks, and a rejected
 unsupported form.  This code is intentionally absent from `meson.build` and
 does not change caps or submission.
 
+The same corpus now has a Level-0 canonical-object verifier.  Its precise
+count/resource/control/instruction/slack checks, recovered hard bounds, native
+field hazards, and fail-closed NIR admission map are in
+[native-shader-verifier-policy.md](native-shader-verifier-policy.md).
+
 The NIR-facing gate may map to this key only after proving all of the
 following: one entry point and one acyclic block; exactly one full-XYZW color
 store; only identity MOV wrappers and one full-vector FMUL; leaves limited to
