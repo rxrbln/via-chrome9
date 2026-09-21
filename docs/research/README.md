@@ -158,6 +158,10 @@ targets.
   fixes the state-complete command-16 TEX0*c0 packet map, exact constant and
   format semantics, depth/blend/alpha collision rules, validator/lifetime
   contract, and guarded native-c0 silicon sequence.
+- [ioquake3-gl2-fogpass-native-design.md](ioquake3-gl2-fogpass-native-design.md)
+  closes ioquake3 GL2 fogpass as a five-ALU semantic program with exact
+  float-varying linkage, packet indices, D16/source-over state and guarded
+  zero/negative/square-root silicon oracles.
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
