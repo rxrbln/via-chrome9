@@ -583,6 +583,20 @@ static u32 chrome9_blend_factor_code(u32 factor, bool alpha)
 		return alpha ? 0x01 : 0x02;
 	case DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA:
 		return alpha ? 0x11 : 0x12;
+	case DRM_CHROME9_BLEND_FACTOR_SRC_COLOR:
+		return alpha ? 0x01 : 0x00;
+	case DRM_CHROME9_BLEND_FACTOR_INV_SRC_COLOR:
+		return alpha ? 0x11 : 0x10;
+	case DRM_CHROME9_BLEND_FACTOR_DST_ALPHA:
+		return alpha ? 0x02 : 0x03;
+	case DRM_CHROME9_BLEND_FACTOR_INV_DST_ALPHA:
+		return alpha ? 0x12 : 0x13;
+	case DRM_CHROME9_BLEND_FACTOR_DST_COLOR:
+		return alpha ? 0x02 : 0x01;
+	case DRM_CHROME9_BLEND_FACTOR_INV_DST_COLOR:
+		return alpha ? 0x12 : 0x11;
+	case DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+		return alpha ? 0x19 : 0x08;
 	default:
 		/* The ioctl validator rejects unsupported factors. */
 		return 0;
@@ -3331,12 +3345,14 @@ static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *st
 	} else if (state->alpha_test_func || state->alpha_test_ref) {
 		return -EINVAL;
 	}
-	if (state->rgb_src_factor > DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA ||
-	    state->rgb_dst_factor > DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA ||
+	if (state->rgb_src_factor >
+		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+	    state->rgb_dst_factor >
+		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
 	    state->alpha_src_factor >
-		DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA ||
+		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
 	    state->alpha_dst_factor >
-		DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA ||
+		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
 	    state->rgb_func != DRM_CHROME9_BLEND_FUNC_ADD ||
 	    state->alpha_func != DRM_CHROME9_BLEND_FUNC_ADD)
 		return -EOPNOTSUPP;
