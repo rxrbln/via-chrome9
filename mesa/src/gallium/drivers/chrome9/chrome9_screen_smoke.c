@@ -1091,6 +1091,10 @@ enum smoke_program_fs_mode {
    SMOKE_PROGRAM_FS_NOPERSPECTIVE,
    SMOKE_PROGRAM_FS_INPUT_OFFSET,
    SMOKE_PROGRAM_FS_FLOAT_CONTROLS,
+   SMOKE_PROGRAM_FS_SAME_FILE_MUL,
+   SMOKE_PROGRAM_FS_ALPHA_SWIZZLE,
+   SMOKE_PROGRAM_FS_CONDITIONAL,
+   SMOKE_PROGRAM_FS_COUNT,
 };
 
 /* Exercise the NIR-driven backend independently of the older program-shape
@@ -1111,6 +1115,7 @@ make_program_backend_fs(struct pipe_screen *screen,
    nir_def *barycentric;
    nir_def *color;
    nir_def *constant;
+   static const unsigned aaaa[4] = { 3, 3, 3, 3 };
 
    b.shader->info.io_lowered = true;
    if (mode == SMOKE_PROGRAM_FS_FLOAT_CONTROLS)
@@ -1129,15 +1134,22 @@ make_program_backend_fs(struct pipe_screen *screen,
    constant = nir_load_ubo(
       &b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
       .align_mul = 16, .range_base = 0, .range = 16);
+   if (mode == SMOKE_PROGRAM_FS_SAME_FILE_MUL)
+      color = constant;
+   else if (mode == SMOKE_PROGRAM_FS_ALPHA_SWIZZLE)
+      color = nir_swizzle(&b, color, aaaa, 4);
    if (mode == SMOKE_PROGRAM_FS_SATURATE)
       constant = nir_fsat(&b, constant);
    if (mode == SMOKE_PROGRAM_FS_DISCARD)
       nir_discard_if(&b, nir_imm_false(&b));
-   nir_store_output(&b, nir_fmul(&b, color, constant),
-                    nir_imm_int(&b, 0),
-                    .write_mask = mode == SMOKE_PROGRAM_FS_PARTIAL_STORE ?
-                                  0x7 : 0xf,
-                    .io_semantics.location = FRAG_RESULT_COLOR);
+   if (mode == SMOKE_PROGRAM_FS_CONDITIONAL)
+      nir_push_if(&b, nir_imm_true(&b));
+   nir_store_output(
+      &b, nir_fmul(&b, color, constant), nir_imm_int(&b, 0),
+      .write_mask = mode == SMOKE_PROGRAM_FS_PARTIAL_STORE ? 0x7 : 0xf,
+      .io_semantics.location = FRAG_RESULT_COLOR);
+   if (mode == SMOKE_PROGRAM_FS_CONDITIONAL)
+      nir_pop_if(&b, NULL);
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader,
                           nir_var_shader_in | nir_var_shader_out);
@@ -1322,7 +1334,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
    void *generic_rgbx_vs = NULL, *generic_rgbx_fs = NULL;
    void *program_fs = NULL;
    void *program_c0_fs = NULL;
-   void *rejected_program_fs[6] = { NULL };
+   void *rejected_program_fs[
+      SMOKE_PROGRAM_FS_COUNT - SMOKE_PROGRAM_FS_SATURATE] = { NULL };
+   bool rejected_programs_valid = true;
    struct pipe_resource *solid_buffer = NULL;
    bool passed = false;
 
@@ -1422,6 +1436,20 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          rejected_program_fs[i] = make_program_backend_fs(
             screen, context,
             (enum smoke_program_fs_mode)(SMOKE_PROGRAM_FS_SATURATE + i));
+      for (unsigned i = 0; i < ARRAY_SIZE(rejected_program_fs); i++) {
+         struct chrome9_shader *rejected = rejected_program_fs[i];
+         enum smoke_program_fs_mode mode =
+            (enum smoke_program_fs_mode)(SMOKE_PROGRAM_FS_SATURATE + i);
+         bool exact_abi_reject = mode == SMOKE_PROGRAM_FS_SAME_FILE_MUL ||
+                                 mode == SMOKE_PROGRAM_FS_ALPHA_SWIZZLE;
+
+         if (!rejected || rejected->supported ||
+             (exact_abi_reject ?
+                 (!rejected->native_fs_valid ||
+                  !rejected->native_fs_from_nir) :
+                 rejected->native_fs_valid))
+            rejected_programs_valid = false;
+      }
    }
    if (!depth_resource) {
       solid_buffer = screen->resource_create(screen, &solid_buffer_template);
@@ -1504,24 +1532,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
             CHROME9_FS_LEAF_V0 ||
          ((struct chrome9_shader *)program_fs)->native_fs_key.src[1] !=
             CHROME9_FS_LEAF_C0 ||
-         !rejected_program_fs[0] ||
-         !rejected_program_fs[1] ||
-         !rejected_program_fs[2] ||
-         !rejected_program_fs[3] ||
-         !rejected_program_fs[4] ||
-         !rejected_program_fs[5] ||
-         ((struct chrome9_shader *)rejected_program_fs[0])->supported ||
-         ((struct chrome9_shader *)rejected_program_fs[0])->native_fs_valid ||
-         ((struct chrome9_shader *)rejected_program_fs[1])->supported ||
-         ((struct chrome9_shader *)rejected_program_fs[1])->native_fs_valid ||
-         ((struct chrome9_shader *)rejected_program_fs[2])->supported ||
-         ((struct chrome9_shader *)rejected_program_fs[2])->native_fs_valid ||
-         ((struct chrome9_shader *)rejected_program_fs[3])->supported ||
-         ((struct chrome9_shader *)rejected_program_fs[3])->native_fs_valid ||
-         ((struct chrome9_shader *)rejected_program_fs[4])->supported ||
-         ((struct chrome9_shader *)rejected_program_fs[4])->native_fs_valid ||
-         ((struct chrome9_shader *)rejected_program_fs[5])->supported ||
-         ((struct chrome9_shader *)rejected_program_fs[5])->native_fs_valid)) ||
+         !rejected_programs_valid)) ||
        !scalar_gray_vs ||
        !scalar_gray_fs ||
        ((struct chrome9_shader *)scalar_gray_fs)->fragment_program !=

@@ -303,6 +303,63 @@ chrome9_delete_vs_state(struct pipe_context *pipe, void *state)
  * whose sole result is the unmodified primary color; accepting arbitrary NIR
  * here would silently execute different fragment semantics. */
 static bool
+chrome9_fs_straight_line_entrypoint(nir_shader *nir,
+                                    nir_function_impl **impl_out,
+                                    nir_block **block_out)
+{
+   nir_function_impl *impl;
+   nir_cf_node *node;
+
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT ||
+       !exec_list_is_singular(&nir->functions))
+      return false;
+   impl = nir_shader_get_entrypoint(nir);
+   if (!impl || impl->preamble || !exec_list_is_singular(&impl->body))
+      return false;
+   node = exec_node_data(nir_cf_node, exec_list_get_head(&impl->body), node);
+   if (node->type != nir_cf_node_block)
+      return false;
+   if (impl_out)
+      *impl_out = impl;
+   if (block_out)
+      *block_out = nir_cf_node_as_block(node);
+   return true;
+}
+
+static bool
+chrome9_fs_smooth_variable(const nir_variable *var, unsigned location)
+{
+   return var && var->data.mode == nir_var_shader_in &&
+          var->data.location == location && !var->data.index &&
+          !var->data.location_frac && !var->data.centroid &&
+          !var->data.sample && !var->data.patch && !var->data.compact &&
+          !var->data.per_primitive && !var->data.per_vertex &&
+          (var->data.interpolation == INTERP_MODE_NONE ||
+           var->data.interpolation == INTERP_MODE_SMOOTH);
+}
+
+static bool
+chrome9_fs_smooth_pixel_load(const nir_intrinsic_instr *load,
+                             unsigned location)
+{
+   nir_instr *instr;
+   nir_intrinsic_instr *bary;
+
+   if (!load || load->intrinsic != nir_intrinsic_load_interpolated_input ||
+       nir_intrinsic_io_semantics(load).location != location ||
+       nir_intrinsic_component(load) || !load->src[0].ssa ||
+       !nir_src_is_const(load->src[1]) || nir_src_as_uint(load->src[1]))
+      return false;
+   instr = nir_def_instr(load->src[0].ssa);
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   bary = nir_instr_as_intrinsic(instr);
+   return bary->intrinsic == nir_intrinsic_load_barycentric_pixel &&
+          (nir_intrinsic_interp_mode(bary) == INTERP_MODE_NONE ||
+           nir_intrinsic_interp_mode(bary) == INTERP_MODE_SMOOTH);
+}
+
+static bool
 chrome9_fs_is_primary_color(nir_def *def, unsigned depth)
 {
    nir_instr *instr = nir_def_instr(def);
@@ -315,14 +372,14 @@ chrome9_fs_is_primary_color(nir_def *def, unsigned depth)
 
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
-      case nir_intrinsic_load_interpolated_input:
          return nir_intrinsic_io_semantics(intr).location ==
                    VARYING_SLOT_COL0 &&
                 !nir_intrinsic_component(intr);
+      case nir_intrinsic_load_interpolated_input:
+         return chrome9_fs_smooth_pixel_load(intr, VARYING_SLOT_COL0);
       case nir_intrinsic_load_deref:
          var = nir_intrinsic_get_var(intr, 0);
-         return var && var->data.mode == nir_var_shader_in &&
-                var->data.location == VARYING_SLOT_COL0;
+         return chrome9_fs_smooth_variable(var, VARYING_SLOT_COL0);
       default:
          return false;
       }
@@ -363,17 +420,21 @@ chrome9_fs_is_texcoord(nir_def *def, unsigned unit, unsigned depth)
 
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
-      case nir_intrinsic_load_interpolated_input:
          location = nir_intrinsic_io_semantics(intr).location;
          return (location == VARYING_SLOT_TEX0 + unit ||
                  location == VARYING_SLOT_VAR0 + unit) &&
                 !nir_intrinsic_component(intr);
+      case nir_intrinsic_load_interpolated_input:
+         return chrome9_fs_smooth_pixel_load(intr,
+                                              VARYING_SLOT_TEX0 + unit) ||
+                chrome9_fs_smooth_pixel_load(intr,
+                                              VARYING_SLOT_VAR0 + unit);
       case nir_intrinsic_load_deref:
          var = nir_intrinsic_get_var(intr, 0);
-         return var && var->data.mode == nir_var_shader_in &&
-                (var->data.location == VARYING_SLOT_TEX0 + unit ||
-                 var->data.location == VARYING_SLOT_VAR0 + unit) &&
-                !var->data.location_frac;
+         return chrome9_fs_smooth_variable(var,
+                                            VARYING_SLOT_TEX0 + unit) ||
+                chrome9_fs_smooth_variable(var,
+                                            VARYING_SLOT_VAR0 + unit);
       default:
          return false;
       }
@@ -637,14 +698,13 @@ chrome9_fs_is_generic0(nir_def *def)
 
    switch (intr->intrinsic) {
    case nir_intrinsic_load_input:
-   case nir_intrinsic_load_interpolated_input:
       return nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_VAR0 &&
              !nir_intrinsic_component(intr);
+   case nir_intrinsic_load_interpolated_input:
+      return chrome9_fs_smooth_pixel_load(intr, VARYING_SLOT_VAR0);
    case nir_intrinsic_load_deref:
       var = nir_intrinsic_get_var(intr, 0);
-      return var && var->data.mode == nir_var_shader_in &&
-             var->data.location == VARYING_SLOT_VAR0 &&
-             !var->data.location_frac;
+      return chrome9_fs_smooth_variable(var, VARYING_SLOT_VAR0);
    default:
       return false;
    }
@@ -1361,13 +1421,13 @@ chrome9_fs_is_input_at(nir_def *def, unsigned location)
    intr = nir_instr_as_intrinsic(instr);
    switch (intr->intrinsic) {
    case nir_intrinsic_load_input:
-   case nir_intrinsic_load_interpolated_input:
       return nir_intrinsic_io_semantics(intr).location == location &&
              !nir_intrinsic_component(intr);
+   case nir_intrinsic_load_interpolated_input:
+      return chrome9_fs_smooth_pixel_load(intr, location);
    case nir_intrinsic_load_deref:
       var = nir_intrinsic_get_var(intr, 0);
-      return var && var->data.mode == nir_var_shader_in &&
-             var->data.location == location && !var->data.location_frac;
+      return chrome9_fs_smooth_variable(var, location);
    default:
       return false;
    }
@@ -2179,7 +2239,7 @@ static bool
 chrome9_backend_primary(nir_def *def)
 {
    nir_instr *instr = nir_def_instr(def);
-   nir_intrinsic_instr *load, *bary;
+   nir_intrinsic_instr *load;
    nir_deref_instr *deref;
    nir_variable *var;
 
@@ -2190,24 +2250,10 @@ chrome9_backend_primary(nir_def *def)
    if (load->intrinsic == nir_intrinsic_load_deref) {
       deref = nir_src_as_deref(load->src[0]);
       var = nir_intrinsic_get_var(load, 0);
-      return deref && deref->deref_type == nir_deref_type_var && var &&
-             var->data.mode == nir_var_shader_in &&
-             var->data.location == VARYING_SLOT_COL0 &&
-             !var->data.index && !var->data.location_frac;
+      return deref && deref->deref_type == nir_deref_type_var &&
+             chrome9_fs_smooth_variable(var, VARYING_SLOT_COL0);
    }
-   if (load->intrinsic != nir_intrinsic_load_interpolated_input ||
-       nir_intrinsic_io_semantics(load).location != VARYING_SLOT_COL0 ||
-       nir_intrinsic_component(load) || !load->src[0].ssa ||
-       !nir_src_is_const(load->src[1]) ||
-       nir_src_as_uint(load->src[1]))
-      return false;
-   instr = nir_def_instr(load->src[0].ssa);
-   if (instr->type != nir_instr_type_intrinsic)
-      return false;
-   bary = nir_instr_as_intrinsic(instr);
-   return bary->intrinsic == nir_intrinsic_load_barycentric_pixel &&
-          (nir_intrinsic_interp_mode(bary) == INTERP_MODE_NONE ||
-           nir_intrinsic_interp_mode(bary) == INTERP_MODE_SMOOTH);
+   return chrome9_fs_smooth_pixel_load(load, VARYING_SLOT_COL0);
 }
 
 /* The backend deliberately unwraps MOV only.  Treating FSAT as a copy would
@@ -2267,6 +2313,228 @@ chrome9_backend_source(const nir_alu_src *source,
        !chrome9_backend_leaf(source->src.ssa, 0, leaf))
       return false;
    return identity || chrome9_backend_alpha_leaf(leaf);
+}
+
+struct chrome9_ps_nir_builder {
+   struct chrome9_ps_ir ir;
+   uint8_t next_temp;
+};
+
+static bool
+chrome9_ps_source_from_leaf(enum chrome9_fs_leaf leaf,
+                            struct chrome9_ps_source *source)
+{
+   bool alpha = false;
+
+   memset(source, 0, sizeof(*source));
+   switch (leaf) {
+   case CHROME9_FS_LEAF_V0_A:
+      alpha = true;
+      FALLTHROUGH;
+   case CHROME9_FS_LEAF_V0:
+      source->file = CHROME9_PS_SOURCE_INPUT;
+      source->id = 0;
+      break;
+   case CHROME9_FS_LEAF_V1_A:
+      alpha = true;
+      FALLTHROUGH;
+   case CHROME9_FS_LEAF_V1:
+      source->file = CHROME9_PS_SOURCE_INPUT;
+      source->id = 1;
+      break;
+   case CHROME9_FS_LEAF_C0_A:
+      alpha = true;
+      FALLTHROUGH;
+   case CHROME9_FS_LEAF_C0:
+      source->file = CHROME9_PS_SOURCE_CONSTANT;
+      source->id = 0;
+      break;
+   case CHROME9_FS_LEAF_C1_A:
+      alpha = true;
+      FALLTHROUGH;
+   case CHROME9_FS_LEAF_C1:
+      source->file = CHROME9_PS_SOURCE_CONSTANT;
+      source->id = 1;
+      break;
+   default:
+      return false;
+   }
+   for (unsigned c = 0; c < 4; c++)
+      source->swizzle[c] = alpha ? CHROME9_PS_SWIZZLE_W : c;
+   return true;
+}
+
+static bool chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder,
+                                 nir_def *def,
+                                 struct chrome9_ps_source *source);
+
+static bool
+chrome9_ps_lower_alu_source(struct chrome9_ps_nir_builder *builder,
+                            const nir_alu_src *nir_source,
+                            struct chrome9_ps_source *source)
+{
+   bool alpha = true, identity = true;
+
+   if (!nir_source->src.ssa || nir_source->src.ssa->num_components != 4 ||
+       nir_source->src.ssa->bit_size != 32)
+      return false;
+   for (unsigned c = 0; c < 4; c++) {
+      identity &= nir_source->swizzle[c] == c;
+      alpha &= nir_source->swizzle[c] == 3;
+   }
+   if ((!identity && !alpha) ||
+       !chrome9_ps_lower_def(builder, nir_source->src.ssa, source))
+      return false;
+   if (alpha)
+      for (unsigned c = 0; c < 4; c++)
+         source->swizzle[c] = CHROME9_PS_SWIZZLE_W;
+   return true;
+}
+
+static bool
+chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
+                     struct chrome9_ps_source *source)
+{
+   enum chrome9_fs_leaf leaf;
+   nir_instr *instr;
+   nir_alu_instr *alu;
+   struct chrome9_ps_instruction *native;
+   struct chrome9_ps_source operands[2] = { 0 };
+   uint8_t temp;
+
+   if (chrome9_backend_leaf(def, 0, &leaf))
+      return chrome9_ps_source_from_leaf(leaf, source);
+   instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_fmul || builder->ir.count >= 2 ||
+       builder->next_temp >= 12)
+      return false;
+   temp = builder->next_temp++;
+   if (!chrome9_ps_lower_alu_source(builder, &alu->src[0], &operands[0]) ||
+       !chrome9_ps_lower_alu_source(builder, &alu->src[1], &operands[1]))
+      return false;
+   if (builder->ir.count >= 2)
+      return false;
+   native = &builder->ir.instruction[builder->ir.count];
+   memset(native, 0, sizeof(*native));
+   native->op = CHROME9_PS_OPCODE_MUL;
+   native->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   native->destination.id = temp;
+   native->destination.writemask = 0xf;
+   native->source[0] = operands[0];
+   native->source[1] = operands[1];
+   builder->ir.count++;
+   memset(source, 0, sizeof(*source));
+   source->file = CHROME9_PS_SOURCE_TEMP;
+   source->id = native->destination.id;
+   for (unsigned c = 0; c < 4; c++)
+      source->swizzle[c] = c;
+   return true;
+}
+
+static bool
+chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
+                       struct chrome9_ps_program *program)
+{
+   struct chrome9_ps_nir_builder builder = { 0 };
+   struct chrome9_ps_instruction *terminal;
+   struct chrome9_ps_source operands[2] = { 0 };
+   enum chrome9_ps_opcode op;
+   nir_block *block;
+   nir_def *result = NULL;
+
+   if (!chrome9_fs_straight_line_entrypoint(nir, NULL, &block) ||
+       nir->info.float_controls_execution_mode)
+      return false;
+   nir_foreach_instr(instr, block) {
+      nir_intrinsic_instr *intr;
+      nir_variable *var;
+      unsigned location;
+      nir_def *stored;
+
+      if (instr->type == nir_instr_type_alu ||
+          instr->type == nir_instr_type_deref ||
+          instr->type == nir_instr_type_load_const)
+         continue;
+      if (instr->type != nir_instr_type_intrinsic)
+         return false;
+      intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_store_output) {
+         struct nir_io_semantics semantics =
+            nir_intrinsic_io_semantics(intr);
+
+         location = semantics.location;
+         if (nir_intrinsic_component(intr) ||
+             semantics.dual_source_blend_index ||
+             nir_intrinsic_write_mask(intr) != 0xf ||
+             !nir_src_is_const(intr->src[1]) ||
+             nir_src_as_uint(intr->src[1]))
+            return false;
+         stored = intr->src[0].ssa;
+      } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+
+         var = nir_intrinsic_get_var(intr, 0);
+         if (!deref || deref->deref_type != nir_deref_type_var ||
+             !var || var->data.mode != nir_var_shader_out ||
+             var->data.index || var->data.location_frac ||
+             nir_intrinsic_write_mask(intr) != 0xf)
+            return false;
+         location = var->data.location;
+         stored = intr->src[1].ssa;
+      } else if (intr->intrinsic ==
+                    nir_intrinsic_load_barycentric_pixel ||
+                 intr->intrinsic ==
+                    nir_intrinsic_load_interpolated_input ||
+                 intr->intrinsic == nir_intrinsic_load_deref ||
+                 intr->intrinsic == nir_intrinsic_load_uniform ||
+                 intr->intrinsic == nir_intrinsic_load_ubo ||
+                 intr->intrinsic == nir_intrinsic_load_ubo_vec4) {
+         continue;
+      } else {
+         return false;
+      }
+      if ((location != FRAG_RESULT_COLOR &&
+           location != FRAG_RESULT_DATA0) || result)
+         return false;
+      result = stored;
+   }
+   if (!result || result->num_components != 4 || result->bit_size != 32)
+      return false;
+
+   nir_instr *result_instr = nir_def_instr(result);
+
+   if (result_instr->type == nir_instr_type_alu &&
+       nir_instr_as_alu(result_instr)->op == nir_op_fmul) {
+      nir_alu_instr *alu = nir_instr_as_alu(result_instr);
+
+      op = CHROME9_PS_OPCODE_MUL;
+      if (!chrome9_ps_lower_alu_source(&builder, &alu->src[0],
+                                       &operands[0]) ||
+          !chrome9_ps_lower_alu_source(&builder, &alu->src[1],
+                                       &operands[1]))
+         return false;
+   } else {
+      op = CHROME9_PS_OPCODE_MOV;
+      if (!chrome9_ps_lower_def(&builder, result, &operands[0]))
+         return false;
+   }
+   if (builder.ir.count >= 3)
+      return false;
+   terminal = &builder.ir.instruction[builder.ir.count];
+   memset(terminal, 0, sizeof(*terminal));
+   terminal->op = op;
+   terminal->destination.file = CHROME9_PS_DESTINATION_COLOR;
+   terminal->destination.writemask = 0xf;
+   terminal->source[0] = operands[0];
+   terminal->source[1] = operands[1];
+   builder.ir.count++;
+   if (!chrome9_compile_ps_ir(&builder.ir, program))
+      return false;
+   *ir = builder.ir;
+   return true;
 }
 
 /*
@@ -2371,28 +2639,71 @@ chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
 {
    struct chrome9_fs_key key;
    enum chrome9_shader_verify_error error;
-   bool from_nir = nir && chrome9_fs_key_from_nir(nir, &key);
+   bool from_nir;
 
-   if ((!from_nir &&
-        !chrome9_fs_native_key(shader->fragment_program, &key)) ||
+   memset(&shader->native_fs_ir, 0, sizeof(shader->native_fs_ir));
+   from_nir = chrome9_compile_ps_nir(nir, &shader->native_fs_ir,
+                                     &shader->native_fs);
+   if (from_nir) {
+      if (chrome9_fs_key_from_nir(nir, &key))
+         shader->native_fs_key = key;
+      shader->native_fs_from_nir = true;
+      return true;
+   }
+
+   if (!chrome9_fs_native_key(shader->fragment_program, &key) ||
        !chrome9_compile_fs_offline(&key, &shader->native_fs))
       return false;
 
    if (!chrome9_verify_fs_offline(&key, &shader->native_fs, &error))
       return false;
    shader->native_fs_key = key;
-   shader->native_fs_from_nir = from_nir;
+   shader->native_fs_from_nir = false;
+   return true;
+}
+
+static bool
+chrome9_native_program_source(const struct chrome9_ps_source *source)
+{
+   if (!source || source->id || source->modifier || source->last_use ||
+       (source->file != CHROME9_PS_SOURCE_INPUT &&
+        source->file != CHROME9_PS_SOURCE_CONSTANT))
+      return false;
+   for (unsigned c = 0; c < ARRAY_SIZE(source->swizzle); c++) {
+      if (source->swizzle[c] != c)
+         return false;
+   }
    return true;
 }
 
 static bool
 chrome9_native_fs_is_program_batch(const struct chrome9_shader *shader)
 {
-   return shader->native_fs_valid && shader->native_fs_from_nir &&
-          shader->native_fs.alu_count == 1 && !shader->native_fs.tau_count &&
-          !shader->native_fs.sampler_mask &&
-          !(shader->native_fs.varying_mask & ~1u) &&
-          !(shader->native_fs.constant_mask & ~1u);
+   const struct chrome9_ps_instruction *instruction;
+
+   if (!shader->native_fs_valid || !shader->native_fs_from_nir ||
+       shader->native_fs_ir.count != 1 ||
+       shader->native_fs.alu_count != 1 || shader->native_fs.tau_count ||
+       shader->native_fs.sampler_mask ||
+       (shader->native_fs.varying_mask & ~1u) ||
+       (shader->native_fs.constant_mask & ~1u))
+      return false;
+   instruction = &shader->native_fs_ir.instruction[0];
+   if (instruction->destination.file != CHROME9_PS_DESTINATION_COLOR ||
+       instruction->destination.id ||
+       instruction->destination.writemask != 0xf ||
+       instruction->destination.saturate ||
+       !chrome9_native_program_source(&instruction->source[0]))
+      return false;
+   switch (instruction->op) {
+   case CHROME9_PS_OPCODE_MOV:
+      return true;
+   case CHROME9_PS_OPCODE_MUL:
+      return chrome9_native_program_source(&instruction->source[1]) &&
+             instruction->source[0].file != instruction->source[1].file;
+   default:
+      return false;
+   }
 }
 
 static bool
@@ -2478,11 +2789,15 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       return NULL;
    }
    if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
+      bool straight_line =
+         chrome9_fs_straight_line_entrypoint(state->ir.nir, NULL, NULL);
+
       shader->nir = state->ir.nir;
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);
-      shader->fragment_program = chrome9_fs_classify(state->ir.nir);
-      shader->native_fs_valid =
+      shader->fragment_program = straight_line ?
+         chrome9_fs_classify(state->ir.nir) : CHROME9_FS_UNSUPPORTED;
+      shader->native_fs_valid = straight_line &&
          chrome9_compile_native_fs(shader, state->ir.nir);
       if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
           ctx->draw_program_triangle_d16_rhw_batch &&

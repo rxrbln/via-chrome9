@@ -4,6 +4,10 @@
 
 #include <string.h>
 
+static void set_controls(struct chrome9_ps_program *p, uint32_t a90,
+                         uint32_t a91, uint32_t a92, uint32_t a93,
+                         uint32_t a95);
+
 static bool
 source_valid(const struct chrome9_ps_source *source)
 {
@@ -35,6 +39,34 @@ source_valid(const struct chrome9_ps_source *source)
    return true;
 }
 
+static bool
+destination_valid(const struct chrome9_ps_destination *destination)
+{
+   if (!destination || !destination->writemask ||
+       destination->writemask > 0xf)
+      return false;
+   switch (destination->file) {
+   case CHROME9_PS_DESTINATION_TEMP:
+      return destination->id < 12;
+   case CHROME9_PS_DESTINATION_COLOR:
+      return destination->id == 0 && destination->writemask == 0xf;
+   default:
+      return false;
+   }
+}
+
+static void
+encode_destination(uint32_t record[4],
+                   const struct chrome9_ps_destination *destination)
+{
+   record[2] &= ~0x00f00000;
+   record[3] &= ~0x00001fc0;
+   record[2] |= (uint32_t)destination->writemask << 20;
+   record[3] |= (uint32_t)destination->id << 6 |
+                (uint32_t)destination->file << 10 |
+                (uint32_t)destination->saturate << 12;
+}
+
 static void
 encode_source_a(uint32_t record[4], const struct chrome9_ps_source *source)
 {
@@ -48,7 +80,7 @@ encode_source_a(uint32_t record[4], const struct chrome9_ps_source *source)
                 (uint32_t)source->swizzle[2] >> 1 |
                 (uint32_t)source->id << 8 |
                 (uint32_t)source->file << 14 |
-                (uint32_t)source->dependency << 17;
+                (uint32_t)source->last_use << 17;
 }
 
 static void
@@ -64,7 +96,7 @@ encode_source_c(uint32_t record[4], const struct chrome9_ps_source *source)
                 (uint32_t)source->swizzle[3] |
                 (uint32_t)source->id << 12 |
                 (uint32_t)source->file << 18 |
-                (uint32_t)source->dependency << 21;
+                (uint32_t)source->last_use << 21;
    if (source->modifier)
       record[3] |= 0x00100000;
 }
@@ -101,9 +133,118 @@ chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
    return true;
 }
 
+bool
+chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
+                      struct chrome9_ps_program *p)
+{
+   uint16_t defined_temps = 0;
+   uint8_t temp_uses[12] = { 0 };
+   uint8_t remaining_uses[12];
+
+   if (!ir || !p || !ir->count || ir->count > 3)
+      return false;
+   /* Validate the semantic IR and calculate temporary lifetimes before
+    * packing any hardware words.  Release bits are an encoder result, not a
+    * property callers may guess. */
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &ir->instruction[i];
+      unsigned source_count;
+
+      if (!destination_valid(&instruction->destination))
+         return false;
+      switch (instruction->op) {
+      case CHROME9_PS_OPCODE_MOV:
+         source_count = 1;
+         break;
+      case CHROME9_PS_OPCODE_MUL:
+         source_count = 2;
+         break;
+      default:
+         return false;
+      }
+      for (unsigned s = 0; s < source_count; s++) {
+         const struct chrome9_ps_source *source = &instruction->source[s];
+
+         if (!source_valid(source) || source->last_use)
+            return false;
+         if (source->file == CHROME9_PS_SOURCE_TEMP) {
+            if (!(defined_temps & (1u << source->id)))
+               return false;
+            temp_uses[source->id]++;
+         }
+      }
+      if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP) {
+         if (instruction->destination.writemask != 0xf ||
+             defined_temps & (1u << instruction->destination.id))
+            return false;
+         defined_temps |= 1u << instruction->destination.id;
+      } else if (i + 1 != ir->count) {
+         return false;
+      }
+   }
+   if (ir->instruction[ir->count - 1].destination.file !=
+       CHROME9_PS_DESTINATION_COLOR)
+      return false;
+   for (unsigned temp = 0; temp < 12; temp++) {
+      if ((defined_temps & (1u << temp)) && !temp_uses[temp])
+         return false;
+   }
+
+   memset(p, 0, sizeof(*p));
+   memcpy(remaining_uses, temp_uses, sizeof(remaining_uses));
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &ir->instruction[i];
+      struct chrome9_ps_source sources[2] = { 0 };
+      uint8_t instruction_uses[12] = { 0 };
+      unsigned source_count = instruction->op == CHROME9_PS_OPCODE_MOV ? 1 : 2;
+
+      for (unsigned s = 0; s < source_count; s++)
+         sources[s] = instruction->source[s];
+      for (unsigned s = 0; s < source_count; s++) {
+         if (sources[s].file == CHROME9_PS_SOURCE_TEMP)
+            instruction_uses[sources[s].id]++;
+      }
+      for (unsigned s = 0; s < source_count; s++) {
+         unsigned temp = sources[s].id;
+
+         if (sources[s].file == CHROME9_PS_SOURCE_TEMP &&
+             remaining_uses[temp] == instruction_uses[temp]) {
+            /* If A and C consume the same final value, the vendor compiler
+             * marks A only. */
+            if (s == 0 || sources[0].file != CHROME9_PS_SOURCE_TEMP ||
+                sources[0].id != temp)
+               sources[s].last_use = true;
+         }
+      }
+      for (unsigned temp = 0; temp < 12; temp++)
+         remaining_uses[temp] -= instruction_uses[temp];
+
+      if (instruction->op == CHROME9_PS_OPCODE_MOV) {
+         if (!chrome9_encode_ps_mov(&sources[0], p->alu[i]))
+            return false;
+      } else if (!chrome9_encode_ps_mul(&sources[0], &sources[1],
+                                        p->alu[i])) {
+         return false;
+      }
+      encode_destination(p->alu[i], &instruction->destination);
+      for (unsigned s = 0; s < source_count; s++) {
+         if (sources[s].file == CHROME9_PS_SOURCE_INPUT)
+            p->varying_mask |= 1u << sources[s].id;
+         else if (sources[s].file == CHROME9_PS_SOURCE_CONSTANT)
+            p->constant_mask |= 1u << sources[s].id;
+      }
+   }
+   p->alu_count = ir->count;
+   set_controls(p, 0x90058000, 0x91000000,
+                0x92000000 | ir->count, 0x93000000, 0x95000000);
+   return true;
+}
+
 static struct chrome9_ps_source
 source(enum chrome9_ps_source_file file, unsigned id, bool alpha,
-       bool dependency)
+       bool last_use)
 {
    struct chrome9_ps_source result = {
       .file = file,
@@ -114,7 +255,7 @@ source(enum chrome9_ps_source_file file, unsigned id, bool alpha,
          alpha ? CHROME9_PS_SWIZZLE_W : CHROME9_PS_SWIZZLE_Z,
          CHROME9_PS_SWIZZLE_W,
       },
-      .dependency = dependency,
+      .last_use = last_use,
    };
 
    return result;

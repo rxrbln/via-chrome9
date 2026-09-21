@@ -45,6 +45,11 @@ enum chrome9_ps_source_file {
    CHROME9_PS_SOURCE_CONSTANT = 2,
 };
 
+enum chrome9_ps_destination_file {
+   CHROME9_PS_DESTINATION_TEMP = 0,
+   CHROME9_PS_DESTINATION_COLOR = 2,
+};
+
 enum chrome9_ps_swizzle {
    CHROME9_PS_SWIZZLE_X,
    CHROME9_PS_SWIZZLE_Y,
@@ -61,7 +66,33 @@ struct chrome9_ps_source {
    uint8_t id;
    uint8_t swizzle[4];
    uint8_t modifier;
-   bool dependency;
+   /* Filled by the compiler finalizer for the last use of a temporary. */
+   bool last_use;
+};
+
+struct chrome9_ps_destination {
+   enum chrome9_ps_destination_file file;
+   uint8_t id;
+   uint8_t writemask;
+   bool saturate;
+};
+
+enum chrome9_ps_opcode {
+   CHROME9_PS_OPCODE_MOV,
+   CHROME9_PS_OPCODE_MUL,
+};
+
+struct chrome9_ps_instruction {
+   enum chrome9_ps_opcode op;
+   struct chrome9_ps_destination destination;
+   struct chrome9_ps_source source[2];
+};
+
+/* Straight-line compiler IR.  This is deliberately semantic rather than a
+ * native-word container: every record is range checked and packed here. */
+struct chrome9_ps_ir {
+   struct chrome9_ps_instruction instruction[CHROME9_PS_MAX_ALU];
+   uint8_t count;
 };
 
 struct chrome9_ps_program {
@@ -124,6 +155,8 @@ bool chrome9_encode_ps_mov(const struct chrome9_ps_source *source,
 bool chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
                            const struct chrome9_ps_source *source_c,
                            uint32_t record[4]);
+bool chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
+                           struct chrome9_ps_program *program);
 
 /* These verify a complete canonical object for a closed key.  They are not
  * validators for arbitrary native shader words. */

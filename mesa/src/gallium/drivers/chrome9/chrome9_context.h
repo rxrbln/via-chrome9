@@ -53,6 +53,7 @@ struct chrome9_shader {
       CHROME9_FS_COMPILED_ALU,
    } fragment_program;
    struct chrome9_fs_key native_fs_key;
+   struct chrome9_ps_ir native_fs_ir;
    struct chrome9_ps_program native_fs;
    bool native_fs_valid;
    bool native_fs_from_nir;

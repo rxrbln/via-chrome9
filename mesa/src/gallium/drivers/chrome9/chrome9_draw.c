@@ -97,22 +97,27 @@ chrome9_two_texture_coord_valid(const struct chrome9_context *ctx,
 }
 
 static bool
-chrome9_program_source(enum chrome9_fs_leaf leaf,
+chrome9_program_source(const struct chrome9_ps_source *native,
                        struct drm_chrome9_ps_source *source)
 {
    memset(source, 0, sizeof(*source));
-   switch (leaf) {
-   case CHROME9_FS_LEAF_V0:
+   if (!native || native->id || native->modifier || native->last_use)
+      return false;
+   switch (native->file) {
+   case CHROME9_PS_SOURCE_INPUT:
       source->file = DRM_CHROME9_PS_SOURCE_VARYING;
       break;
-   case CHROME9_FS_LEAF_C0:
+   case CHROME9_PS_SOURCE_CONSTANT:
       source->file = DRM_CHROME9_PS_SOURCE_CONSTANT;
       break;
    default:
       return false;
    }
-   for (unsigned c = 0; c < ARRAY_SIZE(source->swizzle); c++)
-      source->swizzle[c] = c;
+   for (unsigned c = 0; c < ARRAY_SIZE(source->swizzle); c++) {
+      if (native->swizzle[c] != c)
+         return false;
+      source->swizzle[c] = native->swizzle[c];
+   }
    return true;
 }
 
@@ -120,24 +125,34 @@ static bool
 chrome9_program_instruction(const struct chrome9_shader *shader,
                             struct drm_chrome9_ps_instruction *instruction)
 {
+   const struct chrome9_ps_instruction *native;
+
    if (!shader || !shader->native_fs_valid || !shader->native_fs_from_nir ||
+       shader->native_fs_ir.count != 1 ||
        shader->native_fs.alu_count != 1 || shader->native_fs.tau_count ||
        shader->native_fs.sampler_mask ||
        (shader->native_fs.varying_mask & ~1u) ||
        (shader->native_fs.constant_mask & ~1u))
       return false;
 
+   native = &shader->native_fs_ir.instruction[0];
+   if (native->destination.file != CHROME9_PS_DESTINATION_COLOR ||
+       native->destination.id || native->destination.writemask != 0xf ||
+       native->destination.saturate)
+      return false;
    memset(instruction, 0, sizeof(*instruction));
-   switch (shader->native_fs_key.op) {
-   case CHROME9_FS_OP_MOV:
+   switch (native->op) {
+   case CHROME9_PS_OPCODE_MOV:
       instruction->op = DRM_CHROME9_PS_OP_MOV;
-      return chrome9_program_source(shader->native_fs_key.src[0],
+      return chrome9_program_source(&native->source[0],
                                     &instruction->src[0]);
-   case CHROME9_FS_OP_MUL:
+   case CHROME9_PS_OPCODE_MUL:
+      if (native->source[0].file == native->source[1].file)
+         return false;
       instruction->op = DRM_CHROME9_PS_OP_MUL;
-      return chrome9_program_source(shader->native_fs_key.src[0],
+      return chrome9_program_source(&native->source[0],
                                     &instruction->src[0]) &&
-             chrome9_program_source(shader->native_fs_key.src[1],
+             chrome9_program_source(&native->source[1],
                                     &instruction->src[1]);
    default:
       return false;
@@ -1254,8 +1269,6 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    }
    program_batch = perspective_batch &&
       ctx->draw_program_triangle_d16_rhw_batch &&
-      (!ctx->draw_triangle_d16_rhw_run ||
-       ctx->fs->fragment_program == CHROME9_FS_COMPILED_ALU) &&
       chrome9_program_instruction(ctx->fs, &program_instruction) &&
       (!(ctx->fs->native_fs.constant_mask & 1) ||
        chrome9_fragment_constant_c0(ctx, program_constant_c0));
@@ -1877,7 +1890,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
       crender->batch_count++;
       if (crender->batch_count ==
-          (rhw_run_batch ? DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES :
+          ((rhw_run_batch || program_batch) ?
+                           DRM_CHROME9_TRIANGLE_RUN_MAX_TRIANGLES :
                            DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES))
          chrome9_flush_triangle_batch(crender);
       return;

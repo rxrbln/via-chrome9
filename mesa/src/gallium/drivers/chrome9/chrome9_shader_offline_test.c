@@ -179,6 +179,147 @@ check_fs(void)
    }
 }
 
+static struct chrome9_ps_source
+identity_source(enum chrome9_ps_source_file file, unsigned id,
+                bool last_use)
+{
+   struct chrome9_ps_source source = {
+      .file = file,
+      .id = id,
+      .swizzle = {
+         CHROME9_PS_SWIZZLE_X, CHROME9_PS_SWIZZLE_Y,
+         CHROME9_PS_SWIZZLE_Z, CHROME9_PS_SWIZZLE_W,
+      },
+      .last_use = last_use,
+   };
+
+   return source;
+}
+
+static void
+check_ps_ir(void)
+{
+   static const uint32_t mul_c0_c1_r0[4] = {
+      0x0140b6d0, 0x30081053, 0x00f08005, 0x00000020,
+   };
+   static const uint32_t mul_r0_c2_oc0[4] = {
+      0x0140b6d0, 0x30082053, 0x00f20005, 0x00000820,
+   };
+   struct chrome9_ps_ir ir = { 0 };
+   struct chrome9_ps_program program;
+
+   ir.count = 2;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_TEMP;
+   ir.instruction[0].destination.writemask = 0xf;
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 0, false);
+   ir.instruction[0].source[1] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 1, false);
+   ir.instruction[1].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[1].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[1].destination.writemask = 0xf;
+   ir.instruction[1].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+   ir.instruction[1].source[1] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 2, false);
+
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   assert(program.alu_count == 2 && !program.tau_count);
+   assert(program.control[0] == 0x90058000);
+   assert(program.control[2] == 0x92000002);
+   assert(program.constant_mask == 0x7 && !program.varying_mask);
+   assert(!memcmp(program.alu[0], mul_c0_c1_r0,
+                  sizeof(mul_c0_c1_r0)));
+   assert(!memcmp(program.alu[1], mul_r0_c2_oc0,
+                  sizeof(mul_r0_c2_oc0)));
+
+   ir.instruction[1].source[0].last_use = true;
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+   ir.instruction[1].source[0].last_use = false;
+   ir.instruction[0].destination.id = 12;
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+   ir.instruction[0].destination.id = 0;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+   ir.count = 4;
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+
+   /* A temporary must be defined before use and must not be left dead. */
+   memset(&ir, 0, sizeof(ir));
+   ir.count = 1;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[0].destination.writemask = 0xf;
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+   ir.count = 2;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_TEMP;
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 0, false);
+   ir.instruction[1].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[1].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[1].destination.writemask = 0xf;
+   ir.instruction[1].source[0] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 1, false);
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+
+   /* The finalizer marks only the last read.  Different final temporaries
+    * may release together in A and C. */
+   memset(&ir, 0, sizeof(ir));
+   ir.count = 3;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_TEMP;
+   ir.instruction[0].destination.id = 0;
+   ir.instruction[0].destination.writemask = 0xf;
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 0, false);
+   ir.instruction[0].source[1] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 1, false);
+   ir.instruction[1].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[1].destination.file = CHROME9_PS_DESTINATION_TEMP;
+   ir.instruction[1].destination.id = 1;
+   ir.instruction[1].destination.writemask = 0xf;
+   ir.instruction[1].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+   ir.instruction[1].source[1] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 2, false);
+   ir.instruction[2].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[2].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[2].destination.writemask = 0xf;
+   ir.instruction[2].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+   ir.instruction[2].source[1] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 1, false);
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   assert(!(program.alu[1][2] & (1u << 17)));
+   assert(program.alu[2][2] & (1u << 17));
+   assert(program.alu[2][1] & (1u << 21));
+
+   /* When A and C make the final read of one temporary, the vendor encoding
+    * gives the single release marker to A. */
+   ir.count = 2;
+   ir.instruction[1].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[1].destination.id = 0;
+   ir.instruction[1].source[1] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   assert(program.alu[1][2] & (1u << 17));
+   assert(!(program.alu[1][1] & (1u << 21)));
+
+   /* Re-defining a live SSA-style temporary is rejected. */
+   ir.count = 3;
+   ir.instruction[1].destination.file = CHROME9_PS_DESTINATION_TEMP;
+   ir.instruction[1].destination.id = 0;
+   ir.instruction[2].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[2].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[2].destination.writemask = 0xf;
+   ir.instruction[2].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+}
+
 static void
 check_vs(void)
 {
@@ -328,6 +469,7 @@ main(void)
 {
    check_ps_encoder();
    check_fs();
+   check_ps_ir();
    check_vs();
    check_verifier();
    puts("Chrome9 PS encoder + offline corpus: 15 PS + 8 VS templates and verifier passed");
