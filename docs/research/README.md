@@ -154,6 +154,10 @@ targets.
   reduced renderer's generic/fast-light/texturecolor execution order, proves
   that fast lightall needs a packed-coordinate post-TNL split rather than a
   native VS ABI, and records fresh Windows compiler hashes and staged gates.
+- [ioquake3-gl2-texturecolor-command16-audit.md](ioquake3-gl2-texturecolor-command16-audit.md)
+  fixes the state-complete command-16 TEX0*c0 packet map, exact constant and
+  format semantics, depth/blend/alpha collision rules, validator/lifetime
+  contract, and guarded native-c0 silicon sequence.
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
