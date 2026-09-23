@@ -1,9 +1,9 @@
 # Chrome9 vPos, CMP, and FRC compiler/runtime contract
 
-Status: production Linux compiler objects are byte-exact; Mesa state-tracker
-integration is source-exact; native `vPos`, CMP, and FRC numerical behavior
-still requires the guarded silicon oracles below.  This note does not promote
-an API capability by itself.
+Status: production Linux compiler objects and the VX900 draw-time MISC enable
+are byte-exact; Mesa state-tracker integration is source-exact; native `vPos`,
+CMP, and FRC numerical behavior still requires the guarded silicon oracles
+below.  This note does not promote an API capability by itself.
 
 ## What the vendor objects establish
 
@@ -93,11 +93,49 @@ All tokens and instruction records are retained in
 corpus is a compiler/finalizer oracle, not proof that silicon implements the
 expected arithmetic.
 
+## VX900 draw-time MISC enable
+
+The controls above are exact after compiler configuration two, but they are
+not yet the complete controls emitted by the vendor draw path.  On chip id 5,
+the programmable-PS updater copies compiled-object `+0x80.bit0` into
+`+0x2c.bit19` before constructing A90.  The later uploader then ORs object
+`+0x2c` with object `+0x6c`.  Consequently the complete VX900 controls for the
+smallest vPos object are:
+
+```text
+configuration-two A90  90058008
+draw-time VX900 A90     900d8008
+```
+
+Linux proves both steps.  `stmUpdatePS_inv:0x180110..0x180140` routes chip id
+5 to `0x180119`, reads object `+0x80`, and replaces byte `+0x2e.bit3`, which is
+word `+0x2c.bit19`.  `0x17fcb9..0x17fcc4` subsequently emits
+`0x90000000 | object[0x2c] | object[0x6c]`.
+
+The Windows D3D UMD independently has the same chip-5 path.  Its dispatch at
+`VTGUModeDX32A.dll:0x1015b0a4..0x1015b0c4` maps chip id 5 to class one, and
+`0x1015b0dc..0x1015b0f0` copies object `+0x80` into object `+0x2c.bit19`.
+This occurs before the A90 command builder at `0x1015b6d4..0x1015b909`.
+
+This bit is conditional on the sticky MISC predicate, not on ordinary FRC or
+ALU use.  It is clear for an otherwise identical constant-only shader.  The
+predicate deliberately over-approximates semantic identity: both vPos and
+vFace set it and compile byte-identically, so bit 19 enables the common MISC
+route but does not select between them.
+
+The generation dispatch is not universal.  Linux applies the A90-bit-19 path
+to ids 4--8 and 14; other ids use either no such patch or a separate cached
+raster-state update.  The Windows D3D table applies it to ids 4--7 and 13--14,
+while ids 8--12 use the separate-state class.  The only common conclusion
+needed here is chip id 5/VX900.  Do not extend the bit unconditionally to
+other generations without their own draw-path proof.
+
 ## Raster linkage boundary
 
 The static evidence supports a narrow model: the pixel engine supplies one
-special MISC vector selected by the compiled program's A90/A91 resource
-usage.  The pixel compiler/finalizer emits no FVF mutation, and the inspected
+special MISC vector selected by the draw-time A90 bit-19 enable plus the
+compiled program's relocated A90/A91 resource usage.  The pixel
+compiler/finalizer emits no FVF mutation, and the inspected
 ordinary raster FVF paths program position, colors, fog, and texture-coordinate
 lanes without a recovered dependency on the pixel object's MISC predicate.
 Therefore the initial implementation must keep `vPos` outside the T0/T1
@@ -259,6 +297,45 @@ exact uploaded integer and unrolled to that value.  Refuse negative counts,
 integer overflow, excessive ALU count, or excessive temporary pressure; use
 the driver's real software fallback when the native 96-ALU/12-temp envelope
 is exceeded.  Never truncate the iteration count.
+
+## Destination masks and synthetic zero lanes
+
+The production compiler may synthesize native zero selectors for lanes that
+the D3D destination mask does not write.  This is an internal lane-closing
+operation, not evidence that a full-width semantic source can request literal
+zero.  The decisive Linux 5.75 offline differential is:
+
+| PS 2.0 operation | finalized ALU |
+| --- | --- |
+| `FRC oC0.xy,vPos.xyxy` | `01c00530 d01c0053 0032c306 000e0820` |
+| `FRC oC0.xy,vPos.xyzz` | `01c00530 d01c0053 0032c306 000e0820` |
+| `FRC oC0.xy,vPos.xyww` | `01c00530 d01c0053 0032c306 000e0820` |
+| `FRC oC0,vPos.xyxy` | `01c00530 101c0053 00f2c304 000e0820` |
+
+The first three shaders use destination token `00030800`; their unused source
+Z/W choices disappear and the native destination mask remains `0x3`.  The
+full-width shader uses destination token `000f0800`, retains XYXY, and has
+native destination mask `0xf`.  The native record
+
+```text
+01c00530 d01c0053 00f2c306 000e0820
+```
+
+mixes the full destination mask with the partial-write XY00 normalization and
+is not emitted by this proprietary compiler.  A guarded VX900 submission of
+that hybrid timed out at the completion cookie and quarantined the engine.
+It does not disprove MISC/vPos linkage or FRC: the submitted record was outside
+the recovered compiler envelope.  Semantic POSITION should therefore admit
+only X/Y selector replication for a full color result.  A future partial-write
+path may use synthetic zero in masked-off lanes only if it also preserves the
+compiler-exact destination mask.
+
+An ensuing full-width `FRC oC0,vPos.xyxy` did use the exact compiler record
+`01c00530 101c0053 00f2c304 000e0820`, but it retained configuration-two
+A90=`90058008` and also timed out.  That result is the draw-time-bit-19
+discriminator above, not a second selector failure.  The next live gate must
+compare both the ALU record and VX900 A90=`900d8008` byte-for-byte before
+submission.  Do not label or validate an XY00 packet as the XYXY oracle.
 
 ## Guarded live oracles
 
