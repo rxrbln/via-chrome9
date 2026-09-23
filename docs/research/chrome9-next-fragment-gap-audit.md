@@ -46,6 +46,26 @@ The standalone vendor NRM opcode expands to four records
 `DP3, subop9, RSQ, MUL`; the generic backend should keep explicit operations
 and prove their finite semantics rather than adding an opaque NRM UAPI opcode.
 
+A smaller fresh Linux production object now isolates only the generic
+normalize data flow:
+
+```text
+# DP3 r0.x,T0.xyz,T0.xyz; RSQ r1.x,r0.x;
+# MUL r2.xyz,T0.xyz,r1.x; MOV oC0,r2.xyz0
+01c00530 500c0055 0010c005 00020020
+01c00530 801c0053 001200b6 00070060
+0140b6d0 50201005 0072c005 000000a0
+01c00530 401c0053 00f20205 000d0820
+```
+
+Its active tuple is `(1,3,1,0)` and its complete nonzero controls are
+`A90=90058001`, `A92=92000004`.  This object is preferable to proprietary NRM
+for the first silicon gate: constant T0.xyz=`(.6,.8,0)` must yield logical
+`(.6,.8,0,0)`, approximately packed BGRA `0000cc99`, proving DP3, scalar RSQ,
+scalar-to-vector broadcast, and MUL without a following dot/MAX masking the
+normalized vector.  Follow with unit X/Y/Z and a non-unit positive vector;
+zero length and exceptional values remain rejected.
+
 A fresh production differential now closes a compact generic reflect object:
 
 ```text
