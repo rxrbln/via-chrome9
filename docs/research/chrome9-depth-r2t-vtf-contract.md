@@ -45,6 +45,13 @@ this VX900.  Gallium FBO completeness, alternate compare modes, depth-only
 scratch rendering, and GL capability exposure still require implementation
 and focused proof.
 
+Mesa's experimental private `X8Z24_UNORM` resource/FBO smoke then passed on
+the target with `CHROME9_EXPERIMENTAL_X8Z24=1`: private sampler-only and
+depth-only allocation, rejection of mip/shared forms, identity sampler view,
+guarded depth-only scratch, CPU clear to `80000000`, and color/depth-only FBO
+rebind.  This is a Gallium resource/state/CPU-clear proof, not yet a Gallium
+GPU draw or GL state-tracker conformance proof; the experimental gate remains.
+
 * Chrome9's native sampled 24-bit depth layout is depth in bits 31:8.  The
   correct Gallium formats are `PIPE_FORMAT_X8Z24_UNORM` and
   `PIPE_FORMAT_S8_UINT_Z24_UNORM`, not `Z24X8` or `Z24_UNORM_S8_UINT`.
