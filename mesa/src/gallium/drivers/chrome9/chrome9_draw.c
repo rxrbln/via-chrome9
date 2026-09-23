@@ -706,6 +706,19 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    }
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       *blend_successor = true;
+   /*
+    * A live VX900 repeatedly stopped before the completion cookie for both
+    * the one-triangle and batched one-texture MODULATE+blend objects.  Keep
+    * the known-good REPLACE successor available, but fail this exact state
+    * closed until its vendor register sequence is understood.  A rejected
+    * draw is recoverable; publishing the current object wedges the CR ring
+    * and prevents later clients from using the same X server.
+    */
+   *reason = "textured-modulate-blend-unproven";
+   if (texture_count == 1 && *blend_successor &&
+       ctx->fs->fragment_program != CHROME9_FS_TEXTURE_REPLACE &&
+       ctx->fs->fragment_program != CHROME9_FS_TEXTURE_RGBX)
+      return false;
    *reason = "stencil/depth-bounds";
    if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
                     ctx->dsa->stencil[1].enabled ||
@@ -1910,8 +1923,16 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          chrome9_flush_triangle_batch(crender);
       return;
    }
+   /*
+    * Keep source-over and other blended texture draws on the independently
+    * retired one-triangle command.  A live ioquake3 UI reached a valid
+    * 16-triangle MODULATE+blend packet but VX900 timed out after the fetch
+    * cursor reached the post-draw H2 boundary and before the cookie.
+    * Non-blended cmd1a batching remains proven and is still used for Present
+    * and ordinary opaque texture work.
+    */
    if (crender->textured && crender->texture_count == 1 && !depth_active &&
-       ctx->draw_textured_triangle_batch) {
+       !blend_successor && ctx->draw_textured_triangle_batch) {
       struct drm_chrome9_draw_textured_triangle_batch next = {
          .destination_handle = texture_args.destination_handle,
          .texture_handle = texture_args.texture_handle,
