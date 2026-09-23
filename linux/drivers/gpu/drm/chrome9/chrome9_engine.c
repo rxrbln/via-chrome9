@@ -950,7 +950,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		0xcccccccc, 0xdddddddd,
 	};
 	static const u32 modulate_control[] = {
-		0x90018000, 0x91000001, 0x92010002, 0x93000001,
+		0x90018000, 0x91000001, 0x92010001, 0x93000001,
 		0x94000000, 0x95000000, 0x96000000, 0x97000000,
 		0x98000000, 0x99000000, 0x9a000000,
 		0xcccccccc, 0xdddddddd,
@@ -961,8 +961,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		0x01c00000, 0x301c0000, 0x00f20105, 0x000d083f,
 	};
 	static const u32 modulate_program[] = {
-		0x0140b6d0, 0x30040053, 0x00f20005, 0x0000007f,
-		0x01c00000, 0x301c0000, 0x00f20105, 0x000d083f,
+		0x0140b6d0, 0x30040053, 0x00f20005, 0x00000820,
 	};
 	static const u32 sync[] = { 0x6c, 0x00800000 };
 	static const u32 status[] = {
@@ -999,6 +998,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	u32 delta = 0;
 	u32 depth_delta = 0;
 	u32 mip_delta = mip ? 12 : 0;
+	u32 ps_offset;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	u32 triangle_count = request->triangle_count ?: 1;
@@ -1160,9 +1160,9 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		*p++ = src->s_float;
 		*p++ = src->t_float;
 	}
-	if (p - body != delta + depth_delta + mip_delta +
-	    (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ?
-	     228 : 224) + (vertex_count - 3) * 8 ||
+	ps_offset = 160 + delta + depth_delta + mip_delta;
+	if (p - body != delta + depth_delta + mip_delta + 224 +
+	    (vertex_count - 3) * 8 ||
 	    body[4] != destination_state[0] ||
 	    body[5] != 0x51100000 || body[6] != destination_state[2] ||
 	    body[20 + delta] != texture_state[0] ||
@@ -1206,15 +1206,20 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	      body[77 + delta + mip_delta] != 0x23004f02 ||
 	      body[78 + delta + mip_delta] !=
 		(0x24000000 | vertex_count) ||
-	      body[(request->texture_program ==
-		     DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ? 204 : 200) +
-		   delta + mip_delta] != 0xfe020440 ||
-	      body[(request->texture_program ==
-		     DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ? 206 : 202) +
-		   delta + mip_delta] != 0x00000000)) ||
-	    body[(request->texture_program ==
-		 DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ?
-		 200 + delta : 196 + delta) + depth_delta + mip_delta] !=
+	      body[200 + delta + mip_delta] != 0xfe020440 ||
+	      body[202 + delta + mip_delta] != 0x00000000)) ||
+	    (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE &&
+	     (body[ps_offset + 6] != 0x92010001 ||
+	      body[ps_offset + 20] != 0xfe020440 ||
+	      body[ps_offset + 22] != 0x21030000 ||
+	      body[ps_offset + 24] != modulate_tau[0] ||
+	      body[ps_offset + 28] != 0xfe020440 ||
+	      body[ps_offset + 30] != 0x20030000 ||
+	      memcmp(&body[ps_offset + 32], modulate_program,
+		     sizeof(modulate_program)) ||
+	      body[ps_offset + 36] != 0xfe020440 ||
+	      body[ps_offset + 38] != 0x00000000)) ||
+	    body[196 + delta + depth_delta + mip_delta] !=
 		0xfe020440)
 		return -EINVAL;
 	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
@@ -1226,12 +1231,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 				      &job->segment_stop))
 		return -E2BIG;
 	if (run && triangle_count == DRM_CHROME9_TEXTURE_RUN_MAX_TRIANGLES &&
-	    (*pause != (mip && depth_blend &&
-			 request->texture_program ==
-			 DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ? 0x0d70 : 0x0cf0) ||
-	     job->segment_stop != (mip && depth_blend &&
-			 request->texture_program ==
-			 DRM_CHROME9_TEXTURE_PROGRAM_MODULATE ? 0x0df0 : 0x0d70) ||
+	    (*pause != 0x0cf0 || job->segment_stop != 0x0d70 ||
 	     raster_fvf[10] != 0x24000048))
 		return -EINVAL;
 	return 0;
@@ -3169,6 +3169,25 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	int dev_idx;
 	int ret;
 
+	/*
+	 * Both the immediate and batched one-texture MODULATE+blend command
+	 * objects have reproducibly stopped VX900 before their completion cookie.
+	 * Reject the shared unsafe state at the ABI boundary until its remaining
+	 * vendor state difference is proven; otherwise any client can wedge the
+	 * ring and take rendering away from every later X client.
+	 */
+	if (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE &&
+	    chrome9_draw_has_blend(request) &&
+	    (request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
+	     request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16_BLEND ||
+	     request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16 ||
+	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH ||
+	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_RUN ||
+	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_MIP))
+		return -EOPNOTSUPP;
+
 	if (!drm_dev_enter(drm, &dev_idx))
 		return -ENODEV;
 	engine = READ_ONCE(cdev->engine);
@@ -3425,25 +3444,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		request->kind == CHROME9_DRAW_COPY_RECT;
 	int dev_idx;
 	int ret;
-
-	/*
-	 * Both the immediate and batched one-texture MODULATE+blend command
-	 * objects have reproducibly stopped VX900 before their completion cookie.
-	 * Reject the shared unsafe state at the ABI boundary until its vendor
-	 * register sequence is proven; otherwise any client can wedge the ring and
-	 * take rendering away from every later X client.
-	 */
-	if (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE &&
-	    chrome9_draw_has_blend(request) &&
-	    (request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
-	     request->kind ==
-		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16_BLEND ||
-	     request->kind ==
-		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16 ||
-	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH ||
-	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_RUN ||
-	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_MIP))
-		return -EOPNOTSUPP;
 
 	if (!drm_dev_enter(drm, &dev_idx))
 		return -ENODEV;
