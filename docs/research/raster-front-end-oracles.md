@@ -352,6 +352,16 @@ reconstruct near `0xff000000`.  Linux emits it at
 positive nonzero Z before the depth comparison.  Treat A20 `20007fff` as a
 mandatory first-depth-draw prerequisite, not as an optional clipping feature.
 
+The 2026-09-23 VX900 command-22 silicon check extends that requirement to
+draws with depth testing disabled. A guarded 64x64 BGRA8888 target and the
+one-ALU `MOV oC0,c0` program retired but changed zero pixels for a triangle at
+Z=0.5 while the no-depth path omitted A1E--A20. Restoring the three exact
+viewport-builder words on every generic draw produced 1176 changed pixels,
+including the expected `ffff0000` interior; the exterior and guards remained
+intact. The command used the compiler's counted H3 constant and ALU stores,
+so this separately qualifies the ALU-only H3 upload. A later varying-source
+draw still timed out and must be diagnosed independently.
+
 ## Polygon offset / depth bias
 
 The manual gives the exact equation:
