@@ -229,6 +229,90 @@ engine status clean.  The same test must verify that leaving stage 3 unused in
 the fragment program does not make stage 4 or 5 inherit stale image/sampler
 state.
 
+## Patch-ready TAU scheduler and allocator
+
+Lower the fragment program to an ordered dependency graph whose native nodes
+are four-dword ALU records and one-dword TAU records.  A direct interpolated
+texture coordinate can feed TAU after coordinate-slot compaction.  An
+ALU-generated coordinate cannot feed TAU directly from an ordinary temporary:
+the production compiler inserts a MOV into texture-coordinate register class
+one before every such fetch.  One iteration of the eleven-tap object is:
+
+```text
+ALU: coordinate arithmetic into ordinary TEMP
+ALU: MOV texture-coordinate slot j, TEMP
+TAU: TEX using coordinate slot j
+ALU: consume sampled-result TEMP
+```
+
+For a full-vector MOV from ordinary TEMP zero, the bridge records differ only
+in destination slot:
+
+```text
+01c00530 c01c0053 00f00006 (000d0420 | (j << 6))
+```
+
+Slots j=1..7 produce dword three `000d0460, 000d04a0, ...,
+000d05e0`.  General source selection and final-use bits still come from the
+normal MOV encoder.  The eleven-tap total follows exactly: 11 coordinate ALU,
+11 bridge MOV, 11 weight/accumulate ALU, and two output MOV = 35 ALU.
+
+Construct a semantic TAU word only after physical allocation:
+
+```text
+tau = 20000000
+    | (coordinate_last_use ? 10000000 : 0)
+    | ((logical_sampler & 0xf) << 24)
+    | ((operation & 0xf) << 20)
+    | ((destination_temp & 0xf) << 16)
+    | ((coordinate_slot & 0x3f) << 12)
+    | swizzle
+    | (logical_sampler & 0xf)
+```
+
+TEXLD/TEXLDB/TEXKILL/TEXLDP operation nibbles are 1/3/4/7 and identity
+swizzle is `1b0`.  Destination and coordinate contributions overlap in bits
+17:16 because the vendor emitter ORs them.  Keep the two semantic ids
+separate until this final OR; never decode, patch, or validate one by masking
+the already packed word.  The bounded allocator uses coordinate slots 0..7
+and ordinary temporary slots 0..11, matching the shipping limits and keeping
+the coordinate contribution's high overlapping bits clear.
+
+Ordinary TEX destinations enter the same physical TEMP allocation used by
+ALU.  The later ALU consumer carries the TEMP final-read marker: source A is
+dword2 bit17, source C dword1 bit21, and source B dword0 bit25.  When one
+record reads the same physical TEMP more than once, precedence is A, then C,
+then B.  TAU bit28 is the corresponding final-read marker for the physical
+coordinate slot.
+
+These markers describe the last occurrence of a **physical register in the
+complete program**, not the end of each SSA value interval.  The eleven-tap
+program reuses ordinary TEMP zero for every coordinate, but only its last
+bridge read has dword2 bit17.  It reuses coordinate slots 1..4, so only their
+second TAU reads set bit28; one-use slots 5..7 set it immediately.  Therefore:
+
+1. lower and DCE;
+2. allocate/reuse physical TEMP and coordinate slots;
+3. create the final interleaved ALU/TAU schedule;
+4. scan that schedule backwards and mark only the last read of each physical
+   TEMP and coordinate slot;
+5. derive A91 from the set of allocated coordinate slots;
+6. derive the transition maps from the finalized order.
+
+Upload ALU and TAU stores separately, retaining their ordinal positions in
+the interleaved schedule.  Set A90 bit18 when the first scheduled node is
+ALU.  At every TAU-to-ALU boundary after TAU ordinal `k`, set T2A bit `k`; at
+every ALU-to-TAU boundary after ALU ordinal `k`, set A2T bit `k`.  Pack both
+maps in the 24-bit chunks described above.  A92 carries the two final counts.
+No native END record is emitted.
+
+A simple safe list scheduler keeps side-effecting texture operations in
+program order, selects only dependency-ready nodes, and prefers another node
+from the current engine when legal to reduce transitions.  This optimization
+cannot move a bridge after its TAU or a sampled-result consumer before its
+TAU.  Reject the program if allocation, record counts, or transition-map
+capacity fails; do not spill or silently truncate.
+
 ## Fail-closed compiler rules
 
 1. Count lowered native records and reject more than 96 ALU or 32 TAU.
