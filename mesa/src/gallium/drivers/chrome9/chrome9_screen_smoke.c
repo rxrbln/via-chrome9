@@ -1689,12 +1689,20 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
             (enum smoke_program_fs_mode)(SMOKE_PROGRAM_FS_SATURATE + i);
          bool exact_abi_reject = mode == SMOKE_PROGRAM_FS_SAME_FILE_MUL ||
                                  mode == SMOKE_PROGRAM_FS_ALPHA_SWIZZLE;
+         /* c0*c0 exceeds cmd19's source-file rule but is valid in cmd22. */
+         bool generic_supported = mode == SMOKE_PROGRAM_FS_SAME_FILE_MUL &&
+            chrome9_screen_has_capability(
+               screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
 
-         if (!rejected || rejected->supported ||
+         if (!rejected || rejected->supported != generic_supported ||
+             (generic_supported &&
+              (rejected->fragment_program != CHROME9_FS_COMPILED_ALU ||
+               !rejected->semantic_fs_valid ||
+               rejected->semantic_input_mask)) ||
              (exact_abi_reject ?
                  (!rejected->native_fs_valid ||
                   !rejected->native_fs_from_nir) :
-                 rejected->native_fs_valid))
+                  rejected->native_fs_valid))
             rejected_programs_valid = false;
       }
    }
@@ -2597,6 +2605,11 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          chrome9_context(context)->submitted_program_batches;
       uint64_t rhw_runs = chrome9_context(context)->submitted_rhw_runs;
       uint64_t rejected = chrome9_context(context)->rejected_triangles;
+      const struct chrome9_shader *shader = program_c0_fs;
+      /* cmd22 submits each triangle; the older cmd19 path batches both. */
+      unsigned expected_program_batches =
+         chrome9_context(context)->draw_fragment_program &&
+         shader->semantic_fs_valid && !shader->semantic_input_mask ? 2 : 1;
       uint32_t pixel;
 
       context->bind_blend_state(context, blend_handle);
@@ -2623,7 +2636,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                chrome9_context(context)->submitted_triangles ==
                   submitted + 2 &&
                chrome9_context(context)->submitted_program_batches ==
-                  program_batches + 1 &&
+                  program_batches + expected_program_batches &&
                chrome9_context(context)->submitted_rhw_runs == rhw_runs &&
                chrome9_context(context)->rejected_triangles == rejected &&
                smoke_guard_pages_match(draw_surface) &&
@@ -6402,6 +6415,12 @@ main(int argc, char **argv)
    }
    if (argc > 2 && !strcmp(argv[2], "--a8-only")) {
       bool passed = smoke_a8_generic_texture(screen);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--texture-only")) {
+      bool passed = run_pipe_texture(screen);
 
       screen->destroy(screen);
       return passed ? 0 : 1;
