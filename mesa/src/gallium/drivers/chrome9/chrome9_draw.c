@@ -5,6 +5,7 @@
 
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
+#include "chrome9_format.h"
 #include "chrome9_fragment.h"
 #include "chrome9_resource.h"
 
@@ -948,6 +949,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          struct pipe_resource *original = view ? view->texture : NULL;
          struct pipe_resource *source = view ?
             chrome9_sampler_view_resource(view) : NULL;
+         const struct chrome9_texture_format_info *format = source ?
+            chrome9_texture_format_info(source->format) : NULL;
 
          samplers[unit] = ctx->sampler_states[logical];
          *reason = "sampler-state";
@@ -958,14 +961,16 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          if (original == resource || source == resource ||
              textures[unit]->bo.handle == (*target)->bo.handle ||
              source->target != PIPE_TEXTURE_2D ||
-             (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-              source->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+             (!chrome9_use_generic_fragment_program(ctx) ?
+                (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+                 source->format != PIPE_FORMAT_B8G8R8A8_UNORM) : !format) ||
              view->u.tex.first_level ||
              view->u.tex.last_level > original->last_level ||
              !textures[unit]->guarded ||
              !textures[unit]->bo.handle ||
              (textures[unit]->data_offset & 0xff) ||
-             textures[unit]->stride != ALIGN_POT(source->width0 * 4, 32) ||
+             textures[unit]->stride !=
+                ALIGN_POT(source->width0 * format->bytes_per_pixel, 32) ||
              textures[unit]->data_size <
                 (uint64_t)textures[unit]->stride * source->height0)
             return false;
@@ -1099,6 +1104,8 @@ chrome9_submit_generic_triangle(
       return false;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
       const struct pipe_resource *resource = &textures[unit]->base;
+      const struct chrome9_texture_format_info *format =
+         chrome9_texture_format_info(resource->format);
       const unsigned logical = chrome9_fragment_sampler_unit(
          crender->ctx, unit);
       const struct pipe_sampler_view *view =
@@ -1106,7 +1113,7 @@ chrome9_submit_generic_triangle(
       unsigned last_level;
       int max_lod;
 
-      if (!view || view->u.tex.first_level)
+      if (!view || !format || view->u.tex.first_level)
          return false;
       last_level = view->u.tex.last_level;
       max_lod = last_level * 32;
@@ -1114,10 +1121,7 @@ chrome9_submit_generic_triangle(
           last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS)
          return false;
       texture_state[unit].handle = textures[unit]->bo.handle;
-      texture_state[unit].format =
-         resource->format == PIPE_FORMAT_B8G8R8X8_UNORM ?
-         DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888 :
-         DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888;
+      texture_state[unit].format = format->drm_format;
       texture_state[unit].width = resource->width0;
       texture_state[unit].height = resource->height0;
       texture_state[unit].last_level = last_level;

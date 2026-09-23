@@ -7,6 +7,7 @@ libchrome9 = static_library(
     'chrome9_context.c',
     'chrome9_draw.c',
     'chrome9_drm.c',
+    'chrome9_format.c',
     'chrome9_fragment.c',
     'chrome9_resource.c',
     'chrome9_screen.c',
@@ -59,6 +60,16 @@ chrome9_fragment_test = executable(
   install : false,
 )
 test('chrome9-fragment', chrome9_fragment_test, suite : ['chrome9'])
+
+chrome9_format_test = executable(
+  'chrome9-format-test',
+  ['chrome9_format.c', 'chrome9_format_test.c'],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  c_args : ['-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0'],
+  native : true,
+  install : false,
+)
+test('chrome9-format', chrome9_format_test, suite : ['chrome9'])
 
 chrome9_mipmap_test = executable(
   'chrome9-mipmap-test',

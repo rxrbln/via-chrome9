@@ -5,6 +5,7 @@
 
 #include "chrome9_draw.h"
 #include "chrome9_drm.h"
+#include "chrome9_format.h"
 #include "chrome9_resource.h"
 #include "chrome9_specialise.h"
 
@@ -3832,18 +3833,14 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
    bool supported = view && texture && texture->target == PIPE_TEXTURE_2D &&
                     templ->target == PIPE_TEXTURE_2D &&
                     templ->format == texture->format &&
-                    (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
-                     templ->format == PIPE_FORMAT_B8G8R8A8_UNORM) &&
+                    chrome9_texture_format_info(templ->format) &&
                     !templ->u.tex.first_level &&
                     templ->u.tex.last_level <= texture->last_level &&
                     !templ->u.tex.first_layer &&
                     !templ->u.tex.last_layer &&
-                    templ->swizzle_r == PIPE_SWIZZLE_X &&
-                    templ->swizzle_g == PIPE_SWIZZLE_Y &&
-                    templ->swizzle_b == PIPE_SWIZZLE_Z &&
-                    (templ->swizzle_a == PIPE_SWIZZLE_W ||
-                     (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM &&
-                      templ->swizzle_a == PIPE_SWIZZLE_1));
+                    chrome9_texture_swizzle_supported(
+                       templ->format, templ->swizzle_r, templ->swizzle_g,
+                       templ->swizzle_b, templ->swizzle_a);
 
    if (supported && !chrome9_resource(texture)->guarded) {
       struct pipe_resource shadow_templ = *texture;

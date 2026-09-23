@@ -3,6 +3,7 @@
 
 #include "chrome9_resource.h"
 
+#include "chrome9_format.h"
 #include "chrome9_public.h"
 
 #include <limits.h>
@@ -64,6 +65,7 @@ chrome9_resource_layout(const struct pipe_resource *templ,
 {
    uint64_t aligned_level0_size;
    uint64_t cursor;
+   const struct chrome9_texture_format_info *format;
    unsigned cpp;
    long page_size;
 
@@ -77,10 +79,9 @@ chrome9_resource_layout(const struct pipe_resource *templ,
       return true;
    }
 
+   format = chrome9_texture_format_info(templ->format);
    if (!chrome9_is_surface_target(templ->target) ||
-       (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-        templ->format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-        templ->format != PIPE_FORMAT_Z16_UNORM) ||
+       (!format && templ->format != PIPE_FORMAT_Z16_UNORM) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
        templ->depth0 != 1 || templ->array_size != 1 ||
@@ -95,7 +96,7 @@ chrome9_resource_layout(const struct pipe_resource *templ,
        page_size > UINT32_MAX || page_size < CHROME9_MIP_ALIGNMENT)
       return false;
 
-   cpp = templ->format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
+   cpp = format ? format->bytes_per_pixel : 2;
    for (unsigned level = 0; level <= templ->last_level; level++) {
       const unsigned width = u_minify(templ->width0, level);
       const unsigned height = u_minify(templ->height0, level);
@@ -198,6 +199,8 @@ chrome9_format_supported(struct pipe_screen *screen,
    const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL |
                                    PIPE_BIND_SAMPLER_VIEW |
                                    PIPE_BIND_LINEAR;
+   const unsigned sampler_bindings = PIPE_BIND_SAMPLER_VIEW |
+                                     PIPE_BIND_LINEAR;
    unsigned bgra_bindings = PIPE_BIND_LINEAR;
    bool bgra_render;
 
@@ -235,6 +238,13 @@ chrome9_format_supported(struct pipe_screen *screen,
       return false;
    if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
       return !(bindings & ~surface_bindings);
+   if (format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_L8_UNORM ||
+       format == PIPE_FORMAT_L8A8_UNORM ||
+       format == PIPE_FORMAT_B5G6R5_UNORM)
+      return chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM |
+                        DRM_CHROME9_CAP_FRAGMENT_TEXTURE_LEGACY_FORMATS) &&
+             !(bindings & ~sampler_bindings);
    if (format != PIPE_FORMAT_B8G8R8A8_UNORM)
       return false;
    if (chrome9_screen_has_capability(
@@ -512,9 +522,12 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    if (resource->target == PIPE_BUFFER) {
       offset = box->x;
    } else {
+      const struct chrome9_texture_format_info *format =
+         chrome9_texture_format_info(resource->format);
+
       transfer->stride = cresource->level_stride[level];
       transfer->layer_stride = cresource->level_size[level];
-      const unsigned cpp = resource->format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
+      const unsigned cpp = format ? format->bytes_per_pixel : 2;
 
       offset = cresource->level_offset[level] +
                (uint64_t)box->y * cresource->level_stride[level] +
@@ -675,6 +688,42 @@ chrome9_mipmap_z16_level(const struct chrome9_mipmap_mapping *source,
    }
 }
 
+static void
+chrome9_mipmap_packed_level(enum pipe_format format, unsigned cpp,
+                            const struct chrome9_mipmap_mapping *source,
+                            unsigned source_width, unsigned source_height,
+                            const struct chrome9_mipmap_mapping *destination,
+                            unsigned destination_width,
+                            unsigned destination_height)
+{
+   for (unsigned y = 0; y < destination_height; y++) {
+      const unsigned y0 = source_height == 1 ? 0 : y * 2;
+      const unsigned y1 = source_height == 1 ? 0 : y0 + 1;
+      const uint8_t *rows[2] = {
+         source->data + (uint64_t)y0 * source->stride,
+         source->data + (uint64_t)y1 * source->stride,
+      };
+      uint8_t *dst = destination->data + (uint64_t)y * destination->stride;
+
+      for (unsigned x = 0; x < destination_width; x++, dst += cpp) {
+         const unsigned x0 = source_width == 1 ? 0 : x * 2;
+         const unsigned x1 = source_width == 1 ? 0 : x0 + 1;
+         float texels[4][4];
+         float result[4];
+
+         util_format_unpack_rgba(format, texels[0], rows[0] + x0 * cpp, 1);
+         util_format_unpack_rgba(format, texels[1], rows[0] + x1 * cpp, 1);
+         util_format_unpack_rgba(format, texels[2], rows[1] + x0 * cpp, 1);
+         util_format_unpack_rgba(format, texels[3], rows[1] + x1 * cpp, 1);
+         for (unsigned channel = 0; channel < 4; channel++)
+            result[channel] = (texels[0][channel] + texels[1][channel] +
+                               texels[2][channel] + texels[3][channel]) *
+                              0.25f;
+         util_format_pack_rgba(format, dst, result, 1);
+      }
+   }
+}
+
 bool
 chrome9_generate_mipmap(struct pipe_context *pipe,
                         struct pipe_resource *pres,
@@ -683,21 +732,21 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
                         unsigned first_layer, unsigned last_layer)
 {
    struct chrome9_resource *resource;
+   const struct chrome9_texture_format_info *format_info;
    unsigned cpp;
 
+   format_info = chrome9_texture_format_info(format);
    if (!pipe || !pres || !pipe->texture_map || !pipe->texture_unmap ||
        pres->target != PIPE_TEXTURE_2D || pres->depth0 != 1 ||
        pres->array_size != 1 || pres->nr_samples > 1 ||
        pres->nr_storage_samples > 1 || format != pres->format ||
-       (format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-        format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-        format != PIPE_FORMAT_Z16_UNORM) ||
+       (!format_info && format != PIPE_FORMAT_Z16_UNORM) ||
        base_level > last_level || last_level > pres->last_level ||
        first_layer || last_layer)
       return false;
 
    resource = chrome9_resource(pres);
-   cpp = format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
+   cpp = format_info ? format_info->bytes_per_pixel : 2;
    if (!resource->guarded || !resource->bo.map)
       return false;
    for (unsigned level = base_level; level <= last_level; level++)
@@ -725,10 +774,14 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
          chrome9_mipmap_z16_level(&source, source_width, source_height,
                                   &destination, destination_width,
                                   destination_height);
-      else
+      else if (cpp == 4)
          chrome9_mipmap_bgra_level(format, &source, source_width,
                                    source_height, &destination,
                                    destination_width, destination_height);
+      else
+         chrome9_mipmap_packed_level(format, cpp, &source, source_width,
+                                     source_height, &destination,
+                                     destination_width, destination_height);
       chrome9_mipmap_unmap_level(pipe, &destination);
       chrome9_mipmap_unmap_level(pipe, &source);
    }
