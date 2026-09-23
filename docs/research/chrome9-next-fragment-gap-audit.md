@@ -122,6 +122,23 @@ antiparallel reflect inputs, and power bases `0, .25, .5, 1` with exponents
 `1,2,20`.  Read float-sensitive intermediates through multiple color lanes;
 an UNORM terminal alone cannot prove scalar broadcast.
 
+The first bounded numeric gates have now passed on the 192.168.2.60 VX900
+target through the generic structured program path:
+
+- explicit DP3 -> RSQ -> MUL -> MOV normalized `(.6,.8,0)` to the expected
+  logical `(.6,.8,0,0)` (`0099cc00`, allowing the tool's two-byte conversion
+  tolerance);
+- LOG2 -> MUL -> EXP2 -> MOV produced `.5^2=.25` (`40404040`) and
+  `.25^.5=.5` (`80808080`);
+- DP3 -> ADD -> modified-source MAD reflected `(.6,-.8,0)` around
+  `(0,1,0)` to `(.6,.8,0)` (`0099cc00`).
+
+Every draw passed its D16, BO-guard, and triangle-exterior checks.  A
+known-good EGL draw passed after each candidate, and no new engine diagnostic
+appeared.  These results qualify the tested finite points and record chains;
+they do not yet cover zero-length normalize, general POW zero/negative
+domains, precision away from exact powers, or the full vector set above.
+
 ### P1: discard is a separate side effect, not CMP
 
 The generic compiler currently rejects every discard/demote/terminate
