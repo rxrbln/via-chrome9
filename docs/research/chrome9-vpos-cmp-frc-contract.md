@@ -130,6 +130,26 @@ while ids 8--12 use the separate-state class.  The only common conclusion
 needed here is chip id 5/VX900.  Do not extend the bit unconditionally to
 other generations without their own draw-path proof.
 
+The same programmable-PS update owns type-01 A8A when MISC is present.  The
+VX900 manual names A90 bit 19 `HPSLocationReg`.  With it set, A8A bit 3
+chooses between direct `PEY` and `bottom_y - PEY`; A8A bits 15:4 supply that
+bottom-Y value.  A8A bit 17 is the VX900 TS-ZTAG deadlock ECO enable.
+
+Linux `stmUpdatePS_inv:0x17f7e5..0x17f843` reads the same object `+0x80`
+predicate, replaces A8A bits 15:4 from the current viewport height/bottom,
+updates bit 3 from the drawable-orientation state, and marks the raster group
+dirty.  Windows D3D does the corresponding H5/H6 update at
+`0x1015b0f3..0x1015b1ac`.  Its chip-image initializer additionally sets A8A
+bit 17 for PCI ids `7122` and `a122` at `0x10154cbf..0x10154cd9`.
+
+For the first native upper-left/no-inversion identity gate, the explicit
+VX900 state is therefore `A8A=8a020000`: ECO enabled and Y inversion disabled,
+making bits 15:4 irrelevant.  A later inverted-drawable implementation must
+derive the bottom value from the current viewport/orientation state exactly;
+it must not bake a target height into the shader.  The generic Chrome9 raster
+builder currently ends at A52 and does not emit A8A, so relying on reset or a
+previous draw leaves this MISC-only state stale.
+
 ## Raster linkage boundary
 
 The static evidence supports a narrow model: the pixel engine supplies one
