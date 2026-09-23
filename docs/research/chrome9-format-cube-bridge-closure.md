@@ -191,10 +191,20 @@ direct ALU references not also consumed by TAU.  The implementation rule is:
 5. allocate computed TEMP-coordinate bridge slots only after the persistent
    union, using the proven circular lifetime allocator.
 
+Two sparse production rows prove that this is physical compaction, not merely
+slot reservation.  `MOV oC0,T5` compiles identically to `MOV oC0,T0`: logical
+usage metadata is bit 5, but the ALU source and A90 use physical slot/bit zero.
+`TEX(s0,T0); MUL oC0,r0,T5` compacts union `{T0,T5}` to slots `{0,1}`: TAU is
+`301001b0`, the ALU source ID is one (`...302c1053...`), A90 is `90018002`, and
+A91 is `91000001`.  Therefore every direct ALU varying source must be rewritten
+through the same logical-to-physical map used by TAU.
+
 The current kernel fragment allocator only discovers direct coordinates while
-walking TEX instructions.  It therefore compacts T1 to slot zero for the mixed
-case and disagrees with the production `301011b0`.  Fix the union allocation
-before admitting arbitrary packed varying plus texture shaders.
+walking TEX instructions, and `chrome9_fragment_source_id()` returns a varying's
+logical index unchanged.  It would both compact T1 incorrectly in the first
+mixed case and encode sparse ALU T5 as physical five in the second.  Fix union
+allocation and ALU source rewriting before admitting arbitrary packed
+varying-plus-texture shaders.
 
 The exact computed-coordinate object remains:
 
