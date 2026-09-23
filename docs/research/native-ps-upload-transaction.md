@@ -492,8 +492,17 @@ temporary forwarding and count-three controls together, moving the
 three-coordinate failure back to producer/consumer linkage.  A black result
 with normal retirement reproduces the missing terminal color write without
 any varying state; a timeout identifies an execution/store boundary instead.
-Do not alter H3 framing between outcomes.  This discriminator is compiler-
-exact but has not been submitted to hardware in this audit.
+Do not alter H3 framing between outcomes.
+
+The guarded discriminator passed on VX900 silicon on 2026-09-23.  One bounded
+submission completed normally with exactly 1,176 changed pixels; the first
+and interior words were `ffff0000`, the exterior remained `00000000`, and
+both page guards remained intact.  The post-run kernel log had no Chrome9
+timeout, error, or quarantine entry.  This qualifies the three-record counted
+H3 store, A92 count three, two TEMP forwarding/releases, and the terminal
+COLOR record together.  The earlier three-varying silent-black result is
+therefore not explained by H3 packet framing, count-three control, or generic
+temporary forwarding.
 
 ## Acceptance and transition tests
 
@@ -524,12 +533,14 @@ or LOD semantics.
 
 - **Silicon-proven:** the complete 188-dword varying pass-through and
   232-dword one-texture streams; their fixed H2 PS stores and linkage; and
-  the generic counted-H3 one-record constant MOV transaction.
+  generic counted-H3 one- and three-record constant MOV transactions,
+  including two TEMP forwards.
 - **Compiler- and builder-exact:** all twelve A90..A9b sources, H3 counts and
   selectors, ALU-before-TAU upload order, configuration-two finalized
   `MOV/MUL` objects, 96/32 store limits, and c0..c31 bank split.
 - **Hardware-independent checked:** fifteen canonical Mesa PS objects and
   complete-byte verifier.
-- **Still requiring silicon gate:** generic counted-H3 programs with more
-  than one ALU, general A90/A91 derivation, and every arithmetic/sampling
-  behavior outside the already executed fixed keys.
+- **Still requiring silicon gate:** wider generic resource/control tuples and
+  every arithmetic/sampling behavior outside the already executed fixed
+  keys.  The three-varying silent-black result remains a linkage/lifetime
+  interaction, not an H3 count boundary.

@@ -481,17 +481,37 @@ outputs.  Together with the byte-exact fragment object, no concrete mismatch
 is presently visible in A00/A08/A09, the A25/A28 masks, the VS output copies,
 the fragment source IDs, or A90/A92.
 
-The narrow remaining unqualified boundary is therefore a counted H3 upload
-containing more than one ALU record: the live generic H3 successes so far
-contain one ALU record, while this is the first three-record generic H3
-program.  If only its first record became effective, it would write TEMP0 but
-never COLOR, which is consistent with the observed black target.  This is a
-discriminator, not a recovered root cause: the current packet uses the
-vendor-proven `FE03043c`, count=`alu_count * 4`, `20030000`, `cc000000`
-transaction, so static evidence does not justify changing that framing.
-Future isolation should compare an otherwise identical multi-record
-constant-only program against a one-record direct-v2 program; neither has
-been submitted here, and no further GPU matrix was run.
+The static audit initially left multi-record H3 execution as an unqualified
+boundary, although its `FE03043c`, count=`alu_count * 4`, `20030000`,
+`cc000000` transaction already matched all three proprietary builders.  The
+corresponding constant-only discriminator subsequently passed on VX900 silicon.
+The exact three-record chain `MOV r0,c0; MOV r1,r0; MOV oC0,r1` produced
+exactly 1,176 guarded opaque-red pixels with correct interior/exterior and no
+engine error.  This eliminates counted-H3 count three, A92 count three, two
+TEMP forwards, lifetime releases, and terminal COLOR execution as the cause
+of the three-varying black target.
+
+A direct `MOV oC0,T2` is not the correct next isolation: the proprietary and
+current compilers compact a lone logical T2 use to physical coordinate zero.
+The source-backed one-record discriminator which retains physical T0, T1 and
+T2 simultaneously is instead:
+
+```text
+MAD oC0, T0, T1, T2
+
+# Linux production configuration-2 output
+02c20530 302c1053 00f2c005 00000820
+A90..A92 = 90058007 91000000 92000001
+```
+
+Set T0 and T1 to zero and T2 to opaque red.  This preserves the exact
+three-float4 FE/FVF/VS closure from the silent-black draw while reducing the
+fragment program to one ALU and no TEMP.  A red result qualifies physical T2
+producer/consumer linkage and narrows the original failure to the interaction
+between multiple varying-consuming ALUs and their release schedule; a black
+result isolates multi-coordinate/T2 linkage without H3 or TEMP ambiguity.
+This next oracle is compiler-exact but has not been run, and no additional
+GPU submission was made during this documentation update.
 
 ## Polygon offset / depth bias
 
