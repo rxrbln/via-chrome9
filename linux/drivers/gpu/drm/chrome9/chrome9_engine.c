@@ -69,6 +69,11 @@ module_param_named(rhw_chain, chrome9_rhw_chain, bool, 0400);
 MODULE_PARM_DESC(rhw_chain,
 		 "Enable the pre-promotion D16 RHW chain ioctl (default: false)");
 
+static bool chrome9_ps_add;
+module_param_named(ps_add, chrome9_ps_add, bool, 0400);
+MODULE_PARM_DESC(ps_add,
+		 "Enable the pre-promotion structured pixel ADD opcode (default: false)");
+
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
@@ -2896,6 +2901,11 @@ bool chrome9_rhw_chain_enabled(void)
 	return READ_ONCE(chrome9_rhw_chain);
 }
 
+bool chrome9_ps_add_enabled(void)
+{
+	return READ_ONCE(chrome9_ps_add);
+}
+
 int chrome9_engine_init(struct chrome9_device *cdev)
 {
 	struct chrome9_engine *engine;
@@ -4260,6 +4270,19 @@ chrome9_encode_ps_source_c(u32 record[4],
 		record[3] |= 0x00100000;
 }
 
+static void
+chrome9_encode_ps_source_b(u32 record[4],
+			   const struct drm_chrome9_ps_source *source)
+{
+	record[0] &= ~0x03ffffff;
+	record[0] |= chrome9_ps_source_modifier(source) |
+		     (u32)source->swizzle[0] << 13 |
+		     (u32)source->swizzle[1] << 10 |
+		     (u32)source->swizzle[2] << 7 |
+		     (u32)source->swizzle[3] << 4 |
+		     chrome9_ps_source_file(source) << 22;
+}
+
 static int chrome9_encode_ps_instruction(
 		const struct drm_chrome9_ps_instruction *instruction,
 		const u32 constant_c0[4], u32 record[4])
@@ -4269,6 +4292,9 @@ static int chrome9_encode_ps_instruction(
 	};
 	static const u32 mul[4] = {
 		0x0140b6d0, 0x30081053, 0x00f08005, 0x00000820,
+	};
+	static const u32 add[4] = {
+		0x00810530, 0x30140924, 0x00f08005, 0x00000820,
 	};
 	bool constant;
 	unsigned int i;
@@ -4299,6 +4325,18 @@ static int chrome9_encode_ps_instruction(
 			DRM_CHROME9_PS_SOURCE_CONSTANT ||
 			instruction->src[1].file ==
 			DRM_CHROME9_PS_SOURCE_CONSTANT;
+		break;
+	case DRM_CHROME9_PS_OP_ADD:
+		if (!chrome9_ps_add_enabled() ||
+		    !chrome9_ps_source_valid(&instruction->src[1]))
+			return -EINVAL;
+		/* The first live gate admits only v0+c0 in either source order. */
+		if (instruction->src[0].file == instruction->src[1].file)
+			return -EINVAL;
+		memcpy(record, add, sizeof(add));
+		chrome9_encode_ps_source_a(record, &instruction->src[0]);
+		chrome9_encode_ps_source_b(record, &instruction->src[1]);
+		constant = true;
 		break;
 	default:
 		return -EINVAL;

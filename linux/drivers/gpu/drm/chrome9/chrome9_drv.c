@@ -2407,6 +2407,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			if (chrome9_rhw_chain_enabled())
 				args->value |=
 					DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_CHAIN;
+			if (chrome9_ps_add_enabled())
+				args->value |= DRM_CHROME9_CAP_FRAGMENT_ADD;
 			if (chrome9_two_texture_signed_repeat)
 				args->value |=
 					DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS;
