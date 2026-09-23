@@ -97,6 +97,28 @@ render target also clamps.
 
 ## CMP guarded silicon oracle
 
+The narrowest first discriminator is now constant-only.  Both proprietary
+compilers produce this exact finalized record for `CMP oC0,c0,c1,c2`:
+
+```text
+00820530 30081053 00f08005 00090820
+```
+
+Use c0=`(-0.5,+0.25,+0,-0)`, c1=`(.25,.75,.5,1)` and
+c2=`(.125,.125,.125,.125)`.  D3D `>= 0` semantics select logical
+`(.125,.75,.5,1)`, approximately BGRA bytes `(32,191,128,255)` and packed
+little-endian `ff80bf20`.  Swap only c1/c2 in a companion draw; the expected
+packed result becomes `20202040`.  These two rows isolate predicate boundary
+and A/C/B arm placement without involving FVF or varying linkage.  Microsoft's
+[CMP reference](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/cmp---ps)
+explicitly selects the true arm for `src0 >= 0`, including its zero example;
+NaN behavior remains unspecified and rejected.
+
+`tools/re/chrome9_cmp_guard_smoke.c` implements both constant-only rows as
+`--reverse-arms` alternatives with guarded BGRA8888 and D16 allocations.  It
+is an opt-in test and must still be bracketed by known-good draws and engine
+status/reset checks when scheduled on silicon.
+
 Use the proven command-19 D16/RHW packet, BGRA8888 target, COPY, no blend,
 flat v0, guarded pages, and known-good draws before and after each candidate.
 For `CMP_C0_V0_C0`, use logical v0 `(0.25,0.75,0.5,1)` and c0
