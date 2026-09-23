@@ -106,6 +106,14 @@ final B occurrence.  Their exact raw/final records are retained in the corpus.
 This matches a semantic last-use walk; setting every relocated occurrence's
 release bit is not equivalent.
 
+ABS is the important synthetic exception.  One `ABS oC0,vPos.xyxy` token is
+expanded to A=vPos, C=vPos, B=-vPos, and configuration two emits
+`02c30418 100c3041 00f0c304 00090820`: only synthesized B has the terminal
+marker.  Ordinary TEMP ABS instead follows TEMP alias precedence and releases
+A.  A semantic compiler must account for the expanded POSITION occurrences
+before assigning release; it cannot mark A merely because the UAPI has one
+source operand.
+
 ## Real relocation-code ladder
 
 To exercise every configuration-two return without injecting private state,
