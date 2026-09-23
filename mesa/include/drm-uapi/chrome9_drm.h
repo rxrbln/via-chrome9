@@ -137,7 +137,7 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_BLEND	(1ULL << 7)
 /* RT0 ADD blending and color masks for immediate textured triangles. */
 #define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BLEND	(1ULL << 8)
-/* Blend successors can select A8R8G8B8 destination storage. */
+/* Blend successors can render to guarded A8R8G8B8 surfaces. */
 #define DRM_CHROME9_CAP_BLEND_BGRA8888	(1ULL << 9)
 /* Blend-aware draw successors expose fixed-function fragment alpha test. */
 #define DRM_CHROME9_CAP_ALPHA_TEST	(1ULL << 10)
@@ -145,6 +145,7 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_SCISSOR	(1ULL << 11)
 /* D16 LESS/write can be combined with blend, masks, and alpha test. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND	(1ULL << 12)
+/* Up to 34 untextured triangles share one validated state envelope. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH	(1ULL << 13)
 /* Two level-zero textures can be multiplied RGBA-by-RGBA. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE	(1ULL << 14)
@@ -205,6 +206,8 @@ enum drm_chrome9_param {
 /* Generic fragment textures accept A8, L8, L8A8, and RGB565 storage. */
 #define DRM_CHROME9_CAP_FRAGMENT_TEXTURE_LEGACY_FORMATS	(1ULL << 50)
 #define DRM_CHROME9_CAP_FRAGMENT_KILL			(1ULL << 51)
+/* Fragment ALU may read the native pixel-position MISC source in XY. */
+#define DRM_CHROME9_CAP_FRAGMENT_POSITION		(1ULL << 52)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -517,6 +520,10 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 
 #define DRM_CHROME9_DESTINATION_FORMAT_BGRX8888	0
 #define DRM_CHROME9_DESTINATION_FORMAT_BGRA8888	1
+#define DRM_CHROME9_DESTINATION_FORMAT_RGB565	2
+#define DRM_CHROME9_DESTINATION_FORMAT_L8A8	3
+#define DRM_CHROME9_DESTINATION_FORMAT_ARGB1555	4
+#define DRM_CHROME9_DESTINATION_FORMAT_ARGB4444	5
 
 struct drm_chrome9_blend_state {
 	__u32 flags;
@@ -648,6 +655,12 @@ struct drm_chrome9_draw_triangle_d16_blend {
 #define DRM_CHROME9_TEXTURE_RUN_BLEND	(1U << 1)
 #define DRM_CHROME9_TEXTURE_RUN_MAX_TRIANGLES	24U
 
+/*
+ * Submit a triangle list under one state envelope.  vertices_ptr addresses
+ * triangle_count * 3 drm_chrome9_vertex_d16 records.  Z is ignored unless
+ * DEPTH is set.  This remains a structured, kernel-generated command ABI;
+ * userspace never supplies native packets.
+ */
 struct drm_chrome9_draw_triangle_batch {
 	__u32 destination_handle;
 	__u32 depth_handle;
@@ -978,6 +991,8 @@ enum drm_chrome9_fragment_file {
 	DRM_CHROME9_FRAGMENT_FILE_TEMP = 0,
 	DRM_CHROME9_FRAGMENT_FILE_VARYING = 1,
 	DRM_CHROME9_FRAGMENT_FILE_CONSTANT = 2,
+	/* Native fragment position, not a vertex varying; index must be zero. */
+	DRM_CHROME9_FRAGMENT_FILE_POSITION = 3,
 };
 
 #define DRM_CHROME9_FRAGMENT_DEST_TEMP	0
