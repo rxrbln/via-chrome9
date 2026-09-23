@@ -1,7 +1,7 @@
 # Chrome9 HD render-target formats and layout
 
-Status: A52 formats `98` and `99` are live-proven on VX900 for linear SF
-targets.  Formats `b8` and `b9`, tiled targets, and framebuffer sRGB retain
+Status: A52 formats `98`, `99`, and `89` are live-proven on VX900 for linear
+SF targets.  Formats `b8` and `b9`, tiled targets, and framebuffer sRGB retain
 independent manual and executable-driver evidence but are not yet measured.
 This note keeps storage format, address domain, tiling, pitch, and color-space
 conversion separate so that adding EGL/FBO formats does not silently change
@@ -68,7 +68,7 @@ also fixed by Windows' public-format conversion at
 | A52 byte | private format | D3D9 format | hardware packing | tentative Gallium format | status |
 |---:|---:|---|---|---|---|
 | `88` | `1017`/`101a` | `X1R5G5B5` for `101a` | RGB555, implicit alpha 1 | `B5G5R5X1_UNORM` | static |
-| `89` | `1018` | `R5G6B5` | RGB565 | `B5G6R5_UNORM` | static |
+| `89` | `1018` | `R5G6B5` | RGB565 | `B5G6R5_UNORM` | live |
 | `8a` | `1019` | `A1R5G5B5` | ARGB1555 | `B5G5R5A1_UNORM` | static |
 | `8b` | `101b` | `A4R4G4B4` | ARGB4444 | `B4G4R4A4_UNORM` | static |
 | `9a` | `203a` | `A2R10G10B10` | ARGB2:10:10:10 | `B10G10R10A2_UNORM` | static |
@@ -93,6 +93,48 @@ The manual also describes `d8/d9` (RGBA8880/8888) and `e8/e9`
 (BGRA8880/8888).  Neither proprietary RT lookup below exposes them, and the
 Xorg table does not contain them.  They must not be inferred from the manual
 alone or advertised as alternative 32-bit FBO layouts.
+
+### Next bounded packed-target gate: ARGB1555
+
+ARGB1555 is the smallest unambiguous successor to the live RGB565 gate.  It
+uses the same ordinary 16-bit UNORM render path while testing stored alpha;
+unlike L8A8, it has no unresolved RGB-to-luminance reduction rule.  Three
+production lookups independently select A52 format byte `8a`:
+
+- Windows D3D `VTGUModeDX32A:0x100c7590..0x100c7965` maps public
+  `D3DFMT_A1R5G5B5` to private format `1019`, and its RT-only lookup at
+  `0x1020a4c0..0x1020a57d` maps `1019` to `8a`;
+- Windows OpenGL uses the same `1019 -> 8a` row at
+  `VTGOGL32A:0x1025d3f0..0x1025d4ad`; and
+- proprietary Linux GL returns `8a` for `1019` in
+  `stmLookupRenderTargetFormat_invi:0x1a6c20..0x1a6d53`.
+
+For a 64x64 linear SF target, byte pitch is 128, so the exact destination word
+is `A52=528a0004`.  A guarded endpoint test can use the already live-proven
+`MOV oC0,c0` triangle and compare numeric little-endian `uint16_t` values:
+
+| fragment output RGBA | expected A1R5G5B5 word |
+|---|---:|
+| `(1,0,0,0)` | `7c00` |
+| `(1,0,0,1)` | `fc00` |
+| `(0,1,0,1)` | `83e0` |
+| `(0,0,1,1)` | `801f` |
+
+`tools/re/chrome9_argb1555_guard_smoke.c` performs these four draws, requires
+the established 1,176-pixel triangle footprint on each, checks an interior
+and exterior pixel, rejects every third pixel value, and preserves page guards
+around the 8-KiB target.  This simultaneously distinguishes channel order,
+the A52 `8a` selection, 16-bit pitch/extent, and stored alpha.  It intentionally
+does not enable blending or depth; those are separate format/state products.
+
+The implementation must append a destination enum (without renumbering the
+existing `0..2` values), lower it through a closed format table to
+`{ A52 byte 8a, cpp 2 }`, and use that same `cpp` for pitch and BO-extent
+validation.  The current generic path handles RGB565 with equality tests in
+both A52 lowering and pitch validation, so merely increasing the maximum enum
+would incorrectly program ARGB1555 as BGRX8888 with four-byte geometry.
+ARGB4444 (`8b`) is the next equivalent gate after this one.  L8A8 (`15`) should
+remain gray-only until its unequal-RGB reduction rule is measured.
 
 ### Executable provenance
 
@@ -239,30 +281,33 @@ Two bounded live discriminators remain required before advertising sRGB:
 ## Minimal EGL/FBO enablement order
 
 The existing successor ABI can grow without changing any ioctl structure
-size.  Preserve the current numeric values and append:
+size.  Preserve the current numeric values and append the first proven packed
+alpha target:
 
 ```text
 DRM_CHROME9_DESTINATION_FORMAT_BGRX8888 = 0 -> A52 98
 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 = 1 -> A52 99
-DRM_CHROME9_DESTINATION_FORMAT_RGBX8888 = 2 -> A52 b8
-DRM_CHROME9_DESTINATION_FORMAT_RGBA8888 = 3 -> A52 b9
+DRM_CHROME9_DESTINATION_FORMAT_RGB565   = 2 -> A52 89
+DRM_CHROME9_DESTINATION_FORMAT_ARGB1555 = 3 -> A52 8a
 
 DRM_CHROME9_BLEND_FRAMEBUFFER_SRGB_ENABLE = 1 << 2
 ```
 
-The kernel should lower the destination enum through a closed switch rather
-than another two-way ternary and reject values above 3.  The sRGB flag changes
-only A53 bits `[6:4]` from `000` to `101`; it must preserve raster-op and
-write-mask fields.  A separate capability bit should gate the new A52 pair,
-and a different capability bit should gate A53 sRGB conversion.  Requiring
-the blend-aware successor for these formats is appropriate even when blending
-is disabled, because the legacy ioctls cannot carry either selection.
+Append ARGB4444/L8A8 and the `b8/b9` channel-reversed pair only as their gates
+pass; do not reuse value 2 from pre-RGB565 design notes.  The kernel should
+lower the destination enum through a closed table carrying both A52 byte and
+bytes per pixel, rather than another equality chain, and reject unknown values.
+The sRGB flag changes only A53 bits `[6:4]` from `000` to `101`; it must
+preserve raster-op and write-mask fields.  Separate capability bits should
+gate each newly proven format family and A53 sRGB conversion.
 
 Suggested first exact words for the existing canonical 32-by-32 pitch are:
 
 ```text
 BGRX linear:  A52=52980004  A53=53010c0f
 BGRA linear:  A52=52990004  A53=53010c0f
+RGB565 linear: A52=52890002  A53=53010c0f
+ARGB1555 linear:A52=528a0002 A53=53010c0f
 RGBX linear:  A52=52b80004  A53=53010c0f
 RGBA linear:  A52=52b90004  A53=53010c0f
 BGRA sRGB:    A52=52990004  A53=53010c5f
@@ -278,15 +323,17 @@ the corresponding Gallium byte-order names on little-endian systems.
 2. Keep `B8G8R8A8_UNORM/A52=99` as an internal render target until its
    display/import/export contract is implemented.  Its COPY, alpha-only mask,
    and independent-alpha source-over results are already live.
-3. Add `R8G8B8X8_UNORM/b8` and `R8G8B8A8_UNORM/b9` only after guarded channel
+3. Keep the live `B5G6R5_UNORM/89` path, then add `B5G5R5A1_UNORM/8a` only
+   after the four guarded endpoint rows above pass.
+4. Add `R8G8B8X8_UNORM/b8` and `R8G8B8A8_UNORM/b9` only after guarded channel
    order tests.  Each test must vary only A52, write logical red/green/blue,
    and compare exact dwords (`000000ff` red for `b8`, `ff0000ff` opaque red
    for `b9`).
-4. Accept `PIPE_TEXTURE_RECT` for an internal DRI drawable destination using
+5. Accept `PIPE_TEXTURE_RECT` for an internal DRI drawable destination using
    the same guarded linear layout.  Keep rectangle sampling rejected; enabling
    the full NPOT cap solely to force a 2D drawable target overclaims mip,
    filtering, and wrap behavior.
-5. Expose sRGB target formats only after both A53 discriminators pass.  The
+6. Expose sRGB target formats only after both A53 discriminators pass.  The
    resource/view format selects A52 storage; dynamic framebuffer-sRGB state
    selects A53 conversion.
 
