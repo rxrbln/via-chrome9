@@ -2,8 +2,9 @@
 
 Status: exact Linux production-compiler differential, exact Linux/Windows
 finalizer provenance, and exact Windows D3D runtime writer.  The initial
-direct-T0 correction is live-qualified; the generalized resource rule is
-static compiler/runtime evidence pending a new bounded silicon check.
+direct-T0 correction is live-qualified.  The generalized scheduled-record
+resource rule is implemented and host-selftested, but is pending a bounded
+silicon check.
 
 ## Result
 
@@ -20,7 +21,7 @@ Consequently neither the old generic rule
 A00[7:4] = fragment_texture_count
 ```
 
-nor the current rule
+nor the former generic rule
 
 ```text
 A00[7:4] = max(fragment_texture_count, compact_coordinate_count)
@@ -188,26 +189,25 @@ native instruction, controls, and `+0x34=1`.  The Linux DCL parser increments
 instance `+0x3c` at `stmPPSTokenParser20_invi:0x1b7310..0x1b7344`; the H5 DCL
 emitter is a no-op at `stmPPS_DCL_PS20_invi:0x162c60..0x162c66`.
 
-## Current-code mismatch and bounded correction
+## Former mismatch and current validation boundary
 
 The original direct-T0 packet's A00=`00000001` was incomplete.  A00=`11`
 subsequently passed the guarded direct-T0 test, proving the one-resource case.
 That result does not validate the later `max(texture_count,varying_count)`
 generalization.
 
-The current kernel `chrome9_fragment_fe_config()` computes
-`max(texture_count, varying_count)`.  It therefore emitted A00=`31` for the
-one-record `MAD oC0,T0,T1,T2` discriminator, although the byte-exact vendor
-object requires resource count one and A00=`11`.  That guarded draw timed out
-after reaching the post-draw closure.  The mismatch is exact; causality still
+The earlier kernel `chrome9_fragment_fe_config()` computed
+`max(texture_count, varying_count)`.  It emitted A00=`31` for the one-record
+`MAD oC0,T0,T1,T2` discriminator, although the byte-exact vendor object
+requires resource count one and A00=`11`.  That guarded draw timed out after
+reaching the post-draw closure.  The mismatch is exact; causality still
 requires a single corrected cold-boot test.
 
-The implementation-ready correction is to carry an independently computed
-active texture-temporary count in `chrome9_fragment_program` and make FE
-construction consume that field.  Compute it from the scheduled native
-records using the `B/C` component-mask algorithm above, before constructing
-FE state.  A focused selftest should at minimum cover
-the contradictory pairs:
+Kernel commits `eb8524b` and `5d70f4b` now carry an independently computed
+`active_texture_count` in `chrome9_fragment_program` and use it for FE A00.
+The compiler computes the count from scheduled native records with the
+`B/C` component-mask analysis above; A08 still uses the independent producer
+coordinate high-water.  Host selftests cover the contradictory pairs:
 
 ```text
 MOV T0                          -> 1
@@ -217,6 +217,8 @@ three-record repeated T0       -> 1
 TEX s5,T5                      -> 1, sampler high-water 6 separately
 ```
 
-Changing all multi-varying programs to one would be equally wrong.  Until the
-native resource analyzer is ported, unsupported shapes should be rejected
-rather than falling back to varying count, texture count, or their maximum.
+Changing all multi-varying programs to one would be equally wrong.  The host
+selftests establish the compiler-to-FE contract, not silicon behavior: rerun
+the guarded MAD discriminator with A00=`11` after a cold boot, and keep any
+shape the native analyzer cannot represent unsupported rather than falling
+back to varying count, texture count, or their maximum.
