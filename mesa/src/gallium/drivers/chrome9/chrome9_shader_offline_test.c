@@ -543,8 +543,11 @@ check_integer_pow_ir(void)
    static const struct {
       uint32_t exponent;
       unsigned multiplications;
+      uint32_t a90;
    } cases[] = {
-      { 1, 0 }, { 2, 1 }, { 20, 5 },
+      { 1, 0, 0x90058000 }, { 2, 1, 0x90058000 },
+      { 20, 5, 0x90048000 }, { 30, 7, 0x90040000 },
+      { 100, 8, 0x90040000 },
    };
 
    for (unsigned test = 0; test < sizeof(cases) / sizeof(cases[0]); test++) {
@@ -585,8 +588,8 @@ check_integer_pow_ir(void)
       assert((result.file == CHROME9_PS_SOURCE_CONSTANT ? 1 :
               degree[result.id]) == cases[test].exponent);
 
-      /* Every stage multiplies the base or a previous product.  With base
-       * zero the result therefore remains zero for every positive power. */
+      /* Vendor configuration two uses bucket zero for seven through twelve
+       * physical temporaries; it is a valid A90 value, not a failure code. */
       ir.instruction[ir.count].op = CHROME9_PS_OPCODE_MOV;
       ir.instruction[ir.count].destination.file = CHROME9_PS_DESTINATION_COLOR;
       ir.instruction[ir.count].destination.writemask = 0xf;
@@ -594,7 +597,7 @@ check_integer_pow_ir(void)
       ir.count++;
       assert(chrome9_compile_ps_ir(&ir, &program));
       assert(program.alu_count == ir.count);
-      assert(program.control[0] & 0x00018000);
+      assert(program.control[0] == cases[test].a90);
    }
 
    {
@@ -604,24 +607,32 @@ check_integer_pow_ir(void)
       struct chrome9_ps_source result = { 0 };
       uint8_t next_temp = 0, alu_count = 0;
 
-      /* Longer chains need more than the six temporaries described by the
-       * A90 resource buckets.  Reject before emitting a partial program. */
-      assert(!chrome9_ps_emit_integer_pow(&ir, base, 30, &next_temp,
-                                          &alu_count, &result));
-      assert(!chrome9_ps_emit_integer_pow(&ir, base, 100, &next_temp,
-                                          &alu_count, &result));
-      assert(!ir.count && !next_temp && !alu_count);
       assert(!chrome9_ps_emit_integer_pow(&ir, base, 0, &next_temp,
                                           &alu_count, &result));
 
-      next_temp = CHROME9_PS_MAX_RESOURCE_TEMPS - 1;
+      /* Logical IDs 120..127 fit exactly; 121..128 do not.  Resource
+       * packing is a later kernel concern, but IR overflow must be atomic. */
+      next_temp = CHROME9_PS_MAX_VIRTUAL_TEMPS - 8;
+      assert(chrome9_ps_emit_integer_pow(&ir, base, 100, &next_temp,
+                                         &alu_count, &result));
+      assert(ir.count == 8 && next_temp == CHROME9_PS_MAX_VIRTUAL_TEMPS);
+      assert(result.file == CHROME9_PS_SOURCE_TEMP && result.id == 127);
+      memset(&ir, 0, sizeof(ir));
+      next_temp = CHROME9_PS_MAX_VIRTUAL_TEMPS - 7;
+      alu_count = 0;
+      assert(!chrome9_ps_emit_integer_pow(&ir, base, 100, &next_temp,
+                                          &alu_count, &result));
+      assert(!ir.count && next_temp == CHROME9_PS_MAX_VIRTUAL_TEMPS - 7 &&
+             !alu_count);
+
+      next_temp = CHROME9_PS_MAX_VIRTUAL_TEMPS - 1;
       alu_count = CHROME9_PS_MAX_ALU - 1;
 
       ir.count = CHROME9_PS_MAX_INSTRUCTIONS - 1;
       assert(!chrome9_ps_emit_integer_pow(&ir, base, 20, &next_temp,
                                           &alu_count, &result));
       assert(ir.count == CHROME9_PS_MAX_INSTRUCTIONS - 1);
-      assert(next_temp == CHROME9_PS_MAX_RESOURCE_TEMPS - 1);
+      assert(next_temp == CHROME9_PS_MAX_VIRTUAL_TEMPS - 1);
       assert(alu_count == CHROME9_PS_MAX_ALU - 1);
    }
 }

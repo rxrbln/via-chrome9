@@ -437,11 +437,9 @@ chrome9_ps_emit_integer_pow(struct chrome9_ps_ir *ir,
    if (ir->count > CHROME9_PS_MAX_INSTRUCTIONS ||
        *alu_count > CHROME9_PS_MAX_ALU ||
        *next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS ||
-       *next_temp > CHROME9_PS_MAX_RESOURCE_TEMPS ||
        operations > CHROME9_PS_MAX_INSTRUCTIONS - ir->count ||
        operations > CHROME9_PS_MAX_ALU - *alu_count ||
-       operations > CHROME9_PS_MAX_VIRTUAL_TEMPS - *next_temp ||
-       operations > CHROME9_PS_MAX_RESOURCE_TEMPS - *next_temp)
+       operations > CHROME9_PS_MAX_VIRTUAL_TEMPS - *next_temp)
       return false;
 
    for (int bit = (int)highest - 1; bit >= 0; bit--) {
