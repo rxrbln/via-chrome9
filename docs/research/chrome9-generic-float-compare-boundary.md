@@ -89,7 +89,9 @@ has a research-only `CHROME9_INTERNAL_SLT` path which constructs exactly one
 normalized opcode-107 record and calls the named internal emitter.  The
 public optimizer cannot be applied to that isolated record because it
 dereferences parser-owned neighboring IR; configuration-two dependency
-finalization itself succeeds.  The resulting terminal objects are:
+finalization itself succeeds.  The resulting isolated terminal records are
+listed below; the two-varying row is malformed and is not an executable
+oracle.
 
 ```text
 SLT oC0,c0,c1
@@ -113,6 +115,19 @@ SLT oC0,T0,T1
   active=(1,13,1,0), A90=90040001, A91=91000001, A92=92000002
 ```
 
+### Two-varying probe limitation
+
+In the isolated `T0,T1` row, the first record's native B source decodes as
+file 3, id **63**, with no release marker.  The corresponding production SGE
+`T0,T1` row encodes B as file 3, id **1**, with a release marker
+(`02c10538` rather than `00ff0538`).  The SLT row's active tuple also
+accounts for only one direct coordinate.  Id 63 is outside the eight-varying
+semantic ABI and cannot stand for `T1`; do not submit or byte-match this row
+as a valid two-varying program.  Its cause has not been proved, though the
+probe's deliberate bypass of parser-owned optimizer state is a plausible
+explanation.  Recover a correctly linked two-varying object through an
+independent offline path before admitting that operand pairing.
+
 The first record computes `src0 + -src1` into special scratch r12.  Decoding
 the second gives A=r12/release, C=native ZERO, B=native ONE, subop 9, so the
 symbolic operation is exactly `difference >= 0 ? 0 : 1`.  This independently
@@ -121,10 +136,11 @@ Special-r12 allocation explains the active temporary high-water 13 and the
 `90040000` resource bucket, matching the established FLR/POW/NRM special
 scratch family.
 
-These bytes are an executable-shape compiler oracle, but they remain
-silicon-unqualified and use r12, which the current generic allocator does not
-expose.  Do not invent a one-record SLT or silently substitute SUB+CMP.  A
-future semantic SLT opcode must own this two-record expansion, special scratch
+The constant and one-varying rows provide compiler-shape oracles, but they
+remain silicon-unqualified and use r12, which the current generic allocator
+does not expose.  The malformed two-varying row provides no execution oracle.
+Do not invent a one-record SLT or silently substitute SUB+CMP.  A future
+semantic SLT opcode must own this two-record expansion, special scratch
 reservation, and dependency finalization in the kernel.
 
 ## NIR semantics that must be preserved
