@@ -4,6 +4,7 @@
 #include "chrome9_public.h"
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
+#include "chrome9_fragment.h"
 #include "chrome9_resource.h"
 
 #include <fcntl.h>
@@ -1226,6 +1227,107 @@ smoke_varying_arithmetic_compile(struct pipe_screen *screen)
    return passed;
 }
 
+/* Exercise the NIR-to-semantic path without submitting a GPU draw.  Keep
+ * native Z/W out of the live sources until their MISC mapping is known. */
+static bool
+smoke_position_compile(struct pipe_screen *screen)
+{
+   struct pipe_context *context = screen->context_create(screen, NULL, 0);
+   struct chrome9_shader *shader;
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   unsigned instruction_count = 0;
+   nir_builder b;
+   struct pipe_shader_state state;
+   nir_def *position, *transform, *x, *y, *color;
+   bool passed;
+
+   if (!context)
+      return false;
+   b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-position-compile");
+   b.shader->info.io_lowered = true;
+   position = nir_load_frag_coord(&b);
+   transform = nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0),
+                                 nir_imm_int(&b, 2));
+   x = nir_fadd_imm(&b, nir_channel(&b, position, 0), 0.5f);
+   y = nir_fadd_imm(&b, nir_channel(&b, position, 1), 0.5f);
+   y = nir_ffma(&b, y, nir_channel(&b, transform, 0),
+                nir_channel(&b, transform, 1));
+   x = nir_fmul(&b, x,
+                nir_imm_float(&b, 1.0f / 32.0f));
+   y = nir_fmul(&b, y,
+                nir_imm_float(&b, 1.0f / 32.0f));
+   color = nir_vec4(&b, x, y, x, y);
+   nir_store_output(&b, color, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
+   state = (struct pipe_shader_state) {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   shader = context->create_fs_state(context, &state);
+   passed = shader && shader->semantic_fs_valid && shader->supported &&
+      shader->semantic_fs_ir.count >= 2 &&
+      (shader->semantic_constant_mask & (1u << 2)) &&
+      (shader->semantic_uniform_mask & (1u << 2)) &&
+      chrome9_fragment_build_instructions(&shader->semantic_fs_ir, 0,
+                                           instructions,
+                                           &instruction_count) &&
+      instruction_count == shader->semantic_fs_ir.count;
+   if (passed) {
+      bool position_found = false;
+
+      for (unsigned i = 0; i < shader->semantic_fs_ir.count; i++)
+         for (unsigned s = 0; s < 3; s++)
+            position_found |= shader->semantic_fs_ir.instruction[i]
+               .source[s].file == CHROME9_PS_SOURCE_POSITION;
+      passed = position_found;
+   }
+   if (shader)
+      context->delete_fs_state(context, shader);
+   if (passed) {
+      nir_builder boundary = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+         "chrome9-ubo-boundary-compile");
+      nir_def *vec4_lane, *byte_lane;
+
+      boundary.shader->info.io_lowered = true;
+      vec4_lane = nir_load_ubo_vec4(
+         &boundary, 1, 32, nir_imm_int(&boundary, 0),
+         nir_imm_int(&boundary, 1), .base = 4, .component = 2);
+      byte_lane = nir_load_ubo(
+         &boundary, 1, 32, nir_imm_int(&boundary, 0),
+         nir_imm_int(&boundary, 31 * 16 + 12),
+         .align_mul = 4, .range_base = 31 * 16 + 12, .range = 4);
+      nir_store_output(&boundary,
+                       nir_vec4(&boundary, vec4_lane, byte_lane,
+                                vec4_lane, byte_lane),
+                       nir_imm_int(&boundary, 0), .write_mask = 0xf,
+                       .io_semantics.location = FRAG_RESULT_COLOR);
+      nir_shader_gather_info(boundary.shader,
+                             nir_shader_get_entrypoint(boundary.shader));
+      nir_recompute_io_bases(boundary.shader,
+                             nir_var_shader_in | nir_var_shader_out);
+      state.ir.nir = boundary.shader;
+      shader = context->create_fs_state(context, &state);
+      passed = shader && shader->semantic_fs_valid && shader->supported &&
+         (shader->semantic_uniform_mask & ((1u << 5) | (1u << 31))) ==
+            ((1u << 5) | (1u << 31)) &&
+         chrome9_fragment_build_instructions(&shader->semantic_fs_ir, 0,
+                                              instructions,
+                                              &instruction_count);
+      if (shader)
+         context->delete_fs_state(context, shader);
+   }
+   context->destroy(context);
+   if (passed)
+      puts("fragment POSITION XY and dynamic WPOS transform accepted without draw");
+   return passed;
+}
+
 static void *
 make_two_projected_texture_vertex_shader(struct pipe_screen *screen,
                                          struct pipe_context *context)
@@ -1407,6 +1509,38 @@ make_solid_vertex_shader(struct pipe_screen *screen,
    nir_recompute_io_bases(b.shader,
                           nir_var_shader_in | nir_var_shader_out);
    return context->create_vs_state(context, &state);
+}
+
+static void *
+make_position_draw_fs(struct pipe_screen *screen,
+                      struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-position-guarded-draw");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *position, *transform, *x, *y;
+
+   b.shader->info.io_lowered = true;
+   position = nir_load_frag_coord(&b);
+   transform = nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0),
+                                 nir_imm_int(&b, 2));
+   x = nir_fadd_imm(&b, nir_channel(&b, position, 0), 0.5f);
+   y = nir_fadd_imm(&b, nir_channel(&b, position, 1), 0.5f);
+   y = nir_ffma(&b, y, nir_channel(&b, transform, 0),
+                nir_channel(&b, transform, 1));
+   x = nir_fmul_imm(&b, x, 1.0f / 64.0f);
+   y = nir_fmul_imm(&b, y, 1.0f / 64.0f);
+   nir_store_output(&b, nir_vec4(&b, x, y, x, y), nir_imm_int(&b, 0),
+                    .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
 }
 
 static void *
@@ -6216,6 +6350,247 @@ out:
 }
 
 static bool
+smoke_position_draw(struct pipe_screen *screen)
+{
+   static const float vertices[3][4] = {
+      { -0.75f, -0.75f, 0.0f, 1.0f },
+      {  0.75f, -0.75f, 0.0f, 1.0f },
+      { -0.75f,  0.75f, 0.0f, 1.0f },
+   };
+   static const struct {
+      unsigned x, y, red, green;
+   } samples[] = {
+      { 16, 16, 66, 66 },
+      { 24, 16, 98, 66 },
+      { 16, 24, 66, 98 },
+   };
+   const float constants[3][4] = { { 0 }, { 0 }, { 1.0f, 0, 0, 0 } };
+   const struct pipe_constant_buffer constant = {
+      .buffer_size = sizeof(constants),
+      .user_buffer = constants,
+   };
+   struct pipe_resource color_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource depth_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_Z16_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
+   };
+   const struct pipe_vertex_buffer vertex_buffer = {
+      .is_user_buffer = true,
+      .buffer.user = vertices,
+   };
+   const struct pipe_vertex_element element = {
+      .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+      .src_stride = sizeof(vertices[0]),
+   };
+   struct pipe_blend_state blend = { 0 };
+   const struct pipe_depth_stencil_alpha_state dsa = {
+      .depth_enabled = true,
+      .depth_writemask = true,
+      .depth_func = PIPE_FUNC_LESS,
+   };
+   const struct pipe_rasterizer_state rasterizer = {
+      .half_pixel_center = true,
+      .bottom_edge_rule = true,
+      .depth_clip_near = true,
+      .depth_clip_far = true,
+   };
+   const struct pipe_viewport_state viewport = {
+      .scale = { 32.0f, 32.0f, 0.5f },
+      .translate = { 32.5f, 32.5f, 0.5f },
+   };
+   const struct pipe_scissor_state scissor = { .maxx = 64, .maxy = 64 };
+   const struct pipe_draw_info info = {
+      .mode = MESA_PRIM_TRIANGLES,
+      .index_bounds_valid = true,
+      .instance_count = 1,
+      .min_index = 0,
+      .max_index = 2,
+   };
+   const struct pipe_draw_start_count_bias draw = { .count = 3 };
+   const union pipe_color_union clear_color = { 0 };
+   struct pipe_framebuffer_state framebuffer = {
+      .width = 64, .height = 64, .nr_cbufs = 1,
+      .cbufs[0] = { .format = PIPE_FORMAT_B8G8R8X8_UNORM },
+      .zsbuf = { .format = PIPE_FORMAT_Z16_UNORM },
+   };
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   struct pipe_resource *color = NULL, *depth = NULL;
+   struct pipe_context *context = NULL;
+   struct chrome9_resource *ccolor, *cdepth;
+   struct chrome9_shader *shader;
+   const uint32_t *color_pixels;
+   const uint16_t *depth_pixels;
+   uint64_t submitted, rejected, batches;
+   unsigned instruction_count = 0;
+   void *blend_handle = NULL, *dsa_handle = NULL;
+   void *rasterizer_handle = NULL, *elements_handle = NULL;
+   void *vs = NULL, *fs = NULL;
+   bool position_seen = false, passed = false;
+
+   if (!chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM |
+                     DRM_CHROME9_CAP_FRAGMENT_POSITION) ||
+       !screen->is_format_supported(screen, color_templ.format,
+                                    color_templ.target, 1, 1,
+                                    color_templ.bind) ||
+       !screen->is_format_supported(screen, depth_templ.format,
+                                    depth_templ.target, 1, 1,
+                                    depth_templ.bind))
+      goto out;
+   color = screen->resource_create(screen, &color_templ);
+   depth = screen->resource_create(screen, &depth_templ);
+   context = screen->context_create(screen, NULL, 0);
+   if (!color || !depth || !context)
+      goto out;
+   ccolor = chrome9_resource(color);
+   cdepth = chrome9_resource(depth);
+   if (!ccolor->guarded || !cdepth->guarded ||
+       ccolor->stride < 64 * sizeof(uint32_t) ||
+       cdepth->stride < 64 * sizeof(uint16_t) ||
+       ccolor->bo.handle == cdepth->bo.handle ||
+       !smoke_initialize_guard_pages(ccolor) ||
+       !smoke_initialize_guard_pages(cdepth))
+      goto out;
+
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   blend_handle = context->create_blend_state(context, &blend);
+   dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   elements_handle = context->create_vertex_elements_state(context, 1,
+                                                            &element);
+   vs = make_solid_vertex_shader(screen, context);
+   fs = make_position_draw_fs(screen, context);
+   shader = fs;
+   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+       !elements_handle || !vs || !shader || !shader->supported ||
+       !shader->semantic_fs_valid || shader->semantic_input_mask ||
+       shader->semantic_varying_mask || shader->semantic_sampler_mask ||
+       !(shader->semantic_uniform_mask & (1u << 2)) ||
+       !chrome9_fragment_build_instructions(&shader->semantic_fs_ir, 0,
+                                            instructions,
+                                            &instruction_count) ||
+       instruction_count != shader->semantic_fs_ir.count)
+      goto out;
+   printf("POSITION semantic IR (%u):", instruction_count);
+   for (unsigned i = 0; i < instruction_count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &shader->semantic_fs_ir.instruction[i];
+
+      printf(" [%u op%u dst%u.%u/%x", i, instruction->op,
+             instruction->destination.file, instruction->destination.id,
+             instruction->destination.writemask);
+      for (unsigned s = 0; s < 3; s++) {
+         const struct chrome9_ps_source *source =
+            &instruction->source[s];
+
+         printf(" s%u=%u.%u/%u%u%u%u", s, source->file, source->id,
+                source->swizzle[0], source->swizzle[1],
+                source->swizzle[2], source->swizzle[3]);
+         position_seen |= source->file == CHROME9_PS_SOURCE_POSITION;
+      }
+      putchar(']');
+   }
+   putchar('\n');
+   fflush(stdout);
+   if (!position_seen)
+      goto out;
+   if (debug_get_bool_option("CHROME9_POSITION_DRY_RUN", false)) {
+      passed = true;
+      goto out;
+   }
+
+   framebuffer.cbufs[0].texture = color;
+   framebuffer.zsbuf.texture = depth;
+   context->set_framebuffer_state(context, &framebuffer);
+   context->bind_blend_state(context, blend_handle);
+   context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   context->bind_rasterizer_state(context, rasterizer_handle);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, vs);
+   context->bind_fs_state(context, fs);
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0, &constant);
+   context->set_viewport_states(context, 0, 1, &viewport);
+   context->set_scissor_states(context, 0, 1, &scissor);
+   context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                  PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 1.0, 0);
+   submitted = chrome9_context(context)->submitted_triangles;
+   rejected = chrome9_context(context)->rejected_triangles;
+   batches = chrome9_context(context)->submitted_program_batches;
+   context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+   context->flush_resource(context, color);
+   context->flush_resource(context, depth);
+   context->flush(context, NULL, 0);
+
+   color_pixels = (const uint32_t *)((const uint8_t *)ccolor->bo.map +
+                                     ccolor->data_offset);
+   depth_pixels = (const uint16_t *)((const uint8_t *)cdepth->bo.map +
+                                     cdepth->data_offset);
+   passed = chrome9_context(context)->submitted_triangles == submitted + 1 &&
+            chrome9_context(context)->rejected_triangles == rejected &&
+            chrome9_context(context)->submitted_program_batches ==
+               batches + 1 &&
+            smoke_guard_pages_match(ccolor) && smoke_guard_pages_match(cdepth) &&
+            color_pixels[60 * (ccolor->stride / 4) + 60] == 0 &&
+            depth_pixels[60 * (cdepth->stride / 2) + 60] == 0xffff;
+   for (unsigned i = 0; i < ARRAY_SIZE(samples); i++) {
+      uint32_t pixel = color_pixels[samples[i].y * (ccolor->stride / 4) +
+                                    samples[i].x];
+      uint16_t z = depth_pixels[samples[i].y * (cdepth->stride / 2) +
+                                samples[i].x];
+      unsigned red = pixel >> 16 & 0xff;
+      unsigned green = pixel >> 8 & 0xff;
+      unsigned blue = pixel & 0xff;
+
+      passed &= abs((int)red - (int)samples[i].red) <= 1 &&
+                abs((int)green - (int)samples[i].green) <= 1 &&
+                abs((int)blue - (int)samples[i].red) <= 1 &&
+                z >= 0x7ffe && z <= 0x8001;
+      printf("POSITION sample (%u,%u): color=%08x depth=%04x\n",
+             samples[i].x, samples[i].y, pixel, z);
+   }
+   if (passed)
+      puts("Guarded 64x64 Gallium POSITION draw passed");
+   else
+      fprintf(stderr,
+              "Guarded POSITION draw mismatch: outside=%08x/%04x "
+              "submitted=+%" PRIu64 " rejected=+%" PRIu64
+              " batches=+%" PRIu64 " guards=%u/%u\n",
+              color_pixels[60 * (ccolor->stride / 4) + 60],
+              depth_pixels[60 * (cdepth->stride / 2) + 60],
+              chrome9_context(context)->submitted_triangles - submitted,
+              chrome9_context(context)->rejected_triangles - rejected,
+              chrome9_context(context)->submitted_program_batches - batches,
+              smoke_guard_pages_match(ccolor), smoke_guard_pages_match(cdepth));
+
+out:
+   if (context) {
+      if (fs) context->delete_fs_state(context, fs);
+      if (vs) context->delete_vs_state(context, vs);
+      if (elements_handle)
+         context->delete_vertex_elements_state(context, elements_handle);
+      if (rasterizer_handle)
+         context->delete_rasterizer_state(context, rasterizer_handle);
+      if (dsa_handle)
+         context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (blend_handle)
+         context->delete_blend_state(context, blend_handle);
+      context->destroy(context);
+   }
+   if (depth) screen->resource_destroy(screen, depth);
+   if (color) screen->resource_destroy(screen, color);
+   return passed;
+}
+
+static bool
 smoke_d24_combined_draw(struct pipe_screen *screen,
                         struct pipe_context *context,
                         struct pipe_resource *color,
@@ -6887,6 +7262,18 @@ main(int argc, char **argv)
    }
    if (argc > 2 && !strcmp(argv[2], "--varying-arithmetic-compile-only")) {
       bool passed = smoke_varying_arithmetic_compile(screen);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--position-compile-only")) {
+      bool passed = smoke_position_compile(screen);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--position-draw-only")) {
+      bool passed = smoke_position_draw(screen);
 
       screen->destroy(screen);
       return passed ? 0 : 1;
