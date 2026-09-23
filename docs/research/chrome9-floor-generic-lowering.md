@@ -1,9 +1,9 @@
 # Chrome9 generic floor lowering without special scratch
 
 Status: Linux 5.75 production compiler and configuration-two exact; negative
-FRC prerequisite live-qualified on VX900.  This is a straight-line lowering
-candidate for NIR `ffloor`, not authorization to expose native internal FLR
-opcode 103.
+FRC, full generic floor graph, and Mesa GLSL lowering live-qualified on VX900.
+This is the implemented straight-line lowering for NIR `ffloor`, not
+authorization to expose native internal FLR opcode 103.
 
 ## Why the native FLR expansion is unsuitable
 
@@ -90,9 +90,14 @@ That direct `--frc-negative` gate has now passed on the 192.168.2.60 VX900:
 exact `bf40bf40`, correct D16, intact color/depth guards and triangle
 exterior.  The following known-good EGL draw passed and dmesg remained clean.
 Native FRC therefore uses the GLSL/NIR floor-based negative rule for these
-finite values.  The remaining promotion gate is the complete explicit
-FRC -> SUB floor graph (preferably with the observation MAD above), not
-internal opcode 103.
+finite values.  The next promotion gate was the complete explicit FRC -> SUB
+floor graph with the observation MAD above, not internal opcode 103.
+
+The complete `--floor-negative` observation then passed exact `bf004080` on
+the same target, with correct D16, intact color/depth guards and exterior, and
+a passing known-good EGL draw afterward.  This excludes the truncation result
+`bf408080` and qualifies the tested FRC -> SUB floor chain plus observation
+MAD on finite negative and positive lanes.
 
 ## Compiler policy
 
@@ -103,14 +108,14 @@ finite-only contract.  The observation MAD uses one constant id in both
 constant source slots and therefore stays inside the live-proven two-distinct
 constant-per-record limit.
 
-## Current Mesa integration point
+## Mesa integration
 
-The current Chrome9 NIR options in `chrome9_screen.c` enable `lower_fdiv`,
-`lower_flrp32`, `lower_fmod`, `lower_fsat`, and `lower_sincos`, but leave
-`lower_ffloor` false.  The generic fragment builder's ALU switch in
-`chrome9_context.c` accepts `nir_op_ffract` as native FRC and has no
-`nir_op_ffloor` case.  Consequently a surviving floor is rejected, and the
-existing `lower_fmod` path can still create an unsupported floor dependency.
+Before the live closure, Chrome9's NIR options enabled `lower_fdiv`,
+`lower_flrp32`, `lower_fmod`, `lower_fsat`, and `lower_sincos`, but left
+`lower_ffloor` false.  The generic fragment builder accepts `nir_op_ffract`
+as native FRC and intentionally has no direct `nir_op_ffloor` case.  A
+surviving floor was therefore rejected, and `lower_fmod` could create an
+unsupported floor dependency.
 
 Mesa's standard NIR algebraic rule already defines the desired 32-bit
 lowering when `options->lower_ffloor` is true:
@@ -119,8 +124,11 @@ lowering when `options->lower_ffloor` is true:
 ffloor(a) -> fsub(a, ffract(a))
 ```
 
-The implementation should therefore set `.lower_ffloor = true` in the
-Chrome9 NIR options after this complete floor oracle passes.  It should not
-add a direct native-FLR opcode to the backend.  Focused compile tests must
-require one FRC plus one SUB for `ffloor`, and verify that lowered `fmod`
-contains no surviving `ffloor` before semantic translation.
+Mesa commit `7a56ec0` now sets `.lower_ffloor = true` in the Chrome9 NIR
+options; parent integration commit is `4927257`.  A live GLSL shader with a
+uniform negative floor input changed from unsupported to a five-ALU native
+program and passed its negative-pixel check.  The implementation correctly
+uses standard NIR FRC+SUB lowering and did not add native-FLR opcode 103.
+Focused compile coverage should continue to require one FRC plus one SUB for
+the floor subgraph and verify that lowered `fmod` contains no surviving
+`ffloor` before semantic translation.
