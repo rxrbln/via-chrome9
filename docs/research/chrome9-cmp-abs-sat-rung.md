@@ -135,15 +135,18 @@ limit rather than a CMP-only subop error:
 * `MOV c1` passed `ff40bf80`, proving c1 upload and an ordinary source read;
 * `ADD c0,c1` through A/B passed `ff00ff80`;
 * `MUL c0,c1` through A/C passed `00003000`;
+* `MAD c0,c1,c0`, three operands but only two distinct constants, passed
+  `00007000`;
 * `MAD c0,c1,c2` produced `20603020` rather than `20005020`.
 
-The MAD result is exactly c0*c0+c2: c0 squared plus c2 is logical
+The failing MAD result is exactly c0*c0+c2: c0 squared plus c2 is logical
 `(.375,.1875,.125,.125)`, code-99 word `20603020`.  Thus A and C can read
-distinct constants in a two-source instruction, but the three-source packet
-cannot sustain three distinct constant registers; when B consumes the second
-constant resource, C aliases A.  The semantic validator/compiler must reject
-or legalize every MAD/CMP with three distinct constant ids.  This is a native
-per-record resource constraint, not permission to redefine CMP semantics.
+distinct constants, and all three source fields work when only two distinct
+constant ids are present.  The packet cannot sustain three distinct constant
+registers; when B consumes the second constant resource, C aliases A.  The
+semantic validator/compiler must reject or legalize every MAD/CMP with three
+distinct constant ids.  This is a native per-record resource constraint, not
+permission to redefine CMP semantics.
 
 The source-backed legalizer is `MOV temp,c1; CMP color,c0,temp,c2`.  Linux
 configuration two finalizes it as
@@ -156,9 +159,12 @@ A90=90058000 A91=91000000 A92=92000002
 
 It uses one physical temporary and only two constant sources in the CMP
 record.  `tools/re/chrome9_cmp_guard_smoke.c --cmp-temp-true` implements this
-next discriminator.  Only after it proves the intended boundary should the
-direct-T0 and vPos successor modes run.  General lowering must insert the
-legalization based on distinct native constant ids, not shader identity.
+legalization and has passed on VX900 with result `ff20bf80`, correct D16 and
+intact guards; the known-good EGL draw afterward also passed.  This proves the
+documented `>=0` behavior for negative, positive, +0, and -0 once the native
+resource constraint is respected.  The direct-T0 and vPos successor modes are
+now the next linkage gates.  General lowering must insert the legalization
+based on distinct native constant ids, not shader identity.
 
 Use the proven command-19 D16/RHW packet, BGRA8888 target, COPY, no blend,
 flat v0, guarded pages, and known-good draws before and after each candidate.
