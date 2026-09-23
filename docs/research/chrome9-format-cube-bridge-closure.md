@@ -138,6 +138,36 @@ manual fields exactly, but no retained executable cube general-state packet or
 live result independently confirms it.  Keep it behind the cube capability and
 orientation gate.  Do not substitute four-dimensional/projective Q state.
 
+The fragment lookup itself is now production-exact.  Linux OpenGL
+`__glEnableDisable:0x28d5fc..0x28e010` handles public
+`GL_TEXTURE_CUBE_MAP=8513`, stores its enable at per-unit byte `+0x6023`, and
+calls `__glSetTexEnableDimension`.  That function selects internal dimension
+four at `0x28c5ab..0x28c5bb`.  The fixed-function program builder then:
+
+- maps dimension four to a four-lane `Tn.xyzw` declaration through the exact
+  table `via_chrome9_dri.so:0x3f8e60 = 00010000,00030000,00070000,000f0000`;
+- recognizes key four at
+  `__glDpGenerateTexStageBlendMSToken:0x206620..0x20662e`; and
+- emits source token `03010042` (TEXLDP) instead of ordinary `03000042`
+  (TEXLD).
+
+Compiling otherwise identical `TEX(s0,T0); MOV oC0` objects gives:
+
+| production backend | TEXLD TAU | cube/TEXLDP TAU | stable delta |
+|---|---:|---:|---:|
+| Linux 5.75 | `301001b0` | `307001b0` | `00600000` |
+| Windows D3D | `201001b0` | `207001b0` | `00600000` |
+
+The Windows result was generated headlessly from the exact DLL with the
+private tokenizer/compiler/finalizer wrapper; token and output hashes are in
+the corpus.  Bit 28 differs only because the Windows wrapper has a synthetic
+register manager and does not mark this direct coordinate's last use.  Both
+backends independently prove TAU operation field `[22:20]`: one is ordinary
+TEXLD and seven is the TEXLDP form selected by the cube fixed-function path.
+The image A18 shape still distinguishes cube face selection from a projected
+2D lookup.  A first cube implementation must therefore emit operation seven,
+not reuse the current ordinary `...1...` TAU template.
+
 ## Shared varying/coordinate allocation
 
 Three fresh Linux 5.75 production compiler objects close an allocator ambiguity:
