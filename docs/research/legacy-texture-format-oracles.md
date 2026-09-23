@@ -213,6 +213,49 @@ for A4R4G4B4, follow with alpha nibble eight only after the endpoints pass.
 RGB565 must be treated as destination alpha one for destination-alpha blend
 factors, but that factor behavior is a separate capability gate from COPY.
 
+### ARGB4444 mask and blend interaction
+
+The executable builders show no hidden ARGB4444-specific pixel-engine state.
+Windows D3D maps public `D3DFMT_A4R4G4B4` (26) to private `101b` at
+`VTGUModeDX32A:0x100c760b..0x100c7614`; the RT lookup returns A52 byte `8b`
+at `0x1020a511`.  OpenGL returns the same byte at `VTGOGL32A:0x1025d441`,
+and Linux compares private `101b` and returns `8b` at
+`stmLookupRenderTargetFormat_invi:0x1a6d28..0x1a6d30`.
+
+The D3D blend builder's only destination-format workaround is the private
+`101a` X1R5G5B5 case at `0x101fda12..0x101fdb41`; `101b` bypasses it.  The
+independent OpenGL builder has the same sole `101a` comparison at
+`0x10251252..0x10251381`.  Therefore A4R4G4B4 uses the ordinary normalized
+RGBA A34--A37 equations.  Its color mask is also the ordinary logical-channel
+RMW path: D3D `0x101f9cff..0x101f9d3e`, OpenGL
+`0x1024d9bf..0x1024d9fe`, and Linux
+`STM_ColorWriteMode_INV:0x194df0..0x194eb4` all map API R/G/B/A to A53 low
+bits 4/2/1/8 while preserving the upper A53 image.  Do not CPU-repack masked
+writes or force blending merely because storage is nibble-packed.
+
+After the full-mask endpoint gate, the exact guarded channel-preservation
+oracle is to prefill the covered target with numeric word `8321`
+(A=8,R=3,G=2,B=1), draw source `4abc`, and compare:
+
+| API mask | A53 | expected word |
+|---|---:|---:|
+| R | `53010c04` | `8a21` |
+| G | `53010c02` | `83b1` |
+| B | `53010c01` | `832c` |
+| A | `53010c08` | `4321` |
+| RGB | `53010c07` | `8abc` |
+| none | `53010c00` | `8321` |
+| RGBA | `53010c0f` | `4abc` |
+
+Keep all uncovered pixels and row/allocation padding at the original poison
+and retain both page guards.  This distinguishes every mask bit and proves
+nibble preservation without fractional rounding.  The source-backed
+fractional follow-up is clamped source-over over opaque green `f0f0`, with
+source RGBA `(1,0,0,8/15)`, A34--A37
+`34000020 35000148 36000590 37000244`, and full A53; round-to-nearest storage
+should be `f870`.  Both interaction tests remain static oracles until a live
+guarded run records their result.
+
 If a rendered candidate is immediately sampled, order the producer fence,
 retain the BO/PTEs, and emit the consumer's normal type-02/FE texture-cache
 clear pulse (general A00 bit 0).  Merely changing A52 to the matching A30 code
