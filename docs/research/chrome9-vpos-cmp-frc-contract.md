@@ -152,6 +152,16 @@ it must not bake a target height into the shader.  The generic Chrome9 raster
 builder currently ends at A52 and does not emit A8A, so relying on reset or a
 previous draw leaves this MISC-only state stale.
 
+The selected Gallium integration owns drawable-origin conversion in Mesa's
+`nir_lower_wpos_ytransform`, using `STATE_FB_WPOS_Y_TRANSFORM`.  Under that
+contract A8A must remain `8a020000` for both window and FBO draws: native MISC
+first supplies direct upper-left PEY, then the generated shader arithmetic
+performs any required Y inversion.  Programming A8A bit 3 and also retaining
+Mesa's transform would invert twice.  A future hardware-inversion path may
+instead own the conversion in A8A, but only if it disables the corresponding
+shader transform and derives bits 15:4 from current drawable state; the two
+ownership models must never be mixed.
+
 ## Raster linkage boundary
 
 The static evidence supports a narrow model: the pixel engine supplies one
