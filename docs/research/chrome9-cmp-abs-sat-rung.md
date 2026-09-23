@@ -106,9 +106,10 @@ compilers produce this exact finalized record for `CMP oC0,c0,c1,c2`:
 
 Use c0=`(-0.5,+0.25,+0,-0)`, c1=`(.25,.75,.5,1)` and
 c2=`(.125,.125,.125,.125)`.  D3D `>= 0` semantics select logical
-`(.125,.75,.5,1)`, approximately BGRA bytes `(32,191,128,255)` and packed
-little-endian `ff80bf20`.  Swap only c1/c2 in a companion draw; the expected
-packed result becomes `20202040`.  These two rows isolate predicate boundary
+`(.125,.75,.5,1)`.  Code 99 stores numeric A8R8G8B8, so the host word is
+`ff20bf80`; the former `ff80bf20` expectation incorrectly exchanged red and
+blue.  Swap only c1/c2 in a companion draw; the expected host word becomes
+`20402020`.  These two rows isolate predicate boundary
 and A/C/B arm placement without involving FVF or varying linkage.  Microsoft's
 [CMP reference](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/cmp---ps)
 explicitly selects the true arm for `src0 >= 0`, including its zero example;
@@ -118,6 +119,24 @@ NaN behavior remains unspecified and rejected.
 `--reverse-arms` alternatives with guarded BGRA8888 and D16 allocations.  It
 is an opt-in test and must still be bracketed by known-good draws and engine
 status/reset checks when scheduled on silicon.
+
+The first guarded default draw retired safely but disproved the symbolic
+semantics on the current packet: the uniform result was host word `00204000`
+with D16=`8000`, intact guards, no new engine error, and a passing known-good
+draw afterward.  Decoded as code-99 A8R8G8B8 this is logical
+`(.125,.25,0,0)`: the negative X lane came from false arm c2, while the
+nonnegative Y/Z/W lanes came from the condition c0 itself.  In A/C/B notation
+the result is exactly `A >= 0 ? A : B`; the nominal true-arm C value did not
+appear.  This is not conformant D3D CMP and must not be exposed as NIR select.
+
+Two guarded controls now precede any retry.  `--mov-c1` verifies constant c1
+upload and an ordinary source read (`ff40bf80`).  `--mad-c0-c1-c2` uses the
+same A/C/B source fields under the ordinary MAD subop and must produce
+`20005020`.  If both pass, constant upload and C-slot addressing are sound and
+the remaining discrepancy is subop-9 semantics or a missing CMP-specific
+control.  If MAD fails similarly, investigate the C operand encoding/upload
+before interpreting subop 9.  Do not run the direct-T0 or vPos successor modes
+until this constant-only discrepancy is closed.
 
 Use the proven command-19 D16/RHW packet, BGRA8888 target, COPY, no blend,
 flat v0, guarded pages, and known-good draws before and after each candidate.
