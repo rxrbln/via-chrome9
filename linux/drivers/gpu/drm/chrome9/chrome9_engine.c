@@ -1933,11 +1933,12 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 			     vs_control, ARRAY_SIZE(vs_control));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     program->controls, ARRAY_SIZE(program->controls));
+	/* The compiler's counted H3 transaction stores ALU before TAU. */
+	chrome9_emit_header3(&p, 0x20030000, &program->alu[0][0],
+			     program->alu_count * 4);
 	if (program->tau_count)
 		chrome9_emit_header3(&p, 0x21030000, program->tau,
 				     program->tau_count);
-	chrome9_emit_header3(&p, 0x20030000, &program->alu[0][0],
-			     program->alu_count * 4);
 	while (!IS_ALIGNED((unsigned long)p, 16))
 		*p++ = 0xcc000000;
 	*p++ = 0xfe020440;
