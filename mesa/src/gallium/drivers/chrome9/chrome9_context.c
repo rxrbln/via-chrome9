@@ -3229,8 +3229,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
          return false;
       intr = nir_instr_as_intrinsic(instr);
       if (intr->intrinsic == nir_intrinsic_terminate_if) {
-         /* Native kill is not exposed until guarded color/depth suppression
-          * has been proven on silicon.  The opt-in enables that oracle. */
+         /* Keep the proven alpha-less-than-half form opt-in until other
+          * discard predicates and sample domains have execution evidence. */
          if (!allow_kill || result || kill_count++ ||
              !chrome9_ps_lower_alpha_terminate(&builder, intr->src[0].ssa))
             return false;
