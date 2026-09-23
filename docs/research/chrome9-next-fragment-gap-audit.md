@@ -61,10 +61,10 @@ normalize data flow:
 Its active tuple is `(1,3,1,0)` and its complete nonzero controls are
 `A90=90058001`, `A92=92000004`.  This object is preferable to proprietary NRM
 for the first silicon gate: constant T0.xyz=`(.6,.8,0)` must yield logical
-`(.6,.8,0,0)`, approximately packed BGRA `0000cc99`, proving DP3, scalar RSQ,
-scalar-to-vector broadcast, and MUL without a following dot/MAX masking the
-normalized vector.  Follow with unit X/Y/Z and a non-unit positive vector;
-zero length and exceptional values remain rejected.
+`(.6,.8,0,0)`, approximately BGRA8888 host word `0099cc00`, proving DP3,
+scalar RSQ, scalar-to-vector broadcast, and MUL without a following dot/MAX
+masking the normalized vector.  Follow with unit X/Y/Z and a non-unit positive
+vector; zero length and exceptional values remain rejected.
 
 A fresh production differential now closes a compact generic reflect object:
 
