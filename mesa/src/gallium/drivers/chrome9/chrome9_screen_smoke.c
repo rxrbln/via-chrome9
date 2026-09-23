@@ -5550,6 +5550,7 @@ smoke_d24_combined_draw(struct pipe_screen *screen,
    const union pipe_color_union clear_color = { 0 };
    struct chrome9_resource *ccolor = chrome9_resource(color);
    struct chrome9_resource *cdepth = chrome9_resource(depth);
+   struct chrome9_resource *cscratch;
    const uint32_t *color_pixels, *depth_pixels;
    uint64_t submitted, rejected, program_batches;
    unsigned changed = 0;
@@ -5644,6 +5645,74 @@ smoke_d24_combined_draw(struct pipe_screen *screen,
               changed,
               color_pixels[16 * (ccolor->stride / 4) + 16],
               depth_pixels[16 * (cdepth->stride / 4) + 16],
+              chrome9_context(context)->submitted_triangles - submitted,
+              chrome9_context(context)->rejected_triangles - rejected,
+              chrome9_context(context)->submitted_program_batches -
+                 program_batches);
+   if (!passed)
+      goto out;
+
+   /* A depth-only FBO still needs the hardware's color target.  Its private
+    * scratch surface must survive the draw entirely unchanged. */
+   passed = false;
+   cscratch = chrome9_resource(chrome9_context(context)->depth_only_scratch);
+   if (!cscratch || !cscratch->guarded || cscratch->stride != 256 ||
+       !smoke_guard_pages_match(cscratch))
+      goto out;
+   memset((uint8_t *)cscratch->bo.map + cscratch->data_offset, 0xa5,
+          cscratch->data_size);
+   fb->nr_cbufs = 0;
+   fb->cbufs[0].texture = NULL;
+   context->set_framebuffer_state(context, fb);
+   if (chrome9_context(context)->render_target !=
+       &cscratch->base)
+      goto out;
+   context->clear(context, PIPE_CLEAR_DEPTH, 0, 0xff, NULL, NULL, 1.0, 0);
+   submitted = chrome9_context(context)->submitted_triangles;
+   rejected = chrome9_context(context)->rejected_triangles;
+   program_batches = chrome9_context(context)->submitted_program_batches;
+   context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+   context->flush_resource(context, depth);
+   context->flush(context, NULL, 0);
+
+   changed = 0;
+   for (unsigned y = 0; y < 64; y++)
+      for (unsigned x = 0; x < 64; x++) {
+         uint32_t z = depth_pixels[y * (cdepth->stride / 4) + x];
+         uint32_t scratch_pixel = ((const uint32_t *)
+            ((const uint8_t *)cscratch->bo.map + cscratch->data_offset))
+               [y * (cscratch->stride / 4) + x];
+
+         if (scratch_pixel != 0xa5a5a5a5U ||
+             (z != 0xffffff00U &&
+              ((z >> 8) < 0x7fff00U || (z >> 8) > 0x800100U))) {
+            fprintf(stderr,
+                    "X8Z24 depth-only pixel (%u,%u): scratch=%08x depth=%08x\n",
+                    x, y, scratch_pixel, z);
+            goto out;
+         }
+         changed += z != 0xffffff00U;
+      }
+   passed = changed >= 1100 && changed <= 1250 &&
+            depth_pixels[16 * (cdepth->stride / 4) + 16] != 0xffffff00U &&
+            depth_pixels[60 * (cdepth->stride / 4) + 60] == 0xffffff00U &&
+            color_pixels[16 * (ccolor->stride / 4) + 16] == 0x00ff0000U &&
+            chrome9_context(context)->submitted_triangles == submitted + 1 &&
+            chrome9_context(context)->rejected_triangles == rejected &&
+            chrome9_context(context)->submitted_program_batches ==
+               program_batches + 1 &&
+            smoke_guard_pages_match(ccolor) &&
+            smoke_guard_pages_match(cdepth) &&
+            smoke_guard_pages_match(cscratch);
+   if (passed)
+      printf("X8Z24 depth-only Gallium draw passed: changed=%u scratch intact\n",
+             changed);
+   else
+      fprintf(stderr,
+              "X8Z24 depth-only draw mismatch: changed=%u "
+              "submitted=+%" PRIu64 " rejected=+%" PRIu64
+              " program=+%" PRIu64 "\n",
+              changed,
               chrome9_context(context)->submitted_triangles - submitted,
               chrome9_context(context)->rejected_triangles - rejected,
               chrome9_context(context)->submitted_program_batches -
