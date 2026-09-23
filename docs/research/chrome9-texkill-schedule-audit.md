@@ -257,7 +257,15 @@ and color/D16 suppression for the tested finite constants.  It does not yet
 establish sampled-alpha execution through Mesa, stencil suppression, NaN or
 infinity behavior, helper/demote semantics, or arbitrary Boolean conditions.
 Mesa therefore enables only the specific sampled-alpha-less-than-half
-lowering behind both a kernel capability and an explicit experimental opt-in;
-sampled execution and format-domain validation remain pending.  The fixed A33
+lowering behind both a kernel capability and an explicit experimental opt-in.
+On the same VX900, the guarded Gallium A8 test passed nearest `0x7f` below
+half (discard) and `0x80` above half (survive), with correct color, D16,
+guards, and unchanged A8 source.  A linear-filtered `0x7f`/`0x80` midpoint
+read back as alpha `0x80` in BGRA8 but was discarded by TEXKILL.  The packed
+8-bit readback does not reveal the internal filtered value's sign relative
+to half; this is a diagnostic, not evidence for exact-equality semantics.
+The raw constant zero-predicate test above separately proves zero survival.
+Broader sampled formats, stencil, and GL helper semantics remain pending.
+The fixed A33
 alpha-test path remains preferable for alpha-test emulation because it is
 already silicon-proven and avoids this new shader side effect.
