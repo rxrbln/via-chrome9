@@ -6,6 +6,14 @@ RGB565, A1R5G5B5, and A4R4G4B4.  All encodings are exact manual plus
 proprietary-driver recoveries.  They remain capability-gated until the
 bounded tests below retire on VX900.
 
+On 2026-09-23, the guarded 64x64 RGB565 command-22 render-target store did
+retire on the live VX900.  `tools/re/chrome9_rgb565_guard_smoke.c` reused the
+proven constant-red triangle with byte pitch 128 and A52=`52890004`; it found
+1,176 `f800` pixels, an unchanged exterior, and intact leading/trailing
+guards.  This proves a plain RGB565 store only.  Blending, depth interaction,
+render-to-texture ordering, and Mesa render-target/FBO exposure are still
+unvalidated.  The other 16-bit RT formats remain static oracles.
+
 The sampler and render-target format tables are related but not identical.
 A8 and L8 are native sampler formats but are rejected by the render-target
 lookup.  L8A8 and the three 16-bit RGB(A) formats are present in both tables.
