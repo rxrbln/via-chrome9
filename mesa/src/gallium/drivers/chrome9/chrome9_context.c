@@ -2912,13 +2912,58 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       source_components[s] = components;
    if (alu->op == nir_op_fpow) {
       struct chrome9_ps_instruction *log2, *multiply, *exp2;
+      uint32_t integer_exponent = 0;
       uint8_t log_temp, multiply_temp;
 
-      /* Chrome9 implements POW as its native scalar LOG2, MUL and EXP2
-       * sequence.  GLSL already leaves non-positive bases undefined, so this
-       * is the general semantic lowering rather than an application-specific
-       * integer-exponent substitution.  Vector POW is scalarized by the NIR
-       * frontend before this backend grows multi-lane scalar scheduling. */
+      /* Integer powers use multiplication, which also preserves zero raised
+       * to a positive exponent.  Follow bit-exact MOV/vec aliases before
+       * deciding whether the exponent is constant.  Other scalar powers use
+       * the native LOG2, MUL and EXP2 sequence. */
+      if (components == 1 && alu->src[1].src.ssa &&
+          alu->src[1].src.ssa->bit_size == 32 &&
+          alu->src[1].swizzle[0] <
+             alu->src[1].src.ssa->num_components) {
+         nir_scalar exponent = nir_scalar_resolved(
+            alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+
+         if (nir_scalar_is_const(exponent)) {
+            double power = nir_scalar_as_float(exponent);
+
+            /* Every finite float32 value this large is integral.  The
+             * multiplication chain uses a uint32_t exponent; rejecting a
+             * larger integer avoids losing pow(0, positive) semantics. */
+            if (power >= 0x1p32 && power < 0x1p128)
+               return false;
+            if (power >= 1.0 && power < 0x1p32 &&
+                power == (double)(uint32_t)power)
+               integer_exponent = (uint32_t)power;
+         }
+      }
+      if (integer_exponent &&
+          (integer_exponent == 1 ||
+           builder->value_count < CHROME9_PS_MAX_INSTRUCTIONS)) {
+         struct chrome9_ps_source powered;
+
+         if (!chrome9_ps_lower_alu_source(builder, &alu->src[0], 1,
+                                          &operands[0]))
+            return false;
+         if (chrome9_ps_emit_integer_pow(&builder->ir, operands[0],
+                                         integer_exponent,
+                                         &builder->next_temp,
+                                         &builder->alu_count, &powered)) {
+            if (integer_exponent > 1) {
+               value = builder->value_count++;
+               builder->value[value].def = def;
+               builder->value[value].source = powered;
+               builder->value[value].complete = true;
+            }
+            *source = powered;
+            return true;
+         }
+      }
+      if (integer_exponent)
+         return false;
+      /* Vector POW is scalarized by NIR before this scalar backend. */
       if (components != 1 ||
           !chrome9_ps_lower_alu_source(builder, &alu->src[0], 1,
                                        &operands[0]) ||

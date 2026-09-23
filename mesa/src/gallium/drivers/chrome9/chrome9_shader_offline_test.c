@@ -538,6 +538,95 @@ check_buffer_ps_ir(void)
 }
 
 static void
+check_integer_pow_ir(void)
+{
+   static const struct {
+      uint32_t exponent;
+      unsigned multiplications;
+   } cases[] = {
+      { 1, 0 }, { 2, 1 }, { 20, 5 },
+   };
+
+   for (unsigned test = 0; test < sizeof(cases) / sizeof(cases[0]); test++) {
+      struct chrome9_ps_ir ir = { 0 };
+      struct chrome9_ps_program program;
+      struct chrome9_ps_source base =
+         identity_source(CHROME9_PS_SOURCE_CONSTANT, 0, false);
+      struct chrome9_ps_source result;
+      uint32_t degree[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
+      uint8_t next_temp = 0, alu_count = 0;
+
+      for (unsigned c = 1; c < 4; c++)
+         base.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+      assert(chrome9_ps_emit_integer_pow(&ir, base,
+                                         cases[test].exponent,
+                                         &next_temp, &alu_count, &result));
+      assert(ir.count == cases[test].multiplications);
+      assert(alu_count == ir.count && next_temp == ir.count);
+      for (unsigned i = 0; i < ir.count; i++) {
+         const struct chrome9_ps_instruction *multiply = &ir.instruction[i];
+         uint32_t input_degree[2];
+
+         assert(multiply->op == CHROME9_PS_OPCODE_MUL);
+         assert(multiply->destination.file == CHROME9_PS_DESTINATION_TEMP);
+         assert(multiply->destination.id == i);
+         assert(multiply->destination.writemask == 1);
+         for (unsigned s = 0; s < 2; s++) {
+            const struct chrome9_ps_source *input = &multiply->source[s];
+
+            assert(input->swizzle[0] == CHROME9_PS_SWIZZLE_X);
+            assert(input->file == CHROME9_PS_SOURCE_CONSTANT ||
+                   (input->file == CHROME9_PS_SOURCE_TEMP && input->id < i));
+            input_degree[s] = input->file == CHROME9_PS_SOURCE_CONSTANT ?
+               1 : degree[input->id];
+         }
+         degree[i] = input_degree[0] + input_degree[1];
+      }
+      assert((result.file == CHROME9_PS_SOURCE_CONSTANT ? 1 :
+              degree[result.id]) == cases[test].exponent);
+
+      /* Every stage multiplies the base or a previous product.  With base
+       * zero the result therefore remains zero for every positive power. */
+      ir.instruction[ir.count].op = CHROME9_PS_OPCODE_MOV;
+      ir.instruction[ir.count].destination.file = CHROME9_PS_DESTINATION_COLOR;
+      ir.instruction[ir.count].destination.writemask = 0xf;
+      ir.instruction[ir.count].source[0] = result;
+      ir.count++;
+      assert(chrome9_compile_ps_ir(&ir, &program));
+      assert(program.alu_count == ir.count);
+      assert(program.control[0] & 0x00018000);
+   }
+
+   {
+      struct chrome9_ps_ir ir = { 0 };
+      struct chrome9_ps_source base =
+         identity_source(CHROME9_PS_SOURCE_CONSTANT, 0, false);
+      struct chrome9_ps_source result = { 0 };
+      uint8_t next_temp = 0, alu_count = 0;
+
+      /* Longer chains need more than the six temporaries described by the
+       * A90 resource buckets.  Reject before emitting a partial program. */
+      assert(!chrome9_ps_emit_integer_pow(&ir, base, 30, &next_temp,
+                                          &alu_count, &result));
+      assert(!chrome9_ps_emit_integer_pow(&ir, base, 100, &next_temp,
+                                          &alu_count, &result));
+      assert(!ir.count && !next_temp && !alu_count);
+      assert(!chrome9_ps_emit_integer_pow(&ir, base, 0, &next_temp,
+                                          &alu_count, &result));
+
+      next_temp = CHROME9_PS_MAX_RESOURCE_TEMPS - 1;
+      alu_count = CHROME9_PS_MAX_ALU - 1;
+
+      ir.count = CHROME9_PS_MAX_INSTRUCTIONS - 1;
+      assert(!chrome9_ps_emit_integer_pow(&ir, base, 20, &next_temp,
+                                          &alu_count, &result));
+      assert(ir.count == CHROME9_PS_MAX_INSTRUCTIONS - 1);
+      assert(next_temp == CHROME9_PS_MAX_RESOURCE_TEMPS - 1);
+      assert(alu_count == CHROME9_PS_MAX_ALU - 1);
+   }
+}
+
+static void
 check_ps_ir(void)
 {
    static const uint32_t add_c0_c1_oc0[4] = {
@@ -829,6 +918,7 @@ main(void)
    check_ps_encoder();
    check_fs();
    check_direct_texture_ps_ir();
+   check_integer_pow_ir();
    check_ps_ir();
    check_buffer_ps_ir();
    check_jellyfish_ps_ir();

@@ -10,6 +10,8 @@
 #define CHROME9_PS_MAX_TAU 32
 #define CHROME9_PS_MAX_INSTRUCTIONS (CHROME9_PS_MAX_ALU + CHROME9_PS_MAX_TAU)
 #define CHROME9_PS_MAX_VIRTUAL_TEMPS 128
+/* Largest temporary count with a characterized A90 resource bucket. */
+#define CHROME9_PS_MAX_RESOURCE_TEMPS 6
 #define CHROME9_VS_POLICY_MAX 256
 
 enum chrome9_fs_leaf {
@@ -221,6 +223,13 @@ bool chrome9_encode_ps_frc(const struct chrome9_ps_source *source,
                            uint32_t record[4]);
 bool chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                            struct chrome9_ps_program *program);
+/* Emit scalar x^n as a multiplication chain.  The input and result use the
+ * same source representation as the NIR lowering and generic IR compiler. */
+bool chrome9_ps_emit_integer_pow(struct chrome9_ps_ir *ir,
+                                 struct chrome9_ps_source base,
+                                 uint32_t exponent, uint8_t *next_temp,
+                                 uint8_t *alu_count,
+                                 struct chrome9_ps_source *result);
 
 /* These verify a complete canonical object for a closed key.  They are not
  * validators for arbitrary native shader words. */

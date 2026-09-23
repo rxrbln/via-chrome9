@@ -415,6 +415,74 @@ resource_bucket(unsigned direct_inputs, unsigned temporaries)
 }
 
 bool
+chrome9_ps_emit_integer_pow(struct chrome9_ps_ir *ir,
+                            struct chrome9_ps_source base,
+                            uint32_t exponent, uint8_t *next_temp,
+                            uint8_t *alu_count,
+                            struct chrome9_ps_source *result)
+{
+   struct chrome9_ps_source current = base;
+   unsigned operations = 0;
+   unsigned highest = 0;
+
+   if (!ir || !next_temp || !alu_count || !result || !exponent)
+      return false;
+
+   /* The leading one is the base itself.  Each remaining bit squares the
+    * current value and multiplies by the base when that bit is set. */
+   for (uint32_t bits = exponent; bits > 1; bits >>= 1) {
+      operations += 1 + (bits & 1);
+      highest++;
+   }
+   if (ir->count > CHROME9_PS_MAX_INSTRUCTIONS ||
+       *alu_count > CHROME9_PS_MAX_ALU ||
+       *next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS ||
+       *next_temp > CHROME9_PS_MAX_RESOURCE_TEMPS ||
+       operations > CHROME9_PS_MAX_INSTRUCTIONS - ir->count ||
+       operations > CHROME9_PS_MAX_ALU - *alu_count ||
+       operations > CHROME9_PS_MAX_VIRTUAL_TEMPS - *next_temp ||
+       operations > CHROME9_PS_MAX_RESOURCE_TEMPS - *next_temp)
+      return false;
+
+   for (int bit = (int)highest - 1; bit >= 0; bit--) {
+      struct chrome9_ps_instruction *square =
+         &ir->instruction[ir->count++];
+
+      memset(square, 0, sizeof(*square));
+      square->op = CHROME9_PS_OPCODE_MUL;
+      square->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      square->destination.id = (*next_temp)++;
+      square->destination.writemask = 1;
+      square->source[0] = current;
+      square->source[1] = current;
+      current.file = CHROME9_PS_SOURCE_TEMP;
+      current.id = square->destination.id;
+      current.modifier = 0;
+      current.last_use = false;
+      current.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+      for (unsigned c = 1; c < 4; c++)
+         current.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+
+      if (exponent & (1u << bit)) {
+         struct chrome9_ps_instruction *multiply =
+            &ir->instruction[ir->count++];
+
+         memset(multiply, 0, sizeof(*multiply));
+         multiply->op = CHROME9_PS_OPCODE_MUL;
+         multiply->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         multiply->destination.id = (*next_temp)++;
+         multiply->destination.writemask = 1;
+         multiply->source[0] = current;
+         multiply->source[1] = base;
+         current.id = multiply->destination.id;
+      }
+   }
+   *alu_count += operations;
+   *result = current;
+   return true;
+}
+
+bool
 chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                       struct chrome9_ps_program *p)
 {
