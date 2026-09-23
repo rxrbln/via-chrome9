@@ -3062,7 +3062,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
 
 static bool
 chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
-                       struct chrome9_ps_program *program, bool *lowered)
+                       struct chrome9_ps_program *program,
+                       uint32_t *uniform_mask, bool *lowered)
 {
    struct chrome9_ps_nir_builder builder = { 0 };
    struct chrome9_ps_instruction *terminal;
@@ -3200,6 +3201,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    memcpy(program->immediate, builder.immediate,
           sizeof(program->immediate));
    program->immediate_mask = builder.immediate_mask;
+   *uniform_mask = builder.uniform_mask;
    *lowered = true;
    bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
 
@@ -3316,7 +3318,9 @@ chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
 
    memset(&shader->native_fs_ir, 0, sizeof(shader->native_fs_ir));
    from_nir = chrome9_compile_ps_nir(nir, &shader->native_fs_ir,
-                                     &shader->native_fs, &lowered);
+                                     &shader->native_fs,
+                                     &shader->semantic_uniform_mask,
+                                     &lowered);
    shader->semantic_fs_valid = lowered;
    if (lowered) {
       for (unsigned i = 0; i < shader->native_fs_ir.texture_count; i++) {

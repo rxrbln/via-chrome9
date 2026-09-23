@@ -60,6 +60,7 @@ struct chrome9_shader {
    struct chrome9_ps_ir native_fs_ir;
    struct chrome9_ps_program native_fs;
    uint32_t semantic_constant_mask;
+   uint32_t semantic_uniform_mask;
    uint16_t semantic_input_mask;
    uint16_t semantic_varying_mask;
    uint8_t semantic_sampler_mask;

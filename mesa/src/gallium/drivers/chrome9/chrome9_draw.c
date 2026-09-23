@@ -81,6 +81,17 @@ chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
           ctx->fs->semantic_fs_valid && !ctx->fs->semantic_input_mask;
 }
 
+static unsigned
+chrome9_fragment_sampler_unit(const struct chrome9_context *ctx,
+                              unsigned physical)
+{
+   uint32_t mask = ctx->fs->semantic_sampler_mask;
+
+   while (physical--)
+      mask &= mask - 1;
+   return __builtin_ctz(mask);
+}
+
 static bool
 chrome9_fs_uses_constant_color(unsigned program)
 {
@@ -226,8 +237,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       uint16_t varying_mask = crender->ctx->fs->semantic_varying_mask;
 
       crender->varying_count = varying_mask ? 32 - __builtin_clz(varying_mask) : 0;
-      crender->texture_count = crender->ctx->fs->semantic_sampler_mask ?
-         32 - __builtin_clz(crender->ctx->fs->semantic_sampler_mask) : 0;
+      crender->texture_count =
+         __builtin_popcount(crender->ctx->fs->semantic_sampler_mask);
       crender->textured = crender->texture_count != 0;
       crender->packed_generic = 0;
       memset(&crender->vinfo, 0, sizeof(crender->vinfo));
@@ -920,16 +931,24 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                               ctx->draw_textured_triangle))) ||
           /* Gallium may retain an unused trailing sampler after unbinding
            * the corresponding view.  Only active view units are encoded. */
-          ctx->num_sampler_states < texture_count ||
-          ctx->num_sampler_views != texture_count)
+          ctx->num_sampler_states <
+             (chrome9_use_generic_fragment_program(ctx) ?
+              32 - __builtin_clz(ctx->fs->semantic_sampler_mask) :
+              texture_count) ||
+          ctx->num_sampler_views <
+             (chrome9_use_generic_fragment_program(ctx) ?
+              32 - __builtin_clz(ctx->fs->semantic_sampler_mask) :
+              texture_count))
          return false;
       for (unsigned unit = 0; unit < texture_count; unit++) {
-         struct pipe_sampler_view *view = ctx->sampler_views[unit];
+         unsigned logical = chrome9_use_generic_fragment_program(ctx) ?
+            chrome9_fragment_sampler_unit(ctx, unit) : unit;
+         struct pipe_sampler_view *view = ctx->sampler_views[logical];
          struct pipe_resource *original = view ? view->texture : NULL;
          struct pipe_resource *source = view ?
             chrome9_sampler_view_resource(view) : NULL;
 
-         samplers[unit] = ctx->sampler_states[unit];
+         samplers[unit] = ctx->sampler_states[logical];
          *reason = "sampler-state";
          if (!samplers[unit] || !samplers[unit]->supported || !source)
             return false;
@@ -952,6 +971,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          *reason = "mip-view-state";
          if (samplers[unit]->mip_filter !=
                 DRM_CHROME9_TEXTURE_MIP_FILTER_NONE &&
+             !chrome9_use_generic_fragment_program(ctx) &&
              (texture_count != 1 || unit ||
               !chrome9_mip_view_supported(ctx, samplers[unit], view,
                                           textures[unit])))
@@ -1068,12 +1088,14 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
                            uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4])
 {
    const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
+   const unsigned uniform_count = ctx->fs->semantic_uniform_mask ?
+      32 - __builtin_clz(ctx->fs->semantic_uniform_mask) : 0;
    const uint8_t *map = NULL;
 
    memset(constants, 0,
           DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4 * sizeof(uint32_t));
-   if (count) {
-      uint64_t size = (uint64_t)count * 4 * sizeof(uint32_t);
+   if (uniform_count) {
+      uint64_t size = (uint64_t)uniform_count * 4 * sizeof(uint32_t);
 
       if (cb->buffer_size >= size && cb->buffer_offset <= UINT32_MAX - size) {
          if (cb->user_buffer) {
@@ -1093,7 +1115,7 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
       if (ctx->fs->native_fs.immediate_mask & (1u << i))
          memcpy(constants[i], ctx->fs->native_fs.immediate[i],
                 sizeof(constants[i]));
-      else if ((ctx->fs->semantic_constant_mask & (1u << i)) && !map)
+      else if ((ctx->fs->semantic_uniform_mask & (1u << i)) && !map)
          return false;
       for (unsigned c = 0; c < 4; c++) {
          float value;
@@ -1125,7 +1147,8 @@ chrome9_build_fragment_instructions(
       uint16_t swizzle = texture->swizzle ? texture->swizzle : 0x1b0;
 
       instruction->op = DRM_CHROME9_FRAGMENT_OP_TEX;
-      instruction->sampler = texture->sampler;
+      instruction->sampler = __builtin_popcount(
+         shader->semantic_sampler_mask & ((1u << texture->sampler) - 1));
       instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
       instruction->dst.index = texture->destination;
       instruction->dst.writemask = 0xf;
@@ -1190,10 +1213,19 @@ chrome9_submit_generic_triangle(
       return false;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
       const struct pipe_resource *resource = &textures[unit]->base;
+      const unsigned logical = chrome9_fragment_sampler_unit(
+         crender->ctx, unit);
+      const struct pipe_sampler_view *view =
+         crender->ctx->sampler_views[logical];
+      unsigned last_level;
+      int max_lod;
 
-      if (!util_is_power_of_two_or_zero(resource->width0) ||
-          !util_is_power_of_two_or_zero(resource->height0) ||
-          samplers[unit]->mip_filter != DRM_CHROME9_TEXTURE_MIP_FILTER_NONE)
+      if (!view || view->u.tex.first_level)
+         return false;
+      last_level = view->u.tex.last_level;
+      max_lod = last_level * 32;
+      if (last_level != resource->last_level ||
+          last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS)
          return false;
       texture_state[unit].handle = textures[unit]->bo.handle;
       texture_state[unit].format =
@@ -1202,13 +1234,27 @@ chrome9_submit_generic_triangle(
          DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888;
       texture_state[unit].width = resource->width0;
       texture_state[unit].height = resource->height0;
+      texture_state[unit].last_level = last_level;
       texture_state[unit].min_filter = samplers[unit]->min_filter;
       texture_state[unit].mag_filter = samplers[unit]->mag_filter;
       texture_state[unit].mip_filter = samplers[unit]->mip_filter;
       texture_state[unit].wrap_s = samplers[unit]->wrap_s;
       texture_state[unit].wrap_t = samplers[unit]->wrap_t;
-      texture_state[unit].level_offset[0] = textures[unit]->level_offset[0];
-      texture_state[unit].level_pitch[0] = textures[unit]->level_stride[0];
+      texture_state[unit].lod_bias_s5_5 = CLAMP(
+         lroundf(samplers[unit]->base.lod_bias * 32.0f), -512, 511);
+      texture_state[unit].min_lod_s5_5 = CLAMP(
+         lroundf(samplers[unit]->base.min_lod * 32.0f), 0, max_lod);
+      texture_state[unit].max_lod_s5_5 = CLAMP(
+         lroundf(samplers[unit]->base.max_lod * 32.0f),
+         texture_state[unit].min_lod_s5_5, max_lod);
+      for (unsigned level = 0; level <= last_level; level++) {
+         if (textures[unit]->level_offset[level] > UINT32_MAX)
+            return false;
+         texture_state[unit].level_offset[level] =
+            textures[unit]->level_offset[level];
+         texture_state[unit].level_pitch[level] =
+            textures[unit]->level_stride[level];
+      }
    }
    for (unsigned i = 0; i < 3; i++) {
       const float *source;
