@@ -21,6 +21,14 @@ left the exterior zero, and preserved both guard pages
 luminance/low-byte placement at an unambiguous black endpoint.  Unequal RGB
 reduction, blending, depth interaction, and Mesa FBO exposure are not proved.
 
+The guarded ARGB1555 target store passed four endpoint cases on the same
+VX900: transparent red `7c00`, opaque red `fc00`, opaque green `83e0`, and
+opaque blue `801f`.  Each 64x64 zero-varying draw changed exactly 1,176
+pixels, left the exterior unchanged, and retained full guards
+(`tools/re/chrome9_argb1555_guard_smoke.c`).  This closes basic A52=`8a`
+storage and alpha-bit placement, not blending, depth interaction, or FBO
+exposure.
+
 The sampler and render-target format tables are related but not identical.
 A8 and L8 are native sampler formats but are rejected by the render-target
 lookup.  L8A8 and the three 16-bit RGB(A) formats are present in both tables.
