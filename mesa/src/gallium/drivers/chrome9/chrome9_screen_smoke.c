@@ -6849,7 +6849,13 @@ smoke_d24_sample_produced_depth(struct pipe_screen *screen,
       .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
       .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
    };
-   struct pipe_resource *target = NULL;
+   struct pipe_resource z16_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_Z16_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource *target = NULL, *z16 = NULL;
    struct pipe_sampler_state sampler = {
       .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
       .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
@@ -6864,6 +6870,12 @@ smoke_d24_sample_produced_depth(struct pipe_screen *screen,
    };
    struct pipe_blend_state blend = { 0 };
    struct pipe_depth_stencil_alpha_state dsa = { 0 };
+   struct pipe_depth_stencil_alpha_state depth_dsa = {
+      .depth_enabled = true,
+      .depth_writemask = true,
+      .depth_func = PIPE_FUNC_LESS,
+   };
+   const union pipe_color_union clear_color = { 0 };
    struct pipe_rasterizer_state rasterizer = {
       .half_pixel_center = true,
       .bottom_edge_rule = true,
@@ -6888,16 +6900,19 @@ smoke_d24_sample_produced_depth(struct pipe_screen *screen,
       .instance_count = 1, .min_index = 0, .max_index = 3,
    };
    const struct pipe_draw_start_count_bias draw = { .count = 4 };
-   struct chrome9_resource *ctarget, *ccolor = chrome9_resource(color);
+   struct chrome9_resource *ctarget, *cz16;
+   struct chrome9_resource *ccolor = chrome9_resource(color);
    struct chrome9_resource *cdepth = chrome9_resource(depth);
    struct chrome9_resource *cscratch =
       chrome9_resource(chrome9_context(context)->depth_only_scratch);
    struct chrome9_context *ccontext = chrome9_context(context);
    const uint32_t *pixels;
+   const uint16_t *z16_pixels;
    uint8_t *color_copy = NULL, *depth_copy = NULL;
    uint32_t center = 0, exterior = 0;
    uint64_t submitted, rejected, batches;
    void *blend_handle = NULL, *dsa_handle = NULL;
+   void *depth_dsa_handle = NULL;
    void *rasterizer_handle = NULL, *elements_handle = NULL;
    void *sampler_handle = NULL, *vs = NULL, *fs = NULL;
    bool passed = false;
@@ -7027,6 +7042,85 @@ smoke_d24_sample_produced_depth(struct pipe_screen *screen,
               smoke_guard_pages_match(ccolor),
               smoke_guard_pages_match(cdepth),
               smoke_guard_pages_match(cscratch));
+   if (!passed)
+      goto out;
+
+   /* The D24 source must also work with an unrelated active Z16 destination. */
+   passed = false;
+   if (!screen->is_format_supported(screen, z16_templ.format,
+                                    z16_templ.target, 1, 1, z16_templ.bind))
+      goto out;
+   z16 = screen->resource_create(screen, &z16_templ);
+   if (!z16)
+      goto out;
+   cz16 = chrome9_resource(z16);
+   if (!cz16->guarded || !smoke_initialize_guard_pages(cz16) ||
+       cz16->bo.handle == cdepth->bo.handle ||
+       cz16->bo.handle == ctarget->bo.handle)
+      goto out;
+   depth_dsa_handle = context->create_depth_stencil_alpha_state(context,
+                                                               &depth_dsa);
+   if (!depth_dsa_handle)
+      goto out;
+   framebuffer.zsbuf.format = PIPE_FORMAT_Z16_UNORM;
+   framebuffer.zsbuf.texture = z16;
+   context->set_framebuffer_state(context, &framebuffer);
+   context->bind_depth_stencil_alpha_state(context, depth_dsa_handle);
+   context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                  PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 1.0, 0);
+   submitted = ccontext->submitted_triangles;
+   rejected = ccontext->rejected_triangles;
+   batches = ccontext->submitted_program_batches;
+   context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+   context->flush_resource(context, target);
+   context->flush_resource(context, z16);
+   context->flush(context, NULL, 0);
+
+   z16_pixels = (const uint16_t *)((const uint8_t *)cz16->bo.map +
+                                   cz16->data_offset);
+   center = pixels[16 * (ctarget->stride / 4) + 16];
+   exterior = pixels[60 * (ctarget->stride / 4) + 60];
+   passed = (center == 0xff7f0000U || center == 0xff800000U) &&
+            exterior == 0xffff0000U &&
+            z16_pixels[16 * (cz16->stride / 2) + 16] >= 0x7ffeU &&
+            z16_pixels[16 * (cz16->stride / 2) + 16] <= 0x8001U &&
+            z16_pixels[60 * (cz16->stride / 2) + 60] >= 0x7ffeU &&
+            z16_pixels[60 * (cz16->stride / 2) + 60] <= 0x8001U &&
+            ccontext->submitted_triangles == submitted + 2 &&
+            ccontext->rejected_triangles == rejected &&
+            ccontext->submitted_program_batches == batches + 2 &&
+            !memcmp((const uint8_t *)cdepth->bo.map + cdepth->data_offset,
+                    depth_copy, cdepth->data_size) &&
+            !memcmp((const uint8_t *)ccolor->bo.map + ccolor->data_offset,
+                    color_copy, ccolor->data_size) &&
+            smoke_bytes_match((const uint8_t *)cscratch->bo.map +
+                                 cscratch->data_offset,
+                              cscratch->data_size, 0xa5) &&
+            smoke_guard_pages_match(ctarget) &&
+            smoke_guard_pages_match(cz16) &&
+            smoke_guard_pages_match(ccolor) &&
+            smoke_guard_pages_match(cdepth) &&
+            smoke_guard_pages_match(cscratch);
+   if (passed)
+      printf("X8Z24 sample with Z16 destination passed: center=%08x depth=%04x\n",
+             center, z16_pixels[16 * (cz16->stride / 2) + 16]);
+   else
+      fprintf(stderr,
+              "X8Z24 sample with Z16 destination mismatch: "
+              "center=%08x exterior=%08x depth=%04x/%04x "
+              "submitted=+%" PRIu64 " rejected=+%" PRIu64
+              " batches=+%" PRIu64 " guards=%u/%u/%u/%u/%u\n",
+              center, exterior,
+              z16_pixels[16 * (cz16->stride / 2) + 16],
+              z16_pixels[60 * (cz16->stride / 2) + 60],
+              ccontext->submitted_triangles - submitted,
+              ccontext->rejected_triangles - rejected,
+              ccontext->submitted_program_batches - batches,
+              smoke_guard_pages_match(ctarget),
+              smoke_guard_pages_match(cz16),
+              smoke_guard_pages_match(ccolor),
+              smoke_guard_pages_match(cdepth),
+              smoke_guard_pages_match(cscratch));
 
 out:
    free(color_copy);
@@ -7043,9 +7137,12 @@ out:
       context->delete_rasterizer_state(context, rasterizer_handle);
    if (dsa_handle)
       context->delete_depth_stencil_alpha_state(context, dsa_handle);
+   if (depth_dsa_handle)
+      context->delete_depth_stencil_alpha_state(context, depth_dsa_handle);
    if (blend_handle)
       context->delete_blend_state(context, blend_handle);
    pipe_resource_reference(&target, NULL);
+   pipe_resource_reference(&z16, NULL);
    return passed;
 }
 
