@@ -377,6 +377,36 @@ quarantined after each timeout and reset before the next test. Further GPU
 submissions require an independently recovered producer/consumer linkage
 tuple, not another unstructured field sweep.
 
+That linkage is now recovered from the programmable Windows D3D path. In
+`VTGUModeDX32A.dll:0x1015b255..0x1015b26b`, the draw update reads compiled
+instance metadata `+0x34`, shifts it left four, and replaces FE A00 bits 7:4
+in the hardware image at `+0x1c90`. The image initializer at
+`0x101549a8..0x101549c0` proves that `+0x1c90` begins the consecutive FE
+A00--A13 image. The same draw update reads the resulting A00 bits 7:4 at
+`0x1015b3b4..0x1015b42e` and loops over that many coordinate dimensions to
+rebuild the vertex-output masks.
+
+Linux 5.75 production-compiler differentials identify `+0x34` exactly. It is
+zero for `MOV oC0,c0` and `MOV oC0,v0`, one for direct `MOV oC0,T0`, one for
+logical `MOV oC0,T5` after compaction to physical coordinate zero, and one
+for `TEX(s0,T0); MOV oC0,r0`. The `T5` object's separate logical-use metadata
+at `+0x40` is `0x20`, proving that the value copied into A00 is the compact
+physical coordinate high-water rather than a logical mask, TAU count, or
+bound-sampler count. A valid PS 2.0 `dcl T0` produces the same native ALU,
+controls and `+0x34=1`; its declaration metadata is not a hidden program-store
+word.
+
+Therefore the generic direct-T0 packet's A00=`00000001` was incomplete even
+though TAU count and sampler count were both zero. For dense generic linkage,
+the source-backed rule is
+`A00[7:4] = max(fragment_texture_count, program->varying_count)`, preserving
+bit zero independently. One direct T0 requires A00=`00000011`. The runtime
+does not synthesize an image, sampler, TAU instruction, or dummy texture BO;
+only the FE coordinate count is extended. This explains why both A08-only
+tests still hung and provides one bounded next correction, not a new register
+matrix. The full differential and disassembly are recorded in
+`chrome9-direct-t0-fe-count.md`.
+
 ## Polygon offset / depth bias
 
 The manual gives the exact equation:
