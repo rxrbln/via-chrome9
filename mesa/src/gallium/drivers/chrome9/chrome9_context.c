@@ -6,6 +6,7 @@
 #include "chrome9_draw.h"
 #include "chrome9_drm.h"
 #include "chrome9_format.h"
+#include "chrome9_fragment.h"
 #include "chrome9_resource.h"
 #include "chrome9_specialise.h"
 
@@ -3522,16 +3523,28 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
 {
    struct chrome9_fs_key key;
    enum chrome9_shader_verify_error error;
+   nir_shader *semantic_nir;
    bool from_nir, lowered;
 
+   /* The semantic backend lowers vector constructors eagerly.  Remove dead
+    * lanes first so a vec4 used only through .xy cannot materialize its
+    * unused POSITION.zw components in the command stream.  Keep the
+    * canonical shader intact for classification and variant compilation. */
+   semantic_nir = nir_shader_clone(NULL, nir);
+   if (!semantic_nir)
+      return false;
+   nir_opt_shrink_vectors(semantic_nir, true);
+   nir_opt_dce(semantic_nir);
+
    memset(&shader->semantic_fs_ir, 0, sizeof(shader->semantic_fs_ir));
-   from_nir = chrome9_compile_ps_nir(nir, &shader->semantic_fs_ir,
+   from_nir = chrome9_compile_ps_nir(semantic_nir, &shader->semantic_fs_ir,
                                      &shader->native_fs,
                                      &shader->semantic_uniform_mask,
                                      ctx->fragment_kill &&
                                      debug_get_bool_option(
                                         "CHROME9_EXPERIMENTAL_TEXKILL", false),
                                      &lowered);
+   ralloc_free(semantic_nir);
    shader->semantic_fs_valid = lowered;
    if (lowered) {
       for (unsigned i = 0; i < shader->semantic_fs_ir.count; i++) {
@@ -3553,6 +3566,17 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
             }
          }
       }
+      /* A lowered program is usable only if every instruction can be
+       * represented by the DRM UAPI.  Reject it at compile time, before
+       * any draw can attempt to submit a partially translated program. */
+      struct drm_chrome9_fragment_instruction
+         instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+      unsigned instruction_count;
+
+      if (!chrome9_fragment_build_instructions(
+             &shader->semantic_fs_ir, shader->semantic_sampler_mask,
+             instructions, &instruction_count))
+         shader->semantic_fs_valid = false;
    }
    if (from_nir) {
       if (chrome9_fs_key_from_nir(nir, &key))
@@ -3762,6 +3786,37 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
 
 #define CHROME9_MAX_FS_VARIANTS 64
 
+static void
+chrome9_dump_semantic_fs(const struct chrome9_shader *shader)
+{
+   const struct chrome9_ps_ir *ir = &shader->semantic_fs_ir;
+
+   if (!debug_get_bool_option("CHROME9_DUMP_SEMANTIC_FS", false) ||
+       !shader->semantic_fs_valid)
+      return;
+   fprintf(stderr, "chrome9: semantic FS count=%u constants=%08x "
+           "uniforms=%08x immediates=%08x\n", ir->count,
+           shader->semantic_constant_mask, shader->semantic_uniform_mask,
+           shader->native_fs.immediate_mask);
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &ir->instruction[i];
+
+      fprintf(stderr, "chrome9: semantic %u op=%u dst=%u.%u/%x", i,
+              instruction->op, instruction->destination.file,
+              instruction->destination.id,
+              instruction->destination.writemask);
+      for (unsigned s = 0; s < 3; s++) {
+         const struct chrome9_ps_source *source = &instruction->source[s];
+
+         fprintf(stderr, " s%u=%u.%u/%u%u%u%u", s, source->file,
+                 source->id, source->swizzle[0], source->swizzle[1],
+                 source->swizzle[2], source->swizzle[3]);
+      }
+      fputc('\n', stderr);
+   }
+}
+
 /* Choose a fragment program only when all control-flow uniforms have their
  * draw-time values.  Failed variants are cached too, so an unsupported bound
  * is deterministic and never leaves a partially compiled program active. */
@@ -3815,6 +3870,7 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
    shader->variants = variant;
    shader->variant_count++;
    chrome9_apply_fs_variant(shader, variant);
+   chrome9_dump_semantic_fs(shader);
 
    if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false)) {
       fprintf(stderr, "chrome9: FS variant %u", shader->variant_count);
@@ -3856,6 +3912,7 @@ chrome9_create_fs_state(struct pipe_context *pipe,
          nir_print_shader(state->ir.nir, stderr);
       if (!state->ir.nir->info.num_inlinable_uniforms)
          chrome9_compile_fs_nir(ctx, shader, state->ir.nir);
+      chrome9_dump_semantic_fs(shader);
       if (!state->ir.nir->info.num_inlinable_uniforms && !shader->supported &&
           debug_get_bool_option("CHROME9_DUMP_UNSUPPORTED_NIR", false)) {
          fprintf(stderr, "chrome9: unsupported FS %p\n", (void *)shader);
