@@ -188,18 +188,20 @@ Three fresh Linux 5.75 production compiler objects close an allocator ambiguity:
 |---|---|---:|---:|---:|
 | `MOV oC0,T0` | `(1,0,1,0)` | `90058001` | `91000000` | none |
 | `TEX(s0,T0); MOV oC0` | `(1,1,1,1)` | `90018000` | `91000001` | `301001b0` |
+| `TEX(s0,T0); MUL oC0,r0,T0` | `(1,1,1,1)` | `90018001` | `91000001` | `301006f0` |
 | `TEX(s0,T1); MUL oC0,r0,T0` | `(2,1,2,1)` | `90018001` | `91000002` | `301011b0` |
 
 Thus direct ALU and TAU varying references share one persistent coordinate
 namespace.  For the mixed case, ALU T0 reserves slot zero and TAU T1 uses slot
 one.  A91 marks slots actually read by TAU, while A90's low varying bits mark
-direct ALU references not also consumed by TAU.  The implementation rule is:
+all direct ALU references, including a slot also consumed by TAU.  The
+implementation rule is:
 
 1. collect the union of logical varying IDs referenced by ALU or direct TAU;
 2. sort by logical ID and assign dense persistent coordinate slots;
 3. encode each direct TAU with its assigned slot and set that slot in A91;
-4. set A90 low bits for direct ALU varying references excluded from the direct
-   TAU set; and
+4. set A90 low bits for every direct ALU varying reference without subtracting
+   the direct-TAU set; and
 5. allocate computed TEMP-coordinate bridge slots only after the persistent
    union, using the proven circular lifetime allocator.
 
@@ -211,13 +213,15 @@ usage metadata is bit 5, but the ALU source and A90 use physical slot/bit zero.
 A91 is `91000001`.  Therefore every direct ALU varying source must be rewritten
 through the same logical-to-physical map used by TAU.
 
-Kernel commits `928c2ff` and `71cf45c` already implement this contract:
+Kernel commits `928c2ff` and `71cf45c` implement the shared allocator, but the
+current A90 finalization does not yet implement the overlap rule:
 `varying_mask` covers both pipelines, `coordinate_for_varying[]` is the union
-rank map, `chrome9_fragment_source_id()` rewrites ALU sources through it, and
-A90 uses physical ALU/TAU masks.  The built-in sparse-varying test covers TEX
-T5 plus ALU T0.  The complementary production rows above independently verify
-that implementation and should remain regression vectors; no additional
-allocator ABI is needed before arbitrary packed varying-plus-texture shaders.
+rank map, and `chrome9_fragment_source_id()` rewrites ALU sources through it.
+The built-in sparse-varying test covers TEX T5 plus ALU T0, but a shared-T0
+test must additionally require A90 bit zero and A91 bit zero together.  The
+complementary production rows above independently verify the allocator; no
+additional allocator ABI is needed before arbitrary packed varying-plus-
+texture shaders.
 
 The exact computed-coordinate object remains:
 

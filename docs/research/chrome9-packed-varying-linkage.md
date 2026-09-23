@@ -236,7 +236,7 @@ oC0 = r0 * T0.xxxx
 
 ALU 0140b6d0 302c0000 00f20005 00000820
 TAU 301006f0
-A90..A93 90018000 91000001 92010001 93000001
+A90..A93 90018001 91000001 92010001 93000001
 active tuple (1,1,1,1)
 ```
 
@@ -266,7 +266,8 @@ image is a numerical/linkage failure, not a retirement success.
 The one-ALU discriminator was run once on VX900 silicon on 2026-09-23 after
 the programmable A01 correction.  The submitted ring contained the exact
 ALU `0140b6d0 302c0000 00f20005 00000820`, TAU `301006f0`, and
-A01=`01002522`.  It timed out on the first draw at the post-draw cookie
+A01=`01002522`, but A90=`90018000`.  It timed out on the first draw at the
+post-draw cookie
 (`seq=17`, `kind=22`, current `0x7c00`, pause `0x7bf0`, stop `0x7c70`,
 CR=`80000000`, engine=`00002f11`).  The engine was quarantined and no retry
 was made.  This rules out TEMP allocation, partial writes, literal ONE,
@@ -291,3 +292,32 @@ one-ALU timeout above, this excludes float3 FE/FVF transport by itself.  The
 narrow remaining boundary is simultaneous direct-ALU `T0.x` and TAU
 `T0.yz` consumption of physical coordinate zero, including any proprietary
 runtime routing state which selects or duplicates that shared coordinate.
+
+### Missing shared-coordinate A90 route bit
+
+The production runtime supplies that routing state in A90 bit zero.  The
+postprocessed Linux object for both the two-ALU and one-ALU shared-T0 cases
+contains public-instance `+0x6c=00000001`.  The postprocessor receives
+`instance+0x10`; its `0x19b62b..0x19b639` sequence preserves bit 18 of
+object `+0x5c`, ORs the derived direct-input bitmap, and stores it back.
+Consequently object `+0x5c` is public-instance `+0x6c`.
+
+The draw writer proves that this is hardware state, not private compiler
+metadata.  `stmNeedRecompilePPS_invi` returns the public instance at
+`stmUpdatePS_inv:0x17f75b..0x17f773`; the H6 writer then emits
+`A90 = 0x90000000 | instance[0x2c] | instance[0x6c]` at
+`0x17fcb0..0x17fcc4`.  For the one-ALU shared program the exact values are
+`+0x2c=00018000`, `+0x6c=00000001`, hence A90=`90018001`.  An ALU-only T0
+object also has bit zero, while a TAU-only T0 object does not, confirming
+that `+0x6c` is the direct-ALU coordinate-use bitmap even when the same slot
+also appears in A91's TAU-coordinate bitmap.
+
+The timed-out generic packet incorrectly emitted A90=`90018000`.  Its
+compiler used `alu_varying_mask & ~tau_varying_mask`, deleting the overlap;
+the proprietary postprocessor does not perform that subtraction.  The next
+bounded discriminator is therefore the otherwise byte-identical one-ALU
+guarded draw with only A90 bit zero restored.  Success would close the
+shared-coordinate routing bug; failure would leave another shared-route
+state differential to find.  The earlier corpus value `90018000` was an
+offline reconstruction error caused by omitting public-instance `+0x6c`,
+and has been corrected.
