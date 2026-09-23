@@ -35,6 +35,16 @@ colors, independent of poisoned low bytes.  Both BO guards and all source
 bytes remained intact.  This proves standalone raw X8Z24 readout, but not
 ordering a depth write before a texture read from the same BO.
 
+The separate same-BO producer/consumer oracle subsequently passed as well:
+`tools/re/chrome9_d24_r2t_guard_smoke.c` wrote the 64x64 D24 triangle,
+then used that exact depth BO as a raw X8Z24 texture in a second synchronous
+command-22 draw.  Six written/unwritten samples matched, all guards stayed
+intact, and the producer BOs were byte-for-byte unchanged after sampling.
+This establishes the kernel command-22 D24 write-to-raw-read transition on
+this VX900.  Gallium FBO completeness, alternate compare modes, depth-only
+scratch rendering, and GL capability exposure still require implementation
+and focused proof.
+
 * Chrome9's native sampled 24-bit depth layout is depth in bits 31:8.  The
   correct Gallium formats are `PIPE_FORMAT_X8Z24_UNORM` and
   `PIPE_FORMAT_S8_UINT_Z24_UNORM`, not `Z24X8` or `Z24_UNORM_S8_UINT`.
