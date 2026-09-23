@@ -123,10 +123,15 @@ file 3, id **63**, with no release marker.  The corresponding production SGE
 (`02c10538` rather than `00ff0538`).  The SLT row's active tuple also
 accounts for only one direct coordinate.  Id 63 is outside the eight-varying
 semantic ABI and cannot stand for `T1`; do not submit or byte-match this row
-as a valid two-varying program.  Its cause has not been proved, though the
-probe's deliberate bypass of parser-owned optimizer state is a plausible
-explanation.  Recover a correctly linked two-varying object through an
-independent offline path before admitting that operand pairing.
+as a valid two-varying program.  A repeat of the checked-in probe with
+`CHROME9_TRACE_REGS=1` showed `tex-manager: remap logical=0 -> 0` followed by
+`tex-manager: remap logical=1 -> -1`; the latter is truncated to the six-bit
+native id 63.  The isolated emitter call never registered T1 with the texture
+slot manager, so this is a probe-setup failure, not evidence of a silicon
+two-varying limit.  Recover a correctly linked two-varying object by
+registering both inputs in the offline compiler's manager before emission,
+then running configuration-two finalization, before admitting that operand
+pairing.
 
 The first record computes `src0 + -src1` into special scratch r12.  Decoding
 the second gives A=r12/release, C=native ZERO, B=native ONE, subop 9, so the
