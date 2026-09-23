@@ -1066,6 +1066,71 @@ make_two_texture_fragment_shader(struct pipe_screen *screen,
 }
 
 static void *
+make_alpha_kill_fragment_shader(struct pipe_screen *screen,
+                                struct pipe_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-alpha-kill-compile-boundary");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_tex_instr *tex;
+   nir_def *barycentric, *coord, *alpha;
+
+   b.shader->info.io_lowered = true;
+   barycentric = nir_load_barycentric_pixel(&b, 32);
+   coord = nir_load_interpolated_input(
+      &b, 2, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   tex = nir_tex_instr_create(b.shader, 1);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   alpha = nir_channel(&b, &tex->def, 3);
+   nir_discard_if(&b, nir_flt(&b, alpha, nir_imm_float(&b, 0.5f)));
+   nir_store_output(&b, &tex->def, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static bool
+smoke_alpha_kill_compile(struct pipe_screen *screen)
+{
+   struct pipe_context *context = screen->context_create(screen, NULL, 0);
+   struct chrome9_shader *shader;
+   bool enabled, passed;
+
+   if (!context)
+      return false;
+   shader = make_alpha_kill_fragment_shader(screen, context);
+   enabled = debug_get_bool_option("CHROME9_EXPERIMENTAL_TEXKILL", false) &&
+      chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_FRAGMENT_KILL);
+   passed = shader && (!enabled ? !shader->semantic_fs_valid :
+      shader->semantic_fs_valid && shader->supported &&
+      shader->semantic_fs_ir.count == 4 &&
+      shader->semantic_fs_ir.instruction[0].op == CHROME9_PS_OPCODE_TEX &&
+      shader->semantic_fs_ir.instruction[1].op == CHROME9_PS_OPCODE_SUB &&
+      shader->semantic_fs_ir.instruction[2].op == CHROME9_PS_OPCODE_KILL &&
+      shader->semantic_fs_ir.instruction[3].op == CHROME9_PS_OPCODE_MOV);
+   if (shader)
+      context->delete_fs_state(context, shader);
+   context->destroy(context);
+   if (passed)
+      puts(enabled ? "alpha KILL semantic NIR order passed" :
+                     "alpha KILL remains gated");
+   return passed;
+}
+
+static void *
 make_two_projected_texture_vertex_shader(struct pipe_screen *screen,
                                          struct pipe_context *context)
 {
@@ -5744,6 +5809,317 @@ out:
 }
 
 static bool
+smoke_a8_alpha_kill(struct pipe_screen *screen)
+{
+   static const struct {
+      const char *name;
+      float s;
+      bool linear;
+      bool killed;
+   } cases[] = {
+      { "below", 0.25f, false, true },
+      { "above", 0.75f, false, false },
+      { "midpoint", 0.5f, true, false },
+   };
+   struct smoke_texture_vertex vertices[4] = {
+      { { -1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0.5f } },
+      { { -1,  1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0.5f } },
+      { {  1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0.5f } },
+      { {  1,  1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0.5f } },
+   };
+   struct pipe_resource texture_templ = {
+      .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_A8_UNORM,
+      .width0 = 2, .height0 = 2, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource target_templ = {
+      .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = 32, .height0 = 32, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource depth_templ = {
+      .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_Z16_UNORM,
+      .width0 = 32, .height0 = 32, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource *texture = NULL, *target = NULL, *depth = NULL;
+   struct pipe_context *context = NULL;
+   struct pipe_sampler_view view_templ, *view = NULL;
+   struct pipe_sampler_state sampler = {
+      .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      .compare_mode = PIPE_TEX_COMPARE_NONE,
+      .max_anisotropy = 1,
+      .max_lod = 1000.0f,
+      .reduction_mode = PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE,
+   };
+   struct pipe_blend_state blend = { 0 };
+   struct pipe_depth_stencil_alpha_state dsa = {
+      .depth_enabled = true,
+      .depth_writemask = true,
+      .depth_func = PIPE_FUNC_LESS,
+   };
+   struct pipe_rasterizer_state rasterizer = {
+      .half_pixel_center = true, .bottom_edge_rule = true,
+      .depth_clip_near = true, .depth_clip_far = true,
+   };
+   struct pipe_vertex_element elements[2] = { 0 };
+   struct pipe_vertex_buffer vertex_buffer = {
+      .is_user_buffer = true, .buffer.user = vertices,
+   };
+   struct pipe_framebuffer_state framebuffer = {
+      .width = 32, .height = 32, .nr_cbufs = 1,
+      .cbufs[0] = { .format = PIPE_FORMAT_B8G8R8A8_UNORM },
+      .zsbuf = { .format = PIPE_FORMAT_Z16_UNORM },
+   };
+   const struct pipe_viewport_state viewport = {
+      .scale = { 16, 16, 0.5f }, .translate = { 16, 16, 0.5f },
+   };
+   const struct pipe_scissor_state scissor = { .maxx = 32, .maxy = 32 };
+   const struct pipe_draw_info info = {
+      .mode = MESA_PRIM_QUAD_STRIP, .index_bounds_valid = true,
+      .instance_count = 1, .min_index = 0, .max_index = 3,
+   };
+   const struct pipe_draw_start_count_bias draw = { .count = 4 };
+   const union pipe_color_union clear = { 0 };
+   struct chrome9_resource *ctexture, *ctarget, *cdepth;
+   struct chrome9_context *ccontext;
+   uint8_t *texels, *texture_copy = NULL;
+   uint32_t *pixels;
+   uint16_t *depth_pixels;
+   void *blend_handle = NULL, *dsa_handle = NULL;
+   void *rasterizer_handle = NULL, *elements_handle = NULL;
+   void *sampler_handles[2] = { NULL, NULL };
+   void *vs = NULL, *fs = NULL, *sample_fs = NULL;
+   bool passed = false;
+
+   if (!debug_get_bool_option("CHROME9_EXPERIMENTAL_TEXKILL", false) ||
+       !chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_FRAGMENT_KILL) ||
+       !chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM |
+                  DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_D16 |
+                  DRM_CHROME9_CAP_FRAGMENT_TEXTURE_LEGACY_FORMATS)) {
+      fputs("--kill-a8-only requires TEXKILL opt-in and kernel capabilities\n",
+            stderr);
+      return false;
+   }
+   if (!screen->is_format_supported(screen, texture_templ.format,
+                                    texture_templ.target, 1, 1,
+                                    texture_templ.bind) ||
+       !screen->is_format_supported(screen, target_templ.format,
+                                    target_templ.target, 1, 1,
+                                    target_templ.bind) ||
+       !screen->is_format_supported(screen, depth_templ.format,
+                                    depth_templ.target, 1, 1,
+                                    depth_templ.bind))
+      return false;
+   texture = screen->resource_create(screen, &texture_templ);
+   target = screen->resource_create(screen, &target_templ);
+   depth = screen->resource_create(screen, &depth_templ);
+   context = screen->context_create(screen, NULL, 0);
+   if (!texture || !target || !depth || !context)
+      goto out;
+   ctexture = chrome9_resource(texture);
+   ctarget = chrome9_resource(target);
+   cdepth = chrome9_resource(depth);
+   ccontext = chrome9_context(context);
+   if (!ctexture->guarded || !ctarget->guarded || !cdepth->guarded ||
+       ctexture->stride < 2 || ctarget->stride < 32 * sizeof(uint32_t) ||
+       cdepth->stride < 32 * sizeof(uint16_t) ||
+       !smoke_initialize_guard_pages(ctexture) ||
+       !smoke_initialize_guard_pages(ctarget) ||
+       !smoke_initialize_guard_pages(cdepth))
+      goto out;
+   texels = (uint8_t *)ctexture->bo.map + ctexture->data_offset;
+   memset(texels, 0xa5, ctexture->data_size);
+   for (unsigned y = 0; y < 2; y++) {
+      texels[y * ctexture->stride] = 0x7f;
+      texels[y * ctexture->stride + 1] = 0x80;
+   }
+   texture_copy = malloc(ctexture->data_size);
+   if (!texture_copy)
+      goto out;
+   memcpy(texture_copy, texels, ctexture->data_size);
+   u_sampler_view_default_template(&view_templ, texture, texture->format);
+   view = context->create_sampler_view(context, texture, &view_templ);
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   blend_handle = context->create_blend_state(context, &blend);
+   dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   elements[0].src_offset = offsetof(struct smoke_texture_vertex, position);
+   elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[0].src_stride = sizeof(struct smoke_texture_vertex);
+   elements[1].src_offset = offsetof(struct smoke_texture_vertex, texcoord);
+   elements[1].src_format = PIPE_FORMAT_R32G32_FLOAT;
+   elements[1].src_stride = sizeof(struct smoke_texture_vertex);
+   elements_handle = context->create_vertex_elements_state(context, 2,
+                                                            elements);
+   sampler.min_img_filter = sampler.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+   sampler_handles[0] = context->create_sampler_state(context, &sampler);
+   sampler.min_img_filter = sampler.mag_img_filter = PIPE_TEX_FILTER_LINEAR;
+   sampler_handles[1] = context->create_sampler_state(context, &sampler);
+   vs = make_texture_vertex_shader(screen, context, false);
+   fs = make_alpha_kill_fragment_shader(screen, context);
+   sample_fs = make_texture_fragment_shader(screen, context, false);
+   if (!view || view->swizzle_a != PIPE_SWIZZLE_W ||
+       !blend_handle || !dsa_handle || !rasterizer_handle ||
+       !elements_handle || !sampler_handles[0] || !sampler_handles[1] ||
+       !vs || !fs || !sample_fs ||
+       !((struct chrome9_shader *)sample_fs)->supported ||
+       !((struct chrome9_shader *)sample_fs)->semantic_fs_valid ||
+       !((struct chrome9_shader *)fs)->supported ||
+       !((struct chrome9_shader *)fs)->semantic_fs_valid ||
+       ((struct chrome9_shader *)fs)->semantic_fs_ir.count != 4 ||
+       ((struct chrome9_shader *)fs)->semantic_fs_ir.instruction[0].op !=
+          CHROME9_PS_OPCODE_TEX ||
+       ((struct chrome9_shader *)fs)->semantic_fs_ir.instruction[1].op !=
+          CHROME9_PS_OPCODE_SUB ||
+       ((struct chrome9_shader *)fs)->semantic_fs_ir.instruction[2].op !=
+          CHROME9_PS_OPCODE_KILL ||
+       ((struct chrome9_shader *)fs)->semantic_fs_ir.instruction[3].op !=
+          CHROME9_PS_OPCODE_MOV)
+      goto out;
+
+   framebuffer.cbufs[0].texture = target;
+   framebuffer.zsbuf.texture = depth;
+   context->set_framebuffer_state(context, &framebuffer);
+   context->bind_blend_state(context, blend_handle);
+   context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   context->bind_rasterizer_state(context, rasterizer_handle);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, vs);
+   context->bind_fs_state(context, fs);
+   context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0, &view);
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->set_viewport_states(context, 0, 1, &viewport);
+   context->set_scissor_states(context, 0, 1, &scissor);
+   pixels = (uint32_t *)((uint8_t *)ctarget->bo.map + ctarget->data_offset);
+   depth_pixels = (uint16_t *)((uint8_t *)cdepth->bo.map + cdepth->data_offset);
+   for (unsigned c = 0; c < ARRAY_SIZE(cases); c++) {
+      void *sampler_handle = sampler_handles[cases[c].linear];
+      uint64_t submitted, rejected;
+      uint32_t sampled_pixel;
+      uint8_t sampled_alpha;
+      bool discarded, preserved;
+      uint32_t pixel;
+      uint16_t z;
+
+      for (unsigned v = 0; v < ARRAY_SIZE(vertices); v++)
+         vertices[v].texcoord[0] = cases[c].s;
+      context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 1,
+                                   &sampler_handle);
+      context->bind_fs_state(context, sample_fs);
+      submitted = ccontext->submitted_triangles;
+      rejected = ccontext->rejected_triangles;
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &clear, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush_resource(context, target);
+      context->flush_resource(context, depth);
+      context->flush(context, NULL, 0);
+      sampled_pixel = pixels[16 * (ctarget->stride / 4) + 16];
+      sampled_alpha = sampled_pixel >> 24;
+      z = depth_pixels[16 * (cdepth->stride / 2) + 16];
+      if (ccontext->submitted_triangles != submitted + 2 ||
+          ccontext->rejected_triangles != rejected ||
+          (sampled_pixel & 0x00ffffff) ||
+          (c == 0 && sampled_alpha != 0x7f) ||
+          (c == 1 && sampled_alpha != 0x80) ||
+          (c == 2 && sampled_alpha != 0x7f && sampled_alpha != 0x80) ||
+          z < 0x7ffe || z > 0x8001 ||
+          !smoke_guard_pages_match(ctarget) ||
+          !smoke_guard_pages_match(cdepth) ||
+          !smoke_guard_pages_match(ctexture) ||
+          memcmp(texels, texture_copy, ctexture->data_size)) {
+         fprintf(stderr, "A8 alpha sample %s mismatch: color=%08x depth=%04x "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64 "\n",
+                 cases[c].name, sampled_pixel, z,
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected);
+         passed = false;
+         break;
+      }
+      fprintf(stderr, "A8 alpha sample %s: %02x\n",
+              cases[c].name, sampled_alpha);
+      /* BGRA8 quantizes the sampled result.  At the filtered midpoint its
+       * readback byte cannot establish the sign of the internal predicate.
+       * Check color/depth coherence but report the classification separately.
+       */
+      context->bind_fs_state(context, fs);
+      submitted = ccontext->submitted_triangles;
+      rejected = ccontext->rejected_triangles;
+      context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                     PIPE_MASK_RGBA, 0xff, NULL, &clear, 1.0, 0);
+      context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+      context->flush_resource(context, target);
+      context->flush_resource(context, depth);
+      context->flush(context, NULL, 0);
+      pixel = pixels[16 * (ctarget->stride / 4) + 16];
+      z = depth_pixels[16 * (cdepth->stride / 2) + 16];
+      discarded = pixel == 0 && z == 0xffff;
+      preserved = !(pixel & 0x00ffffff) &&
+                  (pixel >> 24) >= 0x7f && (pixel >> 24) <= 0x80 &&
+                  z >= 0x7ffe && z <= 0x8001;
+      passed = ccontext->submitted_triangles == submitted + 2 &&
+               ccontext->rejected_triangles == rejected &&
+               smoke_guard_pages_match(ctarget) &&
+               smoke_guard_pages_match(cdepth) &&
+               smoke_guard_pages_match(ctexture) &&
+               !memcmp(texels, texture_copy, ctexture->data_size) &&
+               (c == 2 ? discarded || preserved :
+                  cases[c].killed ? discarded : preserved);
+      if (!passed) {
+         fprintf(stderr, "A8 alpha KILL %s mismatch: sample=%02x "
+                 "color=%08x depth=%04x "
+                 "submitted=+%" PRIu64 " rejected=+%" PRIu64
+                 " guards=%u/%u/%u source=%u\n",
+                 cases[c].name, sampled_alpha, pixel, z,
+                 ccontext->submitted_triangles - submitted,
+                 ccontext->rejected_triangles - rejected,
+                 smoke_guard_pages_match(ctarget),
+                 smoke_guard_pages_match(cdepth),
+                 smoke_guard_pages_match(ctexture),
+                 !memcmp(texels, texture_copy, ctexture->data_size));
+         break;
+      }
+      if (c == 2)
+         fprintf(stderr, "A8 alpha filtered midpoint: sample=%02x "
+                 "KILL=%s (internal threshold unresolved)\n",
+                 sampled_alpha, discarded ? "discarded" : "survived");
+   }
+   if (passed)
+      puts("Gallium guarded A8 alpha KILL below/above D16 passed; "
+           "midpoint recorded diagnostically");
+
+out:
+   free(texture_copy);
+   if (context) {
+      if (view) pipe_sampler_view_reference(&view, NULL);
+      if (sample_fs) context->delete_fs_state(context, sample_fs);
+      if (fs) context->delete_fs_state(context, fs);
+      if (vs) context->delete_vs_state(context, vs);
+      for (unsigned i = 0; i < ARRAY_SIZE(sampler_handles); i++)
+         if (sampler_handles[i])
+            context->delete_sampler_state(context, sampler_handles[i]);
+      if (elements_handle)
+         context->delete_vertex_elements_state(context, elements_handle);
+      if (rasterizer_handle)
+         context->delete_rasterizer_state(context, rasterizer_handle);
+      if (dsa_handle)
+         context->delete_depth_stencil_alpha_state(context, dsa_handle);
+      if (blend_handle)
+         context->delete_blend_state(context, blend_handle);
+      context->destroy(context);
+   }
+   if (depth) screen->resource_destroy(screen, depth);
+   if (target) screen->resource_destroy(screen, target);
+   if (texture) screen->resource_destroy(screen, texture);
+   return passed;
+}
+
+static bool
 smoke_d24_combined_draw(struct pipe_screen *screen,
                         struct pipe_context *context,
                         struct pipe_resource *color,
@@ -6412,6 +6788,18 @@ main(int argc, char **argv)
    if (!screen) {
       fputs("chrome9_screen_create failed\n", stderr);
       return 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--kill-compile-only")) {
+      bool passed = smoke_alpha_kill_compile(screen);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--kill-a8-only")) {
+      bool passed = smoke_a8_alpha_kill(screen);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
    }
    if (argc > 2 && !strcmp(argv[2], "--a8-only")) {
       bool passed = smoke_a8_generic_texture(screen);
