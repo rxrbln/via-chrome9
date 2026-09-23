@@ -714,7 +714,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
     * cannot poison the persistent ring for every later X client.
     */
    *reason = "textured-modulate-blend-unproven";
-   if (texture_count == 1 && *blend_successor &&
+   if (texture_count == 1 &&
+       (blend->flags & DRM_CHROME9_BLEND_ENABLE) &&
        ctx->fs->fragment_program != CHROME9_FS_TEXTURE_REPLACE &&
        ctx->fs->fragment_program != CHROME9_FS_TEXTURE_RGBX)
       return false;
