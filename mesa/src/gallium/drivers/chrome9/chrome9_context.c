@@ -2717,6 +2717,7 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    struct chrome9_ps_source operands[3] = { 0 };
    enum chrome9_ps_opcode op;
    unsigned source_count;
+   unsigned source_components[3];
    unsigned components;
    unsigned value;
    uint8_t temp;
@@ -2739,6 +2740,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       return false;
    alu = nir_instr_as_alu(instr);
    components = alu->def.num_components;
+   for (unsigned s = 0; s < ARRAY_SIZE(source_components); s++)
+      source_components[s] = components;
    switch (alu->op) {
    case nir_op_mov:
       return chrome9_ps_lower_alu_source(builder, &alu->src[0], components,
@@ -2763,8 +2766,42 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       op = CHROME9_PS_OPCODE_MIN;
       source_count = 2;
       break;
+   case nir_op_fmax:
+      op = CHROME9_PS_OPCODE_MAX;
+      source_count = 2;
+      break;
+   case nir_op_fdot3:
+      op = CHROME9_PS_OPCODE_DP3;
+      source_count = 2;
+      source_components[0] = source_components[1] = 3;
+      break;
+   case nir_op_fdot4:
+      op = CHROME9_PS_OPCODE_DP4;
+      source_count = 2;
+      source_components[0] = source_components[1] = 4;
+      break;
    case nir_op_fexp2:
       op = CHROME9_PS_OPCODE_EXP2;
+      source_count = 1;
+      break;
+   case nir_op_flog2:
+      op = CHROME9_PS_OPCODE_LOG2;
+      source_count = 1;
+      break;
+   case nir_op_frcp:
+      op = CHROME9_PS_OPCODE_RCP;
+      source_count = 1;
+      break;
+   case nir_op_frsq:
+      op = CHROME9_PS_OPCODE_RSQ;
+      source_count = 1;
+      break;
+   case nir_op_fabs:
+      op = CHROME9_PS_OPCODE_ABS;
+      source_count = 1;
+      break;
+   case nir_op_ffract:
+      op = CHROME9_PS_OPCODE_FRC;
       source_count = 1;
       break;
    case nir_op_fneg:
@@ -2787,8 +2824,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       builder->value[value].source.swizzle[c] = c < components ?
          c : CHROME9_PS_SWIZZLE_ZERO;
    for (unsigned s = 0; s < source_count; s++)
-      if (!chrome9_ps_lower_alu_source(builder, &alu->src[s], components,
-                                       &operands[s]))
+      if (!chrome9_ps_lower_alu_source(builder, &alu->src[s],
+                                       source_components[s], &operands[s]))
          return false;
    if (alu->op == nir_op_fneg) {
       static const uint32_t negative_one[4] = {

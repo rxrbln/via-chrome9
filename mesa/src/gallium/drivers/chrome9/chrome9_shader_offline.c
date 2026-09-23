@@ -224,12 +224,147 @@ chrome9_encode_ps_min(const struct chrome9_ps_source *source_a,
    return true;
 }
 
+static bool
+encode_binary_subop(const struct chrome9_ps_source *source_a,
+                    const struct chrome9_ps_source *source_c,
+                    unsigned subop, bool dot3, uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x01c00530, 0x30080053, 0x00f08005, 0x00000820,
+   };
+
+   if (!record || !source_valid(source_a) || !source_valid(source_c) ||
+       subop > 0xf)
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source_a);
+   encode_source_c(record, source_c);
+   record[3] |= subop << 16;
+   if (dot3) {
+      /* DP3 consumes XYZ and fixes W to zero, independent of the NIR
+       * destination width. */
+      record[1] &= ~0x7u;
+      record[1] |= (uint32_t)CHROME9_PS_SWIZZLE_ZERO << 0;
+      record[1] &= ~(7u << 28);
+      record[1] |= (uint32_t)CHROME9_PS_SWIZZLE_ZERO << 28;
+   }
+   return true;
+}
+
+bool
+chrome9_encode_ps_max(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_c,
+                      uint32_t record[4])
+{
+   return encode_binary_subop(source_a, source_c, 0xb, false, record);
+}
+
+bool
+chrome9_encode_ps_dp3(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_c,
+                      uint32_t record[4])
+{
+   return encode_binary_subop(source_a, source_c, 0x2, true, record);
+}
+
+bool
+chrome9_encode_ps_dp4(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_c,
+                      uint32_t record[4])
+{
+   return encode_binary_subop(source_a, source_c, 0x3, false, record);
+}
+
+static bool
+encode_scalar_subop(const struct chrome9_ps_source *source, unsigned subop,
+                    uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x01c00530, 0xb01c0053, 0x00f080b6, 0x00000820,
+   };
+
+   if (!record || !source_valid(source) || subop < 4 || subop > 7)
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source);
+   record[3] |= subop << 16;
+   return true;
+}
+
 bool
 chrome9_encode_ps_exp2(const struct chrome9_ps_source *source,
                        uint32_t record[4])
 {
+   return encode_scalar_subop(source, 4, record);
+}
+
+bool
+chrome9_encode_ps_log2(const struct chrome9_ps_source *source,
+                       uint32_t record[4])
+{
+   return encode_scalar_subop(source, 5, record);
+}
+
+bool
+chrome9_encode_ps_rcp(const struct chrome9_ps_source *source,
+                      uint32_t record[4])
+{
+   return encode_scalar_subop(source, 6, record);
+}
+
+bool
+chrome9_encode_ps_rsq(const struct chrome9_ps_source *source,
+                      uint32_t record[4])
+{
+   return encode_scalar_subop(source, 7, record);
+}
+
+bool
+chrome9_encode_ps_abs(const struct chrome9_ps_source *source,
+                      uint32_t record[4])
+{
+   struct chrome9_ps_source negated;
    static const uint32_t base[4] = {
-      0x01c00530, 0xb01c0053, 0x00f080b6, 0x00040820,
+      0x00000000, 0x00000000, 0x00f00000, 0x00090820,
+   };
+
+   if (!record || !source_valid(source) || source->modifier)
+      return false;
+   negated = *source;
+   negated.modifier = CHROME9_PS_SOURCE_NEGATE;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source);
+   encode_source_c(record, source);
+   encode_source_b(record, &negated);
+   return true;
+}
+
+bool
+chrome9_encode_ps_cmp(const struct chrome9_ps_source *condition,
+                      const struct chrome9_ps_source *if_true,
+                      const struct chrome9_ps_source *if_false,
+                      uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x00000000, 0x00000000, 0x00f00000, 0x00090820,
+   };
+
+   if (!record || !source_valid(condition) || !source_valid(if_true) ||
+       !source_valid(if_false))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, condition);
+   encode_source_c(record, if_true);
+   encode_source_b(record, if_false);
+   return true;
+}
+
+bool
+chrome9_encode_ps_frc(const struct chrome9_ps_source *source,
+                      uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x01c00530, 0x301c0053, 0x00f08005, 0x000e0820,
    };
 
    if (!record || !source_valid(source))
@@ -245,13 +380,22 @@ instruction_source_count(enum chrome9_ps_opcode op)
    switch (op) {
    case CHROME9_PS_OPCODE_MOV:
    case CHROME9_PS_OPCODE_EXP2:
+   case CHROME9_PS_OPCODE_LOG2:
+   case CHROME9_PS_OPCODE_RCP:
+   case CHROME9_PS_OPCODE_RSQ:
+   case CHROME9_PS_OPCODE_ABS:
+   case CHROME9_PS_OPCODE_FRC:
       return 1;
    case CHROME9_PS_OPCODE_MUL:
    case CHROME9_PS_OPCODE_ADD:
    case CHROME9_PS_OPCODE_SUB:
    case CHROME9_PS_OPCODE_MIN:
+   case CHROME9_PS_OPCODE_MAX:
+   case CHROME9_PS_OPCODE_DP3:
+   case CHROME9_PS_OPCODE_DP4:
       return 2;
    case CHROME9_PS_OPCODE_MAD:
+   case CHROME9_PS_OPCODE_CMP:
       return 3;
    default:
       return 0;
@@ -370,7 +514,10 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
 
       for (unsigned s = 0; s < source_count; s++)
          sources[s] = instruction->source[s];
-      if (instruction->op == CHROME9_PS_OPCODE_EXP2) {
+      if (instruction->op == CHROME9_PS_OPCODE_EXP2 ||
+          instruction->op == CHROME9_PS_OPCODE_LOG2 ||
+          instruction->op == CHROME9_PS_OPCODE_RCP ||
+          instruction->op == CHROME9_PS_OPCODE_RSQ) {
          unsigned lane = __builtin_ctz(instruction->destination.writemask);
 
          if (instruction->destination.writemask &
@@ -419,7 +566,10 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
          for (unsigned lane = 0; lane < 4; lane++)
             if (!(instruction->destination.writemask & (1u << lane)))
                sources[s].swizzle[lane] = CHROME9_PS_SWIZZLE_ZERO;
-      if (instruction->op == CHROME9_PS_OPCODE_EXP2) {
+      if (instruction->op == CHROME9_PS_OPCODE_EXP2 ||
+          instruction->op == CHROME9_PS_OPCODE_LOG2 ||
+          instruction->op == CHROME9_PS_OPCODE_RCP ||
+          instruction->op == CHROME9_PS_OPCODE_RSQ) {
          sources[0].swizzle[0] = CHROME9_PS_SWIZZLE_ZERO;
          sources[0].swizzle[1] = CHROME9_PS_SWIZZLE_ZERO;
          sources[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
@@ -452,8 +602,39 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
          encoded = chrome9_encode_ps_min(&sources[0], &sources[1],
                                          p->alu[i]);
          break;
+      case CHROME9_PS_OPCODE_MAX:
+         encoded = chrome9_encode_ps_max(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_DP3:
+         encoded = chrome9_encode_ps_dp3(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_DP4:
+         encoded = chrome9_encode_ps_dp4(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
       case CHROME9_PS_OPCODE_EXP2:
          encoded = chrome9_encode_ps_exp2(&sources[0], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_LOG2:
+         encoded = chrome9_encode_ps_log2(&sources[0], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_RCP:
+         encoded = chrome9_encode_ps_rcp(&sources[0], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_RSQ:
+         encoded = chrome9_encode_ps_rsq(&sources[0], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_ABS:
+         encoded = chrome9_encode_ps_abs(&sources[0], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_CMP:
+         encoded = chrome9_encode_ps_cmp(&sources[0], &sources[1],
+                                         &sources[2], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_FRC:
+         encoded = chrome9_encode_ps_frc(&sources[0], p->alu[i]);
          break;
       default:
          encoded = false;

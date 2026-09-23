@@ -24,6 +24,27 @@ check_ps_encoder(void)
    static const uint32_t add_v0_c0[4] = {
       0x00800530, 0x30140924, 0x00f04005, 0x00000020,
    };
+   static const uint32_t max_v0_c0[4] = {
+      0x01c00530, 0x30080053, 0x00f04005, 0x000b0820,
+   };
+   static const uint32_t dp3_v0_c0[4] = {
+      0x01c00530, 0x50080055, 0x00f04005, 0x00020820,
+   };
+   static const uint32_t dp4_v0_c0[4] = {
+      0x01c00530, 0x30080053, 0x00f04005, 0x00030820,
+   };
+   static const uint32_t rsq_c0_w[4] = {
+      0x01c00530, 0xb01c0053, 0x00f080b6, 0x00070820,
+   };
+   static const uint32_t abs_v0[4] = {
+      0x00400538, 0x30040053, 0x00f04005, 0x00090820,
+   };
+   static const uint32_t cmp_c0_v0_c0[4] = {
+      0x00800530, 0x30040053, 0x00f08005, 0x00090820,
+   };
+   static const uint32_t frc_v0[4] = {
+      0x01c00530, 0x301c0053, 0x00f04005, 0x000e0820,
+   };
    struct chrome9_ps_source v0 = {
       .file = CHROME9_PS_SOURCE_INPUT,
       .swizzle = {
@@ -32,15 +53,34 @@ check_ps_encoder(void)
       },
    };
    struct chrome9_ps_source c0 = v0;
+   struct chrome9_ps_source c0w;
    uint32_t record[4];
 
    c0.file = CHROME9_PS_SOURCE_CONSTANT;
+   c0w = c0;
+   for (unsigned lane = 0; lane < 3; lane++)
+      c0w.swizzle[lane] = CHROME9_PS_SWIZZLE_ZERO;
+   c0w.swizzle[3] = CHROME9_PS_SWIZZLE_W;
    assert(chrome9_encode_ps_mov(&v0, record));
    assert(!memcmp(record, mov_v0, sizeof(record)));
    assert(chrome9_encode_ps_mul(&v0, &c0, record));
    assert(!memcmp(record, mul_v0_c0, sizeof(record)));
    assert(chrome9_encode_ps_add(&v0, &c0, record));
    assert(!memcmp(record, add_v0_c0, sizeof(record)));
+   assert(chrome9_encode_ps_max(&v0, &c0, record));
+   assert(!memcmp(record, max_v0_c0, sizeof(record)));
+   assert(chrome9_encode_ps_dp3(&v0, &c0, record));
+   assert(!memcmp(record, dp3_v0_c0, sizeof(record)));
+   assert(chrome9_encode_ps_dp4(&v0, &c0, record));
+   assert(!memcmp(record, dp4_v0_c0, sizeof(record)));
+   assert(chrome9_encode_ps_rsq(&c0w, record));
+   assert(!memcmp(record, rsq_c0_w, sizeof(record)));
+   assert(chrome9_encode_ps_abs(&v0, record));
+   assert(!memcmp(record, abs_v0, sizeof(record)));
+   assert(chrome9_encode_ps_cmp(&c0, &v0, &c0, record));
+   assert(!memcmp(record, cmp_c0_v0_c0, sizeof(record)));
+   assert(chrome9_encode_ps_frc(&v0, record));
+   assert(!memcmp(record, frc_v0, sizeof(record)));
 
    assert(!chrome9_encode_ps_mov(NULL, record));
    assert(!chrome9_encode_ps_mov(&v0, NULL));

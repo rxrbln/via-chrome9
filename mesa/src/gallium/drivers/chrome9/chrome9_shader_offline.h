@@ -86,7 +86,16 @@ enum chrome9_ps_opcode {
    CHROME9_PS_OPCODE_SUB,
    CHROME9_PS_OPCODE_MAD,
    CHROME9_PS_OPCODE_MIN,
+   CHROME9_PS_OPCODE_MAX,
+   CHROME9_PS_OPCODE_DP3,
+   CHROME9_PS_OPCODE_DP4,
    CHROME9_PS_OPCODE_EXP2,
+   CHROME9_PS_OPCODE_LOG2,
+   CHROME9_PS_OPCODE_RCP,
+   CHROME9_PS_OPCODE_RSQ,
+   CHROME9_PS_OPCODE_ABS,
+   CHROME9_PS_OPCODE_CMP,
+   CHROME9_PS_OPCODE_FRC,
 };
 
 struct chrome9_ps_instruction {
@@ -188,8 +197,31 @@ bool chrome9_encode_ps_mad(const struct chrome9_ps_source *source_a,
 bool chrome9_encode_ps_min(const struct chrome9_ps_source *source_a,
                            const struct chrome9_ps_source *source_c,
                            uint32_t record[4]);
+bool chrome9_encode_ps_max(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_c,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_dp3(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_c,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_dp4(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_c,
+                           uint32_t record[4]);
 bool chrome9_encode_ps_exp2(const struct chrome9_ps_source *source,
                             uint32_t record[4]);
+bool chrome9_encode_ps_log2(const struct chrome9_ps_source *source,
+                            uint32_t record[4]);
+bool chrome9_encode_ps_rcp(const struct chrome9_ps_source *source,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_rsq(const struct chrome9_ps_source *source,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_abs(const struct chrome9_ps_source *source,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_cmp(const struct chrome9_ps_source *condition,
+                           const struct chrome9_ps_source *if_true,
+                           const struct chrome9_ps_source *if_false,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_frc(const struct chrome9_ps_source *source,
+                           uint32_t record[4]);
 bool chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                            struct chrome9_ps_program *program);
 
