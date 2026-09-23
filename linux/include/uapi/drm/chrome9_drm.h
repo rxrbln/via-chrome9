@@ -206,6 +206,8 @@ enum drm_chrome9_param {
 /* Generic fragment textures accept A8, L8, L8A8, and RGB565 storage. */
 #define DRM_CHROME9_CAP_FRAGMENT_TEXTURE_LEGACY_FORMATS	(1ULL << 50)
 #define DRM_CHROME9_CAP_FRAGMENT_KILL			(1ULL << 51)
+/* Fragment ALU may read the native pixel-position MISC source in XY. */
+#define DRM_CHROME9_CAP_FRAGMENT_POSITION		(1ULL << 52)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -989,6 +991,8 @@ enum drm_chrome9_fragment_file {
 	DRM_CHROME9_FRAGMENT_FILE_TEMP = 0,
 	DRM_CHROME9_FRAGMENT_FILE_VARYING = 1,
 	DRM_CHROME9_FRAGMENT_FILE_CONSTANT = 2,
+	/* Native fragment position, not a vertex varying; index must be zero. */
+	DRM_CHROME9_FRAGMENT_FILE_POSITION = 3,
 };
 
 #define DRM_CHROME9_FRAGMENT_DEST_TEMP	0
