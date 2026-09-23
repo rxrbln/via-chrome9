@@ -28,6 +28,7 @@ probe command is:
 
 ```sh
 CHROME9_POSTPROCESS=2 CHROME9_RESOURCE_COUNTS=1 \
+CHROME9_DUMP_CONTROLS=1 \
 qemu-i386 -E LD_LIBRARY_PATH=/tmp/chrome9-probe-libs \
   /tmp/chrome9_pps_probe ffff0200 \
   04000005 00030000 10e41000 20e40000 \
@@ -46,6 +47,9 @@ ALU count=3
 TAU count=1
 301101b0
 instance +2c=00058000 +6c=00000008 +70=00000001
+controls A90-A9a:
+90058008 91000001 92010003 93000001 94000000 95000002
+96000000 97000000 98000000 99000000 9a000000
 ```
 
 The first ALU uses native class 3, physical MISC id 3 (`vPos`), with XY
@@ -53,12 +57,14 @@ selected by the instruction.  The second ALU bridges the computed TEMP into
 coordinate slot zero; the TAU samples slot zero and writes TEMP one; the
 third ALU copies the sample to oC0.  Configuration two owns the `0xcf` to 3
 relocation and final-use bit in the first ALU, and the bridge/TAU/consumer
-phase ordering.  The object implies A90's phase-and-bucket `0x58000`
-(`0x40000 | 0x18000`) plus MISC-usage
-bit 3 (`0x8`), a coordinate mask containing slot zero, and three ALU/one
-TAU counts.  Do not treat these inferred packet fields as a captured full
-command image: the probe prints compiled metadata and records, not a draw
-packet.
+phase ordering.  The exact uploader mapping produces A90's phase-and-bucket
+`0x58000` (`0x40000 | 0x18000`) plus MISC-usage bit 3 (`0x8`).  A91 bit zero
+names internally computed coordinate slot zero; A92 says three ALUs and one
+TAU; A95 bit one changes from ALU to TAU after the bridge; and A93 bit zero
+returns from TAU to the terminal color MOV.  The complete A90--A9a line above
+is therefore runtime-exact control construction from the finalized object,
+not an inferred phase sketch.  It is still not a captured full draw packet:
+the probe prints compiled metadata, records, and uploader-derived controls.
 
 The semantic test defines only r0.xy, so its TEX operand uses the legal
 `r0.xyxy` swizzle rather than naming undefined r0.zw.  Replacing the TEX
@@ -68,6 +74,17 @@ counts, first/third ALUs and TAU; only the bridge changes to
 production-compiled XYXY variant.  Both token forms sample the same 2-D
 coordinate lanes; the latter also satisfies the clean-room validator's
 explicit initialized-lane rule.
+
+The XYXY variant reports the same resource tuple `(1,2,0,1)`.  The third
+output is the field later stored at public instance `+0x34` and copied to FE
+A00 bits 7:4, so this computed-coordinate program requires A00 resource count
+**zero**, despite having one TAU.  The bridge defines coordinate slot zero
+internally before the TAU reads it.  Only external texture-coordinate
+components contribute to that third output.  Consequently a clean compiler
+must not rescan the finalized MISC source as ordinary class-3/id-3 T3: doing
+so would incorrectly emit A00 resource count four and declare nonexistent VS
+outputs.  Resource analysis must either run before MISC relocation or retain
+the source's semantic MISC identity.
 
 `via_chrome9_dri.so` disassembly corroborates the provenance:
 
@@ -82,6 +99,12 @@ explicit initialized-lane rule.
 The Windows D3D UMD independently has all four type-17 set sites at
 `VTGUModeDX32A.dll:0x101db34e,0x101db373,0x101db398,0x101db3bb`; its
 A90 updater reads the same compiled-object `+0x70` at `0x102024ed`.
+The finalizer passes active outputs zero and one to the updater at Linux
+`0x0019b099..0x0019b0b4`; the exact configuration-two thresholds are
+`adjusted0<=4/active1<=3 -> id3`, then `<=5/<=4 -> id4`, then
+`<=8/<=6 -> id7`, otherwise id15, where
+`adjusted0=active0+(MISC-present)`.  This vPos program's `(1,2,0,1)` tuple
+therefore becomes adjusted pair `(2,2)`, bucket `0x18000`, relocation id 3.
 The class-3 MISC source is not a T0 vertex varying.  No FVF mutation was
 found in the pixel compiler/finalizer, so fabricating a VS output for vPos
 would change the resource and raster contract.  vPos and vFace compile
