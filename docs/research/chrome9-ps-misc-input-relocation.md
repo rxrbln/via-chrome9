@@ -1,9 +1,10 @@
 # Chrome9 PS miscellaneous-input relocation
 
 Status: exact static producer lifecycle in Linux 5.75 and both Windows UMDs,
-plus hardware-free production Linux compiler/finalizer differentials.  This
-identifies the previously opaque `compiled_object+0x70` / instance `+0x80`
-resource-bucket predicate.
+hardware-free production Linux compiler/finalizer differentials, and the
+VX900 draw-time A90/A8A consumers.  This identifies the previously opaque
+`compiled_object+0x70` / instance `+0x80` resource-bucket and MISC-enable
+predicate.
 
 ## Result
 
@@ -77,6 +78,15 @@ Configuration two increments active0 from zero to one, selects bucket
 A90..A93 90058008 91000000 92000001 93000000
 ALU       01c00530 301c0053 00f2c305 000d0820
 ```
+
+That A90 is the finalized compiler object, not yet the VX900 draw-time image.
+For chip id 5, Linux `stmUpdatePS_inv:0x180119..0x180140` and Windows D3D
+`0x1015b0dc..0x1015b0f0` independently copy this same predicate into A90 bit
+19 before upload.  The executable value is therefore `900d8008`.  The
+adjacent MISC-only raster update also owns A8A; native upper-left/no-inversion
+uses explicit VX900 `A8A=8a020000`.  Exact register semantics, generation
+dispatch, and live negative history are in
+[`chrome9-vpos-cmp-frc-contract.md`](chrome9-vpos-cmp-frc-contract.md).
 
 The `0xcf -> 3` rewrite and source-A final-use flag are both visible in d2.
 `mov oC0,vFace` with source token `10e41001` produces the exact same raw
