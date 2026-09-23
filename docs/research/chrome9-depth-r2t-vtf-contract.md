@@ -12,6 +12,22 @@ packet/format recovery already recorded in this directory.
 
 ## Bottom line
 
+### Live VX900 checkpoint, 2026-09-23
+
+The guarded generic command-22 D24X8 LESS draw now retires on
+`192.168.2.60` with a zero-varying `MOV oC0,c0` fragment program.  A 64x64
+BGRA destination and separate X8Z24 depth surface produced 1,176 red triangle
+pixels; the sampled depth word was `80000000` for z=0.5.  The kernel verified
+both complete guard pages after retirement, and the smoke test checked
+triangle interior, exterior, and guards.  The test is
+`tools/re/chrome9_d24_guard_smoke.c`; it uses the kernel's fixed
+`13579bdf` guard word for both BOs.  An earlier test-only mismatch expected
+a different depth guard word and falsely reported corruption.
+
+This proves one untextured D24 LESS write, not D24 sampling, alternate
+comparison modes, read-only depth, render-to-texture ordering, or Gallium FBO
+completeness.  Mesa still does not advertise the format.
+
 * Chrome9's native sampled 24-bit depth layout is depth in bits 31:8.  The
   correct Gallium formats are `PIPE_FORMAT_X8Z24_UNORM` and
   `PIPE_FORMAT_S8_UINT_Z24_UNORM`, not `Z24X8` or `Z24_UNORM_S8_UINT`.
