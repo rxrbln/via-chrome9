@@ -377,44 +377,37 @@ quarantined after each timeout and reset before the next test. Further GPU
 submissions require an independently recovered producer/consumer linkage
 tuple, not another unstructured field sweep.
 
-That linkage is now recovered from the programmable Windows D3D path. In
+The programmable Windows D3D path establishes the missing direct-T0 state,
+but a later broader differential corrects the original interpretation.  At
 `VTGUModeDX32A.dll:0x1015b255..0x1015b26b`, the draw update reads compiled
 instance metadata `+0x34`, shifts it left four, and replaces FE A00 bits 7:4
-in the hardware image at `+0x1c90`. The image initializer at
-`0x101549a8..0x101549c0` proves that `+0x1c90` begins the consecutive FE
-A00--A13 image. The same draw update reads the resulting A00 bits 7:4 at
-`0x1015b3b4..0x1015b42e` and loops over that many coordinate dimensions to
-rebuild the vertex-output masks.
+in the hardware image at `+0x1c90`.  Linux and Windows finalizers prove that
+this field is the third output of `stmGetActiveTexTmpNum`: the compiler's
+active texture-temporary resource count.
 
-Linux 5.75 production-compiler differentials identify `+0x34` exactly. It is
-zero for `MOV oC0,c0` and `MOV oC0,v0`, one for direct `MOV oC0,T0`, one for
-logical `MOV oC0,T5` after compaction to physical coordinate zero, and one
-for `TEX(s0,T0); MOV oC0,r0`. The `T5` object's separate logical-use metadata
-at `+0x40` is `0x20`, proving that the value copied into A00 is the compact
-physical coordinate high-water rather than a logical mask, TAU count, or
-bound-sampler count. A valid PS 2.0 `dcl T0` produces the same native ALU,
-controls and `+0x34=1`; its declaration metadata is not a hidden program-store
-word.
+It is not compact coordinate high-water.  Linux production objects give
+`+0x34=1,+0x40=7` for one-record `MAD oC0,T0,T1,T2`, but
+`+0x34=3,+0x40=7` for the three-record distinct T0/T1/T2 chain.  A sparse
+`TEX(s5,T5)` similarly gives `+0x34=1` while the fourth resource output and
+sampler high-water are six.  Thus neither varying count, sampler count, nor
+their maximum is the production A00 input.
 
-Therefore the generic direct-T0 packet's A00=`00000001` was incomplete even
-though TAU count and sampler count were both zero. For dense generic linkage,
-the source-backed rule is
-`A00[7:4] = max(fragment_texture_count, program->varying_count)`, preserving
-bit zero independently. One direct T0 requires A00=`00000011`. The runtime
-does not synthesize an image, sampler, TAU instruction, or dummy texture BO;
-only the FE coordinate count is extended. This explains why both A08-only
-tests still hung and provides one bounded next correction, not a new register
-matrix. The full differential and disassembly are recorded in
-`chrome9-direct-t0-fe-count.md`.
+The original direct-T0 packet's A00=`00000001` was incomplete and one direct
+T0 does require A00=`00000011`; that explains why the A08-only tests still
+hung.  The later live success qualifies this one-resource case only.  The
+implementation must carry the scheduled program's active texture-temporary
+count separately.  The exact finalizer provenance, compiler matrix, and
+current-code mismatch are recorded in `chrome9-direct-t0-fe-count.md`.
 
-The bounded correction passed on VX900 silicon on 2026-09-23.  With A00's
-count changed to `max(texture_count,varying_count)`, the same guarded
+The bounded one-resource correction passed on VX900 silicon on 2026-09-23.
+With A00 changed from zero resources to one, the same guarded
 64-by-64 semantic varying-zero/native-T0 MOV draw at Z=0.5 retired normally
 and changed exactly 1176 pixels to the expected red, including the interior;
 the exterior and both BO guards remained intact.  No image, sampler, TAU, or
-texture BO was present.  This promotes the A00 coordinate-high-water rule
-from binary proof to a live direct-fragment-input requirement.  It does not
-by itself promote arbitrary varying counts or widths: A09/A0a state and the
+texture BO was present.  This promotes the nonzero active-texture-resource
+requirement from binary proof to a live direct-fragment-input requirement.
+It does not validate `max(texture_count,varying_count)` or arbitrary varying
+counts and widths: the scheduled resource count, A09/A0a state, and the
 three-through-eight input closures remain separate gates.
 
 ### Three-coordinate silent-black boundary
@@ -430,8 +423,9 @@ ADD TEMP1, TEMP0, v1   # v1 = (0,0,0,0)
 ADD COLOR, TEMP1, v2   # v2 = (1,0,0,1)
 ```
 
-All three inputs were float4.  The submitted image had coordinate high-water
-three in A00, float4 T0/T1 dimensions in A08, and float4 T2 in A09.  The ioctl
+All three inputs were float4.  The submitted image had the production
+three-record resource count three in A00, float4 T0/T1 dimensions in A08,
+and float4 T2 in A09.  The ioctl
 and engine completed normally and both destination guards remained intact,
 but the entire destination stayed black (`changed=0`).  This is a silent
 no-color-write result, not the earlier direct-T0 timeout.
@@ -506,12 +500,18 @@ A90..A92 = 90058007 91000000 92000001
 
 Set T0 and T1 to zero and T2 to opaque red.  This preserves the exact
 three-float4 FE/FVF/VS closure from the silent-black draw while reducing the
-fragment program to one ALU and no TEMP.  A red result qualifies physical T2
-producer/consumer linkage and narrows the original failure to the interaction
-between multiple varying-consuming ALUs and their release schedule; a black
-result isolates multi-coordinate/T2 linkage without H3 or TEMP ambiguity.
-This next oracle is compiler-exact but has not been run, and no additional
-GPU submission was made during this documentation update.
+fragment program to one ALU and no TEMP.
+
+The guarded oracle was run once on 2026-09-23.  It timed out after the ring
+reader reached the post-draw closure; the engine was quarantined and no retry
+was made.  The submitted fragment object was byte-exact production output,
+but FE A00 was `00000031`, derived from the then-current three-varying rule.
+Subsequent static audit found the exact proprietary contradiction: this
+one-record MAD has compiler resource tuple `(1,0,1,0)` and compiled
+`+0x34=1`, which the Windows runtime copies to A00.  Its production A00 is
+therefore `00000011`, not `00000031`.  The timeout does not yet qualify or
+reject T2 linkage; a single corrected A00 discriminator after cold recovery
+is the bounded causal test.
 
 ## Polygon offset / depth bias
 
