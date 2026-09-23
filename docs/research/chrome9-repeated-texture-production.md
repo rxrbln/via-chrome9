@@ -185,12 +185,11 @@ The three-stage fragment envelope is:
 | stage | resource | image A30 | sampler A30 / A31 / A32 |
 |---:|---|---:|---|
 | 0 | raw D24 depth, one level | `30fe2000` | `30000000 31100000 32000049` |
-| 1 | dynamic BGRA color, full mip chain | `30990000` | `30000L40 31102492 32000049` |
+| 1 | dynamic BGRA color, L0--L9 | `30990000` | `30000240 31102492 32000049` |
 | 2 | BGRA image, one level | `30990000` | `30000000 31102490 32000049` |
 
-In `30000L40`, `L` denotes the validated maximum mip level in A30 bits
-11:6, not a literal hexadecimal digit.  At 800x600 the chain reaches L9 and
-therefore depends on the separately unresolved L9 implicit-tail rule; the
+At 800x600 the chain reaches L9, giving exact A30=`30000240`, and therefore
+depends on the separately unresolved L9 implicit-tail rule; the
 ordinary L1--L8 H3 table is not enough.  General state high-water is three,
 so A00/A08 are `00000031/08010103`.
 
