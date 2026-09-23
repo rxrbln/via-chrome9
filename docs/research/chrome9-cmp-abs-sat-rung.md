@@ -129,14 +129,36 @@ nonnegative Y/Z/W lanes came from the condition c0 itself.  In A/C/B notation
 the result is exactly `A >= 0 ? A : B`; the nominal true-arm C value did not
 appear.  This is not conformant D3D CMP and must not be exposed as NIR select.
 
-Two guarded controls now precede any retry.  `--mov-c1` verifies constant c1
-upload and an ordinary source read (`ff40bf80`).  `--mad-c0-c1-c2` uses the
-same A/C/B source fields under the ordinary MAD subop and must produce
-`20005020`.  If both pass, constant upload and C-slot addressing are sound and
-the remaining discrepancy is subop-9 semantics or a missing CMP-specific
-control.  If MAD fails similarly, investigate the C operand encoding/upload
-before interpreting subop 9.  Do not run the direct-T0 or vPos successor modes
-until this constant-only discrepancy is closed.
+The guarded source-port controls isolate a three-distinct-constant resource
+limit rather than a CMP-only subop error:
+
+* `MOV c1` passed `ff40bf80`, proving c1 upload and an ordinary source read;
+* `ADD c0,c1` through A/B passed `ff00ff80`;
+* `MUL c0,c1` through A/C passed `00003000`;
+* `MAD c0,c1,c2` produced `20603020` rather than `20005020`.
+
+The MAD result is exactly c0*c0+c2: c0 squared plus c2 is logical
+`(.375,.1875,.125,.125)`, code-99 word `20603020`.  Thus A and C can read
+distinct constants in a two-source instruction, but the three-source packet
+cannot sustain three distinct constant registers; when B consumes the second
+constant resource, C aliases A.  The semantic validator/compiler must reject
+or legalize every MAD/CMP with three distinct constant ids.  This is a native
+per-record resource constraint, not permission to redefine CMP semantics.
+
+The source-backed legalizer is `MOV temp,c1; CMP color,c0,temp,c2`.  Linux
+configuration two finalizes it as
+
+```text
+01c00530 301c0053 00f08105 000d0020
+00820530 30200053 00f08005 00090820
+A90=90058000 A91=91000000 A92=92000002
+```
+
+It uses one physical temporary and only two constant sources in the CMP
+record.  `tools/re/chrome9_cmp_guard_smoke.c --cmp-temp-true` implements this
+next discriminator.  Only after it proves the intended boundary should the
+direct-T0 and vPos successor modes run.  General lowering must insert the
+legalization based on distinct native constant ids, not shader identity.
 
 Use the proven command-19 D16/RHW packet, BGRA8888 target, COPY, no blend,
 flat v0, guarded pages, and known-good draws before and after each candidate.
