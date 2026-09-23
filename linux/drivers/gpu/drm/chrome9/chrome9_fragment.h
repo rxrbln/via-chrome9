@@ -23,5 +23,6 @@ int chrome9_fragment_compile(
 	u32 instruction_count, const u32 *constants, u32 constant_count,
 	u32 texture_count, u32 varying_count,
 	struct chrome9_fragment_program *program);
+int chrome9_fragment_selftest(void);
 
 #endif
