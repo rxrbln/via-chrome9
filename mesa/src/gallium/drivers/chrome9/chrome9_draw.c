@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "draw/draw_context.h"
 #include "draw/draw_vbuf.h"
@@ -41,6 +42,7 @@ struct chrome9_vbuf_render {
       batch_textured_vertices[
          DRM_CHROME9_TEXTURED_TRIANGLE_BATCH_MAX_TRIANGLES * 3];
    struct drm_chrome9_draw_textured_triangle_run batch_textured_run_state;
+   struct drm_chrome9_draw_textured_triangle_mip batch_textured_mip_state;
    struct drm_chrome9_textured_vertex
       batch_textured_run_vertices[DRM_CHROME9_TEXTURE_RUN_MAX_TRIANGLES * 3];
    struct drm_chrome9_draw_triangle_d16_rhw_batch batch_rhw;
@@ -57,6 +59,7 @@ struct chrome9_vbuf_render {
    bool batch_compiled_program;
    bool batch_textured;
    bool batch_textured_run;
+   bool batch_textured_mip;
    uint8_t texture_count;
    uint8_t packed_generic;
    bool textured;
@@ -635,6 +638,57 @@ chrome9_fragment_uniform_u32(struct chrome9_context *ctx, unsigned offset,
 }
 
 static bool
+chrome9_mip_view_supported(const struct chrome9_context *ctx,
+                           const struct chrome9_sampler_state *sampler,
+                           const struct pipe_sampler_view *view,
+                           const struct chrome9_resource *texture)
+{
+   const struct pipe_resource *resource = view ? view->texture : NULL;
+   long page_size;
+   unsigned last_level;
+   uint64_t cursor;
+
+   if (!ctx->draw_textured_triangle_mip || !sampler || !view || !resource ||
+       sampler->mip_filter == DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+       resource->target != PIPE_TEXTURE_2D ||
+       resource->format != PIPE_FORMAT_B8G8R8X8_UNORM ||
+       resource->width0 != resource->height0 || resource->width0 > 512 ||
+       !util_is_power_of_two_or_zero(resource->width0) ||
+       sampler->wrap_s != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE ||
+       sampler->wrap_t != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE ||
+       view->u.tex.first_level || view->u.tex.first_layer ||
+       view->u.tex.last_layer || !texture->guarded)
+      return false;
+
+   last_level = view->u.tex.last_level;
+   if (!last_level || last_level > 9 || last_level > resource->last_level ||
+       last_level > util_logbase2(resource->width0) ||
+       (last_level == 9 && resource->width0 != 512) ||
+       sampler->base.max_lod < (float)last_level)
+      return false;
+
+   page_size = sysconf(_SC_PAGESIZE);
+   if (page_size <= 0 || (uint64_t)page_size > UINT32_MAX ||
+       texture->level_offset[0] != (uint64_t)page_size)
+      return false;
+   cursor = ALIGN_POT(texture->level_size[0], (uint64_t)page_size) +
+            2 * (uint64_t)page_size;
+   for (unsigned level = 1; level <= last_level; level++) {
+      const unsigned width = u_minify(resource->width0, level);
+      const unsigned height = u_minify(resource->height0, level);
+
+      cursor = ALIGN_POT(cursor, 256);
+      if (texture->level_offset[level] != cursor ||
+          texture->level_stride[level] != ALIGN_POT(width * 4, 32) ||
+          texture->level_size[level] !=
+             (uint64_t)texture->level_stride[level] * height)
+         return false;
+      cursor += texture->level_size[level];
+   }
+   return true;
+}
+
+static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
                              struct chrome9_resource **depth,
@@ -843,6 +897,13 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              textures[unit]->stride != ALIGN_POT(source->width0 * 4, 32) ||
              textures[unit]->data_size <
                 (uint64_t)textures[unit]->stride * source->height0)
+            return false;
+         *reason = "mip-view-state";
+         if (samplers[unit]->mip_filter !=
+                DRM_CHROME9_TEXTURE_MIP_FILTER_NONE &&
+             (texture_count != 1 || unit ||
+              !chrome9_mip_view_supported(ctx, samplers[unit], view,
+                                          textures[unit])))
             return false;
          *reason = "rgbx-source-format";
          if (!unit && ctx->fs->fragment_program == CHROME9_FS_TEXTURE_RGBX &&
@@ -1099,7 +1160,16 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
    bool submitted;
    bool direct_external = false;
 
-   if (crender->batch_textured && crender->batch_textured_run) {
+   if (crender->batch_textured && crender->batch_textured_mip) {
+      struct drm_chrome9_draw_textured_triangle_mip submit =
+         crender->batch_textured_mip_state;
+
+      chrome9_context_prepare_render_target(ctx);
+      submit.triangle_count = count;
+      submit.vertices_ptr =
+         (uintptr_t)crender->batch_textured_run_vertices;
+      submitted = chrome9_draw_textured_triangle_mip(fd, &submit);
+   } else if (crender->batch_textured && crender->batch_textured_run) {
       struct drm_chrome9_draw_textured_triangle_run submit =
          crender->batch_textured_run_state;
 
@@ -1216,6 +1286,7 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
          fprintf(stderr,
                  "chrome9: DRAW_%sTRIANGLE%s_BATCH failed after=%" PRIu64
                  " count=%u: %s\n",
+                 crender->batch_textured_mip ? "TEXTURED_MIP_" :
                  crender->batch_textured_run ? "TEXTURED_RUN_" :
                  crender->batch_textured ? "TEXTURED_" :
                  crender->batch_compiled_program ? "PROGRAM_" :
@@ -1229,6 +1300,7 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
    crender->batch_count = 0;
    crender->batch_textured = false;
    crender->batch_textured_run = false;
+   crender->batch_textured_mip = false;
    crender->batch_perspective = false;
    crender->batch_large_run = false;
    crender->batch_large_chain = false;
@@ -1293,7 +1365,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
           ctx->draw_program_triangle_d16_rhw_batch)) ||
         (crender->textured &&
          (ctx->draw_textured_triangle_batch ||
-          ctx->draw_textured_triangle_run))) &&
+          ctx->draw_textured_triangle_run ||
+          ctx->draw_textured_triangle_mip))) &&
        crender->batch_failed) {
       ctx->rejected_triangles++;
       return;
@@ -1858,6 +1931,73 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       }
    }
    if (crender->textured && crender->texture_count == 1 &&
+       samplers[0]->mip_filter != DRM_CHROME9_TEXTURE_MIP_FILTER_NONE) {
+      const bool mip_blend = blend_successor ||
+         (depth_active && chrome9_blend_is_source_over(&blend_state));
+      struct pipe_sampler_view *view = ctx->sampler_views[0];
+      struct drm_chrome9_draw_textured_triangle_mip next = {
+         .destination_handle = texture_args.destination_handle,
+         .depth_handle = depth_active ? depth->bo.handle : 0,
+         .flags = depth_active ?
+            DRM_CHROME9_TEXTURE_RUN_DEPTH | depth_flags : 0,
+         .program = texture_args.program,
+         .width = texture_args.width,
+         .height = texture_args.height,
+         .destination_pitch = texture_args.destination_pitch,
+         .depth_pitch = depth_active ? depth->stride : 0,
+         .texture = {
+            .handle = texture_args.texture_handle,
+            .width = texture_args.texture_width,
+            .height = texture_args.texture_height,
+            .pitch = texture_args.texture_pitch,
+            .format = texture_args.texture_format,
+            .min_filter = texture_args.min_filter,
+            .mag_filter = texture_args.mag_filter,
+            .wrap_s = texture_args.wrap_s,
+            .wrap_t = texture_args.wrap_t,
+         },
+         .scissor = texture_args.scissor,
+         .texture_last_level = view->u.tex.last_level,
+         .mip_filter = samplers[0]->mip_filter,
+         .lod_bias_s5_5 = lroundf(samplers[0]->base.lod_bias * 32.0f),
+      };
+
+      if (mip_blend) {
+         next.flags |= DRM_CHROME9_TEXTURE_RUN_BLEND;
+         next.destination_format =
+            target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+            DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+            DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+         next.blend = blend_state;
+      }
+      if (crender->batch_count &&
+          (!crender->batch_textured || !crender->batch_textured_mip ||
+           memcmp(&crender->batch_textured_mip_state, &next, sizeof(next))))
+         chrome9_flush_triangle_batch(crender);
+      if (crender->batch_failed) {
+         ctx->rejected_triangles++;
+         return;
+      }
+      if (!crender->batch_count) {
+         crender->batch_textured = true;
+         crender->batch_textured_run = false;
+         crender->batch_textured_mip = true;
+         crender->batch_perspective = false;
+         crender->batch_large_run = false;
+         crender->batch_large_chain = false;
+         crender->batch_compiled_program = false;
+         crender->batch_textured_mip_state = next;
+      }
+      const unsigned base = crender->batch_count * 3;
+      for (unsigned i = 0; i < 3; i++)
+         crender->batch_textured_run_vertices[base + i] =
+            texture_args.vertices[i];
+      crender->batch_count++;
+      if (crender->batch_count == DRM_CHROME9_TEXTURE_RUN_MAX_TRIANGLES)
+         chrome9_flush_triangle_batch(crender);
+      return;
+   }
+   if (crender->textured && crender->texture_count == 1 &&
        ctx->draw_textured_triangle_run &&
        /* Preserve the no-depth batch's COPY_RECT recognition.  The run is
         * the D16 batching successor; use it without depth only when the
@@ -1908,6 +2048,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (!crender->batch_count) {
          crender->batch_textured = true;
          crender->batch_textured_run = true;
+         crender->batch_textured_mip = false;
          crender->batch_perspective = false;
          crender->batch_large_run = false;
          crender->batch_large_chain = false;
@@ -1967,6 +2108,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (!crender->batch_count) {
          crender->batch_textured = true;
          crender->batch_textured_run = false;
+         crender->batch_textured_mip = false;
          crender->batch_perspective = false;
          crender->batch_large_run = false;
          crender->batch_large_chain = false;
@@ -2091,6 +2233,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (!crender->batch_count) {
          crender->batch_textured = false;
          crender->batch_textured_run = false;
+         crender->batch_textured_mip = false;
          crender->batch_perspective = perspective_batch;
          crender->batch_large_run = rhw_run_batch;
          crender->batch_large_chain = rhw_chain_batch;

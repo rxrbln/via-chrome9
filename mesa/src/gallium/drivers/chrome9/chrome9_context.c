@@ -184,6 +184,12 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
    }
    switch (state->min_mip_filter) {
    case PIPE_TEX_MIPFILTER_NONE: sampler->mip_filter = 0; break;
+   case PIPE_TEX_MIPFILTER_NEAREST:
+      sampler->mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NEAREST;
+      break;
+   case PIPE_TEX_MIPFILTER_LINEAR:
+      sampler->mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_LINEAR;
+      break;
    default: sampler->supported = false; break;
    }
    switch (state->wrap_s) {
@@ -199,8 +205,10 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
    default: sampler->supported = false; break;
    }
    if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
-       state->unnormalized_coords || state->lod_bias != 0.0f ||
-       state->min_lod != 0.0f || state->max_lod != 1000.0f ||
+       state->unnormalized_coords || !isfinite(state->lod_bias) ||
+       state->lod_bias < -16.0f || state->lod_bias > 511.0f / 32.0f ||
+       state->min_lod != 0.0f || !isfinite(state->max_lod) ||
+       state->max_lod < 0.0f ||
        state->max_anisotropy > 1 || state->seamless_cube_map ||
        state->reduction_mode != PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE)
       sampler->supported = false;
@@ -3713,6 +3721,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_BATCH);
    ctx->draw_textured_triangle_run =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_RUN);
+   ctx->draw_textured_triangle_mip =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_MIP);
    ctx->copy_rect = !!(capabilities & DRM_CHROME9_CAP_COPY_RECT);
    ctx->copy_rect_unguarded_destination =
       !!(capabilities & DRM_CHROME9_CAP_COPY_RECT_UNGUARDED_DESTINATION);

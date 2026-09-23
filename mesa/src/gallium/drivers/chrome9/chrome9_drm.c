@@ -26,6 +26,11 @@ _Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_run) == 160,
 _Static_assert(offsetof(struct drm_chrome9_draw_textured_triangle_run,
                         vertices_ptr) == 128,
                "Chrome9 textured run vertex pointer offset");
+_Static_assert(sizeof(struct drm_chrome9_draw_textured_triangle_mip) == 176,
+               "Chrome9 mipmapped textured run ABI size");
+_Static_assert(offsetof(struct drm_chrome9_draw_textured_triangle_mip,
+                        vertices_ptr) == 144,
+               "Chrome9 mipmapped textured run vertex pointer offset");
 _Static_assert(sizeof(struct drm_chrome9_copy_rect) == 96,
                "Chrome9 copy rectangle ABI size");
 _Static_assert(sizeof(struct drm_chrome9_gem_create) == 24,
@@ -195,6 +200,15 @@ chrome9_draw_textured_triangle_run(
    if (!draw)
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_RUN, draw) == 0;
+}
+
+bool
+chrome9_draw_textured_triangle_mip(
+   int fd, const struct drm_chrome9_draw_textured_triangle_mip *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_MIP, draw) == 0;
 }
 
 bool
