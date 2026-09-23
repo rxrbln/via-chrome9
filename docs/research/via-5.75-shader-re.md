@@ -90,6 +90,11 @@ qemu-i386 -E LD_LIBRARY_PATH=/tmp/chrome9-probe-libs \
   /tmp/chrome9-pps-probe
 ```
 
+After `CHROME9_POSTPROCESS=2`, set `CHROME9_DUMP_CONTROLS=1` to print the
+runtime-exact A90--A9A image.  This composes A90 from both public-instance
+`+0x2c` and `+0x6c`; reading only the former loses direct-ALU coordinate bits
+when the same coordinate is also consumed by TAU.
+
 The default shader is `ps_2_0; mov oC0,c0; end`.  Both this Linux compiler and
 the independently recovered Windows UMD compiler produce exactly:
 
