@@ -85,6 +85,34 @@ smoke_guard_pages_match(const struct chrome9_resource *resource)
 }
 
 static bool
+smoke_initialize_guard_pages(struct chrome9_resource *resource)
+{
+   const size_t page_size = resource->data_offset;
+   size_t aligned_data_size;
+   uint32_t *first, *level0_last, *final;
+
+   if (!page_size || (page_size & 3) || !resource->bo.map ||
+       resource->data_size > SIZE_MAX ||
+       resource->bo.size < 2 * page_size)
+      return false;
+   aligned_data_size = ALIGN_POT(resource->data_size, page_size);
+   if (aligned_data_size < resource->data_size ||
+       aligned_data_size > resource->bo.size - 2 * page_size)
+      return false;
+   first = resource->bo.map;
+   level0_last = (uint32_t *)((uint8_t *)resource->bo.map + page_size +
+                              aligned_data_size);
+   final = (uint32_t *)((uint8_t *)resource->bo.map + resource->bo.size -
+                        page_size);
+   for (size_t i = 0; i < page_size / sizeof(uint32_t); i++) {
+      first[i] = CHROME9_SMOKE_GUARD_WORD;
+      level0_last[i] = CHROME9_SMOKE_GUARD_WORD;
+      final[i] = CHROME9_SMOKE_GUARD_WORD;
+   }
+   return smoke_guard_pages_match(resource);
+}
+
+static bool
 smoke_bytes_match(const void *data, size_t size, uint8_t expected)
 {
    const uint8_t *bytes = data;
@@ -5492,6 +5520,7 @@ smoke_d24_framebuffer_contract(struct pipe_screen *screen)
    struct pipe_resource *scratch = NULL;
    const struct chrome9_resource *native;
    bool passed = false;
+   unsigned stage = 1;
 
    if (!screen->is_format_supported(screen, depth_templ.format,
                                      depth_templ.target, 1, 1,
@@ -5506,24 +5535,28 @@ smoke_d24_framebuffer_contract(struct pipe_screen *screen)
                                     depth_templ.target, 1, 1,
                                     depth_templ.bind | PIPE_BIND_SHARED))
       goto out;
+   stage = 2;
    depth_templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR;
    single_use = screen->resource_create(screen, &depth_templ);
    if (!single_use)
       goto out;
    screen->resource_destroy(screen, single_use);
    single_use = NULL;
+   stage = 3;
    depth_templ.bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR;
    single_use = screen->resource_create(screen, &depth_templ);
    if (!single_use)
       goto out;
    screen->resource_destroy(screen, single_use);
    single_use = NULL;
+   stage = 4;
    depth_templ.bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW |
                       PIPE_BIND_LINEAR;
    depth_templ.last_level = 1;
    single_use = screen->resource_create(screen, &depth_templ);
    if (single_use)
       goto out;
+   stage = 5;
    depth_templ.last_level = 0;
    depth = screen->resource_create(screen, &depth_templ);
    color_templ.format = PIPE_FORMAT_B8G8R8X8_UNORM;
@@ -5532,34 +5565,48 @@ smoke_d24_framebuffer_contract(struct pipe_screen *screen)
    context = screen->context_create(screen, NULL, 0);
    if (!depth || !color || !context)
       goto out;
+   stage = 6;
    native = chrome9_resource(depth);
-   if (!native->guarded || native->stride != 256 ||
-       native->data_size != 256 * 64 || !smoke_guard_pages_match(native))
+   if (!smoke_initialize_guard_pages(chrome9_resource(depth)))
       goto out;
+   if (!native->guarded || native->stride != 256 ||
+       native->data_size != 256 * 64 || !smoke_guard_pages_match(native)) {
+      fprintf(stderr, "X8Z24 layout: guarded=%u stride=%u data=%zu first_guard=%08x\n",
+              native->guarded, native->stride, native->data_size,
+              native->bo.map ? ((const uint32_t *)native->bo.map)[0] : 0);
+      goto out;
+   }
+   stage = 7;
    view = context->create_sampler_view(context, depth, &view_templ);
    if (!view)
       goto out;
+   stage = 8;
    fb.zsbuf.format = PIPE_FORMAT_X8Z24_UNORM;
    fb.zsbuf.texture = depth;
    context->set_framebuffer_state(context, &fb);
    scratch = chrome9_context(context)->render_target;
+   if (scratch && !smoke_initialize_guard_pages(chrome9_resource(scratch)))
+      goto out;
    if (!scratch || scratch == depth ||
        scratch != chrome9_context(context)->depth_only_scratch ||
        !chrome9_resource(scratch)->guarded ||
        scratch->format != PIPE_FORMAT_B8G8R8X8_UNORM)
       goto out;
+   stage = 9;
    context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH, 0, 0xff,
                   NULL, NULL, 0.5, 0);
    if (((uint32_t *)((uint8_t *)native->bo.map + native->data_offset))[0] !=
           0x80000000 || !smoke_guard_pages_match(native) ||
        !smoke_guard_pages_match(chrome9_resource(scratch)))
       goto out;
+   stage = 10;
    fb.nr_cbufs = 1;
    fb.cbufs[0].format = PIPE_FORMAT_B8G8R8X8_UNORM;
    fb.cbufs[0].texture = color;
    context->set_framebuffer_state(context, &fb);
    if (chrome9_context(context)->render_target != color)
       goto out;
+   stage = 11;
    fb.nr_cbufs = 0;
    fb.cbufs[0].texture = NULL;
    context->set_framebuffer_state(context, &fb);
@@ -5569,6 +5616,8 @@ smoke_d24_framebuffer_contract(struct pipe_screen *screen)
    passed = true;
 
 out:
+   if (!passed)
+      fprintf(stderr, "X8Z24 contract failed at stage %u\n", stage);
    if (single_use)
       screen->resource_destroy(screen, single_use);
    if (view)
@@ -5653,6 +5702,16 @@ main(int argc, char **argv)
       fputs("X8Z24 private framebuffer contract failed\n", stderr);
       screen->destroy(screen);
       return 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--d24-only")) {
+      if (!getenv("CHROME9_EXPERIMENTAL_X8Z24")) {
+         fputs("--d24-only requires CHROME9_EXPERIMENTAL_X8Z24\n", stderr);
+         screen->destroy(screen);
+         return 1;
+      }
+      screen->destroy(screen);
+      puts("X8Z24 private framebuffer contract passed");
+      return 0;
    }
    shared_xrgb_templ.bind = PIPE_BIND_RENDER_TARGET |
                              PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR |
