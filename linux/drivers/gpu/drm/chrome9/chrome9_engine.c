@@ -3177,7 +3177,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	 * ring and take rendering away from every later X client.
 	 */
 	if (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE &&
-	    chrome9_draw_has_blend(request) &&
+	    (request->blend.flags & DRM_CHROME9_BLEND_ENABLE) &&
 	    (request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
 	     request->kind ==
 		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16_BLEND ||
