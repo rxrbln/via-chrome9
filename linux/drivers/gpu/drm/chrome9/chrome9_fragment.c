@@ -888,6 +888,7 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	program->tau_count = tau_index;
 	program->active_texture_count =
 		chrome9_fragment_active_texture_count(&resource);
+	program->tau_coordinate_mask = state->coordinate_mask;
 	program->controls[0] = 0x90000000 |
 		(state->alu_varying_mask & ~native_tau_varying_mask);
 	starts_alu = state->instructions[0].op != DRM_CHROME9_FRAGMENT_OP_TEX ||
@@ -1088,6 +1089,35 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	/* The production compiler can preserve sampled alpha without a c31
+	 * upload by leaving r1.w undefined and selecting literal ONE at use.
+	 */
+	static const struct drm_chrome9_fragment_instruction packed_gray_partial[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 1, 2, 3, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0x7, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 0, 0, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 4 }, 0, 0 },
+			},
+		},
+	};
 	static const struct drm_chrome9_fragment_instruction varying_reuse[] = {
 		{
 			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
@@ -1214,6 +1244,15 @@ int chrome9_fragment_selftest(void)
 		0x94000000, 0x95000000, 0x96000000, 0x97000000,
 		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
 	};
+	static const u32 expected_packed_gray_partial_alu[][4] = {
+		{ 0x01c00530, 0x501c0053, 0x0072c000, 0x000d0060 },
+		{ 0x0140b6d0, 0x30201054, 0x00f20005, 0x00000820 },
+	};
+	static const u32 expected_packed_gray_partial_controls[] = {
+		0x90018000, 0x91000001, 0x92010002, 0x93000001,
+		0x94000000, 0x95000000, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+	};
 	static const u32 expected_varying_reuse_alu[][4] = {
 		{ 0x01c00530, 0x301c0053, 0x00f0c005, 0x000d0020 },
 		{ 0x0140b6d0, 0x302c0053, 0x00f20005, 0x00000820 },
@@ -1276,6 +1315,7 @@ int chrome9_fragment_selftest(void)
 		ARRAY_SIZE(sparse_varyings), constants, 0, 1, 6, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301011b0 ||
+	    program->tau_coordinate_mask != BIT(1) ||
 	    program->varying_count != 2 || program->varying_logical[0] != 0 ||
 	    program->varying_width[0] != 4 ||
 	    program->varying_logical[1] != 5 ||
@@ -1289,6 +1329,7 @@ int chrome9_fragment_selftest(void)
 		ARRAY_SIZE(packed_varying), constants, 0, 1, 1, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301006f0 || program->varying_count != 1 ||
+	    program->tau_coordinate_mask != BIT(0) ||
 	    program->varying_logical[0] || program->varying_width[0] != 3 ||
 	    program->alu[0][1] != 0x302c0000 ||
 	    program->alu[0][2] != 0x00f20005 ||
@@ -1305,11 +1346,27 @@ int chrome9_fragment_selftest(void)
 	    program->alu_count != ARRAY_SIZE(expected_packed_gray_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301006f0 ||
 	    program->active_texture_count != 1 ||
+	    program->tau_coordinate_mask != BIT(0) ||
 	    program->varying_count != 1 || program->varying_width[0] != 3 ||
 	    memcmp(program->alu, expected_packed_gray_alu,
 		   sizeof(expected_packed_gray_alu)) ||
 	    memcmp(program->controls, expected_packed_gray_controls,
 		   sizeof(expected_packed_gray_controls))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(packed_gray_partial,
+		ARRAY_SIZE(packed_gray_partial), constants, 0, 1, 1, program);
+	if (ret ||
+	    program->alu_count != ARRAY_SIZE(expected_packed_gray_partial_alu) ||
+	    program->tau_count != 1 || program->tau[0] != 0x301006f0 ||
+	    program->active_texture_count != 1 ||
+	    program->tau_coordinate_mask != BIT(0) ||
+	    program->varying_count != 1 || program->varying_width[0] != 3 ||
+	    memcmp(program->alu, expected_packed_gray_partial_alu,
+		   sizeof(expected_packed_gray_partial_alu)) ||
+	    memcmp(program->controls, expected_packed_gray_partial_controls,
+		   sizeof(expected_packed_gray_partial_controls))) {
 		ret = -EINVAL;
 		goto out;
 	}

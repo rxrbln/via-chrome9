@@ -1793,7 +1793,7 @@ static int chrome9_fragment_raster_selftest(void)
 }
 
 static int chrome9_fragment_fe_config(u32 active_texture_count,
-	u32 texture_count, u32 varying_count,
+	u32 varying_count, u8 tau_coordinate_mask,
 	const u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS], u32 config[8])
 {
 	static const u32 default_config[] = {
@@ -1801,19 +1801,18 @@ static int chrome9_fragment_fe_config(u32 active_texture_count,
 		0x04000000, 0x05000000, 0x0d810000,
 		0x09000000, 0x0a000000,
 	};
-	u32 coordinate_count = max(texture_count, varying_count);
 	unsigned int i;
 
 	if (active_texture_count > DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
 		return -E2BIG;
 	memcpy(config, default_config, sizeof(default_config));
-	/* A00 counts compiler-active texture resources, not logical T slots or
-	 * sampler bindings. A08 independently counts VS coordinate outputs.
+	/* A00 counts compiler-active texture resources. A08 independently counts
+	 * VS coordinate outputs, not sampler high-water or internal TAU slots.
 	 */
 	config[0] |= active_texture_count << 4;
-	config[2] |= coordinate_count;
-	for (i = 0; i < coordinate_count; i++) {
-		u32 producer_width = i < varying_count ? varying_width[i] : 2;
+	config[2] |= varying_count;
+	for (i = 0; i < varying_count; i++) {
+		u32 producer_width = varying_width[i];
 		u32 word, shift;
 
 		/* A01 describes the TAU consumer dimension; A08 describes the
@@ -1822,9 +1821,10 @@ static int chrome9_fragment_fe_config(u32 active_texture_count,
 		 */
 		if (!i)
 			config[1] = (config[1] & ~0x3U) |
-				(i < texture_count ? 1 : producer_width - 1);
+				(tau_coordinate_mask & BIT(0) ? 1 :
+				 producer_width - 1);
 		/* A mixed high slot needs a distinct producer/consumer oracle. */
-		if (i >= 2 && i < texture_count && i < varying_count &&
+		if (i >= 2 && tau_coordinate_mask & BIT(i) &&
 		    producer_width != 2)
 			return -EOPNOTSUPP;
 		if (i < 2) {
@@ -1878,7 +1878,8 @@ static int chrome9_fragment_fe_config_selftest(void)
 	    config[6] != 0x09000000 || config[7] != 0x0a000000)
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
-		if (chrome9_fragment_fe_config(cases[i].count, 0, cases[i].count,
+		if (chrome9_fragment_fe_config(cases[i].count, cases[i].count,
+				0,
 				cases[i].width, config))
 			return -EINVAL;
 		if (config[0] != (cases[i].count << 4 | 1) ||
@@ -1887,25 +1888,34 @@ static int chrome9_fragment_fe_config_selftest(void)
 		    config[7] != cases[i].a0a)
 			return -EINVAL;
 	}
-	if (chrome9_fragment_fe_config(8, 8, 0, empty_width, config) ||
-	    config[0] != 0x00000081 || config[1] != 0x01002521 ||
-	    config[6] != 0x09010101 ||
-	    config[7] != 0x0a010101)
+	/* A sparse sampler or an ALU-produced TAU coordinate does not add a
+	 * vertex-shader output to A08.
+	 */
+	if (chrome9_fragment_fe_config(1, 0, BIT(0), empty_width, config) ||
+	    config[0] != 0x00000011 || config[1] != 0x01002521 ||
+	    config[2] != 0x08010100 || config[6] != 0x09000000 ||
+	    config[7] != 0x0a000000)
 		return -EINVAL;
 	/* Packed ALU X plus TAU YZ keeps a float3 producer and a 2-D
 	 * consumer; the same boundary also applies to a float4 producer.
 	 */
-	if (chrome9_fragment_fe_config(1, 1, 1, packed3_width, config) ||
+	if (chrome9_fragment_fe_config(1, 1, BIT(0),
+			packed3_width, config) ||
 	    config[1] != 0x01002521 || config[2] != 0x08010201 ||
-	    chrome9_fragment_fe_config(1, 1, 1, packed4_width, config) ||
+	    chrome9_fragment_fe_config(1, 1, BIT(0),
+			packed4_width, config) ||
 	    config[1] != 0x01002521 || config[2] != 0x08010301)
 		return -EINVAL;
+	/* Sampler zero may consume another coordinate, not T0. */
+	if (chrome9_fragment_fe_config(2, 1, BIT(1),
+			packed4_width, config) || config[1] != 0x01002523)
+		return -EINVAL;
 	/* One MAD can read three T slots while using one active resource. */
-	if (chrome9_fragment_fe_config(1, 0, cases[4].count,
+	if (chrome9_fragment_fe_config(1, cases[4].count, 0,
 			cases[4].width, config) ||
 	    config[0] != 0x00000011 || config[2] != cases[4].a08)
 		return -EINVAL;
-	if (chrome9_fragment_fe_config(4, 4, cases[5].count,
+	if (chrome9_fragment_fe_config(4, cases[5].count, BIT(0),
 			cases[5].width, config) != -EOPNOTSUPP)
 		return -EINVAL;
 	return 0;
@@ -2004,7 +2014,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	if (!base || !program || !request->fragment_vertices || !rt_format)
 		return -EINVAL;
 	ret = chrome9_fragment_fe_config(program->active_texture_count,
-		request->fragment_texture_count, program->varying_count,
+		program->varying_count,
+		program->tau_coordinate_mask,
 		program->varying_width, config);
 	if (ret)
 		return ret;
