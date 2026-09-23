@@ -2814,6 +2814,140 @@ chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
    return false;
 }
 
+/* A defined FRC result lies in [0, 1], as does a selection between two
+ * values already in that interval.  Bound the DAG walk independently of the
+ * shader's size; an excessive graph must fail closed. */
+static bool
+chrome9_ps_unit_interval(nir_scalar scalar, unsigned *budget)
+{
+   nir_alu_instr *alu;
+
+   if (!*budget)
+      return false;
+   (*budget)--;
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   if (scalar.def->bit_size != 32 ||
+       nir_def_instr(scalar.def)->type != nir_instr_type_alu)
+      return false;
+   alu = nir_instr_as_alu(nir_def_instr(scalar.def));
+   if (alu->op == nir_op_ffract)
+      return !alu->fp_math_ctrl;
+   if (alu->op != nir_op_bcsel || alu->fp_math_ctrl ||
+       scalar.comp >= alu->def.num_components)
+      return false;
+   for (unsigned arm = 1; arm <= 2; arm++) {
+      nir_alu_src *input = &alu->src[arm];
+
+      if (!input->src.ssa || input->src.ssa->bit_size != 32 ||
+          input->swizzle[scalar.comp] >= input->src.ssa->num_components ||
+          !chrome9_ps_unit_interval(
+             (nir_scalar) { input->src.ssa, input->swizzle[scalar.comp] },
+             budget))
+         return false;
+   }
+   return true;
+}
+
+/* CMP selects its C operand when A >= 0.  A subtraction can implement an
+ * ordered floating comparison only when its sign is preserved.  For a
+ * proven [0, 1] value and a normal threshold in [0.25, 0.75], the difference
+ * cannot overflow or underflow to a false zero.  Other comparisons need a
+ * native SGE/SLT path with qualified exceptional-value behavior. */
+static bool
+chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
+                                       nir_alu_instr *select, nir_def *def,
+                                       struct chrome9_ps_source *source)
+{
+   nir_alu_instr *compare;
+   nir_scalar predicate, bounded, threshold;
+   struct chrome9_ps_source lhs, rhs, true_value, false_value;
+   struct chrome9_ps_instruction *subtract, *conditional;
+   uint8_t condition_temp, result_temp;
+   unsigned value;
+   unsigned range_budget = CHROME9_PS_MAX_INSTRUCTIONS;
+   float boundary;
+
+   if (select->op != nir_op_bcsel || def->num_components != 1 ||
+       !select->src[0].src.ssa ||
+       select->src[0].src.ssa->bit_size != 1 ||
+       select->src[0].swizzle[0] >=
+          select->src[0].src.ssa->num_components)
+      return false;
+   predicate = nir_scalar_resolved(select->src[0].src.ssa,
+                                   select->src[0].swizzle[0]);
+   if (predicate.comp || nir_def_instr(predicate.def)->type !=
+                            nir_instr_type_alu)
+      return false;
+   compare = nir_instr_as_alu(nir_def_instr(predicate.def));
+   if (compare->op != nir_op_fge ||
+       (compare->fp_math_ctrl & ~nir_fp_preserve_inf) ||
+       !compare->src[0].src.ssa || !compare->src[1].src.ssa ||
+       compare->src[0].src.ssa->bit_size != 32 ||
+       compare->src[1].src.ssa->bit_size != 32 ||
+       compare->src[0].swizzle[0] >=
+          compare->src[0].src.ssa->num_components ||
+       compare->src[1].swizzle[0] >=
+          compare->src[1].src.ssa->num_components)
+      return false;
+   bounded = (nir_scalar) { compare->src[0].src.ssa,
+                            compare->src[0].swizzle[0] };
+   threshold = nir_scalar_resolved(compare->src[1].src.ssa,
+                                   compare->src[1].swizzle[0]);
+   if (!nir_scalar_is_const(threshold) ||
+       !chrome9_ps_unit_interval(bounded, &range_budget))
+      return false;
+   boundary = nir_scalar_as_float(threshold);
+   if (!(boundary >= 0.25f && boundary <= 0.75f))
+      return false;
+   if (!chrome9_ps_lower_alu_source(builder, &compare->src[0], 1, &lhs) ||
+       !chrome9_ps_lower_alu_source(builder, &compare->src[1], 1, &rhs) ||
+       builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+      return false;
+   condition_temp = builder->next_temp++;
+   subtract = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_SUB);
+   if (!subtract)
+      return false;
+   subtract->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   subtract->destination.id = condition_temp;
+   subtract->destination.writemask = 1;
+   subtract->source[0] = lhs;
+   subtract->source[1] = rhs;
+
+   if (!chrome9_ps_lower_alu_source(builder, &select->src[1], 1,
+                                    &true_value) ||
+       !chrome9_ps_lower_alu_source(builder, &select->src[2], 1,
+                                    &false_value) ||
+       builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
+       builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
+      return false;
+   result_temp = builder->next_temp++;
+   conditional = chrome9_ps_append_instruction(builder,
+                                                CHROME9_PS_OPCODE_CMP);
+   if (!conditional)
+      return false;
+   conditional->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   conditional->destination.id = result_temp;
+   conditional->destination.writemask = 1;
+   conditional->source[0].file = CHROME9_PS_SOURCE_TEMP;
+   conditional->source[0].id = condition_temp;
+   conditional->source[0].swizzle[0] = CHROME9_PS_SWIZZLE_X;
+   for (unsigned c = 1; c < 4; c++)
+      conditional->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+   conditional->source[1] = true_value;
+   conditional->source[2] = false_value;
+
+   value = builder->value_count++;
+   builder->value[value].def = def;
+   builder->value[value].source.file = CHROME9_PS_SOURCE_TEMP;
+   builder->value[value].source.id = result_temp;
+   builder->value[value].source.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+   for (unsigned c = 1; c < 4; c++)
+      builder->value[value].source.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+   builder->value[value].complete = true;
+   *source = builder->value[value].source;
+   return true;
+}
+
 static bool
 chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                      struct chrome9_ps_source *source)
@@ -2978,6 +3112,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       return false;
    alu = nir_instr_as_alu(instr);
    components = alu->def.num_components;
+   if (alu->op == nir_op_bcsel)
+      return chrome9_ps_lower_unit_interval_select(builder, alu, def, source);
    for (unsigned s = 0; s < ARRAY_SIZE(source_components); s++)
       source_components[s] = components;
    if (alu->op == nir_op_fpow) {
