@@ -341,11 +341,59 @@ check_position_xy(void)
    return true;
 }
 
+static bool
+check_constant_ports(void)
+{
+   struct drm_chrome9_fragment_instruction
+      native[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   struct chrome9_ps_ir ir = { .count = 1 };
+   unsigned count = 0;
+
+   ir.instruction[0].op = CHROME9_PS_OPCODE_CMP;
+   ir.instruction[0].destination = color();
+   for (unsigned s = 0; s < 3; s++)
+      ir.instruction[0].source[s] = source(
+         CHROME9_PS_SOURCE_CONSTANT, s, CHROME9_PS_SWIZZLE_X,
+         CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_Z,
+         CHROME9_PS_SWIZZLE_W);
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   CHECK(chrome9_fragment_legalize_constant_ports(&ir));
+   CHECK(ir.count == 2);
+   CHECK(ir.instruction[0].op == CHROME9_PS_OPCODE_MOV);
+   CHECK(ir.instruction[0].destination.file == CHROME9_PS_DESTINATION_TEMP);
+   CHECK(ir.instruction[0].destination.id == 0);
+   CHECK(ir.instruction[0].source[0].file == CHROME9_PS_SOURCE_CONSTANT);
+   CHECK(ir.instruction[0].source[0].id == 1);
+   CHECK(ir.instruction[1].op == CHROME9_PS_OPCODE_CMP);
+   CHECK(ir.instruction[1].source[1].file == CHROME9_PS_SOURCE_TEMP);
+   CHECK(ir.instruction[1].source[1].id == 0);
+   CHECK(chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   CHECK(count == 2 && native[1].op == DRM_CHROME9_FRAGMENT_OP_CMP);
+   CHECK(chrome9_fragment_legalize_constant_ports(&ir) && ir.count == 2);
+
+   ir.instruction[1].source[1] = ir.instruction[0].source[0];
+   ir.instruction[1].source[2].id = 0;
+   CHECK(chrome9_fragment_build_instructions(&ir, 0, native, &count));
+
+   ir.instruction[1].source[2].id = 2;
+   ir.instruction[1].destination.writemask = 0x3;
+   ir.instruction[1].op = CHROME9_PS_OPCODE_MAD;
+   ir.count = 1;
+   ir.instruction[0] = ir.instruction[1];
+   CHECK(chrome9_fragment_legalize_constant_ports(&ir));
+   CHECK(ir.count == 2 && ir.instruction[0].destination.writemask == 0x3);
+   CHECK(ir.instruction[1].source[1].swizzle[0] == CHROME9_PS_SWIZZLE_X);
+   CHECK(ir.instruction[1].source[1].swizzle[1] == CHROME9_PS_SWIZZLE_Y);
+   CHECK(ir.instruction[1].source[1].swizzle[2] == CHROME9_PS_SWIZZLE_ZERO);
+   CHECK(ir.instruction[1].source[1].swizzle[3] == CHROME9_PS_SWIZZLE_ZERO);
+   return true;
+}
+
 int
 main(void)
 {
    return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
             check_computed_texture_order() && check_kill_conversion() &&
             check_depth_view_swizzles() && check_depth_kill_swizzles() &&
-            check_position_xy());
+            check_position_xy() && check_constant_ports());
 }

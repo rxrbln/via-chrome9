@@ -556,6 +556,17 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
 
       if (!destination_valid(&instruction->destination) || !source_count)
          return false;
+      /* The C constant port aliases A when all three ALU inputs name
+       * different constant registers.  The NIR path materializes C first;
+       * standalone offline callers must not encode a silent wrong result. */
+      if (source_count == 3 &&
+          instruction->source[0].file == CHROME9_PS_SOURCE_CONSTANT &&
+          instruction->source[1].file == CHROME9_PS_SOURCE_CONSTANT &&
+          instruction->source[2].file == CHROME9_PS_SOURCE_CONSTANT &&
+          instruction->source[0].id != instruction->source[1].id &&
+          instruction->source[0].id != instruction->source[2].id &&
+          instruction->source[1].id != instruction->source[2].id)
+         return false;
       for (unsigned s = 0; s < source_count; s++) {
          const struct chrome9_ps_source *source = &instruction->source[s];
          bool reads_register = false;

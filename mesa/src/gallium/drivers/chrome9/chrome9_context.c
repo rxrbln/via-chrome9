@@ -3404,6 +3404,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    terminal->destination.writemask = 0xf;
    for (unsigned s = 0; s < source_count; s++)
       terminal->source[s] = operands[s];
+   if (!chrome9_fragment_legalize_constant_ports(&builder.ir))
+      return false;
    *ir = builder.ir;
    memset(program, 0, sizeof(*program));
    memcpy(program->immediate, builder.immediate,

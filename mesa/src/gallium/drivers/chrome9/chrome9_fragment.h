@@ -9,6 +9,10 @@
 unsigned chrome9_fragment_sampler_high_water(uint8_t sampler_mask);
 bool chrome9_fragment_sampler_slots_dense(uint8_t sampler_mask);
 
+/* VX900 can read at most two distinct constant registers in one ALU record.
+ * Materialize a third source before translating semantic IR to the UAPI. */
+bool chrome9_fragment_legalize_constant_ports(struct chrome9_ps_ir *ir);
+
 bool chrome9_fragment_build_instructions(
    const struct chrome9_ps_ir *ir, uint8_t sampler_mask,
    struct drm_chrome9_fragment_instruction

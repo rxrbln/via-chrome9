@@ -642,6 +642,18 @@ check_ps_ir(void)
    struct chrome9_ps_program program;
 
    ir.count = 1;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MAD;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[0].destination.writemask = 0xf;
+   for (unsigned s = 0; s < 3; s++)
+      ir.instruction[0].source[s] =
+         identity_source(CHROME9_PS_SOURCE_CONSTANT, s, false);
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+   ir.instruction[0].source[2].id = 0;
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   memset(&ir, 0, sizeof(ir));
+
+   ir.count = 1;
    ir.instruction[0].op = CHROME9_PS_OPCODE_ADD;
    ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_COLOR;
    ir.instruction[0].destination.writemask = 0xf;

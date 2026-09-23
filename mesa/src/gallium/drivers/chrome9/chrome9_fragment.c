@@ -5,6 +5,8 @@
 
 #include <string.h>
 
+#include "util/macros.h"
+
 
 unsigned
 chrome9_fragment_sampler_high_water(uint8_t sampler_mask)
@@ -17,6 +19,79 @@ chrome9_fragment_sampler_slots_dense(uint8_t sampler_mask)
 {
    return sampler_mask == (1u << chrome9_fragment_sampler_high_water(
       sampler_mask)) - 1;
+}
+
+static unsigned chrome9_fragment_source_count(enum chrome9_ps_opcode op);
+
+static bool
+chrome9_fragment_three_distinct_constants(
+   const struct chrome9_ps_instruction *instruction)
+{
+   const struct chrome9_ps_source *a = &instruction->source[0];
+   const struct chrome9_ps_source *c = &instruction->source[1];
+   const struct chrome9_ps_source *b = &instruction->source[2];
+
+   return (instruction->op == CHROME9_PS_OPCODE_MAD ||
+           instruction->op == CHROME9_PS_OPCODE_CMP) &&
+          a->file == CHROME9_PS_SOURCE_CONSTANT &&
+          c->file == CHROME9_PS_SOURCE_CONSTANT &&
+          b->file == CHROME9_PS_SOURCE_CONSTANT &&
+          a->id != c->id && a->id != b->id && c->id != b->id;
+}
+
+bool
+chrome9_fragment_legalize_constant_ports(struct chrome9_ps_ir *ir)
+{
+   unsigned next_temp = 0;
+   unsigned alu_count = 0;
+
+   if (!ir || ir->count > CHROME9_PS_MAX_INSTRUCTIONS)
+      return false;
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction = &ir->instruction[i];
+      unsigned source_count = chrome9_fragment_source_count(instruction->op);
+
+      alu_count += instruction->op != CHROME9_PS_OPCODE_TEX;
+      if (instruction->op != CHROME9_PS_OPCODE_KILL &&
+          instruction->destination.file == CHROME9_PS_DESTINATION_TEMP)
+         next_temp = MAX2(next_temp, (unsigned)instruction->destination.id + 1);
+      for (unsigned s = 0; s < source_count; s++)
+         if (instruction->source[s].file == CHROME9_PS_SOURCE_TEMP)
+            next_temp = MAX2(next_temp, (unsigned)instruction->source[s].id + 1);
+   }
+   for (unsigned i = 0; i < ir->count; i++) {
+      struct chrome9_ps_instruction *move, *consumer;
+      unsigned temp, mask;
+
+      if (!chrome9_fragment_three_distinct_constants(&ir->instruction[i]))
+         continue;
+      if (ir->count >= CHROME9_PS_MAX_INSTRUCTIONS ||
+          alu_count >= CHROME9_PS_MAX_ALU ||
+          next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+         return false;
+      memmove(&ir->instruction[i + 1], &ir->instruction[i],
+              (ir->count - i) * sizeof(ir->instruction[0]));
+      move = &ir->instruction[i];
+      consumer = &ir->instruction[i + 1];
+      temp = next_temp++;
+      mask = consumer->destination.writemask;
+      memset(move, 0, sizeof(*move));
+      move->op = CHROME9_PS_OPCODE_MOV;
+      move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      move->destination.id = temp;
+      move->destination.writemask = mask;
+      move->source[0] = consumer->source[1];
+      memset(&consumer->source[1], 0, sizeof(consumer->source[1]));
+      consumer->source[1].file = CHROME9_PS_SOURCE_TEMP;
+      consumer->source[1].id = temp;
+      for (unsigned c = 0; c < 4; c++)
+         consumer->source[1].swizzle[c] = (mask & (1u << c)) ?
+            c : CHROME9_PS_SWIZZLE_ZERO;
+      ir->count++;
+      alu_count++;
+      i++;
+   }
+   return true;
 }
 
 static bool
@@ -207,6 +282,7 @@ chrome9_fragment_build_instructions(
       unsigned source_count = chrome9_fragment_source_count(source->op);
 
       if (!source_count ||
+          chrome9_fragment_three_distinct_constants(source) ||
           !chrome9_fragment_opcode(source->op, &instruction->op))
          return false;
       if (source->op == CHROME9_PS_OPCODE_KILL) {
