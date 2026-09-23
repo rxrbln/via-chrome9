@@ -293,6 +293,28 @@ as follows:
 | `bcsel(fle(x,y), t, f)` | `y-x` | `t` | `f` |
 | `bcsel(fgt(x,y), t, f)` | `y-x` | `f` | `t` |
 
+The production compiler also closes the two dynamic single-record linkage
+forms needed after the constant-only numerical gate.  Direct T0 as the
+condition in `CMP oC0,T0,c0,c1` finalizes to
+
+```text
+00810530 30080053 00f2c005 00090820
+A90=90058001 A91=91000000 A92=92000001
+```
+
+with active-resource tuple `(1,0,1,0)`.  Native vPos.x as the condition
+finalizes to
+
+```text
+00810530 00080053 00f2c300 00090820
+```
+
+with configuration-two A90=`90058008`; VX900 draw-time linkage makes this
+A90=`900d8008` and requires A8A=`8a020000`.  These rows prove that CMP uses
+the ordinary direct-T and MISC resource paths.  They do not replace the
+constant-only comparison-boundary test, which is deliberately free of either
+front-end dependency.
+
 Require range analysis to prove x, y, their subtraction, and both selected
 arms finite.  GLSL ordered comparisons are false for NaN; native CMP's
 unordered rule is unknown, so merely proving the inputs non-NaN is essential.
