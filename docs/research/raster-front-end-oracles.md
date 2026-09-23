@@ -417,6 +417,82 @@ from binary proof to a live direct-fragment-input requirement.  It does not
 by itself promote arbitrary varying counts or widths: A09/A0a state and the
 three-through-eight input closures remain separate gates.
 
+### Three-coordinate silent-black boundary
+
+A guarded three-coordinate test on 2026-09-23 closes the next failure more
+narrowly, but does not yet identify a state-field correction.  The semantic
+fragment program was deliberately source-corrected so that every declared
+input is consumed:
+
+```text
+MOV TEMP0, v0          # v0 = (0,0,0,0)
+ADD TEMP1, TEMP0, v1   # v1 = (0,0,0,0)
+ADD COLOR, TEMP1, v2   # v2 = (1,0,0,1)
+```
+
+All three inputs were float4.  The submitted image had coordinate high-water
+three in A00, float4 T0/T1 dimensions in A08, and float4 T2 in A09.  The ioctl
+and engine completed normally and both destination guards remained intact,
+but the entire destination stayed black (`changed=0`).  This is a silent
+no-color-write result, not the earlier direct-T0 timeout.
+
+The Linux 5.75 production compiler, run offline on the equivalent PS 2.0
+tokens with post-processing configuration 2, emits exactly:
+
+```text
+01c00530 301c0053 00f2c005 000d0020
+02c10530 30140924 00f20005 00000060
+02c20530 30140924 00f20105 00000820
+
+90058007 91000000 92000003 93000000
+94000000 95000000 96000000 97000000
+98000000 99000000 9a000000 9b000000
+```
+
+The active-resource counts are `3 2 3 0`; compiled metadata `+0x34=3`,
+`+0x40=7`, `+0x44=3`, `+0x6c=7`, and `+0x98=7` agrees that all three compact
+coordinate inputs are active.  The current semantic compiler produces the
+same three ALU records and A90--A9b controls byte for byte, including the
+last-use bits for v0 in the first record, TEMP0/v1 in the second, and
+TEMP1/v2 in the third.  This rules out an obvious source-register,
+swizzle, lifetime-finalization, ALU-count, or program-control mismatch.
+
+The submitted producer/raster closure was:
+
+```text
+# FE coordinate state
+A00=00000031 A01=01002521 A08=08030303 A09=09000003 A0a=0a000000
+
+# D3/D4/D5 float4 -> T0/T1/T2
+A04=040063c2 A05=0500a4c2 A06=0600e5c2
+A12=1200003f A25=25f6fff0 A26=26000000
+A28=28fffff0 A29=29000000 A62=625081ff
+
+# VS copies D3/D4/D5 to oT0/oT1/oT2; control declares six records
+0008c14c 00000000 00000000 0008028f
+0009014c 00000000 00000000 0008029f
+0009414c 00000000 00000000 000802af
+60800006
+```
+
+Those width/mask extensions follow the manual's type-04 definitions and the
+same vendor FVF construction already recovered for five and eight coordinate
+outputs.  Together with the byte-exact fragment object, no concrete mismatch
+is presently visible in A00/A08/A09, the A25/A28 masks, the VS output copies,
+the fragment source IDs, or A90/A92.
+
+The narrow remaining unqualified boundary is therefore a counted H3 upload
+containing more than one ALU record: the live generic H3 successes so far
+contain one ALU record, while this is the first three-record generic H3
+program.  If only its first record became effective, it would write TEMP0 but
+never COLOR, which is consistent with the observed black target.  This is a
+discriminator, not a recovered root cause: the current packet uses the
+vendor-proven `FE03043c`, count=`alu_count * 4`, `20030000`, `cc000000`
+transaction, so static evidence does not justify changing that framing.
+Future isolation should compare an otherwise identical multi-record
+constant-only program against a one-record direct-v2 program; neither has
+been submitted here, and no further GPU matrix was run.
+
 ## Polygon offset / depth bias
 
 The manual gives the exact equation:
