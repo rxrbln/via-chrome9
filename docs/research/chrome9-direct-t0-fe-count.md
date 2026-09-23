@@ -106,6 +106,75 @@ The H5 callback table independently identifies texture-slot allocation with
 `stmPPS_GetReMapTexSlot_invi`.  `CHROME9_TRACE_REGS=1` in the checked-in probe
 traces these callbacks as well as arithmetic-temporary callbacks.
 
+## Exact PS 2.0 third-output algorithm
+
+The third output is now statically closed for PS 2.0.  The independently
+compiled Windows routine at `VTGUModeDX32A:0x10201e60..0x102024d6` makes the
+four 16-entry maps particularly clear:
+
+```text
+A[16] at ebp-f8   arithmetic temporary use counts
+B[16] at ebp-64   externally required texture-register component masks
+C[16] at ebp-b8   internally defined texture-register component masks
+D[16] at ebp-138  sampled-stage presence
+```
+
+The Linux routine uses the equivalent maps at `ebp-48`, `ebp-88`, `ebp-c8`,
+and `ebp-108`.  For each scheduled ALU record it handles at most one
+texture-class source, in native operand priority A, then C, then B.  Windows
+tests source A at `0x1020200d`, source C at `0x1020229b`, and source B at
+`0x10202348`; each successful branch joins the common path before either
+lower-priority source can be considered.  Linux has the same three-way
+control flow at `0x19a550 -> 0x19a870`, `0x19a562 -> 0x19aa58`, and
+`0x19a572 -> 0x19aae8`.
+
+For the selected source, the routine derives a four-bit component-use mask
+from its native swizzle.  Literal-zero and literal-one selectors do not set a
+component bit.  For every selected component not already present in `C[id]`,
+it sets the corresponding bit in `B[id]`.  A texture/address-class ALU
+destination performs the converse operation at
+`VTGUModeDX32A:0x1020216b..0x10202221`: every written component not already
+required in `B[id]` is added to `C[id]`.  Thus a read before a later write
+remains externally required, while a write before a read makes the later read
+internal.
+
+A TAU record marks all four components of its coordinate/address register in
+`B` unless that component is already in `C`
+(`VTGUModeDX32A:0x10201f15..0x10201f77`).  Non-TEXKILL TAUs also mark the
+sampled stage in `D`; operation 4 does not.  The instruction walk follows the
+actual ALU/TAU phase and transition maps, so these masks describe scheduled
+execution order rather than source-token order.
+
+For PS 2.0, the third output is exactly:
+
+```text
+limit = compiled_object[0x2c] ? compiled_object[0x2c] : 16
+third = 1 + highest i below limit for which B[i] != 0, else 0
+```
+
+Windows implements the limit and descending scan at
+`0x1020248d..0x102024b9`, then stores the result through the third output
+pointer at `0x102024bc..0x102024bf`.  Linux performs the relocated equivalent
+at `0x19a758..0x19aa2c`.  `compiled_object+0x2c` is the declaration-derived
+bound (public instance `+0x3c`); the zero-declaration path deliberately scans
+all 16 entries.
+
+This also explains the otherwise surprising differential.  A single native
+MAD with three texture-class operands enters the source-A branch and creates
+only `B[0]=0xf`, so its third output is one.  The three-record chain selects a
+different texture-class source in each record and creates
+`B[0..2]={0xf,0xf,0xf}`, so its third output is three.  Debugger inspection of
+the Linux binary produced those exact maps and return tuples `(1,0,1,0)` and
+`(3,2,3,0)`.
+
+There is no source-backed conservative substitution.  The failed guarded MAD
+used three where the compiler requires one, so rounding up to varying count,
+texture count, population, or high-water is not known safe.  The backend must
+run this scheduled-record analysis exactly, or reject a shape it cannot
+analyze.  In particular, count only the first texture-class ALU source in
+native A/C/B priority; counting every texture operand changes the vendor
+contract.
+
 The finalized direct-T0 object remains:
 
 ```text
@@ -135,7 +204,9 @@ requires a single corrected cold-boot test.
 
 The implementation-ready correction is to carry an independently computed
 active texture-temporary count in `chrome9_fragment_program` and make FE
-construction consume that field.  A focused selftest should at minimum cover
+construction consume that field.  Compute it from the scheduled native
+records using the `B/C` component-mask algorithm above, before constructing
+FE state.  A focused selftest should at minimum cover
 the contradictory pairs:
 
 ```text

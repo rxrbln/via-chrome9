@@ -52,6 +52,33 @@ case sets TEXKILL-present metadata.  Linux reports temporary mask 1; this
 Windows wrapper reports zero, another reason not to transplant raw metadata
 between compiler families.
 
+## TEXKILL metadata is not a context sideband
+
+Public instance `+0x7c` is a compiler/rebuild flag, not a separately emitted
+hardware-context enable.  `stmPPS_TEXKILL_PS20_invi:0x167903` sets it to one;
+initialization clears it at `stmInitializePixelShaderInstance_inv:0x1b81d7`.
+`INVPS_HwRebuildInstBuffDesc:0x198f21..0x198f3d` reconstructs the same flag
+from TAU operation 4 (its object-relative `+0x6c` is public-instance
+`+0x7c`).
+
+Neither production draw updater consumes that flag.  Linux
+`stmUpdatePS_inv:0x17f710..0x180c00` reads public `+0x78` at `0x17f77d` to
+update the fragment-depth context bit, but contains no public `+0x7c` read.
+The Windows D3D programmable update at
+`VTGUModeDX32A:0x1015b000..0x1015c600` likewise reads `+0x78` at
+`0x1015b057` and never reads `+0x7c`.  It uploads the TEXKILL ALU/TAU records
+and A90--A9A transition image through the ordinary program path.
+
+The resource counter provides an independent consistency check.  Pre-final
+`texkill r0; mov oC0,c0` reports `(1,1,0,0)`: the kill-transfer ALU defines
+all four components of internal texture/address register zero, and the kill
+TAU consumes that internally defined register.  Its external texture map is
+empty, so the A00-producing third output remains zero.  TEXKILL must
+therefore neither set a separate context bit nor increment A00 merely because
+it uses the texture/address path.  Its required per-program state is the
+ordered transfer ALU, operation-4 TAU, finalized transition controls, and the
+normal replacement/clear of that complete program on the next draw.
+
 The fresh isolated/output JSON SHA-256 is
 `05bf89b34993acde688ca3da640c24f29477d131ede494c946e15f498a50f035`.
 The two initialized cases have SHA-256
