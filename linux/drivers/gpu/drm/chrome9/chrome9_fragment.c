@@ -210,6 +210,19 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 
 		if (!source_count || instruction->reserved)
 			return -EINVAL;
+		/* VX900 aliases the C read to A when one MAD/CMP names three
+		 * distinct constant registers.  Two distinct registers, including
+		 * a repeated operand, and a TEMP-backed third source are live-proven.
+		 * Reject the silent wrong-pixel form before allocation or submission.
+		 */
+		if (source_count == 3 &&
+		    instruction->src[0].file == DRM_CHROME9_FRAGMENT_FILE_CONSTANT &&
+		    instruction->src[1].file == DRM_CHROME9_FRAGMENT_FILE_CONSTANT &&
+		    instruction->src[2].file == DRM_CHROME9_FRAGMENT_FILE_CONSTANT &&
+		    instruction->src[0].index != instruction->src[1].index &&
+		    instruction->src[0].index != instruction->src[2].index &&
+		    instruction->src[1].index != instruction->src[2].index)
+			return -EINVAL;
 		if (instruction->op == DRM_CHROME9_FRAGMENT_OP_KILL) {
 			const struct drm_chrome9_fragment_source *predicate =
 				&instruction->src[0];
@@ -1641,6 +1654,68 @@ failed:
 	return -EINVAL;
 }
 
+static int chrome9_fragment_constant_port_selftest(
+	struct chrome9_fragment_program *program)
+{
+	static const struct drm_chrome9_fragment_instruction invalid[] = {{
+		.op = DRM_CHROME9_FRAGMENT_OP_CMP,
+		.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+		.src = {
+			{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+			  { 0, 1, 2, 3 }, 0, 0 },
+			{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 1,
+			  { 0, 1, 2, 3 }, 0, 0 },
+			{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 2,
+			  { 0, 1, 2, 3 }, 0, 0 },
+		},
+	}};
+	static const struct drm_chrome9_fragment_instruction legalized[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 1,
+				  { 0, 1, 2, 3 }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_CMP,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 2,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const u32 expected_alu[][4] = {
+		{ 0x01c00530, 0x301c0053, 0x00f08105, 0x000d0020 },
+		{ 0x00820530, 0x30200053, 0x00f08005, 0x00090820 },
+	};
+	static const u32 constants[12];
+	struct drm_chrome9_fragment_instruction repeated = invalid[0];
+	int ret;
+
+	ret = chrome9_fragment_compile(invalid, ARRAY_SIZE(invalid), constants,
+		3, 0, 0, program);
+	if (ret != -EINVAL)
+		return -EINVAL;
+	repeated.op = DRM_CHROME9_FRAGMENT_OP_MAD;
+	repeated.src[2].index = 0;
+	ret = chrome9_fragment_compile(&repeated, 1, constants, 2, 0, 0,
+		program);
+	if (ret)
+		return ret;
+	ret = chrome9_fragment_compile(legalized, ARRAY_SIZE(legalized),
+		constants, 3, 0, 0, program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
+	    program->controls[0] != 0x90058000 ||
+	    program->controls[2] != 0x92000002 ||
+	    memcmp(program->alu, expected_alu, sizeof(expected_alu)))
+		return -EINVAL;
+	return 0;
+}
+
 int chrome9_fragment_selftest(void)
 {
 	static const struct drm_chrome9_fragment_instruction computed[] = {
@@ -2144,6 +2219,8 @@ int chrome9_fragment_selftest(void)
 		ret = -EINVAL;
 	if (!ret)
 		ret = chrome9_fragment_kill_selftest(program, constants);
+	if (!ret)
+		ret = chrome9_fragment_constant_port_selftest(program);
 out:
 	kfree(program);
 	return ret;
