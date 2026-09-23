@@ -3,9 +3,10 @@
 Status: production Linux compiler objects and the VX900 draw-time MISC enable
 are byte-exact.  Native `vPos.xy`, FRC, the integer pixel-center convention,
 and computed texture coordinates from `vPos` have passed guarded VX900
-silicon oracles.  CMP and the remaining FRC numerical boundaries still need
-the guarded tests below.  This note does not promote an API capability by
-itself.
+silicon oracles.  Finite CMP signed-zero lanes, a vPos threshold, and the
+five-step conditional program now pass guarded tests; exceptional CMP and
+the remaining FRC numerical boundaries remain open.  See
+[`chrome9-generic-float-compare-boundary.md`](chrome9-generic-float-compare-boundary.md).
 
 ## What the vendor objects establish
 

@@ -254,6 +254,29 @@ oracle passed negative, positive, +0, and -0 condition lanes; a dynamic vPos
 threshold oracle passed as well.  These finite-domain checks do not qualify
 NaN or arbitrary comparison lowering.
 
+## Mesa finite-range lowering and glmark validation
+
+Mesa now proves the compared value lies in `[0,1]` by a bounded walk over
+defined `ffract` results and selections whose two arms have that same proof.
+It accepts scalar `bcsel(fge(value, threshold), true, false)` only when the
+threshold is a finite FP32 constant in `[0.25,0.75]`, the comparison has no
+local control except optional `preserve:inf`, and the FRC leaves have no local
+FP preservation controls.  On the defined finite domain, subtracting such a
+threshold preserves the comparison sign and cannot overflow or flush a
+nonzero result to zero.  Mesa emits `SUB(value,threshold)` then the native
+three-source CMP.  Other comparison shapes still fail compilation.
+
+The installed `conditionals:fragment-steps=5` scene compiled to 40 semantic
+fragment instructions (the five six-record condition/select steps plus the
+OpenGL position prefix and output assembly).  One bounded 320x240 frame
+submitted without an ioctl error.  At glmark2's 800x600 validation size,
+`glmark2 --validate --off-screen --frame-end=readpixels -b
+conditionals:fragment-steps=5` reported `Validation: Success`.  glmark2
+reported `Validation: Unknown` for the unlisted one-step/default option
+strings; those are not correctness evidence.  The five-step result and the
+31-ALU guarded raw oracle together qualify this finite FRC/select graph,
+not general GLSL comparisons or exceptional values.
+
 ## Guarded qualification sequence
 
 An exact semantic SGE successor should expand one validated instruction to
