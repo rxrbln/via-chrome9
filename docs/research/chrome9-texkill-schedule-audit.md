@@ -4,9 +4,9 @@ Fresh production differentials close the compiler schedule for isolated,
 output-followed, and initialized TEXKILL programs.  TEXKILL is not a lone TAU
 word: the compiler first moves its logical temporary into texture/address
 destination 0, then issues TAU operation 4.  Linux configuration 2 adds the
-ALU-to-TAU dependency bits and changes the control base.  Discard remains
-rejected until a guarded live test proves sign comparison and color/depth
-suppression.
+ALU-to-TAU dependency bits and changes the control base.  A guarded live test
+now proves finite sign comparison and color/D16 suppression; broader discard
+semantics still require separate execution evidence.
 
 ## Exact records and finalization
 
@@ -245,8 +245,19 @@ red; color-only suppression with an incorrect depth write leaves the original
 sentinel because the green draw then fails depth.  Repeat for X/Y/Z/W and
 guard surrounding pixels.
 
-Compiler evidence alone does not establish the comparison boundary, affected
-lanes, or ordering relative to depth/stencil.  Keep all NIR discard/demote
-forms and TEXKILL native keys rejected until the complete live matrix passes.
-The fixed A33 alpha-test path remains preferable for alpha-test emulation
-because it is already silicon-proven and avoids this new shader side effect.
+On 2026-09-23, VX900 `1106:7122` with kernel `7.2.5-t2` and module SHA-256
+`d3a75c8d68d558fbb341b6c8ddb403a65184033a11e98243f3782c8f4e3035cb`
+passed `tools/re/chrome9_texkill_guard_smoke.c` on the render node.  Its eight
+finite cases were all-positive, one negative X/Y/Z/W lane each, and replicated
+below/equal/above-zero predicates.  A killed near red draw followed by an
+accepted farther green draw checked both color and D16 depth; each result
+matched, buffer guards and immutable inputs survived, and no engine timeout
+was logged.  This establishes all-four-lane negative rejection, zero survival,
+and color/D16 suppression for the tested finite constants.  It does not yet
+establish sampled-alpha execution through Mesa, stencil suppression, NaN or
+infinity behavior, helper/demote semantics, or arbitrary Boolean conditions.
+Mesa therefore enables only the specific sampled-alpha-less-than-half
+lowering behind both a kernel capability and an explicit experimental opt-in;
+sampled execution and format-domain validation remain pending.  The fixed A33
+alpha-test path remains preferable for alpha-test emulation because it is
+already silicon-proven and avoids this new shader side effect.
