@@ -205,6 +205,7 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM		(1ULL << 49)
 /* Generic fragment textures accept A8, L8, L8A8, and RGB565 storage. */
 #define DRM_CHROME9_CAP_FRAGMENT_TEXTURE_LEGACY_FORMATS	(1ULL << 50)
+#define DRM_CHROME9_CAP_FRAGMENT_KILL			(1ULL << 51)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -976,6 +977,8 @@ enum drm_chrome9_fragment_op {
 	DRM_CHROME9_FRAGMENT_OP_CMP = 14,
 	DRM_CHROME9_FRAGMENT_OP_FRC = 15,
 	DRM_CHROME9_FRAGMENT_OP_TEX = 16,
+	/* Destination-free, identity-XYZW TEMP predicate; one per program. */
+	DRM_CHROME9_FRAGMENT_OP_KILL = 17,
 };
 
 enum drm_chrome9_fragment_file {
