@@ -244,9 +244,21 @@ The exact tokens and object hashes are stored in
 `chrome9-packed-varying-linkage-corpus.json`.  The second case removes both TEMP
 destinations, the partial XYZ write, literal ONE, the terminal MOV, and every
 multi-ALU dependency while retaining the same float3 T0 producer, ALU XXXX
-read, TAU YZWW read, sampler zero, and physical-coordinate overlap.  It is
+read, TAU YZWW read, sampler zero, and physical-coordinate overlap.  It
 therefore follows the ALU-only float3 gate after restoring the exact
 A01=`01002522` tuple.  If ALU-only float3 retires but this case times out, the
 failure is isolated to the shared ALU/TAU coordinate path.  If both retire,
 the remaining boundary is the multi-record/TEMP schedule.  These are proposed
 guarded oracles, not silicon results.
+
+The guarded cmd22 implementation is the `--one-alu` mode of
+`tools/re/chrome9_packed_varying_guard_smoke.c`; omitting the option retains
+the original two-ALU regression.  It uses four asymmetric BGRA texels, gray
+0.5 and six float3 vertices, then checks all four interior quadrants, the
+untouched exterior, both destination/source guard pages and the immutable
+source image.  Because the direct-output shader multiplies all four lanes,
+its expected alpha is half of the poisoned source alpha (within the same
+one-UNORM-step tolerance as RGB).  A normal completion with four correct
+quadrants qualifies the shared T0 ALU/TAU path.  An ioctl timeout or lost SSH
+requires the usual engine quarantine and no retry; a normal but incorrect
+image is a numerical/linkage failure, not a retirement success.
