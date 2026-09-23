@@ -426,25 +426,33 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    uint8_t remaining_texture_uses[8];
    uint8_t color_writemask = 0;
    uint16_t direct_texture_mask = 0;
+   uint8_t coordinate_map[8];
+   uint8_t coordinate_uses[8] = { 0 };
+   uint8_t coordinate_count = 0;
 
    if (!ir || !p || !ir->count || ir->count > CHROME9_PS_MAX_ALU ||
-       (ir->texture_count != 0 && ir->texture_count != 2))
+       ir->texture_count > CHROME9_PS_MAX_TAU)
       return false;
-   /* The first texture-bearing tranche deliberately accepts only the exact
-    * independently scheduled two-sample topology confirmed byte-for-byte in
-    * both vendor compilers.  It remains offline-only; the live draw gate is
-    * still the one-ALU/no-TAU subset. */
-   if (ir->texture_count) {
-      static const struct chrome9_ps_texture_instruction texture[2] = {
-         { .sampler = 0, .coordinate = 0, .destination = 0 },
-         { .sampler = 1, .coordinate = 1, .destination = 1 },
-      };
+   memset(coordinate_map, 0xff, sizeof(coordinate_map));
+   /* This schedule is the general TAU-first subset: each fetch reads one
+    * direct interpolator, all fetches complete before the ALU stream, and
+    * every sampled result defines an ordinary SSA temporary.  ALU-generated
+    * coordinates require interleaved bridge MOVs and use a separate path. */
+   for (unsigned i = 0; i < ir->texture_count; i++) {
+      const struct chrome9_ps_texture_instruction *texture = &ir->texture[i];
 
-      if (memcmp(ir->texture, texture, sizeof(texture)))
+      if (texture->sampler >= 8 || texture->coordinate >= 8 ||
+          texture->destination >= 12 || texture->reserved ||
+          (defined_temps & (1u << texture->destination)))
          return false;
-      defined_temps = 0x3;
-      defined_components[0] = 0xf;
-      defined_components[1] = 0xf;
+      if (coordinate_map[texture->coordinate] == 0xff) {
+         if (coordinate_count >= 8)
+            return false;
+         coordinate_map[texture->coordinate] = coordinate_count++;
+      }
+      coordinate_uses[coordinate_map[texture->coordinate]]++;
+      defined_temps |= 1u << texture->destination;
+      defined_components[texture->destination] = 0xf;
    }
    /* Validate the semantic IR and calculate temporary lifetimes before
     * packing any hardware words.  Release bits are an encoder result, not a
@@ -656,17 +664,42 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    }
    p->alu_count = ir->count;
    if (ir->texture_count) {
-      if (ir->count != 6 || defined_temps != 0x3f ||
-          direct_texture_mask != 0xc || p->constant_mask != 1 ||
-          p->varying_mask)
+      unsigned temp_count = __builtin_popcount(defined_temps);
+      unsigned direct_input_count = direct_texture_mask ?
+         32 - __builtin_clz(direct_texture_mask) : 0;
+      uint32_t bucket;
+      uint32_t t2a[2] = { 0 };
+
+      if (defined_temps != ((1u << temp_count) - 1) ||
+          direct_input_count > 8)
          return false;
-      p->tau[0] = 0x301001b0;
-      p->tau[1] = 0x311111b1;
-      p->tau_count = 2;
-      p->sampler_mask = 3;
-      p->texture_input_mask |= 3;
-      set_controls(p, 0x90008000 | direct_texture_mask, 0x91000003,
-                   0x92020006, 0x93000002, 0x95000000);
+      bucket = resource_bucket(direct_input_count, temp_count);
+      for (unsigned i = 0; i < ir->texture_count; i++) {
+         const struct chrome9_ps_texture_instruction *texture =
+            &ir->texture[i];
+         unsigned coordinate = coordinate_map[texture->coordinate];
+         uint32_t tau = 0x20000000 |
+            (uint32_t)texture->sampler << 24 |
+            1u << 20 |
+            (uint32_t)texture->destination << 16 |
+            (uint32_t)coordinate << 12 |
+            0x1b0 | texture->sampler;
+
+         if (!--coordinate_uses[coordinate])
+            tau |= 1u << 28;
+         p->tau[i] = tau;
+         p->texture_input_mask |= 1u << texture->coordinate;
+         p->sampler_mask |= 1u << texture->sampler;
+      }
+      p->tau_count = ir->texture_count;
+      t2a[(ir->texture_count - 1) / 24] |=
+         1u << ((ir->texture_count - 1) % 24);
+      set_controls(p, 0x90000000 | bucket | direct_texture_mask,
+                   0x91000000 | ((1u << coordinate_count) - 1),
+                   0x92000000 | (uint32_t)ir->texture_count << 16 |
+                      ir->count,
+                   0x93000000 | t2a[0], 0x95000000);
+      p->control[4] |= t2a[1];
    } else {
       unsigned temp_count = __builtin_popcount(defined_temps);
       unsigned direct_input_count = direct_texture_mask ?

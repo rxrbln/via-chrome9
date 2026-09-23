@@ -260,6 +260,44 @@ scalar_source(enum chrome9_ps_source_file file, unsigned id,
 }
 
 static void
+check_direct_texture_ps_ir(void)
+{
+   static const uint32_t expected_alu[4] = {
+      0x01c00530, 0x301c0053, 0x00f20005, 0x000d0820,
+   };
+   static const uint32_t expected_control[12] = {
+      0x90018000, 0x91000001, 0x92010001, 0x93000001,
+      0x94000000, 0x95000000, 0x96000000, 0x97000000,
+      0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+   };
+   struct chrome9_ps_ir ir = { 0 };
+   struct chrome9_ps_program program;
+
+   ir.texture_count = 1;
+   ir.texture[0] = (struct chrome9_ps_texture_instruction) {
+      .sampler = 0, .coordinate = 0, .destination = 0,
+   };
+   ir.count = 1;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[0].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_COLOR, .writemask = 0xf,
+   };
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
+
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   assert(program.alu_count == 1 && program.tau_count == 1);
+   assert(program.texture_input_mask == 1 && program.sampler_mask == 1);
+   assert(program.tau[0] == 0x301001b0);
+   assert(!memcmp(program.alu[0], expected_alu, sizeof(expected_alu)));
+   assert(!memcmp(program.control, expected_control,
+                  sizeof(expected_control)));
+
+   ir.texture[0].sampler = 8;
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+}
+
+static void
 check_jellyfish_ps_ir(void)
 {
    static const uint32_t expected_alu[6][4] = {
@@ -368,7 +406,7 @@ check_jellyfish_ps_ir(void)
    ir.instruction[3].destination.id = 2;
    assert(!chrome9_compile_ps_ir(&ir, &program));
    ir.instruction[3].destination.id = 4;
-   ir.texture[1].coordinate = 2;
+   ir.texture[1].coordinate = 8;
    assert(!chrome9_compile_ps_ir(&ir, &program));
 }
 
@@ -780,6 +818,7 @@ main(void)
 {
    check_ps_encoder();
    check_fs();
+   check_direct_texture_ps_ir();
    check_ps_ir();
    check_buffer_ps_ir();
    check_jellyfish_ps_ir();

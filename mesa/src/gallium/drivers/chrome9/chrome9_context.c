@@ -2523,6 +2523,7 @@ struct chrome9_ps_nir_builder {
    } value[CHROME9_PS_MAX_ALU];
    uint32_t immediate[32][4];
    uint32_t immediate_mask;
+   uint32_t uniform_mask;
    uint8_t value_count;
    uint8_t next_temp;
 };
@@ -2620,7 +2621,8 @@ chrome9_ps_immediate(struct chrome9_ps_nir_builder *builder,
    }
    if (id == 32) {
       for (unsigned candidate = 32; candidate-- > 16;) {
-         if (!(builder->immediate_mask & (1u << candidate))) {
+         if (!((builder->immediate_mask | builder->uniform_mask) &
+               (1u << candidate))) {
             id = candidate;
             break;
          }
@@ -2663,6 +2665,23 @@ chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
    if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
       unsigned location = ~0u;
+
+      if (load->intrinsic == nir_intrinsic_load_uniform &&
+          nir_src_is_const(load->src[0]) && !nir_intrinsic_base(load) &&
+          def->bit_size == 32 && def->num_components &&
+          def->num_components <= 4) {
+         unsigned id = nir_src_as_uint(load->src[0]);
+
+         if (id >= 32 || !(builder->uniform_mask & (1u << id)))
+            return false;
+         memset(source, 0, sizeof(*source));
+         source->file = CHROME9_PS_SOURCE_CONSTANT;
+         source->id = id;
+         for (unsigned c = 0; c < 4; c++)
+            source->swizzle[c] = c < def->num_components ?
+               c : CHROME9_PS_SWIZZLE_ZERO;
+         return true;
+      }
 
       switch (load->intrinsic) {
       case nir_intrinsic_load_input:
@@ -2725,8 +2744,6 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    if (!def || def->bit_size != 32 || !def->num_components ||
        def->num_components > 4)
       return false;
-   if (chrome9_ps_leaf(builder, def, source))
-      return true;
    for (value = 0; value < builder->value_count; value++) {
       if (builder->value[value].def != def)
          continue;
@@ -2735,7 +2752,48 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       *source = builder->value[value].source;
       return true;
    }
+   if (chrome9_ps_leaf(builder, def, source))
+      return true;
    instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      struct chrome9_ps_source coordinate;
+      int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+
+      if (tex->op != nir_texop_tex || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+          tex->is_array || tex->is_shadow || tex->texture_index >= 8 ||
+          tex->sampler_index != tex->texture_index || coord < 0 ||
+          tex->src[coord].src.ssa->num_components != 2 ||
+          builder->ir.texture_count >= CHROME9_PS_MAX_TAU ||
+          builder->next_temp >= 12 ||
+          builder->value_count >= CHROME9_PS_MAX_ALU)
+         return false;
+      for (unsigned s = 0; s < tex->num_srcs; s++)
+         if ((int)s != coord)
+            return false;
+      if (!chrome9_ps_lower_def(builder, tex->src[coord].src.ssa,
+                                &coordinate) ||
+          coordinate.file != CHROME9_PS_SOURCE_TEXTURE ||
+          coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
+          coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y)
+         return false;
+      temp = builder->next_temp++;
+      value = builder->value_count++;
+      builder->value[value].def = def;
+      builder->value[value].source.file = CHROME9_PS_SOURCE_TEMP;
+      builder->value[value].source.id = temp;
+      for (unsigned c = 0; c < 4; c++)
+         builder->value[value].source.swizzle[c] = c;
+      builder->ir.texture[builder->ir.texture_count++] =
+         (struct chrome9_ps_texture_instruction) {
+            .sampler = tex->sampler_index,
+            .coordinate = coordinate.id,
+            .destination = temp,
+         };
+      builder->value[value].complete = true;
+      *source = builder->value[value].source;
+      return true;
+   }
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
@@ -2876,7 +2934,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
 
       if (instr->type == nir_instr_type_alu ||
           instr->type == nir_instr_type_deref ||
-          instr->type == nir_instr_type_load_const)
+          instr->type == nir_instr_type_load_const ||
+          instr->type == nir_instr_type_tex)
          continue;
       if (instr->type != nir_instr_type_intrinsic)
          return false;
@@ -2904,12 +2963,23 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
             return false;
          location = var->data.location;
          stored = intr->src[1].ssa;
+      } else if (intr->intrinsic == nir_intrinsic_load_uniform) {
+         unsigned id;
+
+         if (!nir_src_is_const(intr->src[0]) || nir_intrinsic_base(intr) ||
+             intr->def.bit_size != 32 || !intr->def.num_components ||
+             intr->def.num_components > 4)
+            return false;
+         id = nir_src_as_uint(intr->src[0]);
+         if (id >= 32)
+            return false;
+         builder.uniform_mask |= 1u << id;
+         continue;
       } else if (intr->intrinsic ==
                     nir_intrinsic_load_barycentric_pixel ||
                  intr->intrinsic ==
                     nir_intrinsic_load_interpolated_input ||
                  intr->intrinsic == nir_intrinsic_load_deref ||
-                 intr->intrinsic == nir_intrinsic_load_uniform ||
                  intr->intrinsic == nir_intrinsic_load_ubo ||
                  intr->intrinsic == nir_intrinsic_load_ubo_vec4) {
          continue;
