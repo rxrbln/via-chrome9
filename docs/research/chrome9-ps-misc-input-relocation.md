@@ -99,6 +99,13 @@ pass gives the relocated MISC value the same terminal-use treatment as other
 temporary-like resources.  It is not a constant/input source that can bypass
 the final-use pass.
 
+Repeated MISC operands use the last semantic occurrence for that terminal
+marker.  `MUL(vPos,vPos)` releases only C, `MAD(vPos,vPos,vPos)` releases only
+B, and a two-record MOV then ADD leaves the first record live and releases the
+final B occurrence.  Their exact raw/final records are retained in the corpus.
+This matches a semantic last-use walk; setting every relocated occurrence's
+release bit is not equivalent.
+
 ## Real relocation-code ladder
 
 To exercise every configuration-two return without injecting private state,
