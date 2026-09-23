@@ -5564,6 +5564,8 @@ smoke_a8_generic_texture(struct pipe_screen *screen)
    const uint32_t *pixels;
    uint8_t *source, *source_copy = NULL;
    uint32_t actual[4] = { 0 };
+   uint32_t mismatch_actual = 0, mismatch_expected = 0;
+   unsigned mismatch_x = 32, mismatch_y = 32;
    uint64_t submitted, rejected, batches;
    void *blend_handle = NULL, *dsa_handle = NULL;
    void *rasterizer_handle = NULL, *elements_handle = NULL;
@@ -5669,17 +5671,35 @@ smoke_a8_generic_texture(struct pipe_screen *screen)
             !memcmp(source, source_copy, ctexture->data_size);
    for (unsigned i = 0; i < 4; i++)
       passed &= actual[i] == (uint32_t)alphas[i] << 24;
+   for (unsigned y = 0; y < 32; y++)
+      for (unsigned x = 0; x < 32; x++) {
+         uint32_t expected =
+            (uint32_t)alphas[(y >= 16) * 2 + (x >= 16)] << 24;
+         uint32_t pixel = pixels[y * (ctarget->stride / 4) + x];
+
+         if (pixel == expected)
+            continue;
+         if (mismatch_y == 32) {
+            mismatch_x = x;
+            mismatch_y = y;
+            mismatch_actual = pixel;
+            mismatch_expected = expected;
+         }
+         passed = false;
+      }
    if (!passed)
       fprintf(stderr, "A8 generic TEX mismatch: samples=%08x,%08x,%08x,%08x "
               "submitted=+%" PRIu64 " rejected=+%" PRIu64
-              " batches=+%" PRIu64 " source=%u guards=%u/%u\n",
+              " batches=+%" PRIu64 " source=%u guards=%u/%u "
+              "first_bad=(%u,%u):%08x/%08x\n",
               actual[0], actual[1], actual[2], actual[3],
               ccontext->submitted_triangles - submitted,
               ccontext->rejected_triangles - rejected,
               ccontext->submitted_program_batches - batches,
               !memcmp(source, source_copy, ctexture->data_size),
               smoke_guard_pages_match(ctarget),
-              smoke_guard_pages_match(ctexture));
+              smoke_guard_pages_match(ctexture),
+              mismatch_x, mismatch_y, mismatch_actual, mismatch_expected);
    else
       puts("Gallium guarded A8 nearest generic TEX passed");
 
@@ -5947,6 +5967,225 @@ out:
 }
 
 static bool
+smoke_d24_sample_produced_depth(struct pipe_screen *screen,
+                                struct pipe_context *context,
+                                struct pipe_resource *color,
+                                struct pipe_resource *depth,
+                                struct pipe_sampler_view *depth_view)
+{
+   static const struct smoke_texture_vertex vertices[4] = {
+      { { -1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0 } },
+      { { -1,  1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 1 } },
+      { {  1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 1, 0 } },
+      { {  1,  1, 0, 1 }, { 1, 1, 1, 1 }, { 1, 1 } },
+   };
+   struct pipe_resource target_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource *target = NULL;
+   struct pipe_sampler_state sampler = {
+      .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+      .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+      .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+      .compare_mode = PIPE_TEX_COMPARE_NONE,
+      .max_anisotropy = 1,
+      .max_lod = 1000.0f,
+      .reduction_mode = PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE,
+   };
+   struct pipe_blend_state blend = { 0 };
+   struct pipe_depth_stencil_alpha_state dsa = { 0 };
+   struct pipe_rasterizer_state rasterizer = {
+      .half_pixel_center = true,
+      .bottom_edge_rule = true,
+      .depth_clip_near = true,
+      .depth_clip_far = true,
+   };
+   struct pipe_vertex_element elements[2] = { 0 };
+   struct pipe_vertex_buffer vertex_buffer = {
+      .is_user_buffer = true,
+      .buffer.user = vertices,
+   };
+   struct pipe_framebuffer_state framebuffer = {
+      .width = 64, .height = 64, .nr_cbufs = 1,
+      .cbufs[0] = { .format = PIPE_FORMAT_B8G8R8A8_UNORM },
+   };
+   const struct pipe_viewport_state viewport = {
+      .scale = { 32, 32, 0.5 }, .translate = { 32, 32, 0.5 },
+   };
+   const struct pipe_scissor_state scissor = { .maxx = 64, .maxy = 64 };
+   const struct pipe_draw_info info = {
+      .mode = MESA_PRIM_QUAD_STRIP, .index_bounds_valid = true,
+      .instance_count = 1, .min_index = 0, .max_index = 3,
+   };
+   const struct pipe_draw_start_count_bias draw = { .count = 4 };
+   struct chrome9_resource *ctarget, *ccolor = chrome9_resource(color);
+   struct chrome9_resource *cdepth = chrome9_resource(depth);
+   struct chrome9_resource *cscratch =
+      chrome9_resource(chrome9_context(context)->depth_only_scratch);
+   struct chrome9_context *ccontext = chrome9_context(context);
+   const uint32_t *pixels;
+   uint8_t *color_copy = NULL, *depth_copy = NULL;
+   uint32_t center = 0, exterior = 0;
+   uint64_t submitted, rejected, batches;
+   void *blend_handle = NULL, *dsa_handle = NULL;
+   void *rasterizer_handle = NULL, *elements_handle = NULL;
+   void *sampler_handle = NULL, *vs = NULL, *fs = NULL;
+   bool passed = false;
+
+   if (!screen->is_format_supported(screen, target_templ.format,
+                                    target_templ.target, 1, 1,
+                                    target_templ.bind) ||
+       !depth_view || depth_view->texture != depth ||
+       depth_view->swizzle_r != PIPE_SWIZZLE_X ||
+       depth_view->swizzle_g != PIPE_SWIZZLE_Y ||
+       depth_view->swizzle_b != PIPE_SWIZZLE_Z ||
+       depth_view->swizzle_a != PIPE_SWIZZLE_W ||
+       !cscratch || !smoke_guard_pages_match(cscratch))
+      goto out;
+   target = screen->resource_create(screen, &target_templ);
+   if (!target)
+      goto out;
+   ctarget = chrome9_resource(target);
+   if (!ctarget->guarded || !smoke_initialize_guard_pages(ctarget) ||
+       ctarget->bo.handle == cdepth->bo.handle ||
+       ctarget->bo.handle == ccolor->bo.handle ||
+       cdepth->bo.handle == ccolor->bo.handle ||
+       ctarget->bo.map == cdepth->bo.map ||
+       ctarget->bo.map == ccolor->bo.map ||
+       cdepth->bo.map == ccolor->bo.map)
+      goto out;
+   color_copy = malloc(ccolor->data_size);
+   depth_copy = malloc(cdepth->data_size);
+   if (!color_copy || !depth_copy)
+      goto out;
+   memcpy(color_copy, (const uint8_t *)ccolor->bo.map + ccolor->data_offset,
+          ccolor->data_size);
+   memcpy(depth_copy, (const uint8_t *)cdepth->bo.map + cdepth->data_offset,
+          cdepth->data_size);
+   memset((uint8_t *)ctarget->bo.map + ctarget->data_offset, 0x5a,
+          ctarget->data_size);
+
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   blend_handle = context->create_blend_state(context, &blend);
+   dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   elements[0].src_offset = offsetof(struct smoke_texture_vertex, position);
+   elements[0].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[0].src_stride = sizeof(struct smoke_texture_vertex);
+   elements[1].src_offset = offsetof(struct smoke_texture_vertex, texcoord);
+   elements[1].src_format = PIPE_FORMAT_R32G32_FLOAT;
+   elements[1].src_stride = sizeof(struct smoke_texture_vertex);
+   elements_handle = context->create_vertex_elements_state(context, 2,
+                                                            elements);
+   sampler_handle = context->create_sampler_state(context, &sampler);
+   vs = make_texture_vertex_shader(screen, context, false);
+   fs = make_texture_fragment_shader(screen, context, false);
+   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+       !elements_handle || !sampler_handle || !vs || !fs ||
+       !((struct chrome9_shader *)fs)->semantic_fs_valid ||
+       ((struct chrome9_shader *)fs)->semantic_input_mask ||
+       ((struct chrome9_shader *)fs)->semantic_sampler_mask != 1)
+      goto out;
+
+   /* Sampling the produced D24 image requires it to be detached from the
+    * framebuffer.  The new color target is a distinct guarded BO. */
+   framebuffer.cbufs[0].texture = target;
+   context->set_framebuffer_state(context, &framebuffer);
+   if (ccontext->render_target != target ||
+       ccontext->framebuffer.zsbuf.texture)
+      goto out;
+   context->bind_blend_state(context, blend_handle);
+   context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   context->bind_rasterizer_state(context, rasterizer_handle);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, vs);
+   context->bind_fs_state(context, fs);
+   context->bind_sampler_states(context, MESA_SHADER_FRAGMENT, 0, 1,
+                                &sampler_handle);
+   context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
+                              &depth_view);
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->set_viewport_states(context, 0, 1, &viewport);
+   context->set_scissor_states(context, 0, 1, &scissor);
+   submitted = ccontext->submitted_triangles;
+   rejected = ccontext->rejected_triangles;
+   batches = ccontext->submitted_program_batches;
+   context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+   context->flush_resource(context, target);
+   context->flush(context, NULL, 0);
+
+   pixels = (const uint32_t *)((const uint8_t *)ctarget->bo.map +
+                               ctarget->data_offset);
+   center = pixels[16 * (ctarget->stride / 4) + 16];
+   exterior = pixels[60 * (ctarget->stride / 4) + 60];
+   /* X8Z24 is (Z,0,0,1) to Gallium.  The red byte may round at the
+    * half-way depth, but green/blue must be zero and alpha must be one. */
+   passed = (center == 0xff7f0000U || center == 0xff800000U) &&
+            exterior == 0xffff0000U &&
+            ccontext->submitted_triangles == submitted + 2 &&
+            ccontext->rejected_triangles == rejected &&
+            ccontext->submitted_program_batches == batches + 2 &&
+            !memcmp((const uint8_t *)ccolor->bo.map + ccolor->data_offset,
+                    color_copy, ccolor->data_size) &&
+            !memcmp((const uint8_t *)cdepth->bo.map + cdepth->data_offset,
+                    depth_copy, cdepth->data_size) &&
+            smoke_bytes_match((const uint8_t *)cscratch->bo.map +
+                                 cscratch->data_offset,
+                              cscratch->data_size, 0xa5) &&
+            smoke_guard_pages_match(ctarget) &&
+            smoke_guard_pages_match(ccolor) &&
+            smoke_guard_pages_match(cdepth) &&
+            smoke_guard_pages_match(cscratch);
+   if (passed)
+      printf("X8Z24 Gallium render-to-texture passed: center=%08x exterior=%08x\n",
+             center, exterior);
+   else
+      fprintf(stderr,
+              "X8Z24 Gallium render-to-texture mismatch: "
+              "center=%08x exterior=%08x submitted=+%" PRIu64
+              " rejected=+%" PRIu64 " batches=+%" PRIu64
+              " source=%u color=%u guards=%u/%u/%u/%u\n",
+              center, exterior,
+              ccontext->submitted_triangles - submitted,
+              ccontext->rejected_triangles - rejected,
+              ccontext->submitted_program_batches - batches,
+              !memcmp((const uint8_t *)cdepth->bo.map + cdepth->data_offset,
+                      depth_copy, cdepth->data_size),
+              !memcmp((const uint8_t *)ccolor->bo.map + ccolor->data_offset,
+                      color_copy, ccolor->data_size),
+              smoke_guard_pages_match(ctarget),
+              smoke_guard_pages_match(ccolor),
+              smoke_guard_pages_match(cdepth),
+              smoke_guard_pages_match(cscratch));
+
+out:
+   free(color_copy);
+   free(depth_copy);
+   /* Drop the context's reference before the caller destroys its view. */
+   context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 0, 1, NULL);
+   if (fs) context->delete_fs_state(context, fs);
+   if (vs) context->delete_vs_state(context, vs);
+   if (sampler_handle)
+      context->delete_sampler_state(context, sampler_handle);
+   if (elements_handle)
+      context->delete_vertex_elements_state(context, elements_handle);
+   if (rasterizer_handle)
+      context->delete_rasterizer_state(context, rasterizer_handle);
+   if (dsa_handle)
+      context->delete_depth_stencil_alpha_state(context, dsa_handle);
+   if (blend_handle)
+      context->delete_blend_state(context, blend_handle);
+   pipe_resource_reference(&target, NULL);
+   return passed;
+}
+
+static bool
 smoke_d24_framebuffer_contract(struct pipe_screen *screen)
 {
    struct pipe_resource depth_templ = {
@@ -6069,6 +6308,9 @@ smoke_d24_framebuffer_contract(struct pipe_screen *screen)
       goto out;
    stage = 12;
    if (!smoke_d24_combined_draw(screen, context, color, depth, &fb))
+      goto out;
+   stage = 13;
+   if (!smoke_d24_sample_produced_depth(screen, context, color, depth, view))
       goto out;
    passed = true;
 
