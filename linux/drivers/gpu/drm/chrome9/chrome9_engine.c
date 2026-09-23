@@ -1792,6 +1792,85 @@ static int chrome9_fragment_raster_selftest(void)
 	return 0;
 }
 
+static int chrome9_fragment_fe_config(u32 texture_count, u32 varying_count,
+	const u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS], u32 config[8])
+{
+	static const u32 default_config[] = {
+		0x00000001, 0x01002521, 0x08010100,
+		0x04000000, 0x05000000, 0x0d810000,
+		0x09000000, 0x0a000000,
+	};
+	u32 coordinate_count = max(texture_count, varying_count);
+	unsigned int i;
+
+	memcpy(config, default_config, sizeof(default_config));
+	config[0] |= coordinate_count << 4;
+	config[2] |= coordinate_count;
+	for (i = 0; i < coordinate_count; i++) {
+		u32 width = i < varying_count ? varying_width[i] : 2;
+		u32 word, shift;
+
+		/* A mixed high slot needs a distinct producer/consumer oracle. */
+		if (i >= 2 && i < texture_count && i < varying_count &&
+		    width != 2)
+			return -EOPNOTSUPP;
+		if (i < 2) {
+			word = 2;
+			shift = 8 * (i + 1);
+		} else if (i < 5) {
+			word = 6;
+			shift = 8 * (i - 2);
+		} else {
+			word = 7;
+			shift = 8 * (i - 5);
+		}
+		config[word] &= ~(0xffU << shift);
+		config[word] |= (width - 1) << shift;
+	}
+	return 0;
+}
+
+static int chrome9_fragment_fe_config_selftest(void)
+{
+	static const struct {
+		u8 count;
+		u8 width[8];
+		u32 a08, a09, a0a;
+	} cases[] = {
+		{ 3, { 4, 2, 3 }, 0x08010303, 0x09000002, 0x0a000000 },
+		{ 5, { 1, 4, 2, 3, 1 }, 0x08030005, 0x09000201,
+		  0x0a000000 },
+		{ 8, { 4, 1, 2, 3, 4, 1, 2, 3 }, 0x08000308,
+		  0x09030201, 0x0a020100 },
+	};
+	static const u8 empty_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u32 config[8];
+	unsigned int i;
+
+	if (chrome9_fragment_fe_config(0, 0, empty_width, config))
+		return -EINVAL;
+	if (config[0] != 0x00000001 || config[2] != 0x08010100 ||
+	    config[6] != 0x09000000 || config[7] != 0x0a000000)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		if (chrome9_fragment_fe_config(0, cases[i].count,
+				cases[i].width, config))
+			return -EINVAL;
+		if (config[0] != (cases[i].count << 4 | 1) ||
+		    config[2] != cases[i].a08 || config[6] != cases[i].a09 ||
+		    config[7] != cases[i].a0a)
+			return -EINVAL;
+	}
+	if (chrome9_fragment_fe_config(8, 0, empty_width, config) ||
+	    config[0] != 0x00000081 || config[6] != 0x09010101 ||
+	    config[7] != 0x0a010101)
+		return -EINVAL;
+	if (chrome9_fragment_fe_config(4, cases[1].count,
+			cases[1].width, config) != -EOPNOTSUPP)
+		return -EINVAL;
+	return 0;
+}
+
 static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	const struct chrome9_draw_request *request, struct chrome9_job *job,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
@@ -1830,11 +1909,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	struct chrome9_blend_words blend_words;
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 destination_state[16];
-	u32 config[] = {
-		request->fragment_texture_count << 4 | 1, 0x01002521,
-		0x08010100 | request->fragment_texture_count,
-		0x04000000, 0x05000000, 0x0d810000,
-	};
+	u32 config[8];
 	u32 common[32] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
 		0x01ce1540, 0x88001ed0, 0x89000800,
@@ -1858,22 +1933,14 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	bool blend = request->flags & DRM_CHROME9_FRAGMENT_BLEND;
 	bool depth_active = request->flags & DRM_CHROME9_FRAGMENT_DEPTH;
 	unsigned int i;
+	int ret;
 
 	if (!base || !program || !request->fragment_vertices)
 		return -EINVAL;
-	/* The FE count must include direct pixel-shader coordinate inputs. */
-	config[0] = max(request->fragment_texture_count,
-			program->varying_count) << 4 | 1;
-	/* A08 counts VS coordinate outputs, including direct PS varyings. */
-	config[2] = (config[2] & ~GENMASK(3, 0)) |
-		max(request->fragment_texture_count, program->varying_count);
-	/* FE A08 dimensions describe VS T0/T1 outputs, not sampler count. */
-	if (program->varying_count)
-		config[2] = (config[2] & ~GENMASK(9, 8)) |
-			(program->varying_width[0] - 1) << 8;
-	if (program->varying_count > 1)
-		config[2] = (config[2] & ~GENMASK(17, 16)) |
-			(program->varying_width[1] - 1) << 16;
+	ret = chrome9_fragment_fe_config(request->fragment_texture_count,
+		program->varying_count, program->varying_width, config);
+	if (ret)
+		return ret;
 	vs_control[0] = 0x60800000 | (3 + program->varying_count);
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
@@ -3531,6 +3598,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"fragment raster-state self-test failed: %d\n", ret);
+		return ret;
+	}
+	ret = chrome9_fragment_fe_config_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"fragment FE configuration self-test failed: %d\n", ret);
 		return ret;
 	}
 	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
