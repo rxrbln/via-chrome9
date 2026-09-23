@@ -23,6 +23,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16	0x0b
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_BATCH	0x0c
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16	0x0d
+#define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_MIP	0x0e
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN	0x0f
 #define DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_D16_BLEND	0x12
 #define DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND	0x13
@@ -74,6 +75,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16 \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TWO_TEXTURED_TRIANGLE_D16, \
 		struct drm_chrome9_draw_two_textured_triangle_d16)
+#define DRM_IOCTL_CHROME9_DRAW_TEXTURED_TRIANGLE_MIP \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TEXTURED_TRIANGLE_MIP, \
+		struct drm_chrome9_draw_textured_triangle_mip)
 #define DRM_IOCTL_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_RUN, \
 		struct drm_chrome9_draw_triangle_d16_rhw_run)
@@ -153,6 +157,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_BATCH	(1ULL << 19)
 /* Two level-zero textures can be multiplied with D16 test/write. */
 #define DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16	(1ULL << 20)
+/* One guarded mip chain can be sampled by a state-complete command list. */
+#define DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE_MIP	(1ULL << 21)
 /* Up to 544 perspective D16 triangles share one state-complete command. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_RUN	(1ULL << 22)
 /* Every D16 draw can test depth without updating the depth surface. */
@@ -303,6 +309,10 @@ struct drm_chrome9_draw_triangle_d16 {
 
 #define DRM_CHROME9_TEXTURE_FILTER_NEAREST	0
 #define DRM_CHROME9_TEXTURE_FILTER_LINEAR	1
+
+#define DRM_CHROME9_TEXTURE_MIP_FILTER_NONE	0
+#define DRM_CHROME9_TEXTURE_MIP_FILTER_NEAREST	1
+#define DRM_CHROME9_TEXTURE_MIP_FILTER_LINEAR	2
 
 #define DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE	1
 #define DRM_CHROME9_TEXTURE_WRAP_REPEAT		2
@@ -706,6 +716,34 @@ struct drm_chrome9_draw_textured_triangle_run {
 	struct drm_chrome9_texture_state texture;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_scissor_state scissor;
+	__u64 vertices_ptr;
+	__u64 reserved[3];
+};
+
+/*
+ * Mipmapped one-texture list successor.  The kernel derives every level
+ * offset and native table word from the validated guarded linear layout.
+ * Userspace supplies only the semantic last level, filter, and signed s5.5
+ * bias; DEPTH and BLEND retain the state-complete RUN meanings.
+ */
+struct drm_chrome9_draw_textured_triangle_mip {
+	__u32 destination_handle;
+	__u32 depth_handle;
+	__u32 flags;
+	__u32 triangle_count;
+	__u32 program;
+	__u32 width;
+	__u32 height;
+	__u32 destination_pitch;
+	__u32 depth_pitch;
+	__u32 destination_format;
+	struct drm_chrome9_texture_state texture;
+	struct drm_chrome9_blend_state blend;
+	struct drm_chrome9_scissor_state scissor;
+	__u32 texture_last_level;
+	__u32 mip_filter;
+	__s32 lod_bias_s5_5;
+	__u32 reserved0;
 	__u64 vertices_ptr;
 	__u64 reserved[3];
 };
