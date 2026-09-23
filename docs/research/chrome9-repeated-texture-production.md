@@ -165,6 +165,43 @@ coordinates; the TAU sampler nibble alone does not create that linkage.  This
 six-stage sparse combination is exact static/compiler evidence and still
 requires a distinct-color live state-closure test.
 
+### Sparse-stage ABI audit
+
+The high-water rule applies to the semantic draw ABI as well as to A00/A08.
+`texture_count` cannot mean the population count of active samplers when TAU
+records retain their logical sampler ids.  The production sparse object above
+uses sampler nibbles `0,1,2,4,5`; its required count is therefore six.  A
+five-element compact descriptor array would either make sampler five fail the
+range check or silently bind it to the wrong resource.
+
+The current clean-room paths expose that mismatch exactly:
+
+* Mesa `chrome9_draw.c:241..243` assigns the generic draw's
+  `texture_count = popcount(semantic_sampler_mask)`, and
+  `chrome9_fragment_sampler_unit()` compacts set bits into dense descriptor
+  indices.
+* The kernel `chrome9_fragment.c:197` requires every native sampler id to be
+  below `texture_count`, and `:269` independently requires
+  `texture_count == fls(sampler_mask)`.
+
+The implementation invariant is consequently:
+
+```text
+texture_count = sampler_mask ? fls(sampler_mask) : 0
+descriptor index = logical sampler id
+```
+
+The present UAPI cannot express that rule safely: it has neither an active
+mask nor a logical index in each descriptor, and the kernel validates, maps,
+and emits every element through `texture_count`.  Do not fill holes by
+renumbering active descriptors, and do not invent a hidden dummy BO contract.
+Until the ABI grows either an active-slot mask over a high-water-sized array or
+explicit logical indices, reject sparse programs.  In the successor ABI every
+set bit must have one complete image/sampler state pair and retained BO, while
+holes emit closed state and own no BO.  The TAU sampler nibble must remain the
+logical id.  This rule is required by terrain's fragment units `0,1,2,4,5`; it
+is not a terrain-specific special case.
+
 ## Multi-source resource-state tables
 
 The installed glmark2 2023.01 sources provide two useful generic state
