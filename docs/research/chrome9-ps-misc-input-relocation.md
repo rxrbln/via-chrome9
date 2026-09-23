@@ -153,6 +153,52 @@ varyings, and it must not reorder commutative operands after resource
 analysis.  MISC still participates independently in the relocation bucket
 and final direct-route mask.
 
+A two-record boundary proves that the MISC relocation bucket also cannot use
+the number of compact varying coordinates:
+
+```text
+MAD r0,T0,T1,T2
+MAD oC0,r0,vPos,T3
+
+resources 1 1 1 0
+ALU 02c20530 302c1053 00f2c005 00000020
+    02c30530 300c3053 00f20005 00000820
+A90..A93 9005800f 91000000 92000002 93000000
+```
+
+All four T inputs are compacted and appear in A90 bits zero through three,
+but active0 is one: the first record selects A-slot T0 and the second selects
+C-slot MISC, which hides B-slot T3 from this resource walk.  MISC adjustment
+therefore changes active0 from one to two, retains bucket `0x18000`, and
+relocates to id 3.  Selecting the bucket from `coordinate_count=4` would
+instead use adjusted count five, incorrectly choose id 4 and produce
+`9005001f`.  MISC relocation must happen after the scheduled resource result
+is known, or through an equivalent two-pass encoder; choosing it during
+semantic varying allocation is not exact.
+
+The exact first two resource outputs are high-water values over the scheduled
+maps, not semantic counts:
+
+```text
+active0 = max(1 + highest nonzero B, 1 + highest nonzero C)
+active1 = 1 + highest nonzero A
+```
+
+Empty maps contribute zero.  Linux computes the B/C maximum at
+`0x19a6d5..0x19a71b` and writes it through output zero at
+`0x19aa2e..0x19aa31`; it scans A at `0x19a6b8..0x19ab79` and writes output
+one at `0x19aa33..0x19aa3c`.  Therefore the B-only third output used by FE
+A00 is not generally a valid substitute for A90's active0: internally
+defined coordinate slots in C contribute to active0 but not A00.
+
+The boundary object also exposes a collision: the proprietary finalizer gives
+both vPos and direct T3 native class 3/id 3 in the second record, and their
+usage shares A90 bit three.  That result is byte-exact but has no silicon
+semantic proof; it may be an unsupported compiler corner case.  A safe first
+implementation should reject a program when the selected MISC location is
+already occupied by a direct T coordinate.  It must not silently choose a
+different bucket, because that would no longer be the vendor algorithm.
+
 The same coexistence survives every relocation bucket.  Prefixing N WAW
 texture samples before `MUL oC0,vPos.xyxy,T0.xyxy` gives:
 
