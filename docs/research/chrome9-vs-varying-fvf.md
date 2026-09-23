@@ -135,10 +135,12 @@ Three independent widths must not be conflated:
 
 1. A25/A26 and the native oT mask define how many lanes the VS produces and
    the rasterizer interpolates.
-2. A08--A0a define the S/ST/STR/STRQ coordinate dimensionality consumed by
-   each texture stage.  The live ordinary 2-D stage uses A08=`08010101`.
-3. The TAU swizzle selects which physical varying lanes become those logical
-   coordinate lanes.
+2. A08--A0a declare the S/ST/STR/STRQ width of the VS texture-coordinate
+   outputs. The live ordinary float2 producer uses A08=`08010101`.
+3. A01 selects the TAU consumer dimension; its swizzle selects which
+   physical varying lanes become those logical coordinate lanes. A packed
+   float3 producer with a 2-D YZ sampler therefore needs A08=`08010201`
+   but A01=`01002521`.
 
 For a sampler dimension D, only the first D TAU selectors are semantically
 consumed.  The production packed-varying object uses `T0.yzww` with a 2-D
@@ -161,7 +163,7 @@ tuple.
 The complete dense eight-coordinate dimension image is:
 
 ```text
-A08[3:0]             coordinate high-water
+A08[3:0]             VS texture-coordinate output count
 A08[9:8],[17:16]     T0,T1 dimension minus one
 A09[1:0],[9:8],[17:16] T2,T3,T4 dimension minus one
 A0a[1:0],[9:8],[17:16] T5,T6,T7 dimension minus one
@@ -180,23 +182,24 @@ draw would retain dimensions from a prior wide draw.  The eight-to-one
 transition must therefore write A09=`09000000` and A0a=`0a000000`, not merely
 reduce A08's count.
 
-Keep sampler-coordinate dimension separate from producer width.  A
-texture-only 2-D slot uses dimension code one even if its VS producer is a
-float4.  For a direct ALU-only T input, the manual-consistent construction is
-the producer `varying_width-1`; this is not yet a byte-exact shader-object
-rule.  The Windows programmable update in `VTGUModeDX32A.dll` writes only the
-compiled coordinate high-water to A00 at `0x1015b255..0x1015b26b`; it does
-not copy a PS width into A08.  Its preceding linkage builder
+Keep sampler-coordinate dimension separate from producer width.  A 2-D TAU
+consumer of T0 uses dimension code one in A01 even if its VS producer is a
+float4 in A08.  For a direct ALU-only T0 input, the manually and live-qualified
+consumer value is `varying_width-1`.  The Windows programmable update in
+`VTGUModeDX32A.dll` writes the compiled active texture-temporary resource
+count to A00 at `0x1015b255..0x1015b26b`; it does not copy a PS width into
+A08.  Its preceding linkage builder
 `0x101574a0..0x10157b8a` instead maintains eight producer/stage dimensions at
 context offsets `+0x2d80..+0x2d9c` (the programmable default writes eight
 width-four entries at `0x10157600..0x1015762a`).  A slot shared by direct ALU
 and TAU must retain enough produced lanes for both consumers while the TAU
 stage dimension still describes the texture operation.
 
-At the current audit point the generic kernel builder patches only T0/T1 in
-A08 and emits no A09/A0a, although its FVF/raster builder already emits A26
-and A29 for T4..T7.  That mismatch makes three through eight direct inputs
-incomplete even after the independent A00 high-water fix.
+The early generic kernel builder patched only T0/T1 in A08 and omitted
+A09/A0a, despite FVF/raster support for T4..T7.  The current builder writes
+all three words and derives A08's count from actual VS outputs, rather than
+sampler high-water.  Those static corrections do not establish silicon
+coverage for every three-through-eight-input width combination.
 
 ## Fail-closed kernel contract
 
