@@ -1269,13 +1269,30 @@ overwritten.
 
 Second, independent one-triangle and 16-triangle captures showed the exact
 one-texture MODULATE plus blend object stopping before its completion cookie.
-The inputs, coordinates, texture bounds, and packet closure were valid, so the
-state remains a vendor-template reverse-engineering problem rather than a
-generic ring fault.  Mesa now rejects this precise unproved combination and
-the kernel rejects it again at the ioctl boundary.  REPLACE blending and
-opaque MODULATE remain available.  This is a correctness containment: a
-missing UI primitive is preferable to poisoning the ring for every later X
-client.
+The hand-derived two-ALU temporary program was replaced with the one-ALU
+direct-output object independently emitted by the Windows production compiler
+and Linux 5.75 compiler:
+
+```text
+A90..A93  90018000 91000001 92010001 93000001
+TAU       301001b0
+ALU       0140b6d0 30040053 00f20005 00000820
+```
+
+That object completed 11,158 immediate draws before the same shutdown-only
+failure.  At timeout the command reader had reached `current=pause+0x10`,
+owned PID00 PAUSE was set, and all non-CR work was idle, but the legacy 2D
+`DST_POS` cookie retained its old value.  The texture, coordinates, normalized
+color, blend words, and packet closure all match vendor evidence.  This makes
+a lost or unreliable cookie, or rare tail visibility, more likely than a
+malformed fragment program.  FE330004 coherent system-write completion is the
+next discriminator.
+
+Until that discriminator is live, Mesa rejects this precise unproved
+combination and the kernel rejects it again at the ioctl boundary.  REPLACE
+blending and opaque MODULATE remain available.  This is a correctness
+containment: a missing UI primitive is preferable to quarantining the ring for
+every later X client.
 
 The rebuilt module and Gallium library were staged as `chrome9-ring-safe-v2`
 and `ioq-safe-v2`.  Under one Xorg process (PID 505), the following ran in
@@ -1297,3 +1314,14 @@ programs and reaches q3dm1, where unsupported bounded fragment programs are
 the next visible gap.  OpenGL1 reaches q3dm1 but currently rejects its texture
 run at the mip/sampler boundary.  Captures and logs are retained under
 `/root/tmp/chrome9-live/new-target-192.168.2.60/ioquake-safe-v2/`.
+
+The final contained `v3` build retains the compiler-correct direct MODULATE
+object behind that gate.  After reboot it again ran two independent ioquake3
+menu processes and then glxgears under one Xorg PID 485, with no timeout or
+quarantine; glxgears reported 338 frames in five seconds, or 67.528 FPS.  Its
+stable hashes are:
+
+```text
+chrome9-current.ko                 2fcfc925d7fe84acdc1fe06ba43747fc7946755b6364d43dad549a6578e476f3
+current/libgallium-26.2.2.so       ec9d69d177a6ca5b0e3ab1e330b256d6f152092171ed6e6a5d21647c76636888
+```
