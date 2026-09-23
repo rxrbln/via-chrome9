@@ -1981,6 +1981,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	static const u32 status[] = {
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
 	};
+	/* VX900 HPSLocationReg: direct PEY, TS-ZTAG deadlock ECO enabled. */
+	static const u32 misc_location[] = { 0x8a020000 };
 	const struct chrome9_fragment_program *program = request->fragment_program;
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(request->destination_format);
@@ -2149,6 +2151,9 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 			     vs_program, 4 * (4 + program->varying_count));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
 			     vs_control, ARRAY_SIZE(vs_control));
+	if (program->controls[0] & BIT(19))
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+				     misc_location, ARRAY_SIZE(misc_location));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     program->controls, ARRAY_SIZE(program->controls));
 	/* The compiler's counted H3 transaction stores ALU before TAU. */

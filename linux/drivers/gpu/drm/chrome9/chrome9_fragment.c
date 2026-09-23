@@ -32,6 +32,10 @@ struct chrome9_fragment_state {
 	u32 alu_varying_mask;
 	u32 coordinate_mask;
 	u32 physical_high_water;
+	u16 position_last_alu;
+	u8 position_id;
+	u8 position_slots[DRM_CHROME9_FRAGMENT_MAX_ALU];
+	bool position_used;
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_varying[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_instruction[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
@@ -93,7 +97,7 @@ static int chrome9_fragment_validate_source(
 	u16 selected = 0;
 	unsigned int i;
 
-	if (source->file > DRM_CHROME9_FRAGMENT_FILE_CONSTANT ||
+	if (source->file > DRM_CHROME9_FRAGMENT_FILE_POSITION ||
 	    source->modifier > DRM_CHROME9_FRAGMENT_MOD_NEG ||
 	    source->reserved)
 		return -EINVAL;
@@ -120,6 +124,16 @@ static int chrome9_fragment_validate_source(
 		if (source->index >= DRM_CHROME9_FRAGMENT_MAX_CONSTANTS)
 			return -EINVAL;
 		state->constant_mask |= BIT(source->index);
+		break;
+	case DRM_CHROME9_FRAGMENT_FILE_POSITION:
+		if (source->index || source->modifier)
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(source->swizzle); i++)
+			if (source->swizzle[i] > DRM_CHROME9_FRAGMENT_SWIZZLE_Y &&
+			    source->swizzle[i] != DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO)
+				return -EINVAL;
+		state->position_used = true;
+		state->position_last_alu = instruction;
 		break;
 	}
 	return 0;
@@ -254,11 +268,25 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 		}
 		state->source_count[i] = source_count;
 		for (source = 0; source < source_count; source++) {
+			const struct drm_chrome9_fragment_source *src =
+				&instruction->src[source];
+			u8 used_lanes =
+				chrome9_fragment_alu_component_mask(instruction);
+			unsigned int lane;
 			int ret = chrome9_fragment_validate_source(state,
-				&instruction->src[source], i);
+					src, i);
 
 			if (ret)
 				return ret;
+			/* The vendor only places ZERO in MISC lanes masked off by
+			 * the destination.  A live ZERO selector has no safe oracle.
+			 */
+			if (src->file == DRM_CHROME9_FRAGMENT_FILE_POSITION)
+				for (lane = 0; lane < ARRAY_SIZE(src->swizzle); lane++)
+					if ((used_lanes & BIT(lane)) &&
+					    src->swizzle[lane] >
+					    DRM_CHROME9_FRAGMENT_SWIZZLE_Y)
+						return -EINVAL;
 		}
 		for (; source < ARRAY_SIZE(instruction->src); source++)
 			if (!chrome9_fragment_source_zero(&instruction->src[source]))
@@ -316,6 +344,17 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			    instruction->src[source].index >= varying_count)
 				return -EINVAL;
 	}
+	return 0;
+}
+
+static u32 chrome9_fragment_resource_bucket(u32 active0, u32 physical)
+{
+	if (active0 <= 4 && physical <= 3)
+		return 0x18000;
+	if (active0 <= 5 && physical <= 4)
+		return 0x10000;
+	if (active0 <= 8 && physical <= 6)
+		return 0x08000;
 	return 0;
 }
 
@@ -462,6 +501,8 @@ static u32 chrome9_fragment_source_id(const struct chrome9_fragment_state *state
 		return state->physical[source->index];
 	if (source->file == DRM_CHROME9_FRAGMENT_FILE_CONSTANT)
 		return chrome9_fragment_native_constant(source->index);
+	if (source->file == DRM_CHROME9_FRAGMENT_FILE_POSITION)
+		return 3;
 	return state->coordinate_for_varying[source->index];
 }
 
@@ -559,7 +600,8 @@ static int chrome9_fragment_resource_note_destination(
 }
 
 static int chrome9_fragment_resource_note_alu(
-	struct chrome9_fragment_resource_state *resource, const u32 record[4])
+	struct chrome9_fragment_resource_state *resource, const u32 record[4],
+	u8 misc_slots)
 {
 	u32 file, id;
 	u8 mask;
@@ -570,42 +612,49 @@ static int chrome9_fragment_resource_note_alu(
 	 * a one-record MAD of T0, T1 and T2 consumes one active resource. */
 	file = FIELD_GET(GENMASK(16, 14), record[2]);
 	if (file == 3) {
-		id = FIELD_GET(GENMASK(13, 8), record[2]);
-		mask = chrome9_fragment_resource_swizzle_mask(
-			FIELD_GET(GENMASK(7, 5), record[2]),
-			FIELD_GET(GENMASK(4, 2), record[2]),
-			FIELD_GET(GENMASK(1, 0), record[2]) << 1 |
-				FIELD_GET(BIT(31), record[1]),
-			FIELD_GET(GENMASK(30, 28), record[1]));
-		ret = chrome9_fragment_resource_note_source(resource, id, mask);
-		if (ret)
-			return ret;
+		if (!(misc_slots & BIT(CHROME9_FRAGMENT_SLOT_A))) {
+			id = FIELD_GET(GENMASK(13, 8), record[2]);
+			mask = chrome9_fragment_resource_swizzle_mask(
+				FIELD_GET(GENMASK(7, 5), record[2]),
+				FIELD_GET(GENMASK(4, 2), record[2]),
+				FIELD_GET(GENMASK(1, 0), record[2]) << 1 |
+					FIELD_GET(BIT(31), record[1]),
+				FIELD_GET(GENMASK(30, 28), record[1]));
+			ret = chrome9_fragment_resource_note_source(resource, id, mask);
+			if (ret)
+				return ret;
+		}
 	} else {
 		file = FIELD_GET(GENMASK(20, 18), record[1]);
 		if (file == 3) {
-			id = FIELD_GET(GENMASK(17, 12), record[1]);
-			mask = chrome9_fragment_resource_swizzle_mask(
-				FIELD_GET(GENMASK(11, 9), record[1]),
-				FIELD_GET(GENMASK(8, 6), record[1]),
-				FIELD_GET(GENMASK(5, 3), record[1]),
-				FIELD_GET(GENMASK(2, 0), record[1]));
-			ret = chrome9_fragment_resource_note_source(resource, id,
-							    mask);
-			if (ret)
-				return ret;
-		} else {
-			file = FIELD_GET(GENMASK(24, 22), record[0]);
-			if (file == 3) {
-				id = FIELD_GET(GENMASK(21, 16), record[0]);
+			if (!(misc_slots & BIT(CHROME9_FRAGMENT_SLOT_C))) {
+				id = FIELD_GET(GENMASK(17, 12), record[1]);
 				mask = chrome9_fragment_resource_swizzle_mask(
-					FIELD_GET(GENMASK(15, 13), record[0]),
-					FIELD_GET(GENMASK(12, 10), record[0]),
-					FIELD_GET(GENMASK(9, 7), record[0]),
-					FIELD_GET(GENMASK(6, 4), record[0]));
+					FIELD_GET(GENMASK(11, 9), record[1]),
+					FIELD_GET(GENMASK(8, 6), record[1]),
+					FIELD_GET(GENMASK(5, 3), record[1]),
+					FIELD_GET(GENMASK(2, 0), record[1]));
 				ret = chrome9_fragment_resource_note_source(resource,
 								    id, mask);
 				if (ret)
 					return ret;
+			}
+		} else {
+			file = FIELD_GET(GENMASK(24, 22), record[0]);
+			if (file == 3) {
+				if (!(misc_slots & BIT(CHROME9_FRAGMENT_SLOT_B))) {
+					u8 x = FIELD_GET(GENMASK(15, 13), record[0]);
+					u8 y = FIELD_GET(GENMASK(12, 10), record[0]);
+					u8 z = FIELD_GET(GENMASK(9, 7), record[0]);
+					u8 w = FIELD_GET(GENMASK(6, 4), record[0]);
+
+					id = FIELD_GET(GENMASK(21, 16), record[0]);
+					mask = chrome9_fragment_resource_swizzle_mask(x, y, z, w);
+					ret = chrome9_fragment_resource_note_source(resource,
+										    id, mask);
+					if (ret)
+						return ret;
+				}
 			}
 		}
 	}
@@ -626,6 +675,17 @@ static int chrome9_fragment_resource_note_tau(
 {
 	return chrome9_fragment_resource_note_source(resource,
 		FIELD_GET(GENMASK(15, 12), tau), 0xf);
+}
+
+static u32
+chrome9_fragment_active_coordinate_count(const struct chrome9_fragment_resource_state *resource)
+{
+	unsigned int i;
+
+	for (i = ARRAY_SIZE(resource->external); i; i--)
+		if (resource->external[i - 1] || resource->defined[i - 1])
+			return i;
+	return 0;
 }
 
 static u32 chrome9_fragment_active_texture_count(
@@ -723,12 +783,14 @@ static int chrome9_fragment_alu_template(u8 op, u32 record[4],
 		slots[0] = CHROME9_FRAGMENT_SLOT_A;
 		slots[1] = CHROME9_FRAGMENT_SLOT_C;
 		slots[2] = CHROME9_FRAGMENT_SLOT_B;
+		subop = 9;
 		break;
 	case DRM_CHROME9_FRAGMENT_OP_CMP:
 		memcpy(record, cmp, sizeof(cmp));
 		slots[0] = CHROME9_FRAGMENT_SLOT_A;
 		slots[1] = CHROME9_FRAGMENT_SLOT_C;
 		slots[2] = CHROME9_FRAGMENT_SLOT_B;
+		subop = 9;
 		break;
 	default:
 		return -EINVAL;
@@ -748,6 +810,21 @@ static bool chrome9_fragment_release_source(
 	u32 physical;
 	unsigned int other;
 
+	if (source->file == DRM_CHROME9_FRAGMENT_FILE_POSITION) {
+		/* ABS expands this operand to A, C and B; B is its final use. */
+		if (instruction->op == DRM_CHROME9_FRAGMENT_OP_ABS)
+			return false;
+		if (state->position_last_alu != instruction_index)
+			return false;
+		/* The native finalizer visits A, C, B, irrespective of UAPI order. */
+		for (other = 0;
+		     other < state->source_count[instruction_index]; other++)
+			if (instruction->src[other].file ==
+			    DRM_CHROME9_FRAGMENT_FILE_POSITION &&
+			    slots[other] < slots[source_index])
+				return false;
+		return true;
+	}
 	if (source->file == DRM_CHROME9_FRAGMENT_FILE_VARYING) {
 		if (state->varying_last_alu[source->index] != instruction_index)
 			return false;
@@ -782,6 +859,17 @@ static bool chrome9_fragment_release_source(
 	return true;
 }
 
+static void chrome9_fragment_relocate_position(u32 record[4], u8 slots,
+					       u8 id)
+{
+	if (slots & BIT(CHROME9_FRAGMENT_SLOT_A))
+		record[2] = (record[2] & ~GENMASK(13, 8)) | id << 8;
+	if (slots & BIT(CHROME9_FRAGMENT_SLOT_C))
+		record[1] = (record[1] & ~GENMASK(17, 12)) | id << 12;
+	if (slots & BIT(CHROME9_FRAGMENT_SLOT_B))
+		record[0] = (record[0] & ~GENMASK(21, 16)) | id << 16;
+}
+
 static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	struct chrome9_fragment_program *program, u32 instruction_count)
 {
@@ -789,7 +877,8 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	u32 previous_phase = U32_MAX;
 	u32 alu_index = 0;
 	u32 tau_index = 0;
-	u32 active0 = 0;
+	u32 active0;
+	u32 bucket;
 	bool starts_alu = false;
 	unsigned int i;
 
@@ -820,7 +909,7 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 			bridge[2] = (bridge[2] & ~GENMASK(23, 20)) | 0xf << 20;
 			bridge[3] = (bridge[3] & ~GENMASK(12, 6)) |
 				BIT(10) | coordinate_id << 6;
-			ret = chrome9_fragment_resource_note_alu(&resource, bridge);
+			ret = chrome9_fragment_resource_note_alu(&resource, bridge, 0);
 			if (ret)
 				return ret;
 			alu_index++;
@@ -833,7 +922,6 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 			if (ret)
 				return ret;
 			state->coordinate_mask |= BIT(coordinate_id);
-			active0 = max(active0, coordinate_id + 1);
 			tau_index++;
 			previous_phase = 1;
 			continue;
@@ -881,7 +969,7 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 				bridge[3] = (bridge[3] & ~GENMASK(12, 6)) |
 					BIT(10) | coordinate_id << 6;
 				ret = chrome9_fragment_resource_note_alu(&resource,
-								 bridge);
+								 bridge, 0);
 				if (ret)
 					return ret;
 				alu_index++;
@@ -906,7 +994,6 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 					return ret;
 			}
 			state->coordinate_mask |= BIT(coordinate_id);
-			active0 = max(active0, coordinate_id + 1);
 			tau_index++;
 			previous_phase = 1;
 			continue;
@@ -917,6 +1004,7 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 		{
 			enum chrome9_fragment_slot slots[3] = { 0 };
 			u32 *record = program->alu[alu_index];
+			u8 misc_slots = 0;
 			unsigned int source;
 			int ret;
 
@@ -948,12 +1036,13 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 					slots[source],
 					chrome9_fragment_release_source(state,
 						instruction, i, source, slots));
+				if (src->file == DRM_CHROME9_FRAGMENT_FILE_POSITION)
+					misc_slots |= BIT(slots[source]);
 				if (src->file == DRM_CHROME9_FRAGMENT_FILE_VARYING) {
 					u32 coordinate_id =
 						state->coordinate_for_varying[src->index];
 
 					state->alu_varying_mask |= BIT(coordinate_id);
-					active0 = max(active0, coordinate_id + 1);
 				}
 			}
 			if (instruction->op == DRM_CHROME9_FRAGMENT_OP_ABS) {
@@ -965,11 +1054,18 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 					&instruction->src[0], CHROME9_FRAGMENT_SLOT_C,
 					false);
 				chrome9_fragment_encode_source(record, state, &negative,
-					CHROME9_FRAGMENT_SLOT_B, false);
+					CHROME9_FRAGMENT_SLOT_B,
+					negative.file == DRM_CHROME9_FRAGMENT_FILE_POSITION &&
+					state->position_last_alu == i);
+				if (negative.file == DRM_CHROME9_FRAGMENT_FILE_POSITION)
+					misc_slots |= BIT(CHROME9_FRAGMENT_SLOT_C) |
+						      BIT(CHROME9_FRAGMENT_SLOT_B);
 			}
 			chrome9_fragment_encode_destination(record, state,
 							&instruction->dst);
-			ret = chrome9_fragment_resource_note_alu(&resource, record);
+			state->position_slots[alu_index] = misc_slots;
+			ret = chrome9_fragment_resource_note_alu(&resource, record,
+								 misc_slots);
 			if (ret)
 				return ret;
 		}
@@ -981,22 +1077,49 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	program->active_texture_count =
 		chrome9_fragment_active_texture_count(&resource);
 	program->tau_coordinate_mask = state->coordinate_mask;
+	active0 = chrome9_fragment_active_coordinate_count(&resource) +
+		state->position_used;
+	bucket = chrome9_fragment_resource_bucket(active0, state->physical_high_water);
+	if (state->position_used) {
+		state->position_id = bucket == 0x18000 ? 3 :
+			bucket == 0x10000 ? 4 : bucket == 0x08000 ? 7 : 15;
+		/* The vendor compiler can alias MISC with a direct T coordinate in
+		 * an otherwise valid object.  Its raster semantics are unproven, so
+		 * do not submit such a collision until a guarded oracle passes.
+		 */
+		if (state->position_id != 15 &&
+		    (state->alu_varying_mask | state->coordinate_mask) &
+		    BIT(state->position_id))
+			return -EOPNOTSUPP;
+		for (i = 0; i < alu_index; i++) {
+			u8 slots = state->position_slots[i];
+
+			chrome9_fragment_relocate_position(program->alu[i], slots,
+							   state->position_id);
+		}
+	}
 	/* A90 retains direct ALU input bits even when A91 also names the same
 	 * physical coordinate for TAU.  The two masks select different consumers.
 	 */
 	program->controls[0] = 0x90000000 | state->alu_varying_mask;
+	if (state->position_used) {
+		/* VX900's runtime uploader enables MISC separately from the
+		 * configuration-two resource bucket and direct-source usage bit.
+		 * MISC is not a VS T varying.
+		 */
+		program->controls[0] |= BIT(19);
+		if (state->position_id != 15)
+			program->controls[0] |= BIT(state->position_id);
+	}
 	starts_alu = state->instructions[0].op != DRM_CHROME9_FRAGMENT_OP_TEX ||
 		state->instructions[0].src[0].file ==
 		DRM_CHROME9_FRAGMENT_FILE_TEMP;
 	if (starts_alu)
 		program->controls[0] |= BIT(18);
-	if (active0 <= 4 && state->physical_high_water <= 3)
-		program->controls[0] |= 0x18000;
-	else if (active0 <= 5 && state->physical_high_water <= 4)
-		program->controls[0] |= 0x10000;
-	else if (active0 <= 8 && state->physical_high_water <= 6)
-		program->controls[0] |= 0x08000;
+	program->controls[0] |= bucket;
 	program->controls[1] = 0x91000000 | state->coordinate_mask;
+	if (state->position_used && state->position_id == 15)
+		program->controls[1] |= BIT(23);
 	program->controls[2] = 0x92000000 | tau_index << 16 | alu_index;
 	for (i = 3; i < ARRAY_SIZE(program->controls); i++)
 		program->controls[i] |= (0x90 + i) << 24;
@@ -1262,6 +1385,260 @@ static int chrome9_fragment_kill_selftest(struct chrome9_fragment_program *progr
 	if (ret != -EINVAL)
 		return -EINVAL;
 	return 0;
+}
+
+static int chrome9_fragment_position_selftest(struct chrome9_fragment_program *program)
+{
+	static const struct drm_chrome9_fragment_instruction position_mov[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_POSITION, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction position_texture[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0x3, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_POSITION, 0,
+				  { 0, 1, 5, 5 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { 0, 1, 5, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction position_varying[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_POSITION, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction position_center[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0x3, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_POSITION, 0,
+				  { 0, 1, 5, 5 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { 0, 1, 5, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_FRC,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction position_mad[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MAD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 2,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MAD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_POSITION, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 3,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const u32 expected_mov[] = {
+		0x01c00530, 0x101c0053, 0x00f2c304, 0x000d0820,
+	};
+	static const u32 expected_frc[] = {
+		0x01c00530, 0x101c0053, 0x00f2c304, 0x000e0820,
+	};
+	static const u32 expected_abs[] = {
+		0x02c30418, 0x100c3041, 0x00f0c304, 0x00090820,
+	};
+	static const u32 expected_sub[] = {
+		0x82c30410, 0x10140924, 0x00f0c304, 0x00000820,
+	};
+	static const u32 expected_position_first[] = {
+		0x0140b6d0, 0x102c0041, 0x00f2c304, 0x00000820,
+	};
+	static const u32 expected_varying_first[] = {
+		0x0140b6d0, 0x102c3041, 0x00f2c004, 0x00000820,
+	};
+	static const u32 expected_texture_alu[][4] = {
+		{ 0x0140b6d0, 0xd008006d, 0x0032c306, 0x00000020 },
+		{ 0x01c00530, 0x101c0053, 0x00f20004, 0x000d0420 },
+		{ 0x01c00530, 0x301c0053, 0x00f20105, 0x000d0820 },
+	};
+	static const u32 expected_center_alu[][4] = {
+		{ 0x0140b6d0, 0xd008006d, 0x0032c306, 0x00000020 },
+		{ 0x01c00530, 0x101c0053, 0x00f20004, 0x000e0820 },
+	};
+	static const u32 expected_texture_controls[] = {
+		0x900d8008, 0x91000001, 0x92010003, 0x93000001,
+		0x94000000, 0x95000002, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+	};
+	static const u32 constants[] = {
+		0x3d000000, 0x3d000000, 0x3f800000, 0x3f800000,
+	};
+	struct drm_chrome9_fragment_instruction invalid;
+	const char *stage;
+	int ret;
+
+	stage = "MOV vPos.xyxy";
+	ret = chrome9_fragment_compile(position_mov, ARRAY_SIZE(position_mov), constants,
+				       0, 0, 0, program);
+	if (ret || program->alu_count != 1 || program->tau_count ||
+	    program->varying_count || program->active_texture_count ||
+	    memcmp(program->alu[0], expected_mov, sizeof(expected_mov)) ||
+	    program->controls[0] != 0x900d8008 ||
+	    program->controls[1] != 0x91000000 ||
+	    program->controls[2] != 0x92000001)
+		goto failed;
+	stage = "FRC vPos.xyxy";
+	invalid = position_mov[0];
+	invalid.op = DRM_CHROME9_FRAGMENT_OP_FRC;
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret || memcmp(program->alu[0], expected_frc,
+			  sizeof(expected_frc)))
+		goto failed;
+	stage = "ABS vPos.xyxy";
+	invalid = position_mov[0];
+	invalid.op = DRM_CHROME9_FRAGMENT_OP_ABS;
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret || memcmp(program->alu[0], expected_abs,
+			  sizeof(expected_abs)))
+		goto failed;
+	stage = "SUB vPos.xyxy,vPos.xyxy";
+	invalid = position_mov[0];
+	invalid.op = DRM_CHROME9_FRAGMENT_OP_SUB;
+	invalid.src[1] = invalid.src[0];
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret || memcmp(program->alu[0], expected_sub,
+			  sizeof(expected_sub)))
+		goto failed;
+	stage = "MUL vPos,T0";
+	ret = chrome9_fragment_compile(position_varying, 1, constants, 0, 0, 1,
+				       program);
+	if (ret || program->active_texture_count || program->varying_count != 1 ||
+	    program->varying_width[0] != 2 ||
+	    memcmp(program->alu[0], expected_position_first,
+		   sizeof(expected_position_first)) ||
+	    program->controls[0] != 0x900d8009)
+		goto failed;
+	stage = "MUL T0,vPos";
+	invalid = position_varying[0];
+	invalid.src[0] = position_varying[0].src[1];
+	invalid.src[1] = position_varying[0].src[0];
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 1, program);
+	if (ret || program->active_texture_count != 1 ||
+	    memcmp(program->alu[0], expected_varying_first,
+		   sizeof(expected_varying_first)) ||
+	    program->controls[0] != 0x900d8009)
+		goto failed;
+	stage = "MUL+FRC vPos";
+	ret = chrome9_fragment_compile(position_center,
+				       ARRAY_SIZE(position_center), constants, 1, 0, 0,
+				       program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_center_alu) ||
+	    program->tau_count || program->varying_count ||
+	    program->active_texture_count ||
+	    memcmp(program->alu, expected_center_alu,
+		   sizeof(expected_center_alu)) ||
+	    program->controls[0] != 0x900d8008 ||
+	    program->controls[1] != 0x91000000 ||
+	    program->controls[2] != 0x92000002)
+		goto failed;
+	stage = "MISC/direct-coordinate alias rejection";
+	ret = chrome9_fragment_compile(position_mad,
+				       ARRAY_SIZE(position_mad), constants, 0, 0, 4,
+				       program);
+	if (ret != -EOPNOTSUPP)
+		goto failed;
+	stage = "vPos computed TEX";
+	ret = chrome9_fragment_compile(position_texture,
+				       ARRAY_SIZE(position_texture), constants, 1, 1, 0,
+				       program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_texture_alu) ||
+	    program->tau_count != 1 || program->tau[0] != 0x301101b0 ||
+	    program->varying_count || program->active_texture_count ||
+	    program->stage0_coordinate != 0 ||
+	    memcmp(program->alu, expected_texture_alu,
+		   sizeof(expected_texture_alu)) ||
+	    memcmp(program->controls, expected_texture_controls,
+		   sizeof(expected_texture_controls)))
+		goto failed;
+	stage = "reject vPos index";
+	invalid = position_mov[0];
+	invalid.src[0].index = 1;
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret != -EINVAL)
+		goto failed;
+	stage = "reject vPos Z selector";
+	invalid = position_mov[0];
+	invalid.src[0].swizzle[2] = DRM_CHROME9_FRAGMENT_SWIZZLE_Z;
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret != -EINVAL)
+		goto failed;
+	stage = "reject active vPos ZERO selector";
+	invalid = position_mov[0];
+	invalid.src[0].swizzle[2] = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret != -EINVAL)
+		goto failed;
+	stage = "reject vPos modifier";
+	invalid = position_mov[0];
+	invalid.src[0].modifier = DRM_CHROME9_FRAGMENT_MOD_NEG;
+	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 0, program);
+	if (ret != -EINVAL)
+		goto failed;
+	return 0;
+
+failed:
+	pr_err("chrome9: fragment position self-test %s failed (%d)\n",
+	       stage, ret);
+	pr_err("chrome9: position probe ALU0=%08x %08x %08x %08x ALU1=%08x %08x %08x %08x controls=%08x %08x %08x counts=%u/%u/%u\n",
+	       program->alu[0][0], program->alu[0][1], program->alu[0][2],
+	       program->alu[0][3], program->alu[1][0], program->alu[1][1],
+	       program->alu[1][2], program->alu[1][3], program->controls[0],
+	       program->controls[1], program->controls[2], program->alu_count,
+	       program->tau_count, program->active_texture_count);
+	return -EINVAL;
 }
 
 int chrome9_fragment_selftest(void)
@@ -1609,6 +1986,9 @@ int chrome9_fragment_selftest(void)
 	program = kzalloc_obj(*program);
 	if (!program)
 		return -ENOMEM;
+	ret = chrome9_fragment_position_selftest(program);
+	if (ret)
+		goto out;
 	ret = chrome9_fragment_compile(computed, ARRAY_SIZE(computed), constants,
 		2, 1, 0, program);
 	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
