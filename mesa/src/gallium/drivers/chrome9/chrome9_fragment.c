@@ -5,6 +5,19 @@
 
 #include <string.h>
 
+unsigned
+chrome9_fragment_sampler_high_water(uint8_t sampler_mask)
+{
+   return sampler_mask ? 32 - __builtin_clz(sampler_mask) : 0;
+}
+
+bool
+chrome9_fragment_sampler_slots_dense(uint8_t sampler_mask)
+{
+   return sampler_mask == (1u << chrome9_fragment_sampler_high_water(
+      sampler_mask)) - 1;
+}
+
 static bool
 chrome9_fragment_swizzle(enum chrome9_ps_swizzle swizzle, uint8_t *result)
 {
@@ -193,8 +206,8 @@ chrome9_fragment_build_instructions(
          if (source->sampler >= 8 ||
              !(sampler_mask & (1u << source->sampler)))
             return false;
-         instruction->sampler = __builtin_popcount(
-            sampler_mask & ((1u << source->sampler) - 1));
+         /* TAU records retain the logical sampler id, including gaps. */
+         instruction->sampler = source->sampler;
       }
       for (unsigned s = 0; s < source_count; s++)
          if (!chrome9_fragment_source(&source->source[s],

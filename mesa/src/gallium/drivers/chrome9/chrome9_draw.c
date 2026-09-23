@@ -83,17 +83,6 @@ chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
           ctx->fs->semantic_fs_valid && !ctx->fs->semantic_input_mask;
 }
 
-static unsigned
-chrome9_fragment_sampler_unit(const struct chrome9_context *ctx,
-                              unsigned physical)
-{
-   uint32_t mask = ctx->fs->semantic_sampler_mask;
-
-   while (physical--)
-      mask &= mask - 1;
-   return __builtin_ctz(mask);
-}
-
 static bool
 chrome9_fs_uses_constant_color(unsigned program)
 {
@@ -239,8 +228,8 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       uint16_t varying_mask = crender->ctx->fs->semantic_varying_mask;
 
       crender->varying_count = varying_mask ? 32 - __builtin_clz(varying_mask) : 0;
-      crender->texture_count =
-         __builtin_popcount(crender->ctx->fs->semantic_sampler_mask);
+      crender->texture_count = chrome9_fragment_sampler_high_water(
+         crender->ctx->fs->semantic_sampler_mask);
       crender->textured = crender->texture_count != 0;
       crender->packed_generic = 0;
       memset(&crender->vinfo, 0, sizeof(crender->vinfo));
@@ -918,6 +907,14 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                      ctx->draw_triangle_blend)))
       return false;
    if (texture_count) {
+      /* The current kernel ABI validates every descriptor below high-water
+       * as a live BO.  Do not compact logical TAU ids or alias a hole to a
+       * real texture until an explicit disabled-descriptor ABI exists. */
+      *reason = "sparse-sampler-abi";
+      if (chrome9_use_generic_fragment_program(ctx) &&
+          !chrome9_fragment_sampler_slots_dense(
+             ctx->fs->semantic_sampler_mask))
+         return false;
       *reason = "texture-count/depth";
       if ((!chrome9_use_generic_fragment_program(ctx) &&
            !(texture_count == 2 ?
@@ -943,8 +940,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
               texture_count))
          return false;
       for (unsigned unit = 0; unit < texture_count; unit++) {
-         unsigned logical = chrome9_use_generic_fragment_program(ctx) ?
-            chrome9_fragment_sampler_unit(ctx, unit) : unit;
+         unsigned logical = unit;
          struct pipe_sampler_view *view = ctx->sampler_views[logical];
          struct pipe_resource *original = view ? view->texture : NULL;
          struct pipe_resource *source = view ?
@@ -1106,8 +1102,7 @@ chrome9_submit_generic_triangle(
       const struct pipe_resource *resource = &textures[unit]->base;
       const struct chrome9_texture_format_info *format =
          chrome9_texture_format_info(resource->format);
-      const unsigned logical = chrome9_fragment_sampler_unit(
-         crender->ctx, unit);
+      const unsigned logical = unit;
       const struct pipe_sampler_view *view =
          crender->ctx->sampler_views[logical];
       unsigned last_level;

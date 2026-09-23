@@ -63,7 +63,7 @@ check_direct_texture_order(void)
    CHECK(chrome9_fragment_build_instructions(&ir, 0x5, native, &count));
    CHECK(count == 2);
    CHECK(native[0].op == DRM_CHROME9_FRAGMENT_OP_TEX);
-   CHECK(native[0].sampler == 1);
+   CHECK(native[0].sampler == 2);
    CHECK(native[0].src[0].file == DRM_CHROME9_FRAGMENT_FILE_VARYING);
    CHECK(native[0].src[0].index == 3);
    CHECK(native[0].src[0].swizzle[0] ==
@@ -73,6 +73,40 @@ check_direct_texture_order(void)
    CHECK(native[1].op == DRM_CHROME9_FRAGMENT_OP_MOV);
    CHECK(native[1].src[0].file == DRM_CHROME9_FRAGMENT_FILE_TEMP);
    CHECK(native[1].src[0].index == 4);
+   return true;
+}
+
+static bool
+check_sparse_sampler_ids(void)
+{
+   struct drm_chrome9_fragment_instruction
+      native[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   struct chrome9_ps_ir ir = { .count = 5 };
+   const unsigned logical[] = { 0, 1, 2, 4, 5 };
+   unsigned count = 0;
+
+   CHECK(chrome9_fragment_sampler_high_water(0) == 0);
+   CHECK(chrome9_fragment_sampler_high_water(0x37) == 6);
+   CHECK(chrome9_fragment_sampler_high_water(0x80) == 8);
+   CHECK(chrome9_fragment_sampler_slots_dense(0));
+   CHECK(chrome9_fragment_sampler_slots_dense(0x3f));
+   CHECK(chrome9_fragment_sampler_slots_dense(0xff));
+   CHECK(!chrome9_fragment_sampler_slots_dense(0x37));
+   CHECK(!chrome9_fragment_sampler_slots_dense(0x80));
+   for (unsigned i = 0; i < 5; i++) {
+      ir.instruction[i].op = CHROME9_PS_OPCODE_TEX;
+      ir.instruction[i].sampler = logical[i];
+      ir.instruction[i].destination = temporary(i);
+      ir.instruction[i].source[0] = source(
+         CHROME9_PS_SOURCE_TEXTURE, 0, CHROME9_PS_SWIZZLE_X,
+         CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_Z,
+         CHROME9_PS_SWIZZLE_W);
+   }
+   CHECK(chrome9_fragment_build_instructions(&ir, 0x37, native, &count));
+   CHECK(count == 5);
+   for (unsigned i = 0; i < 5; i++)
+      CHECK(native[i].sampler == logical[i]);
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0x17, native, &count));
    return true;
 }
 
@@ -125,5 +159,6 @@ check_computed_texture_order(void)
 int
 main(void)
 {
-   return !(check_direct_texture_order() && check_computed_texture_order());
+   return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
+            check_computed_texture_order());
 }
