@@ -790,7 +790,6 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	u32 alu_index = 0;
 	u32 tau_index = 0;
 	u32 active0 = 0;
-	u32 native_tau_varying_mask = 0;
 	bool starts_alu = false;
 	unsigned int i;
 
@@ -908,8 +907,6 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 			}
 			state->coordinate_mask |= BIT(coordinate_id);
 			active0 = max(active0, coordinate_id + 1);
-			if (!computed)
-				native_tau_varying_mask |= BIT(coordinate_id);
 			tau_index++;
 			previous_phase = 1;
 			continue;
@@ -984,8 +981,10 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	program->active_texture_count =
 		chrome9_fragment_active_texture_count(&resource);
 	program->tau_coordinate_mask = state->coordinate_mask;
-	program->controls[0] = 0x90000000 |
-		(state->alu_varying_mask & ~native_tau_varying_mask);
+	/* A90 retains direct ALU input bits even when A91 also names the same
+	 * physical coordinate for TAU.  The two masks select different consumers.
+	 */
+	program->controls[0] = 0x90000000 | state->alu_varying_mask;
 	starts_alu = state->instructions[0].op != DRM_CHROME9_FRAGMENT_OP_TEX ||
 		state->instructions[0].src[0].file ==
 		DRM_CHROME9_FRAGMENT_FILE_TEMP;
@@ -1575,7 +1574,7 @@ int chrome9_fragment_selftest(void)
 		{ 0x0140b6d0, 0x30201053, 0x00f20005, 0x00000820 },
 	};
 	static const u32 expected_packed_gray_controls[] = {
-		0x90018000, 0x91000001, 0x92010003, 0x93000001,
+		0x90018001, 0x91000001, 0x92010003, 0x93000001,
 		0x94000000, 0x95000000, 0x96000000, 0x97000000,
 		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
 	};
@@ -1584,7 +1583,7 @@ int chrome9_fragment_selftest(void)
 		{ 0x0140b6d0, 0x30201054, 0x00f20005, 0x00000820 },
 	};
 	static const u32 expected_packed_gray_partial_controls[] = {
-		0x90018000, 0x91000001, 0x92010002, 0x93000001,
+		0x90018001, 0x91000001, 0x92010002, 0x93000001,
 		0x94000000, 0x95000000, 0x96000000, 0x97000000,
 		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
 	};
@@ -1629,7 +1628,8 @@ int chrome9_fragment_selftest(void)
 		ARRAY_SIZE(swizzled_texture), constants, 0, 1, 1, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->active_texture_count != 1 || program->varying_count != 1 ||
-	    program->varying_width[0] != 2) {
+	    program->varying_width[0] != 2 ||
+	    program->controls[0] != 0x90018000) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1683,7 +1683,7 @@ int chrome9_fragment_selftest(void)
 	    program->varying_logical[0] || program->varying_width[0] != 3 ||
 	    program->alu[0][1] != 0x302c0000 ||
 	    program->alu[0][2] != 0x00f20005 ||
-	    program->controls[0] != 0x90018000 ||
+	    program->controls[0] != 0x90018001 ||
 	    program->controls[1] != 0x91000001 ||
 	    program->controls[2] != 0x92010001 ||
 	    program->controls[3] != 0x93000001)
