@@ -1580,6 +1580,35 @@ static u32 chrome9_fragment_texture_format(u32 format)
 	}
 }
 
+static void chrome9_fragment_mip_state(
+	const struct drm_chrome9_fragment_texture_state *texture, u32 mip[8])
+{
+	u32 level_count = texture->last_level - texture->first_level;
+	unsigned int level;
+
+	memset(mip, 0, 8 * sizeof(*mip));
+	for (level = 1; level <= min(level_count, 8U); level++)
+		mip[level - 1] = 0x40000000 |
+			((texture->level_offset[texture->first_level + level] -
+			  texture->level_offset[texture->first_level]) >> 8);
+}
+
+static void chrome9_fragment_sampler_state(
+	const struct drm_chrome9_fragment_texture_state *texture, u32 sampler[4])
+{
+	u32 lod_min = texture->min_lod_s5_5 / 32;
+	u32 lod_max = texture->max_lod_s5_5 / 32;
+
+	sampler[0] = 0x30000000 |
+		((u32)texture->lod_bias_s5_5 & 0x3ff) << 12 |
+		lod_max << 6 | lod_min;
+	sampler[1] = 0x31100000 | texture->mag_filter << 13 |
+		texture->min_filter << 10 | texture->mag_filter << 7 |
+		texture->min_filter << 4 | texture->mip_filter;
+	sampler[2] = 0x32000040 | texture->wrap_t << 3 | texture->wrap_s;
+	sampler[3] = 0xcccccccc;
+}
+
 static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	const struct chrome9_draw_request *request, struct chrome9_job *job,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
@@ -1739,26 +1768,30 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		u32 height = texture->height >> texture->first_level;
 		u32 log_size = ilog2(max(height, 1U)) << 4 |
 			ilog2(max(width, 1U));
+		u32 level_count = texture->last_level - texture->first_level;
+		u32 mip[8];
 		u32 image[] = {
 			(texture_base[i] + texture->level_offset[texture->first_level]) >> 8,
 			0x18001101, 0x20000000 | height << 12 | width,
-			0x21000001, 0x22008000 | log_size,
+			0x21000001, 0x22000000 |
+			(is_power_of_2(width) && is_power_of_2(height) ? BIT(15) : 0) |
+			log_size,
 			0x30000000 | chrome9_fragment_texture_format(texture->format) << 16 |
 			(texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ?
 			 0x2000 : 0),
 		};
-		u32 sampler[] = {
-			0x30000000,
-			0x31100000 | texture->mag_filter << 13 |
-			texture->min_filter << 10 | texture->mag_filter << 7 |
-			texture->min_filter << 4,
-			0x32000040 | texture->wrap_t << 3 | texture->wrap_s,
-			0xcccccccc,
-		};
+		u32 sampler[4];
+
+		chrome9_fragment_sampler_state(texture, sampler);
 
 		chrome9_emit_header2(&p, 0x440, 0x0000043c,
 				     i << 24 | 0x00020000, image,
 				     ARRAY_SIZE(image));
+		if (level_count) {
+			chrome9_fragment_mip_state(texture, mip);
+			chrome9_emit_header3(&p, 0x10030000 | i << 3, mip,
+					     ARRAY_SIZE(mip));
+		}
 		chrome9_emit_header2(&p, 0x440, 0x0000043c,
 				     i << 24 | 0x20020000, sampler,
 				     ARRAY_SIZE(sampler));
@@ -3279,6 +3312,8 @@ bool chrome9_ps_add_enabled(void)
 	return READ_ONCE(chrome9_ps_add);
 }
 
+static int chrome9_fragment_texture_selftest(void);
+
 int chrome9_engine_init(struct chrome9_device *cdev)
 {
 	struct chrome9_engine *engine;
@@ -3294,6 +3329,18 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 #ifndef CONFIG_X86
 	return -EOPNOTSUPP;
 #endif
+	ret = chrome9_fragment_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"semantic fragment compiler self-test failed: %d\n", ret);
+		return ret;
+	}
+	ret = chrome9_fragment_texture_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"fragment texture-state self-test failed: %d\n", ret);
+		return ret;
+	}
 	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
 	cdev->mmio = chrome9_iomap_bar_once(cdev->pdev, 1);
 	cdev->vram = chrome9_iomap_bar_once(cdev->pdev, 2);
@@ -6648,8 +6695,13 @@ static int chrome9_validate_fragment_texture(
 	const struct drm_chrome9_fragment_texture_state *texture,
 	u64 *object_size)
 {
-	u64 end;
+	u64 base_offset;
+	u64 end = 0;
+	u64 previous_end = 0;
+	u64 relative;
+	u64 level_size;
 	u32 bytes_per_pixel;
+	u32 level_count;
 	unsigned int i;
 
 	switch (texture->format) {
@@ -6666,35 +6718,109 @@ static int chrome9_validate_fragment_texture(
 	}
 	if (!texture->handle || !texture->width || texture->width > 2048 ||
 	    !texture->height || texture->height > 2048 ||
-	    !is_power_of_2(texture->width) ||
-	    !is_power_of_2(texture->height) || texture->first_level ||
-	    texture->last_level ||
+	    texture->first_level > texture->last_level ||
+	    texture->last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
+	    texture->last_level > ilog2(max(texture->width, texture->height)) ||
 	    texture->min_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
 	    texture->mag_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
-	    texture->mip_filter != DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+	    texture->mip_filter > DRM_CHROME9_TEXTURE_MIP_FILTER_LINEAR ||
 	    (texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
 	     texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
 	     texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
 	    (texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
 	     texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
 	     texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
-	    texture->lod_bias_s5_5 || texture->min_lod_s5_5 ||
-	    texture->max_lod_s5_5 || texture->border_color ||
+	    texture->lod_bias_s5_5 < -512 || texture->lod_bias_s5_5 > 511 ||
+	    texture->min_lod_s5_5 < 0 || texture->max_lod_s5_5 < 0 ||
+	    (texture->min_lod_s5_5 & 31) ||
+	    (texture->max_lod_s5_5 & 31) || texture->border_color ||
 	    texture->reserved0 ||
-	    memchr_inv(texture->reserved, 0, sizeof(texture->reserved)) ||
-	    texture->level_offset[0] != PAGE_SIZE ||
-	    texture->level_pitch[0] !=
-		ALIGN(texture->width * bytes_per_pixel, 32))
+	    memchr_inv(texture->reserved, 0, sizeof(texture->reserved)))
 		return -EINVAL;
-	for (i = 1; i < DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS; i++)
-		if (texture->level_offset[i] || texture->level_pitch[i])
+	level_count = texture->last_level - texture->first_level;
+	if (texture->min_lod_s5_5 > texture->max_lod_s5_5 ||
+	    texture->max_lod_s5_5 > level_count * 32 ||
+	    (!level_count &&
+	     texture->mip_filter != DRM_CHROME9_TEXTURE_MIP_FILTER_NONE) ||
+	    (level_count &&
+	     texture->format != DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888 &&
+	     texture->format != DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888))
+		return -EINVAL;
+	base_offset = texture->level_offset[texture->first_level];
+	if (base_offset != PAGE_SIZE)
+		return -EINVAL;
+	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS; i++) {
+		u32 width;
+		u32 height;
+		u32 pitch;
+
+		if (i < texture->first_level || i > texture->last_level) {
+			if (texture->level_offset[i] || texture->level_pitch[i])
+				return -EINVAL;
+			continue;
+		}
+		width = max(texture->width >> i, 1U);
+		height = max(texture->height >> i, 1U);
+		pitch = ALIGN(width * bytes_per_pixel, 32);
+		if (texture->level_pitch[i] != pitch ||
+		    !IS_ALIGNED(texture->level_offset[i], 256) ||
+		    (i > texture->first_level &&
+		     texture->level_offset[i] < ALIGN(previous_end, 256)))
 			return -EINVAL;
-	if (check_mul_overflow((u64)texture->level_pitch[0],
-			       (u64)texture->height, &end) ||
-	    check_add_overflow(end, (u64)texture->level_offset[0], &end) ||
-	    check_add_overflow(ALIGN(end, PAGE_SIZE), (u64)PAGE_SIZE,
+		relative = texture->level_offset[i] - base_offset;
+		if ((relative >> 8) > 0x00ffffff ||
+		    (i > texture->first_level + 8 &&
+		     texture->level_offset[i] !=
+		     texture->level_offset[i - 1] + 0x100))
+			return -EINVAL;
+		if (check_mul_overflow((u64)pitch, (u64)height, &level_size) ||
+		    check_add_overflow((u64)texture->level_offset[i], level_size,
+				       &end))
+			return -E2BIG;
+		previous_end = end;
+	}
+	if (check_add_overflow(ALIGN(end, PAGE_SIZE), (u64)PAGE_SIZE,
 			       object_size))
 		return -E2BIG;
+	return 0;
+}
+
+static int chrome9_fragment_texture_selftest(void)
+{
+	struct drm_chrome9_fragment_texture_state texture = {
+		.handle = 1,
+		.format = DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888,
+		.width = 64,
+		.height = 32,
+		.last_level = 1,
+		.min_filter = DRM_CHROME9_TEXTURE_FILTER_LINEAR,
+		.mag_filter = DRM_CHROME9_TEXTURE_FILTER_LINEAR,
+		.mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_LINEAR,
+		.wrap_s = DRM_CHROME9_TEXTURE_WRAP_REPEAT,
+		.wrap_t = DRM_CHROME9_TEXTURE_WRAP_REPEAT,
+		.lod_bias_s5_5 = -16,
+		.max_lod_s5_5 = 32,
+		.level_offset = { PAGE_SIZE, 3 * PAGE_SIZE },
+		.level_pitch = { 256, 128 },
+	};
+	static const u32 expected_sampler[] = {
+		0x303f0040, 0x31102492, 0x32000052, 0xcccccccc,
+	};
+	u32 sampler[4];
+	u32 mip[8];
+	u64 object_size;
+	int ret;
+
+	ret = chrome9_validate_fragment_texture(&texture, &object_size);
+	if (ret)
+		return ret;
+	chrome9_fragment_sampler_state(&texture, sampler);
+	chrome9_fragment_mip_state(&texture, mip);
+	if (object_size != 5 * PAGE_SIZE ||
+	    memcmp(sampler, expected_sampler, sizeof(expected_sampler)) ||
+	    mip[0] != 0x40000020 || memchr_inv(mip + 1, 0,
+					       7 * sizeof(*mip)))
+		return -EINVAL;
 	return 0;
 }
 
