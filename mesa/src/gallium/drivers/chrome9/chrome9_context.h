@@ -57,7 +57,7 @@ struct chrome9_shader {
    } fragment_program;
    uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
-   struct chrome9_ps_ir native_fs_ir;
+   struct chrome9_ps_ir semantic_fs_ir;
    struct chrome9_ps_program native_fs;
    uint32_t semantic_constant_mask;
    uint32_t semantic_uniform_mask;

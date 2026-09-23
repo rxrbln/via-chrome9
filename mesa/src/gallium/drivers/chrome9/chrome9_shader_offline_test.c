@@ -273,16 +273,19 @@ check_direct_texture_ps_ir(void)
    struct chrome9_ps_ir ir = { 0 };
    struct chrome9_ps_program program;
 
-   ir.texture_count = 1;
-   ir.texture[0] = (struct chrome9_ps_texture_instruction) {
-      .sampler = 0, .coordinate = 0, .destination = 0,
-   };
-   ir.count = 1;
-   ir.instruction[0].op = CHROME9_PS_OPCODE_MOV;
+   ir.count = 2;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_TEX;
+   ir.instruction[0].sampler = 0;
    ir.instruction[0].destination = (struct chrome9_ps_destination) {
-      .file = CHROME9_PS_DESTINATION_COLOR, .writemask = 0xf,
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 0, .writemask = 0xf,
    };
    ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEXTURE, 0, false);
+   ir.instruction[1].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[1].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_COLOR, .writemask = 0xf,
+   };
+   ir.instruction[1].source[0] =
       identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
 
    assert(chrome9_compile_ps_ir(&ir, &program));
@@ -293,7 +296,7 @@ check_direct_texture_ps_ir(void)
    assert(!memcmp(program.control, expected_control,
                   sizeof(expected_control)));
 
-   ir.texture[0].sampler = 8;
+   ir.instruction[0].sampler = 8;
    assert(!chrome9_compile_ps_ir(&ir, &program));
 }
 
@@ -319,72 +322,79 @@ check_jellyfish_ps_ir(void)
    struct chrome9_ps_ir ir = { 0 };
    struct chrome9_ps_program program;
 
-   ir.texture_count = 2;
-   ir.texture[0] = (struct chrome9_ps_texture_instruction) {
-      .sampler = 0, .coordinate = 0, .destination = 0,
-   };
-   ir.texture[1] = (struct chrome9_ps_texture_instruction) {
-      .sampler = 1, .coordinate = 1, .destination = 1,
-   };
-   ir.count = 6;
-
-   /* r2.rgb = T2.rgb + T3.rgb */
-   ir.instruction[0].op = CHROME9_PS_OPCODE_ADD;
+   ir.count = 8;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_TEX;
+   ir.instruction[0].sampler = 0;
    ir.instruction[0].destination = (struct chrome9_ps_destination) {
-      .file = CHROME9_PS_DESTINATION_TEMP, .id = 2, .writemask = 0x7,
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 0, .writemask = 0xf,
    };
    ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEXTURE, 0, false);
+   ir.instruction[1].op = CHROME9_PS_OPCODE_TEX;
+   ir.instruction[1].sampler = 1;
+   ir.instruction[1].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 1, .writemask = 0xf,
+   };
+   ir.instruction[1].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEXTURE, 1, false);
+
+   /* r2.rgb = T2.rgb + T3.rgb */
+   ir.instruction[2].op = CHROME9_PS_OPCODE_ADD;
+   ir.instruction[2].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 2, .writemask = 0x7,
+   };
+   ir.instruction[2].source[0] =
       identity_source(CHROME9_PS_SOURCE_TEXTURE, 2, false);
-   ir.instruction[0].source[1] =
+   ir.instruction[2].source[1] =
       identity_source(CHROME9_PS_SOURCE_TEXTURE, 3, false);
 
    /* r3.rgb = r2.rgb + r1.rgb */
-   ir.instruction[1].op = CHROME9_PS_OPCODE_ADD;
-   ir.instruction[1].destination = (struct chrome9_ps_destination) {
+   ir.instruction[3].op = CHROME9_PS_OPCODE_ADD;
+   ir.instruction[3].destination = (struct chrome9_ps_destination) {
       .file = CHROME9_PS_DESTINATION_TEMP, .id = 3, .writemask = 0x7,
    };
-   ir.instruction[1].source[0] =
+   ir.instruction[3].source[0] =
       identity_source(CHROME9_PS_SOURCE_TEMP, 2, false);
-   ir.instruction[1].source[1] =
+   ir.instruction[3].source[1] =
       identity_source(CHROME9_PS_SOURCE_TEMP, 1, false);
 
    /* oC0.rgb = r3.rgb * r0.rgb */
-   ir.instruction[2].op = CHROME9_PS_OPCODE_MUL;
-   ir.instruction[2].destination = (struct chrome9_ps_destination) {
+   ir.instruction[4].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[4].destination = (struct chrome9_ps_destination) {
       .file = CHROME9_PS_DESTINATION_COLOR, .writemask = 0x7,
    };
-   ir.instruction[2].source[0] =
+   ir.instruction[4].source[0] =
       identity_source(CHROME9_PS_SOURCE_TEMP, 3, false);
-   ir.instruction[2].source[1] =
+   ir.instruction[4].source[1] =
       identity_source(CHROME9_PS_SOURCE_TEMP, 0, false);
 
    /* r4.x = T3.w * T3.w */
-   ir.instruction[3].op = CHROME9_PS_OPCODE_MUL;
-   ir.instruction[3].destination = (struct chrome9_ps_destination) {
+   ir.instruction[5].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[5].destination = (struct chrome9_ps_destination) {
       .file = CHROME9_PS_DESTINATION_TEMP, .id = 4, .writemask = 0x1,
    };
-   ir.instruction[3].source[0] =
+   ir.instruction[5].source[0] =
       scalar_source(CHROME9_PS_SOURCE_TEXTURE, 3, CHROME9_PS_SWIZZLE_W);
-   ir.instruction[3].source[1] = ir.instruction[3].source[0];
+   ir.instruction[5].source[1] = ir.instruction[5].source[0];
 
    /* r5.x = r4.x + r0.w */
-   ir.instruction[4].op = CHROME9_PS_OPCODE_ADD;
-   ir.instruction[4].destination = (struct chrome9_ps_destination) {
+   ir.instruction[6].op = CHROME9_PS_OPCODE_ADD;
+   ir.instruction[6].destination = (struct chrome9_ps_destination) {
       .file = CHROME9_PS_DESTINATION_TEMP, .id = 5, .writemask = 0x1,
    };
-   ir.instruction[4].source[0] =
+   ir.instruction[6].source[0] =
       scalar_source(CHROME9_PS_SOURCE_TEMP, 4, CHROME9_PS_SWIZZLE_X);
-   ir.instruction[4].source[1] =
+   ir.instruction[6].source[1] =
       scalar_source(CHROME9_PS_SOURCE_TEMP, 0, CHROME9_PS_SWIZZLE_W);
 
    /* oC0.w = r5.x + c0.x */
-   ir.instruction[5].op = CHROME9_PS_OPCODE_ADD;
-   ir.instruction[5].destination = (struct chrome9_ps_destination) {
+   ir.instruction[7].op = CHROME9_PS_OPCODE_ADD;
+   ir.instruction[7].destination = (struct chrome9_ps_destination) {
       .file = CHROME9_PS_DESTINATION_COLOR, .writemask = 0x8,
    };
-   ir.instruction[5].source[0] =
+   ir.instruction[7].source[0] =
       scalar_source(CHROME9_PS_SOURCE_TEMP, 5, CHROME9_PS_SWIZZLE_X);
-   ir.instruction[5].source[1] =
+   ir.instruction[7].source[1] =
       scalar_source(CHROME9_PS_SOURCE_CONSTANT, 0, CHROME9_PS_SWIZZLE_X);
 
    assert(chrome9_compile_ps_ir(&ir, &program));
@@ -397,16 +407,16 @@ check_jellyfish_ps_ir(void)
 
    /* Partial definitions are component checked, and both color writes must
     * be disjoint and collectively complete. */
-   ir.instruction[4].source[0].swizzle[0] = CHROME9_PS_SWIZZLE_Y;
+   ir.instruction[6].source[0].swizzle[0] = CHROME9_PS_SWIZZLE_Y;
    assert(!chrome9_compile_ps_ir(&ir, &program));
-   ir.instruction[4].source[0].swizzle[0] = CHROME9_PS_SWIZZLE_X;
-   ir.instruction[5].destination.writemask = 0x1;
+   ir.instruction[6].source[0].swizzle[0] = CHROME9_PS_SWIZZLE_X;
+   ir.instruction[7].destination.writemask = 0x1;
    assert(!chrome9_compile_ps_ir(&ir, &program));
-   ir.instruction[5].destination.writemask = 0x8;
-   ir.instruction[3].destination.id = 2;
+   ir.instruction[7].destination.writemask = 0x8;
+   ir.instruction[5].destination.id = 2;
    assert(!chrome9_compile_ps_ir(&ir, &program));
-   ir.instruction[3].destination.id = 4;
-   ir.texture[1].coordinate = 8;
+   ir.instruction[5].destination.id = 4;
+   ir.instruction[1].source[0].id = 8;
    assert(!chrome9_compile_ps_ir(&ir, &program));
 }
 

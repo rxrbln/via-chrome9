@@ -418,6 +418,8 @@ bool
 chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                       struct chrome9_ps_program *p)
 {
+   const struct chrome9_ps_instruction *textures[CHROME9_PS_MAX_TAU];
+   const struct chrome9_ps_instruction *alu[CHROME9_PS_MAX_ALU];
    uint16_t defined_temps = 0;
    uint8_t defined_components[12] = { 0 };
    uint8_t temp_uses[12] = { 0 };
@@ -429,38 +431,59 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    uint8_t coordinate_map[8];
    uint8_t coordinate_uses[8] = { 0 };
    uint8_t coordinate_count = 0;
+   unsigned texture_count = 0;
+   unsigned alu_count = 0;
+   bool saw_alu = false;
 
-   if (!ir || !p || !ir->count || ir->count > CHROME9_PS_MAX_ALU ||
-       ir->texture_count > CHROME9_PS_MAX_TAU)
+   if (!ir || !p || !ir->count ||
+       ir->count > CHROME9_PS_MAX_INSTRUCTIONS)
       return false;
    memset(coordinate_map, 0xff, sizeof(coordinate_map));
-   /* This schedule is the general TAU-first subset: each fetch reads one
-    * direct interpolator, all fetches complete before the ALU stream, and
-    * every sampled result defines an ordinary SSA temporary.  ALU-generated
-    * coordinates require interleaved bridge MOVs and use a separate path. */
-   for (unsigned i = 0; i < ir->texture_count; i++) {
-      const struct chrome9_ps_texture_instruction *texture = &ir->texture[i];
+   /* The offline native encoder covers the characterized TAU-first subset.
+    * Keep the semantic IR ordered even when this optional encoder cannot
+    * represent an ALU-generated coordinate; cmd22 consumes that full stream
+    * directly and lets the kernel schedule the required bridge operations. */
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction = &ir->instruction[i];
 
-      if (texture->sampler >= 8 || texture->coordinate >= 8 ||
-          texture->destination >= 12 || texture->reserved ||
-          (texture->swizzle & ~0xff0u) ||
-          (defined_temps & (1u << texture->destination)))
+      if (instruction->op != CHROME9_PS_OPCODE_TEX) {
+         if (alu_count >= CHROME9_PS_MAX_ALU)
+            return false;
+         saw_alu = true;
+         alu[alu_count++] = instruction;
+         continue;
+      }
+      if (saw_alu || texture_count >= CHROME9_PS_MAX_TAU ||
+          instruction->sampler >= 8 ||
+          instruction->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+          instruction->destination.id >= 12 ||
+          instruction->destination.writemask != 0xf ||
+          instruction->destination.saturate ||
+          instruction->source[0].file != CHROME9_PS_SOURCE_TEXTURE ||
+          instruction->source[0].id >= 8 ||
+          instruction->source[0].modifier ||
+          instruction->source[0].last_use ||
+          instruction->source[0].swizzle[0] > CHROME9_PS_SWIZZLE_W ||
+          instruction->source[0].swizzle[1] > CHROME9_PS_SWIZZLE_W ||
+          (defined_temps & (1u << instruction->destination.id)))
          return false;
-      if (coordinate_map[texture->coordinate] == 0xff) {
+      if (coordinate_map[instruction->source[0].id] == 0xff) {
          if (coordinate_count >= 8)
             return false;
-         coordinate_map[texture->coordinate] = coordinate_count++;
+         coordinate_map[instruction->source[0].id] = coordinate_count++;
       }
-      coordinate_uses[coordinate_map[texture->coordinate]]++;
-      defined_temps |= 1u << texture->destination;
-      defined_components[texture->destination] = 0xf;
+      coordinate_uses[coordinate_map[instruction->source[0].id]]++;
+      defined_temps |= 1u << instruction->destination.id;
+      defined_components[instruction->destination.id] = 0xf;
+      textures[texture_count++] = instruction;
    }
+   if (!alu_count)
+      return false;
    /* Validate the semantic IR and calculate temporary lifetimes before
     * packing any hardware words.  Release bits are an encoder result, not a
     * property callers may guess. */
-   for (unsigned i = 0; i < ir->count; i++) {
-      const struct chrome9_ps_instruction *instruction =
-         &ir->instruction[i];
+   for (unsigned i = 0; i < alu_count; i++) {
+      const struct chrome9_ps_instruction *instruction = alu[i];
       unsigned source_count = instruction_source_count(instruction->op);
 
       if (!destination_valid(&instruction->destination) || !source_count)
@@ -514,9 +537,8 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    memcpy(remaining_uses, temp_uses, sizeof(remaining_uses));
    memcpy(remaining_texture_uses, texture_uses,
           sizeof(remaining_texture_uses));
-   for (unsigned i = 0; i < ir->count; i++) {
-      const struct chrome9_ps_instruction *instruction =
-         &ir->instruction[i];
+   for (unsigned i = 0; i < alu_count; i++) {
+      const struct chrome9_ps_instruction *instruction = alu[i];
       struct chrome9_ps_source sources[3] = { 0 };
       uint8_t instruction_uses[12] = { 0 };
       unsigned source_count = instruction_source_count(instruction->op);
@@ -664,8 +686,8 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
          }
       }
    }
-   p->alu_count = ir->count;
-   if (ir->texture_count) {
+   p->alu_count = alu_count;
+   if (texture_count) {
       unsigned temp_count = __builtin_popcount(defined_temps);
       unsigned direct_input_count = direct_texture_mask ?
          32 - __builtin_clz(direct_texture_mask) : 0;
@@ -676,31 +698,35 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
           direct_input_count > 8)
          return false;
       bucket = resource_bucket(direct_input_count, temp_count);
-      for (unsigned i = 0; i < ir->texture_count; i++) {
-         const struct chrome9_ps_texture_instruction *texture =
-            &ir->texture[i];
-         unsigned coordinate = coordinate_map[texture->coordinate];
+      for (unsigned i = 0; i < texture_count; i++) {
+         const struct chrome9_ps_instruction *texture = textures[i];
+         const struct chrome9_ps_source *coordinate_source =
+            &texture->source[0];
+         unsigned coordinate = coordinate_map[coordinate_source->id];
          uint32_t tau = 0x20000000 |
             (uint32_t)texture->sampler << 24 |
             1u << 20 |
-            (uint32_t)texture->destination << 16 |
+            (uint32_t)texture->destination.id << 16 |
             (uint32_t)coordinate << 12 |
-            (texture->swizzle ? texture->swizzle : 0x1b0) |
+            (uint32_t)coordinate_source->swizzle[0] << 10 |
+            (uint32_t)coordinate_source->swizzle[1] << 8 |
+            (uint32_t)coordinate_source->swizzle[2] << 6 |
+            (uint32_t)coordinate_source->swizzle[3] << 4 |
             texture->sampler;
 
          if (!--coordinate_uses[coordinate])
             tau |= 1u << 28;
          p->tau[i] = tau;
-         p->texture_input_mask |= 1u << texture->coordinate;
+         p->texture_input_mask |= 1u << coordinate_source->id;
          p->sampler_mask |= 1u << texture->sampler;
       }
-      p->tau_count = ir->texture_count;
-      t2a[(ir->texture_count - 1) / 24] |=
-         1u << ((ir->texture_count - 1) % 24);
+      p->tau_count = texture_count;
+      t2a[(texture_count - 1) / 24] |=
+         1u << ((texture_count - 1) % 24);
       set_controls(p, 0x90000000 | bucket | direct_texture_mask,
                    0x91000000 | ((1u << coordinate_count) - 1),
-                   0x92000000 | (uint32_t)ir->texture_count << 16 |
-                      ir->count,
+                   0x92000000 | (uint32_t)texture_count << 16 |
+                      alu_count,
                    0x93000000 | t2a[0], 0x95000000);
       p->control[4] |= t2a[1];
    } else {
@@ -714,8 +740,8 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
          return false;
       bucket = resource_bucket(direct_input_count, temp_count);
       set_controls(p, 0x90040000 | bucket | direct_texture_mask,
-                   0x91000000,
-                   0x92000000 | ir->count, 0x93000000, 0x95000000);
+                   0x91000000, 0x92000000 | alu_count,
+                   0x93000000, 0x95000000);
    }
    return true;
 }

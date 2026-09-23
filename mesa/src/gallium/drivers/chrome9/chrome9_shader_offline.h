@@ -82,6 +82,7 @@ struct chrome9_ps_destination {
 };
 
 enum chrome9_ps_opcode {
+   CHROME9_PS_OPCODE_TEX,
    CHROME9_PS_OPCODE_MOV,
    CHROME9_PS_OPCODE_MUL,
    CHROME9_PS_OPCODE_ADD,
@@ -104,24 +105,15 @@ struct chrome9_ps_instruction {
    enum chrome9_ps_opcode op;
    struct chrome9_ps_destination destination;
    struct chrome9_ps_source source[3];
-};
-
-struct chrome9_ps_texture_instruction {
    uint8_t sampler;
-   uint8_t coordinate;
-   uint8_t destination;
-   uint8_t reserved;
-   /* Packed four 2-bit coordinate selectors in TAU bits 11:4.  Zero keeps
-    * the canonical XYZW payload for compatibility with existing IR users. */
-   uint16_t swizzle;
 };
 
-/* Straight-line compiler IR.  This is deliberately semantic rather than a
- * native-word container: every record is range checked and packed here. */
+/* Ordered straight-line compiler IR.  Texture and ALU operations share one
+ * stream so data dependencies cannot be lost by construction.  TEX uses
+ * source[0] for its full coordinate source and sampler for its logical
+ * sampler; every other field has the same meaning as an ALU instruction. */
 struct chrome9_ps_ir {
-   struct chrome9_ps_texture_instruction texture[CHROME9_PS_MAX_TAU];
-   struct chrome9_ps_instruction instruction[CHROME9_PS_MAX_ALU];
-   uint8_t texture_count;
+   struct chrome9_ps_instruction instruction[CHROME9_PS_MAX_INSTRUCTIONS];
    uint8_t count;
 };
 

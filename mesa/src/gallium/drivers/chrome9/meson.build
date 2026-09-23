@@ -7,6 +7,7 @@ libchrome9 = static_library(
     'chrome9_context.c',
     'chrome9_draw.c',
     'chrome9_drm.c',
+    'chrome9_fragment.c',
     'chrome9_resource.c',
     'chrome9_screen.c',
     'chrome9_shader_offline.c',
@@ -39,6 +40,15 @@ chrome9_shader_offline_test = executable(
 )
 test('chrome9-shader-offline', chrome9_shader_offline_test,
      suite : ['chrome9'])
+
+chrome9_fragment_test = executable(
+  'chrome9-fragment-test',
+  ['chrome9_fragment.c', 'chrome9_fragment_test.c'],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  native : true,
+  install : false,
+)
+test('chrome9-fragment', chrome9_fragment_test, suite : ['chrome9'])
 
 chrome9_mipmap_test = executable(
   'chrome9-mipmap-test',

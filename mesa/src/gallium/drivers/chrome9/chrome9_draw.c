@@ -5,6 +5,7 @@
 
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
+#include "chrome9_fragment.h"
 #include "chrome9_resource.h"
 
 #include <errno.h>
@@ -158,14 +159,14 @@ chrome9_program_instruction(const struct chrome9_shader *shader,
    const struct chrome9_ps_instruction *native;
 
    if (!shader || !shader->native_fs_valid || !shader->native_fs_from_nir ||
-       shader->native_fs_ir.count != 1 ||
+       shader->semantic_fs_ir.count != 1 ||
        shader->native_fs.alu_count != 1 || shader->native_fs.tau_count ||
        shader->native_fs.sampler_mask ||
        (shader->native_fs.varying_mask & ~1u) ||
        (shader->native_fs.constant_mask & ~1u))
       return false;
 
-   native = &shader->native_fs_ir.instruction[0];
+   native = &shader->semantic_fs_ir.instruction[0];
    if (native->destination.file != CHROME9_PS_DESTINATION_COLOR ||
        native->destination.id || native->destination.writemask != 0xf ||
        native->destination.saturate)
@@ -1023,150 +1024,6 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 }
 
 static bool
-chrome9_fragment_swizzle(enum chrome9_ps_swizzle swizzle, uint8_t *result)
-{
-   switch (swizzle) {
-   case CHROME9_PS_SWIZZLE_X:
-      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
-      return true;
-   case CHROME9_PS_SWIZZLE_Y:
-      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_Y;
-      return true;
-   case CHROME9_PS_SWIZZLE_Z:
-      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_Z;
-      return true;
-   case CHROME9_PS_SWIZZLE_W:
-      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_W;
-      return true;
-   case CHROME9_PS_SWIZZLE_ONE:
-      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
-      return true;
-   case CHROME9_PS_SWIZZLE_ZERO:
-      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
-      return true;
-   default:
-      return false;
-   }
-}
-
-static bool
-chrome9_fragment_source(const struct chrome9_ps_source *source,
-                        struct drm_chrome9_fragment_source *result)
-{
-   memset(result, 0, sizeof(*result));
-   switch (source->file) {
-   case CHROME9_PS_SOURCE_TEMP:
-      result->file = DRM_CHROME9_FRAGMENT_FILE_TEMP;
-      break;
-   case CHROME9_PS_SOURCE_INPUT:
-   case CHROME9_PS_SOURCE_TEXTURE:
-      result->file = DRM_CHROME9_FRAGMENT_FILE_VARYING;
-      break;
-   case CHROME9_PS_SOURCE_CONSTANT:
-      result->file = DRM_CHROME9_FRAGMENT_FILE_CONSTANT;
-      break;
-   default:
-      return false;
-   }
-   if (source->modifier != 0 &&
-       source->modifier != CHROME9_PS_SOURCE_NEGATE)
-      return false;
-   result->index = source->id;
-   result->modifier = source->modifier ? DRM_CHROME9_FRAGMENT_MOD_NEG :
-                                        DRM_CHROME9_FRAGMENT_MOD_NONE;
-   for (unsigned c = 0; c < 4; c++)
-      if (!chrome9_fragment_swizzle(source->swizzle[c],
-                                    &result->swizzle[c]))
-         return false;
-   return true;
-}
-
-static bool
-chrome9_fragment_opcode(enum chrome9_ps_opcode op, uint8_t *result)
-{
-   switch (op) {
-   case CHROME9_PS_OPCODE_MOV:
-      *result = DRM_CHROME9_FRAGMENT_OP_MOV;
-      return true;
-   case CHROME9_PS_OPCODE_MUL:
-      *result = DRM_CHROME9_FRAGMENT_OP_MUL;
-      return true;
-   case CHROME9_PS_OPCODE_ADD:
-      *result = DRM_CHROME9_FRAGMENT_OP_ADD;
-      return true;
-   case CHROME9_PS_OPCODE_SUB:
-      *result = DRM_CHROME9_FRAGMENT_OP_SUB;
-      return true;
-   case CHROME9_PS_OPCODE_MAD:
-      *result = DRM_CHROME9_FRAGMENT_OP_MAD;
-      return true;
-   case CHROME9_PS_OPCODE_MIN:
-      *result = DRM_CHROME9_FRAGMENT_OP_MIN;
-      return true;
-   case CHROME9_PS_OPCODE_MAX:
-      *result = DRM_CHROME9_FRAGMENT_OP_MAX;
-      return true;
-   case CHROME9_PS_OPCODE_DP3:
-      *result = DRM_CHROME9_FRAGMENT_OP_DP3;
-      return true;
-   case CHROME9_PS_OPCODE_DP4:
-      *result = DRM_CHROME9_FRAGMENT_OP_DP4;
-      return true;
-   case CHROME9_PS_OPCODE_EXP2:
-      *result = DRM_CHROME9_FRAGMENT_OP_EXP2;
-      return true;
-   case CHROME9_PS_OPCODE_LOG2:
-      *result = DRM_CHROME9_FRAGMENT_OP_LOG2;
-      return true;
-   case CHROME9_PS_OPCODE_RCP:
-      *result = DRM_CHROME9_FRAGMENT_OP_RCP;
-      return true;
-   case CHROME9_PS_OPCODE_RSQ:
-      *result = DRM_CHROME9_FRAGMENT_OP_RSQ;
-      return true;
-   case CHROME9_PS_OPCODE_ABS:
-      *result = DRM_CHROME9_FRAGMENT_OP_ABS;
-      return true;
-   case CHROME9_PS_OPCODE_CMP:
-      *result = DRM_CHROME9_FRAGMENT_OP_CMP;
-      return true;
-   case CHROME9_PS_OPCODE_FRC:
-      *result = DRM_CHROME9_FRAGMENT_OP_FRC;
-      return true;
-   default:
-      return false;
-   }
-}
-
-static unsigned
-chrome9_fragment_source_count(enum chrome9_ps_opcode op)
-{
-   switch (op) {
-   case CHROME9_PS_OPCODE_MOV:
-   case CHROME9_PS_OPCODE_EXP2:
-   case CHROME9_PS_OPCODE_LOG2:
-   case CHROME9_PS_OPCODE_RCP:
-   case CHROME9_PS_OPCODE_RSQ:
-   case CHROME9_PS_OPCODE_ABS:
-   case CHROME9_PS_OPCODE_FRC:
-      return 1;
-   case CHROME9_PS_OPCODE_MUL:
-   case CHROME9_PS_OPCODE_ADD:
-   case CHROME9_PS_OPCODE_SUB:
-   case CHROME9_PS_OPCODE_MIN:
-   case CHROME9_PS_OPCODE_MAX:
-   case CHROME9_PS_OPCODE_DP3:
-   case CHROME9_PS_OPCODE_DP4:
-      return 2;
-   case CHROME9_PS_OPCODE_MAD:
-   case CHROME9_PS_OPCODE_CMP:
-      return 3;
-   default:
-      return 0;
-   }
-}
-
-static bool
 chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
                            uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4])
 {
@@ -1212,68 +1069,6 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
 }
 
 static bool
-chrome9_build_fragment_instructions(
-   const struct chrome9_shader *shader,
-   struct drm_chrome9_fragment_instruction
-      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS],
-   unsigned *count)
-{
-   unsigned n = 0;
-
-   memset(instructions, 0,
-          DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS * sizeof(*instructions));
-   for (unsigned i = 0; i < shader->native_fs_ir.texture_count; i++) {
-      const struct chrome9_ps_texture_instruction *texture =
-         &shader->native_fs_ir.texture[i];
-      struct drm_chrome9_fragment_instruction *instruction =
-         &instructions[n++];
-      uint16_t swizzle = texture->swizzle ? texture->swizzle : 0x1b0;
-
-      instruction->op = DRM_CHROME9_FRAGMENT_OP_TEX;
-      instruction->sampler = __builtin_popcount(
-         shader->semantic_sampler_mask & ((1u << texture->sampler) - 1));
-      instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
-      instruction->dst.index = texture->destination;
-      instruction->dst.writemask = 0xf;
-      instruction->src[0].file = DRM_CHROME9_FRAGMENT_FILE_VARYING;
-      instruction->src[0].index = texture->coordinate;
-      for (unsigned c = 0; c < 4; c++)
-         instruction->src[0].swizzle[c] = (swizzle >> (10 - 2 * c)) & 3;
-   }
-   for (unsigned i = 0; i < shader->native_fs_ir.count; i++) {
-      const struct chrome9_ps_instruction *source =
-         &shader->native_fs_ir.instruction[i];
-      struct drm_chrome9_fragment_instruction *instruction =
-         &instructions[n++];
-      unsigned source_count = chrome9_fragment_source_count(source->op);
-
-      if (!source_count || n > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS ||
-          !chrome9_fragment_opcode(source->op, &instruction->op))
-         return false;
-      switch (source->destination.file) {
-      case CHROME9_PS_DESTINATION_TEMP:
-         instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
-         break;
-      case CHROME9_PS_DESTINATION_COLOR:
-         instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
-         break;
-      default:
-         return false;
-      }
-      instruction->dst.index = source->destination.id;
-      instruction->dst.writemask = source->destination.writemask;
-      instruction->dst.modifier = source->destination.saturate ?
-         DRM_CHROME9_FRAGMENT_DEST_SAT : 0;
-      for (unsigned s = 0; s < source_count; s++)
-         if (!chrome9_fragment_source(&source->source[s],
-                                      &instruction->src[s]))
-            return false;
-   }
-   *count = n;
-   return n != 0;
-}
-
-static bool
 chrome9_submit_generic_triangle(
    struct chrome9_vbuf_render *crender, const unsigned indices[3],
    struct chrome9_resource *target, struct chrome9_resource *depth,
@@ -1296,8 +1091,10 @@ chrome9_submit_generic_triangle(
    const float pixel_center_bias = crender->ctx->rasterizer &&
       crender->ctx->rasterizer->half_pixel_center ? 0.5f : 0.0f;
 
-   if (!chrome9_build_fragment_instructions(crender->ctx->fs, instructions,
-                                            &instruction_count) ||
+   if (!chrome9_fragment_build_instructions(
+          &crender->ctx->fs->semantic_fs_ir,
+          crender->ctx->fs->semantic_sampler_mask, instructions,
+          &instruction_count) ||
        !chrome9_fragment_constants(crender->ctx, constant_count, constants))
       return false;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {

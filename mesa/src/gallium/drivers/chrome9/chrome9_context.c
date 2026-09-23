@@ -2526,7 +2526,32 @@ struct chrome9_ps_nir_builder {
    uint32_t uniform_mask;
    uint8_t value_count;
    uint8_t next_temp;
+   uint8_t alu_count;
+   uint8_t texture_count;
 };
+
+static struct chrome9_ps_instruction *
+chrome9_ps_append_instruction(struct chrome9_ps_nir_builder *builder,
+                              enum chrome9_ps_opcode op)
+{
+   struct chrome9_ps_instruction *instruction;
+
+   if (builder->ir.count >= CHROME9_PS_MAX_INSTRUCTIONS)
+      return NULL;
+   if (op == CHROME9_PS_OPCODE_TEX) {
+      if (builder->texture_count >= CHROME9_PS_MAX_TAU)
+         return NULL;
+      builder->texture_count++;
+   } else {
+      if (builder->alu_count >= CHROME9_PS_MAX_ALU)
+         return NULL;
+      builder->alu_count++;
+   }
+   instruction = &builder->ir.instruction[builder->ir.count++];
+   memset(instruction, 0, sizeof(*instruction));
+   instruction->op = op;
+   return instruction;
+}
 
 static bool
 chrome9_ps_source_from_leaf(enum chrome9_fs_leaf leaf,
@@ -2813,11 +2838,10 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                    component[c].modifier == component[first].modifier)
                   mask |= 1u << c;
             }
-            if (builder->ir.count >= CHROME9_PS_MAX_ALU)
+            move = chrome9_ps_append_instruction(builder,
+                                                  CHROME9_PS_OPCODE_MOV);
+            if (!move)
                return false;
-            move = &builder->ir.instruction[builder->ir.count++];
-            memset(move, 0, sizeof(*move));
-            move->op = CHROME9_PS_OPCODE_MOV;
             move->destination.file = CHROME9_PS_DESTINATION_TEMP;
             move->destination.id = temp;
             move->destination.writemask = mask;
@@ -2835,6 +2859,7 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    }
    if (instr->type == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
+      struct chrome9_ps_instruction *texture;
       struct chrome9_ps_source coordinate;
       int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
 
@@ -2842,7 +2867,6 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
           tex->is_array || tex->is_shadow || tex->texture_index >= 8 ||
           tex->sampler_index != tex->texture_index || coord < 0 ||
           tex->src[coord].src.ssa->num_components != 2 ||
-          builder->ir.texture_count >= CHROME9_PS_MAX_TAU ||
           builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
           builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
          return false;
@@ -2851,9 +2875,14 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
             return false;
       if (!chrome9_ps_lower_def(builder, tex->src[coord].src.ssa,
                                 &coordinate) ||
-          coordinate.file != CHROME9_PS_SOURCE_TEXTURE ||
+          (coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
+           coordinate.file != CHROME9_PS_SOURCE_TEMP) ||
           coordinate.swizzle[0] > CHROME9_PS_SWIZZLE_W ||
           coordinate.swizzle[1] > CHROME9_PS_SWIZZLE_W)
+         return false;
+      texture = chrome9_ps_append_instruction(builder,
+                                               CHROME9_PS_OPCODE_TEX);
+      if (!texture)
          return false;
       temp = builder->next_temp++;
       value = builder->value_count++;
@@ -2862,16 +2891,13 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       builder->value[value].source.id = temp;
       for (unsigned c = 0; c < 4; c++)
          builder->value[value].source.swizzle[c] = c;
-      builder->ir.texture[builder->ir.texture_count++] =
-         (struct chrome9_ps_texture_instruction) {
-            .sampler = tex->sampler_index,
-            .coordinate = coordinate.id,
-            .destination = temp,
-            .swizzle = ((uint16_t)coordinate.swizzle[0] << 10) |
-                       ((uint16_t)coordinate.swizzle[1] << 8) |
-                       ((uint16_t)CHROME9_PS_SWIZZLE_W << 6) |
-                       ((uint16_t)CHROME9_PS_SWIZZLE_W << 4),
-         };
+      texture->sampler = tex->sampler_index;
+      texture->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      texture->destination.id = temp;
+      texture->destination.writemask = 0xf;
+      texture->source[0] = coordinate;
+      texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_W;
+      texture->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_W;
       builder->value[value].complete = true;
       *source = builder->value[value].source;
       return true;
@@ -2896,7 +2922,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                                        &operands[0]) ||
           !chrome9_ps_lower_alu_source(builder, &alu->src[1], 1,
                                        &operands[1]) ||
-          builder->ir.count > CHROME9_PS_MAX_ALU - 3 ||
+          builder->alu_count > CHROME9_PS_MAX_ALU - 3 ||
+          builder->ir.count > CHROME9_PS_MAX_INSTRUCTIONS - 3 ||
           builder->next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS - 3 ||
           builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
          return false;
@@ -2912,17 +2939,19 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       for (unsigned c = 1; c < 4; c++)
          builder->value[value].source.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
 
-      log2 = &builder->ir.instruction[builder->ir.count++];
-      memset(log2, 0, sizeof(*log2));
-      log2->op = CHROME9_PS_OPCODE_LOG2;
+      log2 = chrome9_ps_append_instruction(builder,
+                                            CHROME9_PS_OPCODE_LOG2);
+      multiply = chrome9_ps_append_instruction(builder,
+                                                CHROME9_PS_OPCODE_MUL);
+      exp2 = chrome9_ps_append_instruction(builder,
+                                            CHROME9_PS_OPCODE_EXP2);
+      if (!log2 || !multiply || !exp2)
+         return false;
       log2->destination.file = CHROME9_PS_DESTINATION_TEMP;
       log2->destination.id = log_temp;
       log2->destination.writemask = 1;
       log2->source[0] = operands[0];
 
-      multiply = &builder->ir.instruction[builder->ir.count++];
-      memset(multiply, 0, sizeof(*multiply));
-      multiply->op = CHROME9_PS_OPCODE_MUL;
       multiply->destination.file = CHROME9_PS_DESTINATION_TEMP;
       multiply->destination.id = multiply_temp;
       multiply->destination.writemask = 1;
@@ -2933,9 +2962,6 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
          multiply->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
       multiply->source[1] = operands[1];
 
-      exp2 = &builder->ir.instruction[builder->ir.count++];
-      memset(exp2, 0, sizeof(*exp2));
-      exp2->op = CHROME9_PS_OPCODE_EXP2;
       exp2->destination.file = CHROME9_PS_DESTINATION_TEMP;
       exp2->destination.id = temp;
       exp2->destination.writemask = 1;
@@ -3018,7 +3044,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    default:
       return false;
    }
-   if (builder->ir.count >= CHROME9_PS_MAX_ALU ||
+   if (builder->alu_count >= CHROME9_PS_MAX_ALU ||
+       builder->ir.count >= CHROME9_PS_MAX_INSTRUCTIONS ||
        builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
        builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
       return false;
@@ -3044,17 +3071,14 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
          return false;
       source_count = 2;
    }
-   if (builder->ir.count >= CHROME9_PS_MAX_ALU)
+   native = chrome9_ps_append_instruction(builder, op);
+   if (!native)
       return false;
-   native = &builder->ir.instruction[builder->ir.count];
-   memset(native, 0, sizeof(*native));
-   native->op = op;
    native->destination.file = CHROME9_PS_DESTINATION_TEMP;
    native->destination.id = temp;
    native->destination.writemask = (1u << components) - 1;
    for (unsigned s = 0; s < source_count; s++)
       native->source[s] = operands[s];
-   builder->ir.count++;
    builder->value[value].complete = true;
    *source = builder->value[value].source;
    return true;
@@ -3186,16 +3210,13 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
          return false;
       source_count = 1;
    }
-   if (builder.ir.count >= CHROME9_PS_MAX_ALU)
+   terminal = chrome9_ps_append_instruction(&builder, op);
+   if (!terminal)
       return false;
-   terminal = &builder.ir.instruction[builder.ir.count];
-   memset(terminal, 0, sizeof(*terminal));
-   terminal->op = op;
    terminal->destination.file = CHROME9_PS_DESTINATION_COLOR;
    terminal->destination.writemask = 0xf;
    for (unsigned s = 0; s < source_count; s++)
       terminal->source[s] = operands[s];
-   builder.ir.count++;
    *ir = builder.ir;
    memset(program, 0, sizeof(*program));
    memcpy(program->immediate, builder.immediate,
@@ -3316,24 +3337,19 @@ chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
    enum chrome9_shader_verify_error error;
    bool from_nir, lowered;
 
-   memset(&shader->native_fs_ir, 0, sizeof(shader->native_fs_ir));
-   from_nir = chrome9_compile_ps_nir(nir, &shader->native_fs_ir,
+   memset(&shader->semantic_fs_ir, 0, sizeof(shader->semantic_fs_ir));
+   from_nir = chrome9_compile_ps_nir(nir, &shader->semantic_fs_ir,
                                      &shader->native_fs,
                                      &shader->semantic_uniform_mask,
                                      &lowered);
    shader->semantic_fs_valid = lowered;
    if (lowered) {
-      for (unsigned i = 0; i < shader->native_fs_ir.texture_count; i++) {
-         const struct chrome9_ps_texture_instruction *texture =
-            &shader->native_fs_ir.texture[i];
-
-         shader->semantic_sampler_mask |= 1u << texture->sampler;
-         shader->semantic_varying_mask |= 1u << texture->coordinate;
-      }
-      for (unsigned i = 0; i < shader->native_fs_ir.count; i++) {
+      for (unsigned i = 0; i < shader->semantic_fs_ir.count; i++) {
          const struct chrome9_ps_instruction *instruction =
-            &shader->native_fs_ir.instruction[i];
+            &shader->semantic_fs_ir.instruction[i];
 
+         if (instruction->op == CHROME9_PS_OPCODE_TEX)
+            shader->semantic_sampler_mask |= 1u << instruction->sampler;
          for (unsigned s = 0; s < 3; s++) {
             const struct chrome9_ps_source *source = &instruction->source[s];
 
@@ -3387,13 +3403,13 @@ chrome9_native_fs_is_program_batch(const struct chrome9_shader *shader,
    const struct chrome9_ps_instruction *instruction;
 
    if (!shader->native_fs_valid || !shader->native_fs_from_nir ||
-       shader->native_fs_ir.count != 1 ||
+       shader->semantic_fs_ir.count != 1 ||
        shader->native_fs.alu_count != 1 || shader->native_fs.tau_count ||
        shader->native_fs.sampler_mask ||
        (shader->native_fs.varying_mask & ~1u) ||
        (shader->native_fs.constant_mask & ~1u))
       return false;
-   instruction = &shader->native_fs_ir.instruction[0];
+   instruction = &shader->semantic_fs_ir.instruction[0];
    if (instruction->destination.file != CHROME9_PS_DESTINATION_COLOR ||
        instruction->destination.id ||
        instruction->destination.writemask != 0xf ||
@@ -3537,8 +3553,8 @@ chrome9_create_fs_state(struct pipe_context *pipe,
                  shader->supported, shader->semantic_fs_valid,
                  shader->native_fs_valid,
                  shader->native_fs_from_nir,
-                 shader->native_fs_ir.count,
-                 shader->native_fs_ir.texture_count,
+                 shader->semantic_fs_ir.count,
+                 __builtin_popcount(shader->semantic_sampler_mask),
                  shader->native_fs.alu_count,
                  shader->native_fs.tau_count,
                  shader->native_fs.constant_mask,

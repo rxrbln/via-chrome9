@@ -1762,9 +1762,9 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
            !((struct chrome9_shader *)program_add_fs)->supported ||
            ((struct chrome9_shader *)program_add_fs)->fragment_program !=
               CHROME9_FS_COMPILED_ALU ||
-           ((struct chrome9_shader *)program_add_fs)->native_fs_ir.count != 1 ||
+           ((struct chrome9_shader *)program_add_fs)->semantic_fs_ir.count != 1 ||
            ((struct chrome9_shader *)program_add_fs)->
-              native_fs_ir.instruction[0].op != CHROME9_PS_OPCODE_ADD)) ||
+              semantic_fs_ir.instruction[0].op != CHROME9_PS_OPCODE_ADD)) ||
          !((struct chrome9_shader *)program_c0_fs)->supported ||
          !((struct chrome9_shader *)program_c0_fs)->native_fs_valid ||
          !((struct chrome9_shader *)program_c0_fs)->native_fs_from_nir ||
