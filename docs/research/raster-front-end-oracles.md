@@ -459,7 +459,13 @@ The remaining differential is not the three-ALU shader instruction encoding.
 The production compiler also emits a byte-exact two-ALU equivalent with a
 partial temporary and literal ONE for sampled alpha; a guarded discriminator
 for that form is checked in at `tools/re/chrome9_packed_varying_guard_smoke.c`
-but has not yet run on silicon.
+and was run on VX900 silicon after a cold boot with kernel module SHA-256
+`6c59d9e05acd91bd464e0c6c4474c14ec3ca8043730ddcb46704ea1f36a1c45f`.
+The module passed its compiler and FE selftests and created the render node,
+but this single guarded cmd22 draw also timed out (`seq=1`, `kind=22`,
+`cr=80000000`, `engine=00002f11`).  Thus the c31 constant upload and third
+ALU record are not sufficient explanations for the packed gray+UV hang.
+The engine was quarantined; no later GPU draws were submitted on that boot.
 
 The FE builder also formerly confused sampler high-water with both A08's VS
 output count and T0's TAU-consumer presence.  A sparse `TEX(s5,T5)` uses one
@@ -467,7 +473,8 @@ compacted VS coordinate output despite sampler high-water six; conversely,
 sampling T1 does not make an ALU-only float4 T0 a two-dimensional consumer.
 Kernel commit `326adb3` now takes A08 count from the actual VS outputs and
 A01's T0 selection from the compiler's TAU-coordinate mask.  This has host
-build and selftest coverage only; the new module is not yet live-qualified.
+build and module-probe selftest coverage.  The packed draw still hangs with
+this correction, so it does not establish a successful linkage tuple.
 
 ### Three-coordinate silent-black boundary
 
