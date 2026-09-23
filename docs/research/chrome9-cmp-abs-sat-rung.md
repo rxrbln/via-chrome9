@@ -233,11 +233,23 @@ active=(1,0,1,0)
 For T0=`(-.25,.5,-.75,-.5)`, the expected logical result is
 `(.25,.5,.75,.5)`, numeric A8R8G8B8 host word `804080bf`; an ordinary MOV
 instead stores `00008000`.  `tools/re/chrome9_normalize_guard_smoke.c --abs`
-implements this guarded D16/exterior discriminator.  It remains pending on
-silicon and must be followed by a known-good draw before native dynamic ABS
-is advertised.
+implements this guarded D16/exterior discriminator.  It passed on VX900 with
+the exact `804080bf` word, intact D16 and guards, and a passing known-good
+EGL draw afterward.  This characterizes finite nonzero dynamic ABS; signed
+zero and the A33 ordering discriminator remain separate gates.
 
 ## Destination-SAT lower-clamp oracle and remaining blocker
+
+The guarded two-record intermediate oracle has now passed on VX900.  It
+computes `MOV_SAT temp,c0; SUB color,temp,c1` for c0
+`(-.5,.25,1.5,2)` and c1 `(.25,.25,.25,.25)`.  The no-SAT control produced
+`ff0000ff`; SAT produced `bf0000bf`, as expected when the temporary is
+clamped to [0,1] before subtraction.  Both kept D16 and guard pages intact,
+and the following EGL draw passed with no new engine error.  The first
+attempt returned `EINVAL` only because the oracle declared zero varyings
+while its vertex helper populated varying slot 0; the fixed oracle zeroes
+all unused vertex varying fields.  This proves intermediate destination SAT
+for the tested finite vector, not the A33 alpha-test ordering below.
 
 The terminal UNORM target masks SAT in ordinary readback.  A33 provides
 lower- and upper-bound discriminators if it consumes the shader value before
