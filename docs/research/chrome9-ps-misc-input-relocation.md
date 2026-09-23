@@ -118,6 +118,55 @@ The raw terminal ALU is `...00f0cf05...` in every row.  Final d2 is
 direct dynamic confirmation that the updater return feeds
 `stmReplaceLocationTexIndexAINST`, rather than being unused status.
 
+## Coexistence with ordinary T inputs
+
+One ALU can read MISC and an ordinary T input simultaneously, but the active
+texture-resource result is deliberately schedule- and slot-sensitive.  The
+production configuration-two results for commuted XYXY MULs are:
+
+```text
+MUL oC0,vPos.xyxy,T0.xyxy
+resources 0 0 0 0
+ALU 0140b6d0 102c0041 00f2c304 00000820
+A90..A93 90058009 91000000 92000001 93000000
+
+MUL oC0,T0.xyxy,vPos.xyxy
+resources 1 0 1 0
+ALU 0140b6d0 102c3041 00f2c004 00000820
+A90..A93 90058009 91000000 92000001 93000000
+```
+
+The programs are algebraically equivalent, and both A90 images retain bit
+zero for direct T0 plus bit three for relocated MISC.  They differ in A00's
+third resource output: the native resource walker considers at most one
+class-3 source per ALU, in source-slot priority A, C, then B.  In the first
+record MISC occupies A, wins that selection, and contributes no external
+texture component; T0 in C is not revisited.  In the commuted record T0 is A,
+so it contributes B[0] and yields resource count one.  This exactly matches
+the `stmGetActiveTexTmpNum` control flow at Linux
+`0x19a550/0x19a562/0x19a572` and Windows
+`0x1020200d/0x1020229b/0x10202348`.
+
+This is a safety constraint for the clean compiler.  It must compute A00 from
+the scheduled native source slots, not from a semantic union of POSITION and
+varyings, and it must not reorder commutative operands after resource
+analysis.  MISC still participates independently in the relocation bucket
+and final direct-route mask.
+
+The same coexistence survives every relocation bucket.  Prefixing N WAW
+texture samples before `MUL oC0,vPos.xyxy,T0.xyxy` gives:
+
+| N / tuple | MISC id | final ALU dword 2 | A90 | A91 | A92 | A93 |
+|---|---:|---:|---:|---:|---:|---:|
+| 4 / `(4,1,4,4)` | 4 | `00f2c404` | `90010011` | `9100000f` | `92040001` | `93000008` |
+| 5 / `(5,1,5,5)` | 7 | `00f2c704` | `90008081` | `9100001f` | `92050001` | `93000010` |
+| 8 / `(8,1,8,8)` | 15 | `00f2cf04` | `90000001` | `918000ff` | `92080001` | `93000080` |
+
+At ids 4 and 7, the MISC location bit and ordinary T0 bit coexist in A90.
+At id 15, MISC usage spills to A91 bit 23 while T0 remains A90 bit zero.
+The WAW prefixes are offline relocation discriminators and remain unsuitable
+for runtime admission.
+
 The complete final control/record rows are in
 [`chrome9-ps-misc-input-relocation-corpus.tsv`](chrome9-ps-misc-input-relocation-corpus.tsv).
 At the eight-texture overflow boundary final A91 is `0x008000ff`, not merely

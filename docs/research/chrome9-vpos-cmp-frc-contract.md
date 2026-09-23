@@ -17,6 +17,14 @@ texture-coordinate input is allocated for `vPos`.
 The smallest finalized objects are:
 
 ```text
+MOV oC0,vPos.xyxy
+A90..A93 90058008 91000000 92000001 93000000
+ALU       01c00530 101c0053 00f2c304 000d0820
+
+FRC oC0,vPos.xyxy
+A90..A93 90058008 91000000 92000001 93000000
+ALU       01c00530 101c0053 00f2c304 000e0820
+
 FRC oC0,vPos
 A90..A93 90058008 91000000 92000001 93000000
 ALU       01c00530 301c0053 00f2c305 000e0820
@@ -26,6 +34,17 @@ A90..A93 90058008 91000000 92000002 93000000
 ALU       0140b6d0 30080053 00f2c305 00000020
           01c00530 301c0053 00f20005 000e0820
 ```
+
+The XY-only source token is `10441000`: D3D `MISCTYPE`, register index zero,
+swizzle XYXY.  Both minimal rows report resource tuple `(0,0,0,0)`, have no
+TAU or ordinary varying, and differ only in ALU subop (`d` MOV versus `e`
+FRC).  Configuration two relocates the raw MISC sentinel `0xcf` to native
+class 3/id 3; finalized dword two `00f2c304` contains that id, class and
+terminal-use marker, while dword one `101c0053` carries XYXY.  A narrow
+semantic ABI can therefore append POSITION as source-file value 3, require
+index zero and XY-only selectors, and keep A00/A08/FVF varying counts zero.
+Initially reject POSITION modifiers, Z/W selectors and unused operands rather
+than treating native class 3/id 3 as an ordinary T3 input.
 
 The second object's unfinalized MISC source is `0xcf`; configuration two
 rewrites it to 3 and marks the consumer's temporary source as final.  FRC is
