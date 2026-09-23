@@ -39,6 +39,11 @@ struct chrome9_fragment_state {
 	u16 varying_last_alu[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 };
 
+struct chrome9_fragment_resource_state {
+	u8 external[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u8 defined[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+};
+
 static bool chrome9_fragment_float_finite(u32 value)
 {
 	return (value & GENMASK(30, 23)) != GENMASK(30, 23);
@@ -473,6 +478,120 @@ static void chrome9_fragment_encode_destination(u32 record[4],
 		record[3] |= BIT(12);
 }
 
+static u8 chrome9_fragment_resource_swizzle_mask(u8 x, u8 y, u8 z, u8 w)
+{
+	const u8 swizzle[] = { x, y, z, w };
+	u8 mask = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(swizzle); i++)
+		if (swizzle[i] < 4)
+			mask |= BIT(swizzle[i]);
+	return mask;
+}
+
+static int chrome9_fragment_resource_note_source(
+	struct chrome9_fragment_resource_state *resource, u32 id, u8 mask)
+{
+	if (id >= ARRAY_SIZE(resource->external))
+		return -E2BIG;
+	resource->external[id] |= mask & ~resource->defined[id];
+	return 0;
+}
+
+static int chrome9_fragment_resource_note_destination(
+	struct chrome9_fragment_resource_state *resource, u32 file, u32 id,
+	u8 mask)
+{
+	if (file != 1)
+		return 0;
+	if (id >= ARRAY_SIZE(resource->defined))
+		return -E2BIG;
+	resource->defined[id] |= mask & ~resource->external[id];
+	return 0;
+}
+
+static int chrome9_fragment_resource_note_alu(
+	struct chrome9_fragment_resource_state *resource, const u32 record[4])
+{
+	u32 file, id;
+	u8 mask;
+	int ret;
+
+	/* The production analyzer admits at most one texture-class source per
+	 * ALU in native A, C, B priority.  Do not count every semantic operand:
+	 * a one-record MAD of T0, T1 and T2 consumes one active resource. */
+	file = FIELD_GET(GENMASK(16, 14), record[2]);
+	if (file == 3) {
+		id = FIELD_GET(GENMASK(13, 8), record[2]);
+		mask = chrome9_fragment_resource_swizzle_mask(
+			FIELD_GET(GENMASK(7, 5), record[2]),
+			FIELD_GET(GENMASK(4, 2), record[2]),
+			FIELD_GET(GENMASK(1, 0), record[2]) << 1 |
+				FIELD_GET(BIT(31), record[1]),
+			FIELD_GET(GENMASK(30, 28), record[1]));
+		ret = chrome9_fragment_resource_note_source(resource, id, mask);
+		if (ret)
+			return ret;
+	} else {
+		file = FIELD_GET(GENMASK(20, 18), record[1]);
+		if (file == 3) {
+			id = FIELD_GET(GENMASK(17, 12), record[1]);
+			mask = chrome9_fragment_resource_swizzle_mask(
+				FIELD_GET(GENMASK(11, 9), record[1]),
+				FIELD_GET(GENMASK(8, 6), record[1]),
+				FIELD_GET(GENMASK(5, 3), record[1]),
+				FIELD_GET(GENMASK(2, 0), record[1]));
+			ret = chrome9_fragment_resource_note_source(resource, id,
+							    mask);
+			if (ret)
+				return ret;
+		} else {
+			file = FIELD_GET(GENMASK(24, 22), record[0]);
+			if (file == 3) {
+				id = FIELD_GET(GENMASK(21, 16), record[0]);
+				mask = chrome9_fragment_resource_swizzle_mask(
+					FIELD_GET(GENMASK(15, 13), record[0]),
+					FIELD_GET(GENMASK(12, 10), record[0]),
+					FIELD_GET(GENMASK(9, 7), record[0]),
+					FIELD_GET(GENMASK(6, 4), record[0]));
+				ret = chrome9_fragment_resource_note_source(resource,
+								    id, mask);
+				if (ret)
+					return ret;
+			}
+		}
+	}
+
+	mask = FIELD_GET(GENMASK(23, 20), record[2]);
+	ret = chrome9_fragment_resource_note_destination(resource,
+		FIELD_GET(GENMASK(11, 10), record[3]),
+		FIELD_GET(GENMASK(9, 6), record[3]), mask);
+	if (ret)
+		return ret;
+	return chrome9_fragment_resource_note_destination(resource,
+		FIELD_GET(GENMASK(5, 4), record[3]),
+		FIELD_GET(GENMASK(3, 0), record[3]), mask);
+}
+
+static int chrome9_fragment_resource_note_tau(
+	struct chrome9_fragment_resource_state *resource, u32 tau)
+{
+	return chrome9_fragment_resource_note_source(resource,
+		FIELD_GET(GENMASK(15, 12), tau), 0xf);
+}
+
+static u32 chrome9_fragment_active_texture_count(
+	const struct chrome9_fragment_resource_state *resource)
+{
+	unsigned int i;
+
+	for (i = ARRAY_SIZE(resource->external); i; i--)
+		if (resource->external[i - 1])
+			return i;
+	return 0;
+}
+
 static int chrome9_fragment_alu_template(u8 op, u32 record[4],
 	enum chrome9_fragment_slot slots[3])
 {
@@ -619,6 +738,7 @@ static bool chrome9_fragment_release_source(
 static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	struct chrome9_fragment_program *program, u32 instruction_count)
 {
+	struct chrome9_fragment_resource_state resource = { 0 };
 	u32 previous_phase = U32_MAX;
 	u32 alu_index = 0;
 	u32 tau_index = 0;
@@ -666,6 +786,10 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 				bridge[2] = (bridge[2] & ~GENMASK(23, 20)) | 0xf << 20;
 				bridge[3] = (bridge[3] & ~GENMASK(12, 6)) |
 					BIT(10) | coordinate_id << 6;
+				ret = chrome9_fragment_resource_note_alu(&resource,
+								 bridge);
+				if (ret)
+					return ret;
 				alu_index++;
 				previous_phase = 0;
 			}
@@ -680,6 +804,13 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 				destination << 16 | native_coordinate << 12 |
 				tau_swizzle |
 				instruction->sampler;
+			{
+				int ret = chrome9_fragment_resource_note_tau(&resource,
+							program->tau[tau_index]);
+
+				if (ret)
+					return ret;
+			}
 			state->coordinate_mask |= BIT(coordinate_id);
 			active0 = max(active0, coordinate_id + 1);
 			if (!computed)
@@ -746,12 +877,17 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 			}
 			chrome9_fragment_encode_destination(record, state,
 							&instruction->dst);
+			ret = chrome9_fragment_resource_note_alu(&resource, record);
+			if (ret)
+				return ret;
 		}
 		alu_index++;
 		previous_phase = 0;
 	}
 	program->alu_count = alu_index;
 	program->tau_count = tau_index;
+	program->active_texture_count =
+		chrome9_fragment_active_texture_count(&resource);
 	program->controls[0] = 0x90000000 |
 		(state->alu_varying_mask & ~native_tau_varying_mask);
 	starts_alu = state->instructions[0].op != DRM_CHROME9_FRAGMENT_OP_TEX ||
@@ -983,6 +1119,76 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction resource_mad[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MAD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 2,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction resource_chain[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 2,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction resource_repeat[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
 	static const u32 expected_alu[][4] = {
 		{ 0x008106d0, 0xd0140924, 0x00308006, 0x00000020 },
 		{ 0x01c00530, 0xc01c0053, 0x00f20006, 0x000d0420 },
@@ -1015,6 +1221,14 @@ int chrome9_fragment_selftest(void)
 	static const u32 expected_varying_duplicate_alu[][4] = {
 		{ 0x0140b6d0, 0x302c0053, 0x00f0c005, 0x00000820 },
 	};
+	static const u32 expected_resource_mad_alu[][4] = {
+		{ 0x02c20530, 0x302c1053, 0x00f2c005, 0x00000820 },
+	};
+	static const u32 expected_resource_chain_alu[][4] = {
+		{ 0x01c00530, 0x301c0053, 0x00f2c005, 0x000d0020 },
+		{ 0x02c10530, 0x30140924, 0x00f20005, 0x00000060 },
+		{ 0x02c20530, 0x30140924, 0x00f20105, 0x00000820 },
+	};
 	static const u32 constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4];
 	struct chrome9_fragment_program *program;
 	int ret;
@@ -1026,6 +1240,7 @@ int chrome9_fragment_selftest(void)
 		2, 1, 0, program);
 	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301101b0 ||
+	    program->active_texture_count != 0 ||
 	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
 	    memcmp(program->controls, expected_controls,
 		   sizeof(expected_controls))) {
@@ -1039,7 +1254,8 @@ int chrome9_fragment_selftest(void)
 	ret = chrome9_fragment_compile(swizzled_texture,
 		ARRAY_SIZE(swizzled_texture), constants, 0, 1, 1, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
-	    program->varying_count != 1 || program->varying_width[0] != 2) {
+	    program->active_texture_count != 1 || program->varying_count != 1 ||
+	    program->varying_width[0] != 2) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1088,6 +1304,7 @@ int chrome9_fragment_selftest(void)
 	if (ret ||
 	    program->alu_count != ARRAY_SIZE(expected_packed_gray_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301006f0 ||
+	    program->active_texture_count != 1 ||
 	    program->varying_count != 1 || program->varying_width[0] != 3 ||
 	    memcmp(program->alu, expected_packed_gray_alu,
 		   sizeof(expected_packed_gray_alu)) ||
@@ -1111,6 +1328,30 @@ int chrome9_fragment_selftest(void)
 	    program->alu_count != ARRAY_SIZE(expected_varying_duplicate_alu) ||
 	    memcmp(program->alu, expected_varying_duplicate_alu,
 		   sizeof(expected_varying_duplicate_alu)))
+		ret = -EINVAL;
+	if (ret)
+		goto out;
+	ret = chrome9_fragment_compile(resource_mad, ARRAY_SIZE(resource_mad),
+		constants, 0, 0, 3, program);
+	if (ret || program->active_texture_count != 1 ||
+	    program->alu_count != ARRAY_SIZE(expected_resource_mad_alu) ||
+	    memcmp(program->alu, expected_resource_mad_alu,
+		   sizeof(expected_resource_mad_alu))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(resource_chain,
+		ARRAY_SIZE(resource_chain), constants, 0, 0, 3, program);
+	if (ret || program->active_texture_count != 3 ||
+	    program->alu_count != ARRAY_SIZE(expected_resource_chain_alu) ||
+	    memcmp(program->alu, expected_resource_chain_alu,
+		   sizeof(expected_resource_chain_alu))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(resource_repeat,
+		ARRAY_SIZE(resource_repeat), constants, 0, 0, 1, program);
+	if (ret || program->active_texture_count != 1)
 		ret = -EINVAL;
 out:
 	kfree(program);
