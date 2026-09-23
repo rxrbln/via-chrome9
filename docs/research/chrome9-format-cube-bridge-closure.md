@@ -131,12 +131,24 @@ for native GL face orientation, but not silicon proof: a hidden sampler
 coordinate transform remains possible.  Gate exposure on one nearest test
 where all six faces and all four corners have unique colors.
 
-The manual-derived coordinate tuple for texture 0 is
-`A01=01002522`, `A08=08010201`: perspective mode one, source texture A,
-three-dimensional STR, and one texture-coordinate register.  This follows the
-manual fields exactly, but no retained executable cube general-state packet or
-live result independently confirms it.  Keep it behind the cube capability and
-orientation gate.  Do not substitute four-dimensional/projective Q state.
+The production-static coordinate tuple for texture 0 is
+`A01=01002523`, `A08=08010301`: perspective mode one, source texture A,
+four-dimensional STRQ, and one texture-coordinate register.  It is important
+not to reduce this to the superficially plausible STR tuple `...22/...0201`.
+The Linux path proves all inputs to the state construction:
+
+- public cube enable selects internal dimension four;
+- `texEnableToStateKey[4]` is three, the hardware `component_count - 1`
+  encoding (`via_chrome9_dri.so:0x4299e0`);
+- the fixed-function pixel program declares `Tn.xyzw` and selects TEXLDP; and
+- `stmUpdateTCI_invi:0x17efe0..0x17f0aa` writes texture 0's type-FE A01 byte,
+  retaining source A, setting perspective mode one, and placing
+  `component_count - 1` in bits 1:0.
+
+A08 uses the same manual-defined two-bit dimension encoding for texture A.
+This closes the static writer chain, but there is still no retained silicon
+cube result.  Keep the complete STRQ tuple behind the cube capability and
+orientation gate.
 
 The fragment lookup itself is now production-exact.  Linux OpenGL
 `__glEnableDisable:0x28d5fc..0x28e010` handles public
