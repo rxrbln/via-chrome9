@@ -98,6 +98,25 @@ its exactness flags.  The existing 20/30/100 corpora use 5/7/8 temporaries and
 LOG-MUL-EXP for the general positive finite domain only after zero, denormal,
 rounding, and precision are measured on silicon.
 
+The explicit four-record generic positive-domain shape also has an exact
+Linux production object; it should replace the older opaque `POW` opcode as
+the compiler/runtime oracle:
+
+```text
+# LOG r0.x,T0.x; MUL r1.x,r0.x,c0.x;
+# EXP r2.x,r1.x; MOV oC0,r2.xxxx
+01c00530 801c0053 0012c0b6 00050020
+0140b6d0 d008016d 00120016 00000060
+01c00530 801c0053 001201b6 000400a0
+01c00530 001c0053 00f20200 000d0820
+```
+
+It has active tuple `(1,3,1,0)`, A90=`90058001`, and A92=`92000004`.
+Exact-power live controls are T0.x=`.5`, c0.x=`2` -> `.25`, and
+T0.x=`.25`, c0.x=`.5` -> `.5`; a non-power positive case must follow before
+claiming useful precision.  Base zero must continue through the integer-MUL
+path or fail closed because this LOG path does not define it safely.
+
 Required live vectors are finite unit axes, `(0.6,0.8,0)`, parallel and
 antiparallel reflect inputs, and power bases `0, .25, .5, 1` with exponents
 `1,2,20`.  Read float-sensitive intermediates through multiple color lanes;
