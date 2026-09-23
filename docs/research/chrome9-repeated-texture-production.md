@@ -257,6 +257,27 @@ Slots j=1..7 produce dword three `000d0460, 000d04a0, ...,
 normal MOV encoder.  The eleven-tap total follows exactly: 11 coordinate ALU,
 11 bridge MOV, 11 weight/accumulate ALU, and two output MOV = 35 ALU.
 
+A smaller production discriminator has no direct T input:
+
+```text
+r0.xy = c0.xy + c1.xy
+r1 = TEX(s0, r0)
+oC0 = r1
+
+ALU 008106d0 d0140924 00308006 00000020
+     01c00530 c01c0053 00f20006 000d0420
+     01c00530 301c0053 00f20105 000d0820
+TAU 301101b0
+A90..A96 90058000 91000001 92010003 93000001
+          94000000 95000002 96000000
+```
+
+With no direct T coordinate occupying slot zero, the bridge uses coordinate
+slot zero.  A95 bit1 switches after the bridge ALU, and A93 bit0 switches back
+after the TAU.  This is the smallest whole-object oracle for computed
+coordinates; its packed native-object SHA-256 is
+`2abd956c99e275c765ab105b3fe5d7a58a7d29d8fc50cc7406059aca984ccb9e`.
+
 Construct a semantic TAU word only after physical allocation:
 
 ```text
