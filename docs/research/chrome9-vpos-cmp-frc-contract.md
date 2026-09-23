@@ -1,9 +1,11 @@
 # Chrome9 vPos, CMP, and FRC compiler/runtime contract
 
 Status: production Linux compiler objects and the VX900 draw-time MISC enable
-are byte-exact; Mesa state-tracker integration is source-exact; native `vPos`,
-CMP, and FRC numerical behavior still requires the guarded silicon oracles
-below.  This note does not promote an API capability by itself.
+are byte-exact.  Native `vPos.xy`, FRC, the integer pixel-center convention,
+and computed texture coordinates from `vPos` have passed guarded VX900
+silicon oracles.  CMP and the remaining FRC numerical boundaries still need
+the guarded tests below.  This note does not promote an API capability by
+itself.
 
 ## What the vendor objects establish
 
@@ -57,10 +59,10 @@ ALU       0140b6d0 d008006d 0032c306 00000020
 ```
 
 Its tokens are retained in the corpus.  With c0.xy exactly 0.25, native
-half-integer centers produce fractional XY values
-`.125,.375,.625,.875` across a four-pixel axis, replicated as XYXY.  The
-object still has A00 resource count zero, no TAU and no ordinary varying;
-only TEMP0 lifetime joins the already closed MISC relocation.
+integer centers produce fractional XY values `0,.25,.5,.75` across a
+four-pixel axis, replicated as XYXY.  The object still has A00 resource count
+zero, no TAU and no ordinary varying; only TEMP0 lifetime joins the already
+closed MISC relocation.
 
 The second object's unfinalized MISC source is `0xcf`; configuration two
 rewrites it to 3 and marks the consumer's temporary source as final.  FRC is
@@ -158,10 +160,10 @@ compiled program's relocated A90/A91 resource usage.  The pixel
 compiler/finalizer emits no FVF mutation, and the inspected
 ordinary raster FVF paths program position, colors, fog, and texture-coordinate
 lanes without a recovered dependency on the pixel object's MISC predicate.
-Therefore the initial implementation must keep `vPos` outside the T0/T1
-allocation and must not fabricate it as a vertex varying.  A live oracle is
-still required because absence of a recovered hidden FVF branch is not proof
-of hardware behavior.
+Therefore the implementation must keep `vPos` outside the T0/T1 allocation
+and must not fabricate it as a vertex varying.  The guarded silicon results
+below confirm that this special route supplies native position without a
+hidden FVF mutation.
 
 There is still an important ambiguity.  `mov oC0,vPos` and
 `mov oC0,vFace` compile byte-for-byte identically, including metadata and
@@ -185,12 +187,15 @@ fs_coord_origin_upper_left = true
 fs_coord_pixel_center_half_integer = true
 ```
 
-It leaves `fs_position_is_sysval` false.  That makes GLSL `gl_FragCoord` a
+This is not the convention exposed by native VX900 MISC.  It leaves
+`fs_position_is_sysval` false, making GLSL `gl_FragCoord` a
 fragment POSITION input rather than a system value, even though native vPos
-is not an interpolated VS output.  Once the silicon position oracle passes,
-the correct representation is:
+is not an interpolated VS output.  The silicon position oracle has passed, so
+the correct native capability representation is:
 
 ```text
+fs_coord_pixel_center_integer = true
+fs_coord_pixel_center_half_integer = false
 fs_position_is_sysval = true
 ```
 
@@ -214,10 +219,25 @@ orientation into a shader object without including them in its variant key.
 Changing a drawable, framebuffer, or its height must update the constant
 before the next draw.
 
-There is no pixel-center bias for the current half-integer claim.  That claim
-also remains conditional on live vPos producing `(x+0.5,y+0.5)` at single
-sample.  The CPU draw path's `half_pixel_center` vertex-edge bias does not
-prove what the pixel engine exposes through MISC.
+Default OpenGL `gl_FragCoord.xy` is half-integer centered, while the proven
+native MISC value is integer centered.  Mesa must therefore add `+0.5` to X
+and Y for the default GLSL convention.  This is already the generic contract:
+current `nir_lower_wpos_ytransform.c:181..204` emits the `+0.5` adjustment
+when the shader requests half-integer centers but the pipe advertises only
+integer centers.  The older Mesa 7.11 state tracker implements the same rule
+at `st_mesa_to_tgsi.c:907..934`.  A shader explicitly requesting
+`pixel_center_integer` receives native coordinates without that bias.
+
+This correction is distinct from the CPU draw path's `half_pixel_center`
+vertex-edge bias.  The latter changes raster coverage; it does not define the
+numeric value supplied by pixel-engine MISC.
+
+The native convention also matches the D3D9 ABI targeted by the proprietary
+compiler.  Microsoft's [D3D9 rasterization
+rules](https://learn.microsoft.com/en-us/windows/win32/direct3d9/rasterization-rules)
+place pixel centers at integer coordinates, and the [HLSL semantics
+reference](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-semantics)
+explicitly distinguishes D3D9 VPOS from the later half-offset SV_Position.
 
 ## Generic FRC rules
 
@@ -357,20 +377,37 @@ discriminator above, not a second selector failure.  The next live gate must
 compare both the ALU record and VX900 A90=`900d8008` byte-for-byte before
 submission.  Do not label or validate an XY00 packet as the XYXY oracle.
 
+That corrected live gate has now passed.  With VX900 A90=`900d8008` and the
+separate type-01 A8A=`8a020000`, the exact full-width FRC object retired with
+clean engine state, intact guards, correct D16, and passing known-good draws
+before and after it.  The first observed black sample at `(12,12)` was not a
+zero-source failure: `FRC(12,12)` is exactly zero under the D3D9 integer-center
+convention.  A subsequent 16-sample identity oracle confirmed integer-valued
+native X/Y.
+
+The compiler-exact `MUL vPos*0.25; FRC` object then produced the four-pixel
+phase `0,.25,.5,.75` independently in X and Y, with D16 and guards intact.
+Finally, `vPos/32` used as a computed TAU coordinate passed 16 nearest/repeat
+samples without changing the source or guard regions.  Together these results
+prove that MISC is a supported silicon position route, not merely a compiler
+artifact; A90 bit 19 and A8A are the missing draw-time linkage, and no FVF
+varying or additional coordinate-scale register is required.
+
 ## Guarded live oracles
 
 Use a guarded BGRA8888 target, fresh passing D16, exact command capture,
 ordered completion cookie, reset/error counters, and known-good draws before
 and after every candidate.
 
-1. **MISC identity.** Submit terminal MOV vPos and FRC vPos objects first.
-   Require retirement and unchanged guard pages.  A vFace-labelled negative
-   control must not be used to claim face support because its object is
-   identical.
-2. **Pixel centers.** On a 4x4 target render
-   `FRC(vPos.xxxx*0.25)` and `FRC(vPos.yyyy*0.25)` in separate draws.  Expected
-   UNORM values for half-integer coordinates are approximately
-   `32,96,159/160,223`.  X must vary across columns and native Y across rows.
+1. **MISC identity -- passed.** Terminal FRC vPos retired with unchanged
+   guards and correct D16.  A vFace-labelled negative control must not be used
+   to claim face support because its object is identical.
+2. **Pixel centers -- passed.** On a four-pixel axis,
+   `FRC(vPos*0.25)` produced native integer-center phases `0,.25,.5,.75`
+   (approximately UNORM `0,64,128,191`).  X varied across columns and native Y
+   across rows.  The former half-integer expectation
+   `.125,.375,.625,.875` is disproved for native MISC and belongs only after
+   Mesa's OpenGL `+0.5` adjustment.
 3. **Origin and offset.** Repeat inside a 4x4 viewport/scissor at nonzero X/Y
    in an 8x8 target with scale 0.125.  The values must include absolute target
    coordinates, not viewport-relative coordinates.  Then test Mesa's
@@ -386,8 +423,11 @@ and after every candidate.
    objects before exposing the lowering.  Compare reference pixels against
    llvmpipe for the installed conditionals/function/loop shader sources.
 
-Only after rows 1--3 pass should Mesa set `fs_position_is_sysval`.  Only after
-rows 4--6 pass should native FRC/CMP graphs replace fallback for finite IR.
+Rows 1--2 and the computed-coordinate TAU composition have passed.  Mesa may
+represent XY as a system value with the integer-center capability and its
+generic OpenGL half-center adjustment.  Row 3 is still required for drawable
+origin/inversion closure.  Only after rows 4--6 pass should arbitrary native
+FRC/CMP graphs replace fallback for finite IR.
 
 ## Evidence identity
 
