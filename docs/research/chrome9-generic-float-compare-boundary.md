@@ -173,6 +173,48 @@ behavior.  Two directional comparisons can characterize equality only after
 SGE/SLT unordered behavior and boolean combination are proven.  Both
 operations remain rejected; there is no source-backed one-CMP shortcut.
 
+## Per-instruction float controls are part of the acceptance boundary
+
+Rejecting only `nir->info.float_controls_execution_mode` is insufficient for
+new comparison lowering.  `nir_alu_instr::fp_math_ctrl` carries the local
+contract.  Mesa 26.2.2 defines `nir_fp_preserve_inf` and
+`nir_fp_preserve_nan` to make an ALU result defined when an input or result is
+an infinity or NaN (`src/compiler/nir/nir.h:1553..1582`).  Floating-point
+comparison opcodes admit exactly those two local flags through
+`binop_compare_all_sizes` (`nir_opcodes.py:665..670`).  The Chrome9 generic
+ALU switch currently neither supports comparisons nor checks the local flags
+(`chrome9_context.c:3088..3155`); its shader-wide check at
+`chrome9_context.c:3274..3277` does not discharge that obligation.
+
+The captured glmark2 programs show why this distinction matters:
+
+* `conditionals` has `fge(ffract(x), 0.5) // preserve:inf`.  For every finite
+  input, `ffract(x)` is in `[0,1)`.  The candidate subtraction is therefore
+  in `[-0.5,0.5)`.  It cannot overflow.  It also cannot turn a representable
+  nonzero distance from `0.5` into a subnormal: around `0.5` the adjacent
+  binary32 spacing is at least `2^-25`, far above the smallest normal.  For
+  operands in `[0.25,1)`, Sterbenz exact subtraction applies; below `0.25`
+  the result magnitude is at least `0.25`.  An infinite comparison operand
+  is impossible after a valid finite `ffract`; a NaN path is explicitly
+  undefined because this instruction does not carry `preserve:nan`.
+  Consequently this one captured predicate has a complete finite-domain
+  proof for production SGE/SUB+CMP.  The proof belongs to this expression,
+  not to generic `fge`.
+* `ideas` compares a varying Z and a uniform W against zero with
+  `feq ... // preserve:inf,nan`, then combines the predicates with `iand` and
+  three `bcsel` operations.  Those sources have no bounded finite range in
+  the captured NIR, and ordered equality must return false for NaN.  Neither
+  the current CMP silicon corpus nor the proprietary SGE/SLT object bytes
+  establish that behavior.  This shader must remain fail-closed.
+
+An implementation-ready first slice is therefore deliberately narrow:
+recognize only `bcsel(fge(ffract(v), 0.5), t, f)` with the exact local-control
+contract above, lower it through the production comparison expansion, and
+leave all other comparisons unsupported.  A more general range analysis may
+later accept expressions whose difference is independently proven normal,
+non-NaN, and sign preserving.  It must inspect `alu->fp_math_ctrl` for every
+comparison it transforms.
+
 ## Guarded qualification sequence
 
 An exact semantic SGE successor should expand one validated instruction to
