@@ -6,6 +6,7 @@
 #include "chrome9_draw.h"
 #include "chrome9_drm.h"
 #include "chrome9_resource.h"
+#include "chrome9_specialise.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -3499,6 +3500,153 @@ chrome9_tgsi_fs_passthrough(const struct tgsi_token *tokens)
    return valid && input >= 0 && output >= 0 && moves == 1;
 }
 
+static void
+chrome9_compile_fs_nir(struct chrome9_context *ctx,
+                       struct chrome9_shader *shader, nir_shader *nir)
+{
+   bool straight_line = chrome9_fs_straight_line_entrypoint(nir, NULL, NULL);
+
+   shader->fragment_program = straight_line ?
+      chrome9_fs_classify(nir, &shader->literal_color) :
+      CHROME9_FS_UNSUPPORTED;
+   shader->flat_primary =
+      shader->fragment_program == CHROME9_FS_PRIMARY_COLOR &&
+      chrome9_fs_has_flat_primary(nir);
+   shader->flat_generic = shader->fragment_program ==
+      CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
+   shader->native_fs_valid = straight_line &&
+      chrome9_compile_native_fs(shader, nir);
+   if (shader->semantic_fs_valid && ctx->draw_fragment_program &&
+       !shader->semantic_input_mask &&
+       shader->fragment_program == CHROME9_FS_UNSUPPORTED)
+      shader->fragment_program = CHROME9_FS_COMPILED_ALU;
+   if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
+       ctx->draw_program_triangle_d16_rhw_batch &&
+       chrome9_native_fs_is_program_batch(shader, ctx->fragment_add))
+      shader->fragment_program = CHROME9_FS_COMPILED_ALU;
+   shader->supported = shader->fragment_program != CHROME9_FS_UNSUPPORTED;
+}
+
+static void
+chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
+                           const struct chrome9_shader *shader)
+{
+   variant->fragment_program = shader->fragment_program;
+   variant->literal_color = shader->literal_color;
+   variant->native_fs_key = shader->native_fs_key;
+   variant->semantic_fs_ir = shader->semantic_fs_ir;
+   variant->native_fs = shader->native_fs;
+   variant->semantic_constant_mask = shader->semantic_constant_mask;
+   variant->semantic_uniform_mask = shader->semantic_uniform_mask;
+   variant->semantic_input_mask = shader->semantic_input_mask;
+   variant->semantic_varying_mask = shader->semantic_varying_mask;
+   variant->semantic_sampler_mask = shader->semantic_sampler_mask;
+   variant->semantic_fs_valid = shader->semantic_fs_valid;
+   variant->native_fs_valid = shader->native_fs_valid;
+   variant->native_fs_from_nir = shader->native_fs_from_nir;
+   variant->flat_primary = shader->flat_primary;
+   variant->flat_generic = shader->flat_generic;
+   variant->supported = shader->supported;
+}
+
+static void
+chrome9_apply_fs_variant(struct chrome9_shader *shader,
+                         const struct chrome9_fs_variant *variant)
+{
+   shader->fragment_program = variant->fragment_program;
+   shader->literal_color = variant->literal_color;
+   shader->native_fs_key = variant->native_fs_key;
+   shader->semantic_fs_ir = variant->semantic_fs_ir;
+   shader->native_fs = variant->native_fs;
+   shader->semantic_constant_mask = variant->semantic_constant_mask;
+   shader->semantic_uniform_mask = variant->semantic_uniform_mask;
+   shader->semantic_input_mask = variant->semantic_input_mask;
+   shader->semantic_varying_mask = variant->semantic_varying_mask;
+   shader->semantic_sampler_mask = variant->semantic_sampler_mask;
+   shader->semantic_fs_valid = variant->semantic_fs_valid;
+   shader->native_fs_valid = variant->native_fs_valid;
+   shader->native_fs_from_nir = variant->native_fs_from_nir;
+   shader->flat_primary = variant->flat_primary;
+   shader->flat_generic = variant->flat_generic;
+   shader->supported = variant->supported;
+}
+
+#define CHROME9_MAX_FS_VARIANTS 64
+
+/* Choose a fragment program only when all control-flow uniforms have their
+ * draw-time values.  Failed variants are cached too, so an unsupported bound
+ * is deterministic and never leaves a partially compiled program active. */
+static bool
+chrome9_select_fs_variant(struct chrome9_context *ctx)
+{
+   struct chrome9_shader *shader = ctx->fs;
+   nir_shader *canonical;
+   unsigned count;
+   size_t bytes;
+
+   if (!shader || !shader->nir)
+      return shader && shader->supported;
+   canonical = shader->nir;
+   count = canonical->info.num_inlinable_uniforms;
+   if (!count)
+      return shader->supported;
+   if (ctx->fs_inline_count != count) {
+      shader->supported = false;
+      return false;
+   }
+   bytes = count * sizeof(ctx->fs_inline[0]);
+
+   for (struct chrome9_fs_variant *variant = shader->variants;
+        variant; variant = variant->next) {
+      if (!memcmp(variant->inline_values, ctx->fs_inline, bytes)) {
+         chrome9_apply_fs_variant(shader, variant);
+         return shader->supported;
+      }
+   }
+   if (shader->variant_count >= CHROME9_MAX_FS_VARIANTS) {
+      shader->supported = false;
+      return false;
+   }
+
+   struct chrome9_fs_variant *variant = CALLOC_STRUCT(chrome9_fs_variant);
+   nir_shader *clone = variant ? nir_shader_clone(NULL, canonical) : NULL;
+
+   if (!clone) {
+      FREE(variant);
+      shader->supported = false;
+      return false;
+   }
+   struct chrome9_shader compiled = { 0 };
+
+   memcpy(variant->inline_values, ctx->fs_inline, bytes);
+   chrome9_nir_inline_uniforms(clone, variant->inline_values);
+   chrome9_compile_fs_nir(ctx, &compiled, clone);
+   chrome9_capture_fs_variant(variant, &compiled);
+   variant->next = shader->variants;
+   shader->variants = variant;
+   shader->variant_count++;
+   chrome9_apply_fs_variant(shader, variant);
+
+   if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false)) {
+      fprintf(stderr, "chrome9: FS variant %u", shader->variant_count);
+      for (unsigned i = 0; i < count; i++)
+         fprintf(stderr, " dw%u=%08x",
+                 canonical->info.inlinable_uniform_dw_offsets[i],
+                 variant->inline_values[i]);
+      fprintf(stderr, " supported=%u ir=%u alu=%u tau=%u\n",
+              shader->supported, shader->semantic_fs_ir.count,
+              shader->native_fs.alu_count, shader->native_fs.tau_count);
+   }
+   if (!shader->supported &&
+       debug_get_bool_option("CHROME9_DUMP_UNSUPPORTED_NIR", false)) {
+      fprintf(stderr, "chrome9: unsupported specialized FS %p\n",
+              (void *)shader);
+      nir_print_shader(clone, stderr);
+   }
+   ralloc_free(clone);
+   return shader->supported;
+}
+
 static void *
 chrome9_create_fs_state(struct pipe_context *pipe,
                         const struct pipe_shader_state *state)
@@ -3514,33 +3662,12 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       return NULL;
    }
    if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
-      bool straight_line =
-         chrome9_fs_straight_line_entrypoint(state->ir.nir, NULL, NULL);
-
       shader->nir = state->ir.nir;
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);
-      shader->fragment_program = straight_line ?
-         chrome9_fs_classify(state->ir.nir, &shader->literal_color) :
-         CHROME9_FS_UNSUPPORTED;
-      shader->flat_primary =
-         shader->fragment_program == CHROME9_FS_PRIMARY_COLOR &&
-         chrome9_fs_has_flat_primary(state->ir.nir);
-      shader->flat_generic = shader->fragment_program ==
-         CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
-      shader->native_fs_valid = straight_line &&
-         chrome9_compile_native_fs(shader, state->ir.nir);
-      if (shader->semantic_fs_valid && ctx->draw_fragment_program &&
-          !shader->semantic_input_mask &&
-          shader->fragment_program == CHROME9_FS_UNSUPPORTED)
-         shader->fragment_program = CHROME9_FS_COMPILED_ALU;
-      if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
-          ctx->draw_program_triangle_d16_rhw_batch &&
-          chrome9_native_fs_is_program_batch(shader, ctx->fragment_add))
-         shader->fragment_program = CHROME9_FS_COMPILED_ALU;
-      shader->supported =
-         shader->fragment_program != CHROME9_FS_UNSUPPORTED;
-      if (!shader->supported &&
+      if (!state->ir.nir->info.num_inlinable_uniforms)
+         chrome9_compile_fs_nir(ctx, shader, state->ir.nir);
+      if (!state->ir.nir->info.num_inlinable_uniforms && !shader->supported &&
           debug_get_bool_option("CHROME9_DUMP_UNSUPPORTED_NIR", false)) {
          fprintf(stderr, "chrome9: unsupported FS %p\n", (void *)shader);
          nir_print_shader(state->ir.nir, stderr);
@@ -3564,7 +3691,7 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->fragment_program = shader->supported ?
          CHROME9_FS_PRIMARY_COLOR : CHROME9_FS_UNSUPPORTED;
    }
-   if (shader->supported && !shader->native_fs_valid)
+   if (!shader->nir && shader->supported && !shader->native_fs_valid)
       shader->native_fs_valid = chrome9_compile_native_fs(
          shader, state->type == PIPE_SHADER_IR_NIR ? state->ir.nir : NULL);
    if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false) &&
@@ -3603,6 +3730,12 @@ chrome9_delete_fs_state(struct pipe_context *pipe, void *state)
       draw_bind_fragment_shader(ctx->draw, NULL);
    }
    draw_delete_fragment_shader(ctx->draw, shader->draw);
+   while (shader->variants) {
+      struct chrome9_fs_variant *variant = shader->variants;
+
+      shader->variants = variant->next;
+      FREE(variant);
+   }
    ralloc_free(shader->nir);
    FREE(shader);
 }
@@ -3670,6 +3803,22 @@ chrome9_set_constant_buffer(struct pipe_context *pipe,
       util_copy_constant_buffer(&ctx->vs_constants[index], buffer);
    else if (shader == MESA_SHADER_FRAGMENT)
       util_copy_constant_buffer(&ctx->fs_constants[index], buffer);
+}
+
+static void
+chrome9_set_inlinable_constants(struct pipe_context *pipe,
+                                mesa_shader_stage shader,
+                                unsigned num_values, uint32_t *values)
+{
+   struct chrome9_context *ctx = chrome9_context(pipe);
+   unsigned count = MIN2(num_values, MAX_INLINABLE_UNIFORMS);
+
+   if (shader == MESA_SHADER_FRAGMENT) {
+      memset(ctx->fs_inline, 0, sizeof(ctx->fs_inline));
+      if (count)
+         memcpy(ctx->fs_inline, values, count * sizeof(*values));
+      ctx->fs_inline_count = count;
+   }
 }
 
 static struct pipe_sampler_view *
@@ -4071,7 +4220,7 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                         "indirect draws are not implemented");
       return;
    }
-   if (!ctx->vs || !ctx->fs || !ctx->fs->supported) {
+   if (!ctx->vs || !ctx->fs || !chrome9_select_fs_variant(ctx)) {
       chrome9_warn_once(ctx, CHROME9_WARN_DRAW_STATE,
                         "draw rejected: unsupported bounded fragment program");
       return;
@@ -4336,6 +4485,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       chrome9_delete_vertex_elements_state;
    ctx->base.set_vertex_buffers = chrome9_set_vertex_buffers;
    ctx->base.set_constant_buffer = chrome9_set_constant_buffer;
+   ctx->base.set_inlinable_constants = chrome9_set_inlinable_constants;
    ctx->base.set_framebuffer_state = chrome9_set_framebuffer_state;
    ctx->base.set_viewport_states = chrome9_set_viewport_states;
    ctx->base.set_scissor_states = chrome9_set_scissor_states;

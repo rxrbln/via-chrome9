@@ -5,6 +5,7 @@
 
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
+#include "compiler/shader_info.h"
 
 #include "chrome9_shader_offline.h"
 
@@ -20,41 +21,66 @@ enum chrome9_warning {
    CHROME9_WARN_SAMPLER_VIEW_BIND = 1u << 6,
 };
 
+enum chrome9_fragment_program {
+   CHROME9_FS_UNSUPPORTED,
+   CHROME9_FS_PRIMARY_COLOR,
+   CHROME9_FS_PRIMARY_GENERIC_RGBA,
+   CHROME9_FS_PRIMARY_GENERIC_RGBX,
+   CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX,
+   CHROME9_FS_PRIMARY_SCALAR_RGBX,
+   CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX,
+   CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX,
+   CHROME9_FS_LITERAL_COLOR,
+   CHROME9_FS_CONSTANT_COLOR,
+   CHROME9_FS_CONSTANT_MODULATE,
+   CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE,
+   CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE,
+   CHROME9_FS_TEXTURE_REPLACE,
+   CHROME9_FS_TEXTURE_RGBX,
+   CHROME9_FS_TEXTURE_MODULATE,
+   CHROME9_FS_TEXTURE_PROJECTED_MODULATE,
+   CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE,
+   CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA,
+   CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA,
+   CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE,
+   CHROME9_FS_TEXTURE_CONSTANT_MODULATE,
+   CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE,
+   CHROME9_FS_TWO_TEXTURE_MODULATE,
+   CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA,
+   CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY,
+   CHROME9_FS_IOQUAKE3_GENERIC_PACKED,
+   CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED,
+   /* Generic one-instruction NIR backend result, not an app-shaped key. */
+   CHROME9_FS_COMPILED_ALU,
+};
+
+struct chrome9_fs_variant {
+   struct chrome9_fs_variant *next;
+   uint32_t inline_values[MAX_INLINABLE_UNIFORMS];
+   enum chrome9_fragment_program fragment_program;
+   uint32_t literal_color;
+   struct chrome9_fs_key native_fs_key;
+   struct chrome9_ps_ir semantic_fs_ir;
+   struct chrome9_ps_program native_fs;
+   uint32_t semantic_constant_mask;
+   uint32_t semantic_uniform_mask;
+   uint16_t semantic_input_mask;
+   uint16_t semantic_varying_mask;
+   uint8_t semantic_sampler_mask;
+   bool semantic_fs_valid;
+   bool native_fs_valid;
+   bool native_fs_from_nir;
+   bool flat_primary;
+   bool flat_generic;
+   bool supported;
+};
+
 struct chrome9_shader {
    void *draw;
    void *nir;
-   enum {
-      CHROME9_FS_UNSUPPORTED,
-      CHROME9_FS_PRIMARY_COLOR,
-      CHROME9_FS_PRIMARY_GENERIC_RGBA,
-      CHROME9_FS_PRIMARY_GENERIC_RGBX,
-      CHROME9_FS_PRIMARY_GENERIC_XXY_RGBX,
-      CHROME9_FS_PRIMARY_SCALAR_RGBX,
-      CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX,
-      CHROME9_FS_PRIMARY_SCALAR_BLUE_RGBX,
-      CHROME9_FS_LITERAL_COLOR,
-      CHROME9_FS_CONSTANT_COLOR,
-      CHROME9_FS_CONSTANT_MODULATE,
-      CHROME9_FS_CONSTANT_MASK_ALPHA_MODULATE,
-      CHROME9_FS_CONSTANT_SOURCE_ALPHA_MODULATE,
-      CHROME9_FS_TEXTURE_REPLACE,
-      CHROME9_FS_TEXTURE_RGBX,
-      CHROME9_FS_TEXTURE_MODULATE,
-      CHROME9_FS_TEXTURE_PROJECTED_MODULATE,
-      CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_MODULATE,
-      CHROME9_FS_TEXTURE_PROJECTED_CONSTANT_RGB_ALPHA,
-      CHROME9_FS_TEXTURE_PROJECTED_PRIMARY_RGB_ALPHA,
-      CHROME9_FS_TEXTURE_PACKED_GRAY_MODULATE,
-      CHROME9_FS_TEXTURE_CONSTANT_MODULATE,
-      CHROME9_FS_TEXTURE_CONSTANT_ALPHA_MODULATE,
-      CHROME9_FS_TWO_TEXTURE_MODULATE,
-      CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA,
-      CHROME9_FS_TWO_PROJECTED_TEXTURE0_ALPHA_PRIMARY,
-      CHROME9_FS_IOQUAKE3_GENERIC_PACKED,
-      CHROME9_FS_IOQUAKE3_LIGHTMAP_PACKED,
-      /* Generic one-instruction NIR backend result, not an app-shaped key. */
-      CHROME9_FS_COMPILED_ALU,
-   } fragment_program;
+   struct chrome9_fs_variant *variants;
+   unsigned variant_count;
+   enum chrome9_fragment_program fragment_program;
    uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
    struct chrome9_ps_ir semantic_fs_ir;
@@ -158,6 +184,8 @@ struct chrome9_context {
    unsigned num_vertex_buffers;
    struct pipe_constant_buffer vs_constants[PIPE_MAX_CONSTANT_BUFFERS];
    struct pipe_constant_buffer fs_constants[PIPE_MAX_CONSTANT_BUFFERS];
+   uint32_t fs_inline[MAX_INLINABLE_UNIFORMS];
+   unsigned fs_inline_count;
    struct chrome9_sampler_state *sampler_states[PIPE_MAX_SAMPLERS];
    unsigned num_sampler_states;
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];

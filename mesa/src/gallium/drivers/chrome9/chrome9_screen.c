@@ -5,6 +5,7 @@
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
 #include "chrome9_resource.h"
+#include "chrome9_specialise.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -270,7 +271,29 @@ static const struct nir_shader_compiler_options chrome9_nir_options = {
    .lower_fmod = true,
    .lower_fsat = true,
    .lower_sincos = true,
+   .lower_uniforms_to_ubo = true,
+   /* For a top-tested i < N loop, NIR reports the last body trip as N - 1.
+    * A limit of 31 therefore admits exactly 32 body executions; the focused
+    * test proves that 32 unrolls and 33 remains explicit control flow. */
+   .max_unroll_iterations = 31,
+   .no_integers = true,
 };
+
+/* Keep specialization metadata on the linked program: the state tracker
+ * uses it to deliver exactly the current control-uniform values to the
+ * context.  Chrome9 fragment programs are float-only, so integer lowering
+ * happens before the metadata is discovered. */
+static void
+chrome9_finalize_nir(struct pipe_screen *screen, nir_shader *nir,
+                     bool optimize)
+{
+   (void)screen;
+   (void)optimize;
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return;
+   chrome9_nir_lower_integers(nir);
+   chrome9_nir_find_inlinable_uniforms(nir);
+}
 
 static void
 chrome9_init_shader_caps(struct chrome9_screen *screen)
@@ -427,9 +450,13 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
         DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND)) ==
       (DRM_CHROME9_CAP_ALPHA_TEST |
        DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_BLEND);
+   /* Fragment variants are owned by the creating context and selected by its
+    * inlinable-constant state. */
    caps->shareable_shaders = false;
+   caps->call_finalize_nir_in_linker = true;
 
    screen->base.destroy = chrome9_screen_destroy;
+   screen->base.finalize_nir = chrome9_finalize_nir;
    screen->base.get_name = chrome9_screen_name;
    screen->base.get_vendor = chrome9_screen_vendor;
    screen->base.get_device_vendor = chrome9_device_vendor;
