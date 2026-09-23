@@ -15,6 +15,7 @@ int chrome9_engine_init(struct chrome9_device *cdev);
 void chrome9_engine_fini(struct chrome9_device *cdev);
 bool chrome9_engine_ready(const struct chrome9_device *cdev);
 bool chrome9_textured_triangle_run_enabled(void);
+bool chrome9_textured_triangle_mip_enabled(void);
 bool chrome9_rhw_chain_enabled(void);
 bool chrome9_ps_add_enabled(void);
 int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
@@ -53,6 +54,9 @@ int chrome9_draw_textured_triangle_batch_ioctl(struct drm_device *drm,
 						void *data,
 						struct drm_file *file);
 int chrome9_draw_textured_triangle_run_ioctl(struct drm_device *drm,
+					     void *data,
+					     struct drm_file *file);
+int chrome9_draw_textured_triangle_mip_ioctl(struct drm_device *drm,
 					     void *data,
 					     struct drm_file *file);
 int chrome9_copy_rect_ioctl(struct drm_device *drm, void *data,
