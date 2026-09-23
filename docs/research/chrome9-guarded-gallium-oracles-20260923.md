@@ -33,8 +33,28 @@ The command was:
 CHROME9_EXPERIMENTAL_X8Z24=1 chrome9-screen-smoke /dev/dri/renderD128 --d24-only
 ```
 
-The experiment does not yet include Gallium sampling of that rendered D24
-resource or an API-level depth-texture FBO; production exposure remains gated.
+The first Gallium sample of that rendered D24 image was rejected by the
+kernel before submission.  Mesa correctly composed the logical X8Z24
+`(Z,0,0,1)` swizzle into a TEX temporary's consumer, which read only its X
+lane.  The kernel validator required *every* defined temporary lane to be
+used, incorrectly rejecting this legal vector swizzle.  Kernel commit
+`c9cf86a` rejects only wholly dead temporaries, with positive partial-use
+and negative wholly-dead compiler selftests.  The tested module SHA-256 was
+`bfe479738bd319e04e48409df2f3a10bcee7dc3aeb341822b5a1f444acaf2efc`.
+
+With that module, the guarded Gallium producer-to-sampler test passed:
+the sampled BGRA center was `0xff800000` (half depth in red, G/B zero,
+alpha one) and the exterior was `0xffff0000` (depth one).  Two triangles
+and two generic program batches were submitted without rejection.  The D24
+producer, original BGRX color and depth-only scratch retained their exact
+contents; all four resources' guards were intact.  Mesa commit `a74264e`
+adds this test.  The smoke helper releases its own reference to the sampled
+target while the context still owns the framebuffer binding, avoiding a
+test-only use-after-free identified in review.
+
+This proves the bounded Gallium D24 render/depth-only/sample path, not an
+API-level GL depth-texture FBO or every filter/wrap/format interaction;
+production exposure remains gated.
 
 ## A8 sampler
 
