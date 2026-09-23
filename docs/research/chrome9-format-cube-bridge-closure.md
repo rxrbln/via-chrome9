@@ -199,12 +199,13 @@ usage metadata is bit 5, but the ALU source and A90 use physical slot/bit zero.
 A91 is `91000001`.  Therefore every direct ALU varying source must be rewritten
 through the same logical-to-physical map used by TAU.
 
-The current kernel fragment allocator only discovers direct coordinates while
-walking TEX instructions, and `chrome9_fragment_source_id()` returns a varying's
-logical index unchanged.  It would both compact T1 incorrectly in the first
-mixed case and encode sparse ALU T5 as physical five in the second.  Fix union
-allocation and ALU source rewriting before admitting arbitrary packed
-varying-plus-texture shaders.
+Kernel commits `928c2ff` and `71cf45c` already implement this contract:
+`varying_mask` covers both pipelines, `coordinate_for_varying[]` is the union
+rank map, `chrome9_fragment_source_id()` rewrites ALU sources through it, and
+A90 uses physical ALU/TAU masks.  The built-in sparse-varying test covers TEX
+T5 plus ALU T0.  The complementary production rows above independently verify
+that implementation and should remain regression vectors; no additional
+allocator ABI is needed before arbitrary packed varying-plus-texture shaders.
 
 The exact computed-coordinate object remains:
 
