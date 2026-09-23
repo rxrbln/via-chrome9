@@ -165,6 +165,71 @@ coordinates; the TAU sampler nibble alone does not create that linkage.  This
 six-stage sparse combination is exact static/compiler evidence and still
 requires a distinct-color live state-closure test.
 
+## Multi-source resource-state tables
+
+The installed glmark2 2023.01 sources provide two useful generic state
+envelopes.  These are not shader keys; they are ordinary arrays of validated
+image and sampler descriptors.  Source SHA-256 values are:
+
+```text
+scene-refract.cpp                  a45f827710dcb6796107d8a96dbc2a83bd2353c459461fa3a305214fd741f141
+light-refract.frag                 5d60dd85933ef77a7bc89eb5d567fb9791fd9b14170ce82b06985da718a5e001
+scene-terrain/terrain-renderer.cpp 1eb240ab4c5db674463bc9864058b3e86de68e8728869796d437dfabe2a6432d
+scene-terrain.cpp                  48a39330414b0a86c4b5464588f7b61c35a2ee53f4b5b9b652c52d0591b2f49b
+terrain.frag                       efc2c1cd2ab3ad01e9d42430f427e6ba441f2e3311fb9afe5aaafe25b503a8d2
+terrain.vert                       f07ac9490a748428ce9e1df9c5896f61659f927e99c1aa5334f926f4b013c76a
+```
+
+The three-stage fragment envelope is:
+
+| stage | resource | image A30 | sampler A30 / A31 / A32 |
+|---:|---|---:|---|
+| 0 | raw D24 depth, one level | `30fe2000` | `30000000 31100000 32000049` |
+| 1 | dynamic BGRA color, full mip chain | `30990000` | `30000L40 31102492 32000049` |
+| 2 | BGRA image, one level | `30990000` | `30000000 31102490 32000049` |
+
+In `30000L40`, `L` denotes the validated maximum mip level in A30 bits
+11:6, not a literal hexadecimal digit.  At 800x600 the chain reaches L9 and
+therefore depends on the separately unresolved L9 implicit-tail rule; the
+ordinary L1--L8 H3 table is not enough.  General state high-water is three,
+so A00/A08 are `00000031/08010103`.
+
+The sparse six-stage envelope uses fragment stages 0,1,2,4,5 and vertex
+stages 3,5:
+
+| stage | resource | use | image A30 | sampler A30 / A31 / A32 |
+|---:|---|---|---:|---|
+| 0 | 512 BGRX asset | fragment | `30980000` | `30000240 31102492 32000052` |
+| 1 | 512 BGRX asset | fragment | `30980000` | `30000240 31102492 32000052` |
+| 2 | 512 BGRX asset | fragment | `30980000` | `30000240 31102492 32000052` |
+| 3 | 256 BGRA generated normal | vertex | `30990000` | `30000000 31102490 32000049` |
+| 4 | 512 BGRA generated specular | fragment | `30990000` | `30000240 31102492 32000052` |
+| 5 | 256 BGRA generated height | fragment and vertex | `30990000` | `30000000 31102490 32000049` |
+
+`30000240` is zero bias, max L9, min L0.  Each mipmapped 512 resource needs
+its own stage-specific H3 selector and validated L1--L8 table plus the L9 tail
+contract.  The generated BGRA resources additionally need render-to-texture
+cache closure before sampling.  Vertex sampling is a software/draw-module
+problem in the planned driver and must not be represented as a fragment TAU.
+
+The six-stage fixed-function general-state image derived from the vendor
+stage packing is:
+
+```text
+A00 00000061   A01 01292521   A02 0235312d   A03 03000000
+A04 04000000   A05 05000000   A08 08010106   A09 09010101
+A0a 0a000001   A0b 0b000000   A0c 0c000000   A0d 0d810000
+```
+
+This is the high-water-six extension of the independently recovered five- and
+eight-stage images.  It is an implementation oracle pending silicon proof,
+not permission to expose six units.  A safe live discriminator binds distinct
+constant colors to stages 0..5, executes one sample from each in separate
+bounded programs, and checks old-six-one transitions with all BO guards and
+engine status clean.  The same test must verify that leaving stage 3 unused in
+the fragment program does not make stage 4 or 5 inherit stale image/sampler
+state.
+
 ## Fail-closed compiler rules
 
 1. Count lowered native records and reject more than 96 ALU or 32 TAU.
