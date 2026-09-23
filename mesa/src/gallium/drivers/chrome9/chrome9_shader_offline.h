@@ -115,7 +115,9 @@ struct chrome9_ps_program {
    uint32_t control[12];       /* complete A90..A9b words */
    uint32_t alu[CHROME9_PS_MAX_ALU][4];
    uint32_t tau[CHROME9_PS_MAX_TAU];
+   uint32_t immediate[32][4];
    uint32_t constant_mask;     /* c0..c31 */
+   uint32_t immediate_mask;    /* compiler-owned literal constants */
    uint32_t constant_x_one_mask; /* constants whose X must be driver-owned 1 */
    uint16_t varying_mask;      /* bit 0 is primary color v0 */
    uint16_t texture_input_mask; /* T0..T7 used by TAU or directly by ALU */

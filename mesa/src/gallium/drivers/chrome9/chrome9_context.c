@@ -2516,6 +2516,14 @@ chrome9_backend_source(const nir_alu_src *source,
 
 struct chrome9_ps_nir_builder {
    struct chrome9_ps_ir ir;
+   struct {
+      nir_def *def;
+      struct chrome9_ps_source source;
+      bool complete;
+   } value[CHROME9_PS_MAX_ALU];
+   uint32_t immediate[32][4];
+   uint32_t immediate_mask;
+   uint8_t value_count;
    uint8_t next_temp;
 };
 
@@ -2570,68 +2578,241 @@ static bool chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder,
 static bool
 chrome9_ps_lower_alu_source(struct chrome9_ps_nir_builder *builder,
                             const nir_alu_src *nir_source,
+                            unsigned components,
                             struct chrome9_ps_source *source)
 {
-   bool alpha = true, identity = true;
+   struct chrome9_ps_source base;
 
-   if (!nir_source->src.ssa || nir_source->src.ssa->num_components != 4 ||
-       nir_source->src.ssa->bit_size != 32)
+   if (!nir_source->src.ssa || !components || components > 4 ||
+       nir_source->src.ssa->bit_size != 32 ||
+       !chrome9_ps_lower_def(builder, nir_source->src.ssa, &base))
       return false;
-   for (unsigned c = 0; c < 4; c++) {
-      identity &= nir_source->swizzle[c] == c;
-      alpha &= nir_source->swizzle[c] == 3;
+   *source = base;
+   for (unsigned c = 0; c < components; c++) {
+      unsigned swizzle = nir_source->swizzle[c];
+
+      if (swizzle >= nir_source->src.ssa->num_components)
+         return false;
+      source->swizzle[c] = base.swizzle[swizzle];
    }
-   if ((!identity && !alpha) ||
-       !chrome9_ps_lower_def(builder, nir_source->src.ssa, source))
-      return false;
-   if (alpha)
-      for (unsigned c = 0; c < 4; c++)
-         source->swizzle[c] = CHROME9_PS_SWIZZLE_W;
+   for (unsigned c = components; c < 4; c++)
+      source->swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
    return true;
+}
+
+static bool
+chrome9_ps_immediate(struct chrome9_ps_nir_builder *builder,
+                     const uint32_t value[4], unsigned components,
+                     struct chrome9_ps_source *source)
+{
+   unsigned id = 32;
+
+   if (!components || components > 4)
+      return false;
+   for (unsigned candidate = 16; candidate < 32; candidate++) {
+      if (!(builder->immediate_mask & (1u << candidate)))
+         continue;
+      if (!memcmp(builder->immediate[candidate], value,
+                  sizeof(builder->immediate[candidate]))) {
+         id = candidate;
+         break;
+      }
+   }
+   if (id == 32) {
+      for (unsigned candidate = 32; candidate-- > 16;) {
+         if (!(builder->immediate_mask & (1u << candidate))) {
+            id = candidate;
+            break;
+         }
+      }
+      if (id == 32)
+         return false;
+      memcpy(builder->immediate[id], value,
+             sizeof(builder->immediate[id]));
+      builder->immediate_mask |= 1u << id;
+   }
+   memset(source, 0, sizeof(*source));
+   source->file = CHROME9_PS_SOURCE_CONSTANT;
+   source->id = id;
+   for (unsigned c = 0; c < 4; c++)
+      source->swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
+   return true;
+}
+
+static bool
+chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
+                struct chrome9_ps_source *source)
+{
+   enum chrome9_fs_leaf leaf;
+   nir_instr *instr = nir_def_instr(def);
+
+   if (chrome9_backend_leaf(def, 0, &leaf))
+      return chrome9_ps_source_from_leaf(leaf, source);
+   if (instr->type == nir_instr_type_load_const) {
+      nir_load_const_instr *load = nir_instr_as_load_const(instr);
+      uint32_t value[4] = { 0 };
+
+      if (def->bit_size != 32 || !def->num_components ||
+          def->num_components > 4)
+         return false;
+      for (unsigned c = 0; c < def->num_components; c++)
+         value[c] = load->value[c].u32;
+      return chrome9_ps_immediate(builder, value, def->num_components,
+                                  source);
+   }
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+      unsigned location = ~0u;
+
+      switch (load->intrinsic) {
+      case nir_intrinsic_load_input:
+         if (!nir_intrinsic_component(load))
+            location = nir_intrinsic_io_semantics(load).location;
+         break;
+      case nir_intrinsic_load_interpolated_input:
+         for (unsigned candidate = 0; candidate < 8; candidate++) {
+            if (chrome9_fs_smooth_pixel_load(load,
+                                             VARYING_SLOT_VAR0 + candidate)) {
+               location = VARYING_SLOT_VAR0 + candidate;
+               break;
+            }
+         }
+         break;
+      case nir_intrinsic_load_deref: {
+         nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+         nir_variable *var = nir_intrinsic_get_var(load, 0);
+
+         if (deref && deref->deref_type == nir_deref_type_var && var &&
+             var->data.location >= VARYING_SLOT_VAR0 &&
+             var->data.location < VARYING_SLOT_VAR0 + 8 &&
+             chrome9_fs_smooth_variable(var, var->data.location))
+            location = var->data.location;
+         break;
+      }
+      default:
+         break;
+      }
+      if (location >= VARYING_SLOT_VAR0 &&
+          location < VARYING_SLOT_VAR0 + 8 && def->bit_size == 32 &&
+          def->num_components && def->num_components <= 4) {
+         memset(source, 0, sizeof(*source));
+         source->file = CHROME9_PS_SOURCE_TEXTURE;
+         source->id = location - VARYING_SLOT_VAR0;
+         for (unsigned c = 0; c < 4; c++)
+            source->swizzle[c] = c < def->num_components ?
+               c : CHROME9_PS_SWIZZLE_ZERO;
+         return true;
+      }
+   }
+   return false;
 }
 
 static bool
 chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                      struct chrome9_ps_source *source)
 {
-   enum chrome9_fs_leaf leaf;
    nir_instr *instr;
    nir_alu_instr *alu;
    struct chrome9_ps_instruction *native;
-   struct chrome9_ps_source operands[2] = { 0 };
+   struct chrome9_ps_source operands[3] = { 0 };
+   enum chrome9_ps_opcode op;
+   unsigned source_count;
+   unsigned components;
+   unsigned value;
    uint8_t temp;
 
-   if (chrome9_backend_leaf(def, 0, &leaf))
-      return chrome9_ps_source_from_leaf(leaf, source);
+   if (!def || def->bit_size != 32 || !def->num_components ||
+       def->num_components > 4)
+      return false;
+   if (chrome9_ps_leaf(builder, def, source))
+      return true;
+   for (value = 0; value < builder->value_count; value++) {
+      if (builder->value[value].def != def)
+         continue;
+      if (!builder->value[value].complete)
+         return false;
+      *source = builder->value[value].source;
+      return true;
+   }
    instr = nir_def_instr(def);
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
-   if ((alu->op != nir_op_fmul && alu->op != nir_op_fadd) ||
-       builder->ir.count >= 2 ||
-       builder->next_temp >= 12)
+   components = alu->def.num_components;
+   switch (alu->op) {
+   case nir_op_mov:
+      return chrome9_ps_lower_alu_source(builder, &alu->src[0], components,
+                                         source);
+   case nir_op_fmul:
+      op = CHROME9_PS_OPCODE_MUL;
+      source_count = 2;
+      break;
+   case nir_op_fadd:
+      op = CHROME9_PS_OPCODE_ADD;
+      source_count = 2;
+      break;
+   case nir_op_fsub:
+      op = CHROME9_PS_OPCODE_SUB;
+      source_count = 2;
+      break;
+   case nir_op_ffma:
+      op = CHROME9_PS_OPCODE_MAD;
+      source_count = 3;
+      break;
+   case nir_op_fmin:
+      op = CHROME9_PS_OPCODE_MIN;
+      source_count = 2;
+      break;
+   case nir_op_fexp2:
+      op = CHROME9_PS_OPCODE_EXP2;
+      source_count = 1;
+      break;
+   case nir_op_fneg:
+      op = CHROME9_PS_OPCODE_MUL;
+      source_count = 1;
+      break;
+   default:
+      return false;
+   }
+   if (builder->ir.count >= CHROME9_PS_MAX_ALU ||
+       builder->next_temp >= 12 ||
+       builder->value_count >= CHROME9_PS_MAX_ALU)
       return false;
    temp = builder->next_temp++;
-   if (!chrome9_ps_lower_alu_source(builder, &alu->src[0], &operands[0]) ||
-       !chrome9_ps_lower_alu_source(builder, &alu->src[1], &operands[1]))
-      return false;
-   if (builder->ir.count >= 2)
+   value = builder->value_count++;
+   builder->value[value].def = def;
+   builder->value[value].source.file = CHROME9_PS_SOURCE_TEMP;
+   builder->value[value].source.id = temp;
+   for (unsigned c = 0; c < 4; c++)
+      builder->value[value].source.swizzle[c] = c < components ?
+         c : CHROME9_PS_SWIZZLE_ZERO;
+   for (unsigned s = 0; s < source_count; s++)
+      if (!chrome9_ps_lower_alu_source(builder, &alu->src[s], components,
+                                       &operands[s]))
+         return false;
+   if (alu->op == nir_op_fneg) {
+      static const uint32_t negative_one[4] = {
+         0xbf800000, 0xbf800000, 0xbf800000, 0xbf800000,
+      };
+
+      if (!chrome9_ps_immediate(builder, negative_one, components,
+                                &operands[1]))
+         return false;
+      source_count = 2;
+   }
+   if (builder->ir.count >= CHROME9_PS_MAX_ALU)
       return false;
    native = &builder->ir.instruction[builder->ir.count];
    memset(native, 0, sizeof(*native));
-   native->op = alu->op == nir_op_fadd ?
-      CHROME9_PS_OPCODE_ADD : CHROME9_PS_OPCODE_MUL;
+   native->op = op;
    native->destination.file = CHROME9_PS_DESTINATION_TEMP;
    native->destination.id = temp;
-   native->destination.writemask = 0xf;
-   native->source[0] = operands[0];
-   native->source[1] = operands[1];
+   native->destination.writemask = (1u << components) - 1;
+   for (unsigned s = 0; s < source_count; s++)
+      native->source[s] = operands[s];
    builder->ir.count++;
-   memset(source, 0, sizeof(*source));
-   source->file = CHROME9_PS_SOURCE_TEMP;
-   source->id = native->destination.id;
-   for (unsigned c = 0; c < 4; c++)
-      source->swizzle[c] = c;
+   builder->value[value].complete = true;
+   *source = builder->value[value].source;
    return true;
 }
 
@@ -2641,8 +2822,9 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
 {
    struct chrome9_ps_nir_builder builder = { 0 };
    struct chrome9_ps_instruction *terminal;
-   struct chrome9_ps_source operands[2] = { 0 };
+   struct chrome9_ps_source operands[3] = { 0 };
    enum chrome9_ps_opcode op;
+   unsigned source_count = 0;
    nir_block *block;
    nir_def *result = NULL;
 
@@ -2707,35 +2889,60 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
 
    nir_instr *result_instr = nir_def_instr(result);
 
-   if (result_instr->type == nir_instr_type_alu &&
-       (nir_instr_as_alu(result_instr)->op == nir_op_fmul ||
-        nir_instr_as_alu(result_instr)->op == nir_op_fadd)) {
+   if (result_instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(result_instr);
 
-      op = alu->op == nir_op_fadd ?
-         CHROME9_PS_OPCODE_ADD : CHROME9_PS_OPCODE_MUL;
-      if (!chrome9_ps_lower_alu_source(&builder, &alu->src[0],
-                                       &operands[0]) ||
-          !chrome9_ps_lower_alu_source(&builder, &alu->src[1],
-                                       &operands[1]))
-         return false;
-   } else {
+      switch (alu->op) {
+      case nir_op_fmul:
+         op = CHROME9_PS_OPCODE_MUL;
+         source_count = 2;
+         break;
+      case nir_op_fadd:
+         op = CHROME9_PS_OPCODE_ADD;
+         source_count = 2;
+         break;
+      case nir_op_fsub:
+         op = CHROME9_PS_OPCODE_SUB;
+         source_count = 2;
+         break;
+      case nir_op_ffma:
+         op = CHROME9_PS_OPCODE_MAD;
+         source_count = 3;
+         break;
+      case nir_op_fmin:
+         op = CHROME9_PS_OPCODE_MIN;
+         source_count = 2;
+         break;
+      default:
+         source_count = 0;
+         break;
+      }
+      for (unsigned s = 0; s < source_count; s++)
+         if (!chrome9_ps_lower_alu_source(&builder, &alu->src[s], 4,
+                                          &operands[s]))
+            return false;
+   }
+   if (!source_count) {
       op = CHROME9_PS_OPCODE_MOV;
       if (!chrome9_ps_lower_def(&builder, result, &operands[0]))
          return false;
+      source_count = 1;
    }
-   if (builder.ir.count >= 3)
+   if (builder.ir.count >= CHROME9_PS_MAX_ALU)
       return false;
    terminal = &builder.ir.instruction[builder.ir.count];
    memset(terminal, 0, sizeof(*terminal));
    terminal->op = op;
    terminal->destination.file = CHROME9_PS_DESTINATION_COLOR;
    terminal->destination.writemask = 0xf;
-   terminal->source[0] = operands[0];
-   terminal->source[1] = operands[1];
+   for (unsigned s = 0; s < source_count; s++)
+      terminal->source[s] = operands[s];
    builder.ir.count++;
    if (!chrome9_compile_ps_ir(&builder.ir, program))
       return false;
+   memcpy(program->immediate, builder.immediate,
+          sizeof(program->immediate));
+   program->immediate_mask = builder.immediate_mask;
    *ir = builder.ir;
    return true;
 }
@@ -2743,9 +2950,9 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
 /*
  * Lower the canonical NIR output expression to the first native backend IR.
  * Unlike the compatibility program classifier, this follows the output DAG
- * and derives opcode and operands directly.  The bounded initial scheduler
- * accepts a straight-line DAG of up to three full-vector MOV or FMUL ALUs and
- * two temporaries; later ISA work extends this same IR rather than adding more
+ * and derives opcode and operands directly.  The scheduler accepts a bounded
+ * straight-line DAG and assigns dense hardware temporaries; unsupported NIR
+ * operations fail compilation instead of being approximated or classified by
  * application-shaped program enums.
  */
 static bool
@@ -3026,9 +3233,15 @@ chrome9_create_fs_state(struct pipe_context *pipe,
          nir_print_shader(state->ir.nir, stderr);
       }
       if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false))
-         fprintf(stderr, "chrome9: create FS %p program=%u supported=%u\n",
+         fprintf(stderr, "chrome9: create FS %p program=%u supported=%u "
+                 "native=%u nir=%u alu=%u tau=%u constants=%08x "
+                 "immediates=%08x\n",
                  (void *)shader, shader->fragment_program,
-                 shader->supported);
+                 shader->supported, shader->native_fs_valid,
+                 shader->native_fs_from_nir, shader->native_fs.alu_count,
+                 shader->native_fs.tau_count,
+                 shader->native_fs.constant_mask,
+                 shader->native_fs.immediate_mask);
    } else if (state->type == PIPE_SHADER_IR_TGSI) {
       shader->supported = chrome9_tgsi_fs_passthrough(state->tokens);
       shader->fragment_program = shader->supported ?
