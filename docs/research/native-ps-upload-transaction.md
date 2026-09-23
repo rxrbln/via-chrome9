@@ -404,6 +404,97 @@ On any post-publication timeout, preserve all mappings and use the existing
 reboot-scoped quarantine; do not retry Gate A, omit A9b, or switch packet forms
 inside the same boot to make the failure disappear.
 
+### Multi-record count and termination re-audit
+
+The three-coordinate silent-black result prompted a fresh instruction-level
+audit of the generic store rather than another packet-field experiment.  The
+Linux 5.75 implementation in `via_chrome9_dri.so` (build ID
+`f140f76cfb18e3f368245054629d1ef2e67be129`) is conclusive:
+
+| range | operation |
+|---|---|
+| `stmUpdatePS_inv:0x17fc29..0x17fc62` | reserves space from the ALU and TAU counts |
+| `0x17fc92..0x17fd8f` | emits the full A90--A9b H2 control object |
+| `0x17fd9e..0x17fe06` | if ALU count is nonzero, aligns, writes H3, and copies the ALU array |
+| `0x1805a0..0x18060d` | if TAU count is nonzero, aligns, writes H3, and copies the TAU array |
+| `0x17fe17..0x17fe3c` | releases exactly the emitted command span |
+
+At `0x17fc35..0x17fc3c`, the ALU count is shifted left two before packet
+construction.  That same dword count is written at `0x17fdc8`; the payload
+copy size is independently formed as ALU count shifted left four bytes at
+`0x17fde2..0x17fdfc`.  The fixed header words are written literally:
+
+```text
+0x17fdc2  FE03043C
+0x17fdc8  ALU_count * 4
+0x17fdcb  20030000
+0x17fdd2  CC000000
+```
+
+The TAU path analogously writes its unscaled record count and copies four
+bytes per record.  There is no END record, payload delimiter, last-record
+flag, or post-program marker.  Execution length comes from A92, while the H3
+count bounds the store transaction.  The next packet, if any, performs its
+own 16-byte alignment.  Consequently the current generic tuple
+
+```text
+FE03043C 0000000C 20030000 CC000000 <three 4-dword ALUs>
+```
+
+is the exact proprietary form for three ALUs.  A static change to count,
+selector, padding, a terminal instruction, or a trailing TAU packet would
+contradict the production writer rather than repair a recovered omission.
+
+Both Windows clients independently confirm every field.  The D3D UMD tests
+the ALU count at `VTGUModeDX32A.dll:0x1015b809`, aligns at
+`0x1015b816..0x1015b831`, writes `FE03043C` at `0x1015b836`, writes
+`ALU_count*4` at `0x1015b845..0x1015b84c`, then writes `20030000` and
+`CC000000` at `0x1015b857/0x1015b866`.  Its memcpy at
+`0x1015b872..0x1015b880` copies `ALU_count<<4` bytes from the compiler
+object.  Its TAU path at `0x1015b893..0x1015b8fb` writes the unchanged TAU
+count, selector `21030000`, and copies `TAU_count<<2` bytes.  The OpenGL ICD's
+separate builder is field-for-field identical: ALU header/count/selector/pad
+at `0x10205f56/0x10205f65..0x10205f6c/0x10205f77/0x10205f86`, followed by
+the copy at `0x10205f92..0x10205fa0`; its TAU path is
+`0x10205fd6..0x1020601b`.  Neither client emits a zero-length TAU store or a
+program terminator.
+
+The smallest remaining silicon discriminator is a three-record constant-only
+MOV chain in the already-live no-varying envelope.  It preserves the proven
+c0 store, target, raster state, geometry, and one-record opcode while changing
+only the temporary chain and ALU/A92 counts:
+
+```text
+# PS 2.0 semantics; c0 = (1,0,0,1)
+MOV r0, c0
+MOV r1, r0
+MOV oC0, r1
+
+# Exact token stream
+ffff0200
+03000001 000f0000 20e40000
+03000001 000f0001 00e40000
+03000001 000f0800 00e40001
+0000ffff
+
+# Linux production configuration-2 output
+01c00530 301c0053 00f08005 000d0020
+01c00530 301c0053 00f20005 000d0060
+01c00530 301c0053 00f20105 000d0820
+
+A90..A92 = 90058000 91000000 92000003
+A93..A9b = 93000000 ... 9b000000
+active-resource-counts = 0 2 0 0
+```
+
+This is a single causal fork.  A red result qualifies multi-record H3,
+temporary forwarding and count-three controls together, moving the
+three-coordinate failure back to producer/consumer linkage.  A black result
+with normal retirement reproduces the missing terminal color write without
+any varying state; a timeout identifies an execution/store boundary instead.
+Do not alter H3 framing between outcomes.  This discriminator is compiler-
+exact but has not been submitted to hardware in this audit.
+
 ## Acceptance and transition tests
 
 After the single-record gate passes, expand only through closed objects:
@@ -432,12 +523,13 @@ or LOD semantics.
 ## Evidence boundary
 
 - **Silicon-proven:** the complete 188-dword varying pass-through and
-  232-dword one-texture streams; their fixed H2 PS stores and linkage.
+  232-dword one-texture streams; their fixed H2 PS stores and linkage; and
+  the generic counted-H3 one-record constant MOV transaction.
 - **Compiler- and builder-exact:** all twelve A90..A9b sources, H3 counts and
   selectors, ALU-before-TAU upload order, configuration-two finalized
   `MOV/MUL` objects, 96/32 store limits, and c0..c31 bank split.
 - **Hardware-independent checked:** fifteen canonical Mesa PS objects and
   complete-byte verifier.
-- **Still requiring silicon gate:** full A9b generic control packet, generic
-  PS H3 stores in the new driver, general A90/A91 derivation, and every
-  arithmetic/sampling behavior outside the already executed fixed keys.
+- **Still requiring silicon gate:** generic counted-H3 programs with more
+  than one ALU, general A90/A91 derivation, and every arithmetic/sampling
+  behavior outside the already executed fixed keys.
