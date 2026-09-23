@@ -1810,6 +1810,11 @@ static int chrome9_fragment_fe_config(u32 texture_count, u32 varying_count,
 		u32 width = i < varying_count ? varying_width[i] : 2;
 		u32 word, shift;
 
+		/* The T0 consumer dimension in A01 must match A08 and the
+		 * float width emitted by the raster/vertex stages.
+		 */
+		if (!i)
+			config[1] = (config[1] & ~0x3U) | (width - 1);
 		/* A mixed high slot needs a distinct producer/consumer oracle. */
 		if (i >= 2 && i < texture_count && i < varying_count &&
 		    width != 2)
@@ -1835,12 +1840,21 @@ static int chrome9_fragment_fe_config_selftest(void)
 	static const struct {
 		u8 count;
 		u8 width[8];
-		u32 a08, a09, a0a;
+		u32 a01, a08, a09, a0a;
 	} cases[] = {
-		{ 3, { 4, 2, 3 }, 0x08010303, 0x09000002, 0x0a000000 },
-		{ 5, { 1, 4, 2, 3, 1 }, 0x08030005, 0x09000201,
+		{ 1, { 1 }, 0x01002520, 0x08010001, 0x09000000,
 		  0x0a000000 },
-		{ 8, { 4, 1, 2, 3, 4, 1, 2, 3 }, 0x08000308,
+		{ 1, { 2 }, 0x01002521, 0x08010101, 0x09000000,
+		  0x0a000000 },
+		{ 1, { 3 }, 0x01002522, 0x08010201, 0x09000000,
+		  0x0a000000 },
+		{ 1, { 4 }, 0x01002523, 0x08010301, 0x09000000,
+		  0x0a000000 },
+		{ 3, { 4, 2, 3 }, 0x01002523, 0x08010303,
+		  0x09000002, 0x0a000000 },
+		{ 5, { 1, 4, 2, 3, 1 }, 0x01002520, 0x08030005, 0x09000201,
+		  0x0a000000 },
+		{ 8, { 4, 1, 2, 3, 4, 1, 2, 3 }, 0x01002523, 0x08000308,
 		  0x09030201, 0x0a020100 },
 	};
 	static const u8 empty_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
@@ -1849,7 +1863,8 @@ static int chrome9_fragment_fe_config_selftest(void)
 
 	if (chrome9_fragment_fe_config(0, 0, empty_width, config))
 		return -EINVAL;
-	if (config[0] != 0x00000001 || config[2] != 0x08010100 ||
+	if (config[0] != 0x00000001 || config[1] != 0x01002521 ||
+	    config[2] != 0x08010100 ||
 	    config[6] != 0x09000000 || config[7] != 0x0a000000)
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -1857,16 +1872,18 @@ static int chrome9_fragment_fe_config_selftest(void)
 				cases[i].width, config))
 			return -EINVAL;
 		if (config[0] != (cases[i].count << 4 | 1) ||
+		    config[1] != cases[i].a01 ||
 		    config[2] != cases[i].a08 || config[6] != cases[i].a09 ||
 		    config[7] != cases[i].a0a)
 			return -EINVAL;
 	}
 	if (chrome9_fragment_fe_config(8, 0, empty_width, config) ||
-	    config[0] != 0x00000081 || config[6] != 0x09010101 ||
+	    config[0] != 0x00000081 || config[1] != 0x01002521 ||
+	    config[6] != 0x09010101 ||
 	    config[7] != 0x0a010101)
 		return -EINVAL;
-	if (chrome9_fragment_fe_config(4, cases[1].count,
-			cases[1].width, config) != -EOPNOTSUPP)
+	if (chrome9_fragment_fe_config(4, cases[5].count,
+			cases[5].width, config) != -EOPNOTSUPP)
 		return -EINVAL;
 	return 0;
 }
