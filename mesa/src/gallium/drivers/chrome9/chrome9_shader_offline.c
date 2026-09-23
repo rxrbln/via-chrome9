@@ -443,6 +443,7 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
 
       if (texture->sampler >= 8 || texture->coordinate >= 8 ||
           texture->destination >= 12 || texture->reserved ||
+          (texture->swizzle & ~0xff0u) ||
           (defined_temps & (1u << texture->destination)))
          return false;
       if (coordinate_map[texture->coordinate] == 0xff) {
@@ -490,10 +491,11 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
             texture_uses[source->id]++;
       }
       if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP) {
-         if (defined_temps & (1u << instruction->destination.id))
+         if (defined_components[instruction->destination.id] &
+             instruction->destination.writemask)
             return false;
          defined_temps |= 1u << instruction->destination.id;
-         defined_components[instruction->destination.id] =
+         defined_components[instruction->destination.id] |=
             instruction->destination.writemask;
       } else {
          if (color_writemask & instruction->destination.writemask)
@@ -683,7 +685,8 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
             1u << 20 |
             (uint32_t)texture->destination << 16 |
             (uint32_t)coordinate << 12 |
-            0x1b0 | texture->sampler;
+            (texture->swizzle ? texture->swizzle : 0x1b0) |
+            texture->sampler;
 
          if (!--coordinate_uses[coordinate])
             tau |= 1u << 28;

@@ -109,6 +109,9 @@ struct chrome9_ps_texture_instruction {
    uint8_t coordinate;
    uint8_t destination;
    uint8_t reserved;
+   /* Packed four 2-bit coordinate selectors in TAU bits 11:4.  Zero keeps
+    * the canonical XYZW payload for compatibility with existing IR users. */
+   uint16_t swizzle;
 };
 
 /* Straight-line compiler IR.  This is deliberately semantic rather than a

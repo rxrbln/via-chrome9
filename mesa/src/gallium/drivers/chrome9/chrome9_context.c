@@ -2755,6 +2755,84 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    if (chrome9_ps_leaf(builder, def, source))
       return true;
    instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *vec = nir_instr_as_alu(instr);
+      unsigned vector_components = 0;
+      struct chrome9_ps_source component[4] = { 0 };
+      struct chrome9_ps_source vector = { 0 };
+      bool alias = true;
+
+      if (vec->op == nir_op_vec2)
+         vector_components = 2;
+      else if (vec->op == nir_op_vec3)
+         vector_components = 3;
+      else if (vec->op == nir_op_vec4)
+         vector_components = 4;
+      if (vector_components) {
+         for (unsigned c = 0; c < vector_components; c++) {
+            if (!chrome9_ps_lower_alu_source(builder, &vec->src[c], 1,
+                                              &component[c]))
+               return false;
+            if (!c) {
+               vector = component[c];
+            } else if (component[c].file != vector.file ||
+                       component[c].id != vector.id ||
+                       component[c].modifier != vector.modifier) {
+               alias = false;
+            }
+            vector.swizzle[c] = component[c].swizzle[0];
+         }
+         if (alias) {
+            for (unsigned c = vector_components; c < 4; c++)
+               vector.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+            *source = vector;
+            return true;
+         }
+         if (builder->next_temp >= 12 ||
+             builder->value_count >= CHROME9_PS_MAX_ALU)
+            return false;
+         temp = builder->next_temp++;
+         value = builder->value_count++;
+         builder->value[value].def = def;
+         builder->value[value].source.file = CHROME9_PS_SOURCE_TEMP;
+         builder->value[value].source.id = temp;
+         for (unsigned c = 0; c < 4; c++)
+            builder->value[value].source.swizzle[c] = c < vector_components ?
+               c : CHROME9_PS_SWIZZLE_ZERO;
+         for (unsigned remaining = (1u << vector_components) - 1;
+              remaining;) {
+            struct chrome9_ps_instruction *move;
+            unsigned first = __builtin_ctz(remaining);
+            unsigned mask = 0;
+
+            for (unsigned c = 0; c < vector_components; c++) {
+               if (!(remaining & (1u << c)))
+                  continue;
+               if (component[c].file == component[first].file &&
+                   component[c].id == component[first].id &&
+                   component[c].modifier == component[first].modifier)
+                  mask |= 1u << c;
+            }
+            if (builder->ir.count >= CHROME9_PS_MAX_ALU)
+               return false;
+            move = &builder->ir.instruction[builder->ir.count++];
+            memset(move, 0, sizeof(*move));
+            move->op = CHROME9_PS_OPCODE_MOV;
+            move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+            move->destination.id = temp;
+            move->destination.writemask = mask;
+            move->source[0] = component[first];
+            for (unsigned c = 0; c < 4; c++)
+               move->source[0].swizzle[c] =
+                  (mask & (1u << c)) ? component[c].swizzle[0] :
+                  CHROME9_PS_SWIZZLE_ZERO;
+            remaining &= ~mask;
+         }
+         builder->value[value].complete = true;
+         *source = builder->value[value].source;
+         return true;
+      }
+   }
    if (instr->type == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
       struct chrome9_ps_source coordinate;
@@ -2774,8 +2852,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       if (!chrome9_ps_lower_def(builder, tex->src[coord].src.ssa,
                                 &coordinate) ||
           coordinate.file != CHROME9_PS_SOURCE_TEXTURE ||
-          coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
-          coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y)
+          coordinate.swizzle[0] > CHROME9_PS_SWIZZLE_W ||
+          coordinate.swizzle[1] > CHROME9_PS_SWIZZLE_W)
          return false;
       temp = builder->next_temp++;
       value = builder->value_count++;
@@ -2789,6 +2867,10 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
             .sampler = tex->sampler_index,
             .coordinate = coordinate.id,
             .destination = temp,
+            .swizzle = ((uint16_t)coordinate.swizzle[0] << 10) |
+                       ((uint16_t)coordinate.swizzle[1] << 8) |
+                       ((uint16_t)CHROME9_PS_SWIZZLE_W << 6) |
+                       ((uint16_t)CHROME9_PS_SWIZZLE_W << 4),
          };
       builder->value[value].complete = true;
       *source = builder->value[value].source;
