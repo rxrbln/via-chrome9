@@ -1633,6 +1633,15 @@ static u32 chrome9_fragment_raster_state(
 		u32 varying_count, const u8 *varying_width, u32 vertex_count,
 		u32 raster[40])
 {
+	static const u32 zero_varying[] = {
+		0x00000206, 0x010000c2, 0x020041d1, 0x030052d0,
+		0x04006342, 0x1200001f, 0x61800000, 0x622081ff,
+		0x20000000, 0x23004f02, 0x24000000, 0x25f6cc00,
+		0x28ffcc00, 0x40800000, 0x41400000, 0x4200493f,
+		0x43800000, 0x44400000, 0x4500493f, 0x46800000,
+		0x47400000, 0x4800003f, 0x49000000, 0x50000000,
+		0x51000000, 0x52147fff,
+	};
 	u32 vertex_stride = 6;
 	u32 a25 = 0x25f60000;
 	u32 a26 = 0x26000000;
@@ -1642,6 +1651,11 @@ static u32 chrome9_fragment_raster_state(
 	unsigned int i;
 
 	memset(raster, 0, 40 * sizeof(*raster));
+	if (!varying_count) {
+		memcpy(raster, zero_varying, sizeof(zero_varying));
+		raster[10] |= vertex_count;
+		return ARRAY_SIZE(zero_varying);
+	}
 	for (i = 0; i < varying_count; i++)
 		vertex_stride += varying_width[i];
 	raster[0] = ((2 + varying_count) << 8) | vertex_stride;
@@ -1697,6 +1711,15 @@ static u32 chrome9_fragment_raster_state(
 
 static int chrome9_fragment_raster_selftest(void)
 {
+	static const u32 expected_zero_varying[] = {
+		0x00000206, 0x010000c2, 0x020041d1, 0x030052d0,
+		0x04006342, 0x1200001f, 0x61800000, 0x622081ff,
+		0x20000000, 0x23004f02, 0x24000003, 0x25f6cc00,
+		0x28ffcc00, 0x40800000, 0x41400000, 0x4200493f,
+		0x43800000, 0x44400000, 0x4500493f, 0x46800000,
+		0x47400000, 0x4800003f, 0x49000000, 0x50000000,
+		0x51000000, 0x52147fff,
+	};
 	static const u8 width[] = { 3 };
 	static const u8 format[] = { 0, 0x02, 0x42, 0x82, 0xc2 };
 	static const u8 link[] = { 0, 0x8, 0xc, 0xe, 0xf };
@@ -1704,6 +1727,11 @@ static int chrome9_fragment_raster_selftest(void)
 	u32 count;
 	unsigned int varying_count;
 
+	count = chrome9_fragment_raster_state(0, NULL, 3, raster);
+	if (count != ARRAY_SIZE(expected_zero_varying) ||
+	    memcmp(raster, expected_zero_varying,
+		   sizeof(expected_zero_varying)))
+		return -EINVAL;
 	count = chrome9_fragment_raster_state(ARRAY_SIZE(width), width, 3,
 		raster);
 	if (count != 28 || raster[0] != 0x00000309 ||
