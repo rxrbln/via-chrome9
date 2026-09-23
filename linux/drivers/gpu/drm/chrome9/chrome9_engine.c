@@ -1882,6 +1882,7 @@ static const struct chrome9_fragment_rt_format chrome9_fragment_rt_formats[] = {
 	[DRM_CHROME9_DESTINATION_FORMAT_RGB565] = { 0x89, 2 },
 	[DRM_CHROME9_DESTINATION_FORMAT_L8A8] = { 0x15, 2 },
 	[DRM_CHROME9_DESTINATION_FORMAT_ARGB1555] = { 0x8a, 2 },
+	[DRM_CHROME9_DESTINATION_FORMAT_ARGB4444] = { 0x8b, 2 },
 };
 
 static const struct chrome9_fragment_rt_format *
