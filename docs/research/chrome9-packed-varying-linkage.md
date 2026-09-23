@@ -1,9 +1,8 @@
 # Chrome9 packed varying to ALU and TAU linkage
 
-Status: exact hardware-free Linux production-compiler result, independent
-Windows raw-TAU cross-check, exact Linux vertex-compiler output, and a
-source-backed one-word raster discriminator.  The complete three-component
-linkage has not retired on VX900 silicon.
+Status: exact Linux production-compiler and Windows raw-TAU cross-checks,
+exact Linux vertex-compiler output, and guarded one- and two-ALU packed
+linkage passes on VX900 silicon after restoring the A90 direct-ALU route bit.
 
 This note closes a generic compiler case in which one smooth varying carries a
 scalar in X and a two-dimensional texture coordinate in YZ.  It is not a scene
@@ -147,9 +146,9 @@ X, Y and Z lanes all differ.  Compare `texture(T0.yz) * T0.x` against a CPU
 reference at interior pixels, then alternate with ordinary `texture(T0.xy)`
 to prove stale A25/FVF/linkage state is fully replaced.
 
-## Remaining timeout: the programmable dimension path
+## Prior timeout: the programmable dimension path
 
-The guarded packed draw still timed out after the PS object, A00 resource
+The guarded packed draw initially timed out after the PS object, A00 resource
 count and A08 producer width were made byte-exact.  A previous analysis
 incorrectly treated the nominal 2-D texture target as the input to the
 proprietary programmable-pixel-shader path and proposed A01=`01002521`,
@@ -246,10 +245,9 @@ destinations, the partial XYZ write, literal ONE, the terminal MOV, and every
 multi-ALU dependency while retaining the same float3 T0 producer, ALU XXXX
 read, TAU YZWW read, sampler zero, and physical-coordinate overlap.  It
 therefore follows the ALU-only float3 gate after restoring the exact
-A01=`01002522` tuple.  If ALU-only float3 retires but this case times out, the
-failure is isolated to the shared ALU/TAU coordinate path.  If both retire,
-the remaining boundary is the multi-record/TEMP schedule.  These are proposed
-guarded oracles, not silicon results.
+A01=`01002522` tuple.  These were the guarded discriminators used to separate
+the float3 producer from shared ALU/TAU coordinate routing; their silicon
+results are recorded below.
 
 The guarded cmd22 implementation is the `--one-alu` mode of
 `tools/re/chrome9_packed_varying_guard_smoke.c`; omitting the option retains
@@ -322,10 +320,27 @@ not merely the difference between ALU and TAU bitmaps.
 
 The timed-out generic packet incorrectly emitted A90=`90018000`.  Its
 compiler used `alu_varying_mask & ~tau_varying_mask`, deleting the overlap;
-the proprietary postprocessor does not perform that subtraction.  The next
-bounded discriminator is therefore the otherwise byte-identical one-ALU
-guarded draw with only A90 bit zero restored.  Success would close the
-shared-coordinate routing bug; failure would leave another shared-route
-state differential to find.  The earlier corpus value `90018000` was an
+the proprietary postprocessor does not perform that subtraction.  The bounded
+discriminator was the otherwise byte-identical one-ALU guarded draw with only
+A90 bit zero restored.  The earlier corpus value `90018000` was an
 offline reconstruction error caused by omitting public-instance `+0x6c`,
 and has been corrected.
+
+### VX900 silicon result after the A90 correction
+
+On 2026-09-23, the corrected module (SHA-256
+`e5b666b691b57fb275024bb7c8cdebf03e6c269c4bfc520be800330e02a37ca0`)
+passed its probe selftest and exposed `/dev/dri/renderD128` on the 256-MiB
+VX900 target.  The exact one-ALU guarded oracle that previously timed out
+completed with all four color quadrants, alpha, destination guards and source
+image intact.  The original two-ALU packed gray+UV oracle then passed the
+same checks.  Neither draw logged a Chrome9 timeout, quarantine, reset or
+engine error.  Both tests were run once, in that order, on the same healthy
+boot.
+
+This isolates the prior timeout to the omitted A90 direct-ALU route bit for
+the shared physical T0 coordinate.  It proves this source-backed packet
+shape on the tested VX900, not arbitrary ALU/TAU sharing, all interpolation
+modes, or general glmark2 scene correctness.  The kernel retains a TAU-only
+negative selftest whose A90 remains `90018000`; the fix does not set the
+direct-ALU bit for TAU-only programs.
