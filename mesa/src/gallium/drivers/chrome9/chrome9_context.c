@@ -2599,7 +2599,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
-   if (alu->op != nir_op_fmul || builder->ir.count >= 2 ||
+   if ((alu->op != nir_op_fmul && alu->op != nir_op_fadd) ||
+       builder->ir.count >= 2 ||
        builder->next_temp >= 12)
       return false;
    temp = builder->next_temp++;
@@ -2610,7 +2611,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       return false;
    native = &builder->ir.instruction[builder->ir.count];
    memset(native, 0, sizeof(*native));
-   native->op = CHROME9_PS_OPCODE_MUL;
+   native->op = alu->op == nir_op_fadd ?
+      CHROME9_PS_OPCODE_ADD : CHROME9_PS_OPCODE_MUL;
    native->destination.file = CHROME9_PS_DESTINATION_TEMP;
    native->destination.id = temp;
    native->destination.writemask = 0xf;
@@ -2698,10 +2700,12 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    nir_instr *result_instr = nir_def_instr(result);
 
    if (result_instr->type == nir_instr_type_alu &&
-       nir_instr_as_alu(result_instr)->op == nir_op_fmul) {
+       (nir_instr_as_alu(result_instr)->op == nir_op_fmul ||
+        nir_instr_as_alu(result_instr)->op == nir_op_fadd)) {
       nir_alu_instr *alu = nir_instr_as_alu(result_instr);
 
-      op = CHROME9_PS_OPCODE_MUL;
+      op = alu->op == nir_op_fadd ?
+         CHROME9_PS_OPCODE_ADD : CHROME9_PS_OPCODE_MUL;
       if (!chrome9_ps_lower_alu_source(&builder, &alu->src[0],
                                        &operands[0]) ||
           !chrome9_ps_lower_alu_source(&builder, &alu->src[1],
@@ -2869,7 +2873,8 @@ chrome9_native_program_source(const struct chrome9_ps_source *source)
 }
 
 static bool
-chrome9_native_fs_is_program_batch(const struct chrome9_shader *shader)
+chrome9_native_fs_is_program_batch(const struct chrome9_shader *shader,
+                                   bool fragment_add)
 {
    const struct chrome9_ps_instruction *instruction;
 
@@ -2892,6 +2897,10 @@ chrome9_native_fs_is_program_batch(const struct chrome9_shader *shader)
       return true;
    case CHROME9_PS_OPCODE_MUL:
       return chrome9_native_program_source(&instruction->source[1]) &&
+             instruction->source[0].file != instruction->source[1].file;
+   case CHROME9_PS_OPCODE_ADD:
+      return fragment_add &&
+             chrome9_native_program_source(&instruction->source[1]) &&
              instruction->source[0].file != instruction->source[1].file;
    default:
       return false;
@@ -2999,7 +3008,7 @@ chrome9_create_fs_state(struct pipe_context *pipe,
          chrome9_compile_native_fs(shader, state->ir.nir);
       if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
           ctx->draw_program_triangle_d16_rhw_batch &&
-          chrome9_native_fs_is_program_batch(shader))
+          chrome9_native_fs_is_program_batch(shader, ctx->fragment_add))
          shader->fragment_program = CHROME9_FS_COMPILED_ALU;
       shader->supported =
          shader->fragment_program != CHROME9_FS_UNSUPPORTED;
@@ -3696,6 +3705,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->draw_program_triangle_d16_rhw_batch =
       !!(capabilities &
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);
+   ctx->fragment_add =
+      !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_ADD);
    ctx->draw_textured_triangle =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE);
    ctx->draw_textured_triangle_batch =

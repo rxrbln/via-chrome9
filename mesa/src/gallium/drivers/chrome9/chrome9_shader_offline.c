@@ -101,6 +101,20 @@ encode_source_c(uint32_t record[4], const struct chrome9_ps_source *source)
       record[3] |= 0x00100000;
 }
 
+static void
+encode_source_b(uint32_t record[4], const struct chrome9_ps_source *source)
+{
+   record[0] &= ~0x03ffffff;
+   record[0] |= (uint32_t)source->modifier |
+                (uint32_t)source->swizzle[0] << 13 |
+                (uint32_t)source->swizzle[1] << 10 |
+                (uint32_t)source->swizzle[2] << 7 |
+                (uint32_t)source->swizzle[3] << 4 |
+                (uint32_t)source->id << 16 |
+                (uint32_t)source->file << 22 |
+                (uint32_t)source->last_use << 25;
+}
+
 bool
 chrome9_encode_ps_mov(const struct chrome9_ps_source *source,
                       uint32_t record[4])
@@ -134,6 +148,25 @@ chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
 }
 
 bool
+chrome9_encode_ps_add(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_b,
+                      uint32_t record[4])
+{
+   /* The pixel ALU is a three-source A*C+B datapath.  ADD fixes C to the
+    * native literal-one selector, leaving A and B as the semantic inputs. */
+   static const uint32_t base[4] = {
+      0x00810530, 0x30140924, 0x00f08005, 0x00000020,
+   };
+
+   if (!record || !source_valid(source_a) || !source_valid(source_b))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source_a);
+   encode_source_b(record, source_b);
+   return true;
+}
+
+bool
 chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                       struct chrome9_ps_program *p)
 {
@@ -158,6 +191,7 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
          source_count = 1;
          break;
       case CHROME9_PS_OPCODE_MUL:
+      case CHROME9_PS_OPCODE_ADD:
          source_count = 2;
          break;
       default:
@@ -224,9 +258,13 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
       if (instruction->op == CHROME9_PS_OPCODE_MOV) {
          if (!chrome9_encode_ps_mov(&sources[0], p->alu[i]))
             return false;
-      } else if (!chrome9_encode_ps_mul(&sources[0], &sources[1],
-                                        p->alu[i])) {
-         return false;
+      } else {
+         bool encoded = instruction->op == CHROME9_PS_OPCODE_MUL ?
+            chrome9_encode_ps_mul(&sources[0], &sources[1], p->alu[i]) :
+            chrome9_encode_ps_add(&sources[0], &sources[1], p->alu[i]);
+
+         if (!encoded)
+            return false;
       }
       encode_destination(p->alu[i], &instruction->destination);
       for (unsigned s = 0; s < source_count; s++) {

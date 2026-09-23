@@ -80,6 +80,7 @@ struct chrome9_ps_destination {
 enum chrome9_ps_opcode {
    CHROME9_PS_OPCODE_MOV,
    CHROME9_PS_OPCODE_MUL,
+   CHROME9_PS_OPCODE_ADD,
 };
 
 struct chrome9_ps_instruction {
@@ -154,6 +155,9 @@ bool chrome9_encode_ps_mov(const struct chrome9_ps_source *source,
                            uint32_t record[4]);
 bool chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
                            const struct chrome9_ps_source *source_c,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_add(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_b,
                            uint32_t record[4]);
 bool chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                            struct chrome9_ps_program *program);

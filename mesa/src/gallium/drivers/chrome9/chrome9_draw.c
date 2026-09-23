@@ -129,6 +129,7 @@ chrome9_program_source(const struct chrome9_ps_source *native,
 
 static bool
 chrome9_program_instruction(const struct chrome9_shader *shader,
+                            bool fragment_add,
                             struct drm_chrome9_ps_instruction *instruction)
 {
    const struct chrome9_ps_instruction *native;
@@ -156,6 +157,15 @@ chrome9_program_instruction(const struct chrome9_shader *shader,
       if (native->source[0].file == native->source[1].file)
          return false;
       instruction->op = DRM_CHROME9_PS_OP_MUL;
+      return chrome9_program_source(&native->source[0],
+                                    &instruction->src[0]) &&
+             chrome9_program_source(&native->source[1],
+                                    &instruction->src[1]);
+   case CHROME9_PS_OPCODE_ADD:
+      if (!fragment_add ||
+          native->source[0].file == native->source[1].file)
+         return false;
+      instruction->op = DRM_CHROME9_PS_OP_ADD;
       return chrome9_program_source(&native->source[0],
                                     &instruction->src[0]) &&
              chrome9_program_source(&native->source[1],
@@ -1348,7 +1358,8 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
        * larger RHW run so state changes can coalesce across GL draw calls;
        * reserve cmd19 for programs which actually need uploaded ALU state. */
       ctx->fs->fragment_program != CHROME9_FS_PRIMARY_COLOR &&
-      chrome9_program_instruction(ctx->fs, &program_instruction) &&
+      chrome9_program_instruction(ctx->fs, ctx->fragment_add,
+                                  &program_instruction) &&
       (!(ctx->fs->native_fs.constant_mask & 1) ||
        chrome9_fragment_constant_c0(ctx, program_constant_c0));
    rhw_chain_batch = perspective_batch &&

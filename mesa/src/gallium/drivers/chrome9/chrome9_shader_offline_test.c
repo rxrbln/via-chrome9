@@ -21,6 +21,9 @@ check_ps_encoder(void)
    static const uint32_t mul_v0_c0[4] = {
       0x0140b6d0, 0x30080053, 0x00f04005, 0x00000820,
    };
+   static const uint32_t add_v0_c0[4] = {
+      0x00800530, 0x30140924, 0x00f04005, 0x00000020,
+   };
    struct chrome9_ps_source v0 = {
       .file = CHROME9_PS_SOURCE_INPUT,
       .swizzle = {
@@ -36,12 +39,17 @@ check_ps_encoder(void)
    assert(!memcmp(record, mov_v0, sizeof(record)));
    assert(chrome9_encode_ps_mul(&v0, &c0, record));
    assert(!memcmp(record, mul_v0_c0, sizeof(record)));
+   assert(chrome9_encode_ps_add(&v0, &c0, record));
+   assert(!memcmp(record, add_v0_c0, sizeof(record)));
 
    assert(!chrome9_encode_ps_mov(NULL, record));
    assert(!chrome9_encode_ps_mov(&v0, NULL));
    assert(!chrome9_encode_ps_mul(NULL, &c0, record));
    assert(!chrome9_encode_ps_mul(&v0, NULL, record));
    assert(!chrome9_encode_ps_mul(&v0, &c0, NULL));
+   assert(!chrome9_encode_ps_add(NULL, &c0, record));
+   assert(!chrome9_encode_ps_add(&v0, NULL, record));
+   assert(!chrome9_encode_ps_add(&v0, &c0, NULL));
 
    v0.id = 2;
    assert(!chrome9_encode_ps_mov(&v0, record));
@@ -54,6 +62,7 @@ check_ps_encoder(void)
    v0.modifier = 0;
    c0.id = 32;
    assert(!chrome9_encode_ps_mul(&v0, &c0, record));
+   assert(!chrome9_encode_ps_add(&v0, &c0, record));
 }
 
 static void
@@ -199,6 +208,9 @@ identity_source(enum chrome9_ps_source_file file, unsigned id,
 static void
 check_ps_ir(void)
 {
+   static const uint32_t add_c0_c1_oc0[4] = {
+      0x00810530, 0x30140924, 0x00f08005, 0x00000820,
+   };
    static const uint32_t mul_c0_c1_r0[4] = {
       0x0140b6d0, 0x30081053, 0x00f08005, 0x00000020,
    };
@@ -207,6 +219,21 @@ check_ps_ir(void)
    };
    struct chrome9_ps_ir ir = { 0 };
    struct chrome9_ps_program program;
+
+   ir.count = 1;
+   ir.instruction[0].op = CHROME9_PS_OPCODE_ADD;
+   ir.instruction[0].destination.file = CHROME9_PS_DESTINATION_COLOR;
+   ir.instruction[0].destination.writemask = 0xf;
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 0, false);
+   ir.instruction[0].source[1] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 1, false);
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   assert(program.alu_count == 1 && program.constant_mask == 3);
+   assert(!memcmp(program.alu[0], add_c0_c1_oc0,
+                  sizeof(add_c0_c1_oc0)));
+
+   memset(&ir, 0, sizeof(ir));
 
    ir.count = 2;
    ir.instruction[0].op = CHROME9_PS_OPCODE_MUL;
