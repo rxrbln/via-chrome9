@@ -95,6 +95,22 @@ OpenGL limit is eight units and only stages 0/1 have live hardware proof.
 Validate the logical ID before encoding and expose no more than s0--s7 until a
 distinguishable eight-stage guarded test passes.
 
+A second sparse probe pairs those samplers with logical coordinates
+T0,T1,T2,T4,T5.  The production allocator compacts the coordinate namespace
+to physical slots 0..4 and emits:
+
+```text
+TAU = 301001b0 311111b1 321221b2 341331b4 351441b5
+A91 = 9100001f
+active tuple = (5,8,5,6)
+object +40 = 00000037   # logical texture-coordinate use
+object +70 = 0000001f   # allocated TAU coordinate-slot use
+```
+
+This directly proves that sparse logical sampler IDs remain sparse in the TAU
+sampler nibbles while sparse logical coordinate IDs are compacted separately.
+Neither `+40` nor A91 may be substituted for the logical sampler set.
+
 ## Per-stage state namespace
 
 The shader sampler number and all state selectors must agree.  For validated
@@ -133,6 +149,21 @@ by its vertex shader.  The sparse production object proves that the fragment
 TAU namespace can express exactly this non-contiguous set.  It does not prove
 D24 render-to-texture, multi-stage cache closure, mip tails, or vertex texture
 fetch, all of which remain separate capability gates.
+
+For fixed-function general texture state, `via3DEmitState_H5` constructs the
+count from the enabled-stage high-water mark:
+
+```text
+general A00 = ((high_water << 4) & 000000fe) | 1
+general A08 = 08010100 | (high_water & 00fefeff)
+```
+
+Consequently a sparse stage set ending at s5 must retain high-water six and
+use A00=`00000061`, not popcount-five A00=`00000051`.  Its final A01--A03 and
+A08--A0a coordinate linkage must describe the compiler-allocated physical
+coordinates; the TAU sampler nibble alone does not create that linkage.  This
+six-stage sparse combination is exact static/compiler evidence and still
+requires a distinct-color live state-closure test.
 
 ## Fail-closed compiler rules
 
