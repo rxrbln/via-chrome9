@@ -5560,6 +5560,7 @@ main(int argc, char **argv)
           screen->caps.two_sided_color || screen->caps.clip_planes ||
           screen->caps.dithering ||
           screen->caps.mixed_colorbuffer_formats ||
+          !screen->caps.generate_mipmap ||
           !screen->caps.mixed_color_depth_bits ||
           screen->caps.npot_textures !=
              chrome9_screen_has_capability(

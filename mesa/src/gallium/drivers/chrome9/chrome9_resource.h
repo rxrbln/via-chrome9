@@ -50,6 +50,11 @@ chrome9_resource_create(struct pipe_screen *screen,
                         const struct pipe_resource *templ);
 void chrome9_resource_destroy(struct pipe_screen *screen,
                               struct pipe_resource *resource);
+bool chrome9_generate_mipmap(struct pipe_context *pipe,
+                             struct pipe_resource *resource,
+                             enum pipe_format format,
+                             unsigned base_level, unsigned last_level,
+                             unsigned first_layer, unsigned last_layer);
 
 void chrome9_init_screen_resource_functions(struct pipe_screen *screen);
 void chrome9_init_context_resource_functions(struct pipe_context *pipe);

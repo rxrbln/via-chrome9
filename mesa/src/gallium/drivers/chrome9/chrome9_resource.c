@@ -540,6 +540,201 @@ chrome9_transfer_unmap(struct pipe_context *pipe,
    FREE(transfer);
 }
 
+struct chrome9_mipmap_mapping {
+   uint8_t *data;
+   struct pipe_transfer *transfer;
+   unsigned stride;
+};
+
+static bool
+chrome9_mipmap_level_valid(const struct chrome9_resource *resource,
+                           unsigned level, unsigned cpp)
+{
+   const unsigned width = u_minify(resource->base.width0, level);
+   const unsigned height = u_minify(resource->base.height0, level);
+
+   return resource->level_stride[level] >= width * cpp &&
+          resource->level_size[level] >=
+             (uint64_t)resource->level_stride[level] * height &&
+          resource->level_offset[level] <= resource->bo.size &&
+          resource->level_size[level] <=
+             resource->bo.size - resource->level_offset[level];
+}
+
+static bool
+chrome9_mipmap_map_level(struct pipe_context *pipe,
+                         struct chrome9_resource *resource, unsigned level,
+                         unsigned usage, unsigned cpp,
+                         struct chrome9_mipmap_mapping *mapping)
+{
+   const unsigned width = u_minify(resource->base.width0, level);
+   const unsigned height = u_minify(resource->base.height0, level);
+   const struct pipe_box box = {
+      .width = width,
+      .height = height,
+      .depth = 1,
+   };
+
+   memset(mapping, 0, sizeof(*mapping));
+   mapping->data = pipe->texture_map(pipe, &resource->base, level, usage,
+                                     &box, &mapping->transfer);
+   if (mapping->data) {
+      if (mapping->transfer && mapping->transfer->stride >= width * cpp) {
+         mapping->stride = mapping->transfer->stride;
+         return true;
+      }
+      if (mapping->transfer)
+         pipe->texture_unmap(pipe, mapping->transfer);
+      memset(mapping, 0, sizeof(*mapping));
+   }
+
+   /* Chrome9 BOs are persistently mapped.  Retain a complete CPU path if
+    * allocating the small pipe_transfer object fails: returning false here
+    * would make the state tracker enter util_gen_mipmap(), while this bounded
+    * driver intentionally has no generic blit callback yet. */
+   if (!resource->bo.map ||
+       !chrome9_mipmap_level_valid(resource, level, cpp))
+      return false;
+   mapping->data = (uint8_t *)resource->bo.map +
+                   resource->level_offset[level];
+   mapping->stride = resource->level_stride[level];
+   return true;
+}
+
+static void
+chrome9_mipmap_unmap_level(struct pipe_context *pipe,
+                           struct chrome9_mipmap_mapping *mapping)
+{
+   if (mapping->transfer)
+      pipe->texture_unmap(pipe, mapping->transfer);
+   memset(mapping, 0, sizeof(*mapping));
+}
+
+static void
+chrome9_mipmap_bgra_level(enum pipe_format format,
+                          const struct chrome9_mipmap_mapping *source,
+                          unsigned source_width, unsigned source_height,
+                          const struct chrome9_mipmap_mapping *destination,
+                          unsigned destination_width,
+                          unsigned destination_height)
+{
+   for (unsigned y = 0; y < destination_height; y++) {
+      const unsigned y0 = source_height == 1 ? 0 : y * 2;
+      const unsigned y1 = source_height == 1 ? 0 : y0 + 1;
+      const uint8_t *rows[2] = {
+         source->data + (uint64_t)y0 * source->stride,
+         source->data + (uint64_t)y1 * source->stride,
+      };
+      uint8_t *dst = destination->data + (uint64_t)y * destination->stride;
+
+      for (unsigned x = 0; x < destination_width; x++, dst += 4) {
+         const unsigned x0 = source_width == 1 ? 0 : x * 2;
+         const unsigned x1 = source_width == 1 ? 0 : x0 + 1;
+
+         for (unsigned channel = 0; channel < 3; channel++)
+            dst[channel] =
+               ((unsigned)rows[0][x0 * 4 + channel] +
+                (unsigned)rows[0][x1 * 4 + channel] +
+                (unsigned)rows[1][x0 * 4 + channel] +
+                (unsigned)rows[1][x1 * 4 + channel]) / 4;
+         if (format == PIPE_FORMAT_B8G8R8A8_UNORM)
+            dst[3] = ((unsigned)rows[0][x0 * 4 + 3] +
+                      (unsigned)rows[0][x1 * 4 + 3] +
+                      (unsigned)rows[1][x0 * 4 + 3] +
+                      (unsigned)rows[1][x1 * 4 + 3]) / 4;
+         else
+            dst[3] = 0xff;
+      }
+   }
+}
+
+static void
+chrome9_mipmap_z16_level(const struct chrome9_mipmap_mapping *source,
+                         unsigned source_width, unsigned source_height,
+                         const struct chrome9_mipmap_mapping *destination,
+                         unsigned destination_width,
+                         unsigned destination_height)
+{
+   for (unsigned y = 0; y < destination_height; y++) {
+      const unsigned y0 = source_height == 1 ? 0 : y * 2;
+      const unsigned y1 = source_height == 1 ? 0 : y0 + 1;
+      const uint16_t *row0 =
+         (const uint16_t *)(source->data + (uint64_t)y0 * source->stride);
+      const uint16_t *row1 =
+         (const uint16_t *)(source->data + (uint64_t)y1 * source->stride);
+      uint16_t *dst = (uint16_t *)(destination->data +
+                                   (uint64_t)y * destination->stride);
+
+      for (unsigned x = 0; x < destination_width; x++) {
+         const unsigned x0 = source_width == 1 ? 0 : x * 2;
+         const unsigned x1 = source_width == 1 ? 0 : x0 + 1;
+
+         dst[x] = ((uint32_t)row0[x0] + row0[x1] +
+                   row1[x0] + row1[x1]) / 4;
+      }
+   }
+}
+
+bool
+chrome9_generate_mipmap(struct pipe_context *pipe,
+                        struct pipe_resource *pres,
+                        enum pipe_format format,
+                        unsigned base_level, unsigned last_level,
+                        unsigned first_layer, unsigned last_layer)
+{
+   struct chrome9_resource *resource;
+   unsigned cpp;
+
+   if (!pipe || !pres || !pipe->texture_map || !pipe->texture_unmap ||
+       pres->target != PIPE_TEXTURE_2D || pres->depth0 != 1 ||
+       pres->array_size != 1 || pres->nr_samples > 1 ||
+       pres->nr_storage_samples > 1 || format != pres->format ||
+       (format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+        format != PIPE_FORMAT_Z16_UNORM) ||
+       base_level > last_level || last_level > pres->last_level ||
+       first_layer || last_layer)
+      return false;
+
+   resource = chrome9_resource(pres);
+   cpp = format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
+   if (!resource->guarded || !resource->bo.map)
+      return false;
+   for (unsigned level = base_level; level <= last_level; level++)
+      if (!chrome9_mipmap_level_valid(resource, level, cpp))
+         return false;
+
+   for (unsigned level = base_level + 1; level <= last_level; level++) {
+      const unsigned source_width = u_minify(pres->width0, level - 1);
+      const unsigned source_height = u_minify(pres->height0, level - 1);
+      const unsigned destination_width = u_minify(pres->width0, level);
+      const unsigned destination_height = u_minify(pres->height0, level);
+      struct chrome9_mipmap_mapping source;
+      struct chrome9_mipmap_mapping destination;
+
+      if (!chrome9_mipmap_map_level(pipe, resource, level - 1,
+                                    PIPE_MAP_READ, cpp, &source))
+         return false;
+      if (!chrome9_mipmap_map_level(pipe, resource, level, PIPE_MAP_WRITE,
+                                    cpp, &destination)) {
+         chrome9_mipmap_unmap_level(pipe, &source);
+         return false;
+      }
+
+      if (format == PIPE_FORMAT_Z16_UNORM)
+         chrome9_mipmap_z16_level(&source, source_width, source_height,
+                                  &destination, destination_width,
+                                  destination_height);
+      else
+         chrome9_mipmap_bgra_level(format, &source, source_width,
+                                   source_height, &destination,
+                                   destination_width, destination_height);
+      chrome9_mipmap_unmap_level(pipe, &destination);
+      chrome9_mipmap_unmap_level(pipe, &source);
+   }
+   return true;
+}
+
 void
 chrome9_init_screen_resource_functions(struct pipe_screen *screen)
 {
@@ -558,6 +753,7 @@ chrome9_init_context_resource_functions(struct pipe_context *pipe)
    pipe->buffer_unmap = chrome9_transfer_unmap;
    pipe->texture_map = chrome9_transfer_map;
    pipe->texture_unmap = chrome9_transfer_unmap;
+   pipe->generate_mipmap = chrome9_generate_mipmap;
    pipe->resource_copy_region = util_resource_copy_region;
    pipe->transfer_flush_region = u_default_transfer_flush_region;
    pipe->buffer_subdata = u_default_buffer_subdata;

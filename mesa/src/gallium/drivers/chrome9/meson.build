@@ -39,3 +39,13 @@ chrome9_shader_offline_test = executable(
 )
 test('chrome9-shader-offline', chrome9_shader_offline_test,
      suite : ['chrome9'])
+
+chrome9_mipmap_test = executable(
+  'chrome9-mipmap-test',
+  'chrome9_mipmap_test.c',
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  dependencies : [dep_libdrm, idep_mesautil, idep_nir],
+  link_with : [libchrome9, libgallium],
+  install : false,
+)
+test('chrome9-mipmap', chrome9_mipmap_test, suite : ['chrome9'])

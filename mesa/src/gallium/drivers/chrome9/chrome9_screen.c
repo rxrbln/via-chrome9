@@ -353,6 +353,9 @@ chrome9_restrict_generic_caps(struct pipe_caps *caps)
    caps->clip_planes = 0;
    caps->dithering = false;
    caps->mixed_colorbuffer_formats = false;
+   /* CPU generation uses the guarded, persistently mapped per-level layout
+    * and covers every local 2D format which this driver can allocate. */
+   caps->generate_mipmap = true;
 }
 
 struct pipe_screen *
