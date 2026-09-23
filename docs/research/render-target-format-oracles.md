@@ -128,8 +128,8 @@ the A52 `8a` selection, 16-bit pitch/extent, and stored alpha.  It intentionally
 does not enable blending or depth; those are separate format/state products.
 
 The implementation must append a destination enum (without renumbering the
-existing `0..2` values), lower it through a closed format table to
-`{ A52 byte 8a, cpp 2 }`, and use that same `cpp` for pitch and BO-extent
+existing `0..3` values, including L8A8 at 3), lower it through a closed format
+table to `{ A52 byte 8a, cpp 2 }`, and use that same `cpp` for pitch and BO-extent
 validation.  The current generic path handles RGB565 with equality tests in
 both A52 lowering and pitch validation, so merely increasing the maximum enum
 would incorrectly program ARGB1555 as BGRX8888 with four-byte geometry.
@@ -288,13 +288,14 @@ alpha target:
 DRM_CHROME9_DESTINATION_FORMAT_BGRX8888 = 0 -> A52 98
 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 = 1 -> A52 99
 DRM_CHROME9_DESTINATION_FORMAT_RGB565   = 2 -> A52 89
-DRM_CHROME9_DESTINATION_FORMAT_ARGB1555 = 3 -> A52 8a
+DRM_CHROME9_DESTINATION_FORMAT_L8A8     = 3 -> A52 15
+DRM_CHROME9_DESTINATION_FORMAT_ARGB1555 = 4 -> A52 8a
 
 DRM_CHROME9_BLEND_FRAMEBUFFER_SRGB_ENABLE = 1 << 2
 ```
 
-Append ARGB4444/L8A8 and the `b8/b9` channel-reversed pair only as their gates
-pass; do not reuse value 2 from pre-RGB565 design notes.  The kernel should
+Append ARGB4444 and the `b8/b9` channel-reversed pair only as their gates pass;
+do not reuse value 2 from pre-RGB565 design notes.  The kernel should
 lower the destination enum through a closed table carrying both A52 byte and
 bytes per pixel, rather than another equality chain, and reject unknown values.
 The sRGB flag changes only A53 bits `[6:4]` from `000` to `101`; it must
