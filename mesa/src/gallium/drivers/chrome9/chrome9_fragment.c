@@ -62,6 +62,11 @@ chrome9_fragment_source(const struct chrome9_ps_source *source,
    case CHROME9_PS_SOURCE_CONSTANT:
       result->file = DRM_CHROME9_FRAGMENT_FILE_CONSTANT;
       break;
+   case CHROME9_PS_SOURCE_POSITION:
+      if (source->id)
+         return false;
+      result->file = DRM_CHROME9_FRAGMENT_FILE_POSITION;
+      break;
    default:
       return false;
    }
@@ -243,6 +248,30 @@ chrome9_fragment_build_instructions(
          if (!chrome9_fragment_source(&source->source[s],
                                       &instruction->src[s]))
             return false;
+      for (unsigned s = 0; s < source_count; s++) {
+         const struct drm_chrome9_fragment_source *input =
+            &instruction->src[s];
+         unsigned used_lanes = source->destination.writemask;
+
+         if (input->file != DRM_CHROME9_FRAGMENT_FILE_POSITION)
+            continue;
+         if (source->op == CHROME9_PS_OPCODE_TEX ||
+             source->op == CHROME9_PS_OPCODE_KILL)
+            return false;
+         if (source->op == CHROME9_PS_OPCODE_DP3)
+            used_lanes = 0x7;
+         else if (source->op == CHROME9_PS_OPCODE_DP4)
+            used_lanes = 0xf;
+         else if (source->op == CHROME9_PS_OPCODE_EXP2 ||
+                  source->op == CHROME9_PS_OPCODE_LOG2 ||
+                  source->op == CHROME9_PS_OPCODE_RCP ||
+                  source->op == CHROME9_PS_OPCODE_RSQ)
+            used_lanes = 0x1;
+         for (unsigned lane = 0; lane < 4; lane++)
+            if ((used_lanes & (1u << lane)) &&
+                input->swizzle[lane] > DRM_CHROME9_FRAGMENT_SWIZZLE_Y)
+               return false;
+      }
    }
    *count = ir->count;
    return true;

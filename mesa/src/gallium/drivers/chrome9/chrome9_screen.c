@@ -443,7 +443,14 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    caps->user_vertex_buffers = true;
    caps->vertex_color_clamped = true;
    caps->fs_coord_origin_upper_left = true;
-   caps->fs_coord_pixel_center_half_integer = true;
+   if (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_POSITION) {
+      /* VX900 vPos is raw D3D9 integer-center XY.  State tracker inserts
+       * GL's half-pixel bias and framebuffer-dependent Y transform. */
+      caps->fs_coord_pixel_center_integer = true;
+      caps->fs_position_is_sysval = true;
+   } else {
+      caps->fs_coord_pixel_center_half_integer = true;
+   }
    caps->alpha_test =
       (screen->capabilities &
        (DRM_CHROME9_CAP_ALPHA_TEST |

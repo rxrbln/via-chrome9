@@ -2670,6 +2670,44 @@ chrome9_ps_immediate(struct chrome9_ps_nir_builder *builder,
    return true;
 }
 
+/* The semantic ABI addresses c0..c31 as vec4 registers.  State tracker
+ * usually emits load_ubo_vec4; direct Gallium NIR may use byte-addressed
+ * load_ubo instead.  Accept only constant, in-register reads from CB0. */
+static bool
+chrome9_ps_ubo_load(const nir_intrinsic_instr *load,
+                    unsigned *id, unsigned *component)
+{
+   unsigned word;
+
+   if ((load->intrinsic != nir_intrinsic_load_ubo &&
+        load->intrinsic != nir_intrinsic_load_ubo_vec4) ||
+       !nir_src_is_const(load->src[0]) ||
+       nir_src_as_uint(load->src[0]) ||
+       !nir_src_is_const(load->src[1]) ||
+       load->def.bit_size != 32 || !load->def.num_components ||
+       load->def.num_components > 4)
+      return false;
+   if (load->intrinsic == nir_intrinsic_load_ubo) {
+      unsigned offset = nir_src_as_uint(load->src[1]);
+
+      if (offset & 3)
+         return false;
+      word = offset / 4;
+   } else {
+      unsigned offset = nir_src_as_uint(load->src[1]);
+      unsigned lane = nir_intrinsic_component(load);
+
+      if (offset >= 32 || nir_intrinsic_base(load) >= 32 - offset ||
+          lane >= 4)
+         return false;
+      word = (nir_intrinsic_base(load) + offset) * 4 +
+             lane;
+   }
+   *id = word / 4;
+   *component = word % 4;
+   return *id < 32 && *component + load->def.num_components <= 4;
+}
+
 static bool
 chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
                 struct chrome9_ps_source *source)
@@ -2694,6 +2732,16 @@ chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
    if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
       unsigned location = ~0u;
+      unsigned id, component;
+
+      if (load->intrinsic == nir_intrinsic_load_frag_coord &&
+          def->bit_size == 32 && def->num_components == 4) {
+         memset(source, 0, sizeof(*source));
+         source->file = CHROME9_PS_SOURCE_POSITION;
+         for (unsigned c = 0; c < 4; c++)
+            source->swizzle[c] = c;
+         return true;
+      }
 
       if (load->intrinsic == nir_intrinsic_load_uniform &&
           nir_src_is_const(load->src[0]) && !nir_intrinsic_base(load) &&
@@ -2709,6 +2757,16 @@ chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
          for (unsigned c = 0; c < 4; c++)
             source->swizzle[c] = c < def->num_components ?
                c : CHROME9_PS_SWIZZLE_ZERO;
+         return true;
+      }
+
+      if (chrome9_ps_ubo_load(load, &id, &component)) {
+         memset(source, 0, sizeof(*source));
+         source->file = CHROME9_PS_SOURCE_CONSTANT;
+         source->id = id;
+         for (unsigned c = 0; c < 4; c++)
+            source->swizzle[c] = c < def->num_components ?
+               component + c : CHROME9_PS_SWIZZLE_ZERO;
          return true;
       }
 
@@ -3271,13 +3329,20 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
             return false;
          builder.uniform_mask |= 1u << id;
          continue;
+      } else if (intr->intrinsic == nir_intrinsic_load_ubo ||
+                 intr->intrinsic == nir_intrinsic_load_ubo_vec4) {
+         unsigned id, component;
+
+         if (!chrome9_ps_ubo_load(intr, &id, &component))
+            return false;
+         builder.uniform_mask |= 1u << id;
+         continue;
       } else if (intr->intrinsic ==
                     nir_intrinsic_load_barycentric_pixel ||
+                 intr->intrinsic == nir_intrinsic_load_frag_coord ||
                  intr->intrinsic ==
                     nir_intrinsic_load_interpolated_input ||
-                 intr->intrinsic == nir_intrinsic_load_deref ||
-                 intr->intrinsic == nir_intrinsic_load_ubo ||
-                 intr->intrinsic == nir_intrinsic_load_ubo_vec4) {
+                 intr->intrinsic == nir_intrinsic_load_deref) {
          continue;
       } else {
          return false;

@@ -49,6 +49,8 @@ enum chrome9_ps_source_file {
    CHROME9_PS_SOURCE_CONSTANT = 2,
    /* Full-precision class-3 texture/misc interpolator T0..T7. */
    CHROME9_PS_SOURCE_TEXTURE = 3,
+   /* Raw, upper-left, integer-centered fragment XY (kernel MISC/vPos). */
+   CHROME9_PS_SOURCE_POSITION = 4,
 };
 
 enum chrome9_ps_destination_file {
