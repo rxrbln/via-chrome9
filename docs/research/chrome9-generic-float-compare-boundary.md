@@ -242,9 +242,17 @@ The exact T0 seed is RGBA `(.125,.375,.25,.75)`.  A MOV control must store
 host BGRA `bf206040`.  Five steps produce exact binary fractions
 `(.375,.125,0,0)`, host BGRA `00602000`; across those lanes both CMP arms are
 taken.  Both draws require D16 near `8000`, untouched exterior pixels, and
-intact leading/trailing BO guard pages.  The tool is host-built only and has
-not been submitted to hardware.  Its first live use must be one bounded run
-bracketed by a known-good draw, with no retries after timeout.
+intact leading/trailing BO guard pages.  Both draws passed on VX900: the
+31-ALU candidate produced the expected pixels, D16, exterior, and guard
+values.  The MOV control first needed its UAPI metadata corrected to use
+zero constant count and a null constant pointer; its earlier `EINVAL` was a
+pre-submission validation failure, not a GPU fault.
+
+The constant-only CMP oracle with three distinct constant registers returned
+`EINVAL` at the kernel's known constant-port guard.  A TEMP-backed CMP
+oracle passed negative, positive, +0, and -0 condition lanes; a dynamic vPos
+threshold oracle passed as well.  These finite-domain checks do not qualify
+NaN or arbitrary comparison lowering.
 
 ## Guarded qualification sequence
 
