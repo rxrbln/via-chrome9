@@ -1609,6 +1609,78 @@ static void chrome9_fragment_sampler_state(
 	sampler[3] = 0xcccccccc;
 }
 
+static u32 chrome9_fragment_raster_state(u32 varying_count, u32 vertex_count,
+		u32 raster[40])
+{
+	u32 vertex_stride = 6 + 4 * varying_count;
+	u32 a25 = 0x25f60000;
+	u32 a26 = 0x26000000;
+	u32 a28 = 0x28ff0000;
+	u32 a29 = 0x29000000;
+	unsigned int i;
+
+	memset(raster, 0, 40 * sizeof(*raster));
+	raster[0] = ((2 + varying_count) << 8) | vertex_stride;
+	raster[1] = 0x010000c2;
+	raster[2] = 0x020041d1;
+	raster[3] = 0x030052d1;
+	for (i = 0; i < varying_count; i++)
+		raster[4 + i] = (4 + i) << 24 | (6 + 4 * i) << 12 |
+			(3 + i) << 8 | 0xc2;
+	i = 4 + varying_count;
+	raster[i++] = 0x12000000 | GENMASK(2 + varying_count, 0);
+	raster[i++] = 0x61800000;
+	/* H6 resource high-water is D2 plus the dense T inputs. */
+	raster[i++] = 0x620081ff | (2 + varying_count) << 20;
+	raster[i++] = 0x20000000;
+	raster[i++] = 0x23004f02;
+	raster[i++] = 0x24000000 | vertex_count;
+	for (unsigned int varying = 0; varying < varying_count; varying++) {
+		u32 shift = 12 - 4 * (varying & 3);
+
+		if (varying < 4) {
+			a25 |= 0xf << shift;
+			a28 |= 0xf << shift;
+		} else {
+			a26 |= 0xf << shift;
+			a29 |= 0xf << shift;
+		}
+	}
+	raster[i++] = a25;
+	raster[i++] = a26;
+	raster[i++] = a28;
+	raster[i++] = a29;
+	raster[i++] = 0x40800000;
+	raster[i++] = 0x41400000;
+	raster[i++] = 0x4200493f;
+	raster[i++] = 0x43800000;
+	raster[i++] = 0x44400000;
+	raster[i++] = 0x4500493f;
+	raster[i++] = 0x46800000;
+	raster[i++] = 0x47400000;
+	raster[i++] = 0x4800003f;
+	raster[i++] = 0x49000000;
+	raster[i++] = 0x50000000;
+	raster[i++] = 0x51000000;
+	raster[i++] = 0x52147fff;
+	return i;
+}
+
+static int chrome9_fragment_raster_selftest(void)
+{
+	u32 raster[40];
+	u32 count;
+
+	count = chrome9_fragment_raster_state(1, 3, raster);
+	if (count != 28 || raster[0] != 0x0000030a ||
+	    raster[4] != 0x040063c2 || raster[5] != 0x1200000f ||
+	    raster[7] != 0x623081ff || raster[10] != 0x24000003 ||
+	    raster[11] != 0x25f6f000 || raster[12] != 0x26000000 ||
+	    raster[13] != 0x28fff000 || raster[14] != 0x29000000)
+		return -EINVAL;
+	return 0;
+}
+
 static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	const struct chrome9_draw_request *request, struct chrome9_job *job,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
@@ -1651,7 +1723,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x81000000 | request->width,
 		chrome9_scissor_y(request), chrome9_scissor_x(request),
 	};
-	u32 raster[40] = { 0 };
+	u32 raster[40];
 	u32 vs_program[4 * (4 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)] = { 0 };
 	u32 vs_control[] = { 0x60800000 | (3 + program->varying_count) };
 	u32 *base = engine->run_staging_cpu;
@@ -1659,7 +1731,6 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	u32 destination_count;
 	u32 common_count = 8;
 	u32 vertex_count = request->triangle_count * 3;
-	u32 vertex_stride = 6 + 4 * program->varying_count;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 		DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	u32 raster_count;
@@ -1707,48 +1778,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	}
 
 	/* D0 position, normalized D1/D2 colors, then dense float4 T0..T7. */
-	raster[0] = ((2 + program->varying_count) << 8) | vertex_stride;
-	raster[1] = 0x010000c2;
-	raster[2] = 0x020041d1;
-	raster[3] = 0x030052d1;
-	for (i = 0; i < program->varying_count; i++)
-		raster[4 + i] = (4 + i) << 24 | (6 + 4 * i) << 12 |
-			(3 + i) << 8 | 0xc2;
-	i = 4 + program->varying_count;
-	raster[i++] = 0x12000000 | GENMASK(2 + program->varying_count, 0);
-	raster[i++] = 0x61800000;
-	raster[i++] = 0x620081ff | (3 + program->varying_count) << 20;
-	raster[i++] = 0x20000000;
-	raster[i++] = 0x23004f02;
-	raster[i++] = 0x24000000 | vertex_count;
-	{
-		u32 a25 = 0x25f60000;
-		u32 a26 = 0x26000000;
-		unsigned int varying;
-
-		for (varying = 0; varying < program->varying_count; varying++)
-			if (varying < 4)
-				a25 |= 0xf << (12 - 4 * varying);
-			else
-				a26 |= 0xf << (28 - 4 * varying);
-		raster[i++] = a25;
-		raster[i++] = a26;
-		raster[i++] = 0x28ffcc00;
-	}
-	raster[i++] = 0x40800000;
-	raster[i++] = 0x41400000;
-	raster[i++] = 0x4200493f;
-	raster[i++] = 0x43800000;
-	raster[i++] = 0x44400000;
-	raster[i++] = 0x4500493f;
-	raster[i++] = 0x46800000;
-	raster[i++] = 0x47400000;
-	raster[i++] = 0x4800003f;
-	raster[i++] = 0x49000000;
-	raster[i++] = 0x50000000;
-	raster[i++] = 0x51000000;
-	raster[i++] = 0x52147fff;
-	raster_count = i;
+	raster_count = chrome9_fragment_raster_state(program->varying_count,
+		vertex_count, raster);
 	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
 	for (i = 0; i < program->varying_count; i++) {
 		u32 *record = vs_program + 16 + i * 4;
@@ -3339,6 +3370,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"fragment texture-state self-test failed: %d\n", ret);
+		return ret;
+	}
+	ret = chrome9_fragment_raster_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"fragment raster-state self-test failed: %d\n", ret);
 		return ret;
 	}
 	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
