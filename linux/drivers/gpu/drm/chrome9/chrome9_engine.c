@@ -1801,6 +1801,9 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
 		0x34000150, 0x35000114, 0x36000500, 0x37000200,
 	};
+	static const u32 pixel_z_clip[] = {
+		0x1e000000, 0x1f000000, 0x20007fff,
+	};
 	static const u32 vs_prefix[] = {
 		0x00380150, 0x00000000, 0x00000000, 0x0008010f,
 		0x0008014c, 0x00100150, 0x00384154, 0x0004021f,
@@ -1825,9 +1828,9 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x08010100 | request->fragment_texture_count,
 		0x04000000, 0x05000000, 0x0d810000,
 	};
-	u32 common[12] = {
+	u32 common[14] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
-		0x01ce1540, 0x88001ed0, 0x89000800, 0xcc000000,
+		0x01ce1540, 0x88001ed0, 0x89000800,
 	};
 	u32 clip[] = {
 		0x80000000 | request->height,
@@ -1840,7 +1843,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	u32 *base = engine->run_staging_cpu;
 	u32 *p = base;
 	u32 destination_count;
-	u32 common_count = 8;
+	u32 common_count = 7;
 	u32 vertex_count = request->triangle_count * 3;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 		DRM_CHROME9_DEPTH_FUNC_SHIFT;
@@ -1884,9 +1887,11 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		common[9] = request->fragment_depth_format ==
 			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000;
 		common[10] = 0x13000000 | depth_func << 16;
-		common[11] = 0x20007fff;
-		common_count = ARRAY_SIZE(common);
+		common_count = 11;
 	}
+	/* The pre-depth pixel-Z clip interval is required even without depth. */
+	memcpy(common + common_count, pixel_z_clip, sizeof(pixel_z_clip));
+	common_count += ARRAY_SIZE(pixel_z_clip);
 
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	raster_count = chrome9_fragment_raster_state(program->varying_count,
