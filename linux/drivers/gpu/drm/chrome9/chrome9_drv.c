@@ -3,6 +3,7 @@
 
 #include <linux/module.h>
 #include <linux/aperture.h>
+#include <linux/bitfield.h>
 #include <linux/pci.h>
 #include <linux/iopoll.h>
 #include <linux/dma-mapping.h>
@@ -322,11 +323,97 @@ static int chrome9_recover_2d_engine(struct chrome9_device *cdev)
 	return 0;
 }
 
-static int chrome9_detect_vram(struct chrome9_device *cdev)
+static resource_size_t chrome9_decode_sr14_vram(u8 code)
+{
+	switch (code) {
+	case 0x00:
+		return SZ_512M;
+	case 0x80:
+		return SZ_256M;
+	case 0xc0:
+		return SZ_128M;
+	case 0xe0:
+		return SZ_64M;
+	case 0xf0:
+		return SZ_32M;
+	case 0xf8:
+		return SZ_16M;
+	default:
+		return 0;
+	}
+}
+
+static resource_size_t chrome9_decode_vx900_vram(u32 config)
+{
+	u32 code = FIELD_GET(GENMASK(14, 12), config);
+
+	if (!(config & BIT(15)) || !code || code > 7)
+		return 0;
+	return (resource_size_t)SZ_4M << code;
+}
+
+static resource_size_t chrome9_decode_sr68_vram(u8 code)
+{
+	switch (code) {
+	case 0x00:
+		return SZ_512M;
+	case 0x80:
+		return SZ_256M;
+	case 0xc0:
+		return SZ_128M;
+	case 0xe0:
+		return SZ_64M;
+	case 0xf0:
+		return SZ_32M;
+	case 0xf8:
+		return SZ_16M;
+	case 0xfc:
+		return SZ_8M;
+	case 0xfe:
+		return SZ_4M;
+	case 0xff:
+		return SZ_2M;
+	default:
+		return 0;
+	}
+}
+
+static resource_size_t chrome9_decode_pci_b2_vram(u8 code)
+{
+	switch (code) {
+	case 0x00:
+		return SZ_512M;
+	case 0x40:
+		return SZ_256M;
+	case 0x60:
+		return SZ_128M;
+	case 0x70:
+		return SZ_64M;
+	case 0x78:
+		return SZ_32M;
+	case 0x7c:
+		return SZ_16M;
+	case 0x7e:
+		return SZ_8M;
+	case 0x7f:
+		return SZ_4M;
+	default:
+		return 0;
+	}
+}
+
+int chrome9_detect_vram(struct chrome9_device *cdev)
 {
 	struct pci_dev *pdev = cdev->pdev;
-	u8 pci_b0;
-	u8 pci_b2;
+	struct pci_dev *memory;
+	resource_size_t aperture_size;
+	resource_size_t controller_size;
+	resource_size_t pci_b2_size;
+	resource_size_t sr14_size;
+	resource_size_t sr68_size;
+	u16 memory_a0;
+	u8 pci_b0 = 0xff;
+	u8 pci_b2 = 0xff;
 	u8 saved_index;
 	u8 size_code;
 	u8 sl_size_code;
@@ -335,6 +422,38 @@ static int chrome9_detect_vram(struct chrome9_device *cdev)
 	u8 cr_gating;
 	u8 gfx_power;
 	int ret;
+
+	if (cdev->vram_size)
+		return 0;
+
+	memory = pci_get_domain_bus_and_slot(pci_domain_nr(pdev->bus),
+					     pdev->bus->number,
+					     PCI_DEVFN(0, 3));
+	if (!memory || memory->vendor != PCI_VENDOR_ID_VIA ||
+	    memory->device != 0x3410) {
+		pci_dev_put(memory);
+		return dev_err_probe(&pdev->dev, -ENODEV,
+			"cannot find VX900 DRAM controller at D0F3\n");
+	}
+	ret = pci_read_config_word(memory, 0xa0, &memory_a0);
+	pci_dev_put(memory);
+	if (ret)
+		return dev_err_probe(&pdev->dev, pcibios_err_to_errno(ret),
+			"cannot read VX900 framebuffer size at D0F3 A0\n");
+	controller_size = chrome9_decode_vx900_vram(memory_a0);
+	if (!controller_size)
+		return dev_err_probe(&pdev->dev, -ENODEV,
+			"unknown VX900 framebuffer-size code %#x at D0F3 A0\n",
+			(u32)FIELD_GET(GENMASK(14, 12), memory_a0));
+	aperture_size = pci_resource_len(pdev, 2);
+	if (!(pci_resource_flags(pdev, 2) & IORESOURCE_MEM) || !aperture_size)
+		return dev_err_probe(&pdev->dev, -ENODEV,
+				     "BAR2 VRAM aperture is unavailable\n");
+	if (aperture_size < controller_size)
+		return dev_err_probe(&pdev->dev, -ERANGE,
+			"BAR2 aperture %llu is smaller than the %llu-byte VX900 framebuffer\n",
+			(unsigned long long)aperture_size,
+			(unsigned long long)controller_size);
 
 	ret = vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
 	if (ret)
@@ -354,42 +473,48 @@ static int chrome9_detect_vram(struct chrome9_device *cdev)
 	gfx_power = vga_io_rseq(0x59);
 	vga_io_w(VGA_SEQ_I, saved_index);
 	vga_put(pdev, VGA_RSRC_LEGACY_IO);
-	pci_read_config_byte(pdev, 0xb0, &pci_b0);
-	pci_read_config_byte(pdev, 0xb2, &pci_b2);
+	ret = pci_read_config_byte(pdev, 0xb0, &pci_b0);
+	if (ret)
+		dev_warn(&pdev->dev, "cannot read diagnostic PCI B0: %pe\n",
+			 ERR_PTR(pcibios_err_to_errno(ret)));
+	ret = pci_read_config_byte(pdev, 0xb2, &pci_b2);
+	if (ret)
+		dev_warn(&pdev->dev, "cannot read diagnostic PCI B2: %pe\n",
+			 ERR_PTR(pcibios_err_to_errno(ret)));
 	cdev->sl_base = (u64)gti[3] << 21 |
 			(u64)gti[4] << 29 |
 			(u64)(gti[5] & GENMASK(6, 0)) << 37;
-
-	switch (size_code) {
-	case 0x00:
-		cdev->vram_size = 512ULL * 1024 * 1024;
-		break;
-	case 0x80:
-		cdev->vram_size = 256ULL * 1024 * 1024;
-		break;
-	case 0xc0:
-		cdev->vram_size = 128ULL * 1024 * 1024;
-		break;
-	case 0xe0:
-		cdev->vram_size = 64ULL * 1024 * 1024;
-		break;
-	case 0xf0:
-		cdev->vram_size = 32ULL * 1024 * 1024;
-		break;
-	case 0xf8:
-		cdev->vram_size = 16ULL * 1024 * 1024;
-		break;
-	default:
-		return dev_err_probe(&pdev->dev, -ENODEV,
-				     "unknown SR14 framebuffer-size code %#02x\n",
-				     size_code);
-	}
-	if (cdev->vram_size > pci_resource_len(pdev, 2))
-		cdev->vram_size = pci_resource_len(pdev, 2);
+	sr14_size = chrome9_decode_sr14_vram(size_code);
+	sr68_size = chrome9_decode_sr68_vram(sl_size_code);
+	pci_b2_size = chrome9_decode_pci_b2_vram(pci_b2);
+	cdev->vram_size = controller_size;
 	dev_info(&pdev->dev,
-		 "memory state: SR14=%#02x SR68=%#02x PCI_B0=%#02x PCI_B2=%#02x BAR2=%llu bytes\n",
-		 size_code, sl_size_code, pci_b0, pci_b2,
-		 (unsigned long long)cdev->vram_size);
+		 "memory state: D0F3_A0=%04x UMA=%llu BAR2=%llu SR14=%#02x (%llu) SR68=%#02x (%llu) PCI_B0=%#02x PCI_B2=%#02x (%llu)\n",
+		 memory_a0, (unsigned long long)controller_size,
+		 (unsigned long long)aperture_size,
+		 size_code, (unsigned long long)sr14_size,
+		 sl_size_code, (unsigned long long)sr68_size,
+		 pci_b0, pci_b2, (unsigned long long)pci_b2_size);
+	if (aperture_size != controller_size)
+		dev_warn(&pdev->dev,
+			 "BAR2 aperture %llu differs from VX900 framebuffer size %llu\n",
+			 (unsigned long long)aperture_size,
+			 (unsigned long long)controller_size);
+	if (sr14_size && sr14_size != cdev->vram_size)
+		dev_warn(&pdev->dev,
+			 "ignoring stale SR14 VRAM size %llu; D0F3/BAR2 give %llu\n",
+			 (unsigned long long)sr14_size,
+			 (unsigned long long)cdev->vram_size);
+	if (sr68_size && sr68_size != cdev->vram_size)
+		dev_warn(&pdev->dev,
+			 "SR68 VRAM size %llu disagrees with D0F3 size %llu\n",
+			 (unsigned long long)sr68_size,
+			 (unsigned long long)cdev->vram_size);
+	if (pci_b2_size && pci_b2_size != cdev->vram_size)
+		dev_warn(&pdev->dev,
+			 "PCI B2 VRAM size %llu disagrees with D0F3 size %llu\n",
+			 (unsigned long long)pci_b2_size,
+			 (unsigned long long)cdev->vram_size);
 	dev_info(&pdev->dev,
 		 "GTI state: SR6A=%02x SR6B=%02x SR6C=%02x SR6D=%02x SR6E=%02x SR6F=%02x SL-base=%#llx\n",
 		 gti[0], gti[1], gti[2], gti[3], gti[4], gti[5],
@@ -2575,6 +2700,9 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = chrome9_read_status(cdev);
 	if (ret)
 		return ret;
+	ret = chrome9_detect_vram(cdev);
+	if (ret)
+		return ret;
 	ret = chrome9_recover_2d_engine(cdev);
 	if (ret)
 		return ret;
@@ -2584,13 +2712,6 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = chrome9_selftest_pcie_ring(cdev);
 	if (ret)
 		return ret;
-	if (chrome9_mmio_probe ||
-	    (chrome9_kms && (chrome9_scanout_offset != ULONG_MAX ||
-			    chrome9_scanout_size))) {
-		ret = chrome9_detect_vram(cdev);
-		if (ret)
-			return ret;
-	}
 	ret = chrome9_selftest_2d(cdev);
 	if (ret)
 		return ret;

@@ -77,7 +77,7 @@ MODULE_PARM_DESC(ps_add,
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
-		 "Reserved BAR2 byte offset of the persistent 64-KiB GART");
+		 "Override BAR2 byte offset of the persistent 64-KiB GART (default: final 64 KiB of detected VRAM)");
 
 static void __iomem *chrome9_iomap_bar_once(struct pci_dev *pdev, int bar)
 {
@@ -261,6 +261,7 @@ struct chrome9_engine {
 	void *run_staging_cpu;
 	void __iomem *gart;
 	void *gart_saved;
+	resource_size_t gart_offset;
 	u64 fence_context;
 	atomic64_t fence_seqno;
 	u32 saved_dst_pos;
@@ -380,50 +381,6 @@ static int chrome9_gart_flush(struct chrome9_device *cdev)
 	return readb_poll_timeout(cdev->mmio + CHROME9_SEQ_DATA, value,
 				  !(value & BIT(7)), 10,
 				  CHROME9_HW_TIMEOUT_US);
-}
-
-static int chrome9_detect_vram_size(struct chrome9_device *cdev)
-{
-	resource_size_t size;
-	u8 saved_index;
-	u8 code;
-	int ret;
-
-	if (cdev->vram_size)
-		return 0;
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
-	if (ret)
-		return ret;
-	saved_index = readb(cdev->mmio + CHROME9_SEQ_INDEX);
-	code = chrome9_seq_read(cdev, 0x14);
-	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
-
-	switch (code) {
-	case 0x00:
-		size = SZ_512M;
-		break;
-	case 0x80:
-		size = SZ_256M;
-		break;
-	case 0xc0:
-		size = SZ_128M;
-		break;
-	case 0xe0:
-		size = SZ_64M;
-		break;
-	case 0xf0:
-		size = SZ_32M;
-		break;
-	case 0xf8:
-		size = SZ_16M;
-		break;
-	default:
-		return -ENODEV;
-	}
-	cdev->vram_size = min_t(resource_size_t, size,
-				 pci_resource_len(cdev->pdev, 2));
-	return 0;
 }
 
 static void chrome9_emit_header0(u32 **cursor, const u32 *pairs,
@@ -2025,12 +1982,10 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	if (ret)
 		goto out_restore_index;
 	chrome9_seq_write(cdev, 0x6c, engine->saved_6c & ~BIT(7));
-	chrome9_seq_write(cdev, 0x6a,
-			  (chrome9_engine_gart_offset >> 12) & 0xff);
-	chrome9_seq_write(cdev, 0x6b,
-			  (chrome9_engine_gart_offset >> 20) & 0xff);
+	chrome9_seq_write(cdev, 0x6a, (engine->gart_offset >> 12) & 0xff);
+	chrome9_seq_write(cdev, 0x6b, (engine->gart_offset >> 20) & 0xff);
 	programmed_6c = (engine->saved_6c & ~BIT(7) & ~BIT(0)) |
-			((chrome9_engine_gart_offset >> 28) & 1);
+			((engine->gart_offset >> 28) & 1);
 	chrome9_seq_write(cdev, 0x6c, programmed_6c);
 	chrome9_seq_write(cdev, 0x7b, (engine->saved_7b & 0xf0) | 4);
 	for (i = 0; i < CHROME9_GART_ENTRIES; i++)
@@ -2909,6 +2864,7 @@ bool chrome9_ps_add_enabled(void)
 int chrome9_engine_init(struct chrome9_device *cdev)
 {
 	struct chrome9_engine *engine;
+	resource_size_t gart_offset;
 	u32 pause;
 	u32 stop;
 	u32 status;
@@ -2920,22 +2876,25 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 #ifndef CONFIG_X86
 	return -EOPNOTSUPP;
 #endif
-	if (chrome9_engine_gart_offset == ULONG_MAX ||
-	    !IS_ALIGNED(chrome9_engine_gart_offset, PAGE_SIZE))
-		return dev_err_probe(&cdev->pdev->dev, -EINVAL,
-			"engine requires a page-aligned engine_gart_offset\n");
 	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
 	cdev->mmio = chrome9_iomap_bar_once(cdev->pdev, 1);
 	cdev->vram = chrome9_iomap_bar_once(cdev->pdev, 2);
 	if (!cdev->mmio || !cdev->vram)
 		return -ENOMEM;
-	ret = chrome9_detect_vram_size(cdev);
+	ret = chrome9_detect_vram(cdev);
 	if (ret)
 		return ret;
-	if (cdev->vram_size < CHROME9_GART_SIZE ||
-	    chrome9_engine_gart_offset != cdev->vram_size - CHROME9_GART_SIZE)
+	if (cdev->vram_size < CHROME9_GART_SIZE)
 		return dev_err_probe(&cdev->pdev->dev, -ERANGE,
-			"engine GART must be the vendor-defined final 64 KiB of VRAM\n");
+			"detected VRAM is too small for the final 64-KiB GART\n");
+	gart_offset = cdev->vram_size - CHROME9_GART_SIZE;
+	if (chrome9_engine_gart_offset != ULONG_MAX &&
+	    (!IS_ALIGNED(chrome9_engine_gart_offset, PAGE_SIZE) ||
+	     chrome9_engine_gart_offset != gart_offset))
+		return dev_err_probe(&cdev->pdev->dev, -ERANGE,
+			"engine_gart_offset %#lx does not match detected final 64-KiB GART at %#llx\n",
+			chrome9_engine_gart_offset,
+			(unsigned long long)gart_offset);
 
 	engine = kzalloc_obj(*engine);
 	if (!engine)
@@ -2948,7 +2907,8 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	INIT_LIST_HEAD(&engine->draw_mappings);
 	engine->fence_context = dma_fence_context_alloc(1);
 	atomic64_set(&engine->fence_seqno, 0);
-	engine->gart = cdev->vram + chrome9_engine_gart_offset;
+	engine->gart_offset = gart_offset;
+	engine->gart = cdev->vram + engine->gart_offset;
 	engine->gart_saved = kvzalloc(CHROME9_GART_SIZE, GFP_KERNEL);
 	if (!engine->gart_saved) {
 		ret = -ENOMEM;
@@ -3032,8 +2992,8 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	engine->module_hold = true;
 	engine->ready = true;
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine ready: GART=%#lx ring=%pad\n",
-		 chrome9_engine_gart_offset, &engine->ring_dma);
+		 "persistent SF engine ready: GART=%#llx ring=%pad\n",
+		 (unsigned long long)engine->gart_offset, &engine->ring_dma);
 	return 0;
 
 err_restore_gart:

@@ -132,6 +132,7 @@ static inline struct chrome9_device *to_chrome9(struct drm_device *drm)
 	return container_of(drm, struct chrome9_device, drm);
 }
 
+int chrome9_detect_vram(struct chrome9_device *cdev);
 bool chrome9_dma32_scanout_supported(struct chrome9_device *cdev);
 
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
