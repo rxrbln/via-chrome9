@@ -21,6 +21,10 @@ chrome9_texture_format_info(enum pipe_format format);
 unsigned chrome9_format_storage_cpp(enum pipe_format format);
 bool chrome9_pack_depth_clear(enum pipe_format format, double depth,
                               uint32_t *word);
+bool chrome9_pack_rgb565_clear(const float rgba[4], uint16_t *word);
+void chrome9_fill_rgb565_rect(uint8_t *pixels, unsigned stride,
+                             unsigned x, unsigned y, unsigned width,
+                             unsigned height, uint16_t word);
 
 bool chrome9_texture_swizzle_supported(enum pipe_format format,
                                        unsigned r, unsigned g,

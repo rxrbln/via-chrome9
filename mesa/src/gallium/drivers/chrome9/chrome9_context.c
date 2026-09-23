@@ -4084,12 +4084,23 @@ chrome9_clear_target(struct chrome9_resource *target,
 
    if (!target ||
        (target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM &&
-        target->base.format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+        target->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+        target->base.format != PIPE_FORMAT_B5G6R5_UNORM) ||
        x >= target->base.width0 || y >= target->base.height0)
       return;
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
-   util_pack_color_union(target->base.format, &packed, color);
+   if (target->base.format == PIPE_FORMAT_B5G6R5_UNORM) {
+      uint16_t word;
+
+      if (!chrome9_pack_rgb565_clear(color->f, &word))
+         return;
+      chrome9_fill_rgb565_rect((uint8_t *)target->bo.map + target->data_offset,
+                               target->stride, x, y, width, height, word);
+      return;
+   } else {
+      util_pack_color_union(target->base.format, &packed, color);
+   }
    util_fill_rect((uint8_t *)target->bo.map + target->data_offset,
                   target->base.format, target->stride, x, y, width, height,
                   &packed);

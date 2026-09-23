@@ -60,6 +60,42 @@ chrome9_pack_depth_clear(enum pipe_format format, double depth,
    return true;
 }
 
+static unsigned
+chrome9_pack_unorm(float value, unsigned maximum)
+{
+   if (!isfinite(value) || value <= 0.0f)
+      return 0;
+   if (value >= 1.0f)
+      return maximum;
+   return (unsigned)(value * maximum + 0.5f);
+}
+
+bool
+chrome9_pack_rgb565_clear(const float rgba[4], uint16_t *word)
+{
+   if (!rgba || !word)
+      return false;
+
+   /* PIPE_FORMAT_B5G6R5_UNORM has blue in bits 4:0 and red in 15:11. */
+   *word = (chrome9_pack_unorm(rgba[0], 31) << 11) |
+           (chrome9_pack_unorm(rgba[1], 63) << 5) |
+            chrome9_pack_unorm(rgba[2], 31);
+   return true;
+}
+
+void
+chrome9_fill_rgb565_rect(uint8_t *pixels, unsigned stride,
+                         unsigned x, unsigned y, unsigned width,
+                         unsigned height, uint16_t word)
+{
+   for (unsigned row = 0; row < height; row++) {
+      uint16_t *dst = (uint16_t *)(pixels + (uint64_t)(y + row) * stride) + x;
+
+      for (unsigned column = 0; column < width; column++)
+         dst[column] = word;
+   }
+}
+
 bool
 chrome9_texture_swizzle_supported(enum pipe_format format,
                                   unsigned r, unsigned g,

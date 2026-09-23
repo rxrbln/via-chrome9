@@ -68,5 +68,43 @@ main(void)
    CHECK(word == 0xffff);
    CHECK(!chrome9_pack_depth_clear(PIPE_FORMAT_Z24X8_UNORM, 1.0, &word));
    CHECK(!chrome9_pack_depth_clear(PIPE_FORMAT_X8Z24_UNORM, 1.0, NULL));
+   {
+      uint16_t rgb565;
+      const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+      const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+      const float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+      const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+      const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+      const float midpoint[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+
+      CHECK(chrome9_pack_rgb565_clear(red, &rgb565));
+      CHECK(rgb565 == 0xf800);
+      CHECK(chrome9_pack_rgb565_clear(green, &rgb565));
+      CHECK(rgb565 == 0x07e0);
+      CHECK(chrome9_pack_rgb565_clear(blue, &rgb565));
+      CHECK(rgb565 == 0x001f);
+      CHECK(chrome9_pack_rgb565_clear(white, &rgb565));
+      CHECK(rgb565 == 0xffff);
+      CHECK(chrome9_pack_rgb565_clear(black, &rgb565));
+      CHECK(rgb565 == 0x0000);
+      CHECK(chrome9_pack_rgb565_clear(midpoint, &rgb565));
+      CHECK(rgb565 == 0x8410);
+      CHECK(!chrome9_pack_rgb565_clear(NULL, &rgb565));
+      CHECK(!chrome9_pack_rgb565_clear(red, NULL));
+      {
+         uint16_t pixels[4][8];
+
+         for (unsigned y = 0; y < 4; y++)
+            for (unsigned x = 0; x < 8; x++)
+               pixels[y][x] = 0xa55a;
+         chrome9_fill_rgb565_rect((uint8_t *)pixels, sizeof(pixels[0]),
+                                  2, 1, 3, 2, 0xf800);
+         for (unsigned y = 0; y < 4; y++)
+            for (unsigned x = 0; x < 8; x++)
+               CHECK(pixels[y][x] ==
+                     ((y == 1 || y == 2) && x >= 2 && x < 5 ?
+                      0xf800 : 0xa55a));
+      }
+   }
    return 0;
 }
