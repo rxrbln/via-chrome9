@@ -1804,6 +1804,13 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	static const u32 pixel_z_clip[] = {
 		0x1e000000, 0x1f000000, 0x20007fff,
 	};
+	static const u32 neutral_depth_bias[] = {
+		0x16000000, 0x17000000, 0x18000000,
+		0x19800000, 0x1a800000, 0x1b803fbf,
+	};
+	static const u32 neutral_stencil[] = {
+		0x2300ffff, 0x24070000, 0x2500ffff, 0x26070000,
+	};
 	static const u32 vs_prefix[] = {
 		0x00380150, 0x00000000, 0x00000000, 0x0008010f,
 		0x0008014c, 0x00100150, 0x00384154, 0x0004021f,
@@ -1828,7 +1835,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x08010100 | request->fragment_texture_count,
 		0x04000000, 0x05000000, 0x0d810000,
 	};
-	u32 common[14] = {
+	u32 common[32] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
 		0x01ce1540, 0x88001ed0, 0x89000800,
 	};
@@ -1839,7 +1846,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	};
 	u32 raster[40];
 	u32 vs_program[4 * (4 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)] = { 0 };
-	u32 vs_control[] = { 0x60800000 | (3 + program->varying_count) };
+	u32 vs_control[] = { 0 };
 	u32 *base = engine->run_staging_cpu;
 	u32 *p = base;
 	u32 destination_count;
@@ -1854,6 +1861,20 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	if (!base || !program || !request->fragment_vertices)
 		return -EINVAL;
+	/* The FE count must include direct pixel-shader coordinate inputs. */
+	config[0] = max(request->fragment_texture_count,
+			program->varying_count) << 4 | 1;
+	/* A08 counts VS coordinate outputs, including direct PS varyings. */
+	config[2] = (config[2] & ~GENMASK(3, 0)) |
+		max(request->fragment_texture_count, program->varying_count);
+	/* FE A08 dimensions describe VS T0/T1 outputs, not sampler count. */
+	if (program->varying_count)
+		config[2] = (config[2] & ~GENMASK(9, 8)) |
+			(program->varying_width[0] - 1) << 8;
+	if (program->varying_count > 1)
+		config[2] = (config[2] & ~GENMASK(17, 16)) |
+			(program->varying_width[1] - 1) << 16;
+	vs_control[0] = 0x60800000 | (3 + program->varying_count);
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
 	destination_state[2] = 0x52000000 |
@@ -1890,10 +1911,22 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000;
 		common[10] = 0x13000000 | depth_func << 16;
 		common_count = 11;
+		memcpy(common + common_count, neutral_depth_bias,
+		       sizeof(neutral_depth_bias));
+		common_count += ARRAY_SIZE(neutral_depth_bias);
 	}
 	/* The pre-depth pixel-Z clip interval is required even without depth. */
 	memcpy(common + common_count, pixel_z_clip, sizeof(pixel_z_clip));
 	common_count += ARRAY_SIZE(pixel_z_clip);
+	if (depth_active) {
+		memcpy(common + common_count, neutral_stencil,
+		       sizeof(neutral_stencil));
+		common_count += ARRAY_SIZE(neutral_stencil);
+		common[common_count++] = blend &&
+			(request->blend.flags &
+			 DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
+			blend_words.a33 : 0x33007000;
+	}
 
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	raster_count = chrome9_fragment_raster_state(program->varying_count,
