@@ -444,10 +444,27 @@ consumer remains two-dimensional. The packed gray+UV smoke timed out first
 with A01=`01002522`, A08=`08010201`, then again with
 A01=`01002521`, A08=`08010101`. The latter incorrectly shrank the A08
 VS-output declaration: the manual says A08 describes producer width, while
-A01 selects the TAU consumer dimension. The source-consistent mixed tuple is
-A01=`01002521`, A08=`08010201`.  It was subsequently tried in a bounded
-`--texture-only` screen smoke and still timed out at cmd22 sequence four;
-therefore it is a necessary source-backed correction, not a complete fix.
+A01 selects texture stage 0's mapped-coordinate consumer dimension.  The
+independently recovered Windows triangle-list writer computes it as
+`min(mapped VS coordinate width, ComputeTexDim(stage0))-1`.  For a
+programmable packed float3 T0, this yields A01=`01002522` with
+A08=`08010201`; that tuple was the first one tried and timed out.  A later
+A01=`01002521`, A08=`08010201` attempt also timed out, but its A01 is not
+the writer's value for this program.  Thus A01 correctness alone does not
+explain the hang, and the kernel's current blanket 2-D A01 for a bound
+sampler still differs from the production programmable rule.
+
+The exact Windows chain is `VTGUModeDX32A:0x1020697a..0x10206a33`
+decoding VS-output width into `ctx+0x2d60[]`,
+`0x1020947e..0x102094e0` copying stage-to-coordinate selectors to
+`ctx+0x2d40[]`, and `0x10157a90..0x10157b13` taking the minimum with
+`ComputeTexDim(ctx,0)` before writing FE A01.  Linux
+`stmUpdateTCI_invi:0x17efc2..0x17f0aa` agrees.  The Windows forced-width-four
+branch requires point-list primitive type one; the guarded draw uses
+triangles.  A programmable PS sets context flag `+0x4fcf`, causing
+`stmComputeTexDim_invi` to return three or four before consulting 2-D
+texture state, so treating A01 as simply the sampler's nominal 2-D width is
+incorrect.
 
 This distinction is explicit in the VX900 Part II manual, pp. 134 and 138:
 A01 is the primitive-engine Texture 0 dimension; A08 describes Texture A in
@@ -467,14 +484,14 @@ but this single guarded cmd22 draw also timed out (`seq=1`, `kind=22`,
 ALU record are not sufficient explanations for the packed gray+UV hang.
 The engine was quarantined; no later GPU draws were submitted on that boot.
 
-The FE builder also formerly confused sampler high-water with both A08's VS
-output count and T0's TAU-consumer presence.  A sparse `TEX(s5,T5)` uses one
-compacted VS coordinate output despite sampler high-water six; conversely,
-sampling T1 does not make an ALU-only float4 T0 a two-dimensional consumer.
-Kernel commit `326adb3` now takes A08 count from the actual VS outputs and
-A01's T0 selection from the compiler's TAU-coordinate mask.  This has host
-build and module-probe selftest coverage.  The packed draw still hangs with
-this correction, so it does not establish a successful linkage tuple.
+The FE builder formerly confused sampler high-water with A08's VS output
+count.  A sparse `TEX(s5,T5)` uses one compacted VS coordinate output despite
+sampler high-water six.  Kernel commit `326adb3` corrected A08 and introduced
+a TAU-coordinate mask, but the mask cannot encode stage-to-coordinate mapping.
+The vendor writer's A01 rule for programmable triangle lists is documented
+above; carrying that mapping into the semantic compiler and FE builder is
+still pending.  The current module passed ordinary X8Z24 and A8 guarded
+sampler regressions, but the packed draw still hangs.
 
 ### Three-coordinate silent-black boundary
 

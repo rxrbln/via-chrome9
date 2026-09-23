@@ -137,10 +137,12 @@ Three independent widths must not be conflated:
    the rasterizer interpolates.
 2. A08--A0a declare the S/ST/STR/STRQ width of the VS texture-coordinate
    outputs. The live ordinary float2 producer uses A08=`08010101`.
-3. A01 selects the TAU consumer dimension; its swizzle selects which
-   physical varying lanes become those logical coordinate lanes. A packed
-   float3 producer with a 2-D YZ sampler therefore needs A08=`08010201`
-   but A01=`01002521`.
+3. A01 selects texture stage 0's mapped-coordinate consumer dimension; its
+   swizzle selects which produced lanes are sampled.  The proprietary
+   triangle-list writer computes this dimension from the mapped VS output
+   width capped by `stmComputeTexDim`.  With a programmable PS and a packed
+   float3 T0 producer, A08=`08010201` and A01=`01002522`, even when only
+   YZ are sampled as 2-D coordinates.
 
 For a sampler dimension D, only the first D TAU selectors are semantically
 consumed.  The production packed-varying object uses `T0.yzww` with a 2-D
@@ -182,10 +184,11 @@ draw would retain dimensions from a prior wide draw.  The eight-to-one
 transition must therefore write A09=`09000000` and A0a=`0a000000`, not merely
 reduce A08's count.
 
-Keep sampler-coordinate dimension separate from producer width.  A 2-D TAU
-consumer of T0 uses dimension code one in A01 even if its VS producer is a
-float4 in A08.  For a direct ALU-only T0 input, the manually and live-qualified
-consumer value is `varying_width-1`.  The Windows programmable update in
+Keep stage-0 mapped-coordinate dimension separate from sampler high-water.
+The programmable triangle-list writer computes A01 as
+`min(mapped_coordinate_width, ComputeTexDim(stage0))-1`, not as a boolean
+"sampler bound" flag.  The direct ALU-only T0 width-four value is
+live-qualified.  The Windows programmable update in
 `VTGUModeDX32A.dll` writes the compiled active texture-temporary resource
 count to A00 at `0x1015b255..0x1015b26b`; it does not copy a PS width into
 A08.  Its preceding linkage builder
