@@ -1130,6 +1130,102 @@ smoke_alpha_kill_compile(struct pipe_screen *screen)
    return passed;
 }
 
+/* Replay the captured straight-line varying arithmetic a prefix at a time.
+ * A prefix failure identifies the first compiler operation that needs work;
+ * the final prefix retains the full output expression and uses no GPU draw.
+ */
+static void *
+make_varying_arithmetic_fs(struct pipe_screen *screen,
+                           struct pipe_context *context, unsigned stage)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, screen->nir_options[MESA_SHADER_FRAGMENT],
+      "chrome9-varying-arithmetic-compile");
+   nir_variable *output = nir_variable_create(
+      b.shader, nir_var_shader_out, glsl_vec4_type(), "fragment_color");
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+   nir_def *varying = make_generic0_load(&b, glsl_vec4_type(), "varying");
+   nir_def *x = nir_fmul(&b, nir_channel(&b, varying, 0),
+                        nir_channel(&b, varying, 3));
+   nir_def *y = nir_fmul(&b, nir_channel(&b, varying, 1),
+                        nir_channel(&b, varying, 3));
+   nir_def *z = nir_fmul(&b, nir_channel(&b, varying, 2),
+                        nir_channel(&b, varying, 3));
+   nir_def *minimum_yz = nir_fmin(&b, y, z);
+   nir_def *minimum = nir_fmin(&b, x, minimum_yz);
+   nir_def *twice = nir_fmul(&b, nir_imm_float(&b, 2.0f), minimum);
+   nir_def *squared = nir_fmul(&b, twice, minimum);
+   nir_def *negated = nir_fneg(&b, squared);
+   nir_def *weight = nir_fexp2(&b, negated);
+   nir_def *weighted = nir_fmul(
+      &b, weight, nir_imm_vec4(&b, 1.0f, 0.5f, 0.2f, 0.2f));
+   nir_def *final = nir_fadd(
+      &b, nir_imm_vec4(&b, 0.0f, 0.5f, 0.8f, 0.8f), weighted);
+   nir_def *prefix[] = {
+      varying, x, y, z, minimum_yz, minimum, twice, squared,
+      negated, weight, weighted, final,
+   };
+   nir_def *color = prefix[stage];
+
+   output->data.location = FRAG_RESULT_COLOR;
+   if (color->num_components == 1)
+      color = nir_vec4(&b, color, color, color, color);
+   nir_store_var(&b, output, color, 0xf);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return context->create_fs_state(context, &state);
+}
+
+static bool
+smoke_varying_arithmetic_compile(struct pipe_screen *screen)
+{
+   static const char *const stage[] = {
+      "varying", "mul-xw", "mul-yw", "mul-zw", "min-yz", "min-x-yz",
+      "mul-two", "mul-square", "negate", "exp2", "vector-mul",
+      "final-add",
+   };
+   struct pipe_context *context = screen->context_create(screen, NULL, 0);
+   bool passed = true;
+
+   if (!context)
+      return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(stage); i++) {
+      struct chrome9_shader *shader =
+         make_varying_arithmetic_fs(screen, context, i);
+
+      if (!shader) {
+         fprintf(stderr, "varying arithmetic %s: create_fs_state failed\n",
+                 stage[i]);
+         passed = false;
+         break;
+      }
+      if (!shader->semantic_fs_valid || !shader->supported) {
+         fprintf(stderr,
+                 "varying arithmetic %s: semantic=%u native=%u "
+                 "native-from-nir=%u supported=%u program-cap=%u "
+                 "ir=%u alu=%u tau=%u\n",
+                 stage[i], shader->semantic_fs_valid,
+                 shader->native_fs_valid, shader->native_fs_from_nir,
+                 shader->supported,
+                 chrome9_context(context)->draw_fragment_program,
+                 shader->semantic_fs_ir.count,
+                 shader->native_fs.alu_count, shader->native_fs.tau_count);
+         passed = false;
+      }
+      context->delete_fs_state(context, shader);
+      if (!passed)
+         break;
+   }
+   context->destroy(context);
+   if (passed)
+      puts("varying arithmetic full fragment NIR accepted without draw");
+   return passed;
+}
+
 static void *
 make_two_projected_texture_vertex_shader(struct pipe_screen *screen,
                                          struct pipe_context *context)
@@ -6788,6 +6884,12 @@ main(int argc, char **argv)
    if (!screen) {
       fputs("chrome9_screen_create failed\n", stderr);
       return 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--varying-arithmetic-compile-only")) {
+      bool passed = smoke_varying_arithmetic_compile(screen);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
    }
    if (argc > 2 && !strcmp(argv[2], "--kill-compile-only")) {
       bool passed = smoke_alpha_kill_compile(screen);
