@@ -79,6 +79,38 @@ Destination SAT does not otherwise disturb the consumer.  For full XYZW the
 terminal source remains identity; for XYZ+SAT it gets the same `xyz1`
 rewrite as unsaturated XYZ.
 
+## Guarded full-mask SAT discriminator
+
+A two-record program distinguishes native intermediate saturation from the
+render target's unavoidable UNORM clamp without relying on alpha-test
+ordering:
+
+```text
+MOV_SAT r0,c0
+SUB     oC0,r0,c1
+```
+
+Linux 5.75 configuration two finalizes that exact token stream as:
+
+```text
+01c00530 301c0053 00f08005 000d1020
+82000530 30140924 00f08105 00000820
+A90=90058000 A91=91000000 A92=92000002 A93=93000000
+active=(0,1,0,0)
+```
+
+Use c0=`(-.5,.25,1.5,2)` and c1=`(.25,.25,.25,.25)`.  Correct
+intermediate SAT gives `(-.25,0,.75,.75)` before the final target conversion,
+so numeric A8R8G8B8 stores host word `bf0000bf`.  Ignoring d3.bit12 instead
+computes `(-.75,0,1.25,1.75)`, which the final target clamps to the distinct
+word `ff0000ff`.  One draw therefore covers both the lower and upper SAT
+bounds while retaining guarded color, D16, exterior, and post-draw checks.
+
+`tools/re/chrome9_normalize_guard_smoke.c --sat-clamp` implements this exact
+offline-verified program.  It has not been run on silicon; SAT must remain a
+pending numerical feature until this guarded discriminator and a succeeding
+known-good draw pass.
+
 ## Last-use and dead-destination finalization
 
 With a live producer, configuration two changes only the terminal TEMP read:
