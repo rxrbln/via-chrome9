@@ -5613,7 +5613,7 @@ smoke_d24_combined_draw(struct pipe_screen *screen,
 
          if (!pixel && z == 0xffffff00U)
             continue;
-         if (pixel != 0xffff0000U || (z >> 8) < 0x7fff00U ||
+         if (pixel != 0x00ff0000U || (z >> 8) < 0x7fff00U ||
              (z >> 8) > 0x800100U) {
             fprintf(stderr, "X8Z24 draw pixel (%u,%u): color=%08x depth=%08x\n",
                     x, y, pixel, z);
@@ -5622,7 +5622,7 @@ smoke_d24_combined_draw(struct pipe_screen *screen,
          changed++;
       }
    passed = changed >= 1100 && changed <= 1250 &&
-            color_pixels[16 * (ccolor->stride / 4) + 16] == 0xffff0000U &&
+            color_pixels[16 * (ccolor->stride / 4) + 16] == 0x00ff0000U &&
             depth_pixels[16 * (cdepth->stride / 4) + 16] != 0xffffff00U &&
             color_pixels[60 * (ccolor->stride / 4) + 60] == 0 &&
             depth_pixels[60 * (cdepth->stride / 4) + 60] == 0xffffff00U &&

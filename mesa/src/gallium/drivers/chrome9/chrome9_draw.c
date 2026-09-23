@@ -1063,8 +1063,10 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
                            uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4])
 {
    const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
-   const unsigned uniform_count = ctx->fs->semantic_uniform_mask ?
-      32 - __builtin_clz(ctx->fs->semantic_uniform_mask) : 0;
+   const uint32_t uniform_mask = ctx->fs->semantic_constant_mask &
+      ~ctx->fs->native_fs.immediate_mask;
+   const unsigned uniform_count = uniform_mask ?
+      32 - __builtin_clz(uniform_mask) : 0;
    const uint8_t *map = NULL;
 
    memset(constants, 0,
@@ -1090,7 +1092,7 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
       if (ctx->fs->native_fs.immediate_mask & (1u << i))
          memcpy(constants[i], ctx->fs->native_fs.immediate[i],
                 sizeof(constants[i]));
-      else if ((ctx->fs->semantic_uniform_mask & (1u << i)) && !map)
+      else if ((uniform_mask & (1u << i)) && !map)
          return false;
       for (unsigned c = 0; c < 4; c++) {
          float value;
