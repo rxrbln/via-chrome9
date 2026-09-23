@@ -407,6 +407,16 @@ tests still hung and provides one bounded next correction, not a new register
 matrix. The full differential and disassembly are recorded in
 `chrome9-direct-t0-fe-count.md`.
 
+The bounded correction passed on VX900 silicon on 2026-09-23.  With A00's
+count changed to `max(texture_count,varying_count)`, the same guarded
+64-by-64 semantic varying-zero/native-T0 MOV draw at Z=0.5 retired normally
+and changed exactly 1176 pixels to the expected red, including the interior;
+the exterior and both BO guards remained intact.  No image, sampler, TAU, or
+texture BO was present.  This promotes the A00 coordinate-high-water rule
+from binary proof to a live direct-fragment-input requirement.  It does not
+by itself promote arbitrary varying counts or widths: A09/A0a state and the
+three-through-eight input closures remain separate gates.
+
 ## Polygon offset / depth bias
 
 The manual gives the exact equation:
