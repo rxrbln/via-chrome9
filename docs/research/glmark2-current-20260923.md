@@ -25,3 +25,19 @@ VAR0, MUL, MIN, EXP2, MUL/ADD fragment expression before the live buffer run.
 This record proves only the listed scene variants on the stated build.  It does
 not validate the complete glmark2 set, all buffer variants, image correctness
 beyond glmark2's reference verdict, or the packed float3 ALU/TAU path.
+
+## Regression on the corrected shared-coordinate kernel
+
+Later on 2026-09-23, the same Gallium library (SHA-256
+`a682753ae07c4c4e25713226dcd7da4225febd23e260f82a6d57c90574ad5f15`)
+was loaded by Xorg PID 554 with the A90-corrected kernel module (SHA-256
+`e5b666b691b57fb275024bb7c8cdebf03e6c269c4bfc520be800330e02a37ca0`).
+Under this one persistent Xorg session, a bounded
+`glmark2 --validate` run reported `Validation: Success` for one frame each of
+`texture:texture-filter=nearest`, `shading:shading=gouraud`, and
+`buffer:update-fraction=10:update-method=map`.  glmark2 ignored the requested
+300x300 size during validation and used its 800x600 reference size.  Xorg
+remained alive and the Chrome9 kernel log contained no timeout, quarantine,
+reset, or engine-error report.  This is a regression check on the corrected
+module, not evidence that additional glmark2 scenes or arbitrary packed
+varying shaders now pass.
