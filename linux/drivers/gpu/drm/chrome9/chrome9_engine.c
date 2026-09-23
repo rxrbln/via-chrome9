@@ -1868,6 +1868,7 @@ static int chrome9_fragment_fe_config_selftest(void)
 	static const u8 empty_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	static const u8 packed3_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 3 };
 	static const u8 packed4_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 4 };
+	static const u8 mixed_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 4, 2 };
 	u32 config[8];
 	unsigned int i;
 
@@ -1907,8 +1908,9 @@ static int chrome9_fragment_fe_config_selftest(void)
 	    config[1] != 0x01002521 || config[2] != 0x08010301)
 		return -EINVAL;
 	/* Sampler zero may consume another coordinate, not T0. */
-	if (chrome9_fragment_fe_config(2, 1, BIT(1),
-			packed4_width, config) || config[1] != 0x01002523)
+	if (chrome9_fragment_fe_config(2, 2, BIT(1),
+			mixed_width, config) || config[1] != 0x01002523 ||
+	    config[2] != 0x08010302)
 		return -EINVAL;
 	/* One MAD can read three T slots while using one active resource. */
 	if (chrome9_fragment_fe_config(1, cases[4].count, 0,

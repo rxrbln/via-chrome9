@@ -1056,6 +1056,25 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction mixed_coordinates[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
 	static const struct drm_chrome9_fragment_instruction packed_gray[] = {
 		{
 			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
@@ -1325,6 +1344,18 @@ int chrome9_fragment_selftest(void)
 		ret = -EINVAL;
 	if (ret)
 		goto out;
+	ret = chrome9_fragment_compile(mixed_coordinates,
+		ARRAY_SIZE(mixed_coordinates), constants, 0, 1, 2, program);
+	if (ret || program->varying_count != 2 ||
+	    program->varying_logical[0] != 0 ||
+	    program->varying_logical[1] != 1 ||
+	    program->varying_width[0] != 4 ||
+	    program->varying_width[1] != 2 ||
+	    program->tau_coordinate_mask != BIT(1) ||
+	    program->active_texture_count != 2) {
+		ret = -EINVAL;
+		goto out;
+	}
 	ret = chrome9_fragment_compile(packed_varying,
 		ARRAY_SIZE(packed_varying), constants, 0, 1, 1, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
