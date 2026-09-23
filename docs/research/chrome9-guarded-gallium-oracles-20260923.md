@@ -48,5 +48,10 @@ mode.  Tool commit `f9d70b5` adds the test:
 chrome9-sampler-guard-smoke /dev/dri/renderD128 --a8
 ```
 
-This proves nearest A8 decode for these coordinates, not repeat/linear,
-Gallium sampler-view selection, shader discard, or the glmark2 `ideas` scene.
+The Gallium A8 test also passed with an identity sampler view, a generic TEX
+shader, four quadrant samples, exactly two submitted triangles and two generic
+program batches, no rejections, an unchanged source and intact guards.  Mesa
+commit `d6c765c` adds the focused `--a8-only` path and includes it in the
+regular screen smoke.  A later full-32-by-32-pixel check is host-built but
+awaits silicon validation.  The proven path is nearest/clamp only; repeat,
+linear filtering, shader discard and the glmark2 `ideas` scene remain open.
