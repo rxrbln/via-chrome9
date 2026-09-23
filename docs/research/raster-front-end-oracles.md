@@ -362,6 +362,21 @@ intact. The command used the compiler's counted H3 constant and ALU stores,
 so this separately qualifies the ALU-only H3 upload. A later varying-source
 draw still timed out and must be diagnosed independently.
 
+Two subsequent single-change checks narrowed, but did not solve, the
+direct-T0 failure. The VX900 manual defines FE A08 bits 3:0 as the number of
+VS texture-coordinate outputs and bits 9:8 as T0's dimension. The original
+generic packet declared zero outputs and 2D T0 despite exporting float4 T0.
+Changing only the count to one (`08010101`), then changing both count and
+dimension to the matching float4 tuple (`08010301`), each still timed out on
+the same guarded `MOV oC0,T0` draw at the post-draw H2 flush. The ALU and
+A90--A92 were byte-exact Linux production-compiler output; the color target
+and vertex guards were not used to infer a successful draw. These two A08
+contradictions are real state defects, but neither alone nor together is a
+sufficient explanation for the direct-varying hang. The engine was
+quarantined after each timeout and reset before the next test. Further GPU
+submissions require an independently recovered producer/consumer linkage
+tuple, not another unstructured field sweep.
+
 ## Polygon offset / depth bias
 
 The manual gives the exact equation:
