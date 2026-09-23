@@ -166,6 +166,20 @@ resource constraint is respected.  The direct-T0 and vPos successor modes are
 now the next linkage gates.  General lowering must insert the legalization
 based on distinct native constant ids, not shader identity.
 
+The generic driver legalization was validated on the 192.168.2.60 VX900
+target with the rebuilt Mesa and DRM module.  The kernel's module-load
+selftest matched the two-record words above.  A direct three-distinct-constant
+CMP submission returned `EINVAL` before execution.  The TEMP-backed CMP and
+the two-distinct-constant MAD both still passed exact BGRA8888, D16, and guard
+checks.  A GLSL 1.20 shader computing `c0*c1+c2` from three runtime `vec4`
+uniforms compiled to native `ir=2`, `alu=2`, with all three constant slots
+present; its 64×64 RGBA8+D16 FBO draw returned the expected interior
+`(64,96,128,128)` and exterior `(0,0,0,255)` pixels.  The existing
+`gl_FragCoord.xy` FBO test passed afterward, with no new kernel timeout or
+engine error.  The standalone offline encoder now rejects the unsafe direct
+form as well.  This closes the hardware constant-port issue for the tested
+MAD path; it does not imply general GLSL control-flow support.
+
 Use the proven command-19 D16/RHW packet, BGRA8888 target, COPY, no blend,
 flat v0, guarded pages, and known-good draws before and after each candidate.
 For `CMP_C0_V0_C0`, use logical v0 `(0.25,0.75,0.5,1)` and c0
@@ -205,6 +219,23 @@ Neither normalized readback nor A33 distinguishes ABS(-0)=+0 from preserved
 -0.  A downstream sign-sensitive ALU or float target is required for native
 ABS signed-zero proof.  The recommended terminal constant lowering avoids
 that uncertainty entirely by clearing the sign bits on the CPU and using MOV.
+
+The next dynamic-source gate uses direct T0 rather than a constant so it
+cannot be replaced by that CPU lowering.  Both proprietary compilers produce
+the one-record object
+
+```text
+ABS oC0,T0 = 00400538 30040053 00f04005 00090820
+A90=90058001 A91=91000000 A92=92000001 A93=93000000
+active=(1,0,1,0)
+```
+
+For T0=`(-.25,.5,-.75,-.5)`, the expected logical result is
+`(.25,.5,.75,.5)`, numeric A8R8G8B8 host word `804080bf`; an ordinary MOV
+instead stores `00008000`.  `tools/re/chrome9_normalize_guard_smoke.c --abs`
+implements this guarded D16/exterior discriminator.  It remains pending on
+silicon and must be followed by a known-good draw before native dynamic ABS
+is advertised.
 
 ## Destination-SAT lower-clamp oracle and remaining blocker
 
