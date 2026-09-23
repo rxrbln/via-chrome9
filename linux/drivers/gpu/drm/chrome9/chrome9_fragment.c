@@ -36,6 +36,7 @@ struct chrome9_fragment_state {
 	u8 coordinate_for_varying[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_instruction[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
 	u8 coordinate_last_tau[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u16 varying_last_alu[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 };
 
 static bool chrome9_fragment_float_finite(u32 value)
@@ -177,6 +178,8 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	       sizeof(state->coordinate_for_instruction));
 	memset(state->coordinate_last_tau, 0xff,
 	       sizeof(state->coordinate_last_tau));
+	memset(state->varying_last_alu, 0xff,
+	       sizeof(state->varying_last_alu));
 	for (i = 0; i < instruction_count; i++) {
 		const struct drm_chrome9_fragment_instruction *instruction =
 			&state->instructions[i];
@@ -360,10 +363,17 @@ static int chrome9_fragment_allocate(struct chrome9_fragment_state *state,
 		const struct drm_chrome9_fragment_instruction *instruction =
 			&state->instructions[i];
 		const struct drm_chrome9_fragment_source *coordinate;
+		unsigned int source;
 		u8 slot;
 
-		if (instruction->op != DRM_CHROME9_FRAGMENT_OP_TEX)
+		if (instruction->op != DRM_CHROME9_FRAGMENT_OP_TEX) {
+			for (source = 0; source < state->source_count[i]; source++)
+				if (instruction->src[source].file ==
+				    DRM_CHROME9_FRAGMENT_FILE_VARYING)
+					state->varying_last_alu[
+						instruction->src[source].index] = i;
 			continue;
+		}
 		coordinate = &instruction->src[0];
 		slot = state->coordinate_for_instruction[i];
 		state->coordinate_last_tau[slot] = i;
@@ -568,6 +578,22 @@ static bool chrome9_fragment_release_source(
 	u32 physical;
 	unsigned int other;
 
+	if (source->file == DRM_CHROME9_FRAGMENT_FILE_VARYING) {
+		if (state->varying_last_alu[source->index] != instruction_index)
+			return false;
+		/*
+		 * The production finalizer assigns a repeated varying's release to
+		 * its last semantic operand in the instruction.  This differs from
+		 * TEMP aliases, whose A/C/B native-slot precedence is handled below.
+		 */
+		for (other = source_index + 1;
+		     other < state->source_count[instruction_index]; other++)
+			if (instruction->src[other].file ==
+			    DRM_CHROME9_FRAGMENT_FILE_VARYING &&
+			    instruction->src[other].index == source->index)
+				return false;
+		return true;
+	}
 	if (source->file != DRM_CHROME9_FRAGMENT_FILE_TEMP)
 		return false;
 	physical = state->physical[source->index];
@@ -872,6 +898,70 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction packed_gray[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 1, 2, 3, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0x7, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 0, 0, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0x8, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 31,
+				  { 5, 5, 5, 0 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction varying_reuse[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction varying_duplicate[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
 	static const u32 expected_alu[][4] = {
 		{ 0x008106d0, 0xd0140924, 0x00308006, 0x00000020 },
 		{ 0x01c00530, 0xc01c0053, 0x00f20006, 0x000d0420 },
@@ -887,7 +977,24 @@ int chrome9_fragment_selftest(void)
 		0x94000000, 0x95000000, 0x96000000, 0x97000000,
 		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
 	};
-	static const u32 constants[8];
+	static const u32 expected_packed_gray_alu[][4] = {
+		{ 0x01c00530, 0x501c0053, 0x0072c000, 0x000d0060 },
+		{ 0x01c00530, 0x801c0053, 0x0080afb6, 0x000d0060 },
+		{ 0x0140b6d0, 0x30201053, 0x00f20005, 0x00000820 },
+	};
+	static const u32 expected_packed_gray_controls[] = {
+		0x90018000, 0x91000001, 0x92010003, 0x93000001,
+		0x94000000, 0x95000000, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+	};
+	static const u32 expected_varying_reuse_alu[][4] = {
+		{ 0x01c00530, 0x301c0053, 0x00f0c005, 0x000d0020 },
+		{ 0x0140b6d0, 0x302c0053, 0x00f20005, 0x00000820 },
+	};
+	static const u32 expected_varying_duplicate_alu[][4] = {
+		{ 0x0140b6d0, 0x302c0053, 0x00f0c005, 0x00000820 },
+	};
+	static const u32 constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4];
 	struct chrome9_fragment_program *program;
 	int ret;
 
@@ -926,10 +1033,42 @@ int chrome9_fragment_selftest(void)
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301006f0 || program->varying_count != 1 ||
 	    program->varying_logical[0] || program->varying_width[0] != 3 ||
+	    program->alu[0][2] != 0x00f2c005 ||
 	    program->controls[0] != 0x90018000 ||
 	    program->controls[1] != 0x91000001 ||
 	    program->controls[2] != 0x92010001 ||
 	    program->controls[3] != 0x93000001)
+		ret = -EINVAL;
+	if (ret)
+		goto out;
+	ret = chrome9_fragment_compile(packed_gray, ARRAY_SIZE(packed_gray),
+		constants, DRM_CHROME9_FRAGMENT_MAX_CONSTANTS, 1, 1, program);
+	if (ret ||
+	    program->alu_count != ARRAY_SIZE(expected_packed_gray_alu) ||
+	    program->tau_count != 1 || program->tau[0] != 0x301006f0 ||
+	    program->varying_count != 1 || program->varying_width[0] != 3 ||
+	    memcmp(program->alu, expected_packed_gray_alu,
+		   sizeof(expected_packed_gray_alu)) ||
+	    memcmp(program->controls, expected_packed_gray_controls,
+		   sizeof(expected_packed_gray_controls))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(varying_reuse,
+		ARRAY_SIZE(varying_reuse), constants, 0, 0, 1, program);
+	if (ret ||
+	    program->alu_count != ARRAY_SIZE(expected_varying_reuse_alu) ||
+	    memcmp(program->alu, expected_varying_reuse_alu,
+		   sizeof(expected_varying_reuse_alu))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(varying_duplicate,
+		ARRAY_SIZE(varying_duplicate), constants, 0, 0, 1, program);
+	if (ret ||
+	    program->alu_count != ARRAY_SIZE(expected_varying_duplicate_alu) ||
+	    memcmp(program->alu, expected_varying_duplicate_alu,
+		   sizeof(expected_varying_duplicate_alu)))
 		ret = -EINVAL;
 out:
 	kfree(program);
