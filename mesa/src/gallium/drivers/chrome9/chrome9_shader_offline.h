@@ -43,6 +43,8 @@ enum chrome9_ps_source_file {
    CHROME9_PS_SOURCE_TEMP = 0,
    CHROME9_PS_SOURCE_INPUT = 1,
    CHROME9_PS_SOURCE_CONSTANT = 2,
+   /* Full-precision class-3 texture/misc interpolator T0..T7. */
+   CHROME9_PS_SOURCE_TEXTURE = 3,
 };
 
 enum chrome9_ps_destination_file {
@@ -89,10 +91,19 @@ struct chrome9_ps_instruction {
    struct chrome9_ps_source source[2];
 };
 
+struct chrome9_ps_texture_instruction {
+   uint8_t sampler;
+   uint8_t coordinate;
+   uint8_t destination;
+   uint8_t reserved;
+};
+
 /* Straight-line compiler IR.  This is deliberately semantic rather than a
  * native-word container: every record is range checked and packed here. */
 struct chrome9_ps_ir {
+   struct chrome9_ps_texture_instruction texture[CHROME9_PS_MAX_TAU];
    struct chrome9_ps_instruction instruction[CHROME9_PS_MAX_ALU];
+   uint8_t texture_count;
    uint8_t count;
 };
 
@@ -103,6 +114,7 @@ struct chrome9_ps_program {
    uint32_t constant_mask;     /* c0..c31 */
    uint32_t constant_x_one_mask; /* constants whose X must be driver-owned 1 */
    uint16_t varying_mask;      /* bit 0 is primary color v0 */
+   uint16_t texture_input_mask; /* T0..T7 used by TAU or directly by ALU */
    uint16_t sampler_mask;      /* s0..s15 */
    uint8_t alu_count;
    uint8_t tau_count;
@@ -148,9 +160,10 @@ bool chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
 bool chrome9_compile_vs_offline(enum chrome9_vs_key key,
                                 struct chrome9_vs_program *program);
 
-/* Encode the first live-gated straight-line instruction subset.  These
- * functions validate logical operands before packing native fields and emit
- * a full oC0 write. */
+/* Encode the first straight-line instruction subset.  These functions
+ * validate logical operands before packing native fields; compile_ps_ir also
+ * supports the larger offline-only tranche while live submission stays
+ * separately gated. */
 bool chrome9_encode_ps_mov(const struct chrome9_ps_source *source,
                            uint32_t record[4]);
 bool chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,

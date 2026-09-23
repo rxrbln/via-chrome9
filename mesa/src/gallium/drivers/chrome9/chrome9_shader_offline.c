@@ -25,6 +25,9 @@ source_valid(const struct chrome9_ps_source *source)
    case CHROME9_PS_SOURCE_CONSTANT:
       limit = 32;
       break;
+   case CHROME9_PS_SOURCE_TEXTURE:
+      limit = 8;
+      break;
    default:
       return false;
    }
@@ -49,7 +52,7 @@ destination_valid(const struct chrome9_ps_destination *destination)
    case CHROME9_PS_DESTINATION_TEMP:
       return destination->id < 12;
    case CHROME9_PS_DESTINATION_COLOR:
-      return destination->id == 0 && destination->writemask == 0xf;
+      return destination->id == 0;
    default:
       return false;
    }
@@ -171,11 +174,33 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                       struct chrome9_ps_program *p)
 {
    uint16_t defined_temps = 0;
+   uint8_t defined_components[12] = { 0 };
    uint8_t temp_uses[12] = { 0 };
    uint8_t remaining_uses[12];
+   uint8_t texture_uses[8] = { 0 };
+   uint8_t remaining_texture_uses[8];
+   uint8_t color_writemask = 0;
+   uint16_t direct_texture_mask = 0;
 
-   if (!ir || !p || !ir->count || ir->count > 3)
+   if (!ir || !p || !ir->count || ir->count > 6 ||
+       (ir->texture_count != 0 && ir->texture_count != 2))
       return false;
+   /* The first texture-bearing tranche deliberately accepts only the exact
+    * independently scheduled two-sample topology confirmed byte-for-byte in
+    * both vendor compilers.  It remains offline-only; the live draw gate is
+    * still the one-ALU/no-TAU subset. */
+   if (ir->texture_count) {
+      static const struct chrome9_ps_texture_instruction texture[2] = {
+         { .sampler = 0, .coordinate = 0, .destination = 0 },
+         { .sampler = 1, .coordinate = 1, .destination = 1 },
+      };
+
+      if (memcmp(ir->texture, texture, sizeof(texture)))
+         return false;
+      defined_temps = 0x3;
+      defined_components[0] = 0xf;
+      defined_components[1] = 0xf;
+   }
    /* Validate the semantic IR and calculate temporary lifetimes before
     * packing any hardware words.  Release bits are an encoder result, not a
     * property callers may guess. */
@@ -199,26 +224,42 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
       }
       for (unsigned s = 0; s < source_count; s++) {
          const struct chrome9_ps_source *source = &instruction->source[s];
+         bool reads_register = false;
 
          if (!source_valid(source) || source->last_use)
             return false;
-         if (source->file == CHROME9_PS_SOURCE_TEMP) {
-            if (!(defined_temps & (1u << source->id)))
-               return false;
-            temp_uses[source->id]++;
+         for (unsigned lane = 0; lane < 4; lane++) {
+            unsigned component;
+
+            if (!(instruction->destination.writemask & (1u << lane)))
+               continue;
+            component = source->swizzle[lane];
+            if (component <= CHROME9_PS_SWIZZLE_W) {
+               reads_register = true;
+               if (source->file == CHROME9_PS_SOURCE_TEMP &&
+                   !(defined_components[source->id] & (1u << component)))
+                  return false;
+            }
          }
+         if (source->file == CHROME9_PS_SOURCE_TEMP && reads_register)
+            temp_uses[source->id]++;
+         else if (source->file == CHROME9_PS_SOURCE_TEXTURE &&
+                  reads_register)
+            texture_uses[source->id]++;
       }
       if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP) {
-         if (instruction->destination.writemask != 0xf ||
-             defined_temps & (1u << instruction->destination.id))
+         if (defined_temps & (1u << instruction->destination.id))
             return false;
          defined_temps |= 1u << instruction->destination.id;
-      } else if (i + 1 != ir->count) {
-         return false;
+         defined_components[instruction->destination.id] =
+            instruction->destination.writemask;
+      } else {
+         if (color_writemask & instruction->destination.writemask)
+            return false;
+         color_writemask |= instruction->destination.writemask;
       }
    }
-   if (ir->instruction[ir->count - 1].destination.file !=
-       CHROME9_PS_DESTINATION_COLOR)
+   if (color_writemask != 0xf)
       return false;
    for (unsigned temp = 0; temp < 12; temp++) {
       if ((defined_temps & (1u << temp)) && !temp_uses[temp])
@@ -227,6 +268,8 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
 
    memset(p, 0, sizeof(*p));
    memcpy(remaining_uses, temp_uses, sizeof(remaining_uses));
+   memcpy(remaining_texture_uses, texture_uses,
+          sizeof(remaining_texture_uses));
    for (unsigned i = 0; i < ir->count; i++) {
       const struct chrome9_ps_instruction *instruction =
          &ir->instruction[i];
@@ -236,9 +279,33 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
 
       for (unsigned s = 0; s < source_count; s++)
          sources[s] = instruction->source[s];
+      /* Vendor records use literal zero selectors for lanes excluded by the
+       * destination mask.  Canonicalize them here so identity and scalar IR
+       * swizzles produce the byte-exact native form. */
       for (unsigned s = 0; s < source_count; s++) {
-         if (sources[s].file == CHROME9_PS_SOURCE_TEMP)
+         for (unsigned lane = 0; lane < 4; lane++) {
+            if (!(instruction->destination.writemask & (1u << lane)))
+               sources[s].swizzle[lane] = CHROME9_PS_SWIZZLE_ZERO;
+         }
+      }
+      for (unsigned s = 0; s < source_count; s++) {
+         bool reads_register = false;
+
+         for (unsigned lane = 0; lane < 4; lane++) {
+            if ((instruction->destination.writemask & (1u << lane)) &&
+                sources[s].swizzle[lane] <= CHROME9_PS_SWIZZLE_W)
+               reads_register = true;
+         }
+         if (sources[s].file == CHROME9_PS_SOURCE_TEMP && reads_register)
             instruction_uses[sources[s].id]++;
+         else if (sources[s].file == CHROME9_PS_SOURCE_TEXTURE &&
+                  reads_register) {
+            unsigned texture = sources[s].id;
+
+            remaining_texture_uses[texture]--;
+            if (!remaining_texture_uses[texture])
+               sources[s].last_use = true;
+         }
       }
       for (unsigned s = 0; s < source_count; s++) {
          unsigned temp = sources[s].id;
@@ -272,11 +339,35 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
             p->varying_mask |= 1u << sources[s].id;
          else if (sources[s].file == CHROME9_PS_SOURCE_CONSTANT)
             p->constant_mask |= 1u << sources[s].id;
+         else if (sources[s].file == CHROME9_PS_SOURCE_TEXTURE) {
+            p->texture_input_mask |= 1u << sources[s].id;
+            direct_texture_mask |= 1u << sources[s].id;
+         }
       }
    }
    p->alu_count = ir->count;
-   set_controls(p, 0x90058000, 0x91000000,
-                0x92000000 | ir->count, 0x93000000, 0x95000000);
+   if (ir->texture_count) {
+      if (ir->count != 6 || defined_temps != 0x3f ||
+          direct_texture_mask != 0xc || p->constant_mask != 1 ||
+          p->varying_mask)
+         return false;
+      p->tau[0] = 0x301001b0;
+      p->tau[1] = 0x311111b1;
+      p->tau_count = 2;
+      p->sampler_mask = 3;
+      p->texture_input_mask |= 3;
+      set_controls(p, 0x90008000 | direct_texture_mask, 0x91000003,
+                   0x92020006, 0x93000002, 0x95000000);
+   } else {
+      unsigned temp_count = __builtin_popcount(defined_temps);
+      uint32_t resource = temp_count <= 3 ? 0x00058000 :
+                          temp_count == 4 ? 0x00050000 : 0x00048000;
+
+      if (direct_texture_mask)
+         return false;
+      set_controls(p, 0x90000000 | resource, 0x91000000,
+                   0x92000000 | ir->count, 0x93000000, 0x95000000);
+   }
    return true;
 }
 
@@ -433,6 +524,7 @@ compile_one_texture(const struct chrome9_fs_key *key,
    p->tau[0] = 0x301001b0;
    p->alu_count = 1;
    p->tau_count = 1;
+   p->texture_input_mask = 1;
    p->sampler_mask = 1;
    set_controls(p, 0x90018000, 0x91000001, 0x92010001,
                 0x93000001, 0x95000000);
@@ -461,6 +553,7 @@ chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
       p->tau_count = 1;
       p->constant_mask = 1;
       p->constant_x_one_mask = 1;
+      p->texture_input_mask = 1;
       p->sampler_mask = 1;
       set_controls(p, 0x90018000, 0x91000001, 0x92010002,
                    0x93000001, 0x95000000);
@@ -475,6 +568,7 @@ chrome9_compile_fs_offline(const struct chrome9_fs_key *key,
       p->tau[1] = 0x311001b1;
       p->alu_count = 1;
       p->tau_count = 2;
+      p->texture_input_mask = 3;
       p->sampler_mask = 3;
       set_controls(p, 0x90000000, 0x91000001, 0x92020001,
                    0x93000002, 0x95000000);
@@ -639,6 +733,7 @@ chrome9_verify_fs_offline(const struct chrome9_fs_key *key,
    if (p->constant_mask != expected.constant_mask ||
        p->constant_x_one_mask != expected.constant_x_one_mask ||
        p->varying_mask != expected.varying_mask ||
+       p->texture_input_mask != expected.texture_input_mask ||
        p->sampler_mask != expected.sampler_mask)
       return verify_fail(error, CHROME9_SHADER_VERIFY_RESOURCE);
    if (memcmp(p->control, expected.control, sizeof(p->control)))
