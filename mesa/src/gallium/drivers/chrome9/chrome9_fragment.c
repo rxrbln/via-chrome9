@@ -5,6 +5,7 @@
 
 #include <string.h>
 
+
 unsigned
 chrome9_fragment_sampler_high_water(uint8_t sampler_mask)
 {
@@ -215,5 +216,102 @@ chrome9_fragment_build_instructions(
             return false;
    }
    *count = ir->count;
+   return true;
+}
+
+bool
+chrome9_fragment_apply_depth_swizzles(
+   struct drm_chrome9_fragment_instruction *instructions, unsigned count,
+   uint8_t depth_sampler_mask,
+   const uint8_t swizzle[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4])
+{
+   uint8_t mapped[CHROME9_PS_MAX_VIRTUAL_TEMPS][4];
+   uint8_t depth_lane[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+
+   if (!instructions || !swizzle || count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+      return false;
+   for (unsigned unit = 0; unit < DRM_CHROME9_FRAGMENT_MAX_TEXTURES; unit++) {
+      if (!(depth_sampler_mask & (1u << unit)))
+         continue;
+      for (unsigned lane = 0; lane < 4; lane++)
+         if (swizzle[unit][lane] != DRM_CHROME9_FRAGMENT_SWIZZLE_X &&
+             swizzle[unit][lane] != DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO &&
+             swizzle[unit][lane] != DRM_CHROME9_FRAGMENT_SWIZZLE_ONE)
+            return false;
+         else
+            depth_lane[unit][lane] = swizzle[unit][lane];
+   }
+   for (unsigned temp = 0; temp < CHROME9_PS_MAX_VIRTUAL_TEMPS; temp++)
+      for (unsigned lane = 0; lane < 4; lane++)
+         mapped[temp][lane] = lane;
+   for (unsigned i = 0; i < count; i++) {
+      struct drm_chrome9_fragment_instruction *instruction =
+         &instructions[i];
+      unsigned live_sources;
+
+      switch (instruction->op) {
+      case DRM_CHROME9_FRAGMENT_OP_TEX:
+      case DRM_CHROME9_FRAGMENT_OP_MOV:
+      case DRM_CHROME9_FRAGMENT_OP_EXP2:
+      case DRM_CHROME9_FRAGMENT_OP_LOG2:
+      case DRM_CHROME9_FRAGMENT_OP_RCP:
+      case DRM_CHROME9_FRAGMENT_OP_RSQ:
+      case DRM_CHROME9_FRAGMENT_OP_ABS:
+      case DRM_CHROME9_FRAGMENT_OP_FRC:
+         live_sources = 1;
+         break;
+      case DRM_CHROME9_FRAGMENT_OP_MUL:
+      case DRM_CHROME9_FRAGMENT_OP_ADD:
+      case DRM_CHROME9_FRAGMENT_OP_SUB:
+      case DRM_CHROME9_FRAGMENT_OP_MIN:
+      case DRM_CHROME9_FRAGMENT_OP_MAX:
+      case DRM_CHROME9_FRAGMENT_OP_DP3:
+      case DRM_CHROME9_FRAGMENT_OP_DP4:
+         live_sources = 2;
+         break;
+      case DRM_CHROME9_FRAGMENT_OP_MAD:
+      case DRM_CHROME9_FRAGMENT_OP_CMP:
+         live_sources = 3;
+         break;
+      default:
+         return false;
+      }
+      for (unsigned source = 0; source < live_sources; source++) {
+         struct drm_chrome9_fragment_source *input =
+            &instruction->src[source];
+
+         if (input->file != DRM_CHROME9_FRAGMENT_FILE_TEMP)
+            continue;
+         if (input->index >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         for (unsigned lane = 0; lane < 4; lane++) {
+            if (input->swizzle[lane] < 4)
+               input->swizzle[lane] =
+                  mapped[input->index][input->swizzle[lane]];
+         }
+      }
+      if (instruction->dst.file == DRM_CHROME9_FRAGMENT_DEST_TEMP) {
+         if (instruction->dst.index >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         for (unsigned lane = 0; lane < 4; lane++) {
+            if (!(instruction->dst.writemask & (1u << lane)))
+               continue;
+            mapped[instruction->dst.index][lane] =
+               instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX &&
+               instruction->sampler < DRM_CHROME9_FRAGMENT_MAX_TEXTURES &&
+               (depth_sampler_mask & (1u << instruction->sampler)) ?
+               depth_lane[instruction->sampler][lane] : lane;
+         }
+      } else if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX &&
+                 instruction->sampler < DRM_CHROME9_FRAGMENT_MAX_TEXTURES &&
+                 (depth_sampler_mask & (1u << instruction->sampler))) {
+         /* There is no source-color register for a post-TEX swizzle. */
+         for (unsigned lane = 0; lane < 4; lane++)
+            if ((instruction->dst.writemask & (1u << lane)) &&
+                depth_lane[instruction->sampler][lane] !=
+                   DRM_CHROME9_FRAGMENT_SWIZZLE_X)
+               return false;
+      }
+   }
    return true;
 }

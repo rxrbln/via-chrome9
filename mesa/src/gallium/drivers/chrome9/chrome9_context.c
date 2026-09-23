@@ -72,7 +72,8 @@ chrome9_context_depth_target(struct chrome9_context *ctx)
 void
 chrome9_context_render_target_written(struct chrome9_context *ctx)
 {
-   ctx->render_target_dirty = true;
+   if (ctx->framebuffer.nr_cbufs)
+      ctx->render_target_dirty = true;
 }
 
 void
@@ -3997,6 +3998,7 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
 
    chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
+   ctx->render_target_dirty = false;
    ctx->render_target_stale = false;
    pipe_resource_reference(&ctx->render_target, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
@@ -4017,6 +4019,36 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
          if (ctx->render_target)
             chrome9_copy_surface(ctx->render_target, color);
       }
+   }
+   if (!framebuffer->nr_cbufs && framebuffer->zsbuf.texture &&
+       framebuffer->zsbuf.format == PIPE_FORMAT_X8Z24_UNORM &&
+       framebuffer->zsbuf.texture->format == PIPE_FORMAT_X8Z24_UNORM &&
+       !framebuffer->zsbuf.level && !framebuffer->zsbuf.first_layer &&
+       !framebuffer->zsbuf.last_layer && framebuffer->width &&
+       framebuffer->height &&
+       framebuffer->width == framebuffer->zsbuf.texture->width0 &&
+       framebuffer->height == framebuffer->zsbuf.texture->height0 &&
+       chrome9_resource(framebuffer->zsbuf.texture)->guarded) {
+      struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+         .width0 = framebuffer->width,
+         .height0 = framebuffer->height,
+         .depth0 = 1,
+         .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR,
+      };
+
+      if (ctx->depth_only_scratch &&
+          (ctx->depth_only_scratch->width0 != framebuffer->width ||
+           ctx->depth_only_scratch->height0 != framebuffer->height))
+         pipe_resource_reference(&ctx->depth_only_scratch, NULL);
+      if (!ctx->depth_only_scratch)
+         ctx->depth_only_scratch =
+            pipe->screen->resource_create(pipe->screen, &templ);
+      if (ctx->depth_only_scratch)
+         pipe_resource_reference(&ctx->render_target,
+                                 ctx->depth_only_scratch);
    }
    if (color && !ctx->render_target &&
        !(ctx->warnings & CHROME9_WARN_FRAMEBUFFER)) {
@@ -4153,7 +4185,8 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    chrome9_draw_flush_batch(ctx);
    if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH)))
       return;
-   if (((buffers & PIPE_CLEAR_COLOR0) && (color_mask & 0xf) != 0xf) ||
+   if (((buffers & PIPE_CLEAR_COLOR0) && ctx->framebuffer.nr_cbufs &&
+        (color_mask & 0xf) != 0xf) ||
        (buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH))) {
       chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
                         "masked color or stencil clears are not implemented");
@@ -4167,7 +4200,7 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
       width = MIN2(scissor->maxx, width) - x;
       height = MIN2(scissor->maxy, height) - y;
    }
-   if ((buffers & PIPE_CLEAR_COLOR0) &&
+   if ((buffers & PIPE_CLEAR_COLOR0) && ctx->framebuffer.nr_cbufs &&
        (resource = ctx->render_target)) {
       chrome9_context_prepare_render_target(ctx);
       chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
@@ -4402,6 +4435,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
       u_upload_destroy(pipe->stream_uploader);
    util_unreference_framebuffer_state(&ctx->framebuffer);
    pipe_resource_reference(&ctx->render_target, NULL);
+   pipe_resource_reference(&ctx->depth_only_scratch, NULL);
    util_set_vertex_buffers_count(ctx->vertex_buffers,
                                  &ctx->num_vertex_buffers, NULL, 0);
    for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++) {

@@ -4,6 +4,8 @@
 #include "chrome9_resource.h"
 
 #include "chrome9_format.h"
+#include "chrome9_context.h"
+#include "chrome9_draw.h"
 #include "chrome9_public.h"
 
 #include <limits.h>
@@ -16,6 +18,7 @@
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "util/format/u_format.h"
+#include "util/u_debug.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
@@ -224,6 +227,14 @@ chrome9_format_supported(struct pipe_screen *screen,
                                       storage_sample_count,
                                       PIPE_BIND_SCANOUT);
    }
+   if (format == PIPE_FORMAT_X8Z24_UNORM)
+      return target == PIPE_TEXTURE_2D &&
+             /* Enable only for guarded validation until the complete
+              * Gallium FBO/draw/clear/rebind path passes on silicon. */
+             debug_get_bool_option("CHROME9_EXPERIMENTAL_X8Z24", false) &&
+             chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
+             !(bindings & ~depth_bindings);
    if ((bindings & PIPE_BIND_SAMPLER_VIEW) &&
        !chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE))
@@ -507,9 +518,15 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    struct pipe_transfer *transfer;
    uint64_t offset;
 
-   (void)pipe;
    if (!out_transfer || !chrome9_transfer_box_valid(resource, level, box))
       return NULL;
+
+   /* A D24 attachment may still be in a retained triangle batch.  The
+    * ioctl itself is synchronous, but a direct persistent mapping is not a
+    * synchronization point until that batch has been submitted. */
+   if (resource->format == PIPE_FORMAT_X8Z24_UNORM &&
+       !(usage & PIPE_MAP_UNSYNCHRONIZED))
+      chrome9_draw_flush_batch(chrome9_context(pipe));
 
    transfer = CALLOC_STRUCT(pipe_transfer);
    if (!transfer)
@@ -740,6 +757,7 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
        pres->target != PIPE_TEXTURE_2D || pres->depth0 != 1 ||
        pres->array_size != 1 || pres->nr_samples > 1 ||
        pres->nr_storage_samples > 1 || format != pres->format ||
+       format == PIPE_FORMAT_X8Z24_UNORM ||
        (!format_info && format != PIPE_FORMAT_Z16_UNORM) ||
        base_level > last_level || last_level > pres->last_level ||
        first_layer || last_layer)

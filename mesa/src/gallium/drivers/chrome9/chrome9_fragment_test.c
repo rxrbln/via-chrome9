@@ -5,6 +5,7 @@
 
 #include <string.h>
 
+
 #define CHECK(condition) do { if (!(condition)) return false; } while (0)
 
 static struct chrome9_ps_source
@@ -156,9 +157,66 @@ check_computed_texture_order(void)
    return true;
 }
 
+static bool
+check_depth_view_swizzles(void)
+{
+   struct drm_chrome9_fragment_instruction instructions[2] = {
+      {
+         .op = DRM_CHROME9_FRAGMENT_OP_TEX,
+         .sampler = 0,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 3, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_VARYING, 0, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      }, {
+         .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_TEMP, 3, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      },
+   };
+   uint8_t view[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+
+   view[0][0] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[0][1] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[0][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[0][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+   CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 2, 1, view));
+   CHECK(instructions[1].src[0].swizzle[0] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+   CHECK(instructions[1].src[0].swizzle[1] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+   CHECK(instructions[1].src[0].swizzle[2] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+   CHECK(instructions[1].src[0].swizzle[3] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
+
+   instructions[1].src[0].swizzle[0] = 0;
+   instructions[1].src[0].swizzle[1] = 1;
+   instructions[1].src[0].swizzle[2] = 2;
+   instructions[1].src[0].swizzle[3] = 3;
+   view[0][1] = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+   view[0][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+   view[0][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+   CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 2, 1, view));
+   CHECK(instructions[1].src[0].swizzle[0] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+   CHECK(instructions[1].src[0].swizzle[1] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO);
+   CHECK(instructions[1].src[0].swizzle[2] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO);
+   CHECK(instructions[1].src[0].swizzle[3] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
+
+   instructions[0].dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
+   CHECK(!chrome9_fragment_apply_depth_swizzles(instructions, 1, 1, view));
+   return true;
+}
+
 int
 main(void)
 {
    return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
-            check_computed_texture_order());
+            check_computed_texture_order() && check_depth_view_swizzles());
 }

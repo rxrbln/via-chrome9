@@ -18,6 +18,7 @@ static const struct chrome9_texture_format_info texture_formats[] = {
    { PIPE_FORMAT_L8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8, 1 },
    { PIPE_FORMAT_L8A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8A8, 2 },
    { PIPE_FORMAT_B5G6R5_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_RGB565, 2 },
+   { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4 },
 };
 
 const struct chrome9_texture_format_info *
@@ -101,7 +102,15 @@ chrome9_texture_swizzle_supported(enum pipe_format format,
                                   unsigned r, unsigned g,
                                   unsigned b, unsigned a)
 {
-   if (!chrome9_texture_format_info(format) || r != PIPE_SWIZZLE_X ||
+   if (!chrome9_texture_format_info(format))
+      return false;
+   /* A raw D24 sample returns depth in every native lane.  The generic
+    * fragment path composes the Gallium view swizzle (including constants)
+    * into later source selectors before submitting the program. */
+   if (format == PIPE_FORMAT_X8Z24_UNORM)
+      return r <= PIPE_SWIZZLE_1 && g <= PIPE_SWIZZLE_1 &&
+             b <= PIPE_SWIZZLE_1 && a <= PIPE_SWIZZLE_1;
+   if (r != PIPE_SWIZZLE_X ||
        g != PIPE_SWIZZLE_Y || b != PIPE_SWIZZLE_Z)
       return false;
 
@@ -112,4 +121,29 @@ chrome9_texture_swizzle_supported(enum pipe_format format,
     */
    return a == PIPE_SWIZZLE_W ||
           (format == PIPE_FORMAT_B8G8R8X8_UNORM && a == PIPE_SWIZZLE_1);
+}
+
+bool
+chrome9_depth_view_swizzle(unsigned pipe_swizzle, uint8_t *native)
+{
+   if (!native)
+      return false;
+   /* The Gallium X8Z24 base format is (Z,0,0,1), while native type-FE
+    * routes Z to every lane.  Resolve the base before applying view swizzle. */
+   switch (pipe_swizzle) {
+   case PIPE_SWIZZLE_X:
+      *native = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+      return true;
+   case PIPE_SWIZZLE_Y:
+   case PIPE_SWIZZLE_Z:
+   case PIPE_SWIZZLE_0:
+      *native = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+      return true;
+   case PIPE_SWIZZLE_W:
+   case PIPE_SWIZZLE_1:
+      *native = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+      return true;
+   default:
+      return false;
+   }
 }

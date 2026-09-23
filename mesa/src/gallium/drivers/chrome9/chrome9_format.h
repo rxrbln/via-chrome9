@@ -29,5 +29,6 @@ void chrome9_fill_rgb565_rect(uint8_t *pixels, unsigned stride,
 bool chrome9_texture_swizzle_supported(enum pipe_format format,
                                        unsigned r, unsigned g,
                                        unsigned b, unsigned a);
+bool chrome9_depth_view_swizzle(unsigned pipe_swizzle, uint8_t *native);
 
 #endif

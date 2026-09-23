@@ -27,6 +27,7 @@ main(void)
       { PIPE_FORMAT_L8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8, 1 },
       { PIPE_FORMAT_L8A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8A8, 2 },
       { PIPE_FORMAT_B5G6R5_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_RGB565, 2 },
+      { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4 },
    };
 
    for (unsigned i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
@@ -53,7 +54,33 @@ main(void)
    CHECK(chrome9_format_storage_cpp(PIPE_FORMAT_Z16_UNORM) == 2);
    CHECK(chrome9_format_storage_cpp(PIPE_FORMAT_X8Z24_UNORM) == 4);
    CHECK(!chrome9_format_storage_cpp(PIPE_FORMAT_Z24X8_UNORM));
-   CHECK(!chrome9_texture_format_info(PIPE_FORMAT_X8Z24_UNORM));
+   CHECK(chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_X8Z24_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_X,
+      PIPE_SWIZZLE_X, PIPE_SWIZZLE_1));
+   CHECK(chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_X8Z24_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_0,
+      PIPE_SWIZZLE_0, PIPE_SWIZZLE_1));
+   CHECK(!chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_X8Z24_UNORM, PIPE_SWIZZLE_X, 255,
+      PIPE_SWIZZLE_0, PIPE_SWIZZLE_1));
+   {
+      uint8_t lane;
+
+      CHECK(chrome9_depth_view_swizzle(PIPE_SWIZZLE_X, &lane));
+      CHECK(lane == DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+      CHECK(chrome9_depth_view_swizzle(PIPE_SWIZZLE_Y, &lane));
+      CHECK(lane == DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO);
+      CHECK(chrome9_depth_view_swizzle(PIPE_SWIZZLE_Z, &lane));
+      CHECK(lane == DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO);
+      CHECK(chrome9_depth_view_swizzle(PIPE_SWIZZLE_W, &lane));
+      CHECK(lane == DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
+      CHECK(chrome9_depth_view_swizzle(PIPE_SWIZZLE_0, &lane));
+      CHECK(lane == DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO);
+      CHECK(chrome9_depth_view_swizzle(PIPE_SWIZZLE_1, &lane));
+      CHECK(lane == DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
+      CHECK(!chrome9_depth_view_swizzle(255, &lane));
+      CHECK(!chrome9_depth_view_swizzle(PIPE_SWIZZLE_X, NULL));
+   }
    CHECK(chrome9_pack_depth_clear(PIPE_FORMAT_X8Z24_UNORM, 0.0, &word));
    CHECK(word == 0x00000000);
    CHECK(chrome9_pack_depth_clear(PIPE_FORMAT_X8Z24_UNORM, 0.5, &word));

@@ -15,4 +15,11 @@ bool chrome9_fragment_build_instructions(
       instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS],
    unsigned *count);
 
+/* Compose the decoded X8Z24 view selectors into virtual-temp sources.
+ * Hardware type-FE returns depth in every native lane. */
+bool chrome9_fragment_apply_depth_swizzles(
+   struct drm_chrome9_fragment_instruction *instructions, unsigned count,
+   uint8_t depth_sampler_mask,
+   const uint8_t swizzle[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4]);
+
 #endif

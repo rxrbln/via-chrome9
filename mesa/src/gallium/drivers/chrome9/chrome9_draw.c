@@ -747,6 +747,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 {
    const struct pipe_surface *surface;
    struct pipe_resource *resource;
+   const bool depth_only = !ctx->framebuffer.nr_cbufs &&
+      ctx->framebuffer.zsbuf.texture &&
+      ctx->framebuffer.zsbuf.format == PIPE_FORMAT_X8Z24_UNORM;
 
    *depth = NULL;
    memset(textures, 0,
@@ -762,8 +765,12 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    surface = ctx->framebuffer.nr_cbufs == 1 ?
              &ctx->framebuffer.cbufs[0] : NULL;
    *reason = "color-surface";
-   if (!surface || !surface->texture || surface->format != resource->format ||
-       surface->level || surface->first_layer || surface->last_layer ||
+   if ((!depth_only &&
+        (!surface || !surface->texture ||
+         surface->format != resource->format || surface->level ||
+         surface->first_layer || surface->last_layer)) ||
+       (depth_only && ctx->render_target !=
+                      ctx->depth_only_scratch) ||
        (resource->target != PIPE_TEXTURE_2D &&
         resource->target != PIPE_TEXTURE_RECT) ||
        (resource->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
@@ -778,6 +785,14 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                                 ctx->blend_extended_factors,
                                 blend_successor))
       return false;
+   if (depth_only) {
+      /* Keep a real guarded A50 target but suppress every color store.  A
+       * blending equation would read undefined scratch contents. */
+      if (blend->flags & DRM_CHROME9_BLEND_ENABLE)
+         return false;
+      blend->color_mask = 0;
+      *blend_successor = true;
+   }
    if (ctx->dsa && ctx->dsa->alpha_enabled) {
       *reason = "alpha-test";
       if (!ctx->alpha_test_supported ||
@@ -832,7 +847,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 
       *reason = "depth-state";
       *depth = chrome9_context_depth_target(ctx);
-      if (!ctx->draw_triangle_d16 ||
+      if ((surface->format == PIPE_FORMAT_X8Z24_UNORM ?
+           !chrome9_use_generic_fragment_program(ctx) :
+           !ctx->draw_triangle_d16) ||
           (!ctx->dsa->depth_writemask &&
            !ctx->depth_read_only_supported) ||
           (ctx->dsa->depth_func != PIPE_FUNC_LESS &&
@@ -842,16 +859,22 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              ctx->dsa->depth_func == PIPE_FUNC_EQUAL) &&
            !(ctx->depth_always_supported &&
              ctx->dsa->depth_func == PIPE_FUNC_ALWAYS)) || !*depth ||
-          surface->format != PIPE_FORMAT_Z16_UNORM || surface->level ||
+          (surface->format != PIPE_FORMAT_Z16_UNORM &&
+           surface->format != PIPE_FORMAT_X8Z24_UNORM) ||
+          surface->level ||
           surface->first_layer || surface->last_layer ||
           ((*depth)->base.target != PIPE_TEXTURE_2D &&
            (*depth)->base.target != PIPE_TEXTURE_RECT) ||
-          (*depth)->base.format != PIPE_FORMAT_Z16_UNORM ||
+          (*depth)->base.format != surface->format ||
           !(*depth)->guarded || !(*depth)->bo.handle ||
           (*depth)->base.width0 != resource->width0 ||
           (*depth)->base.height0 != resource->height0)
          return false;
       *depth_active = true;
+   }
+   if (depth_only && !*depth_active) {
+      *reason = "depth-only-without-depth-state";
+      return false;
    }
    *reason = "compiled-program-depth";
    if (ctx->fs->fragment_program == CHROME9_FS_COMPILED_ALU &&
@@ -956,6 +979,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          *reason = "texture-resource";
          if (original == resource || source == resource ||
              textures[unit]->bo.handle == (*target)->bo.handle ||
+             (*depth_active &&
+              textures[unit]->bo.handle == (*depth)->bo.handle) ||
              source->target != PIPE_TEXTURE_2D ||
              (!chrome9_use_generic_fragment_program(ctx) ?
                 (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
@@ -971,6 +996,15 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                 (uint64_t)textures[unit]->stride * source->height0)
             return false;
          *reason = "mip-view-state";
+         if (source->format == PIPE_FORMAT_X8Z24_UNORM &&
+             (samplers[unit]->min_filter !=
+                 DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+              samplers[unit]->mag_filter !=
+                 DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+              samplers[unit]->mip_filter !=
+                 DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+              view->u.tex.last_level || source->last_level))
+            return false;
          if (samplers[unit]->mip_filter !=
                 DRM_CHROME9_TEXTURE_MIP_FILTER_NONE &&
              !chrome9_use_generic_fragment_program(ctx) &&
@@ -1085,6 +1119,8 @@ chrome9_submit_generic_triangle(
       texture_state[DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { 0 };
    struct drm_chrome9_fragment_vertex vertices[3] = { 0 };
    uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+   uint8_t depth_swizzle[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+   uint8_t depth_sampler_mask = 0;
    struct drm_chrome9_draw_fragment_program draw = { 0 };
    const unsigned constant_count = crender->ctx->fs->semantic_constant_mask ?
       32 - __builtin_clz(crender->ctx->fs->semantic_constant_mask) : 0;
@@ -1097,6 +1133,31 @@ chrome9_submit_generic_triangle(
           crender->ctx->fs->semantic_sampler_mask, instructions,
           &instruction_count) ||
        !chrome9_fragment_constants(crender->ctx, constant_count, constants))
+      return false;
+   for (unsigned unit = 0; unit < crender->texture_count; unit++) {
+      const struct pipe_sampler_view *view =
+         crender->ctx->sampler_views[unit];
+
+      if (textures[unit]->base.format != PIPE_FORMAT_X8Z24_UNORM)
+         continue;
+      if (!view)
+         return false;
+      depth_sampler_mask |= 1u << unit;
+      if (!chrome9_depth_view_swizzle(view->swizzle_r,
+                                      &depth_swizzle[unit][0]) ||
+          !chrome9_depth_view_swizzle(view->swizzle_g,
+                                      &depth_swizzle[unit][1]) ||
+          !chrome9_depth_view_swizzle(view->swizzle_b,
+                                      &depth_swizzle[unit][2]) ||
+          !chrome9_depth_view_swizzle(view->swizzle_a,
+                                      &depth_swizzle[unit][3]))
+         return false;
+   }
+   if (depth_sampler_mask &&
+       !chrome9_fragment_apply_depth_swizzles(instructions,
+                                               instruction_count,
+                                               depth_sampler_mask,
+                                               depth_swizzle))
       return false;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
       const struct pipe_resource *resource = &textures[unit]->base;
@@ -1184,7 +1245,10 @@ chrome9_submit_generic_triangle(
       target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
       DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
       DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
-   draw.depth_format = depth_active ? DRM_CHROME9_FRAGMENT_DEPTH_D16 : 0;
+   draw.depth_format = depth_active ?
+      (depth->base.format == PIPE_FORMAT_X8Z24_UNORM ?
+       DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 : DRM_CHROME9_FRAGMENT_DEPTH_D16) :
+      0;
    draw.instruction_count = instruction_count;
    draw.constant_count = constant_count;
    draw.texture_count = crender->texture_count;

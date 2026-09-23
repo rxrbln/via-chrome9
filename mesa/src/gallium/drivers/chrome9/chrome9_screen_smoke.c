@@ -5464,6 +5464,124 @@ out:
    return passed;
 }
 
+static bool
+smoke_d24_framebuffer_contract(struct pipe_screen *screen)
+{
+   struct pipe_resource depth_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_X8Z24_UNORM,
+      .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW |
+              PIPE_BIND_LINEAR,
+   };
+   struct pipe_resource color_templ = depth_templ;
+   struct pipe_framebuffer_state fb = {
+      .width = 64, .height = 64,
+   };
+   struct pipe_sampler_view view_templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_X8Z24_UNORM,
+      .swizzle_r = PIPE_SWIZZLE_X,
+      .swizzle_g = PIPE_SWIZZLE_Y,
+      .swizzle_b = PIPE_SWIZZLE_Z,
+      .swizzle_a = PIPE_SWIZZLE_W,
+   };
+   struct pipe_resource *depth = NULL, *color = NULL, *single_use = NULL;
+   struct pipe_sampler_view *view = NULL;
+   struct pipe_context *context = NULL;
+   struct pipe_resource *scratch = NULL;
+   const struct chrome9_resource *native;
+   bool passed = false;
+
+   if (!screen->is_format_supported(screen, depth_templ.format,
+                                     depth_templ.target, 1, 1,
+                                     depth_templ.bind) ||
+       !screen->is_format_supported(screen, depth_templ.format,
+                                     depth_templ.target, 1, 1,
+                                     PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR) ||
+       screen->is_format_supported(screen, PIPE_FORMAT_S8_UINT_Z24_UNORM,
+                                    PIPE_TEXTURE_2D, 1, 1,
+                                    depth_templ.bind) ||
+       screen->is_format_supported(screen, depth_templ.format,
+                                    depth_templ.target, 1, 1,
+                                    depth_templ.bind | PIPE_BIND_SHARED))
+      goto out;
+   depth_templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR;
+   single_use = screen->resource_create(screen, &depth_templ);
+   if (!single_use)
+      goto out;
+   screen->resource_destroy(screen, single_use);
+   single_use = NULL;
+   depth_templ.bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR;
+   single_use = screen->resource_create(screen, &depth_templ);
+   if (!single_use)
+      goto out;
+   screen->resource_destroy(screen, single_use);
+   single_use = NULL;
+   depth_templ.bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW |
+                      PIPE_BIND_LINEAR;
+   depth_templ.last_level = 1;
+   single_use = screen->resource_create(screen, &depth_templ);
+   if (single_use)
+      goto out;
+   depth_templ.last_level = 0;
+   depth = screen->resource_create(screen, &depth_templ);
+   color_templ.format = PIPE_FORMAT_B8G8R8X8_UNORM;
+   color_templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
+   color = screen->resource_create(screen, &color_templ);
+   context = screen->context_create(screen, NULL, 0);
+   if (!depth || !color || !context)
+      goto out;
+   native = chrome9_resource(depth);
+   if (!native->guarded || native->stride != 256 ||
+       native->data_size != 256 * 64 || !smoke_guard_pages_match(native))
+      goto out;
+   view = context->create_sampler_view(context, depth, &view_templ);
+   if (!view)
+      goto out;
+   fb.zsbuf.format = PIPE_FORMAT_X8Z24_UNORM;
+   fb.zsbuf.texture = depth;
+   context->set_framebuffer_state(context, &fb);
+   scratch = chrome9_context(context)->render_target;
+   if (!scratch || scratch == depth ||
+       scratch != chrome9_context(context)->depth_only_scratch ||
+       !chrome9_resource(scratch)->guarded ||
+       scratch->format != PIPE_FORMAT_B8G8R8X8_UNORM)
+      goto out;
+   context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH, 0, 0xff,
+                  NULL, NULL, 0.5, 0);
+   if (((uint32_t *)((uint8_t *)native->bo.map + native->data_offset))[0] !=
+          0x80000000 || !smoke_guard_pages_match(native) ||
+       !smoke_guard_pages_match(chrome9_resource(scratch)))
+      goto out;
+   fb.nr_cbufs = 1;
+   fb.cbufs[0].format = PIPE_FORMAT_B8G8R8X8_UNORM;
+   fb.cbufs[0].texture = color;
+   context->set_framebuffer_state(context, &fb);
+   if (chrome9_context(context)->render_target != color)
+      goto out;
+   fb.nr_cbufs = 0;
+   fb.cbufs[0].texture = NULL;
+   context->set_framebuffer_state(context, &fb);
+   if (chrome9_context(context)->render_target != scratch ||
+       !smoke_guard_pages_match(native))
+      goto out;
+   passed = true;
+
+out:
+   if (single_use)
+      screen->resource_destroy(screen, single_use);
+   if (view)
+      context->sampler_view_destroy(context, view);
+   if (context)
+      context->destroy(context);
+   if (color)
+      screen->resource_destroy(screen, color);
+   if (depth)
+      screen->resource_destroy(screen, depth);
+   return passed;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5528,6 +5646,12 @@ main(int argc, char **argv)
    close(fd);
    if (!screen) {
       fputs("chrome9_screen_create failed\n", stderr);
+      return 1;
+   }
+   if (getenv("CHROME9_EXPERIMENTAL_X8Z24") &&
+       !smoke_d24_framebuffer_contract(screen)) {
+      fputs("X8Z24 private framebuffer contract failed\n", stderr);
+      screen->destroy(screen);
       return 1;
    }
    shared_xrgb_templ.bind = PIPE_BIND_RENDER_TARGET |

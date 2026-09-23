@@ -143,6 +143,9 @@ struct chrome9_context {
    /* DRAW_TRIANGLE requires a native guarded BO.  Imported DRI3 images use
     * this guarded shadow and are copied back on flush. */
    struct pipe_resource *render_target;
+   /* A depth-only public framebuffer still needs a guarded native A50
+    * destination.  This private target is never a Gallium color buffer. */
+   struct pipe_resource *depth_only_scratch;
    bool render_target_dirty;
    bool render_target_stale;
    bool draw_triangle_d16;
