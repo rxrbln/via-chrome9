@@ -261,8 +261,12 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	if (output_mask != 0xf || !alu_count ||
 	    alu_count + bridge_count > DRM_CHROME9_FRAGMENT_MAX_ALU)
 		return -EINVAL;
+	/* A vector operation defines its whole write mask even when a later
+	 * swizzle consumes only some lanes (for example raw depth sampled as
+	 * Gallium's (Z, 0, 0, 1)).  Reject a wholly dead temporary, not legal
+	 * unused components of a live one. */
 	for (i = 0; i < CHROME9_FRAGMENT_TEMP_COUNT; i++)
-		if (state->defined_mask[i] & ~state->used_mask[i])
+		if (state->defined_mask[i] && !state->used_mask[i])
 			return -EINVAL;
 	if (constant_count != (state->constant_mask ?
 		fls(state->constant_mask) : 0) ||
@@ -860,6 +864,23 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction swizzled_texture[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 5, 5, 4 }, 0, 0 },
+			},
+		},
+	};
 	static const struct drm_chrome9_fragment_instruction sparse_varyings[] = {
 		{
 			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
@@ -1015,6 +1036,26 @@ int chrome9_fragment_selftest(void)
 		2, 0, 0, program);
 	if (ret)
 		goto out;
+	ret = chrome9_fragment_compile(swizzled_texture,
+		ARRAY_SIZE(swizzled_texture), constants, 0, 1, 1, program);
+	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
+	    program->varying_count != 1 || program->varying_width[0] != 2) {
+		ret = -EINVAL;
+		goto out;
+	}
+	{
+		struct drm_chrome9_fragment_instruction dead_texture[2];
+
+		memcpy(dead_texture, swizzled_texture, sizeof(dead_texture));
+		dead_texture[1].src[0].file = DRM_CHROME9_FRAGMENT_FILE_CONSTANT;
+		dead_texture[1].src[0].index = 0;
+		if (chrome9_fragment_compile(dead_texture,
+			ARRAY_SIZE(dead_texture), constants, 1, 1, 1,
+			program) != -EINVAL) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
 	ret = chrome9_fragment_compile(sparse_varyings,
 		ARRAY_SIZE(sparse_varyings), constants, 0, 1, 6, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
