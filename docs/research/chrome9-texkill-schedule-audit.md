@@ -271,6 +271,14 @@ becomes 514/1024.  Their ideal halfway filter value is 511.5/1024, just
 below half if the filter truncates to code 511.  The observed discard is
 consistent with that pipeline, while the separately rounded BGRA8 output can
 still be `0x80`; the exact filter rounding has not been measured.
+A bounded precision discriminator should keep the identical filtered sample
+and replicated `sample-ref` SUB/TEXKILL sequence, then use separate guarded
+draws with exactly representable float references `510/1024`, `511/1024`,
+and `512/1024`.  Equality survives the already-qualified finite KILL
+lowering, so the survive-to-discard transition bounds the internal result in
+1.10 units without treating an 8-bit render-target value as the sample.  This
+is only a sampler-precision oracle: the production GL predicate remains the
+strict `sampled_alpha < 0.5` and must not be biased to imitate BGRA8 readback.
 The raw constant zero-predicate test above separately proves zero survival.
 Broader sampled formats, stencil, and GL helper semantics remain pending.
 The fixed A33
