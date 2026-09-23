@@ -14,6 +14,13 @@ guards.  This proves a plain RGB565 store only.  Blending, depth interaction,
 render-to-texture ordering, and Mesa render-target/FBO exposure are still
 unvalidated.  The other 16-bit RT formats remain static oracles.
 
+The guarded L8A8 target store also retired on 2026-09-23: a 64x64,
+128-byte-pitch, zero-varying opaque-black draw wrote 1,176 `ff00` pixels,
+left the exterior zero, and preserved both guard pages
+(`tools/re/chrome9_l8a8_guard_smoke.c`).  This checks alpha/high-byte and
+luminance/low-byte placement at an unambiguous black endpoint.  Unequal RGB
+reduction, blending, depth interaction, and Mesa FBO exposure are not proved.
+
 The sampler and render-target format tables are related but not identical.
 A8 and L8 are native sampler formats but are rejected by the render-target
 lookup.  L8A8 and the three 16-bit RGB(A) formats are present in both tables.
