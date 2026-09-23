@@ -188,6 +188,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_GEM_DMA32_SCANOUT	(1ULL << 46)
 /* One immutable RHW draw is internally split into proven 544-triangle runs. */
 #define DRM_CHROME9_CAP_DRAW_TRIANGLE_D16_RHW_CHAIN	(1ULL << 47)
+/* The structured one-instruction pixel program accepts ADD(v0,c0). */
+#define DRM_CHROME9_CAP_FRAGMENT_ADD			(1ULL << 48)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -826,11 +828,12 @@ struct drm_chrome9_draw_triangle_d16_rhw_chain {
  * Version-one structured fragment instruction.  This is deliberately not a
  * native packet ABI: the kernel validates these logical operands and rebuilds
  * the four native instruction words.  The first executable subset writes all
- * four oC0 channels with one MOV or MUL and exposes only the primary varying
- * v0 and one job-local float constant c0.
+ * four oC0 channels with one MOV, MUL, or capability-gated ADD and exposes
+ * only the primary varying v0 and one job-local float constant c0.
  */
 #define DRM_CHROME9_PS_OP_MOV		0
 #define DRM_CHROME9_PS_OP_MUL		1
+#define DRM_CHROME9_PS_OP_ADD		2
 
 #define DRM_CHROME9_PS_SOURCE_VARYING	0
 #define DRM_CHROME9_PS_SOURCE_CONSTANT	1
@@ -861,9 +864,9 @@ struct drm_chrome9_ps_instruction {
  * mandatory and vertices_ptr addresses up to TRIANGLE_RUN_MAX perspective-
  * correct records.
  * constant_c0 contains the exact IEEE-754 words uploaded to fragment c0.
- * Version one accepts identity swizzles and requires modifier zero.  MUL must
- * pair v0 with c0.  The remaining defined swizzle values reserve stable
- * encodings for later independently gated successors.
+ * Version one accepts identity swizzles and requires modifier zero.  MUL and
+ * ADD must pair v0 with c0.  The remaining defined swizzle values reserve
+ * stable encodings for later independently gated successors.
  */
 struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 	__u32 destination_handle;
