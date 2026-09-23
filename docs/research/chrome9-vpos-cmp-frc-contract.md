@@ -46,6 +46,22 @@ index zero and XY-only selectors, and keep A00/A08/FVF varying counts zero.
 Initially reject POSITION modifiers, Z/W selectors and unused operands rather
 than treating native class 3/id 3 as an ordinary T3 input.
 
+The exact two-record pixel-center object is:
+
+```text
+# r0.xy = vPos.xyxy * c0.xyxy; FRC oC0,r0.xyxy
+resources 0 1 0 0
+A90..A93 90058008 91000000 92000002 93000000
+ALU       0140b6d0 d008006d 0032c306 00000020
+          01c00530 101c0053 00f20004 000e0820
+```
+
+Its tokens are retained in the corpus.  With c0.xy exactly 0.25, native
+half-integer centers produce fractional XY values
+`.125,.375,.625,.875` across a four-pixel axis, replicated as XYXY.  The
+object still has A00 resource count zero, no TAU and no ordinary varying;
+only TEMP0 lifetime joins the already closed MISC relocation.
+
 The second object's unfinalized MISC source is `0xcf`; configuration two
 rewrites it to 3 and marks the consumer's temporary source as final.  FRC is
 an ordinary one-A-source ALU with subop `e`; it needs no scheduler sideband.
