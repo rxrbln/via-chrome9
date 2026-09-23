@@ -5493,6 +5493,177 @@ out:
 }
 
 static bool
+smoke_d24_combined_draw(struct pipe_screen *screen,
+                        struct pipe_context *context,
+                        struct pipe_resource *color,
+                        struct pipe_resource *depth,
+                        struct pipe_framebuffer_state *fb)
+{
+   static const float vertices[3][4] = {
+      { -0.75f, -0.75f, 0.0f, 1.0f },
+      {  0.75f, -0.75f, 0.0f, 1.0f },
+      { -0.75f,  0.75f, 0.0f, 1.0f },
+   };
+   const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+   const struct pipe_constant_buffer constant = {
+      .buffer_size = sizeof(red),
+      .user_buffer = red,
+   };
+   const struct pipe_vertex_buffer vertex_buffer = {
+      .is_user_buffer = true,
+      .buffer.user = vertices,
+   };
+   struct pipe_vertex_element element = {
+      .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+      .src_stride = sizeof(vertices[0]),
+   };
+   struct pipe_blend_state blend = { 0 };
+   struct pipe_depth_stencil_alpha_state dsa = {
+      .depth_enabled = true,
+      .depth_writemask = true,
+      .depth_func = PIPE_FUNC_LESS,
+   };
+   struct pipe_rasterizer_state rasterizer = {
+      .half_pixel_center = true,
+      .bottom_edge_rule = true,
+      .depth_clip_near = true,
+      .depth_clip_far = true,
+   };
+   const struct pipe_viewport_state viewport = {
+      .scale = { 32.0f, 32.0f, 0.5f },
+      .translate = { 32.5f, 32.5f, 0.5f },
+   };
+   const struct pipe_scissor_state scissor = {
+      .maxx = 64,
+      .maxy = 64,
+   };
+   const struct pipe_draw_info info = {
+      .mode = MESA_PRIM_TRIANGLES,
+      .index_bounds_valid = true,
+      .instance_count = 1,
+      .min_index = 0,
+      .max_index = 2,
+   };
+   const struct pipe_draw_start_count_bias draw = {
+      .count = 3,
+   };
+   const union pipe_color_union clear_color = { 0 };
+   struct chrome9_resource *ccolor = chrome9_resource(color);
+   struct chrome9_resource *cdepth = chrome9_resource(depth);
+   const uint32_t *color_pixels, *depth_pixels;
+   uint64_t submitted, rejected, program_batches;
+   unsigned changed = 0;
+   void *blend_handle = NULL, *dsa_handle = NULL;
+   void *rasterizer_handle = NULL, *elements_handle = NULL;
+   void *vs = NULL, *fs = NULL;
+   bool passed = false;
+
+   if (!ccolor->guarded || ccolor->stride != 256 ||
+       !smoke_initialize_guard_pages(ccolor))
+      goto out;
+   blend.rt[0].colormask = PIPE_MASK_RGBA;
+   blend_handle = context->create_blend_state(context, &blend);
+   dsa_handle = context->create_depth_stencil_alpha_state(context, &dsa);
+   rasterizer_handle = context->create_rasterizer_state(context, &rasterizer);
+   elements_handle = context->create_vertex_elements_state(context, 1,
+                                                            &element);
+   vs = make_solid_vertex_shader(screen, context);
+   fs = make_constant_color_fs(screen, context, 0);
+   if (!blend_handle || !dsa_handle || !rasterizer_handle ||
+       !elements_handle || !vs || !fs ||
+       !((struct chrome9_shader *)fs)->supported ||
+       !((struct chrome9_shader *)fs)->semantic_fs_valid ||
+       ((struct chrome9_shader *)fs)->semantic_input_mask)
+      goto out;
+
+   fb->nr_cbufs = 1;
+   fb->cbufs[0].format = color->format;
+   fb->cbufs[0].texture = color;
+   context->set_framebuffer_state(context, fb);
+   if (chrome9_context(context)->render_target != color)
+      goto out;
+   context->bind_blend_state(context, blend_handle);
+   context->bind_depth_stencil_alpha_state(context, dsa_handle);
+   context->bind_rasterizer_state(context, rasterizer_handle);
+   context->bind_vertex_elements_state(context, elements_handle);
+   context->bind_vs_state(context, vs);
+   context->bind_fs_state(context, fs);
+   context->set_vertex_buffers(context, 1, &vertex_buffer);
+   context->set_constant_buffer(context, MESA_SHADER_FRAGMENT, 0, &constant);
+   context->set_viewport_states(context, 0, 1, &viewport);
+   context->set_scissor_states(context, 0, 1, &scissor);
+   context->clear(context, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH,
+                  PIPE_MASK_RGBA, 0xff, NULL, &clear_color, 1.0, 0);
+   submitted = chrome9_context(context)->submitted_triangles;
+   rejected = chrome9_context(context)->rejected_triangles;
+   program_batches = chrome9_context(context)->submitted_program_batches;
+   context->draw_vbo(context, &info, 0, NULL, &draw, 1);
+   context->flush_resource(context, color);
+   context->flush_resource(context, depth);
+   context->flush(context, NULL, 0);
+
+   color_pixels = (const uint32_t *)((const uint8_t *)ccolor->bo.map +
+                                    ccolor->data_offset);
+   depth_pixels = (const uint32_t *)((const uint8_t *)cdepth->bo.map +
+                                    cdepth->data_offset);
+   for (unsigned y = 0; y < 64; y++)
+      for (unsigned x = 0; x < 64; x++) {
+         uint32_t pixel = color_pixels[y * (ccolor->stride / 4) + x];
+         uint32_t z = depth_pixels[y * (cdepth->stride / 4) + x];
+
+         if (!pixel && z == 0xffffff00U)
+            continue;
+         if (pixel != 0xffff0000U || (z >> 8) < 0x7fff00U ||
+             (z >> 8) > 0x800100U) {
+            fprintf(stderr, "X8Z24 draw pixel (%u,%u): color=%08x depth=%08x\n",
+                    x, y, pixel, z);
+            goto out;
+         }
+         changed++;
+      }
+   passed = changed >= 1100 && changed <= 1250 &&
+            color_pixels[16 * (ccolor->stride / 4) + 16] == 0xffff0000U &&
+            depth_pixels[16 * (cdepth->stride / 4) + 16] != 0xffffff00U &&
+            color_pixels[60 * (ccolor->stride / 4) + 60] == 0 &&
+            depth_pixels[60 * (cdepth->stride / 4) + 60] == 0xffffff00U &&
+            chrome9_context(context)->submitted_triangles == submitted + 1 &&
+            chrome9_context(context)->rejected_triangles == rejected &&
+            chrome9_context(context)->submitted_program_batches ==
+               program_batches + 1 &&
+            smoke_guard_pages_match(ccolor) && smoke_guard_pages_match(cdepth);
+   if (passed)
+      printf("X8Z24 combined Gallium draw passed: changed=%u center=%08x/%08x\n",
+             changed,
+             color_pixels[16 * (ccolor->stride / 4) + 16],
+             depth_pixels[16 * (cdepth->stride / 4) + 16]);
+   else
+      fprintf(stderr,
+              "X8Z24 combined Gallium draw mismatch: changed=%u "
+              "center=%08x/%08x submitted=+%" PRIu64
+              " rejected=+%" PRIu64 " program=+%" PRIu64 "\n",
+              changed,
+              color_pixels[16 * (ccolor->stride / 4) + 16],
+              depth_pixels[16 * (cdepth->stride / 4) + 16],
+              chrome9_context(context)->submitted_triangles - submitted,
+              chrome9_context(context)->rejected_triangles - rejected,
+              chrome9_context(context)->submitted_program_batches -
+                 program_batches);
+
+out:
+   if (fs) context->delete_fs_state(context, fs);
+   if (vs) context->delete_vs_state(context, vs);
+   if (elements_handle)
+      context->delete_vertex_elements_state(context, elements_handle);
+   if (rasterizer_handle)
+      context->delete_rasterizer_state(context, rasterizer_handle);
+   if (dsa_handle)
+      context->delete_depth_stencil_alpha_state(context, dsa_handle);
+   if (blend_handle)
+      context->delete_blend_state(context, blend_handle);
+   return passed;
+}
+
+static bool
 smoke_d24_framebuffer_contract(struct pipe_screen *screen)
 {
    struct pipe_resource depth_templ = {
@@ -5612,6 +5783,9 @@ smoke_d24_framebuffer_contract(struct pipe_screen *screen)
    context->set_framebuffer_state(context, &fb);
    if (chrome9_context(context)->render_target != scratch ||
        !smoke_guard_pages_match(native))
+      goto out;
+   stage = 12;
+   if (!smoke_d24_combined_draw(screen, context, color, depth, &fb))
       goto out;
    passed = true;
 
