@@ -1176,7 +1176,7 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	struct chrome9_kms_state *kms;
 	int ret;
 
-	kms = devm_kzalloc(&cdev->pdev->dev, sizeof(*kms), GFP_KERNEL);
+	kms = drmm_kzalloc(drm, sizeof(*kms), GFP_KERNEL);
 	if (!kms)
 		return -ENOMEM;
 	mutex_init(&kms->lock);
