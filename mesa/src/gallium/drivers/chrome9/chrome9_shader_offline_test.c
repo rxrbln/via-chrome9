@@ -333,6 +333,123 @@ check_jellyfish_ps_ir(void)
 }
 
 static void
+check_buffer_ps_ir(void)
+{
+   static const uint32_t expected_alu[8][4] = {
+      { 0x0140b6d0, 0x502c06dd, 0x0070c005, 0x00000020 },
+      { 0x01c00530, 0xd000056d, 0x00100036, 0x000c0060 },
+      { 0x01c00530, 0xd020116d, 0x00120016, 0x000c00a0 },
+      { 0x0140b6d0, 0xd000216d, 0x00120216, 0x000000e0 },
+      { 0x0140b6d0, 0xd008016d, 0x00120316, 0x00000120 },
+      { 0x01c00530, 0x801c0053, 0x001204b6, 0x00040160 },
+      { 0x80810530, 0x30140924, 0x00f08205, 0x000001a0 },
+      { 0x00820530, 0x00206053, 0x00f20500, 0x00000820 },
+   };
+   static const uint32_t expected_control[12] = {
+      0x90040001, 0x91000000, 0x92000008, 0x93000000,
+      0x94000000, 0x95000000, 0x96000000, 0x97000000,
+      0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+   };
+   struct chrome9_ps_ir ir = { 0 };
+   struct chrome9_ps_program program;
+
+   ir.count = 8;
+
+   /* r0.xyz = T0.xyz * T0.www */
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[0].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 0, .writemask = 0x7,
+   };
+   ir.instruction[0].source[0] =
+      identity_source(CHROME9_PS_SOURCE_TEXTURE, 0, false);
+   ir.instruction[0].source[1] =
+      scalar_source(CHROME9_PS_SOURCE_TEXTURE, 0, CHROME9_PS_SWIZZLE_W);
+
+   /* r1.x = min(r0.y, r0.z) */
+   ir.instruction[1].op = CHROME9_PS_OPCODE_MIN;
+   ir.instruction[1].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 1, .writemask = 0x1,
+   };
+   ir.instruction[1].source[0] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 0, CHROME9_PS_SWIZZLE_Y);
+   ir.instruction[1].source[1] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 0, CHROME9_PS_SWIZZLE_Z);
+
+   /* r2.x = min(r0.x, r1.x) */
+   ir.instruction[2].op = CHROME9_PS_OPCODE_MIN;
+   ir.instruction[2].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 2, .writemask = 0x1,
+   };
+   ir.instruction[2].source[0] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 0, CHROME9_PS_SWIZZLE_X);
+   ir.instruction[2].source[1] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 1, CHROME9_PS_SWIZZLE_X);
+
+   /* r3.x = r2.x * r2.x */
+   ir.instruction[3].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[3].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 3, .writemask = 0x1,
+   };
+   ir.instruction[3].source[0] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 2, CHROME9_PS_SWIZZLE_X);
+   ir.instruction[3].source[1] = ir.instruction[3].source[0];
+
+   /* r4.x = r3.x * c0.x; r5.x = exp2(r4.x) */
+   ir.instruction[4].op = CHROME9_PS_OPCODE_MUL;
+   ir.instruction[4].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 4, .writemask = 0x1,
+   };
+   ir.instruction[4].source[0] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 3, CHROME9_PS_SWIZZLE_X);
+   ir.instruction[4].source[1] =
+      scalar_source(CHROME9_PS_SOURCE_CONSTANT, 0, CHROME9_PS_SWIZZLE_X);
+   ir.instruction[5].op = CHROME9_PS_OPCODE_EXP2;
+   ir.instruction[5].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 5, .writemask = 0x1,
+   };
+   ir.instruction[5].source[0] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 4, CHROME9_PS_SWIZZLE_X);
+
+   /* mix(c2,c1,r5) = c2 + r5*(c1-c2). */
+   ir.instruction[6].op = CHROME9_PS_OPCODE_SUB;
+   ir.instruction[6].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_TEMP, .id = 6, .writemask = 0xf,
+   };
+   ir.instruction[6].source[0] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 1, false);
+   ir.instruction[6].source[1] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 2, false);
+   ir.instruction[7].op = CHROME9_PS_OPCODE_MAD;
+   ir.instruction[7].destination = (struct chrome9_ps_destination) {
+      .file = CHROME9_PS_DESTINATION_COLOR, .writemask = 0xf,
+   };
+   ir.instruction[7].source[0] =
+      scalar_source(CHROME9_PS_SOURCE_TEMP, 5, CHROME9_PS_SWIZZLE_X);
+   ir.instruction[7].source[1] =
+      identity_source(CHROME9_PS_SOURCE_TEMP, 6, false);
+   ir.instruction[7].source[2] =
+      identity_source(CHROME9_PS_SOURCE_CONSTANT, 2, false);
+
+   assert(chrome9_compile_ps_ir(&ir, &program));
+   assert(program.alu_count == 8 && !program.tau_count);
+   assert(program.constant_mask == 0x7 && !program.varying_mask);
+   assert(program.texture_input_mask == 1 && !program.sampler_mask);
+   if (memcmp(program.alu, expected_alu, sizeof(expected_alu)))
+      for (unsigned i = 0; i < 8; i++)
+         fprintf(stderr, "%u: %08x %08x %08x %08x\n", i,
+                 program.alu[i][0], program.alu[i][1],
+                 program.alu[i][2], program.alu[i][3]);
+   assert(!memcmp(program.alu, expected_alu, sizeof(expected_alu)));
+   assert(!memcmp(program.control, expected_control,
+                  sizeof(expected_control)));
+
+   /* Direct inputs and temporary ids are generic resources, but the active
+    * temporary namespace must remain dense and bounded. */
+   ir.instruction[6].destination.id = 7;
+   assert(!chrome9_compile_ps_ir(&ir, &program));
+}
+
+static void
 check_ps_ir(void)
 {
    static const uint32_t add_c0_c1_oc0[4] = {
@@ -624,6 +741,7 @@ main(void)
    check_ps_encoder();
    check_fs();
    check_ps_ir();
+   check_buffer_ps_ir();
    check_jellyfish_ps_ir();
    check_vs();
    check_verifier();

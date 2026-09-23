@@ -170,6 +170,107 @@ chrome9_encode_ps_add(const struct chrome9_ps_source *source_a,
 }
 
 bool
+chrome9_encode_ps_sub(const struct chrome9_ps_source *minuend,
+                      const struct chrome9_ps_source *subtrahend,
+                      uint32_t record[4])
+{
+   /* B + A*(-1): source order retains the semantic minuend/subtrahend. */
+   static const uint32_t base[4] = {
+      0x80000530, 0x00140924, 0x00f00000, 0x00000020,
+   };
+
+   if (!record || !source_valid(minuend) || !source_valid(subtrahend))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, subtrahend);
+   encode_source_b(record, minuend);
+   return true;
+}
+
+bool
+chrome9_encode_ps_mad(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_c,
+                      const struct chrome9_ps_source *source_b,
+                      uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x00000000, 0x00000000, 0x00f00000, 0x00000020,
+   };
+
+   if (!record || !source_valid(source_a) || !source_valid(source_c) ||
+       !source_valid(source_b))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source_a);
+   encode_source_c(record, source_c);
+   encode_source_b(record, source_b);
+   return true;
+}
+
+bool
+chrome9_encode_ps_min(const struct chrome9_ps_source *source_a,
+                      const struct chrome9_ps_source *source_c,
+                      uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x01c00530, 0x30080053, 0x00f08005, 0x000c0820,
+   };
+
+   if (!record || !source_valid(source_a) || !source_valid(source_c))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source_a);
+   encode_source_c(record, source_c);
+   return true;
+}
+
+bool
+chrome9_encode_ps_exp2(const struct chrome9_ps_source *source,
+                       uint32_t record[4])
+{
+   static const uint32_t base[4] = {
+      0x01c00530, 0xb01c0053, 0x00f080b6, 0x00040820,
+   };
+
+   if (!record || !source_valid(source))
+      return false;
+   memcpy(record, base, sizeof(base));
+   encode_source_a(record, source);
+   return true;
+}
+
+static unsigned
+instruction_source_count(enum chrome9_ps_opcode op)
+{
+   switch (op) {
+   case CHROME9_PS_OPCODE_MOV:
+   case CHROME9_PS_OPCODE_EXP2:
+      return 1;
+   case CHROME9_PS_OPCODE_MUL:
+   case CHROME9_PS_OPCODE_ADD:
+   case CHROME9_PS_OPCODE_SUB:
+   case CHROME9_PS_OPCODE_MIN:
+      return 2;
+   case CHROME9_PS_OPCODE_MAD:
+      return 3;
+   default:
+      return 0;
+   }
+}
+
+static uint32_t
+resource_bucket(unsigned direct_inputs, unsigned temporaries)
+{
+   if (direct_inputs <= 4 && temporaries <= 3)
+      return 0x00018000;
+   if (direct_inputs <= 5 && temporaries <= 4)
+      return 0x00010000;
+   if (direct_inputs <= 8 && temporaries <= 6)
+      return 0x00008000;
+   return 0;
+}
+
+bool
 chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                       struct chrome9_ps_program *p)
 {
@@ -182,7 +283,7 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    uint8_t color_writemask = 0;
    uint16_t direct_texture_mask = 0;
 
-   if (!ir || !p || !ir->count || ir->count > 6 ||
+   if (!ir || !p || !ir->count || ir->count > CHROME9_PS_MAX_ALU ||
        (ir->texture_count != 0 && ir->texture_count != 2))
       return false;
    /* The first texture-bearing tranche deliberately accepts only the exact
@@ -207,21 +308,10 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    for (unsigned i = 0; i < ir->count; i++) {
       const struct chrome9_ps_instruction *instruction =
          &ir->instruction[i];
-      unsigned source_count;
+      unsigned source_count = instruction_source_count(instruction->op);
 
-      if (!destination_valid(&instruction->destination))
+      if (!destination_valid(&instruction->destination) || !source_count)
          return false;
-      switch (instruction->op) {
-      case CHROME9_PS_OPCODE_MOV:
-         source_count = 1;
-         break;
-      case CHROME9_PS_OPCODE_MUL:
-      case CHROME9_PS_OPCODE_ADD:
-         source_count = 2;
-         break;
-      default:
-         return false;
-      }
       for (unsigned s = 0; s < source_count; s++) {
          const struct chrome9_ps_source *source = &instruction->source[s];
          bool reads_register = false;
@@ -273,20 +363,20 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
    for (unsigned i = 0; i < ir->count; i++) {
       const struct chrome9_ps_instruction *instruction =
          &ir->instruction[i];
-      struct chrome9_ps_source sources[2] = { 0 };
+      struct chrome9_ps_source sources[3] = { 0 };
       uint8_t instruction_uses[12] = { 0 };
-      unsigned source_count = instruction->op == CHROME9_PS_OPCODE_MOV ? 1 : 2;
+      unsigned source_count = instruction_source_count(instruction->op);
+      uint8_t scalar_component = 0;
 
       for (unsigned s = 0; s < source_count; s++)
          sources[s] = instruction->source[s];
-      /* Vendor records use literal zero selectors for lanes excluded by the
-       * destination mask.  Canonicalize them here so identity and scalar IR
-       * swizzles produce the byte-exact native form. */
-      for (unsigned s = 0; s < source_count; s++) {
-         for (unsigned lane = 0; lane < 4; lane++) {
-            if (!(instruction->destination.writemask & (1u << lane)))
-               sources[s].swizzle[lane] = CHROME9_PS_SWIZZLE_ZERO;
-         }
+      if (instruction->op == CHROME9_PS_OPCODE_EXP2) {
+         unsigned lane = __builtin_ctz(instruction->destination.writemask);
+
+         if (instruction->destination.writemask &
+             (instruction->destination.writemask - 1))
+            return false;
+         scalar_component = sources[0].swizzle[lane];
       }
       for (unsigned s = 0; s < source_count; s++) {
          bool reads_register = false;
@@ -322,17 +412,55 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
       for (unsigned temp = 0; temp < 12; temp++)
          remaining_uses[temp] -= instruction_uses[temp];
 
-      if (instruction->op == CHROME9_PS_OPCODE_MOV) {
-         if (!chrome9_encode_ps_mov(&sources[0], p->alu[i]))
-            return false;
-      } else {
-         bool encoded = instruction->op == CHROME9_PS_OPCODE_MUL ?
-            chrome9_encode_ps_mul(&sources[0], &sources[1], p->alu[i]) :
-            chrome9_encode_ps_add(&sources[0], &sources[1], p->alu[i]);
-
-         if (!encoded)
-            return false;
+      /* Vendor vector records use literal zero selectors for lanes excluded
+       * by the destination mask.  Scalar transcendental inputs instead live
+       * in native A.W, with A.XYZ fixed to literal zero. */
+      for (unsigned s = 0; s < source_count; s++)
+         for (unsigned lane = 0; lane < 4; lane++)
+            if (!(instruction->destination.writemask & (1u << lane)))
+               sources[s].swizzle[lane] = CHROME9_PS_SWIZZLE_ZERO;
+      if (instruction->op == CHROME9_PS_OPCODE_EXP2) {
+         sources[0].swizzle[0] = CHROME9_PS_SWIZZLE_ZERO;
+         sources[0].swizzle[1] = CHROME9_PS_SWIZZLE_ZERO;
+         sources[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+         sources[0].swizzle[3] = scalar_component;
       }
+
+      bool encoded;
+
+      switch (instruction->op) {
+      case CHROME9_PS_OPCODE_MOV:
+         encoded = chrome9_encode_ps_mov(&sources[0], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_MUL:
+         encoded = chrome9_encode_ps_mul(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_ADD:
+         encoded = chrome9_encode_ps_add(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_SUB:
+         encoded = chrome9_encode_ps_sub(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_MAD:
+         encoded = chrome9_encode_ps_mad(&sources[0], &sources[1],
+                                         &sources[2], p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_MIN:
+         encoded = chrome9_encode_ps_min(&sources[0], &sources[1],
+                                         p->alu[i]);
+         break;
+      case CHROME9_PS_OPCODE_EXP2:
+         encoded = chrome9_encode_ps_exp2(&sources[0], p->alu[i]);
+         break;
+      default:
+         encoded = false;
+         break;
+      }
+      if (!encoded)
+         return false;
       encode_destination(p->alu[i], &instruction->destination);
       for (unsigned s = 0; s < source_count; s++) {
          if (sources[s].file == CHROME9_PS_SOURCE_INPUT)
@@ -360,12 +488,16 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                    0x92020006, 0x93000002, 0x95000000);
    } else {
       unsigned temp_count = __builtin_popcount(defined_temps);
-      uint32_t resource = temp_count <= 3 ? 0x00058000 :
-                          temp_count == 4 ? 0x00050000 : 0x00048000;
+      unsigned direct_input_count = direct_texture_mask ?
+         32 - __builtin_clz(direct_texture_mask) : 0;
+      uint32_t bucket;
 
-      if (direct_texture_mask)
+      if (defined_temps != ((1u << temp_count) - 1) ||
+          direct_input_count > 8)
          return false;
-      set_controls(p, 0x90000000 | resource, 0x91000000,
+      bucket = resource_bucket(direct_input_count, temp_count);
+      set_controls(p, 0x90040000 | bucket | direct_texture_mask,
+                   0x91000000,
                    0x92000000 | ir->count, 0x93000000, 0x95000000);
    }
    return true;

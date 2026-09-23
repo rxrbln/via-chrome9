@@ -83,12 +83,16 @@ enum chrome9_ps_opcode {
    CHROME9_PS_OPCODE_MOV,
    CHROME9_PS_OPCODE_MUL,
    CHROME9_PS_OPCODE_ADD,
+   CHROME9_PS_OPCODE_SUB,
+   CHROME9_PS_OPCODE_MAD,
+   CHROME9_PS_OPCODE_MIN,
+   CHROME9_PS_OPCODE_EXP2,
 };
 
 struct chrome9_ps_instruction {
    enum chrome9_ps_opcode op;
    struct chrome9_ps_destination destination;
-   struct chrome9_ps_source source[2];
+   struct chrome9_ps_source source[3];
 };
 
 struct chrome9_ps_texture_instruction {
@@ -172,6 +176,18 @@ bool chrome9_encode_ps_mul(const struct chrome9_ps_source *source_a,
 bool chrome9_encode_ps_add(const struct chrome9_ps_source *source_a,
                            const struct chrome9_ps_source *source_b,
                            uint32_t record[4]);
+bool chrome9_encode_ps_sub(const struct chrome9_ps_source *minuend,
+                           const struct chrome9_ps_source *subtrahend,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_mad(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_c,
+                           const struct chrome9_ps_source *source_b,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_min(const struct chrome9_ps_source *source_a,
+                           const struct chrome9_ps_source *source_c,
+                           uint32_t record[4]);
+bool chrome9_encode_ps_exp2(const struct chrome9_ps_source *source,
+                            uint32_t record[4]);
 bool chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
                            struct chrome9_ps_program *program);
 
