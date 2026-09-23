@@ -1704,11 +1704,15 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          context->create_vertex_elements_state(context, 1, elements);
       solid_vs = make_solid_vertex_shader(screen, context);
       solid_fs = make_constant_color_fs(screen, context, 0);
-      unsupported_solid_fs = make_constant_color_fs(screen, context, 16);
+      /* c1 is legal; keep negative controls beyond the advertised bank. */
+      unsupported_solid_fs = make_constant_color_fs(
+         screen, context,
+         DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4 * sizeof(float));
       for (unsigned i = 0; i < ARRAY_SIZE(product_fs); i++)
          product_fs[i] = make_constant_product_fs(screen, context, i, 16);
-      unsupported_product_fs =
-         make_constant_product_fs(screen, context, 0, 32);
+      unsupported_product_fs = make_constant_product_fs(
+         screen, context, 0,
+         DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4 * sizeof(float));
       scalar_blue_fs =
          make_scalar_blue_rgbx_fragment_shader(screen, context);
       literal_color_fs = make_literal_color_fragment_shader(screen, context);
