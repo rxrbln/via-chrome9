@@ -1871,6 +1871,29 @@ static int chrome9_fragment_fe_config_selftest(void)
 	return 0;
 }
 
+struct chrome9_fragment_rt_format {
+	u8 a52_format;
+	u8 cpp;
+};
+
+static const struct chrome9_fragment_rt_format chrome9_fragment_rt_formats[] = {
+	[DRM_CHROME9_DESTINATION_FORMAT_BGRX8888] = { 0x98, 4 },
+	[DRM_CHROME9_DESTINATION_FORMAT_BGRA8888] = { 0x99, 4 },
+	[DRM_CHROME9_DESTINATION_FORMAT_RGB565] = { 0x89, 2 },
+	[DRM_CHROME9_DESTINATION_FORMAT_L8A8] = { 0x15, 2 },
+	[DRM_CHROME9_DESTINATION_FORMAT_ARGB1555] = { 0x8a, 2 },
+};
+
+static const struct chrome9_fragment_rt_format *
+chrome9_fragment_rt_format(u32 format)
+{
+	if (format >= ARRAY_SIZE(chrome9_fragment_rt_formats) ||
+	    !chrome9_fragment_rt_formats[format].cpp)
+		return NULL;
+
+	return &chrome9_fragment_rt_formats[format];
+}
+
 static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	const struct chrome9_draw_request *request, struct chrome9_job *job,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
@@ -1906,6 +1929,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
 	};
 	const struct chrome9_fragment_program *program = request->fragment_program;
+	const struct chrome9_fragment_rt_format *rt_format =
+		chrome9_fragment_rt_format(request->destination_format);
 	struct chrome9_blend_words blend_words;
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 destination_state[16];
@@ -1935,7 +1960,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	unsigned int i;
 	int ret;
 
-	if (!base || !program || !request->fragment_vertices)
+	if (!base || !program || !request->fragment_vertices || !rt_format)
 		return -EINVAL;
 	ret = chrome9_fragment_fe_config(request->fragment_texture_count,
 		program->varying_count, program->varying_width, config);
@@ -1945,12 +1970,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
 	destination_state[2] = 0x52000000 |
-		(request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_L8A8 ?
-		 0x00150000 :
-		 request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_RGB565 ?
-		 0x00890000 :
-		 request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ?
-		 0x00990000 : 0x00980000) | (request->pitch >> 5);
+		(rt_format->a52_format << 16) | (request->pitch >> 5);
 	if (blend) {
 		chrome9_lower_blend(&request->blend, &blend_words);
 		for (i = 0; i < 8; i++)
@@ -7140,6 +7160,8 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 					struct drm_file *file)
 {
 	struct drm_chrome9_draw_fragment_program *args = data;
+	const struct chrome9_fragment_rt_format *rt_format =
+		chrome9_fragment_rt_format(args->destination_format);
 	struct drm_chrome9_fragment_instruction *instructions = NULL;
 	struct drm_chrome9_fragment_texture_state *textures = NULL;
 	struct drm_chrome9_fragment_vertex *vertices = NULL;
@@ -7189,13 +7211,9 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 	    (!!args->textures_ptr != !!args->texture_count) ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
-	    args->destination_format > DRM_CHROME9_DESTINATION_FORMAT_L8A8 ||
-	    args->destination_pitch != ALIGN(args->width *
-		(args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_RGB565 ||
-		 args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_L8A8 ?
-		 sizeof(u16) : sizeof(u32)), 32) ||
-	    ((args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_RGB565 ||
-	      args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_L8A8) &&
+	    !rt_format ||
+	    args->destination_pitch != ALIGN(args->width * rt_format->cpp, 32) ||
+	    (rt_format->cpp == 2 &&
 	     (depth || blend)) ||
 	    (!blend && memchr_inv(&args->blend, 0, sizeof(args->blend))) ||
 	    (depth && (!args->depth_handle ||
