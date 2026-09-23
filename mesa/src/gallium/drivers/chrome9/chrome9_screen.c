@@ -266,6 +266,7 @@ chrome9_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
 }
 
 static const struct nir_shader_compiler_options chrome9_nir_options = {
+   .lower_fceil = true,
    .lower_fdiv = true,
    .lower_ffloor = true,
    .lower_flrp32 = true,
