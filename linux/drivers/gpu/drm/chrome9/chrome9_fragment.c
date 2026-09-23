@@ -1033,7 +1033,8 @@ int chrome9_fragment_selftest(void)
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301006f0 || program->varying_count != 1 ||
 	    program->varying_logical[0] || program->varying_width[0] != 3 ||
-	    program->alu[0][2] != 0x00f2c005 ||
+	    program->alu[0][1] != 0x302c0000 ||
+	    program->alu[0][2] != 0x00f20005 ||
 	    program->controls[0] != 0x90018000 ||
 	    program->controls[1] != 0x91000001 ||
 	    program->controls[2] != 0x92010001 ||
