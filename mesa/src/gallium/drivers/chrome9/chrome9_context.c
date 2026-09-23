@@ -2959,8 +2959,17 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       texture->destination.id = temp;
       texture->destination.writemask = 0xf;
       texture->source[0] = coordinate;
-      texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_W;
-      texture->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_W;
+      if (coordinate.file == CHROME9_PS_SOURCE_TEMP) {
+         /* 2D TEX reads XY.  An XY-only computed TEMP must not appear to
+          * read undefined Z/W lanes during kernel validation. */
+         texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+         texture->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ONE;
+      } else {
+         /* Direct varyings retain their native four-lane coordinate map;
+          * the kernel's direct-input gate does not admit literals here. */
+         texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_W;
+         texture->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_W;
+      }
       builder->value[value].complete = true;
       *source = builder->value[value].source;
       return true;
