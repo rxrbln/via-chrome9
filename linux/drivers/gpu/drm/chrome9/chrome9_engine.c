@@ -1915,7 +1915,7 @@ static int chrome9_fragment_fe_config_selftest(void)
 			cases[4].width, config) ||
 	    config[0] != 0x00000011 || config[2] != cases[4].a08)
 		return -EINVAL;
-	if (chrome9_fragment_fe_config(4, cases[5].count, BIT(0),
+	if (chrome9_fragment_fe_config(4, cases[5].count, BIT(3),
 			cases[5].width, config) != -EOPNOTSUPP)
 		return -EINVAL;
 	return 0;
