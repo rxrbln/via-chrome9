@@ -1023,6 +1023,33 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
 }
 
 static bool
+chrome9_fragment_swizzle(enum chrome9_ps_swizzle swizzle, uint8_t *result)
+{
+   switch (swizzle) {
+   case CHROME9_PS_SWIZZLE_X:
+      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+      return true;
+   case CHROME9_PS_SWIZZLE_Y:
+      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_Y;
+      return true;
+   case CHROME9_PS_SWIZZLE_Z:
+      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_Z;
+      return true;
+   case CHROME9_PS_SWIZZLE_W:
+      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_W;
+      return true;
+   case CHROME9_PS_SWIZZLE_ONE:
+      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+      return true;
+   case CHROME9_PS_SWIZZLE_ZERO:
+      *result = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
 chrome9_fragment_source(const struct chrome9_ps_source *source,
                         struct drm_chrome9_fragment_source *result)
 {
@@ -1047,12 +1074,68 @@ chrome9_fragment_source(const struct chrome9_ps_source *source,
    result->index = source->id;
    result->modifier = source->modifier ? DRM_CHROME9_FRAGMENT_MOD_NEG :
                                         DRM_CHROME9_FRAGMENT_MOD_NONE;
-   for (unsigned c = 0; c < 4; c++) {
-      if (source->swizzle[c] > CHROME9_PS_SWIZZLE_ZERO)
+   for (unsigned c = 0; c < 4; c++)
+      if (!chrome9_fragment_swizzle(source->swizzle[c],
+                                    &result->swizzle[c]))
          return false;
-      result->swizzle[c] = source->swizzle[c];
-   }
    return true;
+}
+
+static bool
+chrome9_fragment_opcode(enum chrome9_ps_opcode op, uint8_t *result)
+{
+   switch (op) {
+   case CHROME9_PS_OPCODE_MOV:
+      *result = DRM_CHROME9_FRAGMENT_OP_MOV;
+      return true;
+   case CHROME9_PS_OPCODE_MUL:
+      *result = DRM_CHROME9_FRAGMENT_OP_MUL;
+      return true;
+   case CHROME9_PS_OPCODE_ADD:
+      *result = DRM_CHROME9_FRAGMENT_OP_ADD;
+      return true;
+   case CHROME9_PS_OPCODE_SUB:
+      *result = DRM_CHROME9_FRAGMENT_OP_SUB;
+      return true;
+   case CHROME9_PS_OPCODE_MAD:
+      *result = DRM_CHROME9_FRAGMENT_OP_MAD;
+      return true;
+   case CHROME9_PS_OPCODE_MIN:
+      *result = DRM_CHROME9_FRAGMENT_OP_MIN;
+      return true;
+   case CHROME9_PS_OPCODE_MAX:
+      *result = DRM_CHROME9_FRAGMENT_OP_MAX;
+      return true;
+   case CHROME9_PS_OPCODE_DP3:
+      *result = DRM_CHROME9_FRAGMENT_OP_DP3;
+      return true;
+   case CHROME9_PS_OPCODE_DP4:
+      *result = DRM_CHROME9_FRAGMENT_OP_DP4;
+      return true;
+   case CHROME9_PS_OPCODE_EXP2:
+      *result = DRM_CHROME9_FRAGMENT_OP_EXP2;
+      return true;
+   case CHROME9_PS_OPCODE_LOG2:
+      *result = DRM_CHROME9_FRAGMENT_OP_LOG2;
+      return true;
+   case CHROME9_PS_OPCODE_RCP:
+      *result = DRM_CHROME9_FRAGMENT_OP_RCP;
+      return true;
+   case CHROME9_PS_OPCODE_RSQ:
+      *result = DRM_CHROME9_FRAGMENT_OP_RSQ;
+      return true;
+   case CHROME9_PS_OPCODE_ABS:
+      *result = DRM_CHROME9_FRAGMENT_OP_ABS;
+      return true;
+   case CHROME9_PS_OPCODE_CMP:
+      *result = DRM_CHROME9_FRAGMENT_OP_CMP;
+      return true;
+   case CHROME9_PS_OPCODE_FRC:
+      *result = DRM_CHROME9_FRAGMENT_OP_FRC;
+      return true;
+   default:
+      return false;
+   }
 }
 
 static unsigned
@@ -1164,13 +1247,19 @@ chrome9_build_fragment_instructions(
          &instructions[n++];
       unsigned source_count = chrome9_fragment_source_count(source->op);
 
-      if (!source_count || source->op > CHROME9_PS_OPCODE_FRC ||
-          n > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+      if (!source_count || n > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS ||
+          !chrome9_fragment_opcode(source->op, &instruction->op))
          return false;
-      instruction->op = source->op;
-      instruction->dst.file =
-         source->destination.file == CHROME9_PS_DESTINATION_TEMP ?
-         DRM_CHROME9_FRAGMENT_DEST_TEMP : DRM_CHROME9_FRAGMENT_DEST_COLOR;
+      switch (source->destination.file) {
+      case CHROME9_PS_DESTINATION_TEMP:
+         instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
+         break;
+      case CHROME9_PS_DESTINATION_COLOR:
+         instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
+         break;
+      default:
+         return false;
+      }
       instruction->dst.index = source->destination.id;
       instruction->dst.writemask = source->destination.writemask;
       instruction->dst.modifier = source->destination.saturate ?
@@ -1824,7 +1913,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    rhw_run_batch = perspective_batch && !rhw_chain_batch &&
       ctx->draw_triangle_d16_rhw_run && !program_batch;
    if (ctx->fs->fragment_program == CHROME9_FS_COMPILED_ALU &&
-       !program_batch) {
+       !program_batch && !crender->generic_program) {
       ctx->rejected_triangles++;
       return;
    }
