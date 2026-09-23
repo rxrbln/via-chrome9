@@ -264,10 +264,61 @@ check_depth_view_swizzles(void)
    return true;
 }
 
+static bool
+check_depth_kill_swizzles(void)
+{
+   struct drm_chrome9_fragment_instruction instructions[4] = {
+      {
+         .op = DRM_CHROME9_FRAGMENT_OP_TEX,
+         .sampler = 0,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 3, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_VARYING, 0, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      }, {
+         .op = DRM_CHROME9_FRAGMENT_OP_SUB,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 4, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_TEMP, 3, { 3, 3, 3, 3 }, 0, 0 },
+            { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0, { 0, 0, 0, 0 }, 0, 0 },
+         },
+      }, {
+         .op = DRM_CHROME9_FRAGMENT_OP_KILL,
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_TEMP, 4, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      }, {
+         .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 1, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      },
+   };
+   uint8_t view[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+
+   view[0][0] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[0][1] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[0][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[0][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+   CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 4, 1, view));
+   for (unsigned lane = 0; lane < 4; lane++) {
+      CHECK(instructions[1].src[0].swizzle[lane] ==
+            DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
+      CHECK(instructions[2].src[0].swizzle[lane] == lane);
+   }
+
+   /* KILL cannot directly apply a depth swizzle to its identity TEMP read. */
+   instructions[1] = instructions[2];
+   instructions[1].src[0].index = 3;
+   CHECK(!chrome9_fragment_apply_depth_swizzles(instructions, 2, 1, view));
+   return true;
+}
+
 int
 main(void)
 {
    return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
             check_computed_texture_order() && check_kill_conversion() &&
-            check_depth_view_swizzles());
+            check_depth_view_swizzles() && check_depth_kill_swizzles());
 }

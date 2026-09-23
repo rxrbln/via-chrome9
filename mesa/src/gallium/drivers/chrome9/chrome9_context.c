@@ -3134,15 +3134,79 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
 }
 
 static bool
+chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
+                                 nir_def *condition)
+{
+   static const uint32_t half[4] = { 0x3f000000 };
+   nir_scalar predicate, alpha, reference;
+   nir_alu_instr *compare;
+   nir_tex_instr *texture;
+   struct chrome9_ps_source sampled, threshold;
+   struct chrome9_ps_instruction *subtract, *kill;
+   unsigned temp;
+
+   if (!condition || condition->num_components != 1)
+      return false;
+   predicate = nir_scalar_resolved(condition, 0);
+   if (nir_def_instr(predicate.def)->type != nir_instr_type_alu)
+      return false;
+   compare = nir_instr_as_alu(nir_def_instr(predicate.def));
+   if (predicate.comp || compare->op != nir_op_flt ||
+       compare->src[0].src.ssa->bit_size != 32 ||
+       compare->src[1].src.ssa->bit_size != 32)
+      return false;
+   alpha = nir_scalar_resolved(compare->src[0].src.ssa,
+                               compare->src[0].swizzle[0]);
+   reference = nir_scalar_resolved(compare->src[1].src.ssa,
+                                   compare->src[1].swizzle[0]);
+   if (alpha.comp != 3 ||
+       nir_def_instr(alpha.def)->type != nir_instr_type_tex ||
+       !nir_scalar_is_const(reference) ||
+       nir_scalar_as_uint(reference) != half[0])
+      return false;
+   texture = nir_instr_as_tex(nir_def_instr(alpha.def));
+   if (texture->op != nir_texop_tex ||
+       texture->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       texture->texture_index != 0 || texture->sampler_index != 0 ||
+       texture->is_array || texture->is_shadow ||
+       alpha.def->num_components != 4 || alpha.def->bit_size != 32 ||
+       builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
+       !chrome9_ps_lower_def(builder, alpha.def, &sampled) ||
+       !chrome9_ps_immediate(builder, half, 1, &threshold))
+      return false;
+   for (unsigned c = 0; c < 4; c++) {
+      sampled.swizzle[c] = CHROME9_PS_SWIZZLE_W;
+      threshold.swizzle[c] = CHROME9_PS_SWIZZLE_X;
+   }
+   temp = builder->next_temp++;
+   subtract = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_SUB);
+   kill = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_KILL);
+   if (!subtract || !kill)
+      return false;
+   subtract->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   subtract->destination.id = temp;
+   subtract->destination.writemask = 0xf;
+   subtract->source[0] = sampled;
+   subtract->source[1] = threshold;
+   kill->source[0].file = CHROME9_PS_SOURCE_TEMP;
+   kill->source[0].id = temp;
+   for (unsigned c = 0; c < 4; c++)
+      kill->source[0].swizzle[c] = c;
+   return true;
+}
+
+static bool
 chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        struct chrome9_ps_program *program,
-                       uint32_t *uniform_mask, bool *lowered)
+                       uint32_t *uniform_mask, bool allow_kill,
+                       bool *lowered)
 {
    struct chrome9_ps_nir_builder builder = { 0 };
    struct chrome9_ps_instruction *terminal;
    struct chrome9_ps_source operands[3] = { 0 };
    enum chrome9_ps_opcode op;
    unsigned source_count = 0;
+   unsigned kill_count = 0;
    nir_block *block;
    nir_def *result = NULL;
 
@@ -3164,6 +3228,14 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       if (instr->type != nir_instr_type_intrinsic)
          return false;
       intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_terminate_if) {
+         /* Native kill is not exposed until guarded color/depth suppression
+          * has been proven on silicon.  The opt-in enables that oracle. */
+         if (!allow_kill || result || kill_count++ ||
+             !chrome9_ps_lower_alpha_terminate(&builder, intr->src[0].ssa))
+            return false;
+         continue;
+      }
       if (intr->intrinsic == nir_intrinsic_store_output) {
          struct nir_io_semantics semantics =
             nir_intrinsic_io_semantics(intr);
@@ -3380,7 +3452,8 @@ chrome9_fs_key_from_nir(nir_shader *nir, struct chrome9_fs_key *key)
 }
 
 static bool
-chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
+chrome9_compile_native_fs(struct chrome9_context *ctx,
+                          struct chrome9_shader *shader, nir_shader *nir)
 {
    struct chrome9_fs_key key;
    enum chrome9_shader_verify_error error;
@@ -3390,6 +3463,9 @@ chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
    from_nir = chrome9_compile_ps_nir(nir, &shader->semantic_fs_ir,
                                      &shader->native_fs,
                                      &shader->semantic_uniform_mask,
+                                     ctx->fragment_kill &&
+                                     debug_get_bool_option(
+                                        "CHROME9_EXPERIMENTAL_TEXKILL", false),
                                      &lowered);
    shader->semantic_fs_valid = lowered;
    if (lowered) {
@@ -3563,7 +3639,7 @@ chrome9_compile_fs_nir(struct chrome9_context *ctx,
    shader->flat_generic = shader->fragment_program ==
       CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
    shader->native_fs_valid = straight_line &&
-      chrome9_compile_native_fs(shader, nir);
+      chrome9_compile_native_fs(ctx, shader, nir);
    if (shader->semantic_fs_valid && ctx->draw_fragment_program &&
        !shader->semantic_input_mask &&
        shader->fragment_program == CHROME9_FS_UNSUPPORTED)
@@ -3741,7 +3817,8 @@ chrome9_create_fs_state(struct pipe_context *pipe,
    }
    if (!shader->nir && shader->supported && !shader->native_fs_valid)
       shader->native_fs_valid = chrome9_compile_native_fs(
-         shader, state->type == PIPE_SHADER_IR_NIR ? state->ir.nir : NULL);
+         ctx, shader, state->type == PIPE_SHADER_IR_NIR ?
+                      state->ir.nir : NULL);
    if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false) &&
        shader->supported)
       fprintf(stderr, "chrome9: native FS valid=%u nir=%u alu=%u tau=%u\n",
@@ -4488,6 +4565,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);
    ctx->draw_fragment_program =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
+   ctx->fragment_kill =
+      !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_KILL);
    ctx->fragment_add =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_ADD);
    ctx->draw_textured_triangle =

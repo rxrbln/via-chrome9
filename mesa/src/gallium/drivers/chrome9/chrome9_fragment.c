@@ -287,6 +287,7 @@ chrome9_fragment_apply_depth_swizzles(
       case DRM_CHROME9_FRAGMENT_OP_RSQ:
       case DRM_CHROME9_FRAGMENT_OP_ABS:
       case DRM_CHROME9_FRAGMENT_OP_FRC:
+      case DRM_CHROME9_FRAGMENT_OP_KILL:
          live_sources = 1;
          break;
       case DRM_CHROME9_FRAGMENT_OP_MUL:
@@ -309,10 +310,23 @@ chrome9_fragment_apply_depth_swizzles(
          struct drm_chrome9_fragment_source *input =
             &instruction->src[source];
 
-         if (input->file != DRM_CHROME9_FRAGMENT_FILE_TEMP)
+         if (input->file != DRM_CHROME9_FRAGMENT_FILE_TEMP) {
+            if (instruction->op == DRM_CHROME9_FRAGMENT_OP_KILL)
+               return false;
             continue;
+         }
          if (input->index >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
             return false;
+         if (instruction->op == DRM_CHROME9_FRAGMENT_OP_KILL) {
+            /* KILL must read its TEMP as XYZW.  A depth-view swizzle has
+             * to be consumed by an earlier ALU result, not by KILL itself.
+             */
+            for (unsigned lane = 0; lane < 4; lane++)
+               if (input->swizzle[lane] != lane ||
+                   mapped[input->index][lane] != lane)
+                  return false;
+            continue;
+         }
          for (unsigned lane = 0; lane < 4; lane++) {
             if (input->swizzle[lane] < 4)
                input->swizzle[lane] =
