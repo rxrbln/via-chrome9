@@ -1854,7 +1854,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		common_count = ARRAY_SIZE(common);
 	}
 
-	/* D0 position, normalized D1/D2 colors, then dense float4 T0..T7. */
+	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	raster_count = chrome9_fragment_raster_state(program->varying_count,
 		program->varying_width, vertex_count, raster);
 	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
