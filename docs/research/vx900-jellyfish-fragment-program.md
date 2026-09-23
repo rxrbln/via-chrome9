@@ -183,3 +183,95 @@ values, D16, exterior/BO guards, and known-good draws before and after.  A
 direct-coordinate two-texture pass is not enough: success specifically
 requires the bridge/TAU1 dependency above.  No target submission was made
 while recovering this object.
+
+## Current Mesa 19-record comparison
+
+The current target dump at
+`/root/tmp/chrome9-live/fract-select-dag/jellyfish-semantic.log` reports 19
+ordered semantic records.  Two are TEX, so this is **17 semantic ALUs plus
+two TEX**, not 19 ALUs plus two TEX.  The six-ALU difference from the minimal
+faithful program above is entirely explicit vector assembly:
+
+- two MOVs build packed ambient `(VAR1.w,VAR2.x,VAR2.y)` before its ADD;
+- two MOVs build the computed XY coordinate before TEX1; and
+- two partial MOVs plus a final MOV assemble the split RGB/alpha result,
+  replacing the minimal program's two direct partial color writes.
+
+All partial definitions are closed before use.  TEMP3 receives disjoint X and
+YZ writes before an XYZ ADD; TEMP8 receives disjoint X and Y writes and its
+TEX source is normalized to `XY01`; TEMP14 receives disjoint XYZ and W writes
+before the final full color MOV.  No source selects an undefined lane.  The
+constant bank is also legal: c0 is the time uniform and c29/c30/c31 are
+`-0.3`, `0.025`, and `0.05`; no instruction names three distinct constants.
+
+The kernel's destination-before-source-release allocator compacts the 15
+virtual TEMP names to four physical registers.  In semantic order the map is:
+
+```text
+t3=p0, t2=p1, t5=p0, t4=p2, t7=p0, t6=p3, t8=p0,
+t9=p2, t1=p0, t10=p1, t0=p2, t12=p0, t13=p1,
+t11=p3, t14=p0
+```
+
+Re-expressing the exact current operation order with those four physical
+names and passing it through the production Linux compiler/finalizer produces
+the following oracle:
+
+```text
+ALU
+01c00530 d01c0053 0010c176 000d0020
+01c00530 d01c0053 0060c2a0 000d0020
+02c10550 50140924 00700005 00000060
+0140b6d0 d00af16d 00108016 00000020
+000016d0 d0140924 0010c056 000000a0
+0140b6d0 d00ae16d 00108016 00000020
+000016d0 d0140924 0012c076 000000e0
+01c00530 d01c0053 00100216 000d0020
+01c00530 d01c0053 002003a2 000d0020
+01c00530 101c0053 00f00004 000d04e0  # bridge p0.xyxy -> coord3
+00020550 50140924 00700105 00000020
+0140b6d0 50001055 00700005 000000a0
+00ad16d0 d0140924 00100176 00000020
+0140b6d0 d02c256d 0010c256 00000060
+020116d0 d0140924 00100016 000000e0
+01c00530 501c0053 00720205 000d0020
+01c00530 801c0053 008203b6 000d0020
+01c00530 301c0053 00f20005 000d0820
+
+TAU     311231b1 301101f0
+A90..   90050007 91000009 92020012 93000003
+         94000000 95000600 96000000 97000000
+         98000000 99000000 9a000000
+```
+
+This independently proves the allocator/resource result: physical high-water
+four selects bucket `0x10000`, giving A90 `90050007`; A91 still names direct
+coordinate zero and computed coordinate three.  The current order is
+
+```text
+ALU 0..9 -> TAU1 -> ALU 10 -> TAU0 -> ALU 11..17
+```
+
+so A95 bits nine and ten are `0x600`, while A93 bits zero and one remain
+`0x3`.  Sampler order is intentionally reversed from the minimal oracle:
+computed sampler 1 is `311231b1`, followed by direct sampler 0
+`301101f0`.  This is valid and follows the current recursive NIR lowering.
+
+There is one deliberate byte differential in the bridge's unused lanes.
+PS 2.0 cannot express literal ZERO/ONE selectors in an ordinary source token,
+so the proprietary oracle uses `p0.xyxy`.  Current Mesa submits `p0.xy01` to
+satisfy defined-lane validation.  Applying the documented native source
+packing changes only bridge record nine to:
+
+```text
+01c00530 c01c0053 00f00006 000d04e0  # current kernel XY01 form
+```
+
+Only X/Y feed the 2-D TAU.  The XY01 normalization has separate live silicon
+coverage from the computed-coordinate effect2d path.  Therefore the current
+jellyfish semantic stream has no static ISA, defined-lane, allocation,
+resource-bucket, or phase-map mismatch against production.  Its one-frame
+submission success is consistent with this result.  glmark2 reporting
+`Validation: Unknown` is not itself a pixel failure and should not be treated
+as evidence that this shader object is wrong; a deterministic guarded
+two-texture oracle is still needed for numerical scene validation.
