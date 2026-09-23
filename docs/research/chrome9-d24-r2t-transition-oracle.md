@@ -4,7 +4,33 @@ This note defines the smallest generic writer-to-reader contract needed by
 glmark2 `shadow` and `refract`.  It deliberately separates depth storage,
 producer retirement, consumer texture invalidation, and CPU/DMA ownership.
 Those are four different mechanisms.  The state words are statically exact;
-the complete D24 writer-to-sampler sequence remains a silicon gate.
+the complete D24 writer-to-sampler sequence is now live-qualified for a
+single guarded transition and an independent active Z16 destination.  The
+long alternating cache-stress sequence remains a separate promotion gate.
+
+## Live Gallium closure
+
+On 2026-09-23 the bounded Gallium sequence passed on VX900 with Mesa Chrome9
+nested commit `1d42d47` (parent Mesa commit `68bf5c2`):
+
+```text
+combined color + D24 draw
+depth-only D24 draw through private scratch color
+D24 render-to-texture producer/consumer
+D24 sampled while an unrelated Z16 target is active
+```
+
+The last draw returned center color `ff800000` and Z16=`8000`.  Source,
+destination, and scratch guard regions were intact; submission/rejection/batch
+counters matched; a known-good EGL draw afterward passed; and dmesg gained no
+engine error.  This proves that X8Z24 sampling state is independent of the
+current Z16 destination state and that the producer/consumer transition does
+not accidentally reuse the sampled D24 resource as the active depth target.
+It also closes the ordinary combined and depth-only Gallium attachment paths.
+
+This result does not replace the 64-iteration LOW/HIGH cache-stress oracle or
+the mixed D24-plus-color-sampler test.  Those remain useful to catch delayed
+stale reuse and state leakage across multiple texture units.
 
 ## Required resource and state
 
@@ -224,20 +250,13 @@ ownership pieces which earlier versions of this note listed as gaps:
 6. Target, depth, and all sampled objects remain in the same synchronous job
    and quarantine set through exact retirement.
 
-The remaining integration is Mesa resource/state work plus the live silicon
-gate:
-
-1. advertise and allocate guarded `PIPE_FORMAT_X8Z24_UNORM` under the bind and
-   layout restrictions above;
-2. implement D24 clear/transfer packing with depth in bits `[31:8]`;
-3. populate `DRM_CHROME9_FRAGMENT_DEPTH_X8Z24` and
-   `DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24` from generic framebuffer/sampler state;
-4. lower a public depth-only framebuffer to the private mask-zero scratch
-   target without changing its Gallium attachment list;
-5. accept and validate a zero-color framebuffer throughout the draw-state
-   path;
-6. run the decoder, producer/consumer, cache-transition, alias, and guard
-   oracles before exposing the format.
+Mesa now advertises and allocates guarded `PIPE_FORMAT_X8Z24_UNORM`, packs D24
+clear/transfer values in bits `[31:8]`, selects the semantic depth and texture
+formats, lowers depth-only draws through the private mask-zero scratch target,
+and has passed the guarded producer/consumer plus independent-Z16 live gate.
+Remaining qualification is the long alternating cache sequence, deliberate
+alias rejection, and mixed multi-sampler transition closure before broad
+format exposure.
 
 Mip fields in the semantic UAPI are a separate color-texture issue.  Until
 the H3 address table and sampler LOD state are emitted and validated, accept
