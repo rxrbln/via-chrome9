@@ -465,7 +465,6 @@ static int chrome9_fragment_allocate(struct chrome9_fragment_state *state,
 	for (i = 0; i < instruction_count; i++) {
 		const struct drm_chrome9_fragment_instruction *instruction =
 			&state->instructions[i];
-		const struct drm_chrome9_fragment_source *coordinate;
 		unsigned int source;
 		u8 slot;
 
@@ -482,7 +481,6 @@ static int chrome9_fragment_allocate(struct chrome9_fragment_state *state,
 						instruction->src[source].index] = i;
 			continue;
 		}
-		coordinate = &instruction->src[0];
 		slot = state->coordinate_for_instruction[i];
 		state->coordinate_last_tau[slot] = i;
 	}
@@ -954,11 +952,20 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 				(u32)coordinate->swizzle[2] << 6 |
 				(u32)coordinate->swizzle[3] << 4;
 
+			/* A01 needs one direct stage-zero varying.  Each computed TEX
+			 * carries its own coordinate slot in TAU; keep the first computed
+			 * slot only to suppress the ALU-only T0 fallback in FE setup. */
 			if (!instruction->sampler) {
-				if (program->stage0_coordinate != 0xff &&
-				    program->stage0_coordinate != coordinate_id)
-					return -EOPNOTSUPP;
-				program->stage0_coordinate = coordinate_id;
+				if (computed) {
+					if (program->stage0_coordinate == 0xff)
+						program->stage0_coordinate = coordinate_id;
+				} else {
+					if (program->stage0_coordinate <
+					    program->varying_count &&
+					    program->stage0_coordinate != coordinate_id)
+						return -EOPNOTSUPP;
+					program->stage0_coordinate = coordinate_id;
+				}
 			}
 
 			if (computed) {
@@ -1744,6 +1751,76 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction repeated_computed[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0x3, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { 0, 1, 5, 5 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 1,
+				  { 0, 1, 5, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 5, 4 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 2, 0x3, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { 0, 1, 5, 5 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 2,
+				  { 0, 1, 5, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 3, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 2,
+				  { 0, 1, 5, 4 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 3,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction conflicting_direct[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 0, 1 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
 	static const struct drm_chrome9_fragment_instruction partial[] = {
 		{
 			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
@@ -2072,6 +2149,24 @@ int chrome9_fragment_selftest(void)
 	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
 	    memcmp(program->controls, expected_controls,
 		   sizeof(expected_controls))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(repeated_computed,
+		ARRAY_SIZE(repeated_computed), constants, 3, 1, 0, program);
+	if (ret || program->tau_count != 2 || program->alu_count != 5 ||
+	    program->stage0_coordinate != 0 ||
+	    (program->tau[0] >> 12 & 7) != 0 ||
+	    (program->tau[1] >> 12 & 7) != 1 ||
+	    program->tau_coordinate_mask != (BIT(0) | BIT(1)) ||
+	    program->controls[1] != 0x91000003 ||
+	    program->controls[2] != 0x92020005) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (chrome9_fragment_compile(conflicting_direct,
+		ARRAY_SIZE(conflicting_direct), constants, 0, 1, 2,
+		program) != -EOPNOTSUPP) {
 		ret = -EINVAL;
 		goto out;
 	}
