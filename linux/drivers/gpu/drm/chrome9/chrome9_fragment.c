@@ -32,6 +32,7 @@ struct chrome9_fragment_state {
 	u32 alu_varying_mask;
 	u32 coordinate_mask;
 	u32 physical_high_water;
+	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_varying[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_instruction[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
 	u8 coordinate_last_tau[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
@@ -107,7 +108,6 @@ static int chrome9_fragment_validate_source(
 	case DRM_CHROME9_FRAGMENT_FILE_VARYING:
 		if (source->index >= DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
 			return -EINVAL;
-		state->varying_mask |= BIT(source->index);
 		break;
 	case DRM_CHROME9_FRAGMENT_FILE_CONSTANT:
 		if (source->index >= DRM_CHROME9_FRAGMENT_MAX_CONSTANTS)
@@ -116,6 +116,41 @@ static int chrome9_fragment_validate_source(
 		break;
 	}
 	return 0;
+}
+
+static void chrome9_fragment_note_varying(struct chrome9_fragment_state *state,
+	const struct drm_chrome9_fragment_source *source, u8 component_mask)
+{
+	u8 width = 1;
+	unsigned int component;
+
+	if (source->file != DRM_CHROME9_FRAGMENT_FILE_VARYING)
+		return;
+	for (component = 0; component < ARRAY_SIZE(source->swizzle); component++)
+		if ((component_mask & BIT(component)) &&
+		    source->swizzle[component] < DRM_CHROME9_FRAGMENT_SWIZZLE_ONE)
+			width = max(width, source->swizzle[component] + 1);
+	state->varying_mask |= BIT(source->index);
+	state->varying_width[source->index] =
+		max(state->varying_width[source->index], width);
+}
+
+static u8 chrome9_fragment_alu_component_mask(
+	const struct drm_chrome9_fragment_instruction *instruction)
+{
+	switch (instruction->op) {
+	case DRM_CHROME9_FRAGMENT_OP_DP3:
+		return 0x7;
+	case DRM_CHROME9_FRAGMENT_OP_DP4:
+		return 0xf;
+	case DRM_CHROME9_FRAGMENT_OP_EXP2:
+	case DRM_CHROME9_FRAGMENT_OP_LOG2:
+	case DRM_CHROME9_FRAGMENT_OP_RCP:
+	case DRM_CHROME9_FRAGMENT_OP_RSQ:
+		return 0x1;
+	default:
+		return instruction->dst.writemask;
+	}
 }
 
 static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
@@ -192,6 +227,11 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 		for (; source < ARRAY_SIZE(instruction->src); source++)
 			if (!chrome9_fragment_source_zero(&instruction->src[source]))
 				return -EINVAL;
+		if (instruction->op != DRM_CHROME9_FRAGMENT_OP_TEX)
+			for (source = 0; source < source_count; source++)
+				chrome9_fragment_note_varying(state,
+					&instruction->src[source],
+					chrome9_fragment_alu_component_mask(instruction));
 		if (instruction->dst.file == DRM_CHROME9_FRAGMENT_DEST_TEMP)
 			state->defined_mask[instruction->dst.index] |=
 				instruction->dst.writemask;
@@ -209,6 +249,7 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 					if (coordinate->swizzle[source] >
 					    DRM_CHROME9_FRAGMENT_SWIZZLE_W)
 						return -EINVAL;
+				chrome9_fragment_note_varying(state, coordinate, 0x3);
 			} else {
 				bridge_count++;
 			}
@@ -726,7 +767,15 @@ int chrome9_fragment_compile(
 		return ret;
 	program->constant_count = constant_count;
 	program->texture_count = texture_count;
-	program->varying_count = varying_count;
+	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; i++) {
+		u32 packed = program->varying_count;
+
+		if (!(state.varying_mask & BIT(i)))
+			continue;
+		program->varying_logical[packed] = i;
+		program->varying_width[packed] = state.varying_width[i];
+		program->varying_count++;
+	}
 	if (constant_count)
 		memcpy(program->constants, constants,
 		       constant_count * 4 * sizeof(*constants));
@@ -804,6 +853,25 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction packed_varying[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 1, 2, 3, 3 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 0, 0, 0 }, 0, 0 },
+			},
+		},
+	};
 	static const u32 expected_alu[][4] = {
 		{ 0x008106d0, 0xd0140924, 0x00308006, 0x00000020 },
 		{ 0x01c00530, 0xc01c0053, 0x00f20006, 0x000d0420 },
@@ -844,8 +912,24 @@ int chrome9_fragment_selftest(void)
 		ARRAY_SIZE(sparse_varyings), constants, 0, 1, 6, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301011b0 ||
+	    program->varying_count != 2 || program->varying_logical[0] != 0 ||
+	    program->varying_width[0] != 4 ||
+	    program->varying_logical[1] != 5 ||
+	    program->varying_width[1] != 2 ||
 	    memcmp(program->controls, expected_sparse_controls,
 		   sizeof(expected_sparse_controls)))
+		ret = -EINVAL;
+	if (ret)
+		goto out;
+	ret = chrome9_fragment_compile(packed_varying,
+		ARRAY_SIZE(packed_varying), constants, 0, 1, 1, program);
+	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
+	    program->tau[0] != 0x301006f0 || program->varying_count != 1 ||
+	    program->varying_logical[0] || program->varying_width[0] != 3 ||
+	    program->controls[0] != 0x90018000 ||
+	    program->controls[1] != 0x91000001 ||
+	    program->controls[2] != 0x92010001 ||
+	    program->controls[3] != 0x93000001)
 		ret = -EINVAL;
 out:
 	kfree(program);

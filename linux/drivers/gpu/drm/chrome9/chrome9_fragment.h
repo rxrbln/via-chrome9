@@ -12,6 +12,8 @@ struct chrome9_fragment_program {
 	u32 constant_count;
 	u32 texture_count;
 	u32 varying_count;
+	u8 varying_logical[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u32 controls[12];
 	u32 alu[DRM_CHROME9_FRAGMENT_MAX_ALU][4];
 	u32 tau[DRM_CHROME9_FRAGMENT_MAX_TAU];

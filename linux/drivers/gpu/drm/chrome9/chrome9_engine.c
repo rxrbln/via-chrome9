@@ -1609,24 +1609,46 @@ static void chrome9_fragment_sampler_state(
 	sampler[3] = 0xcccccccc;
 }
 
-static u32 chrome9_fragment_raster_state(u32 varying_count, u32 vertex_count,
+static u32 chrome9_fragment_varying_format(u32 width)
+{
+	static const u8 format[] = { 0, 0x02, 0x42, 0x82, 0xc2 };
+
+	return format[width];
+}
+
+static u32 chrome9_fragment_varying_link(u32 width)
+{
+	static const u8 link[] = { 0, 0x8, 0xc, 0xe, 0xf };
+
+	return link[width];
+}
+
+static u32 chrome9_fragment_raster_state(
+		u32 varying_count, const u8 *varying_width, u32 vertex_count,
 		u32 raster[40])
 {
-	u32 vertex_stride = 6 + 4 * varying_count;
+	u32 vertex_stride = 6;
 	u32 a25 = 0x25f60000;
 	u32 a26 = 0x26000000;
 	u32 a28 = 0x28ff0000;
 	u32 a29 = 0x29000000;
+	u32 offset = 6;
 	unsigned int i;
 
 	memset(raster, 0, 40 * sizeof(*raster));
+	for (i = 0; i < varying_count; i++)
+		vertex_stride += varying_width[i];
 	raster[0] = ((2 + varying_count) << 8) | vertex_stride;
 	raster[1] = 0x010000c2;
 	raster[2] = 0x020041d1;
 	raster[3] = 0x030052d1;
-	for (i = 0; i < varying_count; i++)
-		raster[4 + i] = (4 + i) << 24 | (6 + 4 * i) << 12 |
-			(3 + i) << 8 | 0xc2;
+	for (i = 0; i < varying_count; i++) {
+		u32 width = varying_width[i];
+
+		raster[4 + i] = (4 + i) << 24 | offset << 12 |
+			(3 + i) << 8 | chrome9_fragment_varying_format(width);
+		offset += width;
+	}
 	i = 4 + varying_count;
 	raster[i++] = 0x12000000 | GENMASK(2 + varying_count, 0);
 	raster[i++] = 0x61800000;
@@ -1637,13 +1659,14 @@ static u32 chrome9_fragment_raster_state(u32 varying_count, u32 vertex_count,
 	raster[i++] = 0x24000000 | vertex_count;
 	for (unsigned int varying = 0; varying < varying_count; varying++) {
 		u32 shift = 12 - 4 * (varying & 3);
+		u32 link = chrome9_fragment_varying_link(varying_width[varying]);
 
 		if (varying < 4) {
-			a25 |= 0xf << shift;
-			a28 |= 0xf << shift;
+			a25 |= link << shift;
+			a28 |= link << shift;
 		} else {
-			a26 |= 0xf << shift;
-			a29 |= 0xf << shift;
+			a26 |= link << shift;
+			a29 |= link << shift;
 		}
 	}
 	raster[i++] = a25;
@@ -1668,16 +1691,70 @@ static u32 chrome9_fragment_raster_state(u32 varying_count, u32 vertex_count,
 
 static int chrome9_fragment_raster_selftest(void)
 {
+	static const u8 width[] = { 3 };
+	static const u8 format[] = { 0, 0x02, 0x42, 0x82, 0xc2 };
+	static const u8 link[] = { 0, 0x8, 0xc, 0xe, 0xf };
 	u32 raster[40];
 	u32 count;
+	unsigned int varying_count;
 
-	count = chrome9_fragment_raster_state(1, 3, raster);
-	if (count != 28 || raster[0] != 0x0000030a ||
-	    raster[4] != 0x040063c2 || raster[5] != 0x1200000f ||
+	count = chrome9_fragment_raster_state(ARRAY_SIZE(width), width, 3,
+		raster);
+	if (count != 28 || raster[0] != 0x00000309 ||
+	    raster[4] != 0x04006382 || raster[5] != 0x1200000f ||
 	    raster[7] != 0x623081ff || raster[10] != 0x24000003 ||
-	    raster[11] != 0x25f6f000 || raster[12] != 0x26000000 ||
-	    raster[13] != 0x28fff000 || raster[14] != 0x29000000)
+	    raster[11] != 0x25f6e000 || raster[12] != 0x26000000 ||
+	    raster[13] != 0x28ffe000 || raster[14] != 0x29000000)
 		return -EINVAL;
+	for (varying_count = 1; varying_count <= 8; varying_count++) {
+		u32 layouts = 1U << (2 * varying_count);
+		u32 layout;
+
+		for (layout = 0; layout < layouts; layout++) {
+			u8 widths[8] = { 0 };
+			u32 expected_a25 = 0x25f60000;
+			u32 expected_a26 = 0x26000000;
+			u32 expected_a28 = 0x28ff0000;
+			u32 expected_a29 = 0x29000000;
+			u32 stride = 6;
+			u32 offset = 6;
+			unsigned int varying;
+
+			for (varying = 0; varying < varying_count; varying++) {
+				u32 shift = 12 - 4 * (varying & 3);
+
+				widths[varying] = ((layout >> (2 * varying)) & 3) + 1;
+				stride += widths[varying];
+				if (varying < 4) {
+					expected_a25 |= link[widths[varying]] << shift;
+					expected_a28 |= link[widths[varying]] << shift;
+				} else {
+					expected_a26 |= link[widths[varying]] << shift;
+					expected_a29 |= link[widths[varying]] << shift;
+				}
+			}
+			count = chrome9_fragment_raster_state(varying_count, widths,
+				3, raster);
+			if (count != 27 + varying_count ||
+			    raster[0] != ((2 + varying_count) << 8 | stride) ||
+			    raster[6 + varying_count] !=
+					(0x620081ff | (2 + varying_count) << 20) ||
+			    raster[10 + varying_count] != expected_a25 ||
+			    raster[11 + varying_count] != expected_a26 ||
+			    raster[12 + varying_count] != expected_a28 ||
+			    raster[13 + varying_count] != expected_a29)
+				return -EINVAL;
+			offset = 6;
+			for (varying = 0; varying < varying_count; varying++) {
+				u32 expected = (4 + varying) << 24 | offset << 12 |
+					(3 + varying) << 8 | format[widths[varying]];
+
+				if (raster[4 + varying] != expected)
+					return -EINVAL;
+				offset += widths[varying];
+			}
+		}
+	}
 	return 0;
 }
 
@@ -1779,13 +1856,14 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	/* D0 position, normalized D1/D2 colors, then dense float4 T0..T7. */
 	raster_count = chrome9_fragment_raster_state(program->varying_count,
-		vertex_count, raster);
+		program->varying_width, vertex_count, raster);
 	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
 	for (i = 0; i < program->varying_count; i++) {
 		u32 *record = vs_program + 16 + i * 4;
 
 		record[0] = 0x0008c14c + i * 0x00004000;
-		record[3] = 0x0008028f + i * 0x10;
+		record[3] = (0x00080280 + i * 0x10) |
+			GENMASK(program->varying_width[i] - 1, 0);
 	}
 
 	memset(base, 0xcc, CHROME9_RUN_STAGING_SIZE);
@@ -1878,10 +1956,12 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		*p++ = vertex->color;
 		*p++ = vertex->specular;
 		for (varying = 0; varying < program->varying_count; varying++) {
-			*p++ = vertex->varying[varying][0];
-			*p++ = vertex->varying[varying][1];
-			*p++ = vertex->varying[varying][2];
-			*p++ = vertex->varying[varying][3];
+			u32 logical = program->varying_logical[varying];
+			unsigned int component;
+
+			for (component = 0;
+			     component < program->varying_width[varying]; component++)
+				*p++ = vertex->varying[logical][component];
 		}
 	}
 	chrome9_emit_header0(&p, sync, 1);
