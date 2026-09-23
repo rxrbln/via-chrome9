@@ -295,9 +295,14 @@ TEXLD/TEXLDB/TEXKILL/TEXLDP operation nibbles are 1/3/4/7 and identity
 swizzle is `1b0`.  Destination and coordinate contributions overlap in bits
 17:16 because the vendor emitter ORs them.  Keep the two semantic ids
 separate until this final OR; never decode, patch, or validate one by masking
-the already packed word.  The bounded allocator uses coordinate slots 0..7
-and ordinary temporary slots 0..11, matching the shipping limits and keeping
-the coordinate contribution's high overlapping bits clear.
+the already packed word.  The H5 register manager has ten coordinate slots
+and twelve ordinary temporary slots.  The exact static initialization at
+`stmPPSSetRegManager_invi:0x1b5b6e..0x1b5b9c` writes normal TEMP limit 12 and
+coordinate limit 10.  All current live oracles stay within coordinate slots
+0..7; the initial clean-room allocator therefore deliberately caps
+coordinates at eight and ordinary temporaries at twelve.  Slots 8 and 9
+remain a separately gated extension.  These limits also keep the coordinate
+contribution's high overlapping bits clear.
 
 Ordinary TEX destinations enter the same physical TEMP allocation used by
 ALU.  The later ALU consumer carries the TEMP final-read marker: source A is
@@ -320,6 +325,32 @@ second TAU reads set bit28; one-use slots 5..7 set it immediately.  Therefore:
 5. derive A91 from the set of allocated coordinate slots;
 6. derive the transition maps from the finalized order.
 
+The production coordinate allocator is circular, not an ordinary immediately
+reusing linear scan.  Direct logical T inputs are globally compacted by logical
+id: a deliberately permuted use order `T5,T0,T4,T1,T2` produces physical
+slots `4,0,3,1,2`.  With no direct T input, twelve computed fetches use
+`0,1,2,3,4,5,6,7,0,1,2,3`; with persistent T0 used by coordinate ALU they use
+`1,2,3,4,5,6,7,1,...`.  This is why the eleven-tap object cycles through
+1..7 rather than immediately reusing one slot.
+
+The static ten-slot limit is real but belongs to the highest-pressure resource
+bucket.  A production program with eight direct TAU coordinates followed by
+three computed coordinates emits physical slots
+`0,1,2,3,4,5,6,7,8,9,8`, A91=`0003ff`, and A90=`90000000`.  Its exact TAUs
+and controls are retained in the JSON corpus.  This object is compiler proof,
+not silicon proof for slots 8/9.  The first generic backend should therefore:
+
+1. compact direct coordinates into 0..D-1 by logical id;
+2. reject D greater than eight;
+3. assign every computed-coordinate bridge round-robin over D..7;
+4. reject computed coordinates when D equals eight;
+5. enable slots 8/9 only behind a later ten-slot capability after a guarded
+   numerical test and exact A90 bucket closure.
+
+This policy byte-matches the current computed-coordinate corpora and preserves
+the vendor's reuse distance.  It is intentionally more conservative than the
+full static manager.
+
 Upload ALU and TAU stores separately, retaining their ordinal positions in
 the interleaved schedule.  Set A90 bit18 when the first scheduled node is
 ALU.  At every TAU-to-ALU boundary after TAU ordinal `k`, set T2A bit `k`; at
@@ -327,9 +358,13 @@ every ALU-to-TAU boundary after ALU ordinal `k`, set A2T bit `k`.  Pack both
 maps in the 24-bit chunks described above.  A92 carries the two final counts.
 No native END record is emitted.
 
-A simple safe list scheduler keeps side-effecting texture operations in
-program order, selects only dependency-ready nodes, and prefers another node
-from the current engine when legal to reduce transitions.  This optimization
+A simple safe list scheduler keeps TEXKILL and all texture operations in
+source order, selects only dependency-ready nodes, and prefers another node
+from the current engine when legal to reduce transitions.  Ordinary unread
+TEX results should be removed by DCE; the vendor uses TAU bit 31 to retire an
+unconsumed or overwritten TAU destination, but that path is unnecessary for
+the initial backend and remains rejected.  TAU bit 30 is unresolved and
+remains zero.  This optimization
 cannot move a bridge after its TAU or a sampled-result consumer before its
 TAU.  Reject the program if allocation, record counts, or transition-map
 capacity fails; do not spill or silently truncate.
