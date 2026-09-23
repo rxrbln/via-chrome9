@@ -38,6 +38,9 @@
 #define CHROME9_RING_SIZE		(CHROME9_RING_PAGES * PAGE_SIZE)
 #define CHROME9_RUN_STAGING_SIZE	SZ_64K
 #define CHROME9_CR_READ_AHEAD		0x220U
+#define CHROME9_PRIME_PAUSE		0x70U
+#define CHROME9_PRIME_STOP		0xf0U
+#define CHROME9_WRAP_APPEND		0x380U
 #define CHROME9_SEQ_INDEX		0x83c4
 #define CHROME9_SEQ_DATA			0x83c5
 #define CHROME9_FIXED_BO_SIZE		(3U * PAGE_SIZE)
@@ -52,6 +55,13 @@
 #define CHROME9_DRAW_CACHE_MAX_ENTRIES	64U
 #define CHROME9_DRAW_CACHE_MAX_PAGES	(CHROME9_GART_ENTRIES - \
 					 CHROME9_RING_PAGES)
+
+static_assert(IS_ALIGNED(CHROME9_PRIME_PAUSE, 16));
+static_assert(IS_ALIGNED(CHROME9_PRIME_STOP, 16));
+static_assert(IS_ALIGNED(CHROME9_WRAP_APPEND, 128));
+static_assert(CHROME9_PRIME_STOP - CHROME9_PRIME_PAUSE >= 0x20);
+static_assert(CHROME9_WRAP_APPEND >=
+	      ALIGN(CHROME9_PRIME_STOP + CHROME9_CR_READ_AHEAD, 128));
 
 static bool chrome9_engine_enable;
 module_param_named(engine, chrome9_engine_enable, bool, 0400);
@@ -1839,6 +1849,57 @@ static void chrome9_install_stopped_ring(struct chrome9_device *cdev,
 	readl(cdev->mmio + CHROME9_REG_CR_TRANSPACE);
 }
 
+static void chrome9_fill_ring_dummy(struct chrome9_engine *engine);
+
+static u32 chrome9_ring_append_after(u32 stop)
+{
+	return ALIGN(stop + CHROME9_CR_READ_AHEAD, 128);
+}
+
+static int chrome9_install_prime_ring(struct chrome9_engine *engine,
+				      bool *published)
+{
+	struct chrome9_device *cdev = engine->cdev;
+	u32 *ring = engine->ring_cpu;
+	u32 status;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	*published = false;
+	/* PID10 STOP must retire the old PID00 generation before A68. */
+	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, status,
+				 !(status & BIT(31)), 10,
+				 CHROME9_HW_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	/* Match the vendor replacement path: A68 starts only a dummy H2 head. */
+	chrome9_fill_ring_dummy(engine);
+	ring[0] = 0xfe020420;
+	ring[1] = 0x0000041c;
+	ring[2] = 0x00300000;
+	ring[3] = 0xcc000000;
+	ring[0x80 / sizeof(*ring)] = 0xfe020420;
+	ring[0x84 / sizeof(*ring)] = 0x0000041c;
+	ring[0x88 / sizeof(*ring)] = 0x00300000;
+	ring[0x8c / sizeof(*ring)] = 0xcc000000;
+	chrome9_cache_flush(ring, CHROME9_RING_SIZE);
+	dma_wmb();
+	chrome9_install_stopped_ring(cdev, 1, CHROME9_RING_SIZE,
+				     CHROME9_PRIME_PAUSE);
+	*published = true;
+
+	/* The clear-to-set PID00 edge distinguishes this new dummy generation. */
+	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, status,
+				 status & BIT(31), 10, CHROME9_HW_TIMEOUT_US);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_ENGINE_STATUS,
+				 status, !(status & CHROME9_ENGINE_WORK_MASK), 10,
+				 CHROME9_HW_TIMEOUT_US);
+	return ret;
+}
+
 static int chrome9_stop_active_ring(struct chrome9_engine *engine,
 				    bool *pid10_published)
 {
@@ -1904,6 +1965,7 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	u32 append;
 	u32 status;
 	bool pid10_published;
+	bool prime_published;
 	int ret;
 
 	lockdep_assert_held(&engine->submit_lock);
@@ -1925,22 +1987,42 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	append = engine->append;
 	/* Equality is an exact fit: the copied read-ahead closure ends at A62. */
 	if (append > CHROME9_RING_SIZE - copy_len) {
+		if (copy_len > CHROME9_RING_SIZE - CHROME9_WRAP_APPEND)
+			return -E2BIG;
 		ret = chrome9_stop_active_ring(engine, &pid10_published);
 		if (ret) {
 			*must_quarantine = pid10_published;
 			return ret;
 		}
-		chrome9_fill_ring_dummy(engine);
-		memcpy(engine->ring_cpu, source, copy_len);
-		chrome9_cache_flush(engine->ring_cpu, CHROME9_RING_SIZE);
+		ret = chrome9_install_prime_ring(engine, &prime_published);
+		if (prime_published) {
+			engine->ring_epoch++;
+			engine->wrap_count++;
+		}
+		if (ret) {
+			job->published = true;
+			if (prime_published) {
+				engine->active_pause = CHROME9_PRIME_PAUSE;
+				engine->active_stop = CHROME9_PRIME_STOP;
+				engine->append =
+					chrome9_ring_append_after(CHROME9_PRIME_STOP);
+			}
+			*must_quarantine = true;
+			return ret;
+		}
+		/* Stay beyond every byte fetched while the prime reached PAUSE. */
+		append = chrome9_ring_append_after(CHROME9_PRIME_STOP);
+		memcpy((u8 *)engine->ring_cpu + append, source, copy_len);
+		chrome9_cache_flush((u8 *)engine->ring_cpu + append, copy_len);
 		dma_wmb();
-		append = 0;
-		job->ring_pause = segment_pause;
-		job->ring_stop = job->segment_stop;
-		chrome9_install_stopped_ring(cdev, 1, CHROME9_RING_SIZE,
-					     job->ring_pause);
-		engine->ring_epoch++;
-		engine->wrap_count++;
+		job->ring_pause = append + segment_pause;
+		job->ring_stop = append + job->segment_stop;
+		writel(0x00100000, cdev->mmio + CHROME9_REG_CR_TRANSSET);
+		writel(0x64000000 | (job->ring_pause & 0x00fffff0),
+		       cdev->mmio + CHROME9_REG_CR_TRANSPACE);
+		writel(0x65000000 | (job->ring_pause >> 24),
+		       cdev->mmio + CHROME9_REG_CR_TRANSPACE);
+		readl(cdev->mmio + CHROME9_REG_CR_TRANSPACE);
 	} else {
 		memcpy((u8 *)engine->ring_cpu + append, source,
 		       copy_len);
@@ -1963,7 +2045,8 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	job->published = true;
 	engine->active_pause = job->ring_pause;
 	engine->active_stop = job->ring_stop;
-	engine->append = job->ring_pause + 0x10;
+	/* Never overwrite command bytes already fetched beyond PID00 PAUSE. */
+	engine->append = chrome9_ring_append_after(job->ring_stop);
 	engine->append_count++;
 	return 0;
 }
@@ -3034,7 +3117,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	drm_mm_init(&engine->sf_mm, CHROME9_RING_SIZE,
 		    SZ_64M - CHROME9_RING_SIZE);
 	engine->mm_initialized = true;
-	engine->append = pause + 0x10;
+	engine->append = chrome9_ring_append_after(stop);
 	engine->active_pause = pause;
 	engine->active_stop = stop;
 	engine->last_cookie = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
@@ -3342,6 +3425,25 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		request->kind == CHROME9_DRAW_COPY_RECT;
 	int dev_idx;
 	int ret;
+
+	/*
+	 * Both the immediate and batched one-texture MODULATE+blend command
+	 * objects have reproducibly stopped VX900 before their completion cookie.
+	 * Reject the shared unsafe state at the ABI boundary until its vendor
+	 * register sequence is proven; otherwise any client can wedge the ring and
+	 * take rendering away from every later X client.
+	 */
+	if (request->texture_program == DRM_CHROME9_TEXTURE_PROGRAM_MODULATE &&
+	    chrome9_draw_has_blend(request) &&
+	    (request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BLEND ||
+	     request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16_BLEND ||
+	     request->kind ==
+		CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_D16 ||
+	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_BATCH ||
+	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_RUN ||
+	     request->kind == CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_MIP))
+		return -EOPNOTSUPP;
 
 	if (!drm_dev_enter(drm, &dev_idx))
 		return -ENODEV;
