@@ -216,6 +216,16 @@ of that physical coordinate slot.  This object is production-compiler exact,
 not yet a silicon result; the kernel must continue rebuilding every native word
 from structured instructions.
 
+The combined computed-coordinate plus cube/TEXLDP differential is also closed.
+Replacing only the source TEXLD token with TEXLDP leaves all three Linux ALU
+records and A90--A9B byte-identical and changes only TAU
+`301101b0 -> 307101b0`.  The Windows compiler independently produces
+`207101b0`; again, only its synthetic-wrapper last-use bit differs.  Therefore
+TEMP-coordinate scheduling needs no cube-specific bridge or phase transition:
+use the ordinary full TEMP-to-coordinate bridge, then select TAU operation
+field seven.  The token SHA and Windows TAU SHA in the corpus prevent this
+combined path from being inferred merely by ORing undocumented bits.
+
 ## Smallest safe implementation order
 
 1. Add Mesa resource cpp/layout helpers and sampler-only A8 first; its kernel
