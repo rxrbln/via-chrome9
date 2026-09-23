@@ -81,6 +81,8 @@ chrome9_resource_layout(const struct pipe_resource *templ,
    cpp = chrome9_format_storage_cpp(templ->format);
    if (!chrome9_is_surface_target(templ->target) ||
        !cpp ||
+       (templ->format == PIPE_FORMAT_X8Z24_UNORM &&
+        (templ->target != PIPE_TEXTURE_2D || templ->last_level)) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
        templ->depth0 != 1 || templ->array_size != 1 ||
