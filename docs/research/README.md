@@ -21,6 +21,13 @@ targets.
 - [glmark2-texture-half-pixel-oracle.md](glmark2-texture-half-pixel-oracle.md)
   reconstructs the nearest and linear validation failures exactly and records
   the live-proven post-viewport half-pixel correction.
+- [vx900-mipmap-next-oracle.md](vx900-mipmap-next-oracle.md) specifies the
+  bounded sampler-state and memory-layout ladder for mip selection.
+- [vx900-jellyfish-fragment-program.md](vx900-jellyfish-fragment-program.md)
+  recovers the next multi-ALU/two-TAU compiler target.
+- [fe33-persistent-ring-production.md](fe33-persistent-ring-production.md)
+  records the production completion packet and exact-once ring replacement
+  rules recovered from the Linux and Windows drivers.
 - [glmark-priority-live-20260921.md](glmark-priority-live-20260921.md)
   records the reference-image gates, one-submit texture cube, LLVM Gouraud
   path, live performance, syscall counts, and post-run GPU health.

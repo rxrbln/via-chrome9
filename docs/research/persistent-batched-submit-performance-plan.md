@@ -1,5 +1,42 @@
 # Persistent Chrome9 draw submission performance plan
 
+## 2026-09-23 second-target profiling rung
+
+The current Gouraud path has advanced beyond the earlier 272-triangle design:
+one userspace chain ioctl carries as many as 16,384 triangles and the kernel
+splits it into independently proven runs of at most 544 triangles.  A maximum
+run has PAUSE `0x9c70`, STOP `0x9cf0`, and copied/read-ahead end `0x9f10`.
+With the current 64-KiB resident ring, only the first such segment fits; nearly
+every following segment requires the bounded PID10 stop and full-ring
+reinstall.  A 128-KiB ring would fit segment starts at `0`, `0x9c80`, and
+`0x13900`, reducing reinstall wraps by roughly threefold without changing the
+proven packet or retirement rules.
+
+Do not change ring size before measuring the actual split.  Add a default-off
+`perf_stats` gate and a read-only DRM debugfs report.  Keep aggregate counters
+in `chrome9_device` as atomics so reading debugfs cannot race
+`engine_quiesce` and engine destruction.  Required measurements are chain
+ioctls started/completed/failed, triangles requested/completed, segments
+published/retired, a 1..31 segment-count histogram, wrap stop
+attempt/success/failure, and separately timed cookie, PAUSE, engine-work, and
+whole-retirement waits.  Timing uses `ktime_get_mono_fast_ns()` only while the
+gate is enabled; no MMIO is read from debugfs and no ABI or hot-path logging is
+added.
+
+The first ring experiment may expose only read-only `engine_ring_kb=64|128`,
+validated before GART or ring publication.  Ring size and page count then
+become per-engine values throughout allocation, GART binding, append bounds,
+timeout diagnostics, SF allocator reservation, and teardown.  The 64-MiB SF
+aperture remains a hardware constant.  Test 544, 545, 8160, 14348, and 16384
+triangle RHW chains before glmark2 validation and performance.  Compare equal
+`perf_stats=1` runs first, then repeat FPS with instrumentation disabled.
+
+The new `192.168.2.60` correctness baseline is nearest cube 39 FPS, linear
+cube 38 FPS, and Gouraud cat 9 FPS.  If 128 KiB reduces wrap-stop time without
+materially changing the 122.316-ms cat frame, the next bottleneck is the
+synchronous retirement after every 544-triangle segment; do not enlarge the
+ring again as a substitute for proving fewer retirements.
+
 ## Decision
 
 The first implemented one-texture rung deliberately stops at the exact

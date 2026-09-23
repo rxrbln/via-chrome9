@@ -1088,3 +1088,212 @@ off, Xorg was stopped cleanly at PID 9585, and the VGA state was restored.
 This closes the combined level-zero two-sampler, NPOT, MODULATE, D16 LESS and
 LEQUAL execution path; it does not close mip selection, additional shader
 forms, or the direct-flip gate.
+
+## Texture REPLACE plus D16 application gate
+
+The first full glmark2 scene sweep exposed a pre-submit kernel rejection in
+`effect2d`.  Its state was otherwise inside the existing bounded contract: one
+BGRA texture, nearest/clamp sampling, the exact texture-REPLACE fragment
+program, BGRA destination, Z16 LEQUAL/write, and blending disabled.  The
+failure was an internal builder assertion, not unsupported hardware state.
+The assertion used the MODULATE program's immediate-vertex sentinel offsets
+for every depth-enabled draw.  REPLACE has one fewer pixel ALU record, so the
+sentinels are four dwords earlier.  Selecting offsets by texture program fixes
+the rejection without changing any emitted command word.
+
+The rebuilt module and Mesa regression were staged in:
+
+```text
+/root/tmp/chrome9-live/effect2d-replace/
+module SHA-256       cc7619dfa28bfa434ee9ccc9646dbac54afb78fcd691602a1bbfb6fb1315bc36
+libgallium SHA-256   6811ceb0bdba9ff5c794df50fb3d5c05fd44eba6edb2747d3a858613aad3e525
+screen-smoke SHA-256 fbe8005f9f7fa37d3d20053e8a927ca6b30976e2e3402b14cdd5a273d9cd06d1
+```
+
+On the VX900, the complete Gallium smoke suite passed.  Its new regression
+proved REPLACE plus Z16 for both render-target formats:
+
+```text
+Gallium textured D16 REPLACE format 281 passed
+Gallium textured D16 REPLACE format 105 passed
+```
+
+The real scene then submitted both triangles without a rejection or engine
+diagnostic:
+
+```text
+[effect2d] nframes=1:
+chrome9: submit triangle=0 kind=textured+d16+blend
+chrome9: submit triangle=1 kind=textured+d16+blend
+FPS: 85 FrameTime: 11.825 ms
+```
+
+glmark2 reports `Validation: Unknown` for this scene because it has no bundled
+reference image.  A captured root image showed the expected Linarto logo and
+colored effect sprites with no wrap or channel corruption.  The retained
+artifacts are under
+`/root/tmp/chrome9-live/effect2d-replace/x-20260921-155617/`.
+
+## glmark2 ideas simple-fragment lowerings
+
+After the `effect2d` gate, the captured `ideas` shader set contained three
+fragment expressions that require no native PS arithmetic when they are
+lowered into the post-TNL D1 color attribute:
+
+```text
+GLSL4   vec4(VAR0.x, VAR0.x, VAR0.y, 1)
+GLSL7   vec4(flat VAR0.x, flat VAR0.x, flat VAR0.x, 1)
+GLSL10  literal vec4(0, 0, 0, 1)
+```
+
+Mesa now recognizes each exact NIR expression.  The two-component form packs
+`x,x,y,1` explicitly.  Literal colors are clamped and packed once at shader
+creation.  The flat scalar path copies the selected provoking vertex into all
+three immediate D1 records, preventing the hardware Gouraud state from
+interpolating a value that GLSL declared flat.
+
+The live smoke suite passed these distinct readback oracles for XRGB and BGRA
+targets, including all existing regressions:
+
+```text
+Gallium vec2 VAR0 XXY RGBX passed: sample=00404080
+Gallium literal color passed: sample=004080bf
+Gallium flat scalar VAR0 RGBX passed: sample=00bfbfbf
+```
+
+The next real `ideas:nframes=1` run reduced unsupported shader creation from
+six programs to three and submitted more than 1,100 hardware triangles before
+the remaining complex material rejection.  The only remaining programs in
+that run were GLSL13, GLSL19 and GLSL22: per-fragment lighting, a
+`gl_FragCoord`-derived texture lookup plus discard, and multi-light
+normalization/dot/pow control flow respectively.  Logs are retained under
+`/root/tmp/chrome9-live/ideas-flat/x-20260921-160650/`; the engine remained
+free of timeout, quarantine and error diagnostics.
+
+## Native fragment ADD gate
+
+The first arithmetic expansion beyond MOV/MUL is a structured one-record
+fragment ADD.  Mesa lowers exact full-vector NIR `fadd` into the recovered
+Chrome9 A*C+B datapath with native source C fixed to literal one.  The kernel
+rebuilds that record from logical v0/c0 operands; capability bit 48 prevents a
+new Mesa from sending opcode 2 to a MOV/MUL-only kernel.  The pre-promotion
+module parameter is `ps_add=1`.
+
+The compiler-exact c0+c1 temporary corpus record is
+`00810530 30140924 00f08005 00000020`.  The live v0+c0/oC0 form is
+`00800530 30140924 00f04005 00000820`.  On VX900, varying
+`(0.25,0.5,0.75,0.5)` plus c0 `(0.125,0.125,0.125,0.25)` produced:
+
+```text
+Gallium compiled v0+c0 D16 passed: sample=005f9fdf
+Mesa Chrome9 context, Gallium triangle/D16, guarded resources, and same-device dma-buf sharing smoke passed
+MMIO 040c=00000000
+```
+
+The color and D16 guard pages remained intact and the complete pre-existing
+smoke suite passed before and after a module reload.  Artifacts are retained
+under `/root/tmp/chrome9-live/ps-add-v1/`; the final module SHA-256 is
+`bcd91086869935261003e569d1c058e7059624637a4ade9be8b2024f0d7bcbf4`.
+
+That reload also closed a KMS teardown lifetime bug.  `kms_state` had been
+PCI-devres allocated while its DDC cleanup lived in the DRM-managed action
+stack, so raw PCI unbind freed the state before `i2c_del_adapter()` and
+triggered a use-after-free oops.  Allocating it with `drmm_kzalloc()` preserves
+the state through DRM cleanup.  The supported iteration sequence—unbind
+fbcon, write `1` to `engine_quiesce`, unload, reload, and rebind fbcon—now
+passes without an oops, followed by another complete hardware smoke pass.
+
+The subsequent real `ideas:nframes=1` run still had three unsupported complex
+fragment programs and rendered at 8 FPS.  Its surviving shaders need chained
+ALU, texture/discard, normalize/dot/reflect/pow, or control flow; a single
+v0+c0 ADD does not falsely classify any of them.
+
+## Second VX900 target and dynamic VRAM sizing
+
+The same kernel and Mesa work was brought up on `192.168.2.60`, another
+`1106:7122` VX900 running `7.2.5-t2`.  Unlike the first 128-MiB board, this
+machine has 256 MiB of UMA.  Reusing the first board's explicit
+`engine_gart_offset=0x7ff0000` failed closed before command submission because
+the GART belongs in the final 64 KiB, at `0xfff0000` on this machine.
+
+Production sizing no longer trusts SR14 or requires that offset parameter.
+The driver decodes the authoritative VX900 D0F3 `1106:3410` A0 register,
+checks the BAR2 aperture, cross-checks SR68 and PCI B2, and uses the resulting
+size for KMS bounds and the final-64-KiB GART base.  This target proved why the
+change is necessary: D0F3 A0, SR68, PCI B2, and BAR2 all report 256 MiB while
+SR14 is stale and reports 512 MiB:
+
+```text
+memory state: D0F3_A0=ed00 UMA=268435456 BAR2=268435456
+              SR14=0x0 (536870912) SR68=0x80 (268435456)
+              PCI_B0=0x1 PCI_B2=0x40 (268435456)
+ignoring stale SR14 VRAM size 536870912; D0F3/BAR2 give 268435456
+persistent SF engine ready: GART=0xfff0000
+```
+
+With no `engine_gart_offset` supplied, native DVI KMS selected 1024x768 XR24
+at pitch 4096.  The complete Gallium screen smoke passed, including fragment
+ADD, D16, blending, one- and two-texture paths, NPOT, and dma-buf sharing.
+glmark2 validation then passed the nearest and linear crate cubes and the
+Gouraud cat.  MMIO engine error `0x040c` remained zero throughout.
+
+The direct-rendered, vblank-disabled 300x300 glxgears result was:
+
+```text
+warmup=133.420 FPS
+sustained: min=133.382 average=133.458 max=133.501 FPS (three samples)
+```
+
+Full-duration glmark2 performance on this target is lower than on the first
+board despite identical image validation: nearest cube 39 FPS (26.067 ms),
+linear cube 38 FPS (26.552 ms), and Gouraud cat 9 FPS (122.316 ms).  These are
+the baselines for submission and ring-retirement profiling; they must not be
+conflated with the one-frame validation rate.
+
+Artifacts are retained in
+`/root/tmp/chrome9-live/new-target-192.168.2.60/`.  The tested D0F3-sizing
+module SHA-256 is
+`3dd6f24784c661e18299be64209dfb9b38ac7730b25a5e036d53fe78ffc812c5`.
+
+## Persistent-ring recovery and reusable X session
+
+Normal ioquake3 shutdown exposed two independent persistent-ring hazards on
+the 256-MiB VX900 target.  First, ring replacement had copied the real 3D job
+at offset zero and retriggered A68 directly.  Both vendor drivers instead use
+A68 exactly once to install a dummy-only PID00 generation; normal work follows
+through A64/A65.  The replacement path now installs that prime, proves PID00
+and non-CR idle, then appends the real job at `0x380`, beyond the prime STOP at
+`0xf0` plus the `0x220` command-reader prefetch window.  Ordinary appends also
+start beyond the preceding STOP/read-ahead closure, so fetched bytes are never
+overwritten.
+
+Second, independent one-triangle and 16-triangle captures showed the exact
+one-texture MODULATE plus blend object stopping before its completion cookie.
+The inputs, coordinates, texture bounds, and packet closure were valid, so the
+state remains a vendor-template reverse-engineering problem rather than a
+generic ring fault.  Mesa now rejects this precise unproved combination and
+the kernel rejects it again at the ioctl boundary.  REPLACE blending and
+opaque MODULATE remain available.  This is a correctness containment: a
+missing UI primitive is preferable to poisoning the ring for every later X
+client.
+
+The rebuilt module and Gallium library were staged as `chrome9-ring-safe-v2`
+and `ioq-safe-v2`.  Under one Xorg process (PID 505), the following ran in
+sequence without an X restart, reboot, engine timeout, or quarantine:
+
+```text
+ioquake3 OpenGL1 menu, 20 seconds, graceful SIGTERM
+ioquake3 OpenGL1 menu, 12 seconds, graceful SIGTERM
+glxgears: 339 frames / 5 seconds = 67.594 FPS
+ioquake3 OpenGL1 q3dm1, map and cgame initialized
+ioquake3 OpenGL2 menu with seven-sampler diagnostic override
+ioquake3 OpenGL2 q3dm1, map and cgame initialized
+glxinfo: direct rendering Yes after all clients
+```
+
+Stock OpenGL2 correctly fails shader linking at the advertised two-fragment-
+sampler limit.  The diagnostic seven-sampler override links all 96 renderer
+programs and reaches q3dm1, where unsupported bounded fragment programs are
+the next visible gap.  OpenGL1 reaches q3dm1 but currently rejects its texture
+run at the mip/sampler boundary.  Captures and logs are retained under
+`/root/tmp/chrome9-live/new-target-192.168.2.60/ioquake-safe-v2/`.
