@@ -4,9 +4,27 @@ This note defines the smallest generic writer-to-reader contract needed by
 glmark2 `shadow` and `refract`.  It deliberately separates depth storage,
 producer retirement, consumer texture invalidation, and CPU/DMA ownership.
 Those are four different mechanisms.  The state words are statically exact;
-the complete D24 writer-to-sampler sequence is now live-qualified for a
-single guarded transition and an independent active Z16 destination.  The
-long alternating cache-stress sequence remains a separate promotion gate.
+the complete D24 writer-to-sampler sequence is live-qualified for a single
+guarded transition, an independent active Z16 destination, and 64 alternating
+synchronous producer/consumer transitions.  A no-clear versus forced-miss
+cache discriminator remains a separate promotion gate.
+
+## 2026-09-24 alternating transition test
+
+`chrome9-d24-r2t-guard /dev/dri/renderD128 --alternate=64` passed on VX900
+at `192.168.2.60` with the current 7.2.5-t2 Chrome9 module.  The oracle
+first established the original 1,176-pixel D24 producer and six raw samples.
+It then alternated depth 0.25 and 0.75 using 64 `ALWAYS` producer draws on the
+same guarded depth BO, each immediately followed by a raw X8Z24 consumer
+draw.  The interior sample alternated between the expected 0x40/0xc0 bytes
+within one LSB; final source depth, exterior depth, unchanged producer color,
+and all three resources' guard pages passed.  A subsequent glmark2 cube draw
+passed and dmesg showed no new GPU fault.
+
+This proves the production *synchronous per-ioctl* transition repeatedly.
+The kernel vmaps, cache-flushes, and DMA-syncs BOs on each ioctl, so it does
+not isolate a CPU-independent GPU texture-cache effect.  Do not infer that
+the no-clear/forced-miss diagnostic or mixed multi-sampler closure passed.
 
 ## Live Gallium closure
 
