@@ -481,6 +481,40 @@ known-good vPos FRC draws before and after also passed.  This closes both the
 three-temporary lifetime allocation and mixed POSITION/constant ADD-MAD-MUL
 linkage on silicon.
 
+### Linked-GLSL dead Z/W boundary
+
+A real GLSL 1.20 `gl_FragCoord.xy / 64.0` compile exposed a distinct frontend
+boundary before any draw.  The first semantic dump contained 11 records:
+
+```text
+ADD t1.x, POSITION.x, c31.x
+ADD t4.x, POSITION.y, c31.x
+MUL t3.x, t4.x, c0.x
+ADD t2.x, t3.x, c0.y
+MOV t5.x, t1.x
+MOV t5.y, t2.x
+MOV t5.zw, POSITION.zw       # dead and invalid
+MUL t0.xy, t5.xy, c30.xy
+MOV t6.xy, t0.xy
+MOV t6.zw, c29.zw
+MOV color, t6
+```
+
+The third partial t5 write is dead: the only t5 consumer reads XY.  It must be
+removed before UAPI translation.  The fragment ABI deliberately rejects
+POSITION Z/W selectors, and the kernel validator checks every encoded source
+lane even when the destination mask makes a lane irrelevant.  Relaxing that
+validator would turn an optimizer bug into unproved native MISC semantics.
+
+After deleting the dead record, destination-before-source-release allocation
+still peaks at three physical temporaries: t1=p0, t4=p1, t3=p2, t2=p1,
+t5=p2, t0=p0, and t6=p1.  The object therefore remains in bucket `0x18000`
+with MISC id 3, rather than selecting the unqualified id-4/id-7 buckets.  The
+last POSITION use also moves from the rejected dead MOV to the valid Y ADD,
+where its release marker belongs.  Any linked-GLSL live test must first show
+that the semantic dump contains no POSITION Z/W source and retains this
+three-temporary closure.
+
 ## Guarded live oracles
 
 Use a guarded BGRA8888 target, fresh passing D16, exact command capture,
