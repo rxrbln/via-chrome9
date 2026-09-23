@@ -1,0 +1,155 @@
+# Chrome9 generic floating-point comparison boundary
+
+## Result
+
+The proprietary compilers do not justify lowering every NIR comparison to a
+subtraction followed by native CMP.  They provide an exact, two-record SGE
+expansion and a separate two-record internal SLT emitter.  Only SGE currently
+has an executable frontend object.  Native CMP is live-qualified for ordinary
+finite negative, positive, `+0`, and `-0` conditions, but subtraction
+underflow, denormal handling, infinities, and NaNs remain unqualified.
+
+Consequently the generic backend must continue to reject arbitrary
+`flt`/`fge`/`feq`/`fneu` and their `bcsel` users.  A finite-domain shader may
+use `SUB` plus CMP only after its subtraction result is proven to preserve the
+ordered comparison.  Merely knowing that the two operands are finite is not
+enough: a nonzero difference can underflow or be flushed to zero.
+
+## Production SGE object
+
+Linux 5.75 `stmPPS_SGE_PS20_invi` is at virtual address `0x0016ad60`.
+It allocates a temporary through the callback at object offset `+0x138c`,
+packs the first source-dependent record, and appends it at
+`0x0016afe2..0x0016afed`.  The second record starts from hard-coded bases
+`d0=0140b6d0` at `0x0016aff4` and `d1=30140924` at `0x0016affb`; it is appended
+at `0x0016b075..0x0016b084`.  The temporary is released through callback
+`+0x1394` at `0x0016b084..0x0016b091`.  The Windows counterpart is
+`VTGUModeDX32A.dll:0x10219700` and has the same allocate/two-append/finalize
+shape.
+
+Linux configuration-two finalization gives these complete records:
+
+```text
+SGE oC0,c0,c1
+  00810538 30080924 00f08005 00000020
+  0140b6d0 30140924 00f20005 00090820
+  A90=90058000 A91=91000000 A92=92000002 A93=93000000
+
+SGE oC0,T0,c0
+  00800538 302c0924 00f0c005 00000020
+  0140b6d0 30140924 00f20005 00090820
+  A90=90058001 A91=91000000 A92=92000002 A93=93000000
+
+SGE oC0,c0,T0
+  02c00538 30080924 00f08005 00000020
+  0140b6d0 30140924 00f20005 00090820
+  A90=90058001 A91=91000000 A92=92000002 A93=93000000
+
+SGE oC0,T0,T1
+  02c10538 302c0924 00f0c005 00000020
+  0140b6d0 30140924 00f20005 00090820
+  A90=90058003 A91=91000000 A92=92000002 A93=93000000
+```
+
+The first row is `src0 + -src1` into the allocated temporary.  Decoding the
+second row fixes the apparently opaque constants:
+
+```text
+A: file 0, id 0, XYZW, release       temporary result
+C: file 5, id 0, swizzle 4444       native ONE
+B: file 5, id 0, swizzle 5555       native ZERO
+subop 9, full oC0 write
+```
+
+Thus production SGE is exactly a difference followed by the native
+`difference >= 0 ? 1 : 0` family operation.  The compiler object proves the
+record shape, operand order, resource tuple, and terminal dependency.  It
+does not prove the hardware's NaN, denormal, infinity, or signed-zero result.
+
+The current semantic UAPI cannot reproduce that second record byte-for-byte:
+its source files encode TEMP as native file 0, CONSTANT as file 2, and
+VARYING/MISC as file 3.  Literal ONE/ZERO swizzles do not select native file
+5.  A guarded exact SGE oracle therefore needs either a semantic SGE opcode
+whose kernel template owns both records, or an internal kernel selftest.  An
+`ADD; CMP` program with uploaded constants is useful arithmetic evidence but
+is not the proprietary SGE oracle.
+
+## SLT is not an executable key
+
+Linux `stmPPS_SLT_ICD_PS20_invi` at `0x001644e0` independently allocates a
+temporary and appends two records.  Its second record starts from
+`d0=01409240` at `0x00164699` and `d1=30140b6d` at `0x001646a0`, so it is not
+an alias for SGE with exchanged arguments.  The Windows internal counterpart
+is `VTGUModeDX32A.dll:0x10216550`, reached as `STM_SLT_ICD` internal opcode
+107.
+
+The tested Windows PS 2.0 tokenizer crashes before dispatching direct SLT, and
+the tested Linux direct frontend does not yield a usable executable object.
+The static emitter is therefore evidence that dedicated strict comparison
+exists in the compiler, not a byte oracle suitable for the kernel.  Do not
+invent a one-record SLT or derive it by changing the SGE predicate.
+
+## NIR semantics that must be preserved
+
+Mesa 26.2.2 defines the relevant NIR operations in
+`src/compiler/nir/nir_opcodes.py:927..934`:
+
+```text
+flt   src0 <  src1
+fge   src0 >= src1
+feq   src0 == src1
+fneu  src0 != src1
+```
+
+The ordinary forms are ordered for `<`, `>=`, and `==`; `fneu` is true for an
+unordered NaN input because C/Python `!=` is true there.  NIR separately has
+the explicit unordered `fltu`, `fgeu`, `fequ` and ordered-not-equal `fneo`
+forms.  Collapsing those distinctions in a Chrome9 lowering is incorrect.
+
+Signed zeros compare equal.  The live CMP gates show that both `+0` and `-0`
+conditions select the nonnegative arm, which is compatible with a difference
+that is already known to be zero.  They do not establish which zero sign a
+Chrome9 SUB produces, nor whether a subnormal difference survives.  NaN is
+also unresolved: `+Inf - +Inf` produces NaN even though both operands are
+non-NaN, while SGE/CMP native unordered behavior is unknown.
+
+The first conservative fused-select mappings are therefore only algebraic
+candidates:
+
+```text
+bcsel(fge(x,y), t, f): d = x - y; CMP(d, t, f)
+bcsel(flt(x,y), t, f): d = x - y; CMP(d, f, t)
+```
+
+They are exact only when the compiler proves that `d` is non-NaN and that
+Chrome9 subtraction returns zero exactly iff `x == y`, otherwise a nonzero
+value with the mathematical sign of `x-y`.  No such proof exists for general
+varyings or uniforms.  The current generic Mesa lowering correctly falls
+through as unsupported for comparisons at
+`chrome9_context.c:3086..3153`, and it rejects any explicit NIR float-control
+execution mode at `chrome9_context.c:3273..3275`.
+
+`feq` and `fneu` need more than one sign test.  `ABS(x-y)` followed by a
+negative/equality trick still inherits subtraction underflow and unknown NaN
+behavior.  Two directional comparisons can characterize equality only after
+SGE/SLT unordered behavior and boolean combination are proven.  Both
+operations remain rejected; there is no source-backed one-CMP shortcut.
+
+## Guarded qualification sequence
+
+An exact semantic SGE successor should expand one validated instruction to
+the two production records above and must pass, in order:
+
+1. a no-comparison MOV control with the same BGRA8888, D16, guarded BOs,
+   geometry, constants/varyings, and exterior checks;
+2. lanes covering `<`, `==`, `>`, `+0` versus `-0`, and `-0` versus `+0`;
+3. smallest positive and negative subnormal differences and exact
+   cancellation, while recording the hardware's flush behavior;
+4. `+Inf`, `-Inf`, and equal-infinity pairs;
+5. quiet NaN in each source position, checked against each NIR ordered and
+   unordered operation rather than against D3D compiler naming.
+
+The first two gates are enough to qualify ordinary finite SGE materialization
+for bounded users.  They are not enough to expose generic NIR comparisons.
+The exceptional gates determine whether a general lowering is possible or
+whether Mesa must retain a fail-closed range/fast-math restriction.
