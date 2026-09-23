@@ -1857,7 +1857,9 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
 	destination_state[2] = 0x52000000 |
-		(request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ?
+		(request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_RGB565 ?
+		 0x00890000 :
+		 request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ?
 		 0x00990000 : 0x00980000) | (request->pitch >> 5);
 	if (blend) {
 		chrome9_lower_blend(&request->blend, &blend_words);
@@ -7079,8 +7081,12 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 	    (!!args->textures_ptr != !!args->texture_count) ||
 	    !args->width || args->width > 2048 ||
 	    !args->height || args->height > 2048 ||
-	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
-	    args->destination_format > DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
+	    args->destination_format > DRM_CHROME9_DESTINATION_FORMAT_RGB565 ||
+	    args->destination_pitch != ALIGN(args->width *
+		(args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_RGB565 ?
+		 sizeof(u16) : sizeof(u32)), 32) ||
+	    (args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_RGB565 &&
+	     (depth || blend)) ||
 	    (!blend && memchr_inv(&args->blend, 0, sizeof(args->blend))) ||
 	    (depth && (!args->depth_handle ||
 		(args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_D16 &&
