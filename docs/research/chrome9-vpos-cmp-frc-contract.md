@@ -403,6 +403,62 @@ prove that MISC is a supported silicon position route, not merely a compiler
 artifact; A90 bit 19 and A8A are the missing draw-time linkage, and no FVF
 varying or additional coordinate-scale register is required.
 
+## Mixed OpenGL position-transform object
+
+Mesa's generic OpenGL position lowering reaches the kernel as this eight-step
+semantic graph:
+
+```text
+ADD t1.x, POSITION.x, c31.x
+MUL t0.x, t1.x, c30.x
+ADD t4.x, POSITION.y, c31.x
+MAD t3.x, t4.x, c2.x, c2.y
+MUL t2.x, t3.x, c30.x
+MOV t5.xz, t0.x
+MOV t5.yw, t2.x
+MOV color, t5
+```
+
+Here c31.x is the OpenGL half-pixel offset, c30.x is the reciprocal target
+size used by the test, and c2.xy is `STATE_FB_WPOS_Y_TRANSFORM`.  The constants
+occupy c2, c30, and c31, so the semantic ABI's required constant high-water is
+32 even though only three vectors are read.  Mesa's immediate allocation keeps
+c30/c31 disjoint from the c2 state vector.
+
+The virtual temporary lifetimes compact to three physical registers.  Feeding
+the identical three-register schedule to the Linux 5.75 production compiler
+and dependency finalizer produces:
+
+```text
+00af16d0 d0140924 0010c316 00000020
+0140b6d0 d00ae16d 00100016 00000060
+00af16d0 d0140924 0012c336 00000020
+008236d0 d008216d 00100016 000000a0
+0140b6d0 d00ae16d 00100216 00000020
+01c00530 501c0053 00520114 000d00a0
+01c00530 801c0053 00a200a2 000d00a0
+01c00530 301c0053 00f20205 000d0820
+```
+
+The resource report is `(active-coordinate, temporary, sampler, address) =
+(0,3,0,0)`.  Metadata is `+2c=00058000`, `+6c=00000008`, and
+`+80=00000001`; configuration-two controls are A90=`90058008`,
+A91=`91000000`, A92=`92000008`, and A93=`93000000`.  The third record is the
+last POSITION use, so only its MISC source bears the release marker
+(`0012c336`).  The disjoint t5 xz/yw writes legally share physical temporary 2.
+
+VX900's draw-time MISC patch turns A90 into `900d8008`, and the engine emits
+type-01 A8A=`8a020000` before the controls.  There are no ordinary varying or
+TAU coordinate resources, hence no MISC/direct-coordinate collision.  A8A
+must remain direct PEY because Mesa has already applied the framebuffer-origin
+transform in c2; hardware inversion would apply that transform twice.
+
+This exact Mesa eight-ALU object has passed a guarded VX900 draw.  Three RGB
+samples, Z16, exterior pixels, guard regions, and reset/error counters matched;
+known-good vPos FRC draws before and after also passed.  This closes both the
+three-temporary lifetime allocation and mixed POSITION/constant ADD-MAD-MUL
+linkage on silicon.
+
 ## Guarded live oracles
 
 Use a guarded BGRA8888 target, fresh passing D16, exact command capture,
