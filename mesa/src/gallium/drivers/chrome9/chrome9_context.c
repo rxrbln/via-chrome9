@@ -2520,7 +2520,7 @@ struct chrome9_ps_nir_builder {
       nir_def *def;
       struct chrome9_ps_source source;
       bool complete;
-   } value[CHROME9_PS_MAX_ALU];
+   } value[CHROME9_PS_MAX_INSTRUCTIONS];
    uint32_t immediate[32][4];
    uint32_t immediate_mask;
    uint32_t uniform_mask;
@@ -2788,8 +2788,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
             *source = vector;
             return true;
          }
-         if (builder->next_temp >= 12 ||
-             builder->value_count >= CHROME9_PS_MAX_ALU)
+         if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
+             builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
             return false;
          temp = builder->next_temp++;
          value = builder->value_count++;
@@ -2843,8 +2843,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
           tex->sampler_index != tex->texture_index || coord < 0 ||
           tex->src[coord].src.ssa->num_components != 2 ||
           builder->ir.texture_count >= CHROME9_PS_MAX_TAU ||
-          builder->next_temp >= 12 ||
-          builder->value_count >= CHROME9_PS_MAX_ALU)
+          builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
+          builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
          return false;
       for (unsigned s = 0; s < tex->num_srcs; s++)
          if ((int)s != coord)
@@ -2882,6 +2882,73 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    components = alu->def.num_components;
    for (unsigned s = 0; s < ARRAY_SIZE(source_components); s++)
       source_components[s] = components;
+   if (alu->op == nir_op_fpow) {
+      struct chrome9_ps_instruction *log2, *multiply, *exp2;
+      uint8_t log_temp, multiply_temp;
+
+      /* Chrome9 implements POW as its native scalar LOG2, MUL and EXP2
+       * sequence.  GLSL already leaves non-positive bases undefined, so this
+       * is the general semantic lowering rather than an application-specific
+       * integer-exponent substitution.  Vector POW is scalarized by the NIR
+       * frontend before this backend grows multi-lane scalar scheduling. */
+      if (components != 1 ||
+          !chrome9_ps_lower_alu_source(builder, &alu->src[0], 1,
+                                       &operands[0]) ||
+          !chrome9_ps_lower_alu_source(builder, &alu->src[1], 1,
+                                       &operands[1]) ||
+          builder->ir.count > CHROME9_PS_MAX_ALU - 3 ||
+          builder->next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS - 3 ||
+          builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
+         return false;
+
+      log_temp = builder->next_temp++;
+      multiply_temp = builder->next_temp++;
+      temp = builder->next_temp++;
+      value = builder->value_count++;
+      builder->value[value].def = def;
+      builder->value[value].source.file = CHROME9_PS_SOURCE_TEMP;
+      builder->value[value].source.id = temp;
+      builder->value[value].source.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+      for (unsigned c = 1; c < 4; c++)
+         builder->value[value].source.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+
+      log2 = &builder->ir.instruction[builder->ir.count++];
+      memset(log2, 0, sizeof(*log2));
+      log2->op = CHROME9_PS_OPCODE_LOG2;
+      log2->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      log2->destination.id = log_temp;
+      log2->destination.writemask = 1;
+      log2->source[0] = operands[0];
+
+      multiply = &builder->ir.instruction[builder->ir.count++];
+      memset(multiply, 0, sizeof(*multiply));
+      multiply->op = CHROME9_PS_OPCODE_MUL;
+      multiply->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      multiply->destination.id = multiply_temp;
+      multiply->destination.writemask = 1;
+      multiply->source[0].file = CHROME9_PS_SOURCE_TEMP;
+      multiply->source[0].id = log_temp;
+      multiply->source[0].swizzle[0] = CHROME9_PS_SWIZZLE_X;
+      for (unsigned c = 1; c < 4; c++)
+         multiply->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+      multiply->source[1] = operands[1];
+
+      exp2 = &builder->ir.instruction[builder->ir.count++];
+      memset(exp2, 0, sizeof(*exp2));
+      exp2->op = CHROME9_PS_OPCODE_EXP2;
+      exp2->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      exp2->destination.id = temp;
+      exp2->destination.writemask = 1;
+      exp2->source[0].file = CHROME9_PS_SOURCE_TEMP;
+      exp2->source[0].id = multiply_temp;
+      exp2->source[0].swizzle[0] = CHROME9_PS_SWIZZLE_X;
+      for (unsigned c = 1; c < 4; c++)
+         exp2->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+
+      builder->value[value].complete = true;
+      *source = builder->value[value].source;
+      return true;
+   }
    switch (alu->op) {
    case nir_op_mov:
       return chrome9_ps_lower_alu_source(builder, &alu->src[0], components,
@@ -2952,8 +3019,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       return false;
    }
    if (builder->ir.count >= CHROME9_PS_MAX_ALU ||
-       builder->next_temp >= 12 ||
-       builder->value_count >= CHROME9_PS_MAX_ALU)
+       builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
+       builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
       return false;
    temp = builder->next_temp++;
    value = builder->value_count++;
@@ -2995,7 +3062,7 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
 
 static bool
 chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
-                       struct chrome9_ps_program *program)
+                       struct chrome9_ps_program *program, bool *lowered)
 {
    struct chrome9_ps_nir_builder builder = { 0 };
    struct chrome9_ps_instruction *terminal;
@@ -3005,6 +3072,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    nir_block *block;
    nir_def *result = NULL;
 
+   *lowered = false;
    if (!chrome9_fs_straight_line_entrypoint(nir, NULL, &block) ||
        nir->info.float_controls_execution_mode)
       return false;
@@ -3127,13 +3195,18 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    for (unsigned s = 0; s < source_count; s++)
       terminal->source[s] = operands[s];
    builder.ir.count++;
-   if (!chrome9_compile_ps_ir(&builder.ir, program))
-      return false;
+   *ir = builder.ir;
+   memset(program, 0, sizeof(*program));
    memcpy(program->immediate, builder.immediate,
           sizeof(program->immediate));
    program->immediate_mask = builder.immediate_mask;
-   *ir = builder.ir;
-   return true;
+   *lowered = true;
+   bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
+
+   memcpy(program->immediate, builder.immediate,
+          sizeof(program->immediate));
+   program->immediate_mask = builder.immediate_mask;
+   return compiled;
 }
 
 /*
@@ -3239,11 +3312,38 @@ chrome9_compile_native_fs(struct chrome9_shader *shader, nir_shader *nir)
 {
    struct chrome9_fs_key key;
    enum chrome9_shader_verify_error error;
-   bool from_nir;
+   bool from_nir, lowered;
 
    memset(&shader->native_fs_ir, 0, sizeof(shader->native_fs_ir));
    from_nir = chrome9_compile_ps_nir(nir, &shader->native_fs_ir,
-                                     &shader->native_fs);
+                                     &shader->native_fs, &lowered);
+   shader->semantic_fs_valid = lowered;
+   if (lowered) {
+      for (unsigned i = 0; i < shader->native_fs_ir.texture_count; i++) {
+         const struct chrome9_ps_texture_instruction *texture =
+            &shader->native_fs_ir.texture[i];
+
+         shader->semantic_sampler_mask |= 1u << texture->sampler;
+         shader->semantic_varying_mask |= 1u << texture->coordinate;
+      }
+      for (unsigned i = 0; i < shader->native_fs_ir.count; i++) {
+         const struct chrome9_ps_instruction *instruction =
+            &shader->native_fs_ir.instruction[i];
+
+         for (unsigned s = 0; s < 3; s++) {
+            const struct chrome9_ps_source *source = &instruction->source[s];
+
+            if (source->file == CHROME9_PS_SOURCE_CONSTANT)
+               shader->semantic_constant_mask |= 1u << source->id;
+            else if (source->file == CHROME9_PS_SOURCE_INPUT) {
+               shader->semantic_input_mask |= 1u << source->id;
+               shader->semantic_varying_mask |= 1u << source->id;
+            } else if (source->file == CHROME9_PS_SOURCE_TEXTURE) {
+               shader->semantic_varying_mask |= 1u << source->id;
+            }
+         }
+      }
+   }
    if (from_nir) {
       if (chrome9_fs_key_from_nir(nir, &key))
          shader->native_fs_key = key;
@@ -3410,6 +3510,10 @@ chrome9_create_fs_state(struct pipe_context *pipe,
          CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
       shader->native_fs_valid = straight_line &&
          chrome9_compile_native_fs(shader, state->ir.nir);
+      if (shader->semantic_fs_valid && ctx->draw_fragment_program &&
+          !shader->semantic_input_mask &&
+          shader->fragment_program == CHROME9_FS_UNSUPPORTED)
+         shader->fragment_program = CHROME9_FS_COMPILED_ALU;
       if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
           ctx->draw_program_triangle_d16_rhw_batch &&
           chrome9_native_fs_is_program_batch(shader, ctx->fragment_add))
@@ -3423,11 +3527,15 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       }
       if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false))
          fprintf(stderr, "chrome9: create FS %p program=%u supported=%u "
-                 "native=%u nir=%u alu=%u tau=%u constants=%08x "
-                 "immediates=%08x\n",
+                 "semantic=%u native=%u nir=%u ir=%u/%u alu=%u tau=%u "
+                 "constants=%08x immediates=%08x\n",
                  (void *)shader, shader->fragment_program,
-                 shader->supported, shader->native_fs_valid,
-                 shader->native_fs_from_nir, shader->native_fs.alu_count,
+                 shader->supported, shader->semantic_fs_valid,
+                 shader->native_fs_valid,
+                 shader->native_fs_from_nir,
+                 shader->native_fs_ir.count,
+                 shader->native_fs_ir.texture_count,
+                 shader->native_fs.alu_count,
                  shader->native_fs.tau_count,
                  shader->native_fs.constant_mask,
                  shader->native_fs.immediate_mask);
@@ -4115,6 +4223,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->draw_program_triangle_d16_rhw_batch =
       !!(capabilities &
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);
+   ctx->draw_fragment_program =
+      !!(capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
    ctx->fragment_add =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_ADD);
    ctx->draw_textured_triangle =

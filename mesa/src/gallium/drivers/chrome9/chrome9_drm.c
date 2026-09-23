@@ -35,6 +35,18 @@ _Static_assert(sizeof(struct drm_chrome9_copy_rect) == 96,
                "Chrome9 copy rectangle ABI size");
 _Static_assert(sizeof(struct drm_chrome9_gem_create) == 24,
                "Chrome9 GEM create ABI size");
+_Static_assert(sizeof(struct drm_chrome9_fragment_source) == 8,
+               "Chrome9 fragment source ABI size");
+_Static_assert(sizeof(struct drm_chrome9_fragment_destination) == 4,
+               "Chrome9 fragment destination ABI size");
+_Static_assert(sizeof(struct drm_chrome9_fragment_instruction) == 32,
+               "Chrome9 fragment instruction ABI size");
+_Static_assert(sizeof(struct drm_chrome9_fragment_vertex) == 152,
+               "Chrome9 fragment vertex ABI size");
+_Static_assert(sizeof(struct drm_chrome9_fragment_texture_state) == 176,
+               "Chrome9 fragment texture ABI size");
+_Static_assert(sizeof(struct drm_chrome9_draw_fragment_program) == 184,
+               "Chrome9 fragment draw ABI size");
 
 bool
 chrome9_get_param(int fd, uint32_t param, uint64_t *value)
@@ -173,6 +185,15 @@ chrome9_draw_program_triangle_d16_rhw_batch(
       return false;
    return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
                 draw) == 0;
+}
+
+bool
+chrome9_draw_fragment_program(
+   int fd, const struct drm_chrome9_draw_fragment_program *draw)
+{
+   if (!draw)
+      return false;
+   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_FRAGMENT_PROGRAM, draw) == 0;
 }
 
 bool

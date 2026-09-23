@@ -59,6 +59,11 @@ struct chrome9_shader {
    struct chrome9_fs_key native_fs_key;
    struct chrome9_ps_ir native_fs_ir;
    struct chrome9_ps_program native_fs;
+   uint32_t semantic_constant_mask;
+   uint16_t semantic_input_mask;
+   uint16_t semantic_varying_mask;
+   uint8_t semantic_sampler_mask;
+   bool semantic_fs_valid;
    bool native_fs_valid;
    bool native_fs_from_nir;
    bool flat_primary;
@@ -124,6 +129,7 @@ struct chrome9_context {
    bool draw_triangle_d16_rhw_run;
    bool draw_triangle_d16_rhw_chain;
    bool draw_program_triangle_d16_rhw_batch;
+   bool draw_fragment_program;
    bool fragment_add;
    bool draw_textured_triangle;
    bool draw_textured_triangle_batch;
