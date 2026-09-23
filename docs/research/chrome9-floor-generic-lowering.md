@@ -140,3 +140,12 @@ eight-ALU native fragment program, rendered the expected interior RGBA bytes
 unchanged.  The previous gl_FragCoord FBO test passed immediately afterward
 and dmesg showed no new engine fault.  This qualifies those finite negative
 modulus inputs; it does not establish every divisor or precision corner.
+
+Mesa commit `ef1a0c1` additionally enables standard NIR `lower_fceil`,
+which expands `ceil(x)` to `-floor(-x)` through the already-tested floor
+subgraph; parent integration commit is `7552b17`.  A live GLSL uniform
+`ceil(u)*.25+.25` check with the same negative/positive `u` compiled to a
+seven-ALU native program and rendered expected interior RGBA bytes
+`(0,64,128,191)`.  Its following gl_FragCoord draw passed and dmesg remained
+clean.  Signed zero, non-finite values, and broader precision remain separate
+conformance gates.
