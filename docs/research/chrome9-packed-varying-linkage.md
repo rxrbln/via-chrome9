@@ -262,3 +262,23 @@ one-UNORM-step tolerance as RGB).  A normal completion with four correct
 quadrants qualifies the shared T0 ALU/TAU path.  An ioctl timeout or lost SSH
 requires the usual engine quarantine and no retry; a normal but incorrect
 image is a numerical/linkage failure, not a retirement success.
+
+The one-ALU discriminator was run once on VX900 silicon on 2026-09-23 after
+the programmable A01 correction.  The submitted ring contained the exact
+ALU `0140b6d0 302c0000 00f20005 00000820`, TAU `301006f0`, and
+A01=`01002522`.  It timed out on the first draw at the post-draw cookie
+(`seq=17`, `kind=22`, current `0x7c00`, pause `0x7bf0`, stop `0x7c70`,
+CR=`80000000`, engine=`00002f11`).  The engine was quarantined and no retry
+was made.  This rules out TEMP allocation, partial writes, literal ONE,
+multi-record H3 framing and an ALU dependency chain as necessary causes.  It
+does not yet distinguish float3 FE/FVF transport from simultaneous ALU and
+TAU consumption of the same physical coordinate.
+
+The `varying_xyzx` mode of `tools/re/chrome9_fragment_smoke.c` implements the
+preceding ALU-only float3 gate.  It submits constant float3
+`(1,0.5,0.25)`, expects 1,176 covered pixels near packed BGRA `ffff8040`,
+requires the exterior and both guard pages to remain unchanged, and carries
+no texture or TAU state.  If it times out, the source-backed fault boundary is
+the float3 declaration/producer path.  If it retires with the expected image,
+the failed one-ALU texture draw isolates the remaining boundary to shared
+ALU/TAU coordinate consumption and its runtime linkage state.
