@@ -132,3 +132,11 @@ uses standard NIR FRC+SUB lowering and did not add native-FLR opcode 103.
 Focused compile coverage should continue to require one FRC plus one SUB for
 the floor subgraph and verify that lowered `fmod` contains no surviving
 `ffloor` before semantic translation.
+
+The floor-dependent `lower_fmod` path also passed a live GLSL check.  A
+uniform `mod(u,vec4(2))*0.5` with `u=(-1.75,-.25,.25,1.75)` compiled to an
+eight-ALU native fragment program, rendered the expected interior RGBA bytes
+`(32,223,32,223)` on a 64×64 RGBA8+D16 FBO, and left the black exterior
+unchanged.  The previous gl_FragCoord FBO test passed immediately afterward
+and dmesg showed no new engine fault.  This qualifies those finite negative
+modulus inputs; it does not establish every divisor or precision corner.
