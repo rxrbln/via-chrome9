@@ -156,6 +156,48 @@ projective STRQ remains a separate unproved state gate; the current safe
 projected path lowers S/Q and T/Q in software and retains the ordinary 2-D
 tuple.
 
+### A08--A0a packing and transition closure
+
+The complete dense eight-coordinate dimension image is:
+
+```text
+A08[3:0]             coordinate high-water
+A08[9:8],[17:16]     T0,T1 dimension minus one
+A09[1:0],[9:8],[17:16] T2,T3,T4 dimension minus one
+A0a[1:0],[9:8],[17:16] T5,T6,T7 dimension minus one
+```
+
+The exact all-ST vendor/manual images provide two boundaries:
+
+```text
+five coordinates  A08=08010105 A09=09010101 A0a=0a000000
+eight coordinates A08=08010108 A09=09010101 A0a=0a010101
+```
+
+Emit all three self-addressed words in every generic state image.  A09 first
+becomes nonzero at T2 and A0a at T5, but omitting them on a later low-count
+draw would retain dimensions from a prior wide draw.  The eight-to-one
+transition must therefore write A09=`09000000` and A0a=`0a000000`, not merely
+reduce A08's count.
+
+Keep sampler-coordinate dimension separate from producer width.  A
+texture-only 2-D slot uses dimension code one even if its VS producer is a
+float4.  For a direct ALU-only T input, the manual-consistent construction is
+the producer `varying_width-1`; this is not yet a byte-exact shader-object
+rule.  The Windows programmable update in `VTGUModeDX32A.dll` writes only the
+compiled coordinate high-water to A00 at `0x1015b255..0x1015b26b`; it does
+not copy a PS width into A08.  Its preceding linkage builder
+`0x101574a0..0x10157b8a` instead maintains eight producer/stage dimensions at
+context offsets `+0x2d80..+0x2d9c` (the programmable default writes eight
+width-four entries at `0x10157600..0x1015762a`).  A slot shared by direct ALU
+and TAU must retain enough produced lanes for both consumers while the TAU
+stage dimension still describes the texture operation.
+
+At the current audit point the generic kernel builder patches only T0/T1 in
+A08 and emits no A09/A0a, although its FVF/raster builder already emits A26
+and A29 for T4..T7.  That mismatch makes three through eight direct inputs
+incomplete even after the independent A00 high-water fix.
+
 ## Fail-closed kernel contract
 
 A versioned varying-width successor can be bounded without accepting native
