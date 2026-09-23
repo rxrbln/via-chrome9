@@ -215,6 +215,37 @@ later accept expressions whose difference is independently proven normal,
 non-NaN, and sign preserving.  It must inspect `alu->fp_math_ctrl` for every
 comparison it transforms.
 
+### Five-step guarded conditionals gate
+
+`tools/re/chrome9_conditionals_guard_smoke.c` is the bounded successor to the
+single-CMP tests.  It uses only already-defined semantic UAPI operations and
+does not require SGE exposure.  Each of five dependent steps emits:
+
+```text
+condition = SUB(current, 0.5)
+true      = FRC(MUL(current, 2.0))
+false     = FRC(MUL(current, 3.0))
+current   = CMP(condition, true, false)
+```
+
+This is the same six-record step recovered in
+`chrome9-glmark-control-flow-corpus.tsv` for `conditionals_body_5`.  The raw
+production program has 34 records including its three-record position prefix
+and terminal move, with active tuple `(0,6,0,0)`.  The guarded test replaces
+that already-qualified prefix with a direct T0 seed, so its candidate is 31
+ALUs and isolates the five SUB/MUL/FRC/CMP steps plus allocator lifetime
+reuse.  It deliberately allocates 30 monotonically numbered virtual
+temporaries; the kernel must recycle physical r0--r11 by last use rather than
+accepting it only because the test names a small fixed register set.
+
+The exact T0 seed is RGBA `(.125,.375,.25,.75)`.  A MOV control must store
+host BGRA `bf206040`.  Five steps produce exact binary fractions
+`(.375,.125,0,0)`, host BGRA `00602000`; across those lanes both CMP arms are
+taken.  Both draws require D16 near `8000`, untouched exterior pixels, and
+intact leading/trailing BO guard pages.  The tool is host-built only and has
+not been submitted to hardware.  Its first live use must be one bounded run
+bracketed by a known-good draw, with no retries after timeout.
+
 ## Guarded qualification sequence
 
 An exact semantic SGE successor should expand one validated instruction to
