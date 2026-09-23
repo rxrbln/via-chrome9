@@ -17,6 +17,11 @@ struct chrome9_texture_format_info {
 const struct chrome9_texture_format_info *
 chrome9_texture_format_info(enum pipe_format format);
 
+/* Storage support is independent of sampling and render capability. */
+unsigned chrome9_format_storage_cpp(enum pipe_format format);
+bool chrome9_pack_depth_clear(enum pipe_format format, double depth,
+                              uint32_t *word);
+
 bool chrome9_texture_swizzle_supported(enum pipe_format format,
                                        unsigned r, unsigned g,
                                        unsigned b, unsigned a);

@@ -65,7 +65,6 @@ chrome9_resource_layout(const struct pipe_resource *templ,
 {
    uint64_t aligned_level0_size;
    uint64_t cursor;
-   const struct chrome9_texture_format_info *format;
    unsigned cpp;
    long page_size;
 
@@ -79,9 +78,9 @@ chrome9_resource_layout(const struct pipe_resource *templ,
       return true;
    }
 
-   format = chrome9_texture_format_info(templ->format);
+   cpp = chrome9_format_storage_cpp(templ->format);
    if (!chrome9_is_surface_target(templ->target) ||
-       (!format && templ->format != PIPE_FORMAT_Z16_UNORM) ||
+       !cpp ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
        templ->depth0 != 1 || templ->array_size != 1 ||
@@ -96,7 +95,6 @@ chrome9_resource_layout(const struct pipe_resource *templ,
        page_size > UINT32_MAX || page_size < CHROME9_MIP_ALIGNMENT)
       return false;
 
-   cpp = format ? format->bytes_per_pixel : 2;
    for (unsigned level = 0; level <= templ->last_level; level++) {
       const unsigned width = u_minify(templ->width0, level);
       const unsigned height = u_minify(templ->height0, level);

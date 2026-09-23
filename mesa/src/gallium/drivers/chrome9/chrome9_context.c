@@ -4055,23 +4055,29 @@ chrome9_clear_depth_target(struct chrome9_resource *target, double depth,
                            unsigned x, unsigned y, unsigned width,
                            unsigned height)
 {
-   uint16_t value;
+   uint32_t value;
 
-   if (!target || target->base.format != PIPE_FORMAT_Z16_UNORM ||
+   if (!target ||
+       !chrome9_pack_depth_clear(target->base.format, depth, &value) ||
        x >= target->base.width0 || y >= target->base.height0)
       return;
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
-   if (!isfinite(depth))
-      depth = 0.0;
-   value = (uint16_t)(CLAMP(depth, 0.0, 1.0) * 65535.0 + 0.5);
    for (unsigned row = 0; row < height; row++) {
-      uint16_t *pixels = (uint16_t *)
-         ((uint8_t *)target->bo.map + target->data_offset +
-          (uint64_t)(y + row) * target->stride) + x;
+      uint8_t *pixels = (uint8_t *)target->bo.map + target->data_offset +
+                        (uint64_t)(y + row) * target->stride;
 
-      for (unsigned column = 0; column < width; column++)
-         pixels[column] = value;
+      if (target->base.format == PIPE_FORMAT_Z16_UNORM) {
+         uint16_t *z16 = (uint16_t *)pixels + x;
+
+         for (unsigned column = 0; column < width; column++)
+            z16[column] = (uint16_t)value;
+      } else {
+         uint32_t *x8z24 = (uint32_t *)pixels + x;
+
+         for (unsigned column = 0; column < width; column++)
+            x8z24[column] = value;
+      }
    }
 }
 

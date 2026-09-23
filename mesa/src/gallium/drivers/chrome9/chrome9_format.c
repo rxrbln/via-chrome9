@@ -3,6 +3,8 @@
 
 #include "chrome9_format.h"
 
+#include <math.h>
+
 #include "drm-uapi/chrome9_drm.h"
 #include "pipe/p_state.h"
 #include "util/macros.h"
@@ -25,6 +27,37 @@ chrome9_texture_format_info(enum pipe_format format)
       if (texture_formats[i].pipe_format == format)
          return &texture_formats[i];
    return NULL;
+}
+
+unsigned
+chrome9_format_storage_cpp(enum pipe_format format)
+{
+   const struct chrome9_texture_format_info *info =
+      chrome9_texture_format_info(format);
+
+   if (info)
+      return info->bytes_per_pixel;
+   if (format == PIPE_FORMAT_Z16_UNORM)
+      return 2;
+   if (format == PIPE_FORMAT_X8Z24_UNORM)
+      return 4;
+   return 0;
+}
+
+bool
+chrome9_pack_depth_clear(enum pipe_format format, double depth,
+                         uint32_t *word)
+{
+   if (!word || (format != PIPE_FORMAT_Z16_UNORM &&
+                 format != PIPE_FORMAT_X8Z24_UNORM))
+      return false;
+   if (!isfinite(depth))
+      depth = 0.0;
+   depth = depth < 0.0 ? 0.0 : depth > 1.0 ? 1.0 : depth;
+   *word = format == PIPE_FORMAT_Z16_UNORM ?
+      (uint32_t)(depth * 65535.0 + 0.5) :
+      (uint32_t)(depth * 16777215.0 + 0.5) << 8;
+   return true;
 }
 
 bool
