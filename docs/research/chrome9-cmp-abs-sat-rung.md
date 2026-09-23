@@ -162,9 +162,28 @@ record.  `tools/re/chrome9_cmp_guard_smoke.c --cmp-temp-true` implements this
 legalization and has passed on VX900 with result `ff20bf80`, correct D16 and
 intact guards; the known-good EGL draw afterward also passed.  This proves the
 documented `>=0` behavior for negative, positive, +0, and -0 once the native
-resource constraint is respected.  The direct-T0 and vPos successor modes are
-now the next linkage gates.  General lowering must insert the legalization
-based on distinct native constant ids, not shader identity.
+resource constraint is respected.  General lowering must insert the
+legalization based on distinct native constant ids, not shader identity.
+
+The two dynamic-condition successor gates have now passed too:
+
+- direct T0 condition used exact record
+  `00820530 30081053 00f2c005 00090820`, A90=`90058001`, A92=`92000001`;
+  `--varying-condition` returned exact `ff20bf80` for negative, positive,
+  +0, and -0 lanes;
+- vPos threshold used production records
+  `82c316d0 00140924 00108000 00000020` and
+  `00820530 00081053 00f20000 00090820`, with the VX900 draw-time MISC
+  A90/A8A patch; `--position-threshold` returned green for x<32 and red for
+  x>=32 exactly.
+
+Both draws passed D16 and color/depth guards, their known-good EGL successor
+draws passed, and dmesg remained clean.  The second row proves an ordinary
+TEMP condition produced by preceding arithmetic, in addition to vPos input
+and per-pixel selection.  It initially returned `EINVAL` only because the
+test retained a nonzero unused `src[2]` after changing its first instruction
+from CMP to SUB; tools commit `5898168` clears that field.  This was correct
+fail-closed UAPI validation, not a hardware mismatch.
 
 The generic driver legalization was validated on the 192.168.2.60 VX900
 target with the rebuilt Mesa and DRM module.  The kernel's module-load
