@@ -282,3 +282,12 @@ no texture or TAU state.  If it times out, the source-backed fault boundary is
 the float3 declaration/producer path.  If it retires with the expected image,
 the failed one-ALU texture draw isolates the remaining boundary to shared
 ALU/TAU coordinate consumption and its runtime linkage state.
+
+That float3-only gate passed on VX900 silicon on 2026-09-23 with module
+SHA-256 beginning `9f13173`: the ioctl completed, exactly 1,176 covered
+pixels changed, both the first and interior pixels were `ffff8040`, the
+exterior remained zero, and no engine timeout was logged.  Together with the
+one-ALU timeout above, this excludes float3 FE/FVF transport by itself.  The
+narrow remaining boundary is simultaneous direct-ALU `T0.x` and TAU
+`T0.yz` consumption of physical coordinate zero, including any proprietary
+runtime routing state which selects or duplicates that shared coordinate.
