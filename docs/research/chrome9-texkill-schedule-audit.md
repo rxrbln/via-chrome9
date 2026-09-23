@@ -264,6 +264,13 @@ guards, and unchanged A8 source.  A linear-filtered `0x7f`/`0x80` midpoint
 read back as alpha `0x80` in BGRA8 but was discarded by TEXKILL.  The packed
 8-bit readback does not reveal the internal filtered value's sign relative
 to half; this is a diagnostic, not evidence for exact-equality semantics.
+The VX900 3D manual, part II, printed pp. 108 and 127, says texture alpha
+always uses high-bit extension to s1.10.  Its 8-to-11 conversion gives
+`C11 = 4*C8 + floor(C8/64)` below 255: `0x7f` becomes 509/1024 and `0x80`
+becomes 514/1024.  Their ideal halfway filter value is 511.5/1024, just
+below half if the filter truncates to code 511.  The observed discard is
+consistent with that pipeline, while the separately rounded BGRA8 output can
+still be `0x80`; the exact filter rounding has not been measured.
 The raw constant zero-predicate test above separately proves zero survival.
 Broader sampled formats, stencil, and GL helper semantics remain pending.
 The fixed A33
