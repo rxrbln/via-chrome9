@@ -396,8 +396,10 @@ The original direct-T0 packet's A00=`00000001` was incomplete and one direct
 T0 does require A00=`00000011`; that explains why the A08-only tests still
 hung.  The later live success qualifies this one-resource case only.  The
 implementation must carry the scheduled program's active texture-temporary
-count separately.  The exact finalizer provenance, compiler matrix, and
-current-code mismatch are recorded in `chrome9-direct-t0-fe-count.md`.
+count separately.  That is now implemented and host-selftested in kernel
+commits `eb8524b` and `5d70f4b`; the corrected multi-varying draw has not
+yet been silicon-qualified.  The exact finalizer provenance and compiler
+matrix are recorded in `chrome9-direct-t0-fe-count.md`.
 
 The bounded one-resource correction passed on VX900 silicon on 2026-09-23.
 With A00 changed from zero resources to one, the same guarded
@@ -409,6 +411,63 @@ requirement from binary proof to a live direct-fragment-input requirement.
 It does not validate `max(texture_count,varying_count)` or arbitrary varying
 counts and widths: the scheduled resource count, A09/A0a state, and the
 three-through-eight input closures remain separate gates.
+
+### T0 four-component consumer dimension on VX900
+
+The 2026-09-23 Gallium screen smoke exposed a separate two-dimensional
+consumer setting after the direct-T0 resource-count correction. A generic
+`MOV oC0,T0` with an identity XYZW swizzle submitted two triangles without
+rejection, but a constant `(0.25, 0.5, 0.75, 0.5)` varying produced
+`00408000` instead of `004080bf`: X and Y arrived, Z did not. A bounded
+userspace payload diagnostic confirmed the first vertex reached the ioctl as
+`3e800000,3f000000,3f400000,3f000000` with swizzle `0,1,2,3`. The kernel
+already declared float4 in the raster/VS producer and FE A08=`08010301`,
+but kept FE A01=`01002521`, whose bits 1:0 select only S/T.
+
+The proprietary Linux `stmUpdateTCI_invi` writer and
+`texEnableToStateKey[4]` table independently establish the float4
+consumer tuple A01=`01002523`, A08=`08010301` (see
+`chrome9-format-cube-bridge-closure.md`). For an ALU-only T0, deriving
+A01 bits 1:0 from the T0 varying width made the same guarded draw return
+`004080bf`; the vec3,
+vec2, and full quad-strip coverage tests also passed, without a GPU timeout.
+This proves the T0 width-four packet on this VX900, not the correctness of
+multi-varying resource allocation or all eight FE coordinate slots. The
+full screen smoke then passed D16 after its negative-control and per-triangle
+cmd22 batch-count expectations were updated to match the current compiler.
+The guarded D24 combined/depth-only/render-to-texture oracle also passed on
+this module.
+
+That rule does **not** apply unchanged to a mixed ALU-plus-2D-sampler T0.
+Its VS producer may be float3 (gray in X, sampled UV in YZ), while the TAU
+consumer remains two-dimensional. The packed gray+UV smoke timed out first
+with A01=`01002522`, A08=`08010201`, then again with
+A01=`01002521`, A08=`08010101`. The latter incorrectly shrank the A08
+VS-output declaration: the manual says A08 describes producer width, while
+A01 selects the TAU consumer dimension. The source-consistent mixed tuple is
+A01=`01002521`, A08=`08010201`.  It was subsequently tried in a bounded
+`--texture-only` screen smoke and still timed out at cmd22 sequence four;
+therefore it is a necessary source-backed correction, not a complete fix.
+
+This distinction is explicit in the VX900 Part II manual, pp. 134 and 138:
+A01 is the primitive-engine Texture 0 dimension; A08 describes Texture A in
+the vertex buffer and counts VS texture-coordinate outputs. The proprietary
+PS 2.0 compiler also emits the exact three ALU records, one TAU record,
+active-resource tuple `(1,2,1,1)`, and A90--A93 controls seen in the
+timed-out smoke for the same `sample * vec4(gray,gray,gray,1)` semantics.
+The remaining differential is not the three-ALU shader instruction encoding.
+The production compiler also emits a byte-exact two-ALU equivalent with a
+partial temporary and literal ONE for sampled alpha; a guarded discriminator
+for that form is checked in at `tools/re/chrome9_packed_varying_guard_smoke.c`
+but has not yet run on silicon.
+
+The FE builder also formerly confused sampler high-water with both A08's VS
+output count and T0's TAU-consumer presence.  A sparse `TEX(s5,T5)` uses one
+compacted VS coordinate output despite sampler high-water six; conversely,
+sampling T1 does not make an ALU-only float4 T0 a two-dimensional consumer.
+Kernel commit `326adb3` now takes A08 count from the actual VS outputs and
+A01's T0 selection from the compiler's TAU-coordinate mask.  This has host
+build and selftest coverage only; the new module is not yet live-qualified.
 
 ### Three-coordinate silent-black boundary
 
