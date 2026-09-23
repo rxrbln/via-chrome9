@@ -134,6 +134,63 @@ into a shader without a variant key.  Reject `gl_FragCoord.zw` until separately
 proved.  Neither this object nor a successful vendor compile proves GPU
 execution.
 
+## Offline `ideas` discard successor
+
+The production compiler also accepts the complete dependency shape needed by
+the glmark2 logo-shadow fragment path:
+
+```text
+r0.xy = vPos.xy * c0.xy
+r1    = TEX(s0, r0.xyxy)
+r2    = r1.aaaa - c1.aaaa
+KILL r2
+oC0   = r1
+```
+
+Its exact PS 2.0 stream is:
+
+```text
+ffff0200
+04000005 00030000 10e41000 20e40000
+04000042 000f0001 00440000 20e40800
+03000003 000f0002 00ff0001 20ff0001
+01000041 000f0002
+02000001 000f0800 00e40001
+0000ffff
+```
+
+Linux configuration two emits exactly:
+
+```text
+ALU 0140b6d0 d008006d 0032c306 00000020
+    01c00530 101c0053 00f20004 000d0420
+    80016db0 b0140924 00f0816d 000000a0
+    01c00530 301c0053 00f20205 000d0460
+    01c00530 301c0053 00f20105 000d0820
+TAU 301101b0
+    314011b1
+A90..A9a
+    90058008 91000003 92020005 93000003
+    94000000 9500000a 96000000 97000000
+    98000000 99000000 9a000000
+```
+
+The pre-finalizer resource tuple is `(2,3,0,1)`.  MISC adjustment keeps the
+first bucket and relocation id 3, but the A00-producing third output remains
+zero: both texture/address slots are defined internally by bridge ALUs.  A91
+bits zero and one name the computed sample coordinate and KILL scratch;
+A95 bits one and three enter the two TAUs, and A93 bits zero and one return to
+the dependent ALUs.  A90 bit 20 remains clear as required for dependent
+TEXKILL.  This is the exact whole-program selftest tuple; composing the vPos,
+sample and KILL fragments while recomputing transition maps from counts would
+not be equivalent.
+
+This object adds no ordinary VS T output and must not change FE A08 or the
+FVF varying mask.  It does require stage-zero image/sampler state and the
+ordinary KILL color/depth suppression contract.  Keep it offline until the
+smaller MISC identity/pixel-center and computed-coordinate gates pass; it is
+not a substitute for either gate.
+
 ## Guarded silicon sequence
 
 `tools/re/chrome9_vpos_texture_guard_smoke.c` is an opt-in raw cmd22 test
