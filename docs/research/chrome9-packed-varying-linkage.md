@@ -312,6 +312,14 @@ object also has bit zero, while a TAU-only T0 object does not, confirming
 that `+0x6c` is the direct-ALU coordinate-use bitmap even when the same slot
 also appears in A91's TAU-coordinate bitmap.
 
+A multi-bit differential removes any single-slot ambiguity.  Production
+configuration two for `TEX r0,s0,T0; MAD oC0,r0,T0,T1` emits ALU
+`02c10530 302c0053 00f20005 00000820`, TAU `301001b0`, public-instance
+`+0x40=3`, `+0x6c=3`, and `+0x70=1`.  Its runtime controls are therefore
+`A90=90018003`, `A91=91000001`: bit zero is present in both consumer masks,
+while bit one is direct-ALU-only.  A90 must receive the complete ALU bitmap,
+not merely the difference between ALU and TAU bitmaps.
+
 The timed-out generic packet incorrectly emitted A90=`90018000`.  Its
 compiler used `alu_varying_mask & ~tau_varying_mask`, deleting the overlap;
 the proprietary postprocessor does not perform that subtraction.  The next
