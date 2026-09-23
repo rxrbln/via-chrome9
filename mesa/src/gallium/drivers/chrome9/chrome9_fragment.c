@@ -133,6 +133,9 @@ chrome9_fragment_opcode(enum chrome9_ps_opcode op, uint8_t *result)
    case CHROME9_PS_OPCODE_FRC:
       *result = DRM_CHROME9_FRAGMENT_OP_FRC;
       return true;
+   case CHROME9_PS_OPCODE_KILL:
+      *result = DRM_CHROME9_FRAGMENT_OP_KILL;
+      return true;
    default:
       return false;
    }
@@ -150,6 +153,7 @@ chrome9_fragment_source_count(enum chrome9_ps_opcode op)
    case CHROME9_PS_OPCODE_RSQ:
    case CHROME9_PS_OPCODE_ABS:
    case CHROME9_PS_OPCODE_FRC:
+   case CHROME9_PS_OPCODE_KILL:
       return 1;
    case CHROME9_PS_OPCODE_MUL:
    case CHROME9_PS_OPCODE_ADD:
@@ -165,6 +169,17 @@ chrome9_fragment_source_count(enum chrome9_ps_opcode op)
    default:
       return 0;
    }
+}
+
+static bool
+chrome9_fragment_source_empty(const struct chrome9_ps_source *source)
+{
+   if (source->file || source->id || source->modifier || source->last_use)
+      return false;
+   for (unsigned c = 0; c < 4; c++)
+      if (source->swizzle[c])
+         return false;
+   return true;
 }
 
 bool
@@ -189,15 +204,29 @@ chrome9_fragment_build_instructions(
       if (!source_count ||
           !chrome9_fragment_opcode(source->op, &instruction->op))
          return false;
-      switch (source->destination.file) {
-      case CHROME9_PS_DESTINATION_TEMP:
-         instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
-         break;
-      case CHROME9_PS_DESTINATION_COLOR:
-         instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
-         break;
-      default:
-         return false;
+      if (source->op == CHROME9_PS_OPCODE_KILL) {
+         if (source->destination.file || source->destination.id ||
+             source->destination.writemask ||
+             source->destination.saturate || source->sampler ||
+             source->source[0].file != CHROME9_PS_SOURCE_TEMP ||
+             source->source[0].modifier ||
+             !chrome9_fragment_source_empty(&source->source[1]) ||
+             !chrome9_fragment_source_empty(&source->source[2]))
+            return false;
+         for (unsigned c = 0; c < 4; c++)
+            if (source->source[0].swizzle[c] != c)
+               return false;
+      } else {
+         switch (source->destination.file) {
+         case CHROME9_PS_DESTINATION_TEMP:
+            instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
+            break;
+         case CHROME9_PS_DESTINATION_COLOR:
+            instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
+            break;
+         default:
+            return false;
+         }
       }
       instruction->dst.index = source->destination.id;
       instruction->dst.writemask = source->destination.writemask;

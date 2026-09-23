@@ -101,6 +101,7 @@ enum chrome9_ps_opcode {
    CHROME9_PS_OPCODE_ABS,
    CHROME9_PS_OPCODE_CMP,
    CHROME9_PS_OPCODE_FRC,
+   CHROME9_PS_OPCODE_KILL,
 };
 
 struct chrome9_ps_instruction {
@@ -113,7 +114,8 @@ struct chrome9_ps_instruction {
 /* Ordered straight-line compiler IR.  Texture and ALU operations share one
  * stream so data dependencies cannot be lost by construction.  TEX uses
  * source[0] for its full coordinate source and sampler for its logical
- * sampler; every other field has the same meaning as an ALU instruction. */
+ * sampler.  KILL is a destination-free ordered side effect with one identity
+ * temporary source; the kernel emits its native ALU-to-TAU bridge. */
 struct chrome9_ps_ir {
    struct chrome9_ps_instruction instruction[CHROME9_PS_MAX_INSTRUCTIONS];
    uint8_t count;

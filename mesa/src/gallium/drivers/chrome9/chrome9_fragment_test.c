@@ -158,6 +158,56 @@ check_computed_texture_order(void)
 }
 
 static bool
+check_kill_conversion(void)
+{
+   struct drm_chrome9_fragment_instruction
+      native[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   struct chrome9_ps_ir ir = { .count = 3 };
+   unsigned count = 0;
+
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[0].destination = temporary(0);
+   ir.instruction[0].source[0] = source(
+      CHROME9_PS_SOURCE_CONSTANT, 0, CHROME9_PS_SWIZZLE_X,
+      CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_Z,
+      CHROME9_PS_SWIZZLE_W);
+   ir.instruction[1].op = CHROME9_PS_OPCODE_KILL;
+   ir.instruction[1].source[0] = source(
+      CHROME9_PS_SOURCE_TEMP, 0, CHROME9_PS_SWIZZLE_X,
+      CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_Z,
+      CHROME9_PS_SWIZZLE_W);
+   ir.instruction[2].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[2].destination = color();
+   ir.instruction[2].source[0] = source(
+      CHROME9_PS_SOURCE_CONSTANT, 1, CHROME9_PS_SWIZZLE_X,
+      CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_Z,
+      CHROME9_PS_SWIZZLE_W);
+
+   CHECK(chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   CHECK(count == 3);
+   CHECK(native[1].op == DRM_CHROME9_FRAGMENT_OP_KILL);
+   CHECK(!native[1].dst.file && !native[1].dst.writemask &&
+         !native[1].sampler && native[1].src[0].file ==
+            DRM_CHROME9_FRAGMENT_FILE_TEMP);
+   ir.instruction[1].destination = color();
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   memset(&ir.instruction[1].destination, 0,
+          sizeof(ir.instruction[1].destination));
+   ir.instruction[1].source[0].swizzle[3] = CHROME9_PS_SWIZZLE_X;
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   ir.instruction[1].source[0].swizzle[3] = CHROME9_PS_SWIZZLE_W;
+   ir.instruction[1].source[0].modifier = CHROME9_PS_SOURCE_NEGATE;
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   ir.instruction[1].source[0].modifier = 0;
+   ir.instruction[1].sampler = 1;
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   ir.instruction[1].sampler = 0;
+   ir.instruction[1].source[1].id = 1;
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   return true;
+}
+
+static bool
 check_depth_view_swizzles(void)
 {
    struct drm_chrome9_fragment_instruction instructions[2] = {
@@ -218,5 +268,6 @@ int
 main(void)
 {
    return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
-            check_computed_texture_order() && check_depth_view_swizzles());
+            check_computed_texture_order() && check_kill_conversion() &&
+            check_depth_view_swizzles());
 }

@@ -2541,11 +2541,12 @@ chrome9_ps_append_instruction(struct chrome9_ps_nir_builder *builder,
 
    if (builder->ir.count >= CHROME9_PS_MAX_INSTRUCTIONS)
       return NULL;
-   if (op == CHROME9_PS_OPCODE_TEX) {
+   if (op == CHROME9_PS_OPCODE_TEX || op == CHROME9_PS_OPCODE_KILL) {
       if (builder->texture_count >= CHROME9_PS_MAX_TAU)
          return NULL;
       builder->texture_count++;
-   } else {
+   }
+   if (op != CHROME9_PS_OPCODE_TEX) {
       if (builder->alu_count >= CHROME9_PS_MAX_ALU)
          return NULL;
       builder->alu_count++;
