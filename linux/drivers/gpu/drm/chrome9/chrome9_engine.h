@@ -48,6 +48,8 @@ int chrome9_draw_triangle_d16_rhw_chain_ioctl(struct drm_device *drm,
 					       struct drm_file *file);
 int chrome9_draw_program_triangle_d16_rhw_batch_ioctl(
 		struct drm_device *drm, void *data, struct drm_file *file);
+int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
+					struct drm_file *file);
 int chrome9_draw_textured_triangle_ioctl(struct drm_device *drm, void *data,
 					 struct drm_file *file);
 int chrome9_draw_textured_triangle_batch_ioctl(struct drm_device *drm,

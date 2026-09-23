@@ -29,6 +29,7 @@
 
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
+#include "chrome9_fragment.h"
 
 #define CHROME9_GART_SIZE		SZ_64K
 #define CHROME9_GART_ENTRIES		(CHROME9_GART_SIZE / sizeof(u32))
@@ -125,7 +126,12 @@ struct chrome9_job {
 	struct iosys_map depth_map;
 	struct iosys_map texture2_map;
 	struct iosys_map texture3_map;
-	struct chrome9_sf_mapping *sf_mappings[4];
+	struct chrome9_sf_mapping *sf_mappings[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	struct drm_gem_shmem_object *fragment_objects[
+		2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	struct sg_table *fragment_sgts[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	struct iosys_map fragment_maps[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	bool fragment_mapped[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	struct list_head quarantine_link;
 	unsigned int sf_mapping_count;
 	u32 cookie;
@@ -167,6 +173,7 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN,
 	CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_CHAIN,
 	CHROME9_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH,
+	CHROME9_DRAW_FRAGMENT_PROGRAM,
 };
 
 struct chrome9_draw_request {
@@ -217,6 +224,12 @@ struct chrome9_draw_request {
 	const struct drm_chrome9_vertex_d16 *batch_vertices;
 	const struct drm_chrome9_vertex_d16_rhw *batch_vertices_rhw;
 	const struct drm_chrome9_textured_vertex *textured_batch_vertices;
+	const struct drm_chrome9_fragment_vertex *fragment_vertices;
+	const struct drm_chrome9_fragment_texture_state *fragment_textures;
+	const struct chrome9_fragment_program *fragment_program;
+	u64 fragment_texture_size[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	u32 fragment_texture_count;
+	u32 fragment_depth_format;
 	u32 ps_program[4];
 	u32 ps_constant_c0[4];
 	u32 triangle_count;
@@ -253,6 +266,12 @@ static_assert(sizeof(struct drm_chrome9_ps_source) == 8);
 static_assert(sizeof(struct drm_chrome9_ps_instruction) == 24);
 static_assert(sizeof(struct drm_chrome9_draw_program_triangle_d16_rhw_batch) ==
 	      144);
+static_assert(sizeof(struct drm_chrome9_fragment_source) == 8);
+static_assert(sizeof(struct drm_chrome9_fragment_destination) == 4);
+static_assert(sizeof(struct drm_chrome9_fragment_instruction) == 32);
+static_assert(sizeof(struct drm_chrome9_fragment_vertex) == 152);
+static_assert(sizeof(struct drm_chrome9_fragment_texture_state) == 176);
+static_assert(sizeof(struct drm_chrome9_draw_fragment_program) == 184);
 static_assert(sizeof(struct drm_chrome9_texture_state) == 36);
 static_assert(sizeof(struct drm_chrome9_two_textured_vertex) == 40);
 static_assert(sizeof(struct drm_chrome9_draw_two_textured_triangle) == 240);
@@ -1543,6 +1562,271 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
+}
+
+static u32 chrome9_fragment_texture_format(u32 format)
+{
+	switch (format) {
+	case DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888:
+		return 0x98;
+	case DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888:
+		return 0x99;
+	case DRM_CHROME9_FRAGMENT_TEXTURE_A8:
+		return 0x1b;
+	case DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24:
+		return 0xfe;
+	default:
+		return 0;
+	}
+}
+
+static int chrome9_build_fragment_program(struct chrome9_engine *engine,
+	const struct chrome9_draw_request *request, struct chrome9_job *job,
+	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+	u32 *pause)
+{
+	static const u32 destination_tail[] = {
+		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
+		0x34000150, 0x35000114, 0x36000500, 0x37000200,
+	};
+	static const u32 vs_prefix[] = {
+		0x00380150, 0x00000000, 0x00000000, 0x0008010f,
+		0x0008014c, 0x00100150, 0x00384154, 0x0004021f,
+		0x0008414c, 0x00000000, 0x00000000, 0x0008422f,
+		0x0008814c, 0x00000000, 0x00000000, 0x0008423f,
+	};
+	static const u32 vs_float_constants[] = {
+		0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+		0x49400000, 0x49400000, 0x00000000, 0x00000000,
+	};
+	static const u32 vs_integer_constants[] = { 0, 0, 0, 0 };
+	static const u32 sync[] = { 0x6c, 0x00800000 };
+	static const u32 status[] = {
+		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
+	};
+	const struct chrome9_fragment_program *program = request->fragment_program;
+	struct chrome9_blend_words blend_words;
+	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
+	u32 destination_state[16];
+	u32 config[] = {
+		request->fragment_texture_count << 4 | 1, 0x01002521,
+		0x08010100 | request->fragment_texture_count,
+		0x04000000, 0x05000000, 0x0d810000,
+	};
+	u32 common[12] = {
+		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
+		0x01ce1540, 0x88001ed0, 0x89000800, 0xcc000000,
+	};
+	u32 clip[] = {
+		0x80000000 | request->height,
+		0x81000000 | request->width,
+		chrome9_scissor_y(request), chrome9_scissor_x(request),
+	};
+	u32 raster[40] = { 0 };
+	u32 vs_program[4 * (4 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)] = { 0 };
+	u32 vs_control[] = { 0x60800000 | (3 + program->varying_count) };
+	u32 *base = engine->run_staging_cpu;
+	u32 *p = base;
+	u32 destination_count;
+	u32 common_count = 8;
+	u32 vertex_count = request->triangle_count * 3;
+	u32 vertex_stride = 6 + 4 * program->varying_count;
+	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+		DRM_CHROME9_DEPTH_FUNC_SHIFT;
+	u32 raster_count;
+	bool blend = request->flags & DRM_CHROME9_FRAGMENT_BLEND;
+	bool depth_active = request->flags & DRM_CHROME9_FRAGMENT_DEPTH;
+	unsigned int i;
+
+	if (!base || !program || !request->fragment_vertices)
+		return -EINVAL;
+	destination_state[0] = 0x50000000 | (target >> 8);
+	destination_state[1] = 0x51100000;
+	destination_state[2] = 0x52000000 |
+		(request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ?
+		 0x00990000 : 0x00980000) | (request->pitch >> 5);
+	if (blend) {
+		chrome9_lower_blend(&request->blend, &blend_words);
+		for (i = 0; i < 8; i++)
+			destination_state[3 + i] = (0x38 + i) << 24;
+		destination_state[11] = blend_words.a34;
+		destination_state[12] = blend_words.a35;
+		destination_state[13] = blend_words.a36;
+		destination_state[14] = blend_words.a37;
+		destination_state[15] =
+			(request->blend.flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
+			blend_words.a33 : 0x33007000;
+		destination_count = ARRAY_SIZE(destination_state);
+		common[2] = blend_words.a53;
+		common[3] = blend_words.a00;
+	} else {
+		memcpy(destination_state + 3, destination_tail,
+		       sizeof(destination_tail));
+		destination_count = 3 + ARRAY_SIZE(destination_tail);
+	}
+	if (depth_active) {
+		if (!depth_func)
+			depth_func = DRM_CHROME9_COMPARE_LESS;
+		common[4] = chrome9_depth_control_word(request, true);
+		common[7] = 0x10000000 | (depth >> 8);
+		common[8] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
+		common[9] = request->fragment_depth_format ==
+			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000;
+		common[10] = 0x13000000 | depth_func << 16;
+		common[11] = 0x20007fff;
+		common_count = ARRAY_SIZE(common);
+	}
+
+	/* D0 position, normalized D1/D2 colors, then dense float4 T0..T7. */
+	raster[0] = ((2 + program->varying_count) << 8) | vertex_stride;
+	raster[1] = 0x010000c2;
+	raster[2] = 0x020041d1;
+	raster[3] = 0x030052d1;
+	for (i = 0; i < program->varying_count; i++)
+		raster[4 + i] = (4 + i) << 24 | (6 + 4 * i) << 12 |
+			(3 + i) << 8 | 0xc2;
+	i = 4 + program->varying_count;
+	raster[i++] = 0x12000000 | GENMASK(2 + program->varying_count, 0);
+	raster[i++] = 0x61800000;
+	raster[i++] = 0x620081ff | (3 + program->varying_count) << 20;
+	raster[i++] = 0x20000000;
+	raster[i++] = 0x23004f02;
+	raster[i++] = 0x24000000 | vertex_count;
+	{
+		u32 a25 = 0x25f60000;
+		u32 a26 = 0x26000000;
+		unsigned int varying;
+
+		for (varying = 0; varying < program->varying_count; varying++)
+			if (varying < 4)
+				a25 |= 0xf << (12 - 4 * varying);
+			else
+				a26 |= 0xf << (28 - 4 * varying);
+		raster[i++] = a25;
+		raster[i++] = a26;
+		raster[i++] = 0x28ffcc00;
+	}
+	raster[i++] = 0x40800000;
+	raster[i++] = 0x41400000;
+	raster[i++] = 0x4200493f;
+	raster[i++] = 0x43800000;
+	raster[i++] = 0x44400000;
+	raster[i++] = 0x4500493f;
+	raster[i++] = 0x46800000;
+	raster[i++] = 0x47400000;
+	raster[i++] = 0x4800003f;
+	raster[i++] = 0x49000000;
+	raster[i++] = 0x50000000;
+	raster[i++] = 0x51000000;
+	raster[i++] = 0x52147fff;
+	raster_count = i;
+	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
+	for (i = 0; i < program->varying_count; i++) {
+		u32 *record = vs_program + 16 + i * 4;
+
+		record[0] = 0x0008c14c + i * 0x00004000;
+		record[3] = 0x0008028f + i * 0x10;
+	}
+
+	memset(base, 0xcc, CHROME9_RUN_STAGING_SIZE);
+	chrome9_emit_header0(&p, sync, 1);
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+			     destination_state, destination_count);
+	for (i = 0; i < request->fragment_texture_count; i++) {
+		const struct drm_chrome9_fragment_texture_state *texture =
+			&request->fragment_textures[i];
+		u32 width = texture->width >> texture->first_level;
+		u32 height = texture->height >> texture->first_level;
+		u32 log_size = ilog2(max(height, 1U)) << 4 |
+			ilog2(max(width, 1U));
+		u32 image[] = {
+			(texture_base[i] + texture->level_offset[texture->first_level]) >> 8,
+			0x18001101, 0x20000000 | height << 12 | width,
+			0x21000001, 0x22008000 | log_size,
+			0x30000000 | chrome9_fragment_texture_format(texture->format) << 16 |
+			(texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ?
+			 0x2000 : 0),
+		};
+		u32 sampler[] = {
+			0x30000000,
+			0x31100000 | texture->mag_filter << 13 |
+			texture->min_filter << 10 | texture->mag_filter << 7 |
+			texture->min_filter << 4,
+			0x32000040 | texture->wrap_t << 3 | texture->wrap_s,
+			0xcccccccc,
+		};
+
+		chrome9_emit_header2(&p, 0x440, 0x0000043c,
+				     i << 24 | 0x00020000, image,
+				     ARRAY_SIZE(image));
+		chrome9_emit_header2(&p, 0x440, 0x0000043c,
+				     i << 24 | 0x20020000, sampler,
+				     ARRAY_SIZE(sampler));
+	}
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+			     common, common_count);
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0xfe020000,
+			     config, ARRAY_SIZE(config));
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000, raster,
+			     raster_count);
+	if (program->constant_count) {
+		u32 first = min(program->constant_count, 16U);
+
+		chrome9_emit_header3(&p, 0x22030000, &program->constants[0][0],
+				     first * 4);
+		if (program->constant_count > 16)
+			chrome9_emit_header3(&p, 0x22030080,
+					     &program->constants[16][0],
+					     (program->constant_count - 16) * 4);
+	}
+	chrome9_emit_header3(&p, 0x32030400, vs_float_constants,
+			     ARRAY_SIZE(vs_float_constants));
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x33030000,
+			     vs_integer_constants, ARRAY_SIZE(vs_integer_constants));
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+			     clip, ARRAY_SIZE(clip));
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
+			     vs_program, 4 * (4 + program->varying_count));
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
+			     vs_control, ARRAY_SIZE(vs_control));
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+			     program->controls, ARRAY_SIZE(program->controls));
+	if (program->tau_count)
+		chrome9_emit_header3(&p, 0x21030000, program->tau,
+				     program->tau_count);
+	chrome9_emit_header3(&p, 0x20030000, &program->alu[0][0],
+			     program->alu_count * 4);
+	while (!IS_ALIGNED((unsigned long)p, 16))
+		*p++ = 0xcc000000;
+	*p++ = 0xfe020440;
+	*p++ = 0x0000043c;
+	*p++ = 0x00000000;
+	*p++ = 0xcc000000;
+	for (i = 0; i < vertex_count; i++) {
+		const struct drm_chrome9_fragment_vertex *vertex =
+			&request->fragment_vertices[i];
+		unsigned int varying;
+
+		*p++ = chrome9_q16_to_float(vertex->x_16_16);
+		*p++ = chrome9_q16_to_float(vertex->y_16_16);
+		*p++ = chrome9_q16_to_float(vertex->z_16_16);
+		*p++ = vertex->rhw_float;
+		*p++ = vertex->color;
+		*p++ = vertex->specular;
+		for (varying = 0; varying < program->varying_count; varying++) {
+			*p++ = vertex->varying[varying][0];
+			*p++ = vertex->varying[varying][1];
+			*p++ = vertex->varying[varying][2];
+			*p++ = vertex->varying[varying][3];
+		}
+	}
+	chrome9_emit_header0(&p, sync, 1);
+	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+			     status, ARRAY_SIZE(status));
+	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
+	chrome9_emit_header0(&p, cookie, 1);
+	return chrome9_finish_ring_sized(base, p, CHROME9_RUN_STAGING_SIZE,
+					 pause, &job->segment_stop);
 }
 
 static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
@@ -3985,6 +4269,268 @@ out_dev_exit:
 	return ret;
 }
 
+static int chrome9_submit_fragment_program(struct drm_device *drm,
+		struct drm_file *file, const struct chrome9_draw_request *request)
+{
+	struct chrome9_device *cdev = to_chrome9(drm);
+	struct drm_gem_object *objects[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	u64 object_sizes[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	u32 bases[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	u32 texture_bases[DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	struct chrome9_engine *engine;
+	struct chrome9_job *job = NULL;
+	struct drm_exec exec;
+	u64 mapped_size = 0;
+	u32 object_count = 1;
+	u32 depth_index = U32_MAX;
+	u32 pause;
+	long wait;
+	bool exec_initialized = false;
+	bool device_owned = false;
+	bool signal = false;
+	bool quarantine = false;
+	bool must_quarantine;
+	unsigned int i;
+	int dev_idx;
+	int ret;
+
+	if (!drm_dev_enter(drm, &dev_idx))
+		return -ENODEV;
+	engine = READ_ONCE(cdev->engine);
+	if (!engine || !chrome9_engine_ready(cdev)) {
+		ret = -EIO;
+		goto out_dev_exit;
+	}
+	objects[0] = drm_gem_object_lookup(file, request->destination_handle);
+	object_sizes[0] = request->object_size;
+	if (request->flags & DRM_CHROME9_FRAGMENT_DEPTH) {
+		depth_index = object_count++;
+		objects[depth_index] = drm_gem_object_lookup(file,
+							      request->depth_handle);
+		object_sizes[depth_index] = request->depth_object_size;
+	}
+	for (i = 0; i < request->fragment_texture_count; i++) {
+		objects[object_count] = drm_gem_object_lookup(file,
+			request->fragment_textures[i].handle);
+		object_sizes[object_count] = request->fragment_texture_size[i];
+		object_count++;
+	}
+	for (i = 0; i < object_count; i++) {
+		unsigned int j;
+
+		if (!objects[i]) {
+			ret = -ENOENT;
+			goto out_put_objects;
+		}
+		if (objects[i]->dev != drm || drm_gem_is_imported(objects[i]) ||
+		    objects[i]->size != object_sizes[i]) {
+			ret = -EINVAL;
+			goto out_put_objects;
+		}
+		/* Read-only textures may alias each other, never a render target. */
+		for (j = 0; j < i; j++)
+			if (objects[i] == objects[j] &&
+			    (i == 0 || i == depth_index ||
+			     j == 0 || j == depth_index)) {
+				ret = -EINVAL;
+				goto out_put_objects;
+			}
+		if (check_add_overflow(mapped_size, objects[i]->size,
+				       &mapped_size)) {
+			ret = -E2BIG;
+			goto out_put_objects;
+		}
+	}
+	if (mapped_size > SZ_64M - CHROME9_RING_SIZE) {
+		ret = -E2BIG;
+		goto out_put_objects;
+	}
+
+	job = kzalloc_obj(*job);
+	if (!job) {
+		ret = -ENOMEM;
+		goto out_put_objects;
+	}
+	INIT_LIST_HEAD(&job->quarantine_link);
+	for (i = 0; i < object_count; i++) {
+		job->fragment_objects[i] = to_drm_gem_shmem_obj(objects[i]);
+		job->fragment_sgts[i] =
+			drm_gem_shmem_get_pages_sgt(job->fragment_objects[i]);
+		if (IS_ERR(job->fragment_sgts[i])) {
+			ret = PTR_ERR(job->fragment_sgts[i]);
+			goto out_free_job;
+		}
+	}
+	job->destination = job->fragment_objects[0];
+	spin_lock_init(&job->fence.lock);
+	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
+			 &job->fence.lock, engine->fence_context,
+			 atomic64_inc_return(&engine->fence_seqno));
+	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT |
+		      DRM_EXEC_IGNORE_DUPLICATES, object_count);
+	exec_initialized = true;
+	drm_exec_until_all_locked(&exec) {
+		for (i = 0; i < object_count; i++) {
+			ret = drm_exec_prepare_obj(&exec, objects[i], 1);
+			drm_exec_retry_on_contention(&exec);
+			if (ret)
+				goto out_exec;
+		}
+	}
+	for (i = 0; i < object_count; i++) {
+		bool write = i == 0 || i == depth_index;
+
+		wait = dma_resv_wait_timeout(objects[i]->resv,
+			dma_resv_usage_rw(write), true, CHROME9_DEP_TIMEOUT);
+		if (wait <= 0) {
+			ret = wait < 0 ? wait : -ETIMEDOUT;
+			goto out_exec;
+		}
+		ret = drm_gem_shmem_vmap_locked(job->fragment_objects[i],
+						 &job->fragment_maps[i]);
+		if (ret)
+			goto out_unmap;
+		job->fragment_mapped[i] = true;
+		if (job->fragment_maps[i].is_iomem) {
+			ret = -EINVAL;
+			goto out_unmap;
+		}
+	}
+
+	ret = mutex_lock_interruptible(&engine->submit_lock);
+	if (ret)
+		goto out_unmap;
+	if (engine->stopping || engine->wedged || !engine->ready) {
+		ret = -EIO;
+		goto out_unlock_submit;
+	}
+	job->kind = request->kind;
+	job->flags = request->flags;
+	for (i = 0; i < object_count; i++) {
+		ret = chrome9_job_acquire_mapping_locked(engine, job, objects[i],
+				job->fragment_sgts[i], &bases[i]);
+		if (ret)
+			goto out_prepublication;
+	}
+	for (i = 0; i < object_count; i++) {
+		chrome9_prepare_map_guards(&job->fragment_maps[i], object_sizes[i]);
+		chrome9_cache_flush(job->fragment_maps[i].vaddr, object_sizes[i]);
+		dma_sync_sgtable_for_device(&cdev->pdev->dev,
+			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+	}
+	device_owned = true;
+	for (i = 0; i < object_count; i++)
+		dma_resv_add_fence(objects[i]->resv, &job->fence.base,
+			(i == 0 || i == depth_index) ? DMA_RESV_USAGE_WRITE :
+							  DMA_RESV_USAGE_READ);
+	job->fence_attached = true;
+	for (i = 0; i < request->fragment_texture_count; i++)
+		texture_bases[i] = bases[object_count -
+			request->fragment_texture_count + i];
+	job->cookie = engine->last_cookie == 0x00010001 ?
+		      0x00020002 : 0x00010001;
+	job->retirement_proven = false;
+	ret = chrome9_build_fragment_program(engine, request, job,
+		bases[0] + PAGE_SIZE,
+		depth_index == U32_MAX ? 0 : bases[depth_index] + PAGE_SIZE,
+		texture_bases, &pause);
+	if (ret)
+		goto out_prepublication;
+	ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
+		CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
+	if (ret) {
+		if (!must_quarantine)
+			goto out_prepublication;
+		dma_fence_set_error(&job->fence.base, -ETIME);
+		job->published = true;
+		chrome9_quarantine_job_locked(engine, job);
+		quarantine = true;
+		goto out_unlock_submit;
+	}
+	ret = chrome9_wait_job(engine, job);
+	if (ret) {
+		dma_fence_set_error(&job->fence.base, -ETIME);
+		chrome9_quarantine_job_locked(engine, job);
+		quarantine = true;
+		goto out_unlock_submit;
+	}
+	job->retirement_proven = true;
+	engine->last_cookie = job->cookie;
+	for (i = 0; i < object_count; i++) {
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
+			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+		chrome9_cache_flush(job->fragment_maps[i].vaddr, object_sizes[i]);
+	}
+	dma_rmb();
+	device_owned = false;
+	for (i = 0; i < object_count; i++) {
+		if (!chrome9_verify_map_guards(&job->fragment_maps[i],
+					       object_sizes[i])) {
+			ret = -EIO;
+			dma_fence_set_error(&job->fence.base, ret);
+		}
+		chrome9_sf_resync_object_locked(engine, objects[i]);
+	}
+	chrome9_job_release_mappings_locked(engine, job);
+	signal = true;
+	goto out_unlock_submit;
+
+out_prepublication:
+	dma_fence_set_error(&job->fence.base, ret ?: -EIO);
+	chrome9_job_release_mappings_locked(engine, job);
+	signal = true;
+out_unlock_submit:
+	mutex_unlock(&engine->submit_lock);
+	if (quarantine) {
+		drm_exec_fini(&exec);
+		if (signal)
+			dma_fence_signal(&job->fence.base);
+		ret = ret ?: -EIO;
+		goto out_dev_exit;
+	}
+out_unmap:
+	if (device_owned) {
+		for (i = 0; i < object_count; i++) {
+			dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
+				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+			chrome9_cache_flush(job->fragment_maps[i].vaddr,
+					    object_sizes[i]);
+		}
+		mutex_lock(&engine->submit_lock);
+		for (i = 0; i < object_count; i++)
+			chrome9_sf_resync_object_locked(engine, objects[i]);
+		mutex_unlock(&engine->submit_lock);
+	}
+	for (i = object_count; i-- > 0; )
+		if (job->fragment_mapped[i]) {
+			drm_gem_shmem_vunmap_locked(job->fragment_objects[i],
+						    &job->fragment_maps[i]);
+			job->fragment_mapped[i] = false;
+		}
+out_exec:
+	if (exec_initialized)
+		drm_exec_fini(&exec);
+	if (signal)
+		dma_fence_signal(&job->fence.base);
+	job->destination = NULL;
+	for (i = 0; i < object_count; i++) {
+		job->fragment_objects[i] = NULL;
+		drm_gem_object_put(objects[i]);
+	}
+	dma_fence_put(&job->fence.base);
+	goto out_dev_exit;
+
+out_free_job:
+	kfree(job);
+out_put_objects:
+	for (i = 0; i < object_count; i++)
+		if (objects[i])
+			drm_gem_object_put(objects[i]);
+out_dev_exit:
+	drm_dev_exit(dev_idx);
+	return ret;
+}
+
 int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file)
 {
@@ -6096,6 +6642,257 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 		args->vertices[2].x_16_16, args->vertices[2].y_16_16))
 		return -EINVAL;
 	return chrome9_submit_depth_triangle(drm, file, &request);
+}
+
+static int chrome9_validate_fragment_texture(
+	const struct drm_chrome9_fragment_texture_state *texture,
+	u64 *object_size)
+{
+	u64 end;
+	u32 bytes_per_pixel;
+	unsigned int i;
+
+	switch (texture->format) {
+	case DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888:
+	case DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888:
+	case DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24:
+		bytes_per_pixel = 4;
+		break;
+	case DRM_CHROME9_FRAGMENT_TEXTURE_A8:
+		bytes_per_pixel = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (!texture->handle || !texture->width || texture->width > 2048 ||
+	    !texture->height || texture->height > 2048 ||
+	    !is_power_of_2(texture->width) ||
+	    !is_power_of_2(texture->height) || texture->first_level ||
+	    texture->last_level ||
+	    texture->min_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
+	    texture->mag_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
+	    texture->mip_filter != DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+	    (texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
+	     texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
+	     texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
+	    (texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
+	     texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
+	     texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
+	    texture->lod_bias_s5_5 || texture->min_lod_s5_5 ||
+	    texture->max_lod_s5_5 || texture->border_color ||
+	    texture->reserved0 ||
+	    memchr_inv(texture->reserved, 0, sizeof(texture->reserved)) ||
+	    texture->level_offset[0] != PAGE_SIZE ||
+	    texture->level_pitch[0] !=
+		ALIGN(texture->width * bytes_per_pixel, 32))
+		return -EINVAL;
+	for (i = 1; i < DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS; i++)
+		if (texture->level_offset[i] || texture->level_pitch[i])
+			return -EINVAL;
+	if (check_mul_overflow((u64)texture->level_pitch[0],
+			       (u64)texture->height, &end) ||
+	    check_add_overflow(end, (u64)texture->level_offset[0], &end) ||
+	    check_add_overflow(ALIGN(end, PAGE_SIZE), (u64)PAGE_SIZE,
+			       object_size))
+		return -E2BIG;
+	return 0;
+}
+
+int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
+					struct drm_file *file)
+{
+	struct drm_chrome9_draw_fragment_program *args = data;
+	struct drm_chrome9_fragment_instruction *instructions = NULL;
+	struct drm_chrome9_fragment_texture_state *textures = NULL;
+	struct drm_chrome9_fragment_vertex *vertices = NULL;
+	struct chrome9_fragment_program *program = NULL;
+	u32 *constants = NULL;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_FRAGMENT_PROGRAM,
+		.destination_handle = args->destination_handle,
+		.depth_handle = args->depth_handle,
+		.flags = args->flags,
+		.width = args->width,
+		.height = args->height,
+		.pitch = args->destination_pitch,
+		.depth_pitch = args->depth_pitch,
+		.destination_format = args->destination_format,
+		.fragment_depth_format = args->depth_format,
+		.scissor = args->scissor,
+		.blend = args->blend,
+		.triangle_count = args->triangle_count,
+		.fragment_texture_count = args->texture_count,
+	};
+	u32 allowed_flags = DRM_CHROME9_FRAGMENT_DEPTH |
+		DRM_CHROME9_FRAGMENT_BLEND;
+	u64 surface_size;
+	u64 total_size;
+	u32 vertex_count;
+	bool depth = args->flags & DRM_CHROME9_FRAGMENT_DEPTH;
+	bool blend = args->flags & DRM_CHROME9_FRAGMENT_BLEND;
+	unsigned int i;
+	int ret;
+
+	if (args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION ||
+	    args->reserved0 || args->pad ||
+	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
+	    chrome9_validate_depth_flags(args->flags, allowed_flags) ||
+	    (!depth && (args->flags & (DRM_CHROME9_DEPTH_FUNC_MASK |
+				       DRM_CHROME9_DEPTH_READ_ONLY))) ||
+	    !args->destination_handle || !args->triangle_count ||
+	    args->triangle_count > DRM_CHROME9_FRAGMENT_MAX_TRIANGLES ||
+	    !args->vertices_ptr || !args->instructions_ptr ||
+	    !args->instruction_count ||
+	    args->instruction_count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS ||
+	    args->constant_count > DRM_CHROME9_FRAGMENT_MAX_CONSTANTS ||
+	    args->texture_count > DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
+	    args->varying_count > DRM_CHROME9_FRAGMENT_MAX_VARYINGS ||
+	    (!!args->constants_ptr != !!args->constant_count) ||
+	    (!!args->textures_ptr != !!args->texture_count) ||
+	    !args->width || args->width > 2048 ||
+	    !args->height || args->height > 2048 ||
+	    args->destination_pitch != ALIGN(args->width * sizeof(u32), 32) ||
+	    args->destination_format > DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ||
+	    (!blend && memchr_inv(&args->blend, 0, sizeof(args->blend))) ||
+	    (depth && (!args->depth_handle ||
+		(args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_D16 &&
+		 args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_X8Z24))) ||
+	    (!depth && (args->depth_handle || args->depth_pitch ||
+			   args->depth_format)))
+		return -EINVAL;
+	ret = chrome9_validate_scissor(&args->scissor, args->width,
+				       args->height);
+	if (ret)
+		return ret;
+	if (blend) {
+		ret = chrome9_validate_blend_state(&args->blend);
+		if (ret)
+			return ret;
+	}
+	if (check_mul_overflow((u64)args->destination_pitch,
+			       (u64)args->height, &surface_size) ||
+	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+			       2ULL * PAGE_SIZE, &request.object_size))
+		return -E2BIG;
+	total_size = request.object_size;
+	if (depth) {
+		u32 bytes_per_pixel = args->depth_format ==
+			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 4 : 2;
+
+		if (args->depth_pitch !=
+		    ALIGN(args->width * bytes_per_pixel, 32) ||
+		    check_mul_overflow((u64)args->depth_pitch,
+				       (u64)args->height, &surface_size) ||
+		    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
+				       2ULL * PAGE_SIZE,
+				       &request.depth_object_size) ||
+		    check_add_overflow(total_size, request.depth_object_size,
+				       &total_size))
+			return -E2BIG;
+	}
+	if (check_mul_overflow(args->triangle_count, 3U, &vertex_count))
+		return -E2BIG;
+	instructions = memdup_array_user(u64_to_user_ptr(args->instructions_ptr),
+		args->instruction_count, sizeof(*instructions));
+	if (IS_ERR(instructions))
+		return PTR_ERR(instructions);
+	if (args->constant_count) {
+		constants = memdup_array_user(u64_to_user_ptr(args->constants_ptr),
+			args->constant_count, 4 * sizeof(*constants));
+		if (IS_ERR(constants)) {
+			ret = PTR_ERR(constants);
+			constants = NULL;
+			goto out_free;
+		}
+	}
+	if (args->texture_count) {
+		textures = memdup_array_user(u64_to_user_ptr(args->textures_ptr),
+			args->texture_count, sizeof(*textures));
+		if (IS_ERR(textures)) {
+			ret = PTR_ERR(textures);
+			textures = NULL;
+			goto out_free;
+		}
+		for (i = 0; i < args->texture_count; i++) {
+			ret = chrome9_validate_fragment_texture(&textures[i],
+				&request.fragment_texture_size[i]);
+			if (ret)
+				goto out_free;
+			if (check_add_overflow(total_size,
+				request.fragment_texture_size[i], &total_size)) {
+				ret = -E2BIG;
+				goto out_free;
+			}
+		}
+	}
+	if (total_size > SZ_64M - CHROME9_RING_SIZE) {
+		ret = -E2BIG;
+		goto out_free;
+	}
+	vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+		vertex_count, sizeof(*vertices));
+	if (IS_ERR(vertices)) {
+		ret = PTR_ERR(vertices);
+		vertices = NULL;
+		goto out_free;
+	}
+	for (i = 0; i < vertex_count; i++) {
+		unsigned int varying;
+
+		if (!chrome9_coordinate_valid(vertices[i].x_16_16, args->width) ||
+		    !chrome9_coordinate_valid(vertices[i].y_16_16, args->height) ||
+		    vertices[i].z_16_16 < 0 || vertices[i].z_16_16 > 0x10000 ||
+		    !chrome9_rhw_valid(vertices[i].rhw_float)) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+		for (varying = 0; varying < args->varying_count; varying++) {
+			unsigned int component;
+
+			for (component = 0; component < 4; component++)
+				if (!chrome9_float_finite(
+					vertices[i].varying[varying][component])) {
+					ret = -EINVAL;
+					goto out_free;
+				}
+		}
+		for (; varying < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; varying++)
+			if (memchr_inv(vertices[i].varying[varying], 0,
+				       sizeof(vertices[i].varying[varying]))) {
+				ret = -EINVAL;
+				goto out_free;
+			}
+	}
+	for (i = 0; i < vertex_count; i += 3)
+		if (!chrome9_triangle_nondegenerate(
+			vertices[i].x_16_16, vertices[i].y_16_16,
+			vertices[i + 1].x_16_16, vertices[i + 1].y_16_16,
+			vertices[i + 2].x_16_16, vertices[i + 2].y_16_16)) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+	program = kvzalloc(sizeof(*program), GFP_KERNEL);
+	if (!program) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	ret = chrome9_fragment_compile(instructions, args->instruction_count,
+		constants, args->constant_count, args->texture_count,
+		args->varying_count, program);
+	if (ret)
+		goto out_free;
+	request.fragment_vertices = vertices;
+	request.fragment_textures = textures;
+	request.fragment_program = program;
+	ret = chrome9_submit_fragment_program(drm, file, &request);
+
+out_free:
+	kvfree(program);
+	kvfree(vertices);
+	kfree(textures);
+	kfree(constants);
+	kfree(instructions);
+	return ret;
 }
 
 void chrome9_engine_fini(struct chrome9_device *cdev)
