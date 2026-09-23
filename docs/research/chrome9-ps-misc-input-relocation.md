@@ -99,20 +99,23 @@ pass gives the relocated MISC value the same terminal-use treatment as other
 temporary-like resources.  It is not a constant/input source that can bypass
 the final-use pass.
 
-Repeated MISC operands use the last semantic occurrence for that terminal
-marker.  `MUL(vPos,vPos)` releases only C, `MAD(vPos,vPos,vPos)` releases only
-B, and a two-record MOV then ADD leaves the first record live and releases the
-final B occurrence.  Their exact raw/final records are retained in the corpus.
-This matches a semantic last-use walk; setting every relocated occurrence's
-release bit is not equivalent.
+Repeated MISC operands use the last occurrence in the finalizer's native
+A-to-C-to-B scan on the last instruction: B wins over C, which wins over A.
+`MUL(vPos,vPos)` therefore releases C and `MAD(vPos,vPos,vPos)` releases B.
+The decisive noncommutative row is `SUB(vPos,vPos)`: semantic source zero is B
+and semantic source one is A, yet B receives the marker.  A two-record MOV
+then ADD leaves the first record live and releases final B.  This is the
+opposite of TEMP alias precedence, which prefers A, then C, then B.
 
-ABS is the important synthetic exception.  One `ABS oC0,vPos.xyxy` token is
-expanded to A=vPos, C=vPos, B=-vPos, and configuration two emits
+ABS follows the same MISC-native order even though its repetitions are
+synthetic.  One `ABS oC0,vPos.xyxy` token expands to A=vPos, C=vPos,
+B=-vPos, and configuration two emits
 `02c30418 100c3041 00f0c304 00090820`: only synthesized B has the terminal
 marker.  Ordinary TEMP ABS instead follows TEMP alias precedence and releases
-A.  A semantic compiler must account for the expanded POSITION occurrences
-before assigning release; it cannot mark A merely because the UAPI has one
-source operand.
+A.  A semantic compiler must choose the lowest-valued native slot in this
+driver's B=0/C=1/A=2 enumeration for repeated POSITION on its last
+instruction, including ABS's expanded C/B occurrences.  It cannot use UAPI
+source order or mark A merely because ABS has one semantic source.
 
 ## Real relocation-code ladder
 
