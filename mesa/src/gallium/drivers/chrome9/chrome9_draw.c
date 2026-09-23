@@ -707,12 +707,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    if (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM)
       *blend_successor = true;
    /*
-    * A live VX900 repeatedly stopped before the completion cookie for both
-    * the one-triangle and batched one-texture MODULATE+blend objects.  Keep
-    * the known-good REPLACE successor available, but fail this exact state
-    * closed until its vendor register sequence is understood.  A rejected
-    * draw is recoverable; publishing the current object wedges the CR ring
-    * and prevents later clients from using the same X server.
+    * The production one-ALU MODULATE shader object completes ordinary UI
+    * traffic, but one repeatable ioquake3 shutdown state still stops VX900
+    * before its completion cookie.  Fail the exact combination closed until
+    * the remaining vendor state difference is understood, so one client
+    * cannot poison the persistent ring for every later X client.
     */
    *reason = "textured-modulate-blend-unproven";
    if (texture_count == 1 && *blend_successor &&
