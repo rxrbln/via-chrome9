@@ -238,6 +238,44 @@ build_front_face_pair(void)
    return b.shader;
 }
 
+static nir_shader *
+build_ubo_index_shift(unsigned shift, bool dynamic_shift, bool extra_use)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
+                                                   &options,
+                                                   "ubo-index-shift");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_float_type(), "out");
+   nir_def *zero = nir_imm_int(&b, 0);
+   /* Models ioquake's unnormalized UBYTE attr_BoneIndexes after vertex fetch:
+    * four exact float32 values in the inclusive range 0..255. */
+   nir_def *bone = nir_load_input(
+      &b, 4, 32, zero, .dest_type = nir_type_float32,
+      .io_semantics.location = VERT_ATTRIB_GENERIC8);
+   nir_def *amount = dynamic_shift ?
+      nir_f2i32(&b, nir_load_input(
+         &b, 1, 32, zero, .base = 1, .dest_type = nir_type_float32,
+         .io_semantics.location = VERT_ATTRIB_GENERIC9)) :
+      nir_imm_int(&b, shift);
+   nir_def *indices = nir_ishl(&b, nir_f2i32(&b, bone), amount);
+   nir_def *sum = nir_imm_float(&b, 0.0f);
+
+   for (unsigned lane = 0; lane < 4; lane++) {
+      nir_def *index = nir_channel(&b, indices, lane);
+
+      for (unsigned row = 0; row < 4; row++) {
+         nir_def *value = nir_load_ubo_vec4(
+            &b, 1, 32, zero, index, .base = 6 + row);
+         sum = nir_fadd(&b, sum, value);
+      }
+      if (!lane && extra_use)
+         sum = nir_fadd(&b, sum, nir_i2f32(&b, index));
+   }
+   nir_store_var(&b, out, sum, 1);
+   nir_validate_shader(b.shader, "Chrome9 UBO index shift input");
+   return b.shader;
+}
+
 static unsigned
 alu_op_count(nir_shader *nir, nir_op op)
 {
@@ -250,6 +288,58 @@ alu_op_count(nir_shader *nir, nir_op op)
                 nir_instr_as_alu(instr)->op == op)
                count++;
    return count;
+}
+
+static bool
+check_ubo_index_shift(void)
+{
+   nir_shader *nir = build_ubo_index_shift(2, false, false);
+   bool valid = chrome9_nir_lower_ubo_index_shifts(nir) &&
+                alu_op_count(nir, nir_op_ishl) == 0 &&
+                alu_op_count(nir, nir_op_imul) == 0 &&
+                alu_op_count(nir, nir_op_fmul) == 1;
+
+   if (!valid) {
+      fprintf(stderr, "UBO index shift prepass rejected positive case: "
+                      "ishl=%u imul=%u fmul=%u\n",
+              alu_op_count(nir, nir_op_ishl),
+              alu_op_count(nir, nir_op_imul),
+              alu_op_count(nir, nir_op_fmul));
+      nir_print_shader(nir, stderr);
+      ralloc_free(nir);
+      return false;
+   }
+   nir_validate_shader(nir, "Chrome9 lowered UBO index shift");
+   nir_opt_algebraic(nir);
+   nir_opt_constant_folding(nir);
+   nir_opt_dce(nir);
+   valid &= alu_op_count(nir, nir_op_ishl) == 0 &&
+            alu_op_count(nir, nir_op_fmul) == 1;
+   nir_lower_int_to_float(nir);
+   valid &= alu_op_count(nir, nir_op_ishl) == 0 &&
+            alu_op_count(nir, nir_op_imul) == 0 &&
+            alu_op_count(nir, nir_op_fmul) == 1;
+   if (!valid) {
+      fprintf(stderr, "UBO index shift did not lower exactly\n");
+      nir_print_shader(nir, stderr);
+   }
+   ralloc_free(nir);
+
+   nir = build_ubo_index_shift(1, false, false);
+   valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
+            alu_op_count(nir, nir_op_ishl) == 1;
+   ralloc_free(nir);
+
+   nir = build_ubo_index_shift(2, true, false);
+   valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
+            alu_op_count(nir, nir_op_ishl) == 1;
+   ralloc_free(nir);
+
+   nir = build_ubo_index_shift(2, false, true);
+   valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
+            alu_op_count(nir, nir_op_ishl) == 1;
+   ralloc_free(nir);
+   return valid;
 }
 
 static void
@@ -415,6 +505,11 @@ check_count(nir_shader *canonical, float count, bool expect_loop)
 int
 main(void)
 {
+   if (!check_ubo_index_shift()) {
+      fprintf(stderr, "UBO index shift lowering failed\n");
+      return 1;
+   }
+
    nir_shader *nir = build_uniform_loop(false);
 
    chrome9_nir_find_inlinable_uniforms(nir);

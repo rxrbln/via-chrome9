@@ -8,6 +8,11 @@
 
 struct nir_shader;
 
+/* Replace the exact power-of-four integer indexing used only to address
+ * load_ubo_vec4 with float-backed multiplication.  The draw interpreter's
+ * no-integer lowering can then retain the bounded address arithmetic. */
+bool chrome9_nir_lower_ubo_index_shifts(struct nir_shader *nir);
+
 /* Chrome9 has no native integer ALU.  Lower integer shader operations to the
  * float representation Mesa places in CB0 while retaining integer UBO
  * element indices used only for addressing. */

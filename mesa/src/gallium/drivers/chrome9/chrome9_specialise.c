@@ -17,6 +17,82 @@
 #include "nir_builder.h"
 
 static bool
+chrome9_ubo_index_use(const nir_def *def, unsigned depth)
+{
+   bool used = false;
+
+   if (depth > 8 || nir_def_used_by_if(def))
+      return false;
+
+   nir_foreach_use(use, def) {
+      nir_instr *instr = nir_src_use_instr(use);
+
+      used = true;
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+         if (intr->intrinsic != nir_intrinsic_load_ubo_vec4 ||
+             use != &intr->src[1])
+            return false;
+         continue;
+      }
+      if (instr->type != nir_instr_type_alu)
+         return false;
+
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->op != nir_op_mov)
+         return false;
+      if (!chrome9_ubo_index_use(&alu->def, depth + 1))
+         return false;
+   }
+   return used;
+}
+
+static bool
+chrome9_lower_ubo_index_shift(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_ishl || alu->def.bit_size != 32 ||
+       alu->src[0].src.ssa->bit_size != 32 ||
+       !nir_src_is_const(alu->src[1].src))
+      return false;
+   for (unsigned c = 0; c < alu->def.num_components; c++) {
+      unsigned swizzle = alu->src[1].swizzle[c];
+
+      if (nir_src_comp_as_uint(alu->src[1].src, swizzle) != 2)
+         return false;
+   }
+   if (!chrome9_ubo_index_use(&alu->def, 0))
+      return false;
+
+   /* The use walk admitted only defined load_ubo_vec4 addresses.  Their valid
+    * vec4 indices are bounded by the advertised constant file, far below
+    * float32's exact-integer limit.  In ioquake the source is additionally an
+    * unnormalized UBYTE bone-index vector (0..255).  Keep the scale explicitly
+    * float-backed: nir_to_tgsi otherwise canonicalizes integer multiply by
+    * four back into the unsupported shift. */
+   b->cursor = nir_before_instr(instr);
+   nir_def *source = nir_i2f32(b, nir_ssa_for_alu_src(b, alu, 0));
+   nir_def_replace(&alu->def, nir_fmul_imm(b, source, 4.0f));
+   return true;
+}
+
+bool
+chrome9_nir_lower_ubo_index_shifts(nir_shader *nir)
+{
+   bool progress = nir_shader_instructions_pass(
+      nir, chrome9_lower_ubo_index_shift, nir_metadata_control_flow, NULL);
+
+   if (progress)
+      NIR_PASS(_, nir, nir_opt_dce);
+   return progress;
+}
+
+static bool
 chrome9_condition_dwords(nir_scalar scalar, uint16_t *dwords,
                          unsigned *count, unsigned depth)
 {

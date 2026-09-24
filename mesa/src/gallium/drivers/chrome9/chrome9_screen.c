@@ -292,6 +292,7 @@ chrome9_finalize_nir(struct pipe_screen *screen, nir_shader *nir,
 {
    (void)screen;
    (void)optimize;
+   chrome9_nir_lower_ubo_index_shifts(nir);
    if (nir->info.stage != MESA_SHADER_FRAGMENT)
       return;
    chrome9_nir_lower_integers(nir);
