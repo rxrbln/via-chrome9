@@ -6835,6 +6835,12 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    draw_texture_sampler(ctx->draw, MESA_SHADER_VERTEX,
                         ctx->vs_tgsi_sampler);
    draw_set_constant_buffer_stride(ctx->draw, sizeof(float));
+   /* The kernel draws triangles only: let draw turn every point and line
+    * (including sprites and stipple) into triangles. */
+   draw_wide_point_threshold(ctx->draw, 0.0f);
+   draw_wide_line_threshold(ctx->draw, 0.0f);
+   draw_enable_point_sprites(ctx->draw, true);
+   draw_enable_line_stipple(ctx->draw, true);
    stage = chrome9_draw_vbuf_stage(ctx);
    if (!stage)
       goto fail;

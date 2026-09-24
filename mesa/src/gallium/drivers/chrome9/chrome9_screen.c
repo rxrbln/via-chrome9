@@ -429,6 +429,13 @@ chrome9_restrict_generic_caps(struct pipe_caps *caps)
    caps->flatshade = false;
    caps->clip_planes = 0;
    caps->dithering = false;
+   /* Draw turns wide points and lines into triangles. */
+   caps->max_line_width = 255.0f;
+   caps->max_line_width_aa = 255.0f;
+   caps->line_width_granularity = 0.1f;
+   caps->max_point_size = 255.0f;
+   caps->max_point_size_aa = 255.0f;
+   caps->point_size_granularity = 0.1f;
    caps->mixed_colorbuffer_formats = false;
    /* CPU generation uses the guarded, persistently mapped per-level layout
     * and covers every local 2D format which this driver can allocate. */
