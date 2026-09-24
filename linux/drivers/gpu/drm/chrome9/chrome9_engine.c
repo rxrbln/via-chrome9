@@ -141,17 +141,26 @@ enum chrome9_prof_phase {
 	CHROME9_PROF_GART,	/* SF draw-cache mapping acquire */
 	CHROME9_PROF_FLUSH,	/* guards and CPU cache flush */
 	CHROME9_PROF_BUILD,	/* command stream build */
-	CHROME9_PROF_GPU,	/* append and wait for retirement */
+	CHROME9_PROF_APPEND,	/* ring copy and doorbell */
+	CHROME9_PROF_GPU,	/* wait for retirement */
 	CHROME9_PROF_VERIFY,	/* flush back, guard verify, mapping release */
 	CHROME9_PROF_RETIRE,	/* unlock, vunmap, object and fence release */
 	CHROME9_PROF_COUNT,
 };
 
 static const char *const chrome9_prof_names[CHROME9_PROF_COUNT] = {
-	"entry", "compile", "map", "gart", "flush", "build", "gpu", "verify",
+	"entry", "compile", "map", "gart", "flush", "build", "append", "gpu",
+	"verify",
 	"retire",
 };
 static u64 chrome9_prof_ns[CHROME9_PROF_COUNT];
+/* Sub-costs inside the flush phase: guards, full flushes, DMA sync. */
+static u64 chrome9_prof_sub_ns[3];
+static u64 chrome9_prof_full_bytes;
+/* Wait phases: FE33 fence, cookie, PAUSE, engine work drain. */
+static u64 chrome9_prof_wait_ns[4];
+/* Full flushes by reason: implicit destination/depth/texture, dirty same. */
+static u64 chrome9_prof_full_kind[6];
 static u64 chrome9_prof_jobs;
 static ktime_t chrome9_prof_last;
 
@@ -185,6 +194,26 @@ static void chrome9_prof_job(struct drm_device *drm)
 			 div64_u64(chrome9_prof_ns[i], 1000 * chrome9_prof_jobs));
 		chrome9_prof_ns[i] = 0;
 	}
+	dev_info(drm->dev,
+		 "profile flush: guards %llu us, full %llu us (%llu KiB), dma sync %llu us\n",
+		 div64_u64(chrome9_prof_sub_ns[0], 1000 * chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_sub_ns[1], 1000 * chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_full_bytes, 1024 * chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_sub_ns[2], 1000 * chrome9_prof_jobs));
+	dev_info(drm->dev,
+		 "profile full flushes: implicit dst %llu depth %llu tex %llu, dirty dst %llu depth %llu tex %llu\n",
+		 chrome9_prof_full_kind[0], chrome9_prof_full_kind[1],
+		 chrome9_prof_full_kind[2], chrome9_prof_full_kind[3],
+		 chrome9_prof_full_kind[4], chrome9_prof_full_kind[5]);
+	memset(chrome9_prof_full_kind, 0, sizeof(chrome9_prof_full_kind));
+	dev_info(drm->dev, "profile wait: fence %llu cookie %llu pause %llu work %llu us\n",
+		 div64_u64(chrome9_prof_wait_ns[0], 1000 * chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_wait_ns[1], 1000 * chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_wait_ns[2], 1000 * chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_wait_ns[3], 1000 * chrome9_prof_jobs));
+	memset(chrome9_prof_wait_ns, 0, sizeof(chrome9_prof_wait_ns));
+	memset(chrome9_prof_sub_ns, 0, sizeof(chrome9_prof_sub_ns));
+	chrome9_prof_full_bytes = 0;
 	chrome9_prof_jobs = 0;
 }
 static uint chrome9_tcl_re;
@@ -4713,6 +4742,7 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 	u32 engine_status;
 	u32 cr_current;
 	u32 value;
+	ktime_t t = ktime_get(), now;
 	int ret;
 
 	if (job->fence_id) {
@@ -4737,12 +4767,18 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 				READ_ONCE(engine->fence_cpu[3]));
 		}
 	}
+	now = ktime_get();
+	chrome9_prof_wait_ns[0] += ktime_to_ns(ktime_sub(now, t));
+	t = now;
 	phase = "cookie";
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_2D_REG_DST_POS, value,
 				 value == job->cookie, 10,
 				 CHROME9_HW_TIMEOUT_US);
 	if (ret)
 		goto timeout;
+	now = ktime_get();
+	chrome9_prof_wait_ns[1] += ktime_to_ns(ktime_sub(now, t));
+	t = now;
 	phase = "pause";
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, value,
 				 value & BIT(31), 10, CHROME9_HW_TIMEOUT_US);
@@ -4751,10 +4787,14 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 	/* A reader stopped at its owned PAUSE may legally retain CR busy bit 4.
 	 * The cookie orders the submitted body before PAUSE; only the non-CR
 	 * engine work bits must drain before the job can retire. */
+	now = ktime_get();
+	chrome9_prof_wait_ns[2] += ktime_to_ns(ktime_sub(now, t));
+	t = now;
 	phase = "work";
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_ENGINE_STATUS,
 				 value, !(value & CHROME9_ENGINE_WORK_MASK), 10,
 				 CHROME9_HW_TIMEOUT_US);
+	chrome9_prof_wait_ns[3] += ktime_to_ns(ktime_sub(ktime_get(), t));
 	if (!ret)
 		return 0;
 
@@ -6180,6 +6220,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			continue;
 		}
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
+		ktime_t t0 = ktime_get(), t1;
 
 		chrome9_prepare_map_guards(&job->fragment_maps[i], object_sizes[i]);
 		if (mapping_sizes[i] != object_sizes[i])
@@ -6191,13 +6232,21 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			if (mapping_sizes[i] != object_sizes[i])
 				chrome9_flush_map_guards(&job->fragment_maps[i],
 							 mapping_sizes[i]);
+			t1 = ktime_get();
+			chrome9_prof_sub_ns[0] += ktime_to_ns(ktime_sub(t1, t0));
 		} else {
 			chrome9_cache_flush(job->fragment_maps[i].vaddr,
 					    mapping_sizes[i]);
 			bo->cpu_dirty = false;
+			t1 = ktime_get();
+			chrome9_prof_sub_ns[1] += ktime_to_ns(ktime_sub(t1, t0));
+			chrome9_prof_full_bytes += mapping_sizes[i];
+			chrome9_prof_full_kind[(bo->explicit_access ? 3 : 0) +
+				(i == 0 ? 0 : i == depth_index ? 1 : 2)]++;
 		}
 		dma_sync_sgtable_for_device(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+		chrome9_prof_sub_ns[2] += ktime_to_ns(ktime_sub(ktime_get(), t1));
 	}
 	device_owned = true;
 	for (i = 0; i < object_count; i++)
@@ -6226,6 +6275,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	chrome9_prof_mark(CHROME9_PROF_BUILD);
 	ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
 		CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
+	chrome9_prof_mark(CHROME9_PROF_APPEND);
 	if (ret) {
 		if (!must_quarantine)
 			goto out_prepublication;
