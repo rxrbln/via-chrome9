@@ -261,6 +261,13 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_DXT_MIP		(1ULL << 3)
 /* DRAW_VERTEX_PROGRAM topology TRIANGLE_STRIP and TRIANGLE_FAN. */
 #define DRM_CHROME9_CAP2_VERTEX_TOPOLOGY		(1ULL << 5)
+/* DRAW_VERTEX_PROGRAM topology POINT_LIST: point_size, POINT_SIZE and
+ * RASTER_POINT_SPRITE. */
+#define DRM_CHROME9_CAP2_NATIVE_POINTS		(1ULL << 9)
+/* DRAW_VERTEX_PROGRAM topology LINE_LIST and LINE_STRIP, one pixel wide. */
+#define DRM_CHROME9_CAP2_NATIVE_LINES		(1ULL << 10)
+/* DRAW_VERTEX_PROGRAM RASTER_POLYGON_CW/CCW modes for triangles. */
+#define DRM_CHROME9_CAP2_POLYGON_MODE		(1ULL << 11)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1341,6 +1348,9 @@ enum drm_chrome9_vertex_dest {
 	 * clip_distance_mask are written once, others are dropped.  Pixels
 	 * with a negative interpolated distance are discarded. */
 	DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE = 5,
+	/* Point size, index zero, writemask X, no SAT; used only with
+	 * RASTER_POINT_SIZE_VERTEX (written once), dropped otherwise. */
+	DRM_CHROME9_VERTEX_DEST_POINT_SIZE = 6,
 };
 
 /* Swizzles, NEG and SAT use the DRM_CHROME9_FRAGMENT_* values. */
@@ -1406,11 +1416,29 @@ struct drm_chrome9_vertex_buffer {
 #define DRM_CHROME9_VERTEX_BFC_CW	(1U << 3)
 #define DRM_CHROME9_VERTEX_BFC_CCW	(1U << 4)
 
-/* Primitive assembly of the vertex or index sequence; values 1..3 are
- * reserved for points and lines. */
+/* Primitive assembly of the vertex or index sequence. */
 #define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST	0U
+#define DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST		1U
+#define DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST		2U
+#define DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP		3U
 #define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP	4U
 #define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN	5U
+
+/* raster_flags.  POINT_SPRITE replaces the logical varyings in SPRITE_MASK
+ * by (s, t, 0, 1) with (0, 0) at the upper-left corner of the point;
+ * masked varyings need no VS write.  POINT_SIZE_VERTEX takes the size from
+ * the POINT_SIZE destination, clamped to [1.0, point_size].  Both require
+ * POINT_LIST; bit 1 is reserved. */
+#define DRM_CHROME9_RASTER_POINT_SPRITE		(1U << 0)
+#define DRM_CHROME9_RASTER_POINT_SIZE_VERTEX	(1U << 2)
+#define DRM_CHROME9_RASTER_SPRITE_MASK(m)	((__u32)(m) << 8)
+/* Polygon mode per screen winding of a triangle topology; a POINT face
+ * requires POINT on both windings. */
+#define DRM_CHROME9_POLYGON_FILL		0U
+#define DRM_CHROME9_POLYGON_LINE		1U
+#define DRM_CHROME9_POLYGON_POINT		2U
+#define DRM_CHROME9_RASTER_POLYGON_CW(m)	((__u32)(m) << 16)
+#define DRM_CHROME9_RASTER_POLYGON_CCW(m)	((__u32)(m) << 18)
 
 /*
  * fragment carries the complete pixel state with vertices_ptr and
@@ -1421,9 +1449,13 @@ struct drm_chrome9_vertex_buffer {
  * non-zero, vertex_count/vertex_stride/vertices_ptr zero) fetches every
  * element from buffers[element.buffer] at offset + element.offset +
  * (index + base_vertex) * stride through index_count 16- or 32-bit
- * indices.  A list takes a multiple of three vertices, a strip or fan at
- * least three; strips and fans take no BFC_* flag.  Offsets and strides are dword aligned, strides
- * 0..2044 bytes; stride 0 repeats one element for every vertex.
+ * indices.  A triangle list takes a multiple of three vertices, a strip
+ * or fan at least three, a point list one, a line list a multiple of two
+ * and a line strip at least two; only triangle lists take BFC_* flags and
+ * only triangles CULL_* flags.  FLAT shades lines from the last vertex.
+ * Offsets and strides are dword aligned, strides 0..2044 bytes; stride 0
+ * repeats one element for every vertex.  point_size (float bits, 1.0 to
+ * 2048.0, zero for 1.0) is non-zero only for draws that rasterize points.
  */
 struct drm_chrome9_draw_vertex_program {
 	struct drm_chrome9_draw_fragment_program fragment;
@@ -1449,7 +1481,9 @@ struct drm_chrome9_draw_vertex_program {
 	/* Enabled CLIP_DISTANCE planes, bits below MAX_CLIP_DISTANCES. */
 	__u32 clip_distance_mask;
 	__u32 topology;		/* DRM_CHROME9_VERTEX_TOPOLOGY_* */
-	__u64 reserved[3];
+	__u32 point_size;
+	__u32 raster_flags;	/* DRM_CHROME9_RASTER_* */
+	__u64 reserved[2];
 };
 
 /*
