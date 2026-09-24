@@ -300,8 +300,6 @@ check_packed_alpha_kill(struct chrome9_context *context)
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader,
                           nir_var_shader_in | nir_var_shader_out);
-   if (setenv("CHROME9_EXPERIMENTAL_TEXKILL", "1", 1))
-      goto out;
    context->fragment_kill = true;
    chrome9_compile_fs_nir(context, &shader, b.shader);
    if (!shader.supported || !shader.semantic_fs_valid ||
@@ -993,25 +991,23 @@ check_ideas_logo_shadow_compilation(struct chrome9_context *context)
 {
    struct chrome9_shader shader = { 0 }, wrong_reference = { 0 };
    struct chrome9_shader reversed = { 0 }, non_alpha = { 0 };
+   struct chrome9_shader no_kill_capability = { 0 };
    nir_shader *nir = make_ideas_logo_shadow_fragment(0.5f, 3, false);
    nir_shader *negative = make_ideas_logo_shadow_fragment(0.25f, 3, false);
    nir_shader *reversed_nir = make_ideas_logo_shadow_fragment(0.5f, 3, true);
    nir_shader *non_alpha_nir = make_ideas_logo_shadow_fragment(0.5f, 0, false);
    const struct chrome9_ps_instruction *p = shader.semantic_fs_ir.instruction;
    bool valid;
+   bool old_fragment_kill = context->fragment_kill;
 
-   if (setenv("CHROME9_EXPERIMENTAL_TEXKILL", "1", 1)) {
-      ralloc_free(non_alpha_nir);
-      ralloc_free(reversed_nir);
-      ralloc_free(negative);
-      ralloc_free(nir);
-      return false;
-   }
    context->fragment_kill = true;
    chrome9_compile_fs_nir(context, &shader, nir);
    chrome9_compile_fs_nir(context, &wrong_reference, negative);
    chrome9_compile_fs_nir(context, &reversed, reversed_nir);
    chrome9_compile_fs_nir(context, &non_alpha, non_alpha_nir);
+   context->fragment_kill = false;
+   chrome9_compile_fs_nir(context, &no_kill_capability, nir);
+   context->fragment_kill = old_fragment_kill;
    /* This is the exact source-order semantic chain: transformed Y, X/Y
     * assembly, normalized sample, sampled-alpha KILL, then sampled color. */
    valid = shader.supported && shader.semantic_fs_valid &&
@@ -1087,7 +1083,9 @@ check_ideas_logo_shadow_compilation(struct chrome9_context *context)
       !p[8].source[0].modifier &&
       !wrong_reference.supported && !wrong_reference.semantic_fs_valid &&
       !reversed.supported && !reversed.semantic_fs_valid &&
-      !non_alpha.supported && !non_alpha.semantic_fs_valid;
+      !non_alpha.supported && !non_alpha.semantic_fs_valid &&
+      !no_kill_capability.supported &&
+      !no_kill_capability.semantic_fs_valid;
    if (valid)
       for (unsigned lane = 0; lane < 4; lane++)
          valid &= p[6].source[0].swizzle[lane] ==
@@ -1100,14 +1098,16 @@ check_ideas_logo_shadow_compilation(struct chrome9_context *context)
       fprintf(stderr, "ideas logo-shadow compilation failed: "
               "supported=%u semantic=%u ir=%u inputs=%x varyings=%x "
               "samplers=%x uniforms=%x wrong=%u/%u reversed=%u/%u "
-              "nonalpha=%u/%u\n",
+              "nonalpha=%u/%u no-kill=%u/%u\n",
               shader.supported, shader.semantic_fs_valid,
               shader.semantic_fs_ir.count, shader.semantic_input_mask,
               shader.semantic_varying_mask, shader.semantic_sampler_mask,
               shader.semantic_uniform_mask,
               wrong_reference.supported, wrong_reference.semantic_fs_valid,
               reversed.supported, reversed.semantic_fs_valid,
-              non_alpha.supported, non_alpha.semantic_fs_valid);
+              non_alpha.supported, non_alpha.semantic_fs_valid,
+              no_kill_capability.supported,
+              no_kill_capability.semantic_fs_valid);
    ralloc_free(non_alpha_nir);
    ralloc_free(reversed_nir);
    ralloc_free(negative);

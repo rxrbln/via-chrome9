@@ -3535,8 +3535,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
          return false;
       intr = nir_instr_as_intrinsic(instr);
       if (intr->intrinsic == nir_intrinsic_terminate_if) {
-         /* Keep the proven alpha-less-than-half form opt-in until other
-          * discard predicates and sample domains have execution evidence. */
+         /* The kernel capability admits only the qualified sampled-alpha
+          * form; reject other discard predicates and sample domains. */
          if (!allow_kill || result || kill_count++ ||
              !chrome9_ps_lower_alpha_terminate(&builder, intr->src[0].ssa))
             return false;
@@ -3789,9 +3789,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
    from_nir = chrome9_compile_ps_nir(semantic_nir, &shader->semantic_fs_ir,
                                      &shader->native_fs,
                                      &shader->semantic_uniform_mask,
-                                     ctx->fragment_kill &&
-                                     debug_get_bool_option(
-                                        "CHROME9_EXPERIMENTAL_TEXKILL", false),
+                                     ctx->fragment_kill,
                                      &lowered);
    ralloc_free(semantic_nir);
    shader->semantic_fs_valid = lowered;
