@@ -9,6 +9,15 @@ targets.
 
 ## Documents
 
+- [chrome9-hw-tcl-implementation-plan.md](chrome9-hw-tcl-implementation-plan.md)
+  designs the semantic vertex-program UAPI, kernel compiler, vertex fetch and
+  Mesa bypass for hardware TCL, with a one-variable silicon ladder.
+- [chrome9-near-plane-clipping-re.md](chrome9-near-plane-clipping-re.md)
+  recovers the vendor clip-engine enable (type-01 A01 bits 11 and 20).
+- [chrome9-fragment-capacity-strategies.md](chrome9-fragment-capacity-strategies.md)
+  shows terrain's noise pass cannot fit the 96-ALU store and ranks fallbacks.
+- [ioquake3-gl2-remaining-features.md](ioquake3-gl2-remaining-features.md)
+  re-ranks the ioquake3 GL2 blockers after the lightmap fix.
 - [chrome9-modulate-blend-cmd22-hang.md](chrome9-modulate-blend-cmd22-hang.md)
   traces the GL1 menu cmd22 hang (and the kind-7 timeout) to ioquake3's
   pulsing glow alpha `0xFE` landing in uncounted H2 type-00 vertex data, where
