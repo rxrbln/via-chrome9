@@ -1181,6 +1181,173 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	return 0;
 }
 
+/* One ALU record reads at most one distinct texture-class (T or MISC)
+ * register; VX900 times out otherwise.  Keep MISC or the highest varying.
+ */
+static bool chrome9_fragment_split_source(
+	const struct drm_chrome9_fragment_instruction *instruction,
+	unsigned int source_count, unsigned int source)
+{
+	const struct drm_chrome9_fragment_source *src = &instruction->src[source];
+	int kept = -1;
+	unsigned int i;
+
+	if (src->file != DRM_CHROME9_FRAGMENT_FILE_VARYING)
+		return false;
+	for (i = 0; i < source_count; i++) {
+		const struct drm_chrome9_fragment_source *other =
+			&instruction->src[i];
+
+		if (other->file == DRM_CHROME9_FRAGMENT_FILE_POSITION)
+			return true;
+		if (other->file == DRM_CHROME9_FRAGMENT_FILE_VARYING)
+			kept = max_t(int, kept, other->index);
+	}
+	return src->index != kept;
+}
+
+static unsigned int chrome9_fragment_split_sources(
+	const struct drm_chrome9_fragment_instruction *instruction)
+{
+	unsigned int source_count = chrome9_fragment_op_sources(instruction->op);
+
+	if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX ||
+	    instruction->op == DRM_CHROME9_FRAGMENT_OP_KILL ||
+	    !chrome9_fragment_alu_component_mask(instruction) ||
+	    source_count < 2)
+		return 0;
+	return source_count;
+}
+
+/* All operands naming one varying share a single copy. */
+static int chrome9_fragment_split_alias(
+	const struct drm_chrome9_fragment_instruction *instruction,
+	unsigned int source)
+{
+	unsigned int i;
+
+	for (i = 0; i < source; i++)
+		if (instruction->src[i].file == instruction->src[source].file &&
+		    instruction->src[i].index == instruction->src[source].index)
+			return i;
+	return -1;
+}
+
+/* Copy each excess varying to a fresh temporary with an identity MOV of the
+ * referenced components, as the vendor GL read-port pass does; the consumer
+ * keeps its swizzle and selects ZERO outside its lane mask.
+ */
+static int chrome9_fragment_split_texture_reads(
+	const struct drm_chrome9_fragment_instruction *instructions,
+	u32 *instruction_count, struct drm_chrome9_fragment_instruction **split)
+{
+	bool temp_used[CHROME9_FRAGMENT_TEMP_COUNT] = { 0 };
+	struct drm_chrome9_fragment_instruction *out;
+	u32 count = *instruction_count;
+	u32 copies = 0, n = 0;
+	int temp = CHROME9_FRAGMENT_TEMP_COUNT - 1;
+	unsigned int i, source, lane;
+
+	*split = NULL;
+	if (!count || count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+		return 0;
+	for (i = 0; i < count; i++) {
+		const struct drm_chrome9_fragment_instruction *instruction =
+			&instructions[i];
+		unsigned int source_count =
+			chrome9_fragment_split_sources(instruction);
+
+		if (instruction->dst.file == DRM_CHROME9_FRAGMENT_DEST_TEMP &&
+		    instruction->dst.index < CHROME9_FRAGMENT_TEMP_COUNT)
+			temp_used[instruction->dst.index] = true;
+		for (source = 0; source < ARRAY_SIZE(instruction->src); source++)
+			if (instruction->src[source].file ==
+			    DRM_CHROME9_FRAGMENT_FILE_TEMP &&
+			    instruction->src[source].index <
+			    CHROME9_FRAGMENT_TEMP_COUNT)
+				temp_used[instruction->src[source].index] = true;
+		for (source = 0; source < source_count; source++)
+			if (chrome9_fragment_split_source(instruction,
+							  source_count, source) &&
+			    chrome9_fragment_split_alias(instruction, source) < 0)
+				copies++;
+	}
+	if (!copies)
+		return 0;
+	if (count + copies > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+		return -E2BIG;
+	out = kcalloc(count + copies, sizeof(*out), GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+	for (i = 0; i < count; i++) {
+		const struct drm_chrome9_fragment_instruction *instruction =
+			&instructions[i];
+		struct drm_chrome9_fragment_instruction consumer = *instruction;
+		unsigned int source_count =
+			chrome9_fragment_split_sources(instruction);
+		u8 lanes = chrome9_fragment_alu_component_mask(instruction);
+		u8 copy_temp[ARRAY_SIZE(consumer.src)];
+
+		for (source = 0; source < source_count; source++) {
+			struct drm_chrome9_fragment_source *src = &consumer.src[source];
+			struct drm_chrome9_fragment_instruction *mov;
+			int alias = chrome9_fragment_split_alias(instruction, source);
+			unsigned int other;
+			u8 components = 0;
+
+			if (!chrome9_fragment_split_source(instruction, source_count,
+							   source))
+				continue;
+			if (alias >= 0) {
+				copy_temp[source] = copy_temp[alias];
+				goto rewrite;
+			}
+			while (temp >= 0 && temp_used[temp])
+				temp--;
+			if (temp < 0) {
+				kfree(out);
+				return -E2BIG;
+			}
+			copy_temp[source] = temp--;
+			for (other = source; other < source_count; other++) {
+				const struct drm_chrome9_fragment_source *use =
+					&instruction->src[other];
+
+				if (use->file != src->file || use->index != src->index)
+					continue;
+				for (lane = 0; lane < ARRAY_SIZE(use->swizzle); lane++)
+					if ((lanes & BIT(lane)) && use->swizzle[lane] <
+					    DRM_CHROME9_FRAGMENT_SWIZZLE_ONE)
+						components |= BIT(use->swizzle[lane]);
+			}
+			/* A literal-only operand still names the register. */
+			if (!components)
+				components = 0x1;
+			mov = &out[n++];
+			mov->op = DRM_CHROME9_FRAGMENT_OP_MOV;
+			mov->dst.file = DRM_CHROME9_FRAGMENT_DEST_TEMP;
+			mov->dst.index = copy_temp[source];
+			mov->dst.writemask = components;
+			mov->src[0].file = DRM_CHROME9_FRAGMENT_FILE_VARYING;
+			mov->src[0].index = src->index;
+			for (lane = 0; lane < ARRAY_SIZE(src->swizzle); lane++)
+				mov->src[0].swizzle[lane] = components & BIT(lane) ?
+					lane : DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+rewrite:
+			src->file = DRM_CHROME9_FRAGMENT_FILE_TEMP;
+			src->index = copy_temp[source];
+			for (lane = 0; lane < ARRAY_SIZE(src->swizzle); lane++)
+				if (!(lanes & BIT(lane)))
+					src->swizzle[lane] =
+						DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+		}
+		out[n++] = consumer;
+	}
+	*split = out;
+	*instruction_count = n;
+	return 0;
+}
+
 static int chrome9_fragment_compile_internal(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,
@@ -1191,21 +1358,29 @@ static int chrome9_fragment_compile_internal(
 	struct chrome9_fragment_state state = {
 		.instructions = instructions,
 	};
+	struct drm_chrome9_fragment_instruction *split;
 	unsigned int i;
 	int ret;
 
 	memset(program, 0, sizeof(*program));
+	ret = chrome9_fragment_split_texture_reads(instructions,
+						   &instruction_count, &split);
+	if (ret)
+		return ret;
+	if (split)
+		state.instructions = split;
 	ret = chrome9_fragment_validate(&state, instruction_count,
 		constant_count, texture_count, descriptor_mask,
 		sparse_textures, varying_count);
 	if (ret)
-		return ret;
+		goto out;
+	ret = -EINVAL;
 	for (i = 0; i < constant_count * 4; i++)
 		if (!chrome9_fragment_float_finite(constants[i]))
-			return -EINVAL;
+			goto out;
 	ret = chrome9_fragment_allocate(&state, instruction_count);
 	if (ret)
-		return ret;
+		goto out;
 	program->constant_count = constant_count;
 	program->texture_count = texture_count;
 	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; i++) {
@@ -1221,7 +1396,10 @@ static int chrome9_fragment_compile_internal(
 	if (constant_count)
 		memcpy(program->constants, constants,
 		       constant_count * 4 * sizeof(*constants));
-	return chrome9_fragment_encode(&state, program, instruction_count);
+	ret = chrome9_fragment_encode(&state, program, instruction_count);
+out:
+	kfree(split);
+	return ret;
 }
 
 int chrome9_fragment_compile(
@@ -1572,11 +1750,14 @@ static int chrome9_fragment_position_selftest(struct chrome9_fragment_program *p
 	static const u32 expected_sub[] = {
 		0x82c30410, 0x10140924, 0x00f0c304, 0x00000820,
 	};
-	static const u32 expected_position_first[] = {
-		0x0140b6d0, 0x102c0041, 0x00f2c304, 0x00000820,
+	/* MISC and T are both texture-class reads; T0.xy moves to a TEMP. */
+	static const u32 expected_position_first[][4] = {
+		{ 0x01c00530, 0xd01c0053, 0x0032c006, 0x000d0020 },
+		{ 0x0140b6d0, 0x10200041, 0x00f2c304, 0x00000820 },
 	};
-	static const u32 expected_varying_first[] = {
-		0x0140b6d0, 0x102c3041, 0x00f2c004, 0x00000820,
+	static const u32 expected_varying_first[][4] = {
+		{ 0x01c00530, 0xd01c0053, 0x0032c006, 0x000d0020 },
+		{ 0x0140b6d0, 0x102c3041, 0x00f20004, 0x00000820 },
 	};
 	static const u32 expected_texture_alu[][4] = {
 		{ 0x0140b6d0, 0xd008006d, 0x0032c306, 0x00000020 },
@@ -1634,11 +1815,13 @@ static int chrome9_fragment_position_selftest(struct chrome9_fragment_program *p
 	stage = "MUL vPos,T0";
 	ret = chrome9_fragment_compile(position_varying, 1, constants, 0, 0, 1,
 				       program);
-	if (ret || program->active_texture_count || program->varying_count != 1 ||
-	    program->varying_width[0] != 2 ||
-	    memcmp(program->alu[0], expected_position_first,
+	if (ret || program->active_texture_count != 1 ||
+	    program->varying_count != 1 || program->varying_width[0] != 2 ||
+	    program->alu_count != ARRAY_SIZE(expected_position_first) ||
+	    memcmp(program->alu, expected_position_first,
 		   sizeof(expected_position_first)) ||
-	    program->controls[0] != 0x900d8009)
+	    program->controls[0] != 0x900d8009 ||
+	    program->controls[2] != 0x92000002)
 		goto failed;
 	stage = "MUL T0,vPos";
 	invalid = position_varying[0];
@@ -1646,9 +1829,11 @@ static int chrome9_fragment_position_selftest(struct chrome9_fragment_program *p
 	invalid.src[1] = position_varying[0].src[0];
 	ret = chrome9_fragment_compile(&invalid, 1, constants, 0, 0, 1, program);
 	if (ret || program->active_texture_count != 1 ||
-	    memcmp(program->alu[0], expected_varying_first,
+	    program->alu_count != ARRAY_SIZE(expected_varying_first) ||
+	    memcmp(program->alu, expected_varying_first,
 		   sizeof(expected_varying_first)) ||
-	    program->controls[0] != 0x900d8009)
+	    program->controls[0] != 0x900d8009 ||
+	    program->controls[2] != 0x92000002)
 		goto failed;
 	stage = "MUL+FRC vPos";
 	ret = chrome9_fragment_compile(position_center,
@@ -1663,11 +1848,17 @@ static int chrome9_fragment_position_selftest(struct chrome9_fragment_program *p
 	    program->controls[1] != 0x91000000 ||
 	    program->controls[2] != 0x92000002)
 		goto failed;
-	stage = "MISC/direct-coordinate alias rejection";
+	/* With one texture-class read per record the MISC location follows
+	 * every direct coordinate, so the alias rejection is not reached.
+	 */
+	stage = "MISC after split direct coordinates";
 	ret = chrome9_fragment_compile(position_mad,
 				       ARRAY_SIZE(position_mad), constants, 0, 0, 4,
 				       program);
-	if (ret != -EOPNOTSUPP)
+	if (ret || program->alu_count != 5 ||
+	    program->active_texture_count != 4 ||
+	    program->alu[4][1] != 0x302c4041 ||
+	    program->controls[0] != 0x900d001f)
 		goto failed;
 	stage = "vPos computed TEX";
 	ret = chrome9_fragment_compile(position_texture,
@@ -1943,6 +2134,95 @@ static int chrome9_fragment_vec3_cmp_selftest(
 		   sizeof(expected_controls)))
 		return -EINVAL;
 	return 0;
+}
+
+/* Linux 5.75 goldens for the vendor GL read-port split of ADD/MAD T. */
+static int chrome9_fragment_texture_read_selftest(
+	struct chrome9_fragment_program *program)
+{
+	static const struct drm_chrome9_fragment_instruction add[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction mad[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MAD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 0, 0, 0 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 1, 1, 1, 1 }, 0, 0 },
+			},
+		},
+	};
+	static const struct drm_chrome9_fragment_instruction same[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_DP3,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+			},
+		},
+	};
+	/* mov r0,t0; add oC0,r0,t1 */
+	static const u32 expected_add[][4] = {
+		{ 0x01c00530, 0x301c0053, 0x00f2c005, 0x000d0020 },
+		{ 0x02c10530, 0x30140924, 0x00f20005, 0x00000820 },
+	};
+	/* mov r0.xy,t0; mad oC0,r0.xxxx,t1,r0.yyyy */
+	static const u32 expected_mad[][4] = {
+		{ 0x01c00530, 0xd01c0053, 0x0032c006, 0x000d0020 },
+		{ 0x00002490, 0x002c1053, 0x00f20000, 0x00000820 },
+	};
+	static const u32 expected_same[] = {
+		0x01c00530, 0x502c0055, 0x00f0c005, 0x00020820,
+	};
+	const char *stage = "ADD T0,T1";
+	int ret;
+
+	ret = chrome9_fragment_compile(add, ARRAY_SIZE(add), NULL, 0, 0, 2,
+				       program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_add) ||
+	    memcmp(program->alu, expected_add, sizeof(expected_add)) ||
+	    program->active_texture_count != 2 ||
+	    program->controls[0] != 0x90058003 ||
+	    program->controls[2] != 0x92000002)
+		goto failed;
+	stage = "MAD T0.x,T1,T0.y";
+	ret = chrome9_fragment_compile(mad, ARRAY_SIZE(mad), NULL, 0, 0, 2,
+				       program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_mad) ||
+	    memcmp(program->alu, expected_mad, sizeof(expected_mad)) ||
+	    program->varying_width[0] != 2 ||
+	    program->controls[0] != 0x90058003 ||
+	    program->controls[2] != 0x92000002)
+		goto failed;
+	stage = "DP3 T0,T0";
+	ret = chrome9_fragment_compile(same, ARRAY_SIZE(same), NULL, 0, 0, 1,
+				       program);
+	if (ret || program->alu_count != 1 ||
+	    memcmp(program->alu[0], expected_same, sizeof(expected_same)))
+		goto failed;
+	return 0;
+
+failed:
+	pr_err("chrome9: fragment texture-read self-test %s failed (%d)\n",
+	       stage, ret);
+	return -EINVAL;
 }
 
 static int chrome9_fragment_primary_selftest(
@@ -2600,8 +2880,13 @@ int chrome9_fragment_selftest(void)
 	static const u32 expected_varying_duplicate_alu[][4] = {
 		{ 0x0140b6d0, 0x302c0053, 0x00f0c005, 0x00000820 },
 	};
+	/* One texture-class read per record: mov r0,t0; mov r1,t1;
+	 * mad oC0,r0,r1,t2 (the one-record MAD timed out on VX900).
+	 */
 	static const u32 expected_resource_mad_alu[][4] = {
-		{ 0x02c20530, 0x302c1053, 0x00f2c005, 0x00000820 },
+		{ 0x01c00530, 0x301c0053, 0x00f2c005, 0x000d0020 },
+		{ 0x01c00530, 0x301c0053, 0x00f2c105, 0x000d0060 },
+		{ 0x02c20530, 0x30201053, 0x00f20005, 0x00000820 },
 	};
 	static const u32 expected_resource_chain_alu[][4] = {
 		{ 0x01c00530, 0x301c0053, 0x00f2c005, 0x000d0020 },
@@ -2623,6 +2908,9 @@ int chrome9_fragment_selftest(void)
 	if (ret)
 		goto out;
 	ret = chrome9_fragment_primary_selftest(program);
+	if (ret)
+		goto out;
+	ret = chrome9_fragment_texture_read_selftest(program);
 	if (ret)
 		goto out;
 	ret = chrome9_fragment_sqrt_chain_selftest(program);
@@ -2820,7 +3108,7 @@ int chrome9_fragment_selftest(void)
 		goto out;
 	ret = chrome9_fragment_compile(resource_mad, ARRAY_SIZE(resource_mad),
 		constants, 0, 0, 3, program);
-	if (ret || program->active_texture_count != 1 ||
+	if (ret || program->active_texture_count != 3 ||
 	    program->alu_count != ARRAY_SIZE(expected_resource_mad_alu) ||
 	    memcmp(program->alu, expected_resource_mad_alu,
 		   sizeof(expected_resource_mad_alu))) {
