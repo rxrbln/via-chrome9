@@ -139,6 +139,17 @@ appeared.  These results qualify the tested finite points and record chains;
 they do not yet cover zero-length normalize, general POW zero/negative
 domains, precision away from exact powers, or the full vector set above.
 
+A later 31-record startup self-test exposed an important byte-level
+qualification.  The module used for these live draws packed the unused native
+XYZ selectors of EXP2/LOG2/RCP/RSQ as selector zero (`X`), producing `XXXX`,
+where both proprietary compilers encode literal ZERO in those lanes and the
+selected scalar only in native W (`000X`).  The finite POW results above remain
+valid arithmetic/retirement evidence for the old stream, but do not prove the
+vendor-canonical selector image or its exact multi-record chain.  The old
+stream also cannot be used to condemn the corrected form after a timeout.
+Fresh corrected-module tests must compare the native records first, then
+repeat the bounded finite POW gate before expanding its domain.
+
 ### P1: discard is a separate side effect, not CMP
 
 The generic compiler currently rejects every discard/demote/terminate
