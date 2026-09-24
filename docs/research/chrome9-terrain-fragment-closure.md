@@ -9,9 +9,9 @@ Windows/Linux compiler corpora are used where noted.
 
 ## Result
 
-The default terrain fragment shader is not presently blocked by an unknown
-terrain-specific instruction.  Its first compiler failure is an ordering bug
-in draw-time uniform specialization:
+The default terrain fragment shader is not blocked by an unknown
+terrain-specific instruction.  Its former first compiler failure was an
+ordering bug in draw-time uniform specialization:
 
 1. the GLSL branch on `pointLightDistance[0]` is if-converted to a scalar
    `bcsel` before the Chrome9 finalizer runs;
@@ -123,11 +123,8 @@ With the default distance fixed to zero, the optimized offline shader contains
 61 NIR ALU nodes and five TEX nodes (printed NIR SHA-256
 `022f057502d3ea51c333776a23fe1066395428570d05504cb09b46a2ac0d4015`).
 General POW adds two records when expanded from one NIR node to
-LOG2/MUL/EXP2; disjoint vector construction can add further MOVs.  This fits
-96 ALUs and 32 TEX records in principle, but remains a capacity estimate:
-exact semantic count, twelve-register physical-temp pressure, and computed
-coordinate bridges require successful specialization and a real compiler
-dump.
+LOG2/MUL/EXP2; disjoint vector construction adds further MOVs.  The exact
+post-inline compiler result below replaces this earlier capacity estimate.
 
 At the current compiler boundary the exact unspecialized program produces no
 semantic object: `supported=0`, `semantic=0`, `semantic_count=0`, with zero
@@ -190,10 +187,50 @@ canonical program that cannot compile proceeds to draw-time specialization.
 
 The exact default terrain ShaderSource inputs have been regenerated at
 `/tmp/chrome9-terrain-final.vert` and `.frag`, matching the hashes above.
-The existing standalone linked-shader probe does not execute the new
-draw-time specialization, so the exact terrain post-inline semantic count and
-native compile result remain unverified.  This is compiler progress, not a
-terrain-scene or hardware acceptance claim.
+
+### Exact post-inline result
+
+A current-Mesa standalone linker/probe now performs the same unpacked uniform
+location assignment, sampler lowering, default-UBO lowering, Chrome9
+inlinable-uniform discovery, zero-value substitution, and Chrome9 fragment
+compilation.  It identifies exactly one key dword, default-UBO dword 60 for
+`pointLightDistance[0]`.  Substituting zero removes the distance comparison,
+SQRT, reciprocal, MIN, and select arm.
+
+The finalized semantic result is accepted:
+
+```text
+supported=1 semantic=1 semantic_count=73
+ALU=68 TEX=5
+MOV=11 MUL=27 ADD=14 DP3=7 RSQ=5 MAX=2 LOG2=1 EXP2=1
+sampler_mask=1f varying_mask=000f input_mask=0000
+uniform_mask=00007fff constant_mask=80007fff
+```
+
+The semantic stream uses virtual temporary ids 0 through 66.  A conservative
+component-lifetime reconstruction peaks at nine simultaneously live virtual
+registers, at record 53; the high virtual id is SSA naming, not 67-register
+pressure.  The five TEX records are interleaved with dependent ALU at records
+4, 5, 8, 17, and 52.  Therefore the optional userspace TAU-first native
+encoder reports `native=0`, as expected for this general ordered stream; that
+is not a semantic rejection because cmd22 submits the 73-record semantic
+program for kernel scheduling.
+
+The regenerated source hashes remain
+`f82cc07c2bad46f554694623d5c71588bb899152146f9d36240e611abf19d6db`
+and `c666837de4308cb64903d6d97d178a292929a4c6dd495a4d70e364da13293558`.
+The host probe binary SHA-256 is
+`91c1a4c6deaf7fb717d5ba450e894a12c1716727254cf2cd968f0830e9cbe43a`;
+its captured result is
+`a39d393efc19bc0846fbb41592c8afe04c581840ecf622d09a0cd006a238eeca`.
+No DRM node or GPU was used.
+
+This closes the fragment semantic compiler gate, not the scene.  Public caps
+still expose three fragment inputs and three fragment sampler/view slots,
+while this shader needs four packed input slots and five dense fragment
+samplers; the terrain vertex shader also needs the still-disabled public
+vertex-texture path.  Uniform POW's LOG-zero numerical behavior remains a
+separate hardware correctness gate.
 
 ## Proprietary uniform-POW oracle
 
