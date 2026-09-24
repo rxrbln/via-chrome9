@@ -203,6 +203,26 @@ build_alpha_mode_terminates(void)
    return b.shader;
 }
 
+/* Exercise both NIR FACE forms.  The boolean form chooses the same numeric
+ * sign exposed directly by load_front_face_fsign. */
+static nir_shader *
+build_front_face_pair(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                   &options,
+                                                   "front-face-pair");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_vec2_type(), "out");
+   nir_def *face = nir_load_front_face(&b, 1);
+   nir_def *from_bool = nir_bcsel(&b, face, nir_imm_float(&b, 1.0f),
+                                  nir_imm_float(&b, -1.0f));
+   nir_def *from_fsign = nir_load_front_face_fsign(&b);
+
+   nir_store_var(&b, out, nir_vec2(&b, from_bool, from_fsign), 0x3);
+   nir_validate_shader(b.shader, "Chrome9 FACE specialization input");
+   return b.shader;
+}
+
 static unsigned
 alu_op_count(nir_shader *nir, nir_op op)
 {
@@ -298,6 +318,47 @@ terminate_count(nir_shader *nir)
 }
 
 static bool
+check_front_face(nir_shader *canonical, bool front_face)
+{
+   nir_shader *variant = nir_shader_clone(NULL, canonical);
+   uint32_t expected = float_bits(front_face ? 1.0f : -1.0f);
+   bool saw_store = false;
+   bool valid = chrome9_nir_specialize_front_face(variant, front_face);
+
+   nir_validate_shader(variant, "Chrome9 specialized FACE");
+   nir_foreach_function_impl(impl, variant) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+            if (intr->intrinsic == nir_intrinsic_load_front_face ||
+                intr->intrinsic == nir_intrinsic_load_front_face_fsign)
+               valid = false;
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_def *value = intr->src[1].ssa;
+
+            saw_store = true;
+            if (!nir_def_is_const(value) || value->num_components != 2 ||
+                nir_src_comp_as_uint(nir_src_for_ssa(value), 0) != expected ||
+                nir_src_comp_as_uint(nir_src_for_ssa(value), 1) != expected)
+               valid = false;
+         }
+      }
+   }
+   if (!saw_store)
+      valid = false;
+   if (!valid) {
+      fprintf(stderr, "FACE %u did not specialize correctly\n", front_face);
+      nir_print_shader(variant, stderr);
+   }
+   ralloc_free(variant);
+   return valid;
+}
+
+static bool
 check_alpha_mode(nir_shader *canonical, unsigned mode,
                  unsigned expected_terminates)
 {
@@ -366,6 +427,13 @@ main(void)
        !check_alpha_mode(nir, 2, 1) ||
        !check_alpha_mode(nir, 3, 1)) {
       fprintf(stderr, "alpha mode terminate specialization failed\n");
+      return 1;
+   }
+   ralloc_free(nir);
+
+   nir = build_front_face_pair();
+   if (!check_front_face(nir, false) || !check_front_face(nir, true)) {
+      fprintf(stderr, "FACE specialization failed\n");
       return 1;
    }
    ralloc_free(nir);

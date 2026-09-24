@@ -3,6 +3,7 @@
 #ifndef CHROME9_SPECIALISE_H
 #define CHROME9_SPECIALISE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct nir_shader;
@@ -22,5 +23,11 @@ void chrome9_nir_find_inlinable_uniforms(struct nir_shader *nir);
  * shader reaches a stable form. */
 void chrome9_nir_inline_uniforms(struct nir_shader *nir,
                                  const uint32_t *values);
+
+/* Replace FACE by the one semantic face which can survive a cull-front or
+ * cull-back draw.  Cull-none callers must retain dynamic FACE and must not
+ * call this helper. */
+bool chrome9_nir_specialize_front_face(struct nir_shader *nir,
+                                       bool front_face);
 
 #endif

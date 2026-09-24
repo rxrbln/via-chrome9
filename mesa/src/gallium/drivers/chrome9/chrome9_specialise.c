@@ -333,3 +333,36 @@ chrome9_nir_inline_uniforms(nir_shader *nir, const uint32_t *values)
       return;
    chrome9_fold_after_inline(nir);
 }
+
+static bool
+chrome9_replace_front_face(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
+{
+   bool front_face = *(const bool *)data;
+   nir_def *replacement;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_front_face:
+      replacement = nir_imm_boolN_t(b, front_face, intr->def.bit_size);
+      break;
+   case nir_intrinsic_load_front_face_fsign:
+      replacement = nir_imm_floatN_t(b, front_face ? 1.0 : -1.0,
+                                     intr->def.bit_size);
+      break;
+   default:
+      return false;
+   }
+   nir_def_replace(&intr->def, replacement);
+   return true;
+}
+
+bool
+chrome9_nir_specialize_front_face(nir_shader *nir, bool front_face)
+{
+   if (!nir_shader_intrinsics_pass(nir, chrome9_replace_front_face,
+                                   nir_metadata_control_flow, &front_face))
+      return false;
+   chrome9_fold_after_inline(nir);
+   return true;
+}
