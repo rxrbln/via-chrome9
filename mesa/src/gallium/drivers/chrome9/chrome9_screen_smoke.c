@@ -1412,7 +1412,9 @@ make_two_projected_texture_fragment_shader(struct pipe_screen *screen,
       &b, nir_channel(&b, first_product, 0),
       nir_channel(&b, first_product, 1),
       nir_channel(&b, first_product, 2), nir_channel(&b, color, 3));
-   nir_def *product = nir_fmul(&b, sample[1], first_rgb_primary_alpha);
+   nir_def *product = nir_fmul(&b, sample[1],
+                               preserve_texture0_alpha ? first_product :
+                                                         first_rgb_primary_alpha);
    nir_def *result = nir_vec4(
       &b, nir_channel(&b, product, 0), nir_channel(&b, product, 1),
       nir_channel(&b, product, 2),
@@ -3167,7 +3169,7 @@ out:
 }
 
 static bool
-run_pipe_texture(struct pipe_screen *screen)
+run_pipe_texture(struct pipe_screen *screen, bool projected_only)
 {
    static const struct smoke_texture_vertex white_vertices[] = {
       { { -1, -1, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0 } },
@@ -3589,6 +3591,9 @@ run_pipe_texture(struct pipe_screen *screen)
    context->set_viewport_states(context, 0, 1, &viewport);
    context->set_scissor_states(context, 0, 1, &scissor);
 
+   if (projected_only)
+      goto projected_test;
+
    for (unsigned program = 0; program < 2; program++) {
       const uint32_t expect[2][4] = {
          { 0xff0000, 0x00ff00, 0x0000ff, 0xffffff },
@@ -3816,6 +3821,18 @@ run_pipe_texture(struct pipe_screen *screen)
                                  &view);
       puts("Gallium texture RGBX lowering passed");
    }
+projected_test:
+   pixels = (uint32_t *)((uint8_t *)ctarget->bo.map + ctarget->data_offset);
+   if (projected_only) {
+      uint32_t *rgbx_source = (uint32_t *)
+         ((uint8_t *)crhw_texture->bo.map + crhw_texture->data_offset);
+
+      for (unsigned i = 0; i < 8; i++)
+         rgbx_source[i] = i < 4 ? 0x00ff0000 : 0x00ffffff;
+      if (!smoke_initialize_guard_pages(ctarget) ||
+          !smoke_initialize_guard_pages(crhw_texture))
+         goto out;
+   }
    {
       const unsigned at[4][2] = { { 8, 8 }, { 24, 8 },
                                   { 8, 24 }, { 24, 24 } };
@@ -3827,6 +3844,8 @@ run_pipe_texture(struct pipe_screen *screen)
       };
       uint64_t submitted = ccontext->submitted_triangles;
       uint64_t rejected = ccontext->rejected_triangles;
+      uint32_t first_actual[4] = { 0 };
+      uint32_t second_actual[4] = { 0 };
       bool pixels_match = true;
 
       context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
@@ -3841,25 +3860,47 @@ run_pipe_texture(struct pipe_screen *screen)
                      &clear, 1.0, 0);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
-      for (unsigned i = 0; i < ARRAY_SIZE(at); i++)
-         pixels_match &=
-            (pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
-             0xffffff) == expect[i];
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++) {
+         first_actual[i] =
+            pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] & 0xffffff;
+         pixels_match &= first_actual[i] == expect[i];
+      }
 
       context->bind_fs_state(context, projected_modulate_fs);
       context->clear(context, PIPE_CLEAR_COLOR0, PIPE_MASK_RGBA, 0xff, NULL,
                      &clear, 1.0, 0);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
-      for (unsigned i = 0; i < ARRAY_SIZE(at); i++)
-         pixels_match &=
-            (pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] &
-             0xffffff) == expect[i];
+      for (unsigned i = 0; i < ARRAY_SIZE(at); i++) {
+         second_actual[i] =
+            pixels[at[i][1] * (ctarget->stride / 4) + at[i][0]] & 0xffffff;
+         pixels_match &= second_actual[i] == expect[i];
+      }
 
       vertex_buffer.buffer.user = bad_q_vertices;
       context->set_vertex_buffers(context, 1, &vertex_buffer);
       context->draw_vbo(context, &info, 0, NULL, &draw, 1);
       context->flush(context, NULL, 0);
+      if (projected_only) {
+         passed = pixels_match &&
+            ccontext->submitted_triangles == submitted + 4 &&
+            ccontext->rejected_triangles == rejected + 1 &&
+            smoke_guard_pages_match(ctarget) &&
+            smoke_guard_pages_match(crhw_texture);
+         if (!passed)
+            fprintf(stderr, "generic projected Q-domain mismatch: "
+                    "submitted=+%" PRIu64 " rejected=+%" PRIu64
+                    " pixels=%u first=%06x,%06x,%06x,%06x "
+                    "second=%06x,%06x,%06x,%06x\n",
+                    ccontext->submitted_triangles - submitted,
+                    ccontext->rejected_triangles - rejected, pixels_match,
+                    first_actual[0], first_actual[1], first_actual[2],
+                    first_actual[3], second_actual[0], second_actual[1],
+                    second_actual[2], second_actual[3]);
+         else
+            puts("Gallium generic projected XRGB q=1 and q=2 reject passed");
+         goto out;
+      }
       vertex_buffer.buffer.user = projected_vertices;
       context->set_vertex_buffers(context, 1, &vertex_buffer);
       context->set_sampler_views(context, MESA_SHADER_FRAGMENT, 0, 1, 0,
@@ -5191,7 +5232,8 @@ out:
 
 static bool
 run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
-                           bool projected_blend, bool texture0_alpha)
+                           bool projected_blend, bool texture0_alpha,
+                           bool projector_only)
 {
    struct pipe_resource target_template = {
       .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8X8_UNORM,
@@ -5469,6 +5511,11 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
 
          if (baseline_alpha < 0x7f || baseline_alpha > 0x81)
             goto out;
+         if (projector_only) {
+            puts("Gallium program25 PRIMARY+T0+T1 projected pixel/guard passed");
+            passed = true;
+            goto out;
+         }
          repeat_sampler.wrap_s = PIPE_TEX_WRAP_REPEAT;
          repeat_sampler.wrap_t = PIPE_TEX_WRAP_REPEAT;
          repeat_sampler_handle =
@@ -5607,7 +5654,9 @@ run_pipe_two_npot_textures(struct pipe_screen *screen, bool depth_test,
          puts("Gallium program24-equivalent TEX0*primary alpha with signed "
               "REPEAT passed");
       } else {
-         puts("Gallium two projected XRGB textures D16+blend passed");
+         puts(projector_only ?
+              "Gallium program24 PRIMARY+T0+T1 projected pixel/guard passed" :
+              "Gallium two projected XRGB textures D16+blend passed");
       }
       passed = true;
       goto out;
@@ -7391,8 +7440,33 @@ main(int argc, char **argv)
       return passed ? 0 : 1;
    }
    if (argc > 2 && !strcmp(argv[2], "--texture-only")) {
-      bool passed = run_pipe_texture(screen);
+      bool passed = run_pipe_texture(screen, false);
 
+      screen->destroy(screen);
+      return passed ? 0 : 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--projected-only")) {
+      bool passed = run_pipe_texture(screen, true);
+
+      screen->destroy(screen);
+      return passed ? 0 : 1;
+   }
+   if (argc > 2 && !strcmp(argv[2], "--two-projector-only")) {
+      const uint64_t required = DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM |
+         DRM_CHROME9_CAP_FRAGMENT_PRIMARY |
+         DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY;
+      bool passed;
+
+      if (!chrome9_screen_has_capability(screen, required) ||
+          screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers < 2 ||
+          screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views < 2) {
+         fputs("--two-projector-only requires cmd22 primary and two-sampler "
+               "capabilities\n", stderr);
+         screen->destroy(screen);
+         return 1;
+      }
+      passed = run_pipe_two_npot_textures(screen, true, true, false, true) &&
+               run_pipe_two_npot_textures(screen, true, true, true, true);
       screen->destroy(screen);
       return passed ? 0 : 1;
    }
@@ -7792,7 +7866,7 @@ main(int argc, char **argv)
       return 1;
    }
    if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions) {
-      if (!run_pipe_texture(screen)) {
+      if (!run_pipe_texture(screen, false)) {
          fputs("Chrome9 Gallium texture draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -7846,7 +7920,7 @@ main(int argc, char **argv)
          return 1;
       }
       if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers >= 2 &&
-          !run_pipe_two_npot_textures(screen, false, false, false)) {
+          !run_pipe_two_npot_textures(screen, false, false, false, false)) {
          fputs("Chrome9 Gallium two-unit NPOT texture draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -7854,7 +7928,7 @@ main(int argc, char **argv)
       }
       if (chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16) &&
-          !run_pipe_two_npot_textures(screen, true, false, false)) {
+          !run_pipe_two_npot_textures(screen, true, false, false, false)) {
          fputs("Chrome9 Gallium two-unit textured D16 draw failed\n", stderr);
          screen->resource_destroy(screen, resource);
          screen->destroy(screen);
@@ -7863,7 +7937,7 @@ main(int argc, char **argv)
       if (chrome9_screen_has_capability(
              screen,
              DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE_D16_BLEND) &&
-          !run_pipe_two_npot_textures(screen, true, true, false)) {
+          !run_pipe_two_npot_textures(screen, true, true, false, false)) {
          fputs("Chrome9 Gallium two-unit projected D16 blend draw failed\n",
                stderr);
          screen->resource_destroy(screen, resource);
@@ -7874,7 +7948,7 @@ main(int argc, char **argv)
              screen, DRM_CHROME9_CAP_TWO_TEXTURE_TEX0_ALPHA_PRIMARY) &&
           chrome9_screen_has_capability(
              screen, DRM_CHROME9_CAP_TWO_TEXTURE_SIGNED_REPEAT_COORDS) &&
-          !run_pipe_two_npot_textures(screen, true, true, true)) {
+          !run_pipe_two_npot_textures(screen, true, true, true, false)) {
          fputs("Chrome9 Gallium program24-equivalent signed-repeat draw "
                "failed\n", stderr);
          screen->resource_destroy(screen, resource);

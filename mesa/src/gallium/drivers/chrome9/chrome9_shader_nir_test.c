@@ -129,6 +129,184 @@ make_texture_primary_multiply(void)
 }
 
 static nir_shader *
+make_projected_texture_primary_multiply(bool preserve_primary_alpha,
+                                        bool wrong_projector_lane,
+                                        bool legacy_io)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-projected-texture-primary");
+   nir_variable *output = NULL;
+   nir_def *tc, *color;
+
+   if (legacy_io) {
+      nir_variable *tc_var = nir_variable_create(
+         b.shader, nir_var_shader_in, glsl_vec4_type(), "tc");
+      nir_variable *color_var = nir_variable_create(
+         b.shader, nir_var_shader_in, glsl_vec4_type(), "color");
+
+      output = nir_variable_create(
+         b.shader, nir_var_shader_out, glsl_vec4_type(), "result");
+      tc_var->data.location = VARYING_SLOT_TEX0;
+      tc_var->data.interpolation = INTERP_MODE_SMOOTH;
+      color_var->data.location = VARYING_SLOT_COL0;
+      output->data.location = FRAG_RESULT_COLOR;
+      tc = nir_load_deref(&b, nir_build_deref_var(&b, tc_var));
+      color = nir_load_deref(&b, nir_build_deref_var(&b, color_var));
+   } else {
+      nir_def *barycentric = nir_load_barycentric_pixel(
+         &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+
+      b.shader->info.io_lowered = true;
+      tc = nir_load_interpolated_input(
+         &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+         .io_semantics.location = VARYING_SLOT_VAR0);
+      color = nir_load_interpolated_input(
+         &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+         .io_semantics.location = VARYING_SLOT_COL0);
+   }
+   nir_def *coord = nir_vec2(&b, nir_channel(&b, tc, 0),
+                             nir_channel(&b, tc, 1));
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+   nir_def *product, *result;
+
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   tex->src[1] = nir_tex_src_for_ssa(
+      nir_tex_src_projector,
+      nir_channel(&b, tc, wrong_projector_lane ? 2 : 3));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   product = nir_fmul(&b, &tex->def, color);
+   result = preserve_primary_alpha ? nir_vec4(
+      &b, nir_channel(&b, product, 0), nir_channel(&b, product, 1),
+      nir_channel(&b, product, 2), nir_channel(&b, color, 3)) : product;
+   if (legacy_io)
+      nir_store_deref(&b, nir_build_deref_var(&b, output), result, 0xf);
+   else
+      nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
+                       .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static nir_shader *
+make_two_projected_texture_primary_multiply(bool wrong_second_projector)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-two-projected-primary");
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_def *sample[2];
+
+   b.shader->info.io_lowered = true;
+   for (unsigned unit = 0; unit < 2; unit++) {
+      nir_def *tc = nir_load_interpolated_input(
+         &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+         .io_semantics.location = VARYING_SLOT_VAR0 + unit);
+      nir_def *coord = nir_vec2(&b, nir_channel(&b, tc, 0),
+                                nir_channel(&b, tc, 1));
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+
+      tex->op = nir_texop_tex;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->texture_index = unit;
+      tex->sampler_index = unit;
+      tex->coord_components = 2;
+      tex->dest_type = nir_type_float32;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+      tex->src[1] = nir_tex_src_for_ssa(
+         nir_tex_src_projector,
+         nir_channel(&b, tc,
+                     unit == 1 && wrong_second_projector ? 2 : 3));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      sample[unit] = &tex->def;
+   }
+   nir_def *product = nir_fmul(&b, sample[1],
+                               nir_fmul(&b, sample[0], color));
+   nir_def *result = nir_vec4(
+      &b, nir_channel(&b, product, 0), nir_channel(&b, product, 1),
+      nir_channel(&b, product, 2), nir_channel(&b, color, 3));
+
+   nir_store_output(&b, result, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static bool
+check_identity_projector_compilation(struct chrome9_context *context)
+{
+   for (unsigned alpha = 0; alpha < 2; alpha++) {
+      for (unsigned wrong_lane = 0; wrong_lane < 2; wrong_lane++) {
+         for (unsigned legacy_io = 0; legacy_io < 2; legacy_io++) {
+            struct chrome9_shader shader = { 0 };
+            nir_shader *nir = make_projected_texture_primary_multiply(
+               alpha, wrong_lane, legacy_io);
+            bool valid;
+
+            chrome9_compile_fs_nir(context, &shader, nir);
+            valid = wrong_lane ? !shader.semantic_fs_valid :
+               shader.supported && shader.semantic_fs_valid &&
+               shader.semantic_input_mask == 1 &&
+               shader.semantic_varying_mask == 1 &&
+               shader.semantic_sampler_mask == 1 &&
+               shader.semantic_identity_projector_input_mask == (1u << 3) &&
+               shader.semantic_fs_ir.count >= 2 &&
+               shader.semantic_fs_ir.instruction[0].op == CHROME9_PS_OPCODE_TEX;
+            if (!valid)
+               fprintf(stderr, "projected texture alpha=%u wrong_lane=%u "
+                       "legacy_io=%u: supported=%u semantic=%u "
+                       "projector=%08x ir=%u\n",
+                       alpha, wrong_lane, legacy_io, shader.supported,
+                       shader.semantic_fs_valid,
+                       shader.semantic_identity_projector_input_mask,
+                       shader.semantic_fs_ir.count);
+            ralloc_free(nir);
+            if (!valid)
+               return false;
+         }
+      }
+   }
+   for (unsigned wrong = 0; wrong < 2; wrong++) {
+      struct chrome9_shader shader = { 0 };
+      nir_shader *nir = make_two_projected_texture_primary_multiply(wrong);
+      bool valid;
+
+      chrome9_compile_fs_nir(context, &shader, nir);
+      valid = wrong ? !shader.semantic_fs_valid :
+         shader.supported && shader.semantic_fs_valid &&
+         shader.semantic_input_mask == 1 &&
+         shader.semantic_varying_mask == 3 &&
+         shader.semantic_sampler_mask == 3 &&
+         shader.semantic_identity_projector_input_mask ==
+            ((1u << 3) | (1u << 7));
+      if (!valid)
+         fprintf(stderr, "two projected textures wrong=%u: "
+                 "supported=%u semantic=%u projector=%08x "
+                 "varying=%x sampler=%x\n",
+                 wrong, shader.supported, shader.semantic_fs_valid,
+                 shader.semantic_identity_projector_input_mask,
+                 shader.semantic_varying_mask,
+                 shader.semantic_sampler_mask);
+      ralloc_free(nir);
+      if (!valid)
+         return false;
+   }
+   return true;
+}
+
+static nir_shader *
 make_scalar_literal_chain(bool reserve_c31, unsigned literal_count)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -621,6 +799,73 @@ check_vector_conditional_compilation(struct chrome9_context *context,
 }
 
 static bool
+check_equal_zero_select_compilation(struct chrome9_context *context,
+                                    float reference, bool expect_supported)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-shared-equal-zero-select");
+   struct chrome9_shader shader = { 0 };
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *varying = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR1);
+   nir_def *predicate = nir_feq(&b, nir_channel(&b, varying, 2),
+                                 nir_imm_float(&b, reference));
+   nir_def *color = nir_imm_vec3(&b, 0.0f, 0.0f, 0.0f);
+   unsigned abs_count = 0, sub_count = 0, cmp_count = 0;
+   bool valid;
+
+   nir_instr_as_alu(nir_def_instr(predicate))->fp_math_ctrl =
+      nir_fp_preserve_inf | nir_fp_preserve_nan;
+   for (unsigned i = 0; i < 3; i++) {
+      nir_def *selected = nir_bcsel(
+         &b, predicate,
+         nir_imm_vec3(&b, 0.125f, 0.25f, 0.375f),
+         nir_imm_vec3(&b, 0.5f, 0.625f, 0.75f));
+
+      color = nir_fadd(&b, color, selected);
+   }
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b, nir_channel(&b, color, 0),
+                                  nir_channel(&b, color, 1),
+                                  nir_channel(&b, color, 2),
+                                  nir_imm_float(&b, 1.0f)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      switch (shader.semantic_fs_ir.instruction[i].op) {
+      case CHROME9_PS_OPCODE_ABS: abs_count++; break;
+      case CHROME9_PS_OPCODE_SUB: sub_count++; break;
+      case CHROME9_PS_OPCODE_CMP: cmp_count++; break;
+      default: break;
+      }
+   }
+   valid = expect_supported ?
+      shader.supported && shader.semantic_fs_valid &&
+      shader.native_fs_valid &&
+      shader.semantic_equal_zero_input_mask == (1u << 6) &&
+      abs_count == 1 && sub_count == 1 && cmp_count == 3 :
+      !shader.supported && !shader.semantic_fs_valid;
+   if (!valid)
+      fprintf(stderr, "equal-zero select compilation failed: ref=%g "
+              "expected=%u supported=%u semantic=%u native=%u "
+              "domain=%08x abs/sub/cmp=%u/%u/%u\n", reference,
+              expect_supported, shader.supported, shader.semantic_fs_valid,
+              shader.native_fs_valid,
+              shader.semantic_equal_zero_input_mask,
+              abs_count, sub_count, cmp_count);
+   if (!valid)
+      nir_print_shader(b.shader, stderr);
+   ralloc_free(b.shader);
+   return valid;
+}
+
+static bool
 check_canonical_uniform_select_context(void)
 {
    struct pipe_screen screen = { .get_screen_fd = test_screen_fd };
@@ -696,6 +941,113 @@ out_shader:
 out:
    if (!valid)
       fprintf(stderr, "canonical uniform select context fallback failed\n");
+   pipe->destroy(pipe);
+   return valid;
+}
+
+static bool
+check_front_face_variant_context(void)
+{
+   struct pipe_screen screen = { .get_screen_fd = test_screen_fd };
+   struct pipe_context *pipe = chrome9_context_create(&screen, NULL, 0);
+   struct chrome9_context *ctx;
+   struct chrome9_shader *shader = NULL;
+   struct pipe_rasterizer_state raster = { 0 };
+   void *state = NULL;
+   struct pipe_draw_info info = {
+      .mode = MESA_PRIM_TRIANGLES,
+      .index_size = 2,
+      .has_user_indices = true,
+      .instance_count = 1,
+   };
+   struct pipe_draw_start_count_bias draw = { .count = 3 };
+   uint32_t front_color = 0;
+   bool valid = false;
+
+   if (!pipe)
+      return false;
+   ctx = chrome9_context(pipe);
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-front-face-variant");
+   nir_def *face = nir_load_front_face(&b, 1);
+   nir_def *value = nir_bcsel(&b, face, nir_imm_float(&b, 0.25f),
+                             nir_imm_float(&b, 0.75f));
+   struct pipe_shader_state fs_state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b, value, value, value,
+                                 nir_imm_float(&b, 1.0f)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   shader = pipe->create_fs_state(pipe, &fs_state);
+   state = pipe->create_rasterizer_state(pipe, &raster);
+   if (!shader || !state || shader->canonical_supported ||
+       b.shader->info.num_inlinable_uniforms)
+      goto out;
+   pipe->bind_fs_state(pipe, shader);
+   ctx->vs = shader;
+
+   raster.cull_face = PIPE_FACE_BACK;
+   pipe->delete_rasterizer_state(pipe, state);
+   state = pipe->create_rasterizer_state(pipe, &raster);
+   pipe->bind_rasterizer_state(pipe, state);
+   pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+   if (!shader->supported || shader->variant_count != 1 ||
+       shader->variants->face_mode != 1 || unexpected_ioctls)
+      goto out;
+   front_color = shader->literal_color;
+
+   raster.cull_face = PIPE_FACE_FRONT;
+   pipe->bind_rasterizer_state(pipe, NULL);
+   pipe->delete_rasterizer_state(pipe, state);
+   state = pipe->create_rasterizer_state(pipe, &raster);
+   pipe->bind_rasterizer_state(pipe, state);
+   pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+   if (!shader->supported || shader->variant_count != 2 ||
+       shader->variants->face_mode != 2 ||
+       shader->literal_color == front_color || unexpected_ioctls)
+      goto out;
+
+   raster.cull_face = 0;
+   pipe->bind_rasterizer_state(pipe, NULL);
+   pipe->delete_rasterizer_state(pipe, state);
+   state = pipe->create_rasterizer_state(pipe, &raster);
+   pipe->bind_rasterizer_state(pipe, state);
+   pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+   if (shader->supported || shader->variant_count != 2 || unexpected_ioctls)
+      goto out;
+
+   raster.cull_face = PIPE_FACE_BACK;
+   pipe->bind_rasterizer_state(pipe, NULL);
+   pipe->delete_rasterizer_state(pipe, state);
+   state = pipe->create_rasterizer_state(pipe, &raster);
+   pipe->bind_rasterizer_state(pipe, state);
+   pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+   valid = shader->supported && shader->variant_count == 2 &&
+           shader->literal_color == front_color && !unexpected_ioctls;
+
+out:
+   if (!valid)
+      fprintf(stderr, "front-face cull variant cache failed: supported=%u "
+              "variants=%u ioctls=%u\n", shader && shader->supported,
+              shader ? shader->variant_count : 0, unexpected_ioctls);
+   ctx->vs = NULL;
+   if (state) {
+      pipe->bind_rasterizer_state(pipe, NULL);
+      pipe->delete_rasterizer_state(pipe, state);
+   }
+   if (shader) {
+      pipe->bind_fs_state(pipe, NULL);
+      pipe->delete_fs_state(pipe, shader);
+   } else {
+      ralloc_free(b.shader);
+   }
    pipe->destroy(pipe);
    return valid;
 }
@@ -1188,7 +1540,8 @@ main(void)
       return 1;
    }
    ralloc_free(nir);
-   if (!check_scalar_literal_packing(&context, false, 17, true) ||
+   if (!check_identity_projector_compilation(&context) ||
+       !check_scalar_literal_packing(&context, false, 17, true) ||
        !check_scalar_literal_packing(&context, true, 17, true) ||
        !check_scalar_literal_packing(&context, false, 64, true) ||
        !check_scalar_literal_packing(&context, false, 65, false) ||
@@ -1199,13 +1552,16 @@ main(void)
        !check_vector_conditional_compilation(&context, 3, false) ||
        !check_vector_conditional_compilation(&context, 4, false) ||
        !check_vector_conditional_compilation(&context, 1, true) ||
+       !check_equal_zero_select_compilation(&context, 0.0f, true) ||
+       !check_equal_zero_select_compilation(&context, 1.0f, false) ||
        !check_canonical_uniform_select_context() ||
+       !check_front_face_variant_context() ||
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
        !check_function_medium_sqrt_boundary(&context) ||
        !check_ideas_logo_shadow_compilation(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur compilation passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur compilation passed");
    return 0;
 }

@@ -59,6 +59,8 @@ enum chrome9_fragment_program {
 struct chrome9_fs_variant {
    struct chrome9_fs_variant *next;
    uint32_t inline_values[MAX_INLINABLE_UNIFORMS];
+   /* 0: dynamic FACE, 1: surviving front face, 2: surviving back face. */
+   uint8_t face_mode;
    enum chrome9_fragment_program fragment_program;
    uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
@@ -69,6 +71,11 @@ struct chrome9_fs_variant {
    uint16_t semantic_input_mask;
    uint16_t semantic_varying_mask;
    uint8_t semantic_sampler_mask;
+   /* Direct varying lanes used by equality-to-zero selects.  The draw path
+    * proves exact signed zero or unit-magnitude values before submission. */
+   uint32_t semantic_equal_zero_input_mask;
+   /* Projected samples lowered to 2D TEX only when Q is exactly one. */
+   uint32_t semantic_identity_projector_input_mask;
    bool semantic_fs_valid;
    bool native_fs_valid;
    bool native_fs_from_nir;
@@ -92,6 +99,8 @@ struct chrome9_shader {
    uint16_t semantic_input_mask;
    uint16_t semantic_varying_mask;
    uint8_t semantic_sampler_mask;
+   uint32_t semantic_equal_zero_input_mask;
+   uint32_t semantic_identity_projector_input_mask;
    bool semantic_fs_valid;
    bool native_fs_valid;
    bool native_fs_from_nir;

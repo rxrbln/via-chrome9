@@ -29,6 +29,19 @@
 #include "util/u_prim.h"
 
 #define CHROME9_FRAGMENT_BATCH_TRIANGLES 16U
+#define CHROME9_DEFERRED_FRAGMENT_MAX_TRIANGLES 4096U
+
+struct chrome9_deferred_fragment_batch {
+   struct chrome9_deferred_fragment_batch *next;
+   struct drm_chrome9_draw_fragment_program draw;
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+   struct drm_chrome9_fragment_texture_state
+      textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   struct drm_chrome9_fragment_vertex
+      vertices[CHROME9_FRAGMENT_BATCH_TRIANGLES * 3];
+};
 
 struct chrome9_vbuf_render {
    struct vbuf_render base;
@@ -71,6 +84,12 @@ struct chrome9_vbuf_render {
    bool batch_large_chain;
    bool batch_compiled_program;
    bool batch_generic_program;
+   bool defer_guarded_domain;
+   bool deferred_failed;
+   unsigned deferred_triangles;
+   uint64_t deferred_rejected_before;
+   struct chrome9_deferred_fragment_batch *deferred_head;
+   struct chrome9_deferred_fragment_batch *deferred_tail;
    bool batch_textured;
    bool batch_textured_run;
    bool batch_textured_mip;
@@ -501,9 +520,11 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
    size_t size;
+   const bool primary = crender->ctx->fs &&
+      crender->ctx->fs->semantic_input_mask == 1;
 
    unsigned expected_words = crender->generic_program ?
-      4 + 4 * crender->varying_count :
+      4 + (primary ? 1 : 0) + 4 * crender->varying_count :
       crender->packed_generic >= 6 ? 12 :
       crender->packed_generic ? 9 : 6 + 4 * crender->texture_count;
 
@@ -1143,6 +1164,80 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
    return true;
 }
 
+static bool
+chrome9_equal_zero_value(uint32_t bits)
+{
+   const uint32_t magnitude = bits & 0x7fffffff;
+
+   /* Signed zero stays zero; +/-1 times positive finite-normal RHW cannot
+    * underflow or overflow before perspective interpolation. */
+   return magnitude == 0 || magnitude == 0x3f800000;
+}
+
+/* Preflight the entire post-VS vbuf callback before its first batch can be
+ * submitted.  Equality-to-zero lanes must be bit-identical in their proven
+ * finite domain; omitted projectors must be exactly one at every vertex.
+ * The batches are deferred until the complete Gallium draw ends, so a late
+ * callback cannot invalidate an earlier cmd22 submission. */
+static bool
+chrome9_guarded_draw_domain(const struct chrome9_vbuf_render *crender,
+                            const uint16_t *indices, unsigned start,
+                            unsigned count)
+{
+   const uint32_t equal_zero_mask = crender->ctx->fs ?
+      crender->ctx->fs->semantic_equal_zero_input_mask : 0;
+   const uint32_t projector_mask = crender->ctx->fs ?
+      crender->ctx->fs->semantic_identity_projector_input_mask : 0;
+   const unsigned primary = crender->ctx->fs &&
+      crender->ctx->fs->semantic_input_mask == 1;
+   uint32_t reference[32] = { 0 };
+
+   if (!equal_zero_mask && !projector_mask)
+      return true;
+   if (!crender->generic_program || !crender->layout_valid)
+      return false;
+   for (unsigned i = 0; i < count; i++) {
+      const unsigned index = indices ? indices[i] : start + i;
+      const float *vertex;
+      uint32_t rhw;
+
+      if (index >= crender->vertex_count ||
+          (size_t)(index + 1) * crender->vertex_size > crender->capacity)
+         return false;
+      vertex = (const float *)(crender->vertices +
+                               (size_t)index * crender->vertex_size);
+      memcpy(&rhw, vertex + 3, sizeof(rhw));
+      if ((rhw & 0x80000000) || !(rhw & 0x7f800000) ||
+          (rhw & 0x7f800000) == 0x7f800000)
+         return false;
+      for (uint32_t remaining = equal_zero_mask; remaining;
+           remaining &= remaining - 1) {
+         unsigned lane = __builtin_ctz(remaining);
+         uint32_t bits;
+
+         if (lane / 4 >= crender->varying_count)
+            return false;
+         memcpy(&bits, vertex + 4 + primary + lane, sizeof(bits));
+         if (!chrome9_equal_zero_value(bits) ||
+             (i && bits != reference[lane]))
+            return false;
+         reference[lane] = bits;
+      }
+      for (uint32_t remaining = projector_mask; remaining;
+           remaining &= remaining - 1) {
+         unsigned lane = __builtin_ctz(remaining);
+         uint32_t bits;
+
+         if (lane / 4 >= crender->varying_count)
+            return false;
+         memcpy(&bits, vertex + 4 + primary + lane, sizeof(bits));
+         if (bits != 0x3f800000)
+            return false;
+      }
+   }
+   return true;
+}
+
 static void chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender);
 
 static bool
@@ -1173,6 +1268,22 @@ chrome9_queue_generic_triangle(
    const bool primary = crender->ctx->fs->semantic_input_mask == 1;
 
    *queued = false;
+   /* The laboratory draw limit applies to cmd22 as well as the older
+    * immediate paths.  Include deferred batches: none has been submitted
+    * yet, but each already consumes one slot in this draw's limit. */
+   if (crender->ctx->draw_limit &&
+       crender->ctx->submitted_triangles + crender->deferred_triangles +
+          crender->batch_count >= crender->ctx->draw_limit) {
+      if (!crender->ctx->draw_limit_reported) {
+         fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
+                         " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
+                 crender->ctx->submitted_triangles +
+                    crender->deferred_triangles + crender->batch_count,
+                 crender->ctx->draw_limit);
+         crender->ctx->draw_limit_reported = true;
+      }
+      return true;
+   }
    if (!chrome9_fragment_build_instructions(
           &crender->ctx->fs->semantic_fs_ir,
           crender->ctx->fs->semantic_sampler_mask, instructions,
@@ -1284,6 +1395,28 @@ chrome9_queue_generic_triangle(
          memcpy(&vertices[i].color, source + 4, sizeof(vertices[i].color));
       memcpy(vertices[i].varying, source + 4 + primary,
              crender->varying_count * 4 * sizeof(uint32_t));
+   }
+   for (uint32_t remaining = crender->ctx->fs->semantic_equal_zero_input_mask;
+        remaining; remaining &= remaining - 1) {
+      const unsigned lane = __builtin_ctz(remaining);
+      const uint32_t bits = vertices[0].varying[lane / 4][lane % 4];
+
+      if (lane / 4 >= crender->varying_count ||
+          !chrome9_equal_zero_value(bits) ||
+          vertices[1].varying[lane / 4][lane % 4] != bits ||
+          vertices[2].varying[lane / 4][lane % 4] != bits)
+         return false;
+   }
+   for (uint32_t remaining =
+           crender->ctx->fs->semantic_identity_projector_input_mask;
+        remaining; remaining &= remaining - 1) {
+      const unsigned lane = __builtin_ctz(remaining);
+
+      if (lane / 4 >= crender->varying_count ||
+          vertices[0].varying[lane / 4][lane % 4] != 0x3f800000 ||
+          vertices[1].varying[lane / 4][lane % 4] != 0x3f800000 ||
+          vertices[2].varying[lane / 4][lane % 4] != 0x3f800000)
+         return false;
    }
    {
       int32_t x[3], y[3];
@@ -1569,6 +1702,39 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
 
    if (!count)
       return;
+   if (crender->defer_guarded_domain && crender->batch_generic_program) {
+      struct chrome9_deferred_fragment_batch *batch = NULL;
+
+      if (!crender->deferred_failed &&
+          count <= CHROME9_DEFERRED_FRAGMENT_MAX_TRIANGLES -
+                   crender->deferred_triangles)
+         batch = CALLOC_STRUCT(chrome9_deferred_fragment_batch);
+      if (batch) {
+         batch->draw = crender->batch_fragment;
+         batch->draw.triangle_count = count;
+         memcpy(batch->instructions, crender->batch_fragment_instructions,
+                sizeof(batch->instructions));
+         memcpy(batch->constants, crender->batch_fragment_constants,
+                sizeof(batch->constants));
+         memcpy(batch->textures, crender->batch_fragment_textures,
+                sizeof(batch->textures));
+         memcpy(batch->vertices, crender->batch_fragment_vertices,
+                count * 3 * sizeof(batch->vertices[0]));
+         if (crender->deferred_tail)
+            crender->deferred_tail->next = batch;
+         else
+            crender->deferred_head = batch;
+         crender->deferred_tail = batch;
+         crender->deferred_triangles += count;
+      } else {
+         crender->deferred_failed = true;
+         crender->batch_failed = true;
+         crender->ctx->rejected_triangles += count;
+      }
+      crender->batch_count = 0;
+      crender->batch_generic_program = false;
+      return;
+   }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
    bool submitted;
    bool direct_external = false;
@@ -2850,6 +3016,10 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
 
    if (start > crender->vertex_count || nr > crender->vertex_count - start)
       return;
+   if (!chrome9_guarded_draw_domain(crender, NULL, start, nr)) {
+      crender->ctx->rejected_triangles++;
+      return;
+   }
    end = start + nr;
    switch (crender->prim) {
    case MESA_PRIM_TRIANGLES:
@@ -2905,6 +3075,10 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
 
    if (!indices)
       return;
+   if (!chrome9_guarded_draw_domain(crender, indices, 0, nr_indices)) {
+      crender->ctx->rejected_triangles++;
+      return;
+   }
    switch (crender->prim) {
    case MESA_PRIM_TRIANGLES:
       for (unsigned i = 0; i + 2 < nr_indices; i += 3)
@@ -2975,8 +3149,16 @@ static void
 chrome9_vbuf_destroy(struct vbuf_render *render)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   struct chrome9_deferred_fragment_batch *batch = crender->deferred_head;
 
-   chrome9_flush_triangle_batch(crender);
+   if (!crender->defer_guarded_domain)
+      chrome9_flush_triangle_batch(crender);
+   while (batch) {
+      struct chrome9_deferred_fragment_batch *next = batch->next;
+
+      FREE(batch);
+      batch = next;
+   }
    if (crender->ctx->vbuf_render == crender)
       crender->ctx->vbuf_render = NULL;
    FREE(crender->vertices);
@@ -3034,5 +3216,72 @@ chrome9_draw_flush_batch(struct chrome9_context *ctx)
       /* Match the former per-vbuf-draw recovery boundary: one rejected batch
        * does not permanently disable later frames after an explicit flush. */
       render->batch_failed = false;
+   }
+}
+
+void
+chrome9_draw_begin_guarded_domain(struct chrome9_context *ctx)
+{
+   struct chrome9_vbuf_render *render;
+
+   if (!ctx || !ctx->vbuf_render)
+      return;
+   chrome9_draw_flush_batch(ctx);
+   render = ctx->vbuf_render;
+   if (render->defer_guarded_domain || render->deferred_head)
+      return;
+   render->defer_guarded_domain = true;
+   render->deferred_failed = false;
+   render->deferred_triangles = 0;
+   render->deferred_rejected_before = ctx->rejected_triangles;
+}
+
+void
+chrome9_draw_end_guarded_domain(struct chrome9_context *ctx)
+{
+   struct chrome9_vbuf_render *render;
+   struct chrome9_deferred_fragment_batch *batch;
+   bool failed;
+
+   if (!ctx || !ctx->vbuf_render)
+      return;
+   render = ctx->vbuf_render;
+   if (!render->defer_guarded_domain)
+      return;
+   chrome9_flush_triangle_batch(render);
+   failed = render->deferred_failed ||
+      ctx->rejected_triangles != render->deferred_rejected_before;
+   render->defer_guarded_domain = false;
+   render->deferred_failed = false;
+   render->batch_failed = false;
+   batch = render->deferred_head;
+   render->deferred_head = NULL;
+   render->deferred_tail = NULL;
+   render->deferred_triangles = 0;
+   if (failed)
+      for (struct chrome9_deferred_fragment_batch *item = batch;
+           item; item = item->next)
+         ctx->rejected_triangles += item->draw.triangle_count;
+   while (batch) {
+      struct chrome9_deferred_fragment_batch *next = batch->next;
+
+      if (!failed && !render->batch_failed) {
+         render->batch_fragment = batch->draw;
+         memcpy(render->batch_fragment_instructions, batch->instructions,
+                sizeof(batch->instructions));
+         memcpy(render->batch_fragment_constants, batch->constants,
+                sizeof(batch->constants));
+         memcpy(render->batch_fragment_textures, batch->textures,
+                sizeof(batch->textures));
+         memcpy(render->batch_fragment_vertices, batch->vertices,
+                batch->draw.triangle_count * 3 * sizeof(batch->vertices[0]));
+         render->batch_count = batch->draw.triangle_count;
+         render->batch_generic_program = true;
+         chrome9_flush_triangle_batch(render);
+      } else if (!failed) {
+         ctx->rejected_triangles += batch->draw.triangle_count;
+      }
+      FREE(batch);
+      batch = next;
    }
 }
