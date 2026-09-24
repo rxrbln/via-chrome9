@@ -269,6 +269,9 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_OCCLUSION_QUERY	(1ULL << 6)
 /* Fragment texture target 3D: POT volume, one level, no mip filter. */
 #define DRM_CHROME9_CAP2_TEXTURE_3D		(1ULL << 7)
+/* DRAW_VERTEX_PROGRAM REP/ENDREP and IF/ELSE/ENDIF on constants,
+ * bool_constants and int_constants_ptr; nesting depth one. */
+#define DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW	(1ULL << 8)
 /* DRAW_VERTEX_PROGRAM topology POINT_LIST: point_size, POINT_SIZE and
  * RASTER_POINT_SPRITE. */
 #define DRM_CHROME9_CAP2_NATIVE_POINTS		(1ULL << 9)
@@ -1352,6 +1355,9 @@ struct drm_chrome9_draw_fragment_program {
 #define DRM_CHROME9_VERTEX_MAX_BATCH		64U
 /* Hardware user clip planes: two FE coordinate groups of three lanes. */
 #define DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES	6U
+/* Integer (i#) and Boolean (b#) constants of static flow control. */
+#define DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS	16U
+#define DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS	16U
 
 enum drm_chrome9_vertex_op {
 	DRM_CHROME9_VERTEX_OP_MOV = 0,
@@ -1375,6 +1381,18 @@ enum drm_chrome9_vertex_op {
 	DRM_CHROME9_VERTEX_OP_RSQ = 17,
 	DRM_CHROME9_VERTEX_OP_EXP2 = 18,
 	DRM_CHROME9_VERTEX_OP_LOG2 = 19,
+	/*
+	 * Structured static flow control (CAP2_VERTEX_STATIC_FLOW).  REP
+	 * runs its body i#.x times (0..255), IF takes its first arm when b#
+	 * is set.  Only TEMP destinations and no INPUT sources inside; a
+	 * temp may be rewritten there, and after ENDREP/ENDIF it keeps only
+	 * the lanes defined on every path.  Unused operands are zero.
+	 */
+	DRM_CHROME9_VERTEX_OP_REP = 20,		/* src[0] INT, identity swizzle */
+	DRM_CHROME9_VERTEX_OP_ENDREP = 21,
+	DRM_CHROME9_VERTEX_OP_IF = 22,		/* src[0] BOOL, identity swizzle */
+	DRM_CHROME9_VERTEX_OP_ELSE = 23,
+	DRM_CHROME9_VERTEX_OP_ENDIF = 24,
 	DRM_CHROME9_VERTEX_OP_COUNT
 };
 
@@ -1384,6 +1402,9 @@ enum drm_chrome9_vertex_file {
 	/* Dense inputs: index n reads vertex element n. */
 	DRM_CHROME9_VERTEX_FILE_INPUT = 1,
 	DRM_CHROME9_VERTEX_FILE_CONSTANT = 2,
+	/* Flow-control operands: b0..b15 and i0..i15. */
+	DRM_CHROME9_VERTEX_FILE_BOOL = 3,
+	DRM_CHROME9_VERTEX_FILE_INT = 4,
 };
 
 enum drm_chrome9_vertex_dest {
@@ -1537,7 +1558,12 @@ struct drm_chrome9_draw_vertex_program {
 	__u32 topology;		/* DRM_CHROME9_VERTEX_TOPOLOGY_* */
 	__u32 point_size;
 	__u32 raster_flags;	/* DRM_CHROME9_RASTER_* */
-	__u64 reserved[2];
+	/* Zero; reserved for line stipple. */
+	__u32 reserved;
+	/* CAP2_VERTEX_STATIC_FLOW: b0..b15, and i0..i15 as 16 x {x, y, z, w}
+	 * __u8 (REP count in x); a zero pointer uploads zeros. */
+	__u32 bool_constants;
+	__u64 int_constants_ptr;
 };
 
 /*
