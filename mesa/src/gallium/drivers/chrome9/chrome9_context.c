@@ -4215,7 +4215,32 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
             return false;
          builder->identity_projector_input_mask |=
             1u << (coordinate.id * 4 + 3);
+      } else if (coordinate.file == CHROME9_PS_SOURCE_TEXTURE &&
+                 (coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
+                  coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y)) {
+         /* Like D3D9 texld, a direct coordinate is the varying's XY; the
+          * FE consumer is capped at three lanes.  Route a swizzled one
+          * (e.g. packed lightmap .zw) through the computed-TEMP bridge. */
+         struct chrome9_ps_instruction *move;
+
+         if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         move = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+         if (!move)
+            return false;
+         move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         move->destination.id = builder->next_temp++;
+         move->destination.writemask = 0x3;
+         move->source[0] = coordinate;
+         move->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+         move->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ZERO;
+         coordinate.file = CHROME9_PS_SOURCE_TEMP;
+         coordinate.id = move->destination.id;
+         coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+         coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
       }
+      if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+         return false;
       texture = chrome9_ps_append_instruction(builder,
                                                CHROME9_PS_OPCODE_TEX);
       if (!texture)
@@ -5430,15 +5455,72 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
    return shader->supported;
 }
 
+/* CHROME9_DEBUG_FS_MARK=lo[-hi] replaces the color output of the fragment
+ * shaders created in that index range by magenta; "id" paints every shader
+ * with its index as R=bits 2:0, G=5:3, B=7:6, to locate a material. */
+static void
+chrome9_debug_mark_fs(nir_shader *nir, unsigned index)
+{
+   const char *range = getenv("CHROME9_DEBUG_FS_MARK");
+   float color[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+   unsigned lo, hi;
+
+   if (range && !strcmp(range, "id")) {
+      lo = 0;
+      hi = UINT_MAX;
+      color[0] = (index & 7) / 7.0f;
+      color[1] = ((index >> 3) & 7) / 7.0f;
+      color[2] = ((index >> 6) & 3) / 3.0f;
+   } else if (!range || sscanf(range, "%u-%u", &lo, &hi) < 1) {
+      return;
+   } else if (!strchr(range, '-')) {
+      hi = lo;
+   }
+   fprintf(stderr, "chrome9: FS index %u%s\n", index,
+           index >= lo && index <= hi ? " marked" : "");
+   if (index < lo || index > hi)
+      return;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *intr;
+            unsigned value;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            intr = nir_instr_as_intrinsic(instr);
+            value = intr->intrinsic == nir_intrinsic_store_deref;
+
+            if ((intr->intrinsic != nir_intrinsic_store_output &&
+                 (!value || !nir_deref_mode_is(nir_src_as_deref(intr->src[0]),
+                                               nir_var_shader_out))) ||
+                intr->src[value].ssa->num_components != 4)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[value],
+                            nir_imm_vec4(&b, color[0], color[1], color[2],
+                                         color[3]));
+         }
+      }
+      nir_opt_dce(nir);
+   }
+}
+
 static void *
 chrome9_create_fs_state(struct pipe_context *pipe,
                         const struct pipe_shader_state *state)
 {
+   static unsigned fs_index;
    struct chrome9_context *ctx = chrome9_context(pipe);
    struct chrome9_shader *shader = CALLOC_STRUCT(chrome9_shader);
 
    if (!shader)
       return NULL;
+   if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir)
+      chrome9_debug_mark_fs(state->ir.nir, fs_index);
+   fs_index++;
    shader->draw = draw_create_fragment_shader(ctx->draw, state);
    if (!shader->draw) {
       FREE(shader);

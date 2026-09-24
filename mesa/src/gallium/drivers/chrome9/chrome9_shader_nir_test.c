@@ -952,6 +952,62 @@ check_nonnegative_select_compilation(struct chrome9_context *context)
    return true;
 }
 
+/* A packed vec4 varying sampled as .zw (ioquake3 GL2 lightmap) must go
+ * through a MOV bridge: the native direct coordinate is the varying's XY. */
+static bool
+check_swizzled_texcoord_bridge(struct chrome9_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-zw-texcoord");
+   struct chrome9_shader shader = { 0 };
+   nir_def *bary = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *tc = nir_load_interpolated_input(
+      &b, 4, 32, bary, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_def *sample[2];
+   bool valid;
+
+   b.shader->info.io_lowered = true;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+
+      tex->op = nir_texop_tex;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->coord_components = 2;
+      tex->dest_type = nir_type_float32;
+      tex->texture_index = tex->sampler_index = i;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                        nir_channels(&b, tc, i ? 0xc : 0x3));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      sample[i] = &tex->def;
+   }
+   nir_store_output(&b, nir_fmul(&b, sample[0], sample[1]),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   valid = shader.supported && shader.semantic_fs_valid;
+   for (unsigned i = 0; valid && i < shader.semantic_fs_ir.count; i++) {
+      const struct chrome9_ps_instruction *in =
+         &shader.semantic_fs_ir.instruction[i];
+
+      if (in->op == CHROME9_PS_OPCODE_TEX &&
+          in->source[0].file == CHROME9_PS_SOURCE_TEXTURE &&
+          (in->source[0].swizzle[0] != CHROME9_PS_SWIZZLE_X ||
+           in->source[0].swizzle[1] != CHROME9_PS_SWIZZLE_Y))
+         valid = false;
+   }
+   if (!valid)
+      fprintf(stderr, "swizzled texcoord bridge failed: supported=%u "
+              "semantic=%u ir=%u\n", shader.supported,
+              shader.semantic_fs_valid, shader.semantic_fs_ir.count);
+   ralloc_free(b.shader);
+   return valid;
+}
+
 static nir_def *
 flag_fp(nir_def *def, unsigned flags)
 {
@@ -2278,6 +2334,7 @@ main(void)
        !check_nonnegative_select_compilation(&context) ||
        !check_general_predicate_compilation(&context) ||
        !check_cel_compilation(&context) ||
+       !check_swizzled_texcoord_bridge(&context) ||
        !check_equal_zero_select_compilation(&context, 0.0f, true) ||
        !check_equal_zero_select_compilation(&context, 1.0f, false) ||
        !check_canonical_uniform_select_context() ||
