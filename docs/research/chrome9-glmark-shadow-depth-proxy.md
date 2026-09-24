@@ -115,21 +115,25 @@ behavior on VX900.
 ## Bounded acceptance and exceptional-value gate
 
 Both captured comparisons carry `preserve:inf` but not `preserve:nan`.
-Therefore an implementation may leave NaN-input behavior undefined, but it
-must preserve comparisons involving infinity.  This scene has a useful
-narrow domain:
+That flag constrains a comparison when one of its own defined inputs is
+infinite; it does not retroactively add infinity preservation to its producer
+DAG. Mesa `nir.h` specifies that an ALU result is undefined when an input or
+result is infinite unless that ALU itself carries `preserve:inf`. In the
+captured shader, `frcp`, `fmul`, and `fadd` carry no such flag; only the two
+`flt` records do. This scene has a useful narrow domain:
 
 * the sampled X8Z24 depth value is finite and lies in `[0,1]`;
-* the first compare is exactly finite zero versus W, so it never subtracts
-  two infinities;
-* the second compare has a finite left operand, so an infinite limit also
-  never produces `Inf-Inf`;
+* the first compare is exactly finite zero versus finite W;
+* the second compare has a finite sampled left operand; if projection or
+  bias would produce infinity, its unqualified producer has undefined output,
+  so there is no defined infinite right operand which `flt` must preserve;
 * a NaN from projection or bias is outside the local contract because neither
   comparison requests `preserve:nan`.
 
-The remaining scene prerequisite is finite-versus-infinity sign handling.
-Subnormal comparison is a separate execution-mode discriminator, not a
-default-mode prerequisite.  The first predicate can receive a finite
+There is therefore no remaining infinity prerequisite for this exact shadow
+shader. Finite ordered comparison remains required. Subnormal comparison is
+a separate execution-mode discriminator, not a default-mode prerequisite.
+The first predicate can receive a finite
 subnormal W directly from the validated varying stream, so `0-W` can be
 exactly `-minsubnormal`; the live gate below shows that VX900 flushes this
 case before CMP.  However, this shader has
@@ -141,8 +145,9 @@ unsupported.
 Do not infer a broad `flt`/`fge` lowering from that default-mode allowance.
 Arbitrary operands can form `Inf-Inf`, comparisons may request NaN
 preservation, and the captured shadow comparisons separately request
-`preserve:inf`.  Only the exact finite-versus-infinity domain below can close
-that last local control.
+`preserve:inf`. The exceptional-value probes below remain useful before
+promoting a broader generic comparison rule, but they do not gate this exact
+producer DAG.
 
 ### Exact proprietary SLT mapping
 
@@ -183,7 +188,8 @@ subnormal, infinity, or NaN arithmetic.  In particular:
   Every corresponding difference is exactly `-minsubnormal`; these are the
   shortest flush-to-zero discriminators.  Default mode may flush them.
 * finite versus `+Inf`/`-Inf` requires the mathematical sign of the infinite
-  difference.  This is the infinity shape used by shadow.
+  difference. This is required by a broader generic comparison whose inputs
+  can be defined infinities, but not by shadow's unqualified producer DAG.
 * equal infinities form NaN in the first record.  A general comparison with
   `preserve:inf` must still handle those inputs, but shadow's finite left
   operand and finite uploaded W exclude them.
@@ -269,9 +275,10 @@ This is a negative result for the complete
 `RCP(signed zero) -> 0-result -> CMP` exceptional-value path. It does not yet
 locate the loss: `RCP(-0)` may lose its sign, reciprocal zero may use a
 finite/saturated convention, or SUB may fail to preserve the required sign.
-Do not promote shadow's `preserve:inf` comparison from this gate. Conversely,
-do not claim that ordinary finite RCP or finite SUB is broken; both are
-outside what this single exceptional-value result distinguishes.
+Do not use this gate to promote an unrestricted comparison over defined
+infinities. Conversely, do not reject the exact shadow shader or claim that
+ordinary finite RCP/SUB is broken; both are outside what this single
+exceptional-value result distinguishes.
 
 The next bounded discriminator is `chrome9_cmp_guard_smoke --rcp-sign`.
 It removes SUB entirely and constructs one TEMP with four partial native RCP
@@ -291,7 +298,7 @@ possibilities without another matrix:
 * both zero and finite pairs false/true: RCP preserves sign and the preceding
   SUB path lost the distinction;
 * both pairs false/false: native RCP does not preserve negative sign in this
-  path, so it cannot implement shadow projection generally;
+  path, so it cannot implement an unrestricted IEEE-sign reciprocal path;
 * any other pattern is an unclassified RCP/CMP behavior and remains closed.
 
 The five-record test retains the existing BGRA+D16 guard/exterior checks and
@@ -326,16 +333,12 @@ Both are strictly positive normal values, and perspective-correct
 interpolation over the quad preserves that bounded interval. Thus the
 default scene itself never exercises signed-zero RCP or an infinite
 projection. This is useful validation scope, not permission for a scene-name
-special case: a generic backend still needs a source-backed finite range
-proof or a gate for arbitrary finite positive W and signed Z before accepting
-all shaders with the same NIR flags.
-
-The smallest remaining general shadow-domain arithmetic gate uses only the
-already-observed positive reciprocal-zero path: broadcast `RCP(+0)`, multiply
-it by `(+1,-1,+1,-1)`, subtract those values from finite sampled-depth-like
-`.5`, and feed native CMP. Expected true/false lanes alternate. That isolates
-whether positive reciprocal overflow retains the multiplier's sign through
-MUL and SUB; it does not depend on unsupported negative-zero RCP semantics.
+special case. The generic reason this exact shader is bounded is its NIR
+dataflow: submitted varyings and samples are finite, while any infinity
+produced by the unqualified RCP/MUL/ADD chain makes that producer result
+undefined. A different shader that feeds defined infinities directly to
+`flt`, or whose producers request infinity preservation, still requires an
+exceptional-value gate.
 
 ### Runnable subnormal gate
 
@@ -375,9 +378,10 @@ numeric behavior. The proposed generic strict-`<` lowering is therefore
 itself reject the default-mode glmark2 shadow shader: its NIR requests
 `preserve:inf` locally but no denormal-preserving execution mode, and the
 Chrome9 backend already rejects nonzero `float_controls_execution_mode`.
-Finite-versus-infinity sign and the shader's exact input domain still need
-separate qualification before promoting shadow. Static proprietary SLT bytes
-do not override the live subnormal counterexample.
+The exact shadow producer DAG has no defined-infinity input to its compares,
+so this denormal result is the only FP-mode qualification it needs: default
+mode may flush, preserve-denorm mode remains rejected. Static proprietary SLT
+bytes do not override the live subnormal counterexample.
 
 ### Proprietary mode/control conclusion
 
@@ -408,5 +412,5 @@ sampled depth below the threshold, sampled depth above it, and the outer
 `W <= 0` arm.  Expected gray values are `.15`, `.30`, and `.30`; the test also
 requires D16 near `8000`, untouched exterior pixels, intact color/depth/source
 guards, and a byte-identical X8Z24 source.  It builds under strict warnings
-but has not been submitted to a GPU.  Run it only after the infinity-sign
-gate and a known-good baseline.
+but has not been submitted to a GPU. Run it once between known-good baselines;
+the failed generic infinity-sign characterization is not a prerequisite.
