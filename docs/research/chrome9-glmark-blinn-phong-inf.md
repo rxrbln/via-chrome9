@@ -98,6 +98,13 @@ A92=92000016
 A93..A9b phase words zero apart from their type-byte prefixes
 ```
 
+The durable schedule is
+`chrome9-blinn-phong-inf-semantic.tsv`.  The offline checker
+`tools/re/chrome9_blinn_phong_resource_check.py` independently applies the
+kernel's allocate-before-release rule, verifies every definition and last
+use, and asserts the physical map, high-water, constant/varying masks, bucket,
+and A90--A92 values above.
+
 Therefore neither semantic virtual temp 12 nor POW100 is a kernel resource
 blocker.  The smallest next proof is compile-only or one guarded full shader
 draw through cmd22, asserting these counts/controls and the four-temp peak;
