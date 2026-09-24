@@ -1,6 +1,7 @@
 # Chrome9 default terrain fragment closure
 
-Status: source-exact glmark2 2023.01 plus Mesa 26.2.2 offline audit.  No DRM
+Status: source-exact glmark2 2023.01 plus Mesa 26.2.2 offline audit, refreshed
+through Chrome9 commit `78f237a` and shared Mesa commit `4575a3c`.  No DRM
 node or GPU was used.  The Windows production probe was attempted only under
 the shared offline lock, but its existing Wine prefix did not complete within
 the bounded timeout; no new Windows result is claimed.  Existing hashed
@@ -40,16 +41,27 @@ insufficient for terrain correctness.
 
 ## Exact linked interface and operation inventory
 
-The audited source is `terrain.frag` SHA-256
-`efc2c1cd2ab3ad01e9d42430f427e6ba441f2e3311fb9afe5aaafe25b503a8d2`.
-It was linked with five independent passthrough vertex attributes so the
-linker could perform normal scalar varying packing without algebraically
-identifying unrelated terrain values.  The Mesa 26.2.2 post-link, scalarized
-offline NIR has source Blake3 words:
+The audited glmark2 tree is commit
+`42e3d8fe3aa88743ef90348138f643f7b04a9237`.  Raw and exact default
+`ShaderSource::str()` hashes are:
 
 ```text
-2ad40952 d0c218d1 87f717ec 0d474950
-3f8a3d6b ae2b9b11 e7267648 cd0e9a75
+terrain.vert file          f07ac9490a748428ce9e1df9c5896f61659f927e99c1aa5334f926f4b013c76a
+terrain.frag file          efc2c1cd2ab3ad01e9d42430f427e6ba441f2e3311fb9afe5aaafe25b503a8d2
+post-ShaderSource vertex   f82cc07c2bad46f554694623d5c71588bb899152146f9d36240e611abf19d6db
+post-ShaderSource fragment c666837de4308cb64903d6d97d178a292929a4c6dd495a4d70e364da13293558
+```
+
+The final hashes include glmark2's generated precision macro block; the
+fragment also includes its default mediump-float block.  Mesa's standalone
+GLSL linker followed by the Chrome9 options, vector shrinking and DCE produces
+printed fragment NIR SHA-256
+`86b4a3ce28006216e507afab18aec0553c4788fb98ed35a42f06d5970a458c41`.
+Its source BLAKE3 words are:
+
+```text
+1a5275b3 a5aed1dd 0d1c076a 1839fb95
+31c35861 717b45c9 b9f92d1f 9c4f0d76
 ```
 
 Its exact resources are:
@@ -63,32 +75,34 @@ Its exact resources are:
 | physical interpolation slots after scalar packing | 4 (`VAR0..VAR3`) |
 | non-sampler uniform vec4 slots | 16; the distance load becomes dead after folding but the linked ABI allocation remains |
 | color outputs | 1 |
-| scalarized NIR ALU nodes before distance folding | 69 |
+| optimized linked NIR ALU nodes before distance folding | 70 |
 | TEX nodes | 5 |
 
-The 69 ALU nodes comprise 26 MUL, 13 ADD, seven DP3, five RSQ, four `vec3`,
-two `vec4`, two NEG, and one each of FLRP, FLT, SQRT, RCP, MIN, BCSEL, two
-MAX, LOG2 and EXP2.  This inventory is after the loop with literal trip count
-one is unrolled.  It is before Chrome9's `lower_flrp32` expansion and
-semantic vector-constructor materialization, so it must not be mistaken for
-a finalized ALU-store count.
+The 70 ALU nodes comprise 26 MUL, 15 ADD, seven DP3, five RSQ, three `vec3`,
+two `vec4`, one `vec2`, three NEG, two MAX, and one each of FLT, SQRT, RCP,
+MIN, BCSEL and POW.  Chrome9's options have already lowered FLRP; POW remains
+a NIR operation and general POW later expands to LOG2, MUL, EXP2.  This
+inventory is after the literal-one light loop is unrolled but before semantic
+vector-constructor materialization, so it is not a finalized ALU-store count.
 
 The physical varying map is concrete and useful for linkage tests:
 
 ```text
-VAR0.xyz              vTangent.xyz
-VAR0.w, VAR1.xy       vBinormal.xyz
-VAR1.zw, VAR2.x       vNormal.xyz
-VAR2.yz               vUv.xy
-VAR2.w, VAR3.xy       vViewPosition.xyz
+VAR0.xy                vTangent.xy
+VAR0.zw                vUv.xy
+VAR1.x                 vTangent.z
+VAR1.yzw               vBinormal.xyz
+VAR2.xyz               vNormal.xyz
+VAR2.w, VAR3.xy        vViewPosition.xyz
 ```
 
 Thus five logical GLSL varyings do not require five hardware interpolation
 slots in this build.  A cap/link test must require at least four physical FS
 inputs while retaining the 14-component packing contract.  The current
-driver still advertises only two or three FS inputs, 32 ALUs, three fragment
-samplers, and zero vertex samplers (`chrome9_screen.c:301-362`), so the scene
-correctly remains unavailable independently of this compiler fix.
+structured path advertises 96 ALU/total instructions and 32 TEX instructions,
+but still only three FS inputs, three fragment sampler/view slots, and zero
+public vertex sampler/view slots.  The scene therefore remains unavailable
+independently of the instruction-store capacity.
 
 Four fragment samples consume the computed coordinate
 `uRepeatOverlay * vUv + uOffset`; displacement consumes direct `vUv`.  The
@@ -105,12 +119,24 @@ uniform POW         LOG2, MUL, EXP2
 texture mixing      FLRP lowered by Mesa, then MUL
 ```
 
-With distance fixed to zero, the offline shader contains 60 scalarized NIR
-ALU nodes and five TEX nodes.  Straight mechanical backend accounting gives
-approximately 69 semantic ALUs after four-record FLRP lowering and disjoint
-vector packing, still below the recovered 96-ALU store.  This is a capacity
-estimate, not a finalized-object claim: exact physical-temp pressure and any
-kernel coordinate bridges still require a real Chrome9 compiler dump.
+With the default distance fixed to zero, the optimized offline shader contains
+61 NIR ALU nodes and five TEX nodes (printed NIR SHA-256
+`022f057502d3ea51c333776a23fe1066395428570d05504cb09b46a2ac0d4015`).
+General POW adds two records when expanded from one NIR node to
+LOG2/MUL/EXP2; disjoint vector construction can add further MOVs.  This fits
+96 ALUs and 32 TEX records in principle, but remains a capacity estimate:
+exact semantic count, twelve-register physical-temp pressure, and computed
+coordinate bridges require successful specialization and a real compiler
+dump.
+
+At the current compiler boundary the exact unspecialized program produces no
+semantic object: `supported=0`, `semantic=0`, `semantic_count=0`, with zero
+ALU and TAU output.  The output DAG reaches the general
+`bcsel(flt(0,pointLightDistance[0]), falloff, 1)` form.  The only current
+selector lowering requires a scalar `fge` of a proven unit-interval value
+against a constant threshold in `[0.25,0.75]`; this zero-threshold uniform
+comparison fails before either arm can become native.  The runtime value zero
+is therefore the first compiler gate, not an instruction-store limit.
 
 ## Why current specialization misses the default value
 
