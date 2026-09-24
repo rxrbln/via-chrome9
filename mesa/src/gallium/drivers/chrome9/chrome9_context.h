@@ -161,6 +161,7 @@ struct chrome9_context {
    bool draw_triangle_d16_rhw_chain;
    bool draw_program_triangle_d16_rhw_batch;
    bool draw_fragment_program;
+   bool fragment_primary;
    bool fragment_kill;
    bool fragment_add;
    bool draw_textured_triangle;

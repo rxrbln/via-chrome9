@@ -92,7 +92,9 @@ static bool
 chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
 {
    return ctx->draw_fragment_program && ctx->fs &&
-          ctx->fs->semantic_fs_valid && !ctx->fs->semantic_input_mask;
+          ctx->fs->semantic_fs_valid &&
+          (!ctx->fs->semantic_input_mask ||
+           (ctx->fragment_primary && ctx->fs->semantic_input_mask == 1));
 }
 
 static bool
@@ -238,6 +240,7 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       chrome9_use_generic_fragment_program(crender->ctx);
    if (crender->generic_program) {
       uint16_t varying_mask = crender->ctx->fs->semantic_varying_mask;
+      bool primary = crender->ctx->fs->semantic_input_mask == 1;
 
       crender->varying_count = varying_mask ? 32 - __builtin_clz(varying_mask) : 0;
       crender->texture_count = chrome9_fragment_sampler_high_water(
@@ -247,6 +250,10 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       memset(&crender->vinfo, 0, sizeof(crender->vinfo));
       draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, position);
       crender->layout_valid = position >= 0;
+      if (primary) {
+         draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color0);
+         crender->layout_valid &= color0 >= 0;
+      }
       for (unsigned i = 0; i < crender->varying_count; i++) {
          generic[i] = draw_find_shader_output(crender->ctx->draw,
                                                TGSI_SEMANTIC_GENERIC, i);
@@ -259,7 +266,7 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       }
       draw_compute_vertex_size(&crender->vinfo);
       crender->layout_valid &= crender->vinfo.size ==
-         4 + 4 * crender->varying_count;
+         4 + (primary ? 1 : 0) + 4 * crender->varying_count;
       return &crender->vinfo;
    }
    crender->varying_count = 0;
@@ -1144,6 +1151,7 @@ chrome9_queue_generic_triangle(
    unsigned instruction_count;
    const float pixel_center_bias = crender->ctx->rasterizer &&
       crender->ctx->rasterizer->half_pixel_center ? 0.5f : 0.0f;
+   const bool primary = crender->ctx->fs->semantic_input_mask == 1;
 
    *queued = false;
    if (!chrome9_fragment_build_instructions(
@@ -1236,8 +1244,11 @@ chrome9_queue_generic_triangle(
          return false;
       source = (const float *)(crender->vertices +
          (size_t)indices[i] * crender->vertex_size);
-      for (unsigned c = 0; c < 4 + 4 * crender->varying_count; c++)
+      for (unsigned c = 0; c < 4; c++)
          if (!isfinite(source[c]))
+            return false;
+      for (unsigned c = 0; c < 4 * crender->varying_count; c++)
+         if (!isfinite(source[4 + primary + c]))
             return false;
       vertices[i].x_16_16 = chrome9_coord_16_16(
          source[0] - pixel_center_bias, target->base.width0);
@@ -1245,7 +1256,9 @@ chrome9_queue_generic_triangle(
          source[1] - pixel_center_bias, target->base.height0);
       vertices[i].z_16_16 = chrome9_depth_16_16(source[2]);
       memcpy(&vertices[i].rhw_float, &source[3], sizeof(uint32_t));
-      memcpy(vertices[i].varying, source + 4,
+      if (primary)
+         memcpy(&vertices[i].color, source + 4, sizeof(vertices[i].color));
+      memcpy(vertices[i].varying, source + 4 + primary,
              crender->varying_count * 4 * sizeof(uint32_t));
    }
    {

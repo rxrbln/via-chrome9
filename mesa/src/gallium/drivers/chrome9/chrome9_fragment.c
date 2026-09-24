@@ -131,6 +131,10 @@ chrome9_fragment_source(const struct chrome9_ps_source *source,
       result->file = DRM_CHROME9_FRAGMENT_FILE_TEMP;
       break;
    case CHROME9_PS_SOURCE_INPUT:
+      if (source->id)
+         return false;
+      result->file = DRM_CHROME9_FRAGMENT_FILE_PRIMARY;
+      break;
    case CHROME9_PS_SOURCE_TEXTURE:
       result->file = DRM_CHROME9_FRAGMENT_FILE_VARYING;
       break;

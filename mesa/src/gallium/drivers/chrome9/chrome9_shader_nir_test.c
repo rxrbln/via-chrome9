@@ -38,6 +38,38 @@ make_alpha_primary_multiply(void)
    return b.shader;
 }
 
+static nir_shader *
+make_texture_primary_multiply(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-texture-primary-multiply");
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *coord = nir_load_interpolated_input(
+      &b, 2, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+
+   b.shader->info.io_lowered = true;
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_store_output(&b, nir_fmul(&b, &tex->def, color),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
 int
 main(void)
 {
@@ -78,6 +110,39 @@ main(void)
       return 1;
    }
    ralloc_free(nir);
-   puts("chrome9 shrunk primary alpha compiler boundary passed");
+   context.fragment_primary = true;
+   context.draw_fragment_program = true;
+   shader = (struct chrome9_shader) { 0 };
+   nir = make_alpha_primary_multiply();
+   chrome9_compile_fs_nir(&context, &shader, nir);
+   if (!shader.supported ||
+       shader.fragment_program != CHROME9_FS_COMPILED_ALU ||
+       !shader.semantic_fs_valid || shader.semantic_input_mask != 1 ||
+       shader.semantic_varying_mask) {
+      fprintf(stderr, "primary-color capability did not enable semantic "
+              "program without a T varying\n");
+      ralloc_free(nir);
+      return 1;
+   }
+   ralloc_free(nir);
+   shader = (struct chrome9_shader) { 0 };
+   nir = make_texture_primary_multiply();
+   chrome9_compile_fs_nir(&context, &shader, nir);
+   if (!shader.supported || !shader.semantic_fs_valid ||
+       shader.semantic_input_mask != 1 ||
+       shader.semantic_varying_mask != 1 ||
+       shader.semantic_sampler_mask != 1 ||
+       shader.semantic_fs_ir.count != 2) {
+      fprintf(stderr, "texture times primary did not retain separate "
+              "D1/T0 semantics: supported=%u valid=%u input=%u "
+              "varying=%u sampler=%u instructions=%u\n",
+              shader.supported, shader.semantic_fs_valid,
+              shader.semantic_input_mask, shader.semantic_varying_mask,
+              shader.semantic_sampler_mask, shader.semantic_fs_ir.count);
+      ralloc_free(nir);
+      return 1;
+   }
+   ralloc_free(nir);
+   puts("chrome9 primary alpha and texture modulation compiler boundaries passed");
    return 0;
 }

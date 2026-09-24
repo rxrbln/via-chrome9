@@ -342,6 +342,28 @@ check_position_xy(void)
 }
 
 static bool
+check_primary_color(void)
+{
+   struct drm_chrome9_fragment_instruction
+      native[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   struct chrome9_ps_ir ir = { .count = 1 };
+   unsigned count = 0;
+
+   ir.instruction[0].op = CHROME9_PS_OPCODE_MOV;
+   ir.instruction[0].destination = color();
+   ir.instruction[0].source[0] = source(
+      CHROME9_PS_SOURCE_INPUT, 0, CHROME9_PS_SWIZZLE_X,
+      CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_Z,
+      CHROME9_PS_SWIZZLE_W);
+   CHECK(chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   CHECK(count == 1 && native[0].src[0].file ==
+         DRM_CHROME9_FRAGMENT_FILE_PRIMARY && !native[0].src[0].index);
+   ir.instruction[0].source[0].id = 1;
+   CHECK(!chrome9_fragment_build_instructions(&ir, 0, native, &count));
+   return true;
+}
+
+static bool
 check_constant_ports(void)
 {
    struct drm_chrome9_fragment_instruction
@@ -395,5 +417,6 @@ main(void)
    return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
             check_computed_texture_order() && check_kill_conversion() &&
             check_depth_view_swizzles() && check_depth_kill_swizzles() &&
-            check_position_xy() && check_constant_ports());
+            check_position_xy() && check_primary_color() &&
+            check_constant_ports());
 }

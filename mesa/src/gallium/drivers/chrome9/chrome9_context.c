@@ -3731,7 +3731,6 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                shader->semantic_constant_mask |= 1u << source->id;
             else if (source->file == CHROME9_PS_SOURCE_INPUT) {
                shader->semantic_input_mask |= 1u << source->id;
-               shader->semantic_varying_mask |= 1u << source->id;
             } else if (source->file == CHROME9_PS_SOURCE_TEXTURE) {
                shader->semantic_varying_mask |= 1u << source->id;
             }
@@ -3901,7 +3900,8 @@ chrome9_compile_fs_nir(struct chrome9_context *ctx,
    shader->native_fs_valid = straight_line &&
       chrome9_compile_native_fs(ctx, shader, nir);
    if (shader->semantic_fs_valid && ctx->draw_fragment_program &&
-       !shader->semantic_input_mask &&
+       (!shader->semantic_input_mask ||
+        (ctx->fragment_primary && shader->semantic_input_mask == 1)) &&
        shader->fragment_program == CHROME9_FS_UNSUPPORTED)
       shader->fragment_program = CHROME9_FS_COMPILED_ALU;
    if (shader->fragment_program == CHROME9_FS_UNSUPPORTED &&
@@ -4858,6 +4858,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);
    ctx->draw_fragment_program =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
+   ctx->fragment_primary =
+      !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_KILL);
    ctx->fragment_add =
