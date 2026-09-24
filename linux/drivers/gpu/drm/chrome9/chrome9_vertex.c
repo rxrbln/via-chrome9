@@ -830,6 +830,16 @@ int chrome9_vertex_compile(
 	if (fragment->varying_count + DIV_ROUND_UP(hweight32(clip_mask), 3) >
 	    DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
 		return -E2BIG;
+	/* A01[21] replaces every texture coordinate, A2F[9:0] selects none
+	 * (rung sprite P3b): all varyings are sprite coordinates, no UCP. */
+	if (sprite_mask) {
+		u32 all = 0;
+
+		for (i = 0; i < fragment->varying_count; i++)
+			all |= BIT(fragment->varying_logical[i]);
+		if (sprite_mask != all || clip_mask)
+			return -EINVAL;
+	}
 	back = two_side && fragment->primary_used;
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
 	if (!state)
@@ -1385,6 +1395,13 @@ static const u32 sprite_rec[][4] = {
 	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008423f },
 	{ CHROME9_VS_LITERAL_W1, 0, 0, 0x00080283 },
 };
+/* T0 and T1 (or clip distance 0) written: complete without sprites. */
+static const struct drm_chrome9_vertex_instruction sprite_pair_insn[] = {
+	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
+	VS_I(MOV, VS_DST(VARYING, 0, 3, 0), VS_R(INPUT, 1)),
+	VS_I(MOV, VS_DST(VARYING, 1, 3, 0), VS_R(INPUT, 1)),
+	VS_I(MOV, VS_DST(CLIP_DISTANCE, 0, 1, 0), VS_R(INPUT, 1)),
+};
 static const struct drm_chrome9_vertex_instruction bad_point_size_insn[] = {
 	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
 	VS_I(MOV, VS_DST(POINT_SIZE, 0, 3, 0), VS_R(INPUT, 1)),
@@ -1478,6 +1495,23 @@ static int chrome9_vertex_point_selftest(
 				   false, 0, false, 0x1, NULL, program) ||
 	    chrome9_vertex_compile(point_size_insn, 3, fragment, 2, NULL, 0, 0,
 				   false, 0, false, 0x100, NULL, program) != -EINVAL)
+		return -EIO;
+	/* A second, ordinary coordinate would be replaced too. */
+	fragment->varying_count = 2;
+	fragment->varying_width[1] = 2;
+	fragment->varying_logical[1] = 1;
+	if (chrome9_vertex_compile(sprite_pair_insn, 3, fragment, 2, NULL, 0, 0,
+				   false, 0, false, 0, NULL, program) ||
+	    chrome9_vertex_compile(sprite_pair_insn, 3, fragment, 2, NULL, 0, 0,
+				   false, 0, false, 0x1, NULL, program) != -EINVAL ||
+	    chrome9_vertex_compile(sprite_pair_insn, 3, fragment, 2, NULL, 0, 0,
+				   false, 0, false, 0x3, NULL, program))
+		return -EIO;
+	fragment->varying_count = 1;
+	if (chrome9_vertex_compile(sprite_pair_insn, 4, fragment, 2, NULL, 0, 0,
+				   false, 0x1, false, 0, NULL, program) ||
+	    chrome9_vertex_compile(sprite_pair_insn, 4, fragment, 2, NULL, 0, 0,
+				   false, 0x1, false, 0x1, NULL, program) != -EINVAL)
 		return -EIO;
 	return 0;
 }

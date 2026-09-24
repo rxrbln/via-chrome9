@@ -5422,7 +5422,11 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 	if (!args->flags ||
 	    args->flags & ~(prepare | DRM_CHROME9_GEM_CPU_EXPLICIT |
 			    DRM_CHROME9_GEM_CPU_IMPLICIT |
-			    DRM_CHROME9_GEM_CPU_WAIT) ||
+			    DRM_CHROME9_GEM_CPU_WAIT |
+			    DRM_CHROME9_GEM_CPU_NOWAIT) ||
+	    (args->flags & DRM_CHROME9_GEM_CPU_NOWAIT &&
+	     args->flags != (DRM_CHROME9_GEM_CPU_NOWAIT |
+			     DRM_CHROME9_GEM_CPU_PREPARE_WRITE)) ||
 	    (args->flags & DRM_CHROME9_GEM_CPU_EXPLICIT &&
 	     args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT))
 		return -EINVAL;
@@ -5439,6 +5443,12 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 	ret = dma_resv_lock_interruptible(obj->resv, NULL);
 	if (ret)
 		goto out_put;
+	/* An unsynchronized write only needs its range flushed before the
+	 * next job that uses the object. */
+	if (args->flags & DRM_CHROME9_GEM_CPU_NOWAIT) {
+		chrome9_bo_cpu_dirty(bo, args->offset, size);
+		goto out_unlock;
+	}
 	wait = dma_resv_wait_timeout(obj->resv, DMA_RESV_USAGE_BOOKKEEP, true,
 				     CHROME9_DEP_TIMEOUT);
 	if (wait <= 0) {
@@ -5798,7 +5808,7 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_3D;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
-	return caps;
+	return caps | DRM_CHROME9_CAP2_GEM_CPU_NOWAIT;
 }
 
 static int chrome9_fragment_texture_selftest(void);
