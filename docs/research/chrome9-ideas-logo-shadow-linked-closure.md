@@ -1,7 +1,7 @@
 # Chrome9 ideas logo-shadow linked compiler closure
 
-Status: source-exact linked NIR and production compiler object; no new GPU
-execution in this audit.
+Status: source-exact linked NIR, production compiler object, and current
+semantic-cmd22 path audit; no new GPU execution in this audit.
 
 This note closes the static whole-program object for the default glmark2
 `ideas-logo-shadow.frag` draw.  It extends
@@ -153,7 +153,7 @@ transition maps, and color-only destination packet are all qualified fields.
 The only unqualified item is their complete linked execution on silicon; no
 unknown register or packet field has been isolated inside that composition.
 
-## Current implementation boundary
+## Current implementation boundary, 2026-09-24
 
 The current clean-room tree already contains every semantic piece:
 
@@ -167,23 +167,48 @@ The current clean-room tree already contains every semantic piece:
   coordinates, and finite below/equal/above TEXKILL each have guarded live
   evidence.
 
-Compilation is still blocked by policy in `chrome9_context.c`: the call to
-the exact alpha-terminate lowerer requires both the kernel KILL capability
-and `CHROME9_EXPERIMENTAL_TEXKILL=1`.  The kernel advertises
-`DRM_CHROME9_CAP_FRAGMENT_KILL` and `DRM_CHROME9_CAP_FRAGMENT_POSITION`.
-Consequently the explicit experimental option, rather than a missing opcode
-or resource field, is the first remaining gate for this shader.
+Nested Mesa commit `3ecbc201f63bdce4605c4f9b19f2fcaf6333579e`
+removed the former `CHROME9_EXPERIMENTAL_TEXKILL` policy gate.  The call to
+`chrome9_ps_lower_alpha_terminate()` now depends only on the kernel's
+`DRM_CHROME9_CAP_FRAGMENT_KILL` capability, while retaining its exact sample,
+alpha-lane, threshold, comparison-direction, and single-side-effect checks.
+The negative cases in `check_ideas_logo_shadow_compilation()` cover a 0.25
+reference, reversed comparison, non-alpha lane, and missing KILL capability.
+
+The current target observation is `program=28`, an 11-record semantic stream,
+one sampler, and `native=0`.  The reported semantic count and sampler count
+must not be read as an already emitted userspace native ALU/TAU object.  The
+last field is expected and is **not** a missing KILL or texture operation.
+`chrome9_compile_ps_ir()` is the optional
+userspace native encoder for the characterized TAU-first subset.  It returns
+false when it reaches a TEX after any ALU (`saw_alu`); this shader necessarily
+executes the POSITION Y transform and coordinate normalization before TEX.
+`chrome9_compile_ps_nir()` independently sets `lowered=true`, retains the
+ordered semantic program, and validates that every record fits the DRM UAPI.
+`chrome9_use_generic_fragment_program()` selects that semantic path without
+requiring `native_fs_valid`, and `chrome9_queue_generic_triangle()` submits it
+through cmd22.  The kernel, rather than the optional userspace encoder, inserts
+the TEMP-coordinate bridge and the KILL bridge and schedules the phase
+transitions.
+
+For the source-exact nine-record semantic object above, the recovered native
+resource tuple is `(2,5,0,1)`: two address/coordinate resources, physical TEMP
+high-water five, no map-C entry, and one active sampler.  It expands to nine
+ALU records and two TAU records because computed TEX and KILL each need a
+bridge.  Configuration-two is
+`90048080 91000003 92020009 93000003 ... 950000a0`; the current VX900 cmd22
+setup adds the independently recovered MISC enable bit, producing
+`A90=900c8080`.
+These are resource facts, not an instruction-capacity problem.
+
+No generic fragment operation remains missing for this exact program after
+`3ecbc20`.  Its first remaining gate is execution validation of the complete
+linked composition.  A target report of `native=0` must not route it back to a
+legacy classifier or be used as an unsupported-shader verdict.
 
 ## Smallest guarded production gate
 
-The smallest generic change is to admit the existing exact sampled-alpha
-lowering whenever the kernel KILL capability is present.  Do not generalize
-discard, comparisons, samplers, or arbitrary predicates.  Keep every check
-inside `chrome9_ps_lower_alpha_terminate()` and continue rejecting a second
-side effect, a non-s0 sample, non-2-D target, non-alpha lane, non-0.5
-reference, demote, or control flow.
-
-Before removing the option, add one offline captured-shape test which asserts:
+The offline captured-shape test now asserts:
 
 ```text
 POSITION source present; no fabricated VS varying
@@ -194,8 +219,8 @@ all instruction/resource/UAPI bounds accepted
 any predicate/lane/reference mutation rejected
 ```
 
-Then run one guarded composition test, because independent primitive success
-does not prove their combined schedule:
+The remaining step is one guarded composition test, because independent
+primitive success does not prove their combined schedule:
 
 1. Use a guarded 32x32 A8 stipple texture, NEAREST/REPEAT, guarded BGRA color
    and D16, and a nonzero viewport origin.

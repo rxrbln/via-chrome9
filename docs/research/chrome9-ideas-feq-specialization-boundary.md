@@ -42,8 +42,10 @@ The draw-time uniform-predicate finder has since advanced beyond the original
 snapshot described below.  In a one-frame `ideas` run it keyed UBO dword
 offsets `{3,7,11}` to exact zero, then constant-folded all three light-W
 equalities, their general reciprocal arms, and the Boolean conjunctions.  The
-logo-shadow program (`program=28`, 11 ALU plus one TEX) compiled successfully;
-the first fragment program actually bound and rejected was instead the
+logo-shadow program (`program=28`, 11 semantic records and one sampler)
+compiled successfully; `native=0` is expected for its ALU-before-TEX cmd22
+path and is not a missing fragment operation.  The first fragment program
+actually bound and rejected was instead the
 three-light lamp specialization.
 
 Its captured NIR is in
