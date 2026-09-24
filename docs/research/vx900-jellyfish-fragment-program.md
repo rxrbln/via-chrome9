@@ -285,6 +285,18 @@ sampler 0 from direct T0, disjoint partial definitions, split RGB/alpha, and
 the terminal color move. Constants are compacted to c0--c3, which does not
 alter temporary lifetime or ALU/TAU phase ordering.
 
+The two TEX source classes have different UAPI normalization contracts.  A
+TEMP-computed coordinate may use `XY01`; the compiler inserts the proven
+bridge and only X/Y feed the 2-D TAU.  A direct VARYING coordinate may name
+only X/Y/Z/W components: `chrome9_fragment_validate()` rejects selectors
+greater than W in that path before allocation.  Mesa consequently submits
+the direct sampler-0 source as `T0.xyww`, not `T0.xy01`.  The first raw-oracle
+attempt accidentally used `XY01` for both forms and therefore returned
+`EINVAL` before execution, with no kernel fault and known-good draws passing
+before and after.  This was a test-ABI error, not evidence against the
+19-record shader, and the guarded tool now keeps `XY01` only on the computed
+TEMP path and uses `XYWW` for direct T0.
+
 Every vertex carries the same three float4 varyings. Direct sampler 0 reads
 T0.xy=(.25,.25). The computed path forms
 T0.zw + 12*(.05,.025)=(.85,.55), so nearest/repeat sampler 1 must select its
