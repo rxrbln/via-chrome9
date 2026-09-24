@@ -1,8 +1,9 @@
 # ioquake3 current generic projector boundary
 
-Status: source and retained-live-capture audit on 2026-09-24.  No target draw
-was issued for this audit.  The current Mesa and kernel production sources
-were not changed.
+Status: source, compiler and bounded live-capture audit on 2026-09-24.  The
+identity-projector implementation was exercised by a target application run;
+this document did not initiate a target draw or change kernel production
+source.
 
 ## Evidence boundary
 
@@ -43,8 +44,8 @@ used Mesa `d621583564`; its first reported boundary was the then-intentional
 blend, depth and lightmap commits mean that log cannot establish the first
 rejection of current HEAD.
 
-A newer bounded application run now provides the current application-side
-boundary.  Target artifact
+A newer pre-implementation bounded application run records the boundary that
+the identity-projector change closes.  Target artifact
 `/root/tmp/chrome9-live/ioquake-20260924/gl1-default-mip.log`, SHA-256
 `270a6abc8d6fd39c143f286cd9cd666e2efb3d37957a5b88699a329ac77444ba`,
 reports Mesa `git-a854407ab5`, enters `q3dm1`, loads cgame and all map
@@ -58,19 +59,23 @@ blend=1/0/3/19/0/3/19 mask=0xf blend_successor=1
 
 Enum value 16 is `CHROME9_FS_TEXTURE_PROJECTED_MODULATE`.  The same log
 submits two ordinary `textured+d16` triangles immediately before the reject.
-This proves that the current first retained GL1 application stop is the
-closed projected-MODULATE program combined with blend, not mip allocation or
-basic textured depth.  It does not by itself prove the later world-material
-passes; those remain ordered next gates after generic projector lowering.
+This proves that the first retained GL1 application stop before the new
+lowering was the closed projected-MODULATE program combined with blend, not
+mip allocation or basic textured depth.  It does not by itself prove the
+later world-material passes.
 
-## Current generic compiler rejection
+## Implemented generic identity-projector path
 
-The closed classifier recognizes all five shapes above by application-neutral
-NIR structure.  The generic semantic compiler does not.  In current
-`chrome9_context.c:3283..3298`, a 2D TEX is accepted only when every texture
-source is the coordinate source.  The retained ioquake instruction has a
-second `nir_tex_src_projector`, so semantic lowering returns false before it
-can lower the color expression.
+The generic semantic compiler now recognizes the identity-projector case by
+application-neutral NIR structure.  The accepted shape is an ordinary 2D TEX
+with direct XY coordinate lanes and a projector from W of the same fragment
+input.  It records an identity-projector varying mask, removes the projector
+only from the private semantic clone, and passes the resulting ordinary TEX
+through the existing instruction builder.  The draw path preflights the
+complete post-TNL draw before publishing its deferred command-22 batches and
+requires the corresponding Q lane to have raw bits `0x3f800000`.  A mismatched
+projector, including the two-projector regression's T1.z negative case, stays
+fail-closed.
 
 This is independent of the RGB/alpha reconstruction.  Once the projector is
 removed from a private semantic clone, the current generic vector builder can
@@ -84,10 +89,12 @@ MOV   result.w    = primary.w
 MOV   oC0.xyzw    = result.xyzw
 ```
 
-The exact allocation and lifetime bits must come from the production compiler
-selftest; the five semantic operations above are not a claim of finalized
-native dwords.  They obey the kernel's current single terminal full-mask color
-write rule.  Full RGBA modulation is smaller: one TEX and one terminal MUL.
+The compiler regressions cover one projector and two independent projectors
+(identity masks `0x08` and `0x88` respectively), including the RGB/alpha DAGs
+above.  The exact allocation and lifetime bits still come from the production
+compiler rather than from the illustrative operations here.  They obey the
+kernel's current single terminal full-mask color-write rule.  Full RGBA
+modulation is smaller: one TEX and one terminal MUL.
 
 The generic RGB/alpha form is more conforming than the old format shortcut.
 It ignores sampled alpha because that is what the linked NIR says, so it is
@@ -130,20 +137,54 @@ compilers encode TEXLDP operation seven (`207001b0` before scheduling), but
 its full runtime linkage, implicit-LOD behavior and VX900 execution are not
 live-qualified.
 
+## Capped q3dm1 hardware evidence
+
+The corrected TEX0-dereference build is preserved as target
+`libgallium-26.2.2.so`, SHA-256
+`c6916db5cbdf4f613e8db2d52cd442b3ce9ad35d3a1fe500bf7ca282d8d0830c`.
+Two bounded q3dm1 captures use that build:
+
+- `gl1-mip-limit1-tex0.log`, SHA-256
+  `c20c4c101083071c8777db9224ec23a9893ee0c06150ad8587237b3665d32443`,
+  stops at the next triangle with the generic counter equal to one; and
+- `gl1-mip-limit64.log`, SHA-256
+  `74d43c884eb92d29d6fa429e06083808546ae1df63bceb9f48530d8cc872a98f`,
+  stops at the next triangle with the counter equal to 64.
+
+The draw-limit check includes submitted, deferred and current generic batch
+triangles.  The guarded-domain end publishes a deferred batch only after the
+whole-draw identity-Q proof succeeds.  Thus the second capture is hardware
+submission/retirement evidence for 64 generic command-22 triangles, not only
+shader admission.  The first executed class is program 18, four ALU plus one
+TEX and constant c0.  Before the limit line, programs 19, 16, 17 and 18 all
+report `supported=1`; programs 24, 25 and 9 are created later and also report
+supported, but the cap prevents treating those later bindings as hardware
+execution evidence.  The projected classes have 5/1, 2/1, 2/1, 5/1, 7/2 and
+7/2 total/TEX records as applicable.  There is no unsupported,
+bounded-state-reject, ioctl-failure, timeout, quarantine or GPU-fault line in
+the application captures or the contemporaneous kernel log.  The userspace
+trace does not retain a numeric ioctl cookie; command kind 22 follows from
+the source path `batch_generic_program -> chrome9_draw_fragment_program`.
+
+This is not a pixel oracle.  It proves that the exact application-side
+projector classes survive compiler, whole-draw guard, generic state builder,
+kernel validation and GPU retirement for the bounded prefix.  It does not
+prove the RGB/alpha equation, blend result, mip choice or depth result.
+
 ## Next GL1 compiler and state rungs
 
-After the first RGB/primary-alpha form, implement in captured order rather
-than by shader hashes:
+The bounded compiler trace now admits the captured one- and two-projector
+forms in NIR-structure order rather than by shader hashes: full projected
+RGBA sample-times-primary; projected sample times a direct current-color
+uniform, including the RGB-only/current-alpha constructor; and two projected
+samples times primary with independent identity-Q requirements and output
+alpha DAGs.  Programs 24 and 25 establish compiler admission for the latter
+two-texture forms, not executed-pixel correctness because they are created
+after the 64-triangle stop.
 
-1. full projected RGBA sample-times-primary, using the same identity-Q
-   metadata;
-2. projected sample times a direct full vec4 current-color uniform, including
-   the RGB-only/current-alpha constructor;
-3. two projected samples times primary with one identity-Q requirement per
-   coordinate varying and exact independent output-alpha DAGs;
-4. classic texture-environment ADD and missing-alpha REPLACE, where RGB and
-   alpha are separate lane groups and RGB ADD is saturated; and
-5. only then any nonunit-Q TEXLDP path.
+Remaining GL1 compiler rungs are classic texture-environment ADD and
+missing-alpha REPLACE, where RGB and alpha are separate lane groups and RGB
+ADD is saturated, followed only later by any nonunit-Q TEXLDP path.
 
 For gameplay, shader admission is not enough.  Preserve the already separated
 state gates: complete mip views and mip filtering for world textures;
@@ -154,13 +195,14 @@ passes.  These are generic GL states, not ioquake scene keys.
 
 ## Projected-MODULATE plus blend qualification
 
-The projector lowering makes the retained first draw representable, but it
-does not itself qualify the complete draw on silicon.  There is no retained
-pixel oracle for generic command 22 combining TEX times primary color with
-ioquake's same-factor `SRC_ALPHA,INV_SRC_ALPHA` blend.  Existing Gallium
-source-over results either use REPLACE or the canonical separate-alpha
-equation, while the older fixed MODULATE list has one completion-timeout
-incident.  Vendor state builders do strongly support the packet shape:
+The projector lowering and capped run make the retained first draw
+representable and prove bounded command retirement, but they do not qualify
+the pixel result.  There is no retained pixel oracle for generic command 22
+combining TEX times primary color with ioquake's same-factor
+`SRC_ALPHA,INV_SRC_ALPHA` blend.  Existing Gallium source-over results either
+use REPLACE or the canonical separate-alpha equation, while the older fixed
+MODULATE list has one completion-timeout incident.  Vendor state builders do
+strongly support the packet shape:
 A34--A37 and the RT A00 blend gate are built independently of the pixel
 shader and TEX count, and the generic request carries the same normalized
 blend block beside the semantic program.
@@ -184,8 +226,17 @@ separate-alpha source-over result `80807f00` is a negative discriminator.
 This second draw also proves A52 format 99 rather than merely RGB agreement on
 an XRGB target.
 
-After that gate, source and current capability review find no deterministic
-generic-state rejection for the next q3dm1 material classes.  The first
+An existing ordinary `--texture-only` MODULATE smoke is not a substitute for
+that gate.  Target `texture-only-debug.log`, SHA-256
+`23805d1a9cc17d7807886bc54c6c51b8484378a9a1add90a23fa10233b5554b3`,
+reports program 15 as semantic/native-valid but observes zero submitted and
+zero rejected triangles (`+0/+0`) and four zero samples instead of the red
+pattern.  That is a separate unresolved draw-path/control result, not evidence
+that the q3dm1 command-22 pixels are correct.
+
+After a numeric pixel gate, source and current capability review find no
+deterministic generic-state rejection for the next q3dm1 material classes.
+The first
 representative two-pass material is protobanner: projected BGRA times primary
 with GE128 and LEQUAL/write, followed by projected XRGB lightmap times white
 with `DST_COLOR,ZERO` and EQUAL/read-only.  Dynamic light uses XRGB times
