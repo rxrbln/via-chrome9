@@ -81,3 +81,11 @@ text-expanded, literal-bound, and uniform-bound. The earlier validated
 passed both passes with a maximum RGB delta of one 8-bit level. Xorg remained
 alive and the bounded kernel fault check found no new Chrome9 error. Logs
 are retained under `/root/tmp/chrome9-live/vs-uniform-float/`.
+
+The five-step `function` scene with low vertex/fragment complexity also
+reported `Validation: Success` on that build. The corresponding
+medium-complexity variant exited without a kernel fault but reported
+`Validation: Failure`; Chrome9 logged `draw rejected: unsupported bounded
+fragment program`. It remains an explicit compiler-feature gap, not a
+passed scene. The target logs are `function-low-five-validate.log` and
+`function-medium-five-validate.log` in the same staging directory.
