@@ -47,11 +47,15 @@ vec3 normalTex = texture2D(tNormal, uv).xyz * 2.0 - 1.0;
 ```
 
 `TerrainRenderer::init_program()` assigns `tNormal = 3` and
-`tDisplacement = 5`.  Thus this is two active vertex samplers but a sampler
-and view high-water of six; arrays of length two are insufficient.  Both
-resources are 256x256 generated BGRA color targets.  `BaseRenderer` defaults
-them to `GL_LINEAR` minification/magnification and `GL_CLAMP_TO_EDGE` in both
-axes; neither renderer changes those defaults.
+`tDisplacement = 5`.  Those are application texture units, not Gallium shader
+slots.  The linker assigns the two active per-stage opaque uniforms dense
+indices 0 and 1 through `UniformStorage[].opaque[VERTEX].index`; the state
+tracker then uses `prog->SamplerUnits[0..1]` to select application units 3 and
+5 and installs their states/views at pipe slots 0 and 1.  Thus the truthful
+per-stage cap floor is two vertex samplers/views, not application-unit
+high-water six.  Both resources are 256x256 generated BGRA color targets.
+`BaseRenderer` defaults them to `GL_LINEAR` minification/magnification and
+`GL_CLAMP_TO_EDGE` in both axes; neither renderer changes those defaults.
 
 Implicit vertex `texture2D` did not become explicit LOD zero merely because
 NIR-to-TGSI happened to run its projector lowering.  Shared Mesa commit
@@ -155,12 +159,16 @@ no-LLVM gate without changing public caps:
    centers and half-way points, with different resources in logical units 3
    and 5;
 5. it runs both implicit and explicit-LOD variants of a draw-module vertex
-   shader whose unit-3 and unit-5 samples independently alter position and a
-   varying, checking both vec4 outputs for four vertices against a CPU
-   reference.
+   shader whose deliberately raw NIR unit-3 and unit-5 samples independently
+   alter position and a varying, checking both vec4 outputs for four vertices
+   against a CPU reference.
 
 The test passes with the target sysroot loader.  Cap promotion still requires
 extending the callback to the complete operation/state envelope implied by
-the chosen Gallium limits; the present bounded success is not permission to
-advertise arbitrary vertex sampling.  This gate remains independent of the
-fragment compiler and kernel packet ABI.
+the chosen Gallium limits.  It proves sparse callback array indexing, but it
+does not prove the linked GL terrain binding path: ordinary linked terrain
+uses dense pipe slots 0 and 1 with `SamplerUnits[]` mapping them to GL units 3
+and 5.  A state-tracker-level dense-slot regression remains necessary before
+cap promotion.  The present bounded success is not permission to advertise
+arbitrary vertex sampling.  This gate remains independent of the fragment
+compiler and kernel packet ABI.
