@@ -41,3 +41,23 @@ remained alive and the Chrome9 kernel log contained no timeout, quarantine,
 reset, or engine-error report.  This is a regression check on the corrected
 module, not evidence that additional glmark2 scenes or arbitrary packed
 varying shaders now pass.
+
+## 2026-09-24 literal-packing Mesa build
+
+The later client library at
+`/root/tmp/chrome9-live/literal-pack/libgallium-26.2.2.so` has SHA-256
+`34b195977f428bf76e01b61f17c12cd0ede36f02f3458f0279ef5ffe4f152159`.
+The client loaded it from this path under the still-running X session.
+Bounded `nframes=2` runs at 640x480 exited normally for the default
+`effect2d` scene (38 FPS) and the four-window separable desktop blur scene
+(14 FPS). The one-window blur variant completed at 22--23 FPS and produced a
+recognizable captured frame; details and limits are in
+`chrome9-glmark-desktop-blur-closure.md`. No new Chrome9 kernel fault appeared
+in the bounded log checks.
+
+At glmark2's fixed 800x600 validation size, default `effect2d` and desktop
+blur reported `Validation: Unknown`; these are execution results, not pixel
+proofs. The previously validated effect2d Laplacian kernel
+`0,1,0;1,-4,1;0,1,0;` still reported `Validation: Success` with the new
+library. Logs remain on the target under
+`/root/tmp/chrome9-live/literal-pack/`.
