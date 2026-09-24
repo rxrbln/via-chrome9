@@ -240,3 +240,26 @@ triangle exterior, and intact color/depth guard pages.  It passes a strict
 host build; it has not been submitted to the GPU by this audit.  Passing this
 gate would qualify only the finite-positive X-lane chain and scalar forward,
 not zero, signed values, exceptional values, or partial Y/Z/W destinations.
+
+### Finite-positive silicon result
+
+On a fresh VX900 boot with module build `83a0d6`, the exact three-record
+`--sqrt-x-positive` program retired and produced RGBA=`.5` within the guarded
+checker.  D16 and both guard regions passed; known-good draws passed before
+and after, and dmesg gained no timeout.  The target log is
+`/root/tmp/chrome9-live/sqrt-lower/sqrt-x-positive.log`; the tested binary has
+SHA-256
+`75daf5f9703bfd055840c439462d3c5a8480af5a6d9275b59707c0656e6bd229`.
+
+This closes the X-mask RSQ/RCP opcode order, scalar TEMP forward, three-record
+controls/resource bucket, and finite-positive numerical path.  It does not
+rehabilitate the timed-out combined oracle.  Function-medium's optimized NIR
+is scalar, so Y/Z/W partial destinations are not required for this scene and
+should be deferred.  Its recurrence can produce exact zero after `fract`, so
+the next relevant gate is the isolated X-only `RSQ(+0) -> RCP -> MOV`, with
+the same three-record envelope and no CMP or split COLOR writes.  The vendor
+fog compiler reaches zero through MOV_SAT and then emits unguarded RSQ/RCP,
+while refract eagerly emits the pair even for negative k; this supports the
+packet shape but is not silicon proof.  Treat the zero-only gate as a known
+wedge risk on a recoverable fresh boot.  `.lower_fsqrt` remains disabled until
+that isolated zero path retires correctly.
