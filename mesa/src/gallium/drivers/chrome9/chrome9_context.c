@@ -7,6 +7,7 @@
 #include "chrome9_swfb.h"
 #include "chrome9_tcl.h"
 #include "chrome9_drm.h"
+#include "chrome9_public.h"
 #include "chrome9_format.h"
 #include "chrome9_fragment.h"
 #include "chrome9_ps_schedule.h"
@@ -7206,6 +7207,10 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       (capabilities & DRM_CHROME9_CAP_VERTEX_TWO_SIDE);
    ctx->tcl_clip_distance = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE);
+   ctx->tcl_topology = ctx->tcl_enabled &&
+      chrome9_screen_has_capability2(screen,
+                                     DRM_CHROME9_CAP2_VERTEX_TOPOLOGY) &&
+      debug_get_bool_option("CHROME9_TCL_TOPOLOGY", true);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =

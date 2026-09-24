@@ -265,6 +265,8 @@ struct chrome9_context {
    struct chrome9_tcl_batch *tcl_batch;
    /* Native back-face color (oBFD0) and user clip planes (FE A05). */
    bool tcl_twoside;
+   /* Native triangle strips and fans. */
+   bool tcl_topology;
    bool tcl_clip_distance;
    struct chrome9_tcl_state *tcl_state;
    /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */

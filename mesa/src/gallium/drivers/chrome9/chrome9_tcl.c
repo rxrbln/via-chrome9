@@ -53,6 +53,9 @@ struct chrome9_tcl_state {
    uint32_t vertices[TCL_MAX_VERTEX_BYTES / sizeof(uint32_t)];
    /* One stage B chunk; the kernel bounds index_count per draw. */
    uint32_t indices[DRM_CHROME9_VERTEX_MAX_INDICES];
+   /* Draw-relative vertex positions of the current chunk. */
+   unsigned positions[MAX2(DRM_CHROME9_VERTEX_MAX_INDICES,
+                           DRM_CHROME9_VERTEX_MAX_VERTICES)];
 };
 
 struct tcl_builder {
@@ -1226,6 +1229,77 @@ tcl_triangle_count(enum mesa_prim mode, unsigned count)
    }
 }
 
+/*
+ * Submission order of a draw: a list expands every triangle, a native
+ * strip or fan sends its vertices.  Strip chunks start at an even triangle
+ * and overlap by two vertices, fan chunks repeat vertex 0.
+ */
+struct tcl_chunker {
+   enum mesa_prim mode;
+   uint32_t topology;
+   bool flat_first;
+   unsigned triangles;
+   unsigned done;
+};
+
+/* Next chunk of at most max_vertices positions (relative to the draw's
+ * first vertex); returns its triangle count, 0 when finished. */
+static unsigned
+tcl_chunk(struct tcl_chunker *c, unsigned max_vertices, unsigned *positions,
+          unsigned *vertex_count)
+{
+   unsigned n = c->triangles - c->done, k = 0;
+
+   if (!n)
+      return 0;
+   switch (c->topology) {
+   case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP:
+      n = MIN2(n, (max_vertices - 2) & ~1u);
+      for (unsigned i = 0; i < n + 2; i++)
+         positions[k++] = c->done + i;
+      break;
+   case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN:
+      n = MIN2(n, max_vertices - 2);
+      positions[k++] = 0;
+      for (unsigned i = 0; i < n + 1; i++)
+         positions[k++] = c->done + 1 + i;
+      break;
+   default:
+      n = MIN2(n, max_vertices / 3);
+      for (unsigned t = c->done; t < c->done + n; t++) {
+         tcl_triangle(c->mode, t, c->flat_first, &positions[k]);
+         k += 3;
+      }
+      break;
+   }
+   c->done += n;
+   *vertex_count = k;
+   return n;
+}
+
+/* Native assembly keeps the GL provoking-last vertex (hardware vertex c).
+ * Quad strips stay decomposed: a native strip splits their quads along
+ * the other diagonal than the draw module does. */
+static uint32_t
+tcl_topology(const struct chrome9_context *ctx, enum mesa_prim mode,
+             uint32_t flags)
+{
+   const bool flat = flags & DRM_CHROME9_VERTEX_FLAT;
+
+   if (!ctx->tcl_topology ||
+       flags & (DRM_CHROME9_VERTEX_BFC_CW | DRM_CHROME9_VERTEX_BFC_CCW) ||
+       (flat && ctx->rasterizer->flatshade_first))
+      return DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST;
+   switch (mode) {
+   case MESA_PRIM_TRIANGLE_STRIP:
+      return DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP;
+   case MESA_PRIM_TRIANGLE_FAN:
+      return DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN;
+   default:
+      return DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST;
+   }
+}
+
 struct tcl_stream {
    const uint8_t *base;
    size_t size;
@@ -1497,39 +1571,31 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
 static bool
 tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *range,
-                 const uint8_t *indices, unsigned triangles, uint32_t min,
-                 struct chrome9_tcl_state *state,
+                 const uint8_t *indices, struct tcl_chunker chunker,
+                 uint32_t min, struct chrome9_tcl_state *state,
                  struct drm_chrome9_draw_vertex_program *draw,
                  struct pipe_resource *const *resources)
 {
-   const unsigned per_chunk = DRM_CHROME9_VERTEX_MAX_INDICES / 3;
    const int64_t bias = (int64_t)(info->index_size ? range->index_bias : 0) -
                         min;
-   unsigned done = 0;
+   unsigned count, n;
 
    draw->index_size = 4;
    draw->indices_ptr = (uintptr_t)state->indices;
    draw->base_vertex = 0;
-   while (done < triangles) {
-      const unsigned count = MIN2(per_chunk, triangles - done);
-      unsigned n = 0;
+   while ((count = tcl_chunk(&chunker, DRM_CHROME9_VERTEX_MAX_INDICES,
+                             state->positions, &n))) {
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned position = range->start + state->positions[i];
+         int64_t value = position;
 
-      for (unsigned t = done; t < done + count; t++) {
-         unsigned v[3] = { 0 };
-
-         tcl_triangle(info->mode, t, ctx->rasterizer->flatshade_first, v);
-         for (unsigned i = 0; i < 3; i++) {
-            const unsigned position = range->start + v[i];
-            int64_t value = position;
-
-            if (info->index_size == 1)
-               value = indices[position];
-            else if (info->index_size == 2)
-               value = ((const uint16_t *)indices)[position];
-            else if (info->index_size == 4)
-               value = ((const uint32_t *)indices)[position];
-            state->indices[n++] = value + bias;
-         }
+         if (info->index_size == 1)
+            value = indices[position];
+         else if (info->index_size == 2)
+            value = ((const uint16_t *)indices)[position];
+         else if (info->index_size == 4)
+            value = ((const uint32_t *)indices)[position];
+         state->indices[i] = value + bias;
       }
       draw->index_count = n;
       if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, count,
@@ -1540,14 +1606,13 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                             "indices=%u min=%u textures=%u\n",
                     strerror(errno), draw->buffer_count, n, min,
                     state->fragment.draw.texture_count);
-         if (!done)
+         if (chunker.done == count)
             return false;
-         CHROME9_REJECT(ctx, triangles - done);
+         CHROME9_REJECT(ctx, chunker.triangles - chunker.done + count);
          return true;
       }
-      done += count;
    }
-   ctx->tcl_buffer_triangles += triangles;
+   ctx->tcl_buffer_triangles += chunker.triangles;
    return true;
 }
 
@@ -1822,7 +1887,13 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    struct tcl_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct drm_chrome9_draw_vertex_program draw = { 0 };
    struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS];
-   unsigned stride, per_chunk, buffer_count, done = 0;
+   struct tcl_chunker chunker = {
+      .mode = info->mode,
+      .topology = tcl_topology(ctx, info->mode, flags),
+      .flat_first = rs->flatshade_first,
+      .triangles = triangles,
+   };
+   unsigned stride, max_vertices, buffer_count, count, n;
    uint32_t index_min, index_max;
 
    memcpy(streams, bound, p->input_count * sizeof(*streams));
@@ -1833,6 +1904,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
 
    draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
    draw.flags = flags;
+   draw.topology = chunker.topology;
    draw.clip_distance_mask = clip_enable;
    draw.instruction_count = p->instruction_count;
    draw.instructions_ptr = (uintptr_t)p->instructions;
@@ -1851,7 +1923,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       if (drawn) {
          draw.buffer_count = buffer_count;
          draw.buffers_ptr = (uintptr_t)buffers;
-         drawn = tcl_draw_buffers(ctx, info, range, indices, triangles,
+         drawn = tcl_draw_buffers(ctx, info, range, indices, chunker,
                                   index_min, state, &draw, resources);
       }
       for (unsigned b = 0; b < ARRAY_SIZE(uploads); b++)
@@ -1878,55 +1950,48 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       elements[k].offset = stride;
       stride += 4 * tcl_stream_dwords(&streams[k]);
    }
-   per_chunk = MIN2(TCL_MAX_TRIANGLES, TCL_MAX_VERTEX_BYTES / (3 * stride));
+   max_vertices = MIN2(3 * TCL_MAX_TRIANGLES, TCL_MAX_VERTEX_BYTES / stride);
    draw.vertex_stride = stride;
    draw.vertices_ptr = (uintptr_t)state->vertices;
 
-   while (done < triangles) {
-      const unsigned count = MIN2(per_chunk, triangles - done);
+   while ((count = tcl_chunk(&chunker, max_vertices, state->positions, &n))) {
       uint32_t *out = state->vertices;
 
-      for (unsigned t = done; t < done + count; t++) {
-         unsigned v[3];
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned position = range->start + state->positions[i];
+         unsigned index = position;
 
-         tcl_triangle(info->mode, t, rs->flatshade_first, v);
-         for (unsigned i = 0; i < 3; i++) {
-            const unsigned position = range->start + v[i];
-            unsigned index = position;
+         if (info->index_size == 1)
+            index = indices[position];
+         else if (info->index_size == 2)
+            index = ((const uint16_t *)indices)[position];
+         else if (info->index_size == 4)
+            index = ((const uint32_t *)indices)[position];
+         if (info->index_size)
+            index += range->index_bias;
+         unsigned written = tcl_fetch_vertex(streams, p->input_count,
+                                             index, out);
 
-            if (info->index_size == 1)
-               index = indices[position];
-            else if (info->index_size == 2)
-               index = ((const uint16_t *)indices)[position];
-            else if (info->index_size == 4)
-               index = ((const uint32_t *)indices)[position];
-            if (info->index_size)
-               index += range->index_bias;
-            unsigned written = tcl_fetch_vertex(streams, p->input_count,
-                                                index, out);
-
-            if (!written) {
-               if (!done)
-                  return tcl_fallback(ctx, "vertex fetch");
-               CHROME9_REJECT(ctx, triangles - done);
-               return true;
-            }
-            out += written;
+         if (!written) {
+            if (chunker.done == count)
+               return tcl_fallback(ctx, "vertex fetch");
+            CHROME9_REJECT(ctx, triangles - chunker.done + count);
+            return true;
          }
+         out += written;
       }
-      draw.vertex_count = 3 * count;
+      draw.vertex_count = n;
       if (!chrome9_draw_tcl_submit(ctx, &state->fragment, &draw, count,
                                    NULL, 0)) {
          /* A first-chunk rejection falls back to the draw module. */
-         if (!done) {
+         if (chunker.done == count) {
             if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
                tcl_dump(&draw, p, &state->fragment);
             return tcl_fallback(ctx, "kernel rejected the draw");
          }
-         CHROME9_REJECT(ctx, triangles - done);
+         CHROME9_REJECT(ctx, triangles - chunker.done + count);
          return true;
       }
-      done += count;
    }
    ctx->tcl_triangles += triangles;
    return true;
