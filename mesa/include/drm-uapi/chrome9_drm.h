@@ -279,6 +279,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_NATIVE_LINES		(1ULL << 10)
 /* DRAW_VERTEX_PROGRAM RASTER_POLYGON_CW/CCW modes for triangles. */
 #define DRM_CHROME9_CAP2_POLYGON_MODE		(1ULL << 11)
+/* GEM_CPU_ACCESS NOWAIT. */
+#define DRM_CHROME9_CAP2_GEM_CPU_NOWAIT		(1ULL << 12)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -308,6 +310,12 @@ struct drm_chrome9_gem_create {
 #define DRM_CHROME9_GEM_CPU_PREPARE_WRITE	(1U << 3)
 /* Only wait until the device no longer uses the object. */
 #define DRM_CHROME9_GEM_CPU_WAIT		(1U << 4)
+/*
+ * With PREPARE_WRITE only: record the written range without waiting for
+ * the device, for writes to bytes no queued job uses (unsynchronized
+ * maps).  Needs DRM_CHROME9_CAP2_GEM_CPU_NOWAIT.
+ */
+#define DRM_CHROME9_GEM_CPU_NOWAIT		(1U << 5)
 
 struct drm_chrome9_gem_cpu_access {
 	__u32 handle;
