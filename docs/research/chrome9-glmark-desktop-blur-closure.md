@@ -203,3 +203,22 @@ Only after that test passes should a guarded render compare horizontal and
 vertical output against a CPU eleven-tap reference.  The first live image
 should make every tap distinguishable; a uniform-color texture cannot detect
 wrong transition maps, coordinate reuse, or a missing centre fetch.
+
+## Compiler implementation and offline qualification
+
+The Mesa Chrome9 backend now packs bit-exact literal components into free
+lanes of c16..c31, preserving full-register ownership for uniforms.  A
+computed-coordinate alpha-KILL test also verifies that its 0.5 threshold can
+be read from a packed Y lane.  Host tests cover 64 unique scalar literals
+fitting in sixteen registers, rejection of a 65th, a uniform discovered
+later in the NIR block, and distinct `+0`/`-0` vector components.
+
+An additional host test reconstructs the captured 300x300 horizontal blur
+with the exact FP32 offsets and weights above.  It compiles to 45 semantic
+instructions: 20 ADD, 11 MUL, 3 MOV, and 11 TEX.  It checks that the first
+five and last five TEX operations use the corresponding preceding computed
+coordinate ADD results, the sixth/centre TEX uses direct T0, and the packed
+alpha-1.0 lane reaches the terminal color output.  The semantic UAPI
+translation accepts the resulting program.  This is compiler evidence only;
+it does not yet validate GPU execution, FBO-to-texture coherency, or the
+complete glmark2 desktop scene.
