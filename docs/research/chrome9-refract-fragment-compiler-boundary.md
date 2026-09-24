@@ -204,13 +204,23 @@ The blockers are:
    incidental specialization path to flatten structural refract control
    flow.
 
-The API-facing fragment caps are also still conservative:
-`max_instructions=max_alu_instructions=32` and `max_temps=8` at
-`chrome9_screen.c:326..333`.  The exact proprietary object exceeds the
-advertised instruction count even though it fits the UAPI and hardware
-stores.  Raising these claims is a later promotion gate after the Mesa object
-passes offline and guarded execution tests; it is not required to implement
-the legalization itself.
+The former API instruction-cap blocker is closed.  Mesa commit `284e01a`
+advertises 96 structured fragment instructions/ALUs and 32 TEX instructions
+when cmd22 is present, independently of the sampler-slot count.  Extended
+linkage commit `db6365a` advertises eight inputs and eight sampler/view slots
+when the matching kernel capability is present.  `max_temps` remains eight,
+but the exact linked source already reaches NIR and the kernel performs its
+own liveness allocation onto the twelve-entry physical file; the proprietary
+five-temp high-water is inside both limits.  The first static rejection is
+therefore still control-flow/fsqrt/select legalization, not public capacity.
+
+The function-medium offline regression in Mesa commit `f836ff3` now also
+proves the standard `lower_fsqrt` result (`FRSQ` followed by `FRCP`) through
+the Chrome9 semantic compiler.  Production deliberately leaves
+`lower_fsqrt` disabled until the repeated scalar live gate passes.  That work
+removes uncertainty about instruction selection, but it does not flatten the
+two refract `if`/phi regions or broaden the finite unit-interval `bcsel`
+contract to the zero/candidate vector select here.
 
 ## Ranked bounded compiler gates
 
