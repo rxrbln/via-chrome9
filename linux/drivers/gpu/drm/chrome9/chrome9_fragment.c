@@ -1731,6 +1731,93 @@ static int chrome9_fragment_constant_port_selftest(
 	return 0;
 }
 
+static int chrome9_fragment_vec3_cmp_selftest(
+	struct chrome9_fragment_program *program)
+{
+	static const struct drm_chrome9_fragment_instruction instructions[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0x1, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0x7, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 1,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Z,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 2, 0x7, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 2,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Z,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_CMP,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 3, 0x7, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Z,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 2,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Z,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0x7, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 3,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_Z,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 }},
+		},
+	};
+	static const u32 expected_alu[][4] = {
+		{ 0x01c00530, 0xd01c0053, 0x00108016, 0x000d0020 },
+		{ 0x01c00530, 0x501c0053, 0x00708105, 0x000d0060 },
+		{ 0x01c00530, 0x501c0053, 0x00708205, 0x000d00a0 },
+		{ 0x02020550, 0x50201055, 0x00720000, 0x000900e0 },
+		{ 0x01c00530, 0x501c0053, 0x00720305, 0x000d0820 },
+	};
+	static const u32 expected_controls[] = {
+		0x90050000, 0x91000000, 0x92000005, 0x93000000,
+		0x94000000, 0x95000000, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+	};
+	static const u32 constants[12];
+	int ret;
+
+	ret = chrome9_fragment_compile(instructions, ARRAY_SIZE(instructions),
+		constants, 3, 0, 0, program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
+	    program->tau_count || program->constant_count != 3 ||
+	    program->texture_count || program->varying_count ||
+	    program->active_texture_count || program->tau_coordinate_mask ||
+	    program->stage0_coordinate ||
+	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
+	    memcmp(program->controls, expected_controls,
+		   sizeof(expected_controls)))
+		return -EINVAL;
+	return 0;
+}
+
 static int chrome9_fragment_primary_selftest(
 	struct chrome9_fragment_program *program)
 {
@@ -2610,6 +2697,8 @@ int chrome9_fragment_selftest(void)
 		ret = chrome9_fragment_kill_selftest(program, constants);
 	if (!ret)
 		ret = chrome9_fragment_constant_port_selftest(program);
+	if (!ret)
+		ret = chrome9_fragment_vec3_cmp_selftest(program);
 out:
 	kfree(program);
 	return ret;
