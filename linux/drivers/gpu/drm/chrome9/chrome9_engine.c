@@ -4615,18 +4615,6 @@ static void chrome9_bo_cpu_dirty(struct chrome9_bo *bo, u64 offset, u64 size)
 	bo->cpu_dirty = true;
 }
 
-/* KMS scanout reads the pages without announcing CPU or device access. */
-void chrome9_bo_force_implicit(struct drm_gem_object *obj)
-{
-	struct chrome9_bo *bo = to_chrome9_bo(obj);
-
-	dma_resv_lock(obj->resv, NULL);
-	chrome9_bo_cpu_sync_locked(bo, 0, obj->size);
-	bo->explicit_access = false;
-	chrome9_bo_cpu_dirty(bo, 0, obj->size);
-	dma_resv_unlock(obj->resv);
-}
-
 int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {

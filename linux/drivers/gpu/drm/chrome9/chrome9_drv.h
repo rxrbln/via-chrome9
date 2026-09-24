@@ -180,7 +180,6 @@ struct chrome9_bo {
 };
 
 void chrome9_bo_hold_kmap(struct chrome9_bo *bo);
-void chrome9_bo_force_implicit(struct drm_gem_object *obj);
 
 static inline struct chrome9_bo *to_chrome9_bo(struct drm_gem_object *obj)
 {
