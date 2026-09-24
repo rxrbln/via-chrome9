@@ -207,6 +207,15 @@ sampler_mask=1f varying_mask=000f input_mask=0000
 uniform_mask=00007fff constant_mask=80007fff
 ```
 
+The dense sampler mask is the real Gallium shader-slot ABI, not probe-only
+compaction.  `gl_nir_lower_samplers_as_deref()` assigns the linked opaque
+uniform indices 0 through 4.  At draw time `st_atom_texture.c` and
+`st_atom_sampler.c` walk those dense `prog->SamplersUsed` slots and use
+`prog->SamplerUnits[slot]` to fetch application texture units 0,1,2,4,5,
+installing the selected views/states back at pipe slots 0 through 4.  The
+Chrome9 cap requirement is therefore five fragment slots, not application
+unit high-water six.
+
 The semantic stream uses virtual temporary ids 0 through 66.  A conservative
 component-lifetime reconstruction peaks at nine simultaneously live virtual
 registers, at record 53; the high virtual id is SSA naming, not 67-register
