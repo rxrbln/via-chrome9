@@ -276,6 +276,17 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		chrome9_fb_destroy(&chrome9_fb->base);
 		return ERR_PTR(-EINVAL);
 	}
+	/* A layout offset of 0 names the first row of a guarded object. */
+	if (to_chrome9_bo(obj)->create_flags &
+	    DRM_CHROME9_GEM_CREATE_GUARDED_SHARED &&
+	    !chrome9_fb->base.offsets[0]) {
+		if (obj->size < PAGE_SIZE + (u64)chrome9_fb->base.pitches[0] *
+				chrome9_fb->base.height) {
+			chrome9_fb_destroy(&chrome9_fb->base);
+			return ERR_PTR(-EINVAL);
+		}
+		chrome9_fb->base.offsets[0] = PAGE_SIZE;
+	}
 
 	return &chrome9_fb->base;
 }
@@ -462,8 +473,12 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	unsigned int i;
 	int ret;
 
-	if (args->flags & ~DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT ||
+	if (args->flags & ~(DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT |
+			    DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) ||
 	    !args->size || args->handle || args->mmap_offset)
+		return -EINVAL;
+	if ((args->flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) &&
+	    (!IS_ALIGNED(args->size, PAGE_SIZE) || args->size <= 2 * PAGE_SIZE))
 		return -EINVAL;
 	if ((args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT) &&
 	    args->size > CHROME9_DMA32_SCANOUT_MAX_SIZE)
@@ -478,6 +493,7 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	if (IS_ERR(shmem_obj))
 		return PTR_ERR(shmem_obj);
 	obj = &shmem_obj->base;
+	to_chrome9_bo(obj)->create_flags = args->flags;
 	/*
 	 * This VX900 path has an exact 32-bit DMA mask and no IOMMU.  Every GEM
 	 * object submitted to SF must therefore live below 4 GiB; otherwise the
@@ -524,4 +540,22 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 out_put:
 	drm_gem_object_put(obj);
 	return ret;
+}
+
+int chrome9_gem_info_ioctl(struct drm_device *drm, void *data,
+			   struct drm_file *file)
+{
+	struct drm_chrome9_gem_info *args = data;
+	struct drm_gem_object *obj;
+
+	if (args->flags || args->size)
+		return -EINVAL;
+	obj = drm_gem_object_lookup(file, args->handle);
+	if (!obj)
+		return -ENOENT;
+	if (obj->dev == drm && !drm_gem_is_imported(obj))
+		args->flags = to_chrome9_bo(obj)->create_flags;
+	args->size = obj->size;
+	drm_gem_object_put(obj);
+	return 0;
 }

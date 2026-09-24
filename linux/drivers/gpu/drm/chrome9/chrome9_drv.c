@@ -2644,6 +2644,9 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 					DRM_CHROME9_CAP_COPY_RECT_PRESERVE_ALPHA;
 		}
 		break;
+	case DRM_CHROME9_PARAM_CAPABILITIES2:
+		args->value = DRM_CHROME9_CAP2_GUARDED_SHARED;
+		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
 	case DRM_CHROME9_PARAM_BAR2_SIZE:
@@ -2734,6 +2737,8 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_VERTEX_PROGRAMS,
 			  chrome9_draw_vertex_programs_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_GEM_INFO, chrome9_gem_info_ioctl,
 			  DRM_RENDER_ALLOW),
 };
 
