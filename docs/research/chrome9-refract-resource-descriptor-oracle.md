@@ -171,18 +171,22 @@ D24 interior-sample corpus used `32000040`; that was sufficient to qualify
 raw depth decoding but leaves S/T in border mode and is not the glmark edge
 contract.  Do not propagate `32000040` into refract.
 
-The fragment program has three active texture resources and three VS varying
-outputs, so the general-texture prefix is:
+The real `light-refract` fragment program has three active texture resources
+and three VS varying outputs of widths `{3,4,4}`.  With the current FE builder
+its general-texture prefix/linkage is:
 
 ```text
 A00 = 00000031
-A01 = 01002521                  # before final linkage rewriting
-A08 = 08010103
+A01 = 01002521
+A08 = 08030203
+A09 = 09000003
 ```
 
 A00 is the compiler-active texture-resource count.  A08 is the independent
 VS-coordinate-output count.  TAU sampler nibbles must remain logical stages
 0, 1, and 2; A91 is the allocated coordinate-slot mask, not a sampler mask.
+The bounded resource oracle below may intentionally use one simpler varying;
+its FE image is not the production refract FE image.
 
 ## Exact packet differential
 
@@ -192,8 +196,8 @@ Relative to a dense two-stage, single-level resource body:
   `FE03043C,8,10030008,CC000000` plus eight L1--L8 words;
 * adding plain stage 2 adds a twelve-dword aligned image block and an
   eight-dword sampler block, exactly twenty dwords;
-* general A00 changes `00000021 -> 00000031`; for this shader A08 changes
-  `08010102 -> 08010103`; and
+* general A00 changes `00000021 -> 00000031`; A08 does **not** derive from
+  sampler count and remains the shader-I/O-dependent `08030203`; and
 * no RT0 or depth descriptor changes in the consumer because its destination
   is the independent canvas BGRX+Z16 pair.
 
@@ -201,18 +205,77 @@ The total resource-state increment is therefore 32 dwords.  No dummy fourth
 descriptor, mip table for stage 0/2, alternate BGRA RT format, or texture
 count encoded as popcount of another mask is needed.
 
-The proprietary Linux *full replay* chooses a different but self-consistent
-serialization order.  At `0x17790c..0x1779fa` it emits all sixteen image
-blocks, at `0x177a24..0x177abc` all sixteen sampler blocks, and at
-`0x177b4c..0x177bd3` all sixteen eight-word mip tables.  The exact mip
-selector construction is `10030000 | (stage << 3)` at
-`0x177b59..0x177b72`.  Windows instead gathers dirty state into typed ranges
-before serialization.  This proves that descriptors are self-addressed and
-need only be complete before the primitive; it does not require the modern
-builder to replay sixteen inactive stages.  The current compact order
-`image -> optional mip -> sampler` per active stage is consistent with the
-older Xorg packet path and should be retained while it is tested.  Reordering
-it merely to resemble full replay would add risk without new semantics.
+The proprietary Linux *full replay* chooses a category-wide order.  Its
+sixteen-stage image loop begins at `0x177908`, builds each H2 selector at
+`0x177923..0x17792f`, increments/tests the stage at
+`0x1779ec..0x1779fa`, and is followed by the sixteen-stage sampler loop
+`0x177a20..0x177abc`.  After one FE/general block at
+`0x177ae1..0x177b2c`, the sixteen-stage H3 mip loop is
+`0x177b48..0x177bd3`; exact selector construction is
+`10030000 | (stage << 3)` at `0x177b59..0x177b72`.
+
+The Windows D3D dirty gather is also category-wide, but orders the resource
+classes differently.  It appends all dirty sampler chunks, by outer stage
+0--15, in `0x101518e0..0x10151ce8`; all dirty image chunks in
+`0x10151d10..0x10152118`; and all dirty H3 mip chunks in
+`0x10152150..0x101524d1`.  Each stage can contribute several subranges, so
+these are typed dirty-range loops rather than one already-flat packet per
+stage.  They nevertheless establish Windows' all-samplers -> all-images ->
+all-mip-tables append order, in contrast to Linux full replay's all-images ->
+all-samplers -> FE/general -> all-mip-tables order.  The Windows OpenGL copy
+independently has the same three loops at `0x101fcd50..0x101fd158`,
+`0x101fd180..0x101fd588`, and `0x101fd5c0..0x101fd941`.
+
+That cross-driver difference, together with the older Xorg compact
+`image -> optional mip -> sampler` path, is strong evidence that this ordering
+is canonical software serialization rather than a descriptor-latch sequence.
+Image, sampler and H3 selectors are self-addressed and must all be complete
+before the primitive which consumes them.  It does **not** prove that
+cache/ownership barriers may move across producer retirement, nor that state
+may be changed after a consuming primitive.  The current compact order should
+therefore be retained while tested; replaying sixteen inactive stages or
+reshuffling to resemble either UMD adds risk without a recovered hardware
+requirement.
+
+## Current implementation mapping and pre-GPU blockers
+
+The current kernel builder already expresses the recovered compact resource
+model in `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/`
+`drivers/gpu/drm/chrome9/chrome9_engine.c`:
+
+* `:1602..1615` builds A30--A32, including clamp/repeat bits in A32;
+* `:1798..1813` keeps A00's texture count independent of A08's varying count;
+* `:2093..2127` emits image, optional H3 mip table, then sampler for every
+  active stage, with `10030000 | i << 3` at `:2121`; and
+* `:7041..7136` validates every level and the consecutive `+0x100` implicit
+  tail after the ninth explicitly addressed level.
+
+The 1600x1200 producer is nevertheless blocked before any GPU command.  Mesa's
+canonical private mip layout at `chrome9_resource.c:131..160` is
+`[leading guard][L0][internal L0 guard][L1..Ln][final guard]`.  For BGRA
+1600x1200, L0 plus two guards requires `0x755000` bytes, but the full L0--L10
+BO is `0x9c8000`: the internal guard is `0x754000..0x754fff`, L1 begins at
+`0x755000`, and the final guard is `0x9c7000..0x9c7fff`.  The render ioctl
+recomputes only L0 plus two guards at kernel `chrome9_engine.c:7294..7299`,
+stores that as the destination size at `:4698..4699`, then demands exact GEM
+size equality at `:4719..4722`.  The full-size mip-capable RT therefore fails
+with `-EINVAL`; its destination-size contract must accept and validate the
+complete guarded BO without weakening either guard.
+
+Mesa also still rejects the eventual consumer before submission:
+`chrome9_draw.c:696..744` restricts mip sampling to square POT BGRX resources
+no larger than 512, while refract's stage 1 is 1600x1200 BGRA and extends to
+L10.  That gate must be generalized from the proven layout/format contract,
+not bypassed for the scene.
+
+Finally, the CPU mipmap callback is not independently synchronized against a
+retained BGRA producer.  `chrome9_resource.c:524..529` flushes a pending draw
+from `transfer_map` only for X8Z24, whereas `:745..805` maps and reads BGRA
+directly during mip generation.  Refract itself avoids this race because its
+FBO unbind reaches `chrome9_set_framebuffer_state`, which flushes the retained
+batch and render target at `chrome9_context.c:4340..4349`, before
+`glGenerateMipmap`.  The callback still needs a self-contained producer flush
+for callers which generate mipmaps without that framebuffer transition.
 
 ## Bounded guarded oracle
 
