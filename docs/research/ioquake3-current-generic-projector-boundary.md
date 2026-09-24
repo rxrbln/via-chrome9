@@ -246,7 +246,35 @@ size; it still requires an allocator-fixed smoke and capped q3dm1 run.  This
 also explains why the old capture cannot qualify primary-bearing projected
 programs 19, 24 or 25.
 
-After a numeric pixel gate, source and current capability review find no
+The generic vbuf allocation mismatch is now fixed: the allocated stride
+includes the packed PRIMARY word.  The isolated `--projected-only` smoke
+passes on VX900 for projected RGB-times-primary with primary alpha and
+projected RGBA-times-primary, including a Q=2 fail-closed check.  The
+`--two-projector-only` smoke also passes the program-24 and program-25
+PRIMARY+T0+T1 pixel and guard checks with five ALU and two TEX instructions
+each.  These are silicon pixel tests, unlike the earlier shader-admission
+captures above.
+
+The allocator-fixed library in target artifact
+`/root/tmp/chrome9-live/ioquake-projector-20260924/libgallium-26.2.2.so`
+has SHA-256 `8dc2e969209b2b9195d055979cd6fea6d58f4b4881bfe10e3efd8b5e772a4d2a`.
+Its capped GL1 q3dm1 run
+`gl1-mip-primary-limit256.log` has SHA-256
+`2799b25dca4348ed0f4cc9692a7bf10adb372975183f00b2be6581ca1749416a`.
+The log binds programs 9, 16--19, 24 and 25 as supported, reaches player
+spawn, and reports `stopped before triangle=256`.  A *live* capture while
+that process was running,
+`gl1-primary-limit256-live.png` (SHA-256
+`4c221d7e1bda5f6cfa634e7547aef59988ef5c63cbc0db214db1406f42480e2f`),
+shows the textured q3dm1 loading image rendered inside the X window.
+Because the global cap stops later draws, a subsequently captured loading
+frame does not prove gameplay pixels.  No GPU fault or timeout appeared in
+the contemporaneous kernel log.  The test application's SIGTERM handler
+deadlocked while re-entering Mesa texture deletion during shutdown; that
+user-process failure is distinct from command retirement and future bounded
+runs should use a hard timeout.
+
+After these numeric pixel gates, source and current capability review find no
 deterministic generic-state rejection for the next q3dm1 material classes.
 The first
 representative two-pass material is protobanner: projected BGRA times primary
