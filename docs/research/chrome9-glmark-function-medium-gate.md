@@ -1,8 +1,8 @@
 # Chrome9 glmark2 function-medium fragment gate
 
-Status: source-exact and Mesa-26.2.2 offline-NIR audit, 2026-09-24.  No GPU
-command was submitted for this audit.  The proposed square-root chain remains
-a guarded silicon gate before enabling it generally.
+Status: source-exact and Mesa-26.2.2 offline-NIR audit plus guarded oracle
+source, 2026-09-24.  No GPU command was submitted for this audit.  The
+square-root chain remains a guarded silicon gate before enabling it generally.
 
 ## Exact scene source
 
@@ -152,8 +152,9 @@ without changing the finite samples:
 
 ```text
 SUB  t2.x, c0.x(0), result.x
-CMP  result.x, t2.x, c0.y(1), c0.x(0)
-MOV  color, result
+CMP  t3.x, t2.x, c0.y(1), c0.x(0)
+MOV  color.x, t3.x
+MOV  color.yzw, result.yzw
 ```
 
 The semantic/UAPI operand order is predicate, true/C, false/B: Chrome9 CMP
@@ -161,11 +162,19 @@ selects source 1/C when the predicate is nonnegative and source 2/B when it is
 negative.  The expected BGRA8888 host word (AARRGGBB) is therefore
 `0xbfff4080`: exact red `1` proves the zero chain did not leave a positive
 residue, while green/blue/alpha prove `.25/.5/.75` within two UNORM8 codes.
-The entire discriminator is 11 ALU records, one varying, one constant register,
-no texture, and no control flow.  Check D16 and all BO guards, require normal
+CMP must write fresh `t3.x`: the kernel rejects overlapping temporary
+definitions, so overwriting the already-defined `result.x` is invalid.  The
+two COLOR moves have disjoint masks and complete RGBA together.  The entire
+discriminator is 12 ALU records, one varying, one constant register, no
+texture, and no control flow.  Check D16 and all BO guards, require normal
 retirement, and run a known-good draw afterward.  A direct-root companion
 sample (without CMP) should also require the zero byte to be zero so a NaN or
 unexpected sign encoding cannot be hidden solely by CMP behavior.
+
+`tools/re/chrome9_normalize_guard_smoke.c --sqrt-lower` implements this
+12-record discriminator and the `0xbfff4080` check.  It passes a strict host
+compile with `-std=c11 -Wall -Wextra -Werror`; it has not been GPU-run as part
+of this audit.
 
 Passing this gate qualifies `frcp(frsq(x))` for the nonnegative `[0,1)` domain
 used by this scene.  It does not qualify negative roots, arbitrary NaN/

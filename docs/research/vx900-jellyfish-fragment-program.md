@@ -323,3 +323,16 @@ validator issue, but it does **not** validate the shader numerically.  Until
 the source of the color differential is isolated, the test remains an
 unresolved ALU/varying/computed-coordinate linkage oracle rather than evidence
 that jellyfish rendering is correct.
+
+### T2.z discriminator
+
+A second bounded packet replaced the alpha construction with a direct
+`MOV temp14.w, V2.zzzz` while retaining the same three-varying/two-texture
+envelope.  V2.z was `0.4`, so BGRA8 alpha should have been `0x66`.  The draw
+retired but returned alpha `0x00`; RGB remained the same unresolved `6d3d08`
+and D16 remained `8000`.  Known-good draws passed before and after, with no
+new kernel fault.  This isolates at least one real differential below the
+CPU arithmetic reference: the third packed varying's Z component does not
+reach an ordinary fragment ALU in this envelope.  It does not yet distinguish
+FE producer width/link state from A90/resource routing or the native source
+selector, so none of those layers should be changed from this result alone.
