@@ -45,6 +45,19 @@ object `+0x24` (public instance `+0x34`) into FE A00 bits 7:4. Then:
    A28/A29. The separate FE linkage writer at `0x10157a90..0x10157ac5`
    fills `+0x2d80[0]` with the effective width used for A01 field zero.
 
+The width table is not truncated to the active-resource count.  The linkage
+builder at `0x101574a0` reads compiled-object `+0x30` at
+`0x101574b4..0x101574ba`; this is the logical T-use mask.  It compacts every
+set T bit and its producer width from context `+0x2d40[]` at
+`0x1015751c..0x101575bb`, then writes the per-ordinal effective widths into
+`+0x2d80..+0x2d9c` through the branches at
+`0x101576ae..0x10157ac5`.  Consequently the one-MAD object with mask `7`
+constructs three width-four entries for T0/T1/T2.  The later H6 writer still
+iterates only compiled-object `+0x24` / public-instance `+0x34`, which is one.
+The `f000` result is therefore a deliberate split between complete linkage
+metadata and active-resource-limited H6 masking, not an absent T1/T2 width in
+the context table.
+
 For one active resource of width four, this writer sets only A28's T0 nibble
 `[15:12]` to `f`; the T1 and T2 nibbles `[11:8]` and `[7:4]` remain zero.
 The upper 16 bits of A28 depend on other runtime state and are not claimed
@@ -61,8 +74,9 @@ This divergence is *not* proof that clearing A28's T1/T2 bits makes the
 one-MAD shader functional. Defaults could merely replace those sources with
 zeros, and the exact behavior of a compiled PS that uses three physical T
 registers but reports one active resource remains unqualified. A complete
-vendor draw-time image, including the context width table and full shader
-declarations, is still needed before changing the kernel mask rule.
+vendor draw-time image is still desirable before changing the kernel mask
+rule, although the context width-table population and resource-limited mask
+loop are now independently source-proven.
 
 ## Safest discriminator
 
