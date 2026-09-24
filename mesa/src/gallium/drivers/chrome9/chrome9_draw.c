@@ -1610,6 +1610,10 @@ chrome9_queue_generic_triangle(
              crender->texture_count * sizeof(texture_state[0]));
       crender->batch_generic_program = true;
    }
+   /* A signal handler that draws while a flush is still in its ioctl
+    * re-enters with the batch full; fail closed instead of overrunning. */
+   if (crender->batch_count >= CHROME9_FRAGMENT_BATCH_TRIANGLES)
+      return false;
    memcpy(&crender->batch_fragment_vertices[crender->batch_count * 3],
           vertices, sizeof(vertices));
    crender->batch_count++;
@@ -2966,7 +2970,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
          }
       }
       if (crender->batch_count &&
-          (crender->batch_textured ||
+          (crender->batch_textured || crender->batch_generic_program ||
            crender->batch_perspective != perspective_batch ||
            crender->batch_large_run != rhw_run_batch ||
            crender->batch_large_chain != rhw_chain_batch ||

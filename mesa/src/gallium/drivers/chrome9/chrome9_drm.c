@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "drm-uapi/chrome9_drm.h"
+#include "util/macros.h"
 #include "xf86drm.h"
 
 _Static_assert(sizeof(struct drm_chrome9_draw_triangle_d16_rhw_run) == 128,
@@ -209,7 +210,10 @@ chrome9_dump_failed_fragment_program(
       { draw->constants_ptr, (size_t)draw->constant_count * 16 },
       { draw->textures_ptr, (size_t)draw->texture_count *
         sizeof(struct drm_chrome9_fragment_texture_state) },
-      { draw->vertices_ptr, (size_t)draw->triangle_count * 3 *
+      /* A corrupt count must not make the dump read unbounded memory. */
+      { draw->vertices_ptr,
+        (size_t)MIN2(draw->triangle_count,
+                     DRM_CHROME9_FRAGMENT_MAX_TRIANGLES) * 3 *
         sizeof(struct drm_chrome9_fragment_vertex) },
    };
    const uint32_t magic[2] = { 0xc9d02201, (uint32_t)error };
