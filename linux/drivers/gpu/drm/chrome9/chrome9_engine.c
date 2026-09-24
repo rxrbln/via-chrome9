@@ -119,6 +119,12 @@ MODULE_PARM_DESC(hw_tcl,
 #define CHROME9_TCL_RE_NO_BFD_SAT	BIT(1)
 #define CHROME9_TCL_RE_UCP_PERSPECTIVE	BIT(2)
 #define CHROME9_TCL_RE_UCP_CONSUMER	BIT(3)
+/* 16 clip engine off (A01 bits 20/11), 32 A23[4], 64 A23[8] = 0 uncull. */
+#define CHROME9_TCL_RE_CLIP_OFF		BIT(4)
+#define CHROME9_TCL_RE_A23_2FRENDER	BIT(5)
+#define CHROME9_TCL_RE_A23_CULL_CW	BIT(6)
+/* 128 vendor single-color layout: no oD1/oD3 records, no Cs in A25/A28. */
+#define CHROME9_TCL_RE_NO_SECONDARY	BIT(7)
 static uint chrome9_tcl_re;
 module_param_named(tcl_re, chrome9_tcl_re, uint, 0600);
 MODULE_PARM_DESC(tcl_re,
@@ -2222,8 +2228,10 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		      0x20000000;
 	/* A23 bit 8 selects the culled physical winding (set = CCW); bits
 	 * 14:12 select Gouraud (4) or flat from the third vertex C (3). */
-	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ?
+	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ||
+			tcl->re & CHROME9_TCL_RE_A23_CULL_CW ?
 			0x23004e02 : 0x23004f02) & ~GENMASK(14, 12)) |
+		      (tcl->re & CHROME9_TCL_RE_A23_2FRENDER ? BIT(4) : 0) |
 		      (tcl->cull & DRM_CHROME9_VERTEX_FLAT ? 0x3000 : 0x4000) |
 		      /* A23[7]: set = CCW triangles take oBFD (vendor front CW). */
 		      (tcl->cull & DRM_CHROME9_VERTEX_BFC_CCW ? BIT(7) : 0);
@@ -2252,6 +2260,10 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		raster[i++] = 0x25f6cc00;
 		raster[i++] = 0x28ffcc00;
 	}
+	if (tcl->re & CHROME9_TCL_RE_NO_SECONDARY)
+		for (e = 0; e < i; e++)
+			if (raster[e] >> 24 == 0x25 || raster[e] >> 24 == 0x28)
+				raster[e] &= ~BIT(17);
 	for (e = 0; e < 3; e++) {
 		u32 scale = tcl->rows[e];
 		u32 offset = tcl->rows[4 + e];
@@ -2984,7 +2996,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	/* Vendor hardware TCL: type-01 A01 clip engine (bit 11) plus bit 20. */
 	if (tcl)
-		common[4] |= 0x00100800 |
+		common[4] |= (tcl->re & CHROME9_TCL_RE_CLIP_OFF ? 0 : 0x00100800) |
 			     (tcl->cull & (DRM_CHROME9_VERTEX_CULL_CW |
 					   DRM_CHROME9_VERTEX_CULL_CCW) ? BIT(7) : 0);
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
@@ -8740,6 +8752,25 @@ static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 			tcl->clip_mask, &tcl->program);
 		if (ret)
 			goto out_free;
+		if (tcl->re & CHROME9_TCL_RE_NO_SECONDARY) {
+			struct chrome9_vertex_program *vp = &tcl->program;
+			u32 last_input = vp->a62 & 0x1ff, kept = 0, r;
+
+			for (r = 0; r < vp->record_count; r++) {
+				u32 dest = vp->records[r][3] >> 4 & 0xff;
+
+				if (dest == 0x23 || dest == 0x25) {
+					if (r < last_input)
+						vp->a62--;
+					continue;
+				}
+				memmove(vp->records[kept++], vp->records[r],
+					sizeof(vp->records[r]));
+			}
+			vp->active_count -= vp->record_count - kept;
+			vp->record_count = kept;
+			vp->a60 = 0x60800000 | (vp->active_count - 1);
+		}
 		if (tcl->re & CHROME9_TCL_RE_NO_BFD_SAT)
 			for (i = 0; i < tcl->program.record_count; i++)
 				if ((tcl->program.records[i][3] >> 4 & 0xff) == 0x24)
