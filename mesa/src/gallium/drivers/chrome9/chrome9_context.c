@@ -7261,6 +7261,19 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       chrome9_screen_has_capability2(screen,
                                      DRM_CHROME9_CAP2_VERTEX_TOPOLOGY) &&
       debug_get_bool_option("CHROME9_TCL_TOPOLOGY", true);
+   /* Lines passed rungs L1-L3 and the GL smoke; points (size rounding,
+    * edge clipping, sprites) and polygon mode on strips/fans do not yet. */
+   ctx->tcl_points = ctx->tcl_enabled &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_NATIVE_POINTS) &&
+      debug_get_bool_option("CHROME9_TCL_POINTS", false);
+   ctx->tcl_point_size = ctx->tcl_points &&
+      debug_get_bool_option("CHROME9_TCL_POINT_SIZE", false);
+   ctx->tcl_lines = ctx->tcl_enabled &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_NATIVE_LINES) &&
+      debug_get_bool_option("CHROME9_TCL_LINES", true);
+   ctx->tcl_polygon_mode = ctx->tcl_enabled &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_POLYGON_MODE) &&
+      debug_get_bool_option("CHROME9_TCL_POLYGON_MODE", false);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =

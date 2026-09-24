@@ -67,6 +67,7 @@ struct tcl_builder {
    /* The shader writes BFC0 (for CHROME9_TCL_COLOUR_BACK). */
    bool writes_back;
    unsigned clip_enable;
+   bool point_size;
    bool unit_temp[DRM_CHROME9_VERTEX_MAX_TEMPS];
    /* Whole-register copies used to legalize read ports. */
    int16_t constant_temp[DRM_CHROME9_VERTEX_MAX_CONSTANTS];
@@ -791,6 +792,16 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
       tcl_store_clip(b, io.location == VARYING_SLOT_CLIP_DIST1 ? 4 : 0,
                      component, mask, v);
       return;
+   } else if (io.location == VARYING_SLOT_PSIZ) {
+      /* Used by the kernel only for RASTER_POINT_SIZE_VERTEX draws. */
+      if (!b->point_size)
+         return;
+      if (mask != 1) {
+         b->failed = true;
+         return;
+      }
+      mov.dst.file = DRM_CHROME9_VERTEX_DEST_POINT_SIZE;
+      b->p->point_size = true;
    } else if (io.location == VARYING_SLOT_BFC1 ||
               io.location == VARYING_SLOT_CLIP_VERTEX) {
       /* COL1 is not consumed either; st lowers CLIP_VERTEX to distances
@@ -1003,11 +1014,13 @@ tcl_find_key(struct chrome9_tcl_shader *shader)
 bool
 chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
                     enum chrome9_tcl_colour colour, unsigned clip_enable,
-                    unsigned key_count, const uint16_t *key_dword,
-                    const uint32_t *key_value, struct chrome9_tcl_program *p)
+                    bool point_size, unsigned key_count,
+                    const uint16_t *key_dword, const uint32_t *key_value,
+                    struct chrome9_tcl_program *p)
 {
    struct tcl_builder b = {
       .p = p, .colour = colour, .clip_enable = clip_enable,
+      .point_size = point_size,
       .writes_back = !!(source->info.outputs_written & VARYING_BIT_BFC0),
    };
    struct tcl_key key = { key_count, key_dword, key_value };
@@ -1232,23 +1245,26 @@ tcl_triangle_count(enum mesa_prim mode, unsigned count)
 /*
  * Submission order of a draw: a list expands every triangle, a native
  * strip or fan sends its vertices.  Strip chunks start at an even triangle
- * and overlap by two vertices, fan chunks repeat vertex 0.
+ * and overlap by two vertices, fan chunks repeat vertex 0, line strip
+ * chunks overlap by one vertex and a line loop closes on vertex 0.
  */
 struct tcl_chunker {
    enum mesa_prim mode;
    uint32_t topology;
    bool flat_first;
-   unsigned triangles;
+   unsigned primitives;
    unsigned done;
+   /* Vertices of the draw, for the line loop wrap. */
+   unsigned vertices;
 };
 
 /* Next chunk of at most max_vertices positions (relative to the draw's
- * first vertex); returns its triangle count, 0 when finished. */
+ * first vertex); returns its primitive count, 0 when finished. */
 static unsigned
 tcl_chunk(struct tcl_chunker *c, unsigned max_vertices, unsigned *positions,
           unsigned *vertex_count)
 {
-   unsigned n = c->triangles - c->done, k = 0;
+   unsigned n = c->primitives - c->done, k = 0;
 
    if (!n)
       return 0;
@@ -1263,6 +1279,21 @@ tcl_chunk(struct tcl_chunker *c, unsigned max_vertices, unsigned *positions,
       positions[k++] = 0;
       for (unsigned i = 0; i < n + 1; i++)
          positions[k++] = c->done + 1 + i;
+      break;
+   case DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST:
+      n = MIN2(n, max_vertices);
+      for (unsigned i = 0; i < n; i++)
+         positions[k++] = c->done + i;
+      break;
+   case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST:
+      n = MIN2(n, max_vertices / 2);
+      for (unsigned i = 0; i < 2 * n; i++)
+         positions[k++] = 2 * c->done + i;
+      break;
+   case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP:
+      n = MIN2(n, max_vertices - 1);
+      for (unsigned i = 0; i < n + 1; i++)
+         positions[k++] = (c->done + i) % c->vertices;
       break;
    default:
       n = MIN2(n, max_vertices / 3);
@@ -1298,6 +1329,174 @@ tcl_topology(const struct chrome9_context *ctx, enum mesa_prim mode,
    default:
       return DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST;
    }
+}
+
+/* Kernel primitive class and raster state of one draw. */
+struct tcl_raster {
+   bool triangles;
+   /* Points and lines; triangles take tcl_topology(). */
+   uint32_t topology;
+   unsigned primitives;
+   uint32_t point_size;
+   uint32_t flags;
+};
+
+/* GL aliased lines one pixel wide (widths below 1.5 round to one) under
+ * the diamond-exit rule, which A01[22] selects. */
+static const char *
+tcl_raster_lines(const struct pipe_rasterizer_state *rs)
+{
+   if (rs->line_smooth || rs->line_stipple_enable || rs->line_rectangular ||
+       rs->line_last_pixel || rs->point_line_tri_clip ||
+       !rs->half_pixel_center || !(rs->line_width < 1.5f))
+      return "wide, smooth or stippled lines";
+   return NULL;
+}
+
+/*
+ * Aliased points of a state size (rounded unless sprites are on, where
+ * only whole sizes are accepted) or of the VS size, and sprite coordinates
+ * for the logical varyings sprite_coord_enable names (TEXn is generic n,
+ * VARn generic 9 + n) with the upper-left origin of the hardware.
+ */
+static const char *
+tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
+                  struct tcl_raster *r)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   const nir_shader *fs = ctx->fs->nir;
+   float size = rs->point_size;
+   unsigned sprite = 0;
+
+   if (rs->point_smooth || rs->point_line_tri_clip || !rs->half_pixel_center)
+      return "smooth or clipped points";
+   if (rs->point_size_per_vertex) {
+      if (polygon || !ctx->tcl_point_size ||
+          !(ctx->vs->tcl->nir->info.outputs_written & VARYING_BIT_PSIZ))
+         return "per-vertex point size";
+      r->flags |= DRM_CHROME9_RASTER_POINT_SIZE_VERTEX;
+      size = ctx->base.screen->caps.max_point_size;
+   } else if (!rs->point_quad_rasterization) {
+      size = MAX2(1.0f, roundf(size));
+   } else if (!(size >= 1.0f) || size != roundf(size)) {
+      return "fractional point size";
+   }
+   if (!(size <= 2048.0f))
+      return "point size";
+   if (rs->point_quad_rasterization && rs->sprite_coord_enable) {
+      if (!fs || fs->info.inputs_read & VARYING_BIT_PNTC)
+         return "point coordinate";
+      for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++) {
+         const bool tex = fs->info.inputs_read & VARYING_BIT_TEX(n);
+         const bool var = fs->info.inputs_read & VARYING_BIT_VAR(n);
+
+         if (!(tex && rs->sprite_coord_enable & BITFIELD_BIT(n)) &&
+             !(var && rs->sprite_coord_enable & BITFIELD_BIT(9 + n)))
+            continue;
+         /* Both would feed logical varying n. */
+         if (tex && var)
+            return "point coordinate";
+         sprite |= BITFIELD_BIT(n);
+      }
+   }
+   if (sprite) {
+      if (polygon || rs->sprite_coord_mode != PIPE_SPRITE_COORD_UPPER_LEFT)
+         return "point sprite origin";
+      r->flags |= DRM_CHROME9_RASTER_POINT_SPRITE |
+                  DRM_CHROME9_RASTER_SPRITE_MASK(sprite);
+   }
+   memcpy(&r->point_size, &size, sizeof(r->point_size));
+   return NULL;
+}
+
+static uint32_t
+tcl_polygon_mode(unsigned mode)
+{
+   return mode == PIPE_POLYGON_MODE_LINE ? DRM_CHROME9_POLYGON_LINE :
+          mode == PIPE_POLYGON_MODE_POINT ? DRM_CHROME9_POLYGON_POINT :
+          DRM_CHROME9_POLYGON_FILL;
+}
+
+/*
+ * Native points and lines, or triangles with their polygon modes; returns
+ * the fallback reason.  Quads and polygons hide inner edges and per-vertex
+ * edge flags hide others, so their unfilled forms stay with the draw
+ * module, as do flat unfilled polygons and polygon offset of lines and
+ * points.
+ */
+static const char *
+tcl_raster(const struct chrome9_context *ctx, const struct pipe_draw_info *info,
+           unsigned count, bool flat, struct tcl_raster *r)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   unsigned front = rs->fill_front, back = rs->fill_back;
+   const char *why;
+
+   memset(r, 0, sizeof(*r));
+   switch (info->mode) {
+   case MESA_PRIM_POINTS:
+      if (!ctx->tcl_points)
+         return "primitive type";
+      r->topology = DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST;
+      r->primitives = count;
+      return tcl_raster_points(ctx, false, r);
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINE_LOOP:
+      if (!ctx->tcl_lines)
+         return "primitive type";
+      /* Flat lines take vertex B, the last one. */
+      if (flat && rs->flatshade_first)
+         return "flat lines from the first vertex";
+      r->topology = info->mode == MESA_PRIM_LINES ?
+                    DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST :
+                    DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP;
+      r->primitives = info->mode == MESA_PRIM_LINES ? count / 2 :
+                      count < 2 ? 0 :
+                      info->mode == MESA_PRIM_LINE_LOOP ? count : count - 1;
+      return tcl_raster_lines(rs);
+   default:
+      break;
+   }
+   r->triangles = true;
+   r->primitives = tcl_triangle_count(info->mode, count);
+   if (!r->primitives &&
+       !tcl_triangle(info->mode, 0, false, (unsigned[3]){ 0 }))
+      return "primitive type";
+   /* The mode of a culled face is never seen. */
+   if (rs->cull_face == PIPE_FACE_BACK)
+      back = front;
+   else if (rs->cull_face == PIPE_FACE_FRONT)
+      front = back;
+   if (front == PIPE_POLYGON_MODE_FILL && back == PIPE_POLYGON_MODE_FILL)
+      return NULL;
+   if (!ctx->tcl_polygon_mode || front > PIPE_POLYGON_MODE_POINT ||
+       back > PIPE_POLYGON_MODE_POINT ||
+       (front == PIPE_POLYGON_MODE_POINT) !=
+          (back == PIPE_POLYGON_MODE_POINT) ||
+       (info->mode != MESA_PRIM_TRIANGLES &&
+        info->mode != MESA_PRIM_TRIANGLE_STRIP &&
+        info->mode != MESA_PRIM_TRIANGLE_FAN) || flat ||
+       ctx->vs->tcl->nir->info.outputs_written & VARYING_BIT_EDGE ||
+       ((front == PIPE_POLYGON_MODE_LINE || back == PIPE_POLYGON_MODE_LINE) &&
+        rs->offset_line) ||
+       (front == PIPE_POLYGON_MODE_POINT && rs->offset_point))
+      return "polygon mode";
+   if (front == PIPE_POLYGON_MODE_LINE || back == PIPE_POLYGON_MODE_LINE) {
+      why = tcl_raster_lines(rs);
+      if (why)
+         return why;
+   }
+   if (front == PIPE_POLYGON_MODE_POINT) {
+      why = tcl_raster_points(ctx, true, r);
+      if (why)
+         return why;
+   }
+   r->flags |= DRM_CHROME9_RASTER_POLYGON_CW(
+                  tcl_polygon_mode(rs->front_ccw ? back : front)) |
+               DRM_CHROME9_RASTER_POLYGON_CCW(
+                  tcl_polygon_mode(rs->front_ccw ? front : back));
+   return NULL;
 }
 
 struct tcl_stream {
@@ -1608,11 +1807,11 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                     state->fragment.draw.texture_count);
          if (chunker.done == count)
             return false;
-         CHROME9_REJECT(ctx, chunker.triangles - chunker.done + count);
+         CHROME9_REJECT(ctx, chunker.primitives - chunker.done + count);
          return true;
       }
    }
-   ctx->tcl_buffer_triangles += chunker.triangles;
+   ctx->tcl_buffer_triangles += chunker.primitives;
    return true;
 }
 
@@ -1690,6 +1889,7 @@ static const struct chrome9_tcl_program *
 tcl_program(struct chrome9_context *ctx, bool clip_halfz,
             enum chrome9_tcl_colour colour, uint8_t clip_enable)
 {
+   const bool point_size = ctx->tcl_point_size;
    struct chrome9_tcl_shader *shader = ctx->vs->tcl;
    const struct pipe_constant_buffer *cb = &ctx->vs_constants[0];
    const uint8_t *map = cb->user_buffer;
@@ -1713,6 +1913,7 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
       if (variant->clip_halfz == clip_halfz &&
           variant->colour == colour &&
           variant->clip_enable == clip_enable &&
+          variant->point_size == point_size &&
           !memcmp(variant->key, key, sizeof(key))) {
          *link = variant->next;
          variant->next = shader->variants;
@@ -1733,9 +1934,10 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
    variant->clip_halfz = clip_halfz;
    variant->colour = colour;
    variant->clip_enable = clip_enable;
+   variant->point_size = point_size;
    memcpy(variant->key, key, sizeof(key));
    chrome9_tcl_compile(shader->nir, clip_halfz, colour, clip_enable,
-                       shader->key_count, shader->key_dword, key,
+                       point_size, shader->key_count, shader->key_dword, key,
                        &variant->program);
    variant->next = shader->variants;
    shader->variants = variant;
@@ -1743,10 +1945,12 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
    return variant->program.supported ? &variant->program : NULL;
 }
 
-/* Value class of one varying lane for all vertices of a draw. */
+/* Value class of one varying lane for all vertices of a draw; sprite
+ * coordinates are (s, t, 0, 1) with s and t in [0, 1]. */
 static enum chrome9_tcl_origin
 tcl_lane_origin(const struct chrome9_context *ctx,
-                const struct chrome9_tcl_program *p, unsigned lane)
+                const struct chrome9_tcl_program *p, unsigned sprite,
+                unsigned lane)
 {
    const unsigned v = lane / 4, c = lane % 4;
    const struct util_format_description *desc;
@@ -1754,6 +1958,9 @@ tcl_lane_origin(const struct chrome9_context *ctx,
 
    if (v >= DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
       return CHROME9_TCL_ORIGIN_UNKNOWN;
+   if (sprite & BITFIELD_BIT(v))
+      return c < 2 ? CHROME9_TCL_ORIGIN_UNIT :
+             c == 2 ? CHROME9_TCL_ORIGIN_ZERO : CHROME9_TCL_ORIGIN_ONE;
    if (p->origin[v][c] != CHROME9_TCL_ORIGIN_INPUT)
       return p->origin[v][c];
    input = p->origin_input[v][c];
@@ -1773,22 +1980,25 @@ tcl_lane_origin(const struct chrome9_context *ctx,
  * check per vertex; accept them only when the VS proves them statically. */
 static bool
 tcl_guarded_domain(const struct chrome9_context *ctx,
-                   const struct chrome9_tcl_program *p)
+                   const struct chrome9_tcl_program *p, uint32_t raster)
 {
    const struct chrome9_shader *fs = ctx->fs;
+   const unsigned sprite = raster & DRM_CHROME9_RASTER_POINT_SPRITE ?
+                           raster >> 8 & 0xff : 0;
 
    for (uint32_t m = fs->semantic_identity_projector_input_mask; m; m &= m - 1)
-      if (tcl_lane_origin(ctx, p, __builtin_ctz(m)) != CHROME9_TCL_ORIGIN_ONE)
+      if (tcl_lane_origin(ctx, p, sprite, __builtin_ctz(m)) !=
+          CHROME9_TCL_ORIGIN_ONE)
          return false;
    for (uint32_t m = fs->semantic_equal_zero_input_mask; m; m &= m - 1) {
-      const enum chrome9_tcl_origin o = tcl_lane_origin(ctx, p,
-                                                        __builtin_ctz(m));
+      const enum chrome9_tcl_origin o =
+         tcl_lane_origin(ctx, p, sprite, __builtin_ctz(m));
 
       if (o != CHROME9_TCL_ORIGIN_ZERO && o != CHROME9_TCL_ORIGIN_ONE)
          return false;
    }
    for (uint32_t m = fs->semantic_unit_interval_input_mask; m; m &= m - 1)
-      if (tcl_lane_origin(ctx, p, __builtin_ctz(m)) ==
+      if (tcl_lane_origin(ctx, p, sprite, __builtin_ctz(m)) ==
           CHROME9_TCL_ORIGIN_UNKNOWN)
          return false;
    return true;
@@ -1876,7 +2086,7 @@ tcl_fallback(struct chrome9_context *ctx, const char *reason)
 static bool
 tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
               const struct pipe_draw_start_count_bias *range,
-              const uint8_t *indices, unsigned triangles,
+              const uint8_t *indices, const struct tcl_raster *raster,
               struct chrome9_tcl_state *state,
               const struct chrome9_tcl_program *p,
               const struct tcl_stream *bound, uint32_t flags,
@@ -1887,11 +2097,14 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    struct tcl_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct drm_chrome9_draw_vertex_program draw = { 0 };
    struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   const unsigned primitives = raster->primitives;
    struct tcl_chunker chunker = {
       .mode = info->mode,
-      .topology = tcl_topology(ctx, info->mode, flags),
+      .topology = raster->triangles ? tcl_topology(ctx, info->mode, flags) :
+                  raster->topology,
       .flat_first = rs->flatshade_first,
-      .triangles = triangles,
+      .primitives = primitives,
+      .vertices = range->count,
    };
    unsigned stride, max_vertices, buffer_count, count, n;
    uint32_t index_min, index_max;
@@ -1905,6 +2118,8 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
    draw.flags = flags;
    draw.topology = chunker.topology;
+   draw.point_size = raster->point_size;
+   draw.raster_flags = raster->flags;
    draw.clip_distance_mask = clip_enable;
    draw.instruction_count = p->instruction_count;
    draw.instructions_ptr = (uintptr_t)p->instructions;
@@ -1929,7 +2144,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       for (unsigned b = 0; b < ARRAY_SIZE(uploads); b++)
          pipe_resource_reference(&uploads[b], NULL);
       if (drawn) {
-         ctx->tcl_triangles += triangles;
+         ctx->tcl_triangles += primitives;
          return true;
       }
       /* Stage A below; clear every stage B field. */
@@ -1975,7 +2190,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          if (!written) {
             if (chunker.done == count)
                return tcl_fallback(ctx, "vertex fetch");
-            CHROME9_REJECT(ctx, triangles - chunker.done + count);
+            CHROME9_REJECT(ctx, primitives - chunker.done + count);
             return true;
          }
          out += written;
@@ -1989,11 +2204,11 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                tcl_dump(&draw, p, &state->fragment);
             return tcl_fallback(ctx, "kernel rejected the draw");
          }
-         CHROME9_REJECT(ctx, triangles - chunker.done + count);
+         CHROME9_REJECT(ctx, primitives - chunker.done + count);
          return true;
       }
    }
-   ctx->tcl_triangles += triangles;
+   ctx->tcl_triangles += primitives;
    return true;
 }
 
@@ -2046,9 +2261,10 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    struct chrome9_tcl_state *state;
    const uint8_t *indices = NULL;
    const char *why;
+   struct tcl_raster raster;
    bool flat, twoside;
    uint8_t clip_enable;
-   unsigned triangles, passes = 1;
+   unsigned passes = 1;
 
    if (!ctx->tcl_enabled)
       return false;
@@ -2057,9 +2273,7 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (info->primitive_restart || info->instance_count != 1 ||
        info->start_instance)
       return tcl_fallback(ctx, "restart or instancing");
-   if (rs->fill_front != PIPE_POLYGON_MODE_FILL ||
-       rs->fill_back != PIPE_POLYGON_MODE_FILL || !rs->depth_clip_near ||
-       !rs->depth_clip_far || rs->rasterizer_discard)
+   if (!rs->depth_clip_near || !rs->depth_clip_far || rs->rasterizer_discard)
       return tcl_fallback(ctx, "rasterizer state");
    clip_enable = rs->clip_plane_enable;
    if (clip_enable && (!ctx->tcl_clip_distance ||
@@ -2068,20 +2282,22 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (!tcl_fs_flat(ctx->fs, &flat))
       return tcl_fallback(ctx, "flat generic varying");
    flat |= rs->flatshade;
-   triangles = tcl_triangle_count(info->mode, range->count);
-   if (!triangles && !tcl_triangle(info->mode, 0, false, (unsigned[3]){ 0 }))
-      return tcl_fallback(ctx, "primitive type");
-   if (!triangles)
+   why = tcl_raster(ctx, info, range->count, flat, &raster);
+   if (why)
+      return tcl_fallback(ctx, why);
+   if (!raster.primitives)
       return true;
-   if (rs->cull_face == PIPE_FACE_FRONT_AND_BACK)
+   /* Culling and back colours apply to polygons only. */
+   if (raster.triangles && rs->cull_face == PIPE_FACE_FRONT_AND_BACK)
       return true;
 
    /* Back faces are invisible when culled (st also clears the flag); a
     * shader without BFC0 colours both faces with COL0. */
-   twoside = rs->light_twoside && rs->cull_face != PIPE_FACE_BACK &&
+   twoside = raster.triangles && rs->light_twoside &&
+             rs->cull_face != PIPE_FACE_BACK &&
              (ctx->vs->tcl->nir->info.outputs_written & VARYING_BIT_BFC0);
    colours[0] = CHROME9_TCL_COLOUR_FRONT;
-   flags[0] = tcl_cull(rs);
+   flags[0] = raster.triangles ? tcl_cull(rs) : 0;
    if (twoside && ctx->tcl_twoside) {
       /* Back colours go to the back-face winding. */
       colours[0] = CHROME9_TCL_COLOUR_SELECT;
@@ -2110,7 +2326,7 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          return tcl_fallback(ctx, "unwritten clip distance");
       if (!tcl_bind_inputs(ctx, p->input_count, streams[i]))
          return tcl_fallback(ctx, "vertex element format or buffer");
-      if (!tcl_guarded_domain(ctx, p))
+      if (!tcl_guarded_domain(ctx, p, raster.flags))
          return tcl_fallback(ctx, "guarded fragment domain");
       programs[i] = p;
       flags[i] |= flat ? DRM_CHROME9_VERTEX_FLAT : 0;
@@ -2135,13 +2351,13 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (!chrome9_draw_tcl_fragment(ctx, &state->fragment, &why))
       return tcl_fallback(ctx, why);
    for (unsigned i = 0; i < passes; i++) {
-      if (tcl_draw_pass(ctx, info, range, indices, triangles, state,
+      if (tcl_draw_pass(ctx, info, range, indices, &raster, state,
                         programs[i], streams[i], flags[i], clip_enable))
          continue;
       if (!i)
          return false;
       /* The front faces are already drawn. */
-      CHROME9_REJECT(ctx, triangles);
+      CHROME9_REJECT(ctx, raster.primitives);
    }
    return true;
 }

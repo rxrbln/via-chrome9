@@ -271,6 +271,11 @@ struct chrome9_context {
    /* Native triangle strips and fans. */
    bool tcl_topology;
    bool tcl_clip_distance;
+   /* Native points (and VS point size), one-pixel lines, polygon modes. */
+   bool tcl_points;
+   bool tcl_point_size;
+   bool tcl_lines;
+   bool tcl_polygon_mode;
    struct chrome9_tcl_state *tcl_state;
    /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */
    struct chrome9_sw_context *sw;

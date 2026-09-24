@@ -42,6 +42,8 @@ struct chrome9_tcl_program {
    /* Enabled planes the VS writes, and whether it writes BFC0. */
    uint8_t clip_written;
    bool back_primary;
+   /* The VS writes POINT_SIZE (compiled with point_size). */
+   bool point_size;
 };
 
 /* Primary colour routing: front only, hardware back-colour selection, or
@@ -62,6 +64,7 @@ struct chrome9_tcl_variant {
    bool clip_halfz;
    enum chrome9_tcl_colour colour;
    uint8_t clip_enable;
+   bool point_size;
    uint32_t key[CHROME9_TCL_MAX_KEY];
    struct chrome9_tcl_program program;
 };
@@ -79,7 +82,7 @@ struct chrome9_tcl_shader *chrome9_tcl_shader_create(const struct nir_shader *ni
 void chrome9_tcl_shader_destroy(struct chrome9_tcl_shader *shader);
 bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
                          enum chrome9_tcl_colour colour,
-                         unsigned clip_enable,
+                         unsigned clip_enable, bool point_size,
                          unsigned key_count, const uint16_t *key_dword,
                          const uint32_t *key_value,
                          struct chrome9_tcl_program *program);
