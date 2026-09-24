@@ -4077,6 +4077,11 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
 
    if (!shader || !shader->nir)
       return shader && shader->supported;
+   /* A dynamic canonical program needs no variants.  In particular, a
+    * natively lowered select must not exhaust the bounded variant cache as
+    * its control uniform takes on many different values. */
+   if (shader->canonical_supported)
+      return true;
    canonical = shader->nir;
    count = canonical->info.num_inlinable_uniforms;
    if (!count)
@@ -4157,8 +4162,8 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->nir = state->ir.nir;
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);
-      if (!state->ir.nir->info.num_inlinable_uniforms)
-         chrome9_compile_fs_nir(ctx, shader, state->ir.nir);
+      chrome9_compile_fs_nir(ctx, shader, state->ir.nir);
+      shader->canonical_supported = shader->supported;
       chrome9_dump_semantic_fs(shader);
       if (!state->ir.nir->info.num_inlinable_uniforms && !shader->supported &&
           debug_get_bool_option("CHROME9_DUMP_UNSUPPORTED_NIR", false)) {

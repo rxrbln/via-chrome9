@@ -2,6 +2,7 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include "chrome9_context.h"
+#include "chrome9_specialise.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -467,16 +468,20 @@ check_separable_blur_compilation(struct chrome9_context *context)
 
 static bool
 check_vector_conditional_compilation(struct chrome9_context *context,
-                                     unsigned components)
+                                     unsigned components,
+                                     bool uniform_predicate)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &options, "chrome9-vector-conditional");
    struct chrome9_shader shader = { 0 };
    nir_def *barycentric = nir_load_barycentric_pixel(
       &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
-   nir_def *color = nir_load_interpolated_input(
-      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
-      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_def *color = uniform_predicate ?
+      nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0),
+                        nir_imm_int(&b, 0)) :
+      nir_load_interpolated_input(
+         &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+         .io_semantics.location = VARYING_SLOT_COL0);
    nir_def *condition = nir_fge(
       &b, nir_ffract(&b, nir_channel(&b, color, 0)),
       nir_imm_float(&b, 0.5f));
@@ -489,6 +494,7 @@ check_vector_conditional_compilation(struct chrome9_context *context,
    nir_def *selected = nir_bcsel(&b, condition, true_value, false_value);
    nir_def *output[4];
    bool found = false;
+   bool valid;
 
    b.shader->info.io_lowered = true;
    for (unsigned c = 0; c < 4; c++)
@@ -501,6 +507,8 @@ check_vector_conditional_compilation(struct chrome9_context *context,
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_recompute_io_bases(b.shader,
                           nir_var_shader_in | nir_var_shader_out);
+   if (uniform_predicate)
+      chrome9_nir_find_inlinable_uniforms(b.shader);
    chrome9_compile_fs_nir(context, &shader, b.shader);
    for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
       const struct chrome9_ps_instruction *instruction =
@@ -522,8 +530,12 @@ check_vector_conditional_compilation(struct chrome9_context *context,
                         CHROME9_PS_SWIZZLE_ZERO;
       }
    }
-   if (!shader.supported || !shader.semantic_fs_valid ||
-       !shader.native_fs_valid || !found) {
+   valid = shader.supported && shader.semantic_fs_valid &&
+      shader.native_fs_valid && found &&
+      (!uniform_predicate ||
+       (b.shader->info.num_inlinable_uniforms == 1 &&
+        b.shader->info.inlinable_uniform_dw_offsets[0] == 0));
+   if (!valid) {
       fprintf(stderr, "vector conditional compilation failed: width=%u "
               "supported=%u semantic=%u native=%u ir=%u found=%u\n",
               components, shader.supported, shader.semantic_fs_valid,
@@ -552,8 +564,7 @@ check_vector_conditional_compilation(struct chrome9_context *context,
       }
    }
    ralloc_free(b.shader);
-   return shader.supported && shader.semantic_fs_valid &&
-          shader.native_fs_valid && found;
+   return valid;
 }
 
 static bool
@@ -755,10 +766,11 @@ main(void)
        !check_scalar_literal_packing(&context, false, 65, false) ||
        !check_reordered_vector_literals(&context) ||
        !check_packed_alpha_kill(&context) ||
-       !check_vector_conditional_compilation(&context, 1) ||
-       !check_vector_conditional_compilation(&context, 2) ||
-       !check_vector_conditional_compilation(&context, 3) ||
-       !check_vector_conditional_compilation(&context, 4) ||
+       !check_vector_conditional_compilation(&context, 1, false) ||
+       !check_vector_conditional_compilation(&context, 2, false) ||
+       !check_vector_conditional_compilation(&context, 3, false) ||
+       !check_vector_conditional_compilation(&context, 4, false) ||
+       !check_vector_conditional_compilation(&context, 1, true) ||
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
        !check_separable_blur_compilation(&context))

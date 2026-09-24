@@ -97,6 +97,7 @@ struct chrome9_shader {
    bool native_fs_from_nir;
    bool flat_primary;
    bool flat_generic;
+   bool canonical_supported;
    bool supported;
 };
 

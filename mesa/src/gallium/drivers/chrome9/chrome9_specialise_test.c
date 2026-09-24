@@ -34,7 +34,7 @@ float_bits(float value)
  * The second load proves that a dynamic, non-control uniform does not enter
  * the specialization key. */
 static nir_shader *
-build_uniform_loop(void)
+build_uniform_loop(bool with_selects)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
                                                    &options,
@@ -46,6 +46,20 @@ build_uniform_loop(void)
                                       nir_imm_int(&b, 0));
    nir_def *dynamic = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
                                         nir_imm_int(&b, 1));
+   nir_def *select_sum = nir_imm_float(&b, 0.0f);
+
+   if (with_selects) {
+      for (unsigned i = 0; i < 4; i++) {
+         nir_def *selector = nir_load_ubo_vec4(
+            &b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, i + 2));
+         nir_def *condition = nir_flt(
+            &b, nir_imm_float(&b, 0.0f), selector);
+
+         select_sum = nir_fadd(&b, select_sum,
+            nir_bcsel(&b, condition, nir_imm_float(&b, 1.0f),
+                      nir_imm_float(&b, 0.0f)));
+      }
+   }
    nir_phi_instr *phi = nir_phi_instr_create(b.shader);
    nir_loop *loop = nir_push_loop(&b);
 
@@ -65,7 +79,9 @@ build_uniform_loop(void)
    nir_builder_instr_insert(&b, &phi->instr);
    b.cursor = after_loop;
 
-   nir_store_var(&b, out, nir_fadd(&b, &phi->def, dynamic), 1);
+   nir_store_var(&b, out,
+                 nir_fadd(&b, nir_fadd(&b, &phi->def, dynamic), select_sum),
+                 1);
    nir_validate_shader(b.shader, "Chrome9 specialization test input");
    return b.shader;
 }
@@ -88,6 +104,115 @@ build_integer_condition(void)
    nir_pop_if(&b, nif);
    nir_validate_shader(b.shader, "Chrome9 integer specialization input");
    return b.shader;
+}
+
+/* A uniform controls a select, but the selected data is a separate dynamic
+ * uniform.  Only the predicate may enter the variant key. */
+static nir_shader *
+build_uniform_select(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                   &options,
+                                                   "uniform-select");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_float_type(), "out");
+   nir_def *distance = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
+                                          nir_imm_int(&b, 0));
+   nir_def *dynamic = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
+                                         nir_imm_int(&b, 1));
+   nir_def *condition = nir_flt(&b, nir_imm_float(&b, 0.0f), distance);
+   nir_def *length = nir_fsqrt(&b, nir_fmul(&b, dynamic, dynamic));
+   nir_def *falloff = nir_fmin(&b,
+      nir_fmul(&b, length, nir_frcp(&b, distance)),
+      nir_imm_float(&b, 1.0f));
+
+   nir_store_var(&b, out,
+                 nir_bcsel(&b, condition, falloff, dynamic), 1);
+   nir_validate_shader(b.shader, "Chrome9 uniform select input");
+   return b.shader;
+}
+
+static nir_shader *
+build_varying_select(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                   &options,
+                                                   "varying-select");
+   nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
+                                           glsl_float_type(), "in");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_float_type(), "out");
+   nir_def *threshold = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
+                                           nir_imm_int(&b, 0));
+   nir_def *condition = nir_flt(&b, nir_load_var(&b, in), threshold);
+
+   nir_store_var(&b, out,
+                 nir_bcsel(&b, condition, nir_imm_float(&b, 1.0f),
+                           nir_imm_float(&b, 0.0f)), 1);
+   nir_validate_shader(b.shader, "Chrome9 varying select input");
+   return b.shader;
+}
+
+static nir_shader *
+build_vector_uniform_select(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                   &options,
+                                                   "vector-uniform-select");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_vec2_type(), "out");
+   nir_def *a = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
+                                  nir_imm_int(&b, 0));
+   nir_def *c = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
+                                  nir_imm_int(&b, 1));
+   nir_def *conditions = nir_vec2(&b,
+      nir_flt(&b, nir_imm_float(&b, 0.0f), a),
+      nir_flt(&b, nir_imm_float(&b, 0.0f), c));
+   nir_def *selected = nir_bcsel(&b, conditions,
+      nir_vec2(&b, a, c), nir_imm_vec2(&b, 0.0f, 0.0f));
+
+   nir_store_var(&b, out, selected, 0x3);
+   nir_validate_shader(b.shader, "Chrome9 vector uniform select input");
+   return b.shader;
+}
+
+static unsigned
+alu_op_count(nir_shader *nir, nir_op op)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, nir)
+      nir_foreach_block(block, impl)
+         nir_foreach_instr(instr, block)
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == op)
+               count++;
+   return count;
+}
+
+static void
+check_select(nir_shader *canonical, float distance, bool positive)
+{
+   uint32_t value = float_bits(distance);
+   nir_shader *variant = nir_shader_clone(NULL, canonical);
+
+   chrome9_nir_inline_uniforms(variant, &value);
+   nir_validate_shader(variant, "Chrome9 specialized select variant");
+   if (alu_op_count(variant, nir_op_bcsel) ||
+       (positive && !alu_op_count(variant, nir_op_fsqrt)) ||
+       (!positive && (alu_op_count(variant, nir_op_fsqrt) ||
+                     alu_op_count(variant, nir_op_frcp) ||
+                     alu_op_count(variant, nir_op_fmin)))) {
+      fprintf(stderr, "distance %g: select did not fold correctly: "
+                      "bcsel=%u sqrt=%u rcp=%u min=%u\n",
+              distance, alu_op_count(variant, nir_op_bcsel),
+              alu_op_count(variant, nir_op_fsqrt),
+              alu_op_count(variant, nir_op_frcp),
+              alu_op_count(variant, nir_op_fmin));
+      nir_print_shader(variant, stderr);
+      abort();
+   }
+   ralloc_free(variant);
 }
 
 static void
@@ -149,7 +274,7 @@ check_count(nir_shader *canonical, float count, bool expect_loop)
 int
 main(void)
 {
-   nir_shader *nir = build_uniform_loop();
+   nir_shader *nir = build_uniform_loop(false);
 
    chrome9_nir_find_inlinable_uniforms(nir);
    if (nir->info.num_inlinable_uniforms != 1 ||
@@ -167,6 +292,60 @@ main(void)
    check_count(nir, 32.0f, false);
    check_count(nir, 33.0f, true);
 
+   ralloc_free(nir);
+
+   nir = build_vector_uniform_select();
+   chrome9_nir_find_inlinable_uniforms(nir);
+   if (nir->info.num_inlinable_uniforms != 2 ||
+       nir->info.inlinable_uniform_dw_offsets[0] != 0 ||
+       nir->info.inlinable_uniform_dw_offsets[1] != 4) {
+      fprintf(stderr, "vector select has the wrong specialization key\n");
+      return 1;
+   }
+   uint32_t vector_values[] = { float_bits(0.0f), float_bits(2.0f) };
+   chrome9_nir_inline_uniforms(nir, vector_values);
+   nir_validate_shader(nir, "Chrome9 vector select variant");
+   if (alu_op_count(nir, nir_op_bcsel)) {
+      fprintf(stderr, "vector select did not fold\n");
+      return 1;
+   }
+   ralloc_free(nir);
+
+   nir = build_uniform_loop(true);
+   chrome9_nir_find_inlinable_uniforms(nir);
+   if (nir->info.num_inlinable_uniforms != MAX_INLINABLE_UNIFORMS ||
+       nir->info.inlinable_uniform_dw_offsets[0] != 0) {
+      fprintf(stderr, "selects displaced the required loop bound\n");
+      return 1;
+   }
+   uint32_t loop_values[MAX_INLINABLE_UNIFORMS] = { 0 };
+   loop_values[0] = float_bits(5.0f);
+   chrome9_nir_inline_uniforms(nir, loop_values);
+   nir_validate_shader(nir, "Chrome9 bounded select/loop variant");
+   if (loop_count(nir)) {
+      fprintf(stderr, "loop bound was not specialized first\n");
+      return 1;
+   }
+   ralloc_free(nir);
+
+   nir = build_uniform_select();
+   chrome9_nir_find_inlinable_uniforms(nir);
+   if (nir->info.num_inlinable_uniforms != 1 ||
+       nir->info.inlinable_uniform_dw_offsets[0] != 0) {
+      fprintf(stderr, "uniform select has the wrong specialization key\n");
+      return 1;
+   }
+   check_select(nir, 0.0f, false);
+   check_select(nir, -1.0f, false);
+   check_select(nir, 2.0f, true);
+   ralloc_free(nir);
+
+   nir = build_varying_select();
+   chrome9_nir_find_inlinable_uniforms(nir);
+   if (nir->info.num_inlinable_uniforms) {
+      fprintf(stderr, "varying select entered the specialization key\n");
+      return 1;
+   }
    ralloc_free(nir);
 
    nir = build_integer_condition();

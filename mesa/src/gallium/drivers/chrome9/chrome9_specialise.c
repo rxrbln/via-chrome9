@@ -176,21 +176,51 @@ chrome9_nir_find_inlinable_uniforms(nir_shader *nir)
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_if *nif = nir_block_get_following_if(block);
-         uint16_t trial[MAX_INLINABLE_UNIFORMS];
-         unsigned trial_count = count;
+         if (nif) {
+            uint16_t trial[MAX_INLINABLE_UNIFORMS];
+            unsigned trial_count = count;
 
-         if (!nif)
-            continue;
-         memcpy(trial, dwords, sizeof(dwords));
-         if (chrome9_condition_dwords(nir_get_scalar(nif->condition.ssa, 0),
-                                      trial, &trial_count, 0)) {
-            memcpy(dwords, trial, sizeof(dwords));
-            count = trial_count;
+            memcpy(trial, dwords, sizeof(dwords));
+            if (chrome9_condition_dwords(
+                   nir_get_scalar(nif->condition.ssa, 0),
+                   trial, &trial_count, 0)) {
+               memcpy(dwords, trial, sizeof(dwords));
+               count = trial_count;
+            }
          }
       }
    }
    nir_foreach_function_impl(impl, nir)
       chrome9_loop_bound_uniforms(&impl->body, false, dwords, &count);
+   /* Loop bounds are required for an unrolled straight-line program.  Give
+    * them priority over select predicates in the four-dword variant key. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+            if (alu->op != nir_op_bcsel)
+               continue;
+            /* The pixel ISA has no dynamic select.  Only key on a wholly
+             * uniform predicate; never inline data from either arm. */
+            for (unsigned c = 0; c < alu->def.num_components; c++) {
+               uint16_t trial[MAX_INLINABLE_UNIFORMS];
+               unsigned trial_count = count;
+               nir_scalar predicate = nir_scalar_chase_alu_src(
+                  nir_get_scalar(&alu->def, c), 0);
+
+               memcpy(trial, dwords, sizeof(dwords));
+               if (chrome9_condition_dwords(predicate, trial,
+                                            &trial_count, 0)) {
+                  memcpy(dwords, trial, sizeof(dwords));
+                  count = trial_count;
+               }
+            }
+         }
+      }
+   }
    memcpy(nir->info.inlinable_uniform_dw_offsets, dwords, sizeof(dwords));
    nir->info.num_inlinable_uniforms = count;
 }
