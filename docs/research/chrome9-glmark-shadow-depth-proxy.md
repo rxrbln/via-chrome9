@@ -127,17 +127,22 @@ narrow domain:
 * a NaN from projection or bias is outside the local contract because neither
   comparison requests `preserve:nan`.
 
-The remaining silicon questions are finite-versus-infinity sign handling and
-whether a nonzero **subnormal difference retains its sign**.  They are not a
-general IEEE NaN requirement for this shader.  The first predicate can receive
-a finite subnormal W directly from the validated varying stream, so `0-W`
-alone can be exactly `-minsubnormal`.  If SUB flushes that value to `-0`,
-native CMP treats the condition as nonnegative and changes a strict-true
-result to false.  The sampled-depth predicate may admit a stronger spacing
-proof after its exact conversion and projection ranges are analyzed, but that
-does not discharge the W predicate.  Do not broadly lower `flt`/`fge`:
-arbitrary operands can additionally form `Inf-Inf`, and comparisons which
-request NaN preservation have a stronger contract.
+The remaining scene prerequisite is finite-versus-infinity sign handling.
+Subnormal comparison is a separate execution-mode discriminator, not a
+default-mode prerequisite.  The first predicate can receive a finite
+subnormal W directly from the validated varying stream, so `0-W` can be
+exactly `-minsubnormal`; the live gate below shows that VX900 flushes this
+case before CMP.  However, this shader has
+`float_controls_execution_mode=0`, and the Chrome9 backend rejects every
+explicit preserve-denorm, FTZ, or rounding request.  Its fixed default mode
+may therefore flush.  A shader requesting denorm preservation remains
+unsupported.
+
+Do not infer a broad `flt`/`fge` lowering from that default-mode allowance.
+Arbitrary operands can form `Inf-Inf`, comparisons may request NaN
+preservation, and the captured shadow comparisons separately request
+`preserve:inf`.  Only the exact finite-versus-infinity domain below can close
+that last local control.
 
 ### Exact proprietary SLT mapping
 
@@ -173,10 +178,10 @@ subnormal, infinity, or NaN arithmetic.  In particular:
 * `+0 < -0` and `-0 < +0` both require zero.  Existing CMP tests show either
   signed zero condition selects the nonnegative arm, so this passes if SUB
   produces either zero sign.
-* `0 < minsubnormal`, `-minsubnormal < -0`, and
-  `largest-subnormal < min-normal` all require one.  Every corresponding
-  difference is exactly `-minsubnormal`; these are the shortest flush-to-zero
-  discriminators.
+* Under an explicit preserve-denorm mode, `0 < minsubnormal`,
+  `-minsubnormal < -0`, and `largest-subnormal < min-normal` all require one.
+  Every corresponding difference is exactly `-minsubnormal`; these are the
+  shortest flush-to-zero discriminators.  Default mode may flush them.
 * finite versus `+Inf`/`-Inf` requires the mathematical sign of the infinite
   difference.  This is the infinity shape used by shadow.
 * equal infinities form NaN in the first record.  A general comparison with
@@ -186,10 +191,11 @@ subnormal, infinity, or NaN arithmetic.  In particular:
   ordered/unordered result for a NaN in either source.  Shadow does not request
   that contract, so it must not be used to promote the general case.
 
-### Minimal subnormal oracle
+### Minimal denormal-mode discriminator
 
-Before accepting the shadow nested select, add one two-ALU guarded semantic
-oracle using the already-defined SUB and CMP operations.  Upload:
+To characterize the fixed hardware mode and reject an incompatible explicit
+preserve request, use one two-ALU guarded semantic oracle with the
+already-defined SUB and CMP operations.  Upload:
 
 ```text
 x = (+0, +minsubnormal, -minsubnormal, largest-subnormal)
@@ -244,6 +250,12 @@ The reciprocal-zero result itself is not bit-readable through the normalized
 render target, so a passing color result qualifies only the complete
 RCP/SUB/CMP path used by the test.
 
+`tools/re/chrome9_cmp_guard_smoke.c --infinity-sign` now implements the first
+five-ALU case.  It constructs `+Inf` and `-Inf` through RCP of uploaded signed
+zeros, subtracts each from finite zero, and checks the expected alternating
+true/false color `40bf40bf`.  It retains the existing D16, exterior, and guard
+checks and builds with strict host warnings.  It has not been run on a GPU.
+
 ### Runnable subnormal gate
 
 `tools/re/chrome9_cmp_guard_smoke.c` now implements the two finite
@@ -285,3 +297,35 @@ Chrome9 backend already rejects nonzero `float_controls_execution_mode`.
 Finite-versus-infinity sign and the shader's exact input domain still need
 separate qualification before promoting shadow. Static proprietary SLT bytes
 do not override the live subnormal counterexample.
+
+### Proprietary mode/control conclusion
+
+Both proprietary comparison implementations have the same denormal exposure
+as the semantic candidate.  Linux public SGE at `0x0016ad60` and internal SLT
+at `0x001644e0` first emit `src0 + -src1`; their Windows counterparts are
+`VTGUModeDX32A.dll:0x10219700` and `0x10216550`.  The second records differ in
+literal-arm placement, but neither path compares the original operands
+directly.
+
+No recovered compiler entry point accepts a floating-point mode argument.
+Constant values do not change ALU records or A90--A9b, and static control RE
+assigns A90--A9b to resource counts and ALU/TAU scheduling rather than a
+denormal selector.  The live common state therefore characterizes a fixed
+default mode; there is no source-backed state bit to switch into
+preserve-denorm execution.  The old pre-Chrome9 `HC_HenCPUDAZ_MASK` name is
+not used by either Chrome9 H5 compiler/runtime packet and is not evidence of
+a programmable Chrome9 PS mode.
+
+### Full finite shadow-program gate
+
+`tools/re/chrome9_shadow_fragment_guard_smoke.c` contains the complete
+source-equivalent projected comparison as eight semantic records: RCP,
+projective MUL, biased-depth ADD, X8Z24 TEX, two SUBs, and two nested CMPs.
+The kernel adds the required TEMP-coordinate bridge, producing the same
+eight-ALU/one-TAU production schedule.  Three guarded rectangles distinguish
+sampled depth below the threshold, sampled depth above it, and the outer
+`W <= 0` arm.  Expected gray values are `.15`, `.30`, and `.30`; the test also
+requires D16 near `8000`, untouched exterior pixels, intact color/depth/source
+guards, and a byte-identical X8Z24 source.  It builds under strict warnings
+but has not been submitted to a GPU.  Run it only after the infinity-sign
+gate and a known-good baseline.
