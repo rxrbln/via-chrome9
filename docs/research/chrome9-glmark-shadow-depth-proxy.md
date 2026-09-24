@@ -414,3 +414,28 @@ requires D16 near `8000`, untouched exterior pixels, intact color/depth/source
 guards, and a byte-identical X8Z24 source.  It builds under strict warnings
 but has not been submitted to a GPU. Run it once between known-good baselines;
 the failed generic infinity-sign characterization is not a prerequisite.
+
+### Independent packet and guard review
+
+The oracle was re-reviewed against the current Chrome9 UAPI and ordered-field
+front-end builder before any silicon submission.  It is a bounded **GO** for
+one fresh-boot run, with an immediate stop on timeout or engine quarantine:
+
+* varying T0 is float4 because the projection consumes W; the computed TEX
+  coordinate is a distinct XY01 TEMP source, so the kernel inserts the same
+  TEMP-to-coordinate bridge and ordered T0/T1 field image as the proprietary
+  `(2,4,1,1)` object;
+* both CMP records use one uploaded constant register.  They do not exercise
+  the independently rejected three-distinct-constant-register case;
+* the three rectangles separately require inner true, inner false, and outer
+  `W <= 0` behavior, so a constant arm or missing short-circuit select cannot
+  satisfy the checker;
+* BGRA, D16, two exterior points, all color/depth/source guard pages, and the
+  complete X8Z24 source BO are checked after retirement.
+
+A strict host build with `-std=c11 -Wall -Wextra -Werror` completed; the
+review binary SHA-256 is
+`b906316cbf9bac02324bd29a6515be4d2d9dfc3e55ff581195c31e08d30c6c1a`.
+This review qualifies only the finite/default-mode scene domain described
+above.  It deliberately does not reinterpret the negative subnormal or
+infinity-sign results as passing general comparison coverage.
