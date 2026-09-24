@@ -277,6 +277,11 @@ reverse case was **not** run after this negative forward result.
 All four lanes selecting the `.25` false arm is consistent with loss of the
 subnormal difference before CMP, but this probe alone does not distinguish
 input denormal flushing, arithmetic result flushing, or another shader
-numeric behavior.  Therefore the proposed generic strict-`<` lowering is
-**not qualified** for subnormal operands and must remain disabled.  Static
-proprietary SLT bytes do not override the live numeric counterexample.
+numeric behavior. The proposed generic strict-`<` lowering is therefore
+**not qualified for denormal-preserving execution modes**. This does not by
+itself reject the default-mode glmark2 shadow shader: its NIR requests
+`preserve:inf` locally but no denormal-preserving execution mode, and the
+Chrome9 backend already rejects nonzero `float_controls_execution_mode`.
+Finite-versus-infinity sign and the shader's exact input domain still need
+separate qualification before promoting shadow. Static proprietary SLT bytes
+do not override the live subnormal counterexample.
