@@ -37,11 +37,18 @@ fragment shader or a wedged GPU. A known-good guarded fragment draw passed
 after the timeout, Xorg PID 512 remained alive, and the bounded kernel log
 check found no new Chrome9 fault.
 
+The unmodified same-size, same-option glmark2 run with
+`LIBGL_ALWAYS_SOFTWARE=1` completed on llvmpipe in about 0.4 seconds
+(one-frame 31 FPS report). This rules out the application's loop being
+intrinsically unbounded and further narrows the defect to Chrome9's
+draw-module/NIR-to-TGSI path or its constant-buffer integration.
+
 Target evidence is retained at
 `/root/tmp/chrome9-live/literal-pack/loop-literal-validate.log`,
 `loop-literal.strace`, `loop-literal-stack.txt`,
 `loop-no-vs-loop.log`, `loop-literal-vs-loop.log`, and
-`loop-zero-vs-uniform.log`. Do not count this glmark2 variant as passing.
+`loop-zero-vs-uniform.log`, plus `loop-llvmpipe-control.log`. Do not count
+this glmark2 variant as passing.
 Next, identify whether the bound changes representation or address between
 the GL uniform upload, Gallium vertex constant buffer, NIR-to-TGSI lowering,
 and `tgsi_exec_machine_run`; then add a focused regression test before any
