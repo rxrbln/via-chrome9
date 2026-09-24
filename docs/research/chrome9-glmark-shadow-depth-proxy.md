@@ -459,3 +459,94 @@ intermediate values.  The most compact discriminator retains the same
 projective prefix and FE route, then writes projected Z, sampled X, and their
 biased threshold into separate color lanes.  For the low-depth rectangle the
 expected tuple is approximately `(.4,.2,.5505,1)`.
+
+### Partial-output discriminator timeout and revised isolation
+
+The first attempt to expose that tuple was not a valid isolation of the
+projective prefix. It retained RCP, projective MUL, threshold ADD and the
+computed-coordinate TEX, then replaced the comparison tail with three direct
+COLOR stores:
+
+```text
+MOV oC0.xz, threshold.xx
+MOV oC0.y,  sample.x
+MOV oC0.w,  c0.w
+```
+
+On 2026-09-24 that reviewed `--inspect-prefix` binary timed out at the cmd22
+cookie and quarantined the engine. The target operating system remained
+reachable, but no post-draw baseline or further GPU submission was attempted.
+The persistent target log is
+`/root/tmp/chrome9-live/ideas-kill-20260924/shadow-prefix-timeout-dmesg.txt`;
+the copied local artifact is `/tmp/chrome9-shadow-prefix-timeout-dmesg.txt`.
+The fault was:
+
+```text
+phase=cookie seq=1561 kind=22 flags=0x101 epoch=101
+current=0x8900 pause=0x88f0 stop=0x8970
+cr=80000000 engine=00001711
+```
+
+Reconstruction against the current kernel encoder gives seven ALUs and one
+TAU, with the established phase controls:
+
+```text
+01c00530 b01c0053 0010c0b6 00060020
+0140b6d0 30000000 0072c005 00000060
+00800000 20140924 00100149 00000020
+01c00530 c01c0053 00f20106 000d0460  # TEMP-coordinate bridge
+01c00530 501c0053 00520014 000d0820  # oC0.xz
+01c00530 d01c0053 002202a2 000d0820  # oC0.y
+01c00530 b01c0053 008080b6 000d0820  # oC0.w
+TAU 301211b0
+A90..A95 90058001 91000002 92010007 93000001 94000000 95000008
+```
+
+The timeout does **not** prove that RCP, projection or the computed TEX prefix
+wedged. Three disjoint partial oC0 stores were introduced at the same time.
+That is an independently unsafe variable: the corrected T2 split-output
+probe timed out with four disjoint partial COLOR stores, and the old vector
+sqrt probe timed out with X and YZW COLOR stores, while their safer scalar
+successors end in one full oC0 write. The proprietary RGB/W objects in
+`shader-upload-oracles.md` and `ioquake-texture-environment-combine.md` prove
+compiler bytes, not silicon execution; the former explicitly labels its
+two-store RGBX sequence an unsubmitted candidate. Therefore do not use the
+failed run as evidence about projected-Z transport and do not retry it.
+
+This evidence is sufficient for a fail-closed runtime boundary even though it
+does not prove an architectural ban: accept exactly one full-mask oC0 store,
+as the final semantic instruction, until a dedicated partial-output oracle
+passes. Current Mesa already requires one full `store_output` and appends one
+terminal full-mask COLOR instruction, so this boundary removes only raw,
+unqualified diagnostic forms. KILL may still precede the terminal store.
+
+The next prefix discriminator must avoid partial COLOR entirely. One bounded
+shape is:
+
+```text
+t4 = (projected_z, sample, 0, 0)
+t5 = (0, 0, threshold, 1)
+oC0 = t4 + t5
+```
+
+Use full XYZW destinations for both packing temporaries and the single final
+COLOR store. Current allocation gives physical high-water four and this
+source-exact candidate:
+
+```text
+01c00530 b01c0053 0010c0b6 00060020
+0140b6d0 30000000 0072c005 00000060
+00800000 20140924 00100149 00000020
+01c00530 c01c0053 00f00106 000d0460  # bridge, t1 remains live
+0202a2d0 d0140924 00f00156 000000e0  # t4
+0080b6b0 50140924 00f200b4 00000060  # t5
+02010530 30140924 00f20305 00000820  # one full terminal oC0
+TAU 301211b0
+A90..A95 90058001 91000002 92010007 93000001 94000000 95000008
+```
+
+For the first rectangle its expected logical RGBA is approximately
+`(.4,.2,.5505,1)`, host BGRA word `ff66338c` within one UNORM byte. These
+bytes still require a focused compiler self-test and an independent packet
+review before any fresh-boot submission; they are a safe offline next gate,
+not authorization to run it now.
