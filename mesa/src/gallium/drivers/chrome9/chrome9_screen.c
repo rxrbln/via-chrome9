@@ -309,6 +309,10 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
 
    draw_init_shader_caps(vs);
    vs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
+   /* GLSL 1.20 uses float-encoded integer uniforms unless both shader
+    * stages expose native integers.  Keep the draw module's vertex lowering
+    * in that same representation while the fragment backend lacks them. */
+   vs->integers = false;
    /* The draw module executes vertex ALU and constant-buffer accesses, but
     * Chrome9 does not wire its sampler, image, or shader-buffer interfaces.
     * In particular, cso_unbind_context() calls those interfaces whenever the

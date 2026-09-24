@@ -7436,7 +7436,9 @@ main(int argc, char **argv)
       const struct pipe_shader_caps *vs =
          &screen->shader_caps[MESA_SHADER_VERTEX];
 
-      if (vs->max_tex_instructions || vs->max_tex_indirections ||
+      if (vs->integers ||
+          screen->shader_caps[MESA_SHADER_FRAGMENT].integers ||
+          vs->max_tex_instructions || vs->max_tex_indirections ||
           vs->max_texture_samplers || vs->max_sampler_views ||
           vs->max_shader_buffers || vs->max_shader_images ||
           vs->max_hw_atomic_counters ||
