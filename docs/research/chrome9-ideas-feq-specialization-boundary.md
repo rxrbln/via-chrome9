@@ -101,7 +101,7 @@ lamp record count, physical high-water, A90--A92 controls, the shared condition
 being emitted once, and rejection when any triangle vertex violates the
 recorded input-domain requirement.
 
-### Exact bounded replay and first resource gate
+### Exact bounded replay and resource fit
 
 That replay is now complete against the 141-line current capture.  The copied
 capture has SHA-256
@@ -151,11 +151,10 @@ inside the constant-port rule.  Thus neither the 96-ALU limit, the 32-constant
 limit, varying linkage, nor texture capacity is the first failure.
 
 The allocate-before-releasing-last-use replay reaches ten simultaneously live
-whole-register temporaries and physical high-water ten (p0--p9), still inside
-the recovered twelve-register physical file.  The current kernel nevertheless
-fails sooner.  At zero-based bounded record 29, the second light's
-`RSQ t38, t39.x` allocates the ninth live temporary to p8.  At allocation time
-the live set is:
+whole-register temporaries and physical high-water ten (p0--p9), inside the
+recovered twelve-register physical file.  At zero-based bounded record 29,
+the second light's `RSQ t38, t39.x` allocates the ninth live temporary to p8.
+At allocation time the live set is:
 
 ```text
 t10:p1  shared equality condition       t12:p0  shared -position
@@ -165,20 +164,26 @@ t37:p7  second-light selected vector     t39:p5  its DP3 length
 t38:p8  new second-light RSQ result
 ```
 
-`chrome9_fragment_resource_note_destination()` indexes an eight-entry
-resource array and returns `-E2BIG` for destination id p8.  This is the first
-deterministic capacity blocker; the encoder never reaches the later ten-live
-peak or finalizes controls.  A different physical choice cannot help this
-record under the current whole-register allocator because nine values are live
-under its allocate-before-release rule.
+This p8 allocation is not a resource-analyzer failure.  The current kernel's
+eight-entry `external[]` and `defined[]` arrays model the proprietary
+texture/address B/C maps: `chrome9_fragment_resource_note_source()` indexes
+them only for native source file 3, and
+`chrome9_fragment_resource_note_destination()` only for native destination
+file 1.  An arithmetic TEMP source or destination, including p8 and p9, is
+native file 0 and is deliberately ignored by those arrays.  The arithmetic
+TEMP high-water is tracked independently as `physical_high_water`, whose
+kernel limit is twelve.  This program's only B/C resource ids are compact
+direct T0--T2, so all remain below three.
 
-If a generic resource representation and schedule first admit p8/p9, the
-projected no-bucket controls are `A90=90040007`, `A91=91000000`, and
-`A92=92000050`.  They are a projection, not current kernel output: the present
-encoder returns before writing the final controls.  The next implementation
-gate is therefore generic scheduling/recomputation or a proven extension of
-the resource analyzer, followed by this complete 80-record replay.  Raising an
-advertised ALU cap or adding a lamp/shader identity would not fix the failure.
+The bounded program therefore fits the current resource model and reaches
+the no-bucket controls `A90=90040007`, `A91=91000000`, and
+`A92=92000050` after the FEQ lowering is admitted.  Generic scheduling or
+component packing may still improve its ten-register pressure, but neither
+is required for this exact program to fit the recovered twelve-register
+ordinary TEMP file.  The first remaining gate is the guarded, generic shared
+FEQ/select lowering and its input-domain proof described above, followed by
+the complete 80-record replay; there is no independent p8 resource-array
+gate.
 
 ## Exact captured NIR contract
 
