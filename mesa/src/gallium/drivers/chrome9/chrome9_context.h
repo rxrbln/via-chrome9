@@ -176,6 +176,8 @@ struct chrome9_context {
    /* A depth-only public framebuffer still needs a guarded native A50
     * destination.  This private target is never a Gallium color buffer. */
    struct pipe_resource *depth_only_scratch;
+   /* Guarded render shadows of unguarded drawables, keyed by drawable. */
+   struct hash_table *shadows;
    bool render_target_dirty;
    bool render_target_stale;
    bool draw_triangle_d16;

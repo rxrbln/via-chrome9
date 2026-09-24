@@ -6072,6 +6072,45 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
    }
 }
 
+/*
+ * One guarded shadow per unguarded drawable, reused across binds.  Entries
+ * whose drawable only this cache still references are dropped first.
+ */
+static struct pipe_resource *
+chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
+{
+   struct pipe_screen *screen = ctx->base.screen;
+   struct pipe_resource templ = *color;
+   struct pipe_resource *shadow;
+   struct hash_entry *entry;
+
+   if (!ctx->shadows &&
+       !(ctx->shadows = _mesa_pointer_hash_table_create(NULL)))
+      return NULL;
+   hash_table_foreach(ctx->shadows, stale) {
+      struct pipe_resource *key = (struct pipe_resource *)stale->key;
+      struct pipe_resource *old = stale->data;
+
+      if (p_atomic_read(&key->reference.count) > 1)
+         continue;
+      _mesa_hash_table_remove(ctx->shadows, stale);
+      pipe_resource_reference(&old, NULL);
+      pipe_resource_reference(&key, NULL);
+   }
+   entry = _mesa_hash_table_search(ctx->shadows, color);
+   if (entry)
+      return entry->data;
+   templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
+   templ.flags = 0;
+   templ.next = NULL;
+   shadow = screen->resource_create(screen, &templ);
+   if (!shadow)
+      return NULL;
+   pipe_reference(NULL, &color->reference);
+   _mesa_hash_table_insert(ctx->shadows, color, shadow);
+   return shadow;
+}
+
 static void
 chrome9_set_framebuffer_state(struct pipe_context *pipe,
                               const struct pipe_framebuffer_state *framebuffer)
@@ -6095,15 +6134,13 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
       if (resource->guarded) {
          pipe_resource_reference(&ctx->render_target, color);
       } else {
-         struct pipe_resource templ = *color;
-
-         templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
-         templ.flags = 0;
          shadow_attempted = true;
-         ctx->render_target = pipe->screen->resource_create(pipe->screen,
-                                                             &templ);
+         pipe_resource_reference(&ctx->render_target,
+                                 chrome9_render_shadow(ctx, color));
+         /* The drawable's contents are copied in only when a draw or a
+          * partial clear needs them. */
          if (ctx->render_target)
-            chrome9_copy_surface(ctx->render_target, color);
+            ctx->render_target_stale = true;
       }
    }
    if (!framebuffer->nr_cbufs && framebuffer->zsbuf.texture &&
@@ -6338,6 +6375,10 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    }
    if ((buffers & PIPE_CLEAR_COLOR0) && ctx->framebuffer.nr_cbufs &&
        (resource = ctx->render_target)) {
+      /* A clear of every pixel needs no copy of the drawable's contents. */
+      if ((color_mask & 0xf) == 0xf && !x && !y &&
+          width >= resource->width0 && height >= resource->height0)
+         ctx->render_target_stale = false;
       chrome9_context_prepare_render_target(ctx);
       if ((color_mask & 0xf) == 0xf)
          chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
@@ -6346,10 +6387,6 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
          chrome9_clear_target_masked(chrome9_resource(resource), color,
                                      color_mask, x, y, width, height);
       chrome9_context_render_target_written(ctx);
-      /* Imported drawable targets render through a guarded shadow.  Clears
-       * are synchronous CPU writes, so publish the completed image now even
-       * when the state tracker keeps this framebuffer bound. */
-      chrome9_flush_render_target(ctx);
    }
    if (buffers & PIPE_CLEAR_DEPTHSTENCIL)
       chrome9_clear_zs_target(chrome9_context_depth_target(ctx), buffers,
@@ -6665,6 +6702,16 @@ chrome9_context_destroy(struct pipe_context *pipe)
    util_unreference_framebuffer_state(&ctx->framebuffer);
    pipe_resource_reference(&ctx->render_target, NULL);
    pipe_resource_reference(&ctx->depth_only_scratch, NULL);
+   if (ctx->shadows) {
+      hash_table_foreach(ctx->shadows, entry) {
+         struct pipe_resource *key = (struct pipe_resource *)entry->key;
+         struct pipe_resource *shadow = entry->data;
+
+         pipe_resource_reference(&shadow, NULL);
+         pipe_resource_reference(&key, NULL);
+      }
+      _mesa_hash_table_destroy(ctx->shadows, NULL);
+   }
    util_set_vertex_buffers_count(ctx->vertex_buffers,
                                  &ctx->num_vertex_buffers, NULL, 0);
    for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; i++) {
