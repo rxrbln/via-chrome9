@@ -253,6 +253,12 @@ enum drm_chrome9_param {
 /* Second capability word, DRM_CHROME9_PARAM_CAPABILITIES2. */
 /* GEM_CREATE_GUARDED_SHARED and GEM_INFO. */
 #define DRM_CHROME9_CAP2_GUARDED_SHARED		(1ULL << 0)
+/* Fragment texture target CUBE: six faces in one object, face_stride. */
+#define DRM_CHROME9_CAP2_CUBE_MAP		(1ULL << 1)
+/* Fragment texture formats DXT1_RGB..DXT5, level zero. */
+#define DRM_CHROME9_CAP2_DXT			(1ULL << 2)
+/* DXT mip chains of POT textures, levels packed at whole block rows. */
+#define DRM_CHROME9_CAP2_DXT_MIP		(1ULL << 3)
 /* DRAW_VERTEX_PROGRAM topology TRIANGLE_STRIP and TRIANGLE_FAN. */
 #define DRM_CHROME9_CAP2_VERTEX_TOPOLOGY		(1ULL << 5)
 
@@ -1135,6 +1141,19 @@ enum drm_chrome9_fragment_file {
 #define DRM_CHROME9_FRAGMENT_TEXTURE_L8		4
 #define DRM_CHROME9_FRAGMENT_TEXTURE_L8A8	5
 #define DRM_CHROME9_FRAGMENT_TEXTURE_RGB565	6
+/*
+ * S3TC 4x4 blocks: width/height stay in texels, level_pitch is the byte
+ * pitch of one block row, ALIGN(DIV_ROUND_UP(width, 4) * block, 32).
+ * DXT1_RGB and DXT1_RGBA sample identically (punch-through alpha).
+ */
+#define DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGB	7
+#define DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGBA	8
+#define DRM_CHROME9_FRAGMENT_TEXTURE_DXT3	9
+#define DRM_CHROME9_FRAGMENT_TEXTURE_DXT5	10
+
+#define DRM_CHROME9_FRAGMENT_TARGET_2D		0
+/* Square POT, faces +X -X +Y -Y +Z -Z, TEX reads three coordinate lanes. */
+#define DRM_CHROME9_FRAGMENT_TARGET_CUBE	1
 
 struct drm_chrome9_fragment_source {
 	__u8 file;
@@ -1198,7 +1217,11 @@ struct drm_chrome9_fragment_texture_state {
 	__u32 reserved0;
 	__u32 level_offset[DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS];
 	__u32 level_pitch[DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS];
-	__u32 reserved[4];
+	/* DRM_CHROME9_FRAGMENT_TARGET_*; levels describe face 0 of a cube. */
+	__u32 target;
+	/* CUBE: byte distance between equal levels of adjacent faces. */
+	__u32 face_stride;
+	__u32 reserved[2];
 };
 
 /* One stencil face; func is a DRM_CHROME9_COMPARE_* value. */
