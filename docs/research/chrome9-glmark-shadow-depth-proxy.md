@@ -254,7 +254,24 @@ RCP/SUB/CMP path used by the test.
 five-ALU case.  It constructs `+Inf` and `-Inf` through RCP of uploaded signed
 zeros, subtracts each from finite zero, and checks the expected alternating
 true/false color `40bf40bf`.  It retains the existing D16, exterior, and guard
-checks and builds with strict host warnings.  It has not been run on a GPU.
+checks and builds with strict host warnings. The bounded run result follows.
+
+### Live infinity-sign result, 2026-09-24
+
+The reviewed binary with SHA-256
+`f530ac9ec59ba33d06118d39303d8ddd8447578ff420414d9197ffae415b1e36`
+was run once between passing known-good baselines on the VX900 target. The
+draw retired and all sampled lanes selected the `.75` true arm: actual host
+BGRA was `bfbfbfbf`, not the alternating `40bf40bf`; D16 was `8000`, the
+checked guards passed, and the bounded kernel log contained no new fault.
+
+This is a negative result for the complete
+`RCP(signed zero) -> 0-result -> CMP` exceptional-value path. It does not yet
+locate the loss: `RCP(-0)` may lose its sign, reciprocal zero may use a
+finite/saturated convention, or SUB may fail to preserve the required sign.
+Do not promote shadow's `preserve:inf` comparison from this gate. Conversely,
+do not claim that ordinary finite RCP or finite SUB is broken; both are
+outside what this single exceptional-value result distinguishes.
 
 ### Runnable subnormal gate
 
