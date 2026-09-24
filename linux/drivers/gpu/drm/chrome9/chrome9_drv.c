@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright 2026 Chrome9 contributors */
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include <linux/module.h>
@@ -2986,6 +2985,6 @@ static struct pci_driver chrome9_pci_driver = {
 };
 module_pci_driver(chrome9_pci_driver);
 
-MODULE_AUTHOR("Chrome9 contributors");
+MODULE_AUTHOR("René Rebe <rene@exactco.de>");
 MODULE_DESCRIPTION(CHROME9_DRIVER_DESC);
 MODULE_LICENSE("GPL");

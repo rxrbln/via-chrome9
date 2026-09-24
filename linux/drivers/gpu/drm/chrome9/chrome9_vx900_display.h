@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef __CHROME9_VX900_DISPLAY_H__
 #define __CHROME9_VX900_DISPLAY_H__
 
