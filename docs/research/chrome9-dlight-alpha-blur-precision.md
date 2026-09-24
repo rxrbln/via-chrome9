@@ -476,3 +476,27 @@ the other items are open or at risk.
   `/home/ai/tmp/gm2src/usr/bin/glmark2 --data-path
   /home/ai/tmp/gm2src/usr/share/glmark2 --validate -b
   desktop:windows=4:effect=blur:blur-radius=5:passes=1:separable=true`.
+
+## Result of the stage-dump run (2026-09-24, VX900, cmd22 path)
+
+```text
+VPASS 5 x=512 y=206 255 255 255     y=207 254 255 253
+            y=208 235 244 214       y=209 181 215 105
+            y=210 162 205  67       y=211..214 161 205 65
+READPIXEL 512,209 = 136 162 79      (llvmpipe 136 163 80)
+```
+
+* Flat rows (y >= 211) are exact: 161/205/65, so neither the H nor the V
+  output conversion truncates.
+* The final pixel equals `round(V * 192/255)` of the hardware column
+  (181/215/105 -> 136/162/79), so the blender rounds correctly.
+* The difference is confined to the steep edge rows: y=207 G 255 (exact
+  254) and y=209 G/B 215/105 (exact 216/106).  This matches a coarser
+  bilinear sub-texel weight in the hardware sampler rather than a
+  coordinate shift (y=208 is exact).
+
+Conclusion: the 1-LSB validation miss is the VX900 texture filter's weight
+precision on a 1-texel hard edge, not a driver conversion error.  It is a
+hardware precision limit for the conformance phase; the E3 micro-oracle
+(section 2.5) would quantify the weight resolution if a coordinate
+pre-bias is ever to be attempted.
