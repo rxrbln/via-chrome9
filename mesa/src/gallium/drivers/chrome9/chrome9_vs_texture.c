@@ -176,17 +176,21 @@ chrome9_vs_get_dims(struct tgsi_sampler *sampler,
                     unsigned sview_index, int level, int dims[4])
 {
    struct chrome9_context *ctx = ((struct chrome9_vs_sampler *)sampler)->ctx;
+   const struct pipe_sampler_view *view = sview_index < CHROME9_VS_MAX_SAMPLERS ?
+      ctx->vs_sampler_views[sview_index] : NULL;
    const struct chrome9_vs_texture_mapping *mapping =
-      sview_index < CHROME9_VS_MAX_SAMPLERS ?
+      view ?
       &ctx->vs_texture_mappings[sview_index] : NULL;
+   int64_t absolute = mapping ? (int64_t)mapping->first_level + level : -1;
 
    memset(dims, 0, 4 * sizeof(*dims));
    if (!mapping || !mapping->base || level < 0 ||
-       (unsigned)level > mapping->last_level)
+       absolute > mapping->last_level)
       return;
-   dims[0] = u_minify(mapping->width, level);
-   dims[1] = u_minify(mapping->height, level);
+   dims[0] = u_minify(mapping->width, absolute);
+   dims[1] = u_minify(mapping->height, absolute);
    dims[2] = 1;
+   dims[3] = mapping->last_level - mapping->first_level + 1;
 }
 
 static void
@@ -208,18 +212,23 @@ chrome9_vs_get_texel(struct tgsi_sampler *sampler,
    for (unsigned lane = 0; lane < TGSI_QUAD_SIZE; lane++) {
       float result[4] = {0};
 
+      int64_t level_index = mapping ?
+         (int64_t)mapping->first_level + lod[lane] : -1;
+
       if (view && mapping->base &&
           view->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
-          lod[lane] >= (int)mapping->first_level &&
-          lod[lane] <= (int)mapping->last_level && !k[lane] && !offset[2]) {
-         unsigned level = lod[lane];
+          lod[lane] >= 0 && level_index <= mapping->last_level &&
+          !k[lane] && !offset[2]) {
+         unsigned level = level_index;
          unsigned width = u_minify(mapping->width, level);
          unsigned height = u_minify(mapping->height, level);
-         int x = i[lane] + offset[0], y = j[lane] + offset[1];
+         int64_t x = (int64_t)i[lane] + offset[0];
+         int64_t y = (int64_t)j[lane] + offset[1];
 
-         if (x >= 0 && (unsigned)x < width &&
-             y >= 0 && (unsigned)y < height)
-            chrome9_vs_fetch_bgra(mapping, level, x, y, result);
+         if (x >= 0 && (uint64_t)x < width &&
+             y >= 0 && (uint64_t)y < height)
+            chrome9_vs_fetch_bgra(mapping, level, (unsigned)x,
+                                  (unsigned)y, result);
       }
       for (unsigned c = 0; c < 4; c++)
          rgba[c][lane] = result[c];

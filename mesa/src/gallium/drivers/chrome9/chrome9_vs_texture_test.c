@@ -6,6 +6,7 @@
 #include "chrome9_context.h"
 #include "chrome9_resource.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +20,15 @@ test_linear_mips(void)
    struct chrome9_resource resource = {0};
    struct pipe_sampler_view view = {0};
    struct chrome9_vs_texture_mapping mapping;
+   struct chrome9_context ctx = {0};
+   struct tgsi_sampler *sampler;
+   const int x[4] = {0, INT_MAX, INT_MIN, 0};
+   const int y[4] = {0, 0, 0, INT_MAX};
+   const int zero[4] = {0};
+   const int8_t offset[3] = {1, 0, 0};
+   float rgba[4][4];
+   int dims[4];
+   bool sample_ok;
 
    resource.base.target = PIPE_TEXTURE_2D;
    resource.base.format = PIPE_FORMAT_B8G8R8A8_UNORM;
@@ -49,6 +59,28 @@ test_linear_mips(void)
        mapping.last_level != 2 || mapping.row_stride[1] != 32 ||
        mapping.img_stride[1] != 64 || mapping.mip_offset[1] != 0 ||
        mapping.mip_offset[2] != 256)
+      return false;
+
+   /* TXQ/TXF LOD is relative to the view.  A positive offset applied to
+    * INT_MAX must be range-checked without overflowing signed int. */
+   memcpy(bytes + 516, (const uint8_t[]){0, 0, 255, 255}, 4);
+   ctx.vs_sampler_views[0] = &view;
+   ctx.vs_texture_mappings[0] = mapping;
+   sampler = chrome9_vs_texture_sampler_create(&ctx);
+   if (!sampler)
+      return false;
+   sampler->get_dims(sampler, 0, 0, dims);
+   sample_ok = dims[0] == 4 && dims[1] == 2 &&
+      dims[2] == 1 && dims[3] == 2;
+   sampler->get_texel(sampler, 0, x, y, zero, zero, offset, rgba);
+   sample_ok &= fabsf(rgba[0][0] - 1.0f) < 0.0001f &&
+      fabsf(rgba[1][0]) < 0.0001f && fabsf(rgba[2][0]) < 0.0001f &&
+      fabsf(rgba[3][0] - 1.0f) < 0.0001f;
+   for (unsigned lane = 1; lane < 4; lane++)
+      for (unsigned c = 0; c < 4; c++)
+         sample_ok &= rgba[c][lane] == 0.0f;
+   chrome9_vs_texture_sampler_destroy(sampler);
+   if (!sample_ok)
       return false;
 
    resource.level_size[2] = 16;

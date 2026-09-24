@@ -228,17 +228,24 @@ chrome9_bind_sampler_states(struct pipe_context *pipe,
    unsigned end;
 
    if (shader == MESA_SHADER_VERTEX) {
+      struct pipe_sampler_state *new_states[CHROME9_VS_MAX_SAMPLERS];
+      unsigned num_states = 0;
+
       if (start >= CHROME9_VS_MAX_SAMPLERS)
          return;
+      memcpy(new_states, ctx->vs_sampler_states, sizeof(new_states));
       end = MIN2(start + count, CHROME9_VS_MAX_SAMPLERS);
       for (unsigned i = start; i < end; i++)
-         ctx->vs_sampler_states[i] = states ? states[i - start] : NULL;
-      ctx->num_vs_sampler_states = 0;
+         new_states[i] = states ? states[i - start] : NULL;
       for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
-         if (ctx->vs_sampler_states[i])
-            ctx->num_vs_sampler_states = i + 1;
+         if (new_states[i])
+            num_states = i + 1;
+      /* draw_set_samplers flushes pending work before copying state.  The
+       * interpreter callback must see the old state during that flush. */
       draw_set_samplers(ctx->draw, MESA_SHADER_VERTEX,
-                        ctx->vs_sampler_states, ctx->num_vs_sampler_states);
+                        new_states, num_states);
+      memcpy(ctx->vs_sampler_states, new_states, sizeof(new_states));
+      ctx->num_vs_sampler_states = num_states;
       return;
    }
    if (shader != MESA_SHADER_FRAGMENT || start >= PIPE_MAX_SAMPLERS)
@@ -263,17 +270,24 @@ chrome9_delete_sampler_state(struct pipe_context *pipe, void *state)
          ctx->sampler_states[i] = NULL;
    for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++) {
       if (ctx->vs_sampler_states[i] == state) {
-         ctx->vs_sampler_states[i] = NULL;
          vs_changed = true;
       }
    }
    if (vs_changed) {
-      ctx->num_vs_sampler_states = 0;
+      struct pipe_sampler_state *new_states[CHROME9_VS_MAX_SAMPLERS];
+      unsigned num_states = 0;
+
+      memcpy(new_states, ctx->vs_sampler_states, sizeof(new_states));
       for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
-         if (ctx->vs_sampler_states[i])
-            ctx->num_vs_sampler_states = i + 1;
+         if (new_states[i] == state)
+            new_states[i] = NULL;
+      for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
+         if (new_states[i])
+            num_states = i + 1;
       draw_set_samplers(ctx->draw, MESA_SHADER_VERTEX,
-                        ctx->vs_sampler_states, ctx->num_vs_sampler_states);
+                        new_states, num_states);
+      memcpy(ctx->vs_sampler_states, new_states, sizeof(new_states));
+      ctx->num_vs_sampler_states = num_states;
    }
    ctx->num_sampler_states = 0;
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
