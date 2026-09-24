@@ -6577,9 +6577,11 @@ chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    chrome9_report_rejects(ctx);
    if (ctx->tcl_enabled && !(++ctx->tcl_flushes % 16) &&
        debug_get_bool_option("CHROME9_DEBUG_TCL", false))
-      fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " fallback draws=%"
-                      PRIu64 " all triangles=%" PRIu64 "\n",
-              ctx->tcl_triangles, ctx->tcl_fallback_draws,
+      fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " (buffers %" PRIu64
+                      ", rejects %" PRIu64 ") fallback draws=%" PRIu64
+                      " all triangles=%" PRIu64 "\n",
+              ctx->tcl_triangles, ctx->tcl_buffer_triangles,
+              ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
    (void)flags;
    /* DRAW_TRIANGLE completes synchronously. */
@@ -6638,9 +6640,11 @@ chrome9_context_destroy(struct pipe_context *pipe)
    chrome9_flush_render_target(ctx);
    chrome9_report_rejects(ctx);
    if (ctx->tcl_enabled && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
-      fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " fallback draws=%"
-                      PRIu64 " all triangles=%" PRIu64 "\n",
-              ctx->tcl_triangles, ctx->tcl_fallback_draws,
+      fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " (buffers %" PRIu64
+                      ", rejects %" PRIu64 ") fallback draws=%" PRIu64
+                      " all triangles=%" PRIu64 "\n",
+              ctx->tcl_triangles, ctx->tcl_buffer_triangles,
+              ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
    chrome9_sw_context_destroy(ctx);
    if (ctx->reject_sites)
@@ -6712,6 +6716,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES);
    ctx->tcl_enabled = (capabilities & DRM_CHROME9_CAP_VERTEX_PROGRAM) &&
       debug_get_bool_option("CHROME9_TCL", false);
+   ctx->tcl_buffers = ctx->tcl_enabled &&
+      (capabilities & DRM_CHROME9_CAP_VERTEX_BUFFERS) &&
+      debug_get_bool_option("CHROME9_TCL_BUFFERS", false);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =

@@ -49,6 +49,8 @@ struct chrome9_tcl_state {
    struct chrome9_tcl_fragment fragment;
    uint32_t constants[DRM_CHROME9_VERTEX_MAX_CONSTANTS][4];
    uint32_t vertices[TCL_MAX_VERTEX_BYTES / sizeof(uint32_t)];
+   /* One stage B chunk; the kernel bounds index_count per draw. */
+   uint32_t indices[DRM_CHROME9_VERTEX_MAX_INDICES];
 };
 
 struct tcl_builder {
@@ -1313,6 +1315,109 @@ tcl_fetch_vertex(const struct tcl_stream *streams, unsigned inputs,
    return out - start;
 }
 
+/*
+ * Stage B: every element is fetched by the hardware from its GEM buffer.
+ * Elements of one BO and stride share a kernel buffer entry; the binding
+ * offset folds into the element offset.
+ */
+static bool
+tcl_bind_buffers(const struct chrome9_context *ctx, unsigned inputs,
+                 const struct tcl_stream *streams,
+                 struct drm_chrome9_vertex_element *elements,
+                 struct drm_chrome9_vertex_buffer *buffers,
+                 unsigned *buffer_count)
+{
+   unsigned n = 0;
+
+   for (unsigned k = 0; k < inputs; k++) {
+      const struct pipe_vertex_element *el = &ctx->vertex_elements->elements[k];
+      const struct pipe_vertex_buffer *vb =
+         &ctx->vertex_buffers[el->vertex_buffer_index];
+      const unsigned stride = el->src_stride;
+      const uint64_t offset = (uint64_t)vb->buffer_offset + el->src_offset;
+      uint32_t handle;
+      unsigned b;
+
+      if (vb->is_user_buffer || !vb->buffer.resource || !streams[k].dwords ||
+          stride < 4 || stride > 2044 || stride % 4 || offset % 4 ||
+          offset > UINT32_MAX)
+         return false;
+      handle = chrome9_resource(vb->buffer.resource)->bo.handle;
+      for (b = 0; b < n; b++)
+         if (buffers[b].handle == handle && buffers[b].stride == stride)
+            break;
+      if (b == n) {
+         buffers[n].handle = handle;
+         buffers[n].stride = stride;
+         buffers[n].offset = 0;
+         n++;
+      }
+      elements[k].format = streams[k].drm_format;
+      elements[k].buffer = b;
+      elements[k].reserved = 0;
+      elements[k].offset = offset;
+   }
+   *buffer_count = n;
+   return true;
+}
+
+/*
+ * Stage B draw: triangle list indices (provoking vertex last) in chunks.
+ * Returns false only when nothing was submitted, so stage A can retry.
+ */
+static bool
+tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
+                 const struct pipe_draw_start_count_bias *range,
+                 const uint8_t *indices, unsigned triangles,
+                 struct chrome9_tcl_state *state,
+                 struct drm_chrome9_draw_vertex_program *draw)
+{
+   const unsigned per_chunk = DRM_CHROME9_VERTEX_MAX_INDICES / 3;
+   unsigned done = 0;
+
+   draw->index_size = 4;
+   draw->indices_ptr = (uintptr_t)state->indices;
+   draw->base_vertex = info->index_size ? range->index_bias : 0;
+   while (done < triangles) {
+      const unsigned count = MIN2(per_chunk, triangles - done);
+      unsigned n = 0;
+
+      for (unsigned t = done; t < done + count; t++) {
+         unsigned v[3] = { 0 };
+
+         tcl_triangle(info->mode, t, ctx->rasterizer->flatshade_first, v);
+         for (unsigned i = 0; i < 3; i++) {
+            const unsigned position = range->start + v[i];
+
+            if (info->index_size == 1)
+               state->indices[n++] = indices[position];
+            else if (info->index_size == 2)
+               state->indices[n++] = ((const uint16_t *)indices)[position];
+            else if (info->index_size == 4)
+               state->indices[n++] = ((const uint32_t *)indices)[position];
+            else
+               state->indices[n++] = position;
+         }
+      }
+      draw->index_count = n;
+      if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, count)) {
+         ctx->tcl_buffer_rejects++;
+         if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+            fprintf(stderr, "chrome9: TCL buffers rejected (%s): buffers=%u "
+                            "indices=%u base_vertex=%d textures=%u\n",
+                    strerror(errno), draw->buffer_count, n,
+                    draw->base_vertex, state->fragment.draw.texture_count);
+         if (!done)
+            return false;
+         CHROME9_REJECT(ctx, triangles - done);
+         return true;
+      }
+      done += count;
+   }
+   ctx->tcl_buffer_triangles += triangles;
+   return true;
+}
+
 static bool
 tcl_float_bits(float value, uint32_t *bits)
 {
@@ -1572,10 +1677,11 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    struct drm_chrome9_vertex_element elements[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct tcl_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct drm_chrome9_draw_vertex_program draw = { 0 };
+   struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS];
    const uint8_t *indices = NULL;
    const char *why;
    bool flat;
-   unsigned triangles, stride, per_chunk, done = 0;
+   unsigned triangles, stride, per_chunk, buffer_count, done = 0;
 
    if (!ctx->tcl_enabled)
       return false;
@@ -1630,6 +1736,33 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (!chrome9_draw_tcl_fragment(ctx, &state->fragment, &why))
       return tcl_fallback(ctx, why);
 
+   draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
+   draw.flags = tcl_cull(rs) | (flat ? DRM_CHROME9_VERTEX_FLAT : 0);
+   draw.instruction_count = p->instruction_count;
+   draw.instructions_ptr = (uintptr_t)p->instructions;
+   draw.element_count = p->input_count;
+   draw.elements_ptr = (uintptr_t)elements;
+   draw.constant_count = p->uniform_rows + p->immediate_count;
+   draw.constants_ptr = draw.constant_count ? (uintptr_t)state->constants : 0;
+   if (ctx->tcl_buffers &&
+       tcl_bind_buffers(ctx, p->input_count, streams, elements, buffers,
+                        &buffer_count)) {
+      draw.buffer_count = buffer_count;
+      draw.buffers_ptr = (uintptr_t)buffers;
+      if (tcl_draw_buffers(ctx, info, range, indices, triangles, state,
+                           &draw)) {
+         ctx->tcl_triangles += triangles;
+         return true;
+      }
+      /* Stage A below; clear every stage B field. */
+      draw.buffer_count = 0;
+      draw.buffers_ptr = 0;
+      draw.index_count = 0;
+      draw.index_size = 0;
+      draw.indices_ptr = 0;
+      draw.base_vertex = 0;
+   }
+
    /* Packed vertices: the stride is the sum of element fetch dwords. */
    stride = 0;
    for (unsigned k = 0; k < p->input_count; k++) {
@@ -1640,15 +1773,6 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       stride += 4 * tcl_stream_dwords(&streams[k]);
    }
    per_chunk = MIN2(TCL_MAX_TRIANGLES, TCL_MAX_VERTEX_BYTES / (3 * stride));
-   draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
-   /* The native provoking vertex is the last one, as in GL. */
-   draw.flags = tcl_cull(rs) | (flat ? DRM_CHROME9_VERTEX_FLAT : 0);
-   draw.instruction_count = p->instruction_count;
-   draw.instructions_ptr = (uintptr_t)p->instructions;
-   draw.element_count = p->input_count;
-   draw.elements_ptr = (uintptr_t)elements;
-   draw.constant_count = p->uniform_rows + p->immediate_count;
-   draw.constants_ptr = draw.constant_count ? (uintptr_t)state->constants : 0;
    draw.vertex_stride = stride;
    draw.vertices_ptr = (uintptr_t)state->vertices;
 

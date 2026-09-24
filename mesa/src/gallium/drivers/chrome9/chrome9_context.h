@@ -246,12 +246,16 @@ struct chrome9_context {
    struct pipe_viewport_state viewport;
    /* CHROME9_TCL=1 with DRM_CHROME9_CAP_VERTEX_PROGRAM. */
    bool tcl_enabled;
+   /* Stage B: hardware vertex fetch from GEM buffers. */
+   bool tcl_buffers;
    struct chrome9_tcl_state *tcl_state;
    /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */
    struct chrome9_sw_context *sw;
    struct pipe_blend_color blend_color;
    struct pipe_clip_state clip;
    uint64_t tcl_triangles;
+   uint64_t tcl_buffer_triangles;
+   uint64_t tcl_buffer_rejects;
    uint64_t tcl_fallback_draws;
    uint64_t tcl_flushes;
 
