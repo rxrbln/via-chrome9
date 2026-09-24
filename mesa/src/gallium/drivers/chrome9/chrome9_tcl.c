@@ -48,7 +48,7 @@ struct tcl_value {
 struct chrome9_tcl_state {
    struct chrome9_tcl_fragment fragment;
    uint32_t constants[DRM_CHROME9_VERTEX_MAX_CONSTANTS][4];
-   float vertices[TCL_MAX_VERTEX_BYTES / sizeof(float)];
+   uint32_t vertices[TCL_MAX_VERTEX_BYTES / sizeof(uint32_t)];
 };
 
 struct tcl_builder {
@@ -1179,7 +1179,50 @@ struct tcl_stream {
    unsigned stride;
    enum pipe_format format;
    unsigned bytes;
+   /* Kernel element format; FLOAT4 means CPU unpack. */
+   uint8_t drm_format;
+   uint8_t dwords;
+   /* float32 or float16 dwords to check for Inf/NaN (kernel rule). */
+   uint8_t float32;
+   uint8_t float16;
 };
+
+/* Formats the vertex fetcher reads natively (silicon rungs B9-B11). */
+static bool
+tcl_native_format(enum pipe_format format, struct tcl_stream *stream)
+{
+   static const struct {
+      enum pipe_format format;
+      uint8_t drm, dwords, float32, float16;
+   } table[] = {
+      { PIPE_FORMAT_R32_FLOAT, DRM_CHROME9_VERTEX_FORMAT_FLOAT1, 1, 1, 0 },
+      { PIPE_FORMAT_R32G32_FLOAT, DRM_CHROME9_VERTEX_FORMAT_FLOAT2, 2, 2, 0 },
+      { PIPE_FORMAT_R32G32B32_FLOAT, DRM_CHROME9_VERTEX_FORMAT_FLOAT3, 3, 3, 0 },
+      { PIPE_FORMAT_R32G32B32A32_FLOAT, DRM_CHROME9_VERTEX_FORMAT_FLOAT4, 4, 4, 0 },
+      { PIPE_FORMAT_B8G8R8A8_UNORM, DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM, 1, 0, 0 },
+      { PIPE_FORMAT_R8G8B8A8_UNORM, DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM, 1, 0, 0 },
+      { PIPE_FORMAT_R8G8B8A8_USCALED, DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED, 1, 0, 0 },
+      { PIPE_FORMAT_R16G16_UNORM, DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM, 1, 0, 0 },
+      { PIPE_FORMAT_R16G16B16A16_UNORM, DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM, 2, 0, 0 },
+      { PIPE_FORMAT_R16G16_SNORM, DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM, 1, 0, 0 },
+      { PIPE_FORMAT_R16G16B16A16_SNORM, DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM, 2, 0, 0 },
+      { PIPE_FORMAT_R16G16_SSCALED, DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED, 1, 0, 0 },
+      { PIPE_FORMAT_R16G16B16A16_SSCALED, DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED, 2, 0, 0 },
+      { PIPE_FORMAT_R16G16_FLOAT, DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT, 1, 0, 1 },
+      { PIPE_FORMAT_R16G16B16A16_FLOAT, DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT, 2, 0, 2 },
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(table); i++) {
+      if (table[i].format != format)
+         continue;
+      stream->drm_format = table[i].drm;
+      stream->dwords = table[i].dwords;
+      stream->float32 = table[i].float32;
+      stream->float16 = table[i].float16;
+      return true;
+   }
+   return false;
+}
 
 static bool
 tcl_bind_inputs(struct chrome9_context *ctx, unsigned inputs,
@@ -1215,28 +1258,59 @@ tcl_bind_inputs(struct chrome9_context *ctx, unsigned inputs,
       streams[k].stride = el->src_stride;
       streams[k].format = el->src_format;
       streams[k].bytes = desc->block.bits / 8;
+      if (!tcl_native_format(el->src_format, &streams[k])) {
+         streams[k].drm_format = DRM_CHROME9_VERTEX_FORMAT_FLOAT4;
+         streams[k].dwords = 0;
+      }
    }
    return true;
 }
 
-static bool
-tcl_fetch_vertex(const struct tcl_stream *streams, unsigned inputs,
-                 unsigned index, float *out)
+static unsigned
+tcl_stream_dwords(const struct tcl_stream *stream)
 {
-   for (unsigned k = 0; k < inputs; k++) {
-      const size_t offset = (size_t)index * streams[k].stride;
+   return stream->dwords ? stream->dwords : 4;
+}
 
-      if (streams[k].size != SIZE_MAX &&
-          (offset > streams[k].size ||
-           streams[k].size - offset < streams[k].bytes))
-         return false;
-      util_format_unpack_rgba(streams[k].format, out + 4 * k,
-                              streams[k].base + offset, 1);
-      for (unsigned c = 0; c < 4; c++)
-         if (!isfinite(out[4 * k + c]))
-            return false;
+/* Pack one vertex: native elements are copied, others unpacked to FLOAT4.
+ * Returns the dwords written, 0 on an out-of-range or non-finite value. */
+static unsigned
+tcl_fetch_vertex(const struct tcl_stream *streams, unsigned inputs,
+                 unsigned index, uint32_t *out)
+{
+   uint32_t *start = out;
+
+   for (unsigned k = 0; k < inputs; k++) {
+      const struct tcl_stream *stream = &streams[k];
+      const size_t offset = (size_t)index * stream->stride;
+
+      if (stream->size != SIZE_MAX &&
+          (offset > stream->size || stream->size - offset < stream->bytes))
+         return 0;
+      if (!stream->dwords) {
+         float value[4];
+
+         util_format_unpack_rgba(stream->format, value, stream->base + offset,
+                                 1);
+         for (unsigned c = 0; c < 4; c++)
+            if (!isfinite(value[c]))
+               return 0;
+         memcpy(out, value, sizeof(value));
+         out += 4;
+         continue;
+      }
+      /* Formats are whole dwords, so a padding-free copy is exact. */
+      memset(out, 0, stream->dwords * 4);
+      memcpy(out, stream->base + offset, MIN2(stream->bytes, stream->dwords * 4));
+      for (unsigned c = 0; c < stream->float32; c++)
+         if ((out[c] & 0x7f800000) == 0x7f800000)
+            return 0;
+      for (unsigned c = 0; c < stream->float16; c++)
+         if ((out[c] & 0x7c00) == 0x7c00 || (out[c] & 0x7c000000) == 0x7c000000)
+            return 0;
+      out += stream->dwords;
    }
-   return true;
+   return out - start;
 }
 
 static bool
@@ -1556,14 +1630,16 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (!chrome9_draw_tcl_fragment(ctx, &state->fragment, &why))
       return tcl_fallback(ctx, why);
 
-   stride = 16 * p->input_count;
-   per_chunk = MIN2(TCL_MAX_TRIANGLES, TCL_MAX_VERTEX_BYTES / (3 * stride));
+   /* Packed vertices: the stride is the sum of element fetch dwords. */
+   stride = 0;
    for (unsigned k = 0; k < p->input_count; k++) {
-      elements[k].format = DRM_CHROME9_VERTEX_FORMAT_FLOAT4;
+      elements[k].format = streams[k].drm_format;
       elements[k].buffer = 0;
       elements[k].reserved = 0;
-      elements[k].offset = 16 * k;
+      elements[k].offset = stride;
+      stride += 4 * tcl_stream_dwords(&streams[k]);
    }
+   per_chunk = MIN2(TCL_MAX_TRIANGLES, TCL_MAX_VERTEX_BYTES / (3 * stride));
    draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
    /* The native provoking vertex is the last one, as in GL. */
    draw.flags = tcl_cull(rs) | (flat ? DRM_CHROME9_VERTEX_FLAT : 0);
@@ -1578,7 +1654,7 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
 
    while (done < triangles) {
       const unsigned count = MIN2(per_chunk, triangles - done);
-      float *out = state->vertices;
+      uint32_t *out = state->vertices;
 
       for (unsigned t = done; t < done + count; t++) {
          unsigned v[3];
@@ -1596,13 +1672,16 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                index = ((const uint32_t *)indices)[position];
             if (info->index_size)
                index += range->index_bias;
-            if (!tcl_fetch_vertex(streams, p->input_count, index, out)) {
+            unsigned written = tcl_fetch_vertex(streams, p->input_count,
+                                                index, out);
+
+            if (!written) {
                if (!done)
                   return tcl_fallback(ctx, "vertex fetch");
                CHROME9_REJECT(ctx, triangles - done);
                return true;
             }
-            out += 4 * p->input_count;
+            out += written;
          }
       }
       draw.vertex_count = 3 * count;
