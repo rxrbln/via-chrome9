@@ -222,3 +222,15 @@ selftests establish the compiler-to-FE contract, not silicon behavior: rerun
 the guarded MAD discriminator with A00=`11` after a cold boot, and keep any
 shape the native analyzer cannot represent unsupported rather than falling
 back to varying count, texture count, or their maximum.
+
+That rerun must use the later ordered-FE implementation in kernel commit
+`d359ed1`.  Every earlier guarded three-varying MAD, split-output, and chain
+submission predates that commit: those packets wrote only the first A01
+consumer field (for example `01002523`) while the proprietary writer packs
+the subsequent physical T1/T2 fields into the remaining A01 bytes.  For
+three float4 ALU inputs and no sampler, current setup emits
+`A01=012a2523` and explicitly resets A02/A03.  The earlier timeouts therefore
+do not qualify the corrected A00 plus ordered-consumer tuple.  The next live
+discriminator is still the byte-checked one-record MAD, but on a module
+containing both fixes; stop after the first timeout rather than replaying the
+older split-write matrix.
