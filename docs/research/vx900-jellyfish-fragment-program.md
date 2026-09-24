@@ -509,9 +509,11 @@ for the Linux execution image.
 
 Use T0.w=`.1`, T1.w=`.3`, and T2=`(.2,.4,.6,.8)`.  The three expected BGRA8
 words are respectively `cc1a4d33`, `cc1a4d66`, and `cc1a4d99` within normal
-UNORM8 conversion tolerance.  Distinct unused components in T0 and T1 turn
-each result into an alias fingerprint as well.  The full surrounding closure
-must be FE A00=`00000031`, A01=`01002523`, A08=`08030303`,
+UNORM8 conversion tolerance.  With the tool's T0=`(.15,.25,.35,.1)` and
+T1=`(.45,.55,.65,.3)`, a T2-to-T0 alias instead gives
+`1a1a4d26/1a1a4d40/1a1a4d59`; a T2-to-T1 alias gives
+`4d1a4d73/4d1a4d8c/4d1a4da6`.  The full surrounding closure must be FE
+A00=`00000031`, A01=`01002523`, A08=`08030303`,
 A09=`09000003`, FVF A25/A28=`...fff0`, the three float4 VS copies, and
 A60=`60800006`.  This discriminator is source-backed and host-only; it has
 not been submitted to the GPU by this audit.
