@@ -566,7 +566,7 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
       chrome9_context_sync_resource(chrome9_context(pipe), resource, usage);
    else if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
       /* Queued draws may still read the buffer. */
-      chrome9_draw_flush_gpu_batch(chrome9_context(pipe));
+      chrome9_tcl_batch_flush_resource(chrome9_context(pipe), resource);
    chrome9_resource_cpu_access(cresource, usage & PIPE_MAP_WRITE);
 
    transfer = CALLOC_STRUCT(pipe_transfer);

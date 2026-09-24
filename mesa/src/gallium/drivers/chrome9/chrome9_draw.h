@@ -35,6 +35,8 @@ bool chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
                                struct chrome9_tcl_fragment *fragment,
                                const char **why);
 void chrome9_tcl_batch_flush(struct chrome9_context *ctx);
+void chrome9_tcl_batch_flush_resource(struct chrome9_context *ctx,
+                                      const struct pipe_resource *resource);
 void chrome9_tcl_batch_destroy(struct chrome9_context *ctx);
 bool chrome9_draw_tcl_submit(struct chrome9_context *ctx,
                              const struct chrome9_tcl_fragment *fragment,

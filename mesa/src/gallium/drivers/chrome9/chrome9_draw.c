@@ -3678,6 +3678,23 @@ chrome9_tcl_batch_flush(struct chrome9_context *ctx)
    tcl_batch_release(b);
 }
 
+/* Submit the queue if a queued draw reads resource. */
+void
+chrome9_tcl_batch_flush_resource(struct chrome9_context *ctx,
+                                 const struct pipe_resource *resource)
+{
+   struct chrome9_tcl_batch *b = ctx->tcl_batch;
+
+   if (!b || !b->count)
+      return;
+   util_dynarray_foreach(&b->resources, struct pipe_resource *, held) {
+      if (*held == resource) {
+         chrome9_tcl_batch_flush(ctx);
+         return;
+      }
+   }
+}
+
 void
 chrome9_tcl_batch_destroy(struct chrome9_context *ctx)
 {
