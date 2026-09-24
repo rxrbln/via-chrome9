@@ -9,9 +9,11 @@
 #include "chrome9_draw.h"
 #include "chrome9_public.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "drm-uapi/drm_fourcc.h"
@@ -370,6 +372,18 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
+   /* Private surfaces opt in to deferred cache maintenance; buffers are
+    * never written by the device and shared surfaces have foreign CPU
+    * users. */
+   if (templ->target != PIPE_BUFFER &&
+       !(templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT |
+                        PIPE_BIND_DISPLAY_TARGET)) &&
+       chrome9_screen_has_capability(screen,
+                                     DRM_CHROME9_CAP_GEM_CPU_ACCESS) &&
+       debug_get_bool_option("CHROME9_EXPLICIT_ACCESS", true))
+      resource->explicit_access =
+         chrome9_bo_cpu_access(fd, &resource->bo,
+                               DRM_CHROME9_GEM_CPU_EXPLICIT);
    return &resource->base;
 
 fail:
@@ -441,6 +455,18 @@ fail:
    return NULL;
 }
 
+void
+chrome9_resource_cpu_access(struct chrome9_resource *resource, bool write)
+{
+   struct pipe_screen *screen = resource->base.screen;
+
+   if (resource->explicit_access &&
+       !chrome9_bo_cpu_access(screen->get_screen_fd(screen), &resource->bo,
+                              write ? DRM_CHROME9_GEM_CPU_PREPARE_WRITE :
+                                      DRM_CHROME9_GEM_CPU_PREPARE_READ))
+      fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n", strerror(errno));
+}
+
 static bool
 chrome9_resource_get_handle(struct pipe_screen *screen,
                             struct pipe_context *context,
@@ -453,6 +479,13 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
 
    (void)context;
    (void)usage;
+   /* An exported object gets CPU users that do not bracket accesses. */
+   if (resource->explicit_access &&
+       chrome9_bo_cpu_access(screen->get_screen_fd(screen), &resource->bo,
+                             DRM_CHROME9_GEM_CPU_IMPLICIT))
+      resource->explicit_access = false;
+   if (resource->explicit_access)
+      return false;
    kms = whandle && whandle->type == WINSYS_HANDLE_TYPE_KMS;
    if (!whandle || pres->target == PIPE_BUFFER ||
        pres->last_level ||
@@ -533,6 +566,7 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * through a direct persistent mapping until submitted and resolved. */
    if (resource->target != PIPE_BUFFER)
       chrome9_context_sync_resource(chrome9_context(pipe), resource, usage);
+   chrome9_resource_cpu_access(cresource, usage & PIPE_MAP_WRITE);
 
    transfer = CALLOC_STRUCT(pipe_transfer);
    if (!transfer)
@@ -783,6 +817,7 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
 
    /* The first level may still be queued in a retained GPU draw batch. */
    chrome9_draw_flush_batch(chrome9_context(pipe));
+   chrome9_resource_cpu_access(resource, true);
 
    for (unsigned level = base_level + 1; level <= last_level; level++) {
       const unsigned source_width = u_minify(pres->width0, level - 1);

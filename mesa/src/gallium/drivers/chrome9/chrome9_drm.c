@@ -69,6 +69,17 @@ chrome9_get_param(int fd, uint32_t param, uint64_t *value)
 }
 
 bool
+chrome9_bo_cpu_access(int fd, const struct chrome9_bo *bo, uint32_t flags)
+{
+   struct drm_chrome9_gem_cpu_access args = {
+      .handle = bo->handle,
+      .flags = flags,
+   };
+
+   return drmIoctl(fd, DRM_IOCTL_CHROME9_GEM_CPU_ACCESS, &args) == 0;
+}
+
+bool
 chrome9_bo_create(int fd, uint64_t size, uint32_t flags,
                   struct chrome9_bo *bo)
 {

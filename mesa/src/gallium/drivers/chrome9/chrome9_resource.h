@@ -23,7 +23,13 @@ struct chrome9_resource {
    uint64_t data_offset;
    uint64_t data_size;
    bool guarded;
+   /* The kernel defers cache maintenance; CPU accesses are bracketed with
+    * chrome9_resource_cpu_access(). */
+   bool explicit_access;
 };
+
+void chrome9_resource_cpu_access(struct chrome9_resource *resource,
+                                 bool write);
 
 static inline struct chrome9_resource *
 chrome9_resource(struct pipe_resource *resource)

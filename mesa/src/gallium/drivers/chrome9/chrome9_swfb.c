@@ -429,6 +429,8 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
    };
    struct pipe_resource *alias;
 
+   /* llvmpipe accesses the pages directly in this draw. */
+   chrome9_resource_cpu_access(res, bind != 0);
    if (entry)
       return entry->data;
    if (!res->bo.map || resource->target == PIPE_BUFFER)
@@ -465,6 +467,7 @@ chrome9_sw_texture(struct chrome9_sw_context *sw,
 
    if (!resource->last_level)
       return chrome9_sw_alias(sw, resource, 0);
+   chrome9_resource_cpu_access(res, false);
    templ.bind = PIPE_BIND_SAMPLER_VIEW;
    templ.next = NULL;
    pipe_reference_init(&templ.reference, 1);

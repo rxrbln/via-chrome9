@@ -47,6 +47,9 @@ chrome9_copy_surface(struct pipe_resource *destination,
    uint8_t *dst_map = (uint8_t *)dst->bo.map + dst->data_offset;
    const uint8_t *src_map = (const uint8_t *)src->bo.map + src->data_offset;
 
+   chrome9_resource_cpu_access(src, false);
+   chrome9_resource_cpu_access(dst, true);
+
    for (unsigned y = 0; y < height; y++)
       memcpy(dst_map + (size_t)y * dst->stride,
              src_map + (size_t)y * src->stride, width);
@@ -6206,6 +6209,7 @@ chrome9_clear_target(struct chrome9_resource *target,
         target->base.format != PIPE_FORMAT_B5G6R5_UNORM) ||
        x >= target->base.width0 || y >= target->base.height0)
       return;
+   chrome9_resource_cpu_access(target, true);
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
    if (target->base.format == PIPE_FORMAT_B5G6R5_UNORM) {
@@ -6248,6 +6252,7 @@ chrome9_clear_zs_target(struct chrome9_resource *target, unsigned buffers,
    }
    if (keep == 0xffffffff)
       return;
+   chrome9_resource_cpu_access(target, true);
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
    for (unsigned row = 0; row < height; row++) {
@@ -6292,6 +6297,7 @@ chrome9_clear_target_masked(struct chrome9_resource *target,
       keep |= 0x000000ff;
    if (!(color_mask & PIPE_MASK_A))
       keep |= 0xff000000;
+   chrome9_resource_cpu_access(target, true);
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
    for (unsigned row = 0; row < height; row++) {
@@ -6450,6 +6456,8 @@ chrome9_refresh_vs_textures(struct chrome9_context *ctx)
          view = &effective;
       }
       if (chrome9_vs_texture_mapping(view, mapping)) {
+         /* The draw module samples the pages on the CPU. */
+         chrome9_resource_cpu_access(chrome9_resource(view->texture), false);
          draw_set_mapped_texture(ctx->draw, MESA_SHADER_VERTEX, i,
                                  mapping->width, mapping->height, 1,
                                  mapping->first_level, mapping->last_level,
