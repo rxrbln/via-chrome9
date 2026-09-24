@@ -372,15 +372,15 @@ chrome9_fs_has_flat_primary(nir_shader *nir)
 }
 
 static bool
-chrome9_fs_smooth_pixel_load(const nir_intrinsic_instr *load,
-                             unsigned location)
+chrome9_fs_smooth_pixel_load_range(const nir_intrinsic_instr *load,
+                                   unsigned location)
 {
    nir_instr *instr;
    nir_intrinsic_instr *bary;
 
    if (!load || load->intrinsic != nir_intrinsic_load_interpolated_input ||
        nir_intrinsic_io_semantics(load).location != location ||
-       nir_intrinsic_component(load) || !load->src[0].ssa ||
+       !load->src[0].ssa ||
        !nir_src_is_const(load->src[1]) || nir_src_as_uint(load->src[1]))
       return false;
    instr = nir_def_instr(load->src[0].ssa);
@@ -390,6 +390,14 @@ chrome9_fs_smooth_pixel_load(const nir_intrinsic_instr *load,
    return bary->intrinsic == nir_intrinsic_load_barycentric_pixel &&
           (nir_intrinsic_interp_mode(bary) == INTERP_MODE_NONE ||
            nir_intrinsic_interp_mode(bary) == INTERP_MODE_SMOOTH);
+}
+
+static bool
+chrome9_fs_smooth_pixel_load(const nir_intrinsic_instr *load,
+                             unsigned location)
+{
+   return chrome9_fs_smooth_pixel_load_range(load, location) &&
+          !nir_intrinsic_component(load);
 }
 
 static bool
@@ -2735,6 +2743,22 @@ chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
       unsigned location = ~0u;
       unsigned id, component;
 
+      /* Vector shrinking may turn a primary-color .aaaa read into a
+       * one-component load at component 3.  The semantic backend must retain
+       * that source lane even though the compatibility classifier requires a
+       * full, unshifted primary-color load. */
+      if (chrome9_fs_smooth_pixel_load_range(load, VARYING_SLOT_COL0) &&
+          def->bit_size == 32 && def->num_components &&
+          nir_intrinsic_component(load) < 4 &&
+          def->num_components <= 4 - nir_intrinsic_component(load)) {
+         memset(source, 0, sizeof(*source));
+         source->file = CHROME9_PS_SOURCE_INPUT;
+         for (unsigned c = 0; c < 4; c++)
+            source->swizzle[c] = c < def->num_components ?
+               nir_intrinsic_component(load) + c : CHROME9_PS_SWIZZLE_ZERO;
+         return true;
+      }
+
       if (load->intrinsic == nir_intrinsic_load_frag_coord &&
           def->bit_size == 32 && def->num_components == 4) {
          memset(source, 0, sizeof(*source));
@@ -3860,7 +3884,7 @@ chrome9_tgsi_fs_passthrough(const struct tgsi_token *tokens)
    return valid && input >= 0 && output >= 0 && moves == 1;
 }
 
-static void
+void
 chrome9_compile_fs_nir(struct chrome9_context *ctx,
                        struct chrome9_shader *shader, nir_shader *nir)
 {

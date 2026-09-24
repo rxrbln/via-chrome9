@@ -10,6 +10,7 @@
 #include "chrome9_shader_offline.h"
 
 struct draw_context;
+struct nir_shader;
 
 enum chrome9_warning {
    CHROME9_WARN_SUBMIT = 1u << 0,
@@ -230,6 +231,9 @@ chrome9_context_depth_target(struct chrome9_context *ctx);
 void chrome9_context_render_target_written(struct chrome9_context *ctx);
 void chrome9_context_render_target_direct_written(struct chrome9_context *ctx);
 void chrome9_context_prepare_render_target(struct chrome9_context *ctx);
+void chrome9_compile_fs_nir(struct chrome9_context *ctx,
+                            struct chrome9_shader *shader,
+                            struct nir_shader *nir);
 
 struct pipe_context *
 chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags);
