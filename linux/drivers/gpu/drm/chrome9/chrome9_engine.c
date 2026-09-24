@@ -383,6 +383,9 @@ struct chrome9_engine {
 	u64 gart_flush_count;
 	u64 gart_flush_rerequests;
 	u64 gart_flush_slow;
+	u64 gart_flush_kicks;
+	/* Segment staging for GTI kicks; never shared with a job being built. */
+	u32 *kick_cpu;
 	/* Evicted/unmapped PTEs point here instead of the invalid entry. */
 	u32 *scratch_cpu;
 	dma_addr_t scratch_dma;
@@ -484,15 +487,21 @@ static u8 chrome9_gart_request_flush(struct chrome9_device *cdev)
 	return value;
 }
 
+static int chrome9_gart_kick(struct chrome9_engine *engine);
+
 /*
  * Wait for SR6F bit 7 to clear.  A request the GTI did not take is
  * re-issued: VIA rev 0-2 write it up to ten times back to back, rev 3
- * polls every 1 ms for 600 ms (docs/research/chrome9-gart-flush-timeout.md).
+ * polls every 1 ms for 600 ms and gives an idle engine traffic
+ * (docs/research/chrome9-gart-flush-timeout.md).  kick requires
+ * submit_lock: it runs a kernel-owned cookie segment through the ring.
  */
-static int chrome9_gart_flush_wait(struct chrome9_engine *engine, u8 request)
+static int chrome9_gart_flush_wait(struct chrome9_engine *engine, u8 request,
+				   bool kick)
 {
 	struct chrome9_device *cdev = engine->cdev;
 	unsigned int i;
+	int ret;
 
 	writeb(0x6f, cdev->mmio + CHROME9_SEQ_INDEX);
 	for (i = 0; i < CHROME9_GART_FLUSH_BURST; i++) {
@@ -503,7 +512,16 @@ static int chrome9_gart_flush_wait(struct chrome9_engine *engine, u8 request)
 	}
 	engine->gart_flush_slow++;
 	for (i = 0; i < CHROME9_GART_FLUSH_TIMEOUT_MS; i++) {
-		usleep_range(1000, 1200);
+		if (kick && i % 10 == 0 &&
+		    !(readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS) &
+		      CHROME9_ENGINE_WORK_MASK)) {
+			ret = chrome9_gart_kick(engine);
+			/* A busy engine already generates GTI traffic. */
+			if (ret && ret != -EBUSY)
+				return ret;
+		} else {
+			usleep_range(1000, 1200);
+		}
 		writeb(0x6f, cdev->mmio + CHROME9_SEQ_INDEX);
 		if (!(readb(cdev->mmio + CHROME9_SEQ_DATA) & BIT(7)))
 			return 0;
@@ -3319,8 +3337,8 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	return 0;
 }
 
-static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
-			    const u32 *ptes, unsigned int count)
+static int chrome9_gart_set_kick(struct chrome9_engine *engine, u32 first,
+				 const u32 *ptes, unsigned int count, bool kick)
 {
 	struct chrome9_device *cdev = engine->cdev;
 	u8 saved_index;
@@ -3357,7 +3375,7 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	request = chrome9_gart_request_flush(cdev);
 	/* The VIA mapper re-protects SR6C immediately after requesting SR6F. */
 	chrome9_seq_write(cdev, 0x6c, saved_6c | BIT(7));
-	ret = chrome9_gart_flush_wait(engine, request);
+	ret = chrome9_gart_flush_wait(engine, request, kick);
 	if (ret)
 		dev_err_ratelimited(&cdev->pdev->dev,
 			"GART translation flush failed first=%u count=%u ret=%d SR6F=%02x SR3F=%02x 0400=%08x\n",
@@ -3367,6 +3385,13 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
 	chrome9_vga_seq_put(cdev);
 	return ret;
+}
+
+/* Callers not holding submit_lock cannot kick the ring. */
+static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
+			    const u32 *ptes, unsigned int count)
+{
+	return chrome9_gart_set_kick(engine, first, ptes, count, false);
 }
 
 static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
@@ -3409,7 +3434,7 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	wmb();
 	request = chrome9_gart_request_flush(cdev);
 	chrome9_seq_write(cdev, 0x6c, programmed_6c | BIT(7));
-	ret = chrome9_gart_flush_wait(engine, request);
+	ret = chrome9_gart_flush_wait(engine, request, false);
 	if (!ret)
 		engine->gart_programmed = true;
 out_restore_index:
@@ -3441,7 +3466,7 @@ static int chrome9_gart_restore(struct chrome9_engine *engine)
 	wmb();
 	request = chrome9_gart_request_flush(cdev);
 	chrome9_seq_write(cdev, 0x6c, value | BIT(7));
-	ret = chrome9_gart_flush_wait(engine, request);
+	ret = chrome9_gart_flush_wait(engine, request, false);
 	if (ret)
 		goto out;
 	chrome9_seq_write(cdev, 0x6a, engine->saved_6a);
@@ -3540,8 +3565,8 @@ chrome9_draw_mapping_evict_locked(struct chrome9_engine *engine,
 		return -EBUSY;
 
 	mutex_lock(&engine->vm_lock);
-	ret = chrome9_gart_set(engine, mapping->node.start >> PAGE_SHIFT,
-			       NULL, mapping->page_count);
+	ret = chrome9_gart_set_kick(engine, mapping->node.start >> PAGE_SHIFT,
+			       NULL, mapping->page_count, true);
 	if (ret) {
 		engine->wedged = true;
 		mapping->quarantined = true;
@@ -3679,12 +3704,12 @@ chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
 	mapping->node_allocated = true;
 	mapping->bound = true;
 	mutex_lock(&engine->vm_lock);
-	ret = chrome9_gart_set(engine, mapping->node.start >> PAGE_SHIFT,
-			       mapping->ptes, mapping->page_count);
+	ret = chrome9_gart_set_kick(engine, mapping->node.start >> PAGE_SHIFT,
+			       mapping->ptes, mapping->page_count, true);
 	if (ret) {
-		cleanup_ret = chrome9_gart_set(engine,
+		cleanup_ret = chrome9_gart_set_kick(engine,
 					       mapping->node.start >> PAGE_SHIFT,
-					       NULL, mapping->page_count);
+					       NULL, mapping->page_count, true);
 		if (cleanup_ret) {
 			engine->wedged = true;
 			mapping->quarantined = true;
@@ -3834,13 +3859,13 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 		goto err_unlock_vm;
 	mapping->node_allocated = true;
 	mapping->bound = true;
-	ret = chrome9_gart_set(engine, mapping->node.start >> PAGE_SHIFT,
-			       mapping->ptes, mapping->page_count);
+	ret = chrome9_gart_set_kick(engine, mapping->node.start >> PAGE_SHIFT,
+			       mapping->ptes, mapping->page_count, true);
 	if (ret) {
 		/* A failed flush can leave a partly visible table: erase or retain. */
-		cleanup_ret = chrome9_gart_set(engine,
+		cleanup_ret = chrome9_gart_set_kick(engine,
 					       mapping->node.start >> PAGE_SHIFT,
-					       NULL, mapping->page_count);
+					       NULL, mapping->page_count, true);
 		if (cleanup_ret) {
 			engine->wedged = true;
 			mapping->quarantined = true;
@@ -4519,6 +4544,11 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	}
 	engine->scratch_pte = lower_32_bits(engine->scratch_dma >> PAGE_SHIFT) &
 			      0x3fffffff;
+	engine->kick_cpu = (u32 *)get_zeroed_page(GFP_KERNEL);
+	if (!engine->kick_cpu) {
+		ret = -ENOMEM;
+		goto err_free_ring;
+	}
 	engine->staging_cpu = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!engine->staging_cpu) {
 		ret = -ENOMEM;
@@ -4601,6 +4631,7 @@ err_free_ring:
 	vfree(engine->run_staging_cpu);
 	if (engine->staging_cpu)
 		free_page((unsigned long)engine->staging_cpu);
+	free_page((unsigned long)engine->kick_cpu);
 	if (engine->scratch_cpu)
 		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE,
 				  engine->scratch_cpu, engine->scratch_dma);
@@ -4613,6 +4644,59 @@ err_free_saved:
 	kvfree(engine->gart_saved);
 err_free_engine:
 	kfree(engine);
+	return ret;
+}
+
+/*
+ * Give the GTI an outstanding request so a pending SR6F translation flush
+ * can complete while every engine is idle: one cookie write through the
+ * ring, whose PTEs never change.  VIA rev 3 uses a direct 2D blit for the
+ * same purpose, but its MMIO would overwrite the cookie register.
+ */
+static int chrome9_gart_kick(struct chrome9_engine *engine)
+{
+	struct chrome9_job *job;
+	u32 *p = engine->kick_cpu;
+	bool must_quarantine;
+	u32 cookie[2];
+	u32 pause;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (!p || engine->stopping || engine->wedged)
+		return -EIO;
+	job = kzalloc_obj(*job);
+	if (!job)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&job->quarantine_link);
+	job->cookie = engine->last_cookie == 0x00010001 ?
+		      0x00020002 : 0x00010001;
+	cookie[0] = CHROME9_2D_REG_DST_POS;
+	cookie[1] = job->cookie;
+	memset(p, 0xcc, PAGE_SIZE);
+	chrome9_emit_header0(&p, cookie, 1);
+	ret = chrome9_finish_ring(engine->kick_cpu, p, &pause,
+				  &job->segment_stop);
+	if (!ret)
+		ret = chrome9_append_segment(engine, job, engine->kick_cpu,
+					     PAGE_SIZE, pause,
+					     &must_quarantine);
+	if (!ret)
+		ret = chrome9_wait_job(engine, job);
+	else if (!must_quarantine)
+		goto out;
+	if (ret) {
+		/* The ring may still own the segment: keep it for reboot. */
+		engine->wedged = true;
+		chrome9_take_quarantine_hold(engine);
+		dev_crit(&engine->cdev->pdev->dev,
+			 "GART kick did not retire: %d\n", ret);
+		goto out;
+	}
+	engine->last_cookie = job->cookie;
+	engine->gart_flush_kicks++;
+out:
+	kfree(job);
 	return ret;
 }
 
@@ -8592,19 +8676,21 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (!engine->was_master)
 		pci_clear_master(cdev->pdev);
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu sr6f_rerequests=%llu sr6f_slow=%llu fe33=%llu/%u fe33_canary_faults=%llu\n",
+		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu sr6f_rerequests=%llu sr6f_slow=%llu sr6f_kicks=%llu fe33=%llu/%u fe33_canary_faults=%llu\n",
 		 engine->append_count, engine->wrap_count, engine->ring_epoch,
 		 engine->draw_cache_hits, engine->draw_cache_misses,
 		 engine->draw_cache_scanout_hits, engine->draw_cache_evictions,
 		 engine->gart_update_count, engine->gart_pte_write_count,
 		 engine->gart_vga_acquire_count, engine->gart_flush_count,
 		 engine->gart_flush_rerequests, engine->gart_flush_slow,
+		 engine->gart_flush_kicks,
 		 engine->fence_count, engine->fence_last_id,
 		 engine->fence_canary_faults);
 	mutex_unlock(&engine->submit_lock);
 	cdev->engine = NULL;
 	vfree(engine->run_staging_cpu);
 	free_page((unsigned long)engine->staging_cpu);
+	free_page((unsigned long)engine->kick_cpu);
 	dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->scratch_cpu,
 			  engine->scratch_dma);
 	if (engine->fence_cpu)
