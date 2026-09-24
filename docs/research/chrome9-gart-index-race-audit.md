@@ -132,3 +132,45 @@ SR6F on every poll iteration is useful defensive validation, but cannot by
 itself make the index-plus-data write atomic.  Preserve the bounded pre- and
 post-waits and the current quarantine policy.
 
+## Follow-up: write-protect restoration precedes completion polling
+
+A 20-second `glxgears` run with the shared sequencer mutex still failed in a
+different, now unambiguous phase: the newly requested flush remained at
+`SR6F=80` through the 100-ms post-wait for PTEs `6928..7019`; the immediate
+cleanup then timed out in its pre-wait on the same value.  This excludes an
+SR31 index interleave for that run and isolates the request/completion
+sequence.
+
+The Linux 5.75 live mapper never waits for a newly requested flush while the
+table is left unprotected.  Its exact order is:
+
+```text
+clear SR6C.bit7
+wait for the previous SR6F.bit7 request to clear
+write PTEs
+set SR6F.bit7
+immediately select SR6C and restore bit 7
+```
+
+This is explicit at `via_chrome9_dma.c:432-454`; initialization uses the same
+ordering at lines 259-299.  Windows does not contradict it: its map/unmap
+paths pulse SR6F once or nine times and do not poll for the newly requested
+bit to clear.  Neither vendor path requires a CR PAUSE or an engine-idle wait
+around a live allocation map.
+
+The current engine instead waits for the request to complete inside
+`chrome9_gart_flush()` while `SR6C.bit7` is still clear, and restores SR6C
+only after that wait returns (`chrome9_engine.c:414-426,2706-2752`).  The
+manual documents SR6C.bit7 only as *GART Table Write Protect Enable* and
+SR6F.bit7 only as *set by SW and reset by GTI*; it does not document their
+completion dependency.  Nevertheless, the vendor ordering and the observed
+post-wait failure support one narrow discriminator: issue the pulse, restore
+the saved SR6C byte immediately, reselect SR6F, and only then perform the
+bounded post-wait.  This preserves modern completion proof and ensures that a
+timeout leaves the table protected.
+
+The same restructuring must cover restore error handling.  The current
+`chrome9_gart_restore()` branches out when its post-wait fails before writing
+back saved SR6C (`chrome9_engine.c:2822-2828`), leaving table write protection
+cleared.  Protection restoration must be unconditional once it was cleared,
+independent of whether the bounded completion wait succeeds.
