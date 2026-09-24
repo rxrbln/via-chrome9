@@ -1755,6 +1755,82 @@ static int chrome9_fragment_constant_port_selftest(
 	return 0;
 }
 
+static int chrome9_fragment_shadow_prefix_selftest(
+	struct chrome9_fragment_program *program)
+{
+	/* Linux 5.75's shortened shadow prefix reuses physical r0: RCP r0,
+	 * MUL r1,T0,r0, ADD r0,r1.z,c0.x, TEX r2,r1.xy, ADD oC0,r0,r2.
+	 * The MUL releases direct T0 in its A slot, but does not release its
+	 * C-slot r0: a later ADD overwrites the same physical temporary.
+	 */
+	static const struct drm_chrome9_fragment_instruction instructions[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_RCP,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0x1, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 3, 3, 3, 3 }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 1, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 0, 0, 0 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 2, 0x1, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 2, 5, 5, 5 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+				  { 0, 5, 5, 5 }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.sampler = 0,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 3, 0xf, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 1,
+				  { 0, 1, 0, 1 }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_ADD,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 2,
+				  { 0, 0, 0, 0 }, 0, 0 },
+				{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 3,
+				  { 0, 0, 0, 0 }, 0, 0 },
+			},
+		},
+	};
+	static const u32 expected_alu[][4] = {
+		{ 0x01c00530, 0xb01c0053, 0x0010c0b6, 0x00060020 },
+		{ 0x0140b6d0, 0x30000000, 0x00f2c005, 0x00000060 },
+		{ 0x008016d0, 0xd0140924, 0x00100156, 0x00000020 },
+		{ 0x01c00530, 0x101c0053, 0x00f20104, 0x000d0460 },
+		{ 0x02020000, 0x00140924, 0x00f20000, 0x00000820 },
+	};
+	static const u32 expected_controls[] = {
+		0x90058001, 0x91000002, 0x92010005, 0x93000001,
+		0x94000000, 0x95000008, 0x96000000, 0x97000000,
+		0x98000000, 0x99000000, 0x9a000000, 0x9b000000,
+	};
+	static const u32 constants[4] = { 0x3e1a1cac };
+	int ret;
+
+	ret = chrome9_fragment_compile(instructions, ARRAY_SIZE(instructions),
+		constants, 1, 1, 1, program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
+	    program->tau_count != 1 || program->tau[0] != 0x301211b0 ||
+	    program->active_texture_count != 1 ||
+	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
+	    memcmp(program->controls, expected_controls,
+		   sizeof(expected_controls)))
+		return -EINVAL;
+	return 0;
+}
+
 static int chrome9_fragment_vec3_cmp_selftest(
 	struct chrome9_fragment_program *program)
 {
@@ -2754,6 +2830,8 @@ int chrome9_fragment_selftest(void)
 		ret = chrome9_fragment_kill_selftest(program, constants);
 	if (!ret)
 		ret = chrome9_fragment_constant_port_selftest(program);
+	if (!ret)
+		ret = chrome9_fragment_shadow_prefix_selftest(program);
 	if (!ret)
 		ret = chrome9_fragment_vec3_cmp_selftest(program);
 out:

@@ -1635,7 +1635,8 @@ static u32 chrome9_fragment_varying_link(u32 width)
 }
 
 static u32 chrome9_fragment_raster_state(
-		u32 varying_count, const u8 *varying_width, u32 vertex_count,
+		u32 varying_count, const u8 *varying_width, u32 texture_count,
+		u32 vertex_count,
 		u32 raster[40])
 {
 	static const u32 zero_varying[] = {
@@ -1684,14 +1685,21 @@ static u32 chrome9_fragment_raster_state(
 	raster[i++] = 0x24000000 | vertex_count;
 	for (unsigned int varying = 0; varying < varying_count; varying++) {
 		u32 shift = 12 - 4 * (varying & 3);
-		u32 link = chrome9_fragment_varying_link(varying_width[varying]);
+		u32 producer = chrome9_fragment_varying_link(
+			varying_width[varying]);
+		/* A25/A26 describe the VS producer.  A28/A29 describe the
+		 * programmable PS consumer after ComputeTexDim's three-component
+		 * cap when a texture-state object is present.
+		 */
+		u32 consumer = chrome9_fragment_varying_link(min_t(u8,
+			varying_width[varying], texture_count ? 3 : 4));
 
 		if (varying < 4) {
-			a25 |= link << shift;
-			a28 |= link << shift;
+			a25 |= producer << shift;
+			a28 |= consumer << shift;
 		} else {
-			a26 |= link << shift;
-			a29 |= link << shift;
+			a26 |= producer << shift;
+			a29 |= consumer << shift;
 		}
 	}
 	raster[i++] = a25;
@@ -1732,12 +1740,12 @@ static int chrome9_fragment_raster_selftest(void)
 	u32 count;
 	unsigned int varying_count;
 
-	count = chrome9_fragment_raster_state(0, NULL, 3, raster);
+	count = chrome9_fragment_raster_state(0, NULL, 0, 3, raster);
 	if (count != ARRAY_SIZE(expected_zero_varying) ||
 	    memcmp(raster, expected_zero_varying,
 		   sizeof(expected_zero_varying)))
 		return -EINVAL;
-	count = chrome9_fragment_raster_state(ARRAY_SIZE(width), width, 3,
+	count = chrome9_fragment_raster_state(ARRAY_SIZE(width), width, 0, 3,
 		raster);
 	if (count != 28 || raster[0] != 0x00000309 ||
 	    raster[4] != 0x04006382 || raster[5] != 0x1200000f ||
@@ -1773,7 +1781,7 @@ static int chrome9_fragment_raster_selftest(void)
 				}
 			}
 			count = chrome9_fragment_raster_state(varying_count, widths,
-				3, raster);
+				0, 3, raster);
 			if (count != 27 + varying_count ||
 			    raster[0] != ((2 + varying_count) << 8 | stride) ||
 			    raster[6 + varying_count] !=
@@ -1793,6 +1801,33 @@ static int chrome9_fragment_raster_selftest(void)
 				offset += widths[varying];
 			}
 		}
+	}
+	{
+		static const u8 float4_width[] = { 4 };
+		static const u8 mixed_width[] = { 4, 2, 3 };
+		static const u8 fifth_float4[] = { 2, 2, 2, 2, 4 };
+
+		count = chrome9_fragment_raster_state(1, float4_width, 1, 3,
+			raster);
+		if (count != 28 || raster[11] != 0x25f6f000 ||
+		    raster[13] != 0x28ffe000 ||
+		    chrome9_fragment_raster_state(1, float4_width, 0, 3,
+						 raster) != 28 ||
+		    raster[11] != 0x25f6f000 ||
+		    raster[13] != 0x28fff000)
+			return -EINVAL;
+		count = chrome9_fragment_raster_state(3, mixed_width, 1, 3,
+			raster);
+		if (count != 30 || raster[13] != 0x25f6fce0 ||
+		    raster[15] != 0x28ffece0)
+			return -EINVAL;
+		count = chrome9_fragment_raster_state(5, fifth_float4, 1, 3,
+			raster);
+		if (count != 32 || raster[15] != 0x25f6cccc ||
+		    raster[16] != 0x2600f000 ||
+		    raster[17] != 0x28ffcccc ||
+		    raster[18] != 0x2900e000)
+			return -EINVAL;
 	}
 	return 0;
 }
@@ -2151,7 +2186,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	raster_count = chrome9_fragment_raster_state(program->varying_count,
-		program->varying_width, vertex_count, raster);
+		program->varying_width, program->texture_count, vertex_count,
+		raster);
 	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
 	for (i = 0; i < program->varying_count; i++) {
 		u32 *record = vs_program + 16 + i * 4;
