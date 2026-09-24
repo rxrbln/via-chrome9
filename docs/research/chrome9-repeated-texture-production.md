@@ -397,6 +397,21 @@ separate from this stage namespace and from the currently promoted three
 sampler slots.  Terrain's five fragment samplers therefore remain a future
 capability gate even after the ABI representation is correct.
 
+On 2026-09-24 the guarded three-texture test gained a `--s5` mode
+(`tools/re/chrome9_three_texture_guard_smoke.c`, tools commit `9451cd9`).  It
+submits ABI v2 with one compact BGRA descriptor labelled logical unit 5 and
+one `TEX s5` followed by a color MOV.  It requires an exact red pixel, an
+untouched triangle exterior, both destination guards, and byte-identical
+source and source guards.  The strict T2 cross-build passed.  The currently
+loaded cursor-enabled module has `fragment_sparse_textures=N`, so the staged
+binary returned its intentional skip code 77 before GEM allocation or GPU
+submission; dmesg gained zero lines and the render node remained present.
+This is a fail-closed preflight, **not** an s5 silicon pass.  The staged
+binary and skip log are under
+`/root/tmp/chrome9-live/sparse-s5-20260924/` on the target.  Run the s5 draw
+only after a hash-gated opt-in module handoff with exact rollback, then
+continue the sparse-pair and five-stage ladder above.
+
 ## Multi-source resource-state tables
 
 The installed glmark2 2023.01 sources provide two useful generic state
