@@ -91,12 +91,16 @@ struct chrome9_fs_variant {
 
 struct chrome9_tcl_shader;
 struct chrome9_tcl_state;
+struct chrome9_sw_context;
+struct nir_shader;
 
 struct chrome9_shader {
    void *draw;
    void *nir;
    /* Hardware TCL form of a vertex shader, compiled on first use. */
    struct chrome9_tcl_shader *tcl;
+   /* Vertex shader NIR kept for the llvmpipe fragment fallback. */
+   struct nir_shader *sw_nir;
    struct chrome9_fs_variant *variants;
    unsigned variant_count;
    enum chrome9_fragment_program fragment_program;
@@ -243,6 +247,10 @@ struct chrome9_context {
    /* CHROME9_TCL=1 with DRM_CHROME9_CAP_VERTEX_PROGRAM. */
    bool tcl_enabled;
    struct chrome9_tcl_state *tcl_state;
+   /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */
+   struct chrome9_sw_context *sw;
+   struct pipe_blend_color blend_color;
+   struct pipe_clip_state clip;
    uint64_t tcl_triangles;
    uint64_t tcl_fallback_draws;
    uint64_t tcl_flushes;

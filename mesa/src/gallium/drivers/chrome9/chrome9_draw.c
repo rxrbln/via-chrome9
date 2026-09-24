@@ -10,6 +10,7 @@
 #include "chrome9_fragment.h"
 #include "chrome9_public.h"
 #include "chrome9_resource.h"
+#include "chrome9_swfb.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -3396,6 +3397,16 @@ chrome9_draw_vbuf_stage(struct chrome9_context *ctx)
 
 void
 chrome9_draw_flush_batch(struct chrome9_context *ctx)
+{
+   if (!ctx)
+      return;
+   chrome9_sw_finish(ctx);
+   chrome9_draw_flush_gpu_batch(ctx);
+}
+
+/* Submit queued GPU triangles only; pending llvmpipe work may continue. */
+void
+chrome9_draw_flush_gpu_batch(struct chrome9_context *ctx)
 {
    if (ctx && ctx->vbuf_render) {
       struct chrome9_vbuf_render *render = ctx->vbuf_render;

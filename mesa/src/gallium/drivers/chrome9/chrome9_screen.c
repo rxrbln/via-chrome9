@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
 
+#include "chrome9_swfb.h"
 #include "chrome9_public.h"
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
@@ -39,6 +40,9 @@ struct chrome9_screen {
    uint64_t capabilities;
    simple_mtx_t shared_lock;
    struct chrome9_shared_handle *shared_handles;
+   /* llvmpipe fragment fallback, created on first use under shared_lock. */
+   struct pipe_screen *sw_screen;
+   bool sw_tried;
 };
 
 static inline struct chrome9_screen *
@@ -224,6 +228,20 @@ chrome9_device_vendor(struct pipe_screen *screen)
    return "VIA Technologies";
 }
 
+struct pipe_screen *
+chrome9_screen_sw(struct pipe_screen *screen)
+{
+   struct chrome9_screen *cscreen = chrome9_screen(screen);
+
+   simple_mtx_lock(&cscreen->shared_lock);
+   if (!cscreen->sw_tried) {
+      cscreen->sw_tried = true;
+      cscreen->sw_screen = chrome9_sw_screen_create();
+   }
+   simple_mtx_unlock(&cscreen->shared_lock);
+   return cscreen->sw_screen;
+}
+
 static void
 chrome9_screen_destroy(struct pipe_screen *screen)
 {
@@ -238,6 +256,8 @@ chrome9_screen_destroy(struct pipe_screen *screen)
          ioctl(cscreen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
       FREE(entry);
    }
+   if (cscreen->sw_screen)
+      cscreen->sw_screen->destroy(cscreen->sw_screen);
    simple_mtx_destroy(&cscreen->shared_lock);
    close(cscreen->fd);
    FREE(cscreen);

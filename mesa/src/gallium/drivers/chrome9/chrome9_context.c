@@ -5,6 +5,7 @@
 #include "chrome9_context.h"
 
 #include "chrome9_draw.h"
+#include "chrome9_swfb.h"
 #include "chrome9_tcl.h"
 #include "chrome9_drm.h"
 #include "chrome9_format.h"
@@ -326,6 +327,7 @@ chrome9_delete_sampler_state(struct pipe_context *pipe, void *state)
    struct chrome9_context *ctx = chrome9_context(pipe);
    bool vs_changed = false;
 
+   chrome9_sw_forget(ctx, state);
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       if (ctx->sampler_states[i] == state)
          ctx->sampler_states[i] = NULL;
@@ -362,6 +364,7 @@ chrome9_delete_state(struct pipe_context *pipe, void *state)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
+   chrome9_sw_forget(ctx, state);
    if (ctx->blend == state)
       ctx->blend = NULL;
    if (ctx->dsa == state)
@@ -383,10 +386,14 @@ chrome9_create_vs_state(struct pipe_context *pipe,
    /* Clone before draw takes the NIR; TCL compiles it lazily. */
    if (ctx->tcl_enabled && state->type == PIPE_SHADER_IR_NIR && state->ir.nir)
       shader->tcl = chrome9_tcl_shader_create(state->ir.nir);
+   if (chrome9_sw_enabled() && state->type == PIPE_SHADER_IR_NIR &&
+       state->ir.nir)
+      shader->sw_nir = nir_shader_clone(NULL, state->ir.nir);
    shader->draw = draw_create_vertex_shader(ctx->draw, state);
    shader->supported = shader->draw != NULL;
    if (!shader->draw) {
       chrome9_tcl_shader_destroy(shader->tcl);
+      ralloc_free(shader->sw_nir);
       FREE(shader);
       return NULL;
    }
@@ -415,8 +422,10 @@ chrome9_delete_vs_state(struct pipe_context *pipe, void *state)
       ctx->vs = NULL;
       draw_bind_vertex_shader(ctx->draw, NULL);
    }
+   chrome9_sw_forget(ctx, shader);
    draw_delete_vertex_shader(ctx->draw, shader->draw);
    chrome9_tcl_shader_destroy(shader->tcl);
+   ralloc_free(shader->sw_nir);
    FREE(shader);
 }
 
@@ -5743,6 +5752,7 @@ chrome9_delete_fs_state(struct pipe_context *pipe, void *state)
 
    if (!shader)
       return;
+   chrome9_sw_forget(ctx, shader);
    if (ctx->fs == shader) {
       ctx->fs = NULL;
       draw_bind_fragment_shader(ctx->draw, NULL);
@@ -5792,6 +5802,7 @@ chrome9_delete_vertex_elements_state(struct pipe_context *pipe, void *state)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
+   chrome9_sw_forget(ctx, state);
    if (ctx->vertex_elements == state)
       ctx->vertex_elements = NULL;
    FREE(state);
@@ -6113,6 +6124,7 @@ static void
 chrome9_set_clip_state(struct pipe_context *pipe,
                        const struct pipe_clip_state *clip)
 {
+   chrome9_context(pipe)->clip = *clip;
    draw_set_clip_state(chrome9_context(pipe)->draw, clip);
 }
 
@@ -6413,13 +6425,24 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
    if (!ctx->vs || !ctx->fs || !chrome9_select_fs_variant(ctx)) {
+      /* Beyond the pixel engine: llvmpipe renders into the same BOs. */
+      if (chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+         return;
       chrome9_warn_once(ctx, CHROME9_WARN_DRAW_STATE,
                         "draw rejected: unsupported bounded fragment program");
       CHROME9_REJECT(ctx, draws[0].count);
       return;
    }
 
+   /* Vertex texturing runs in the interpreter on the draw path; llvmpipe
+    * compiles it instead. */
+   if (ctx->vs->sw_nir &&
+       BITSET_COUNT(ctx->vs->sw_nir->info.textures_used) &&
+       chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+      return;
    chrome9_refresh_vs_textures(ctx);
+   /* No GPU job may start while llvmpipe still accesses a BO. */
+   chrome9_sw_finish(ctx);
    if (chrome9_tcl_draw(ctx, info, &draws[0]))
       return;
 
@@ -6516,8 +6539,7 @@ static void
 chrome9_set_blend_color(struct pipe_context *pipe,
                         const struct pipe_blend_color *color)
 {
-   (void)pipe;
-   (void)color;
+   chrome9_context(pipe)->blend_color = *color;
 }
 
 static void
@@ -6555,6 +6577,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
                       PRIu64 " all triangles=%" PRIu64 "\n",
               ctx->tcl_triangles, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
+   chrome9_sw_context_destroy(ctx);
    if (ctx->reject_sites)
       _mesa_hash_table_destroy(ctx->reject_sites, NULL);
    ctx->reject_sites = NULL;

@@ -1,5 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026 Chrome9 contributors
+# Copyright 2026 René Rebe <rene@exactco.de>
+
+# llvmpipe renders fragment programs beyond the hardware limits.
+chrome9_sw_files = []
+chrome9_sw_args = []
+chrome9_sw_libs = []
+chrome9_sw_deps = []
+if with_any_llvmpipe
+  chrome9_sw_files = ['chrome9_swfb.c']
+  chrome9_sw_args = ['-DCHROME9_HAVE_LLVMPIPE']
+  chrome9_sw_libs = [libllvmpipe]
+  chrome9_sw_deps = [dep_llvm]
+endif
 
 libchrome9 = static_library(
   'chrome9',
@@ -16,15 +29,19 @@ libchrome9 = static_library(
     'chrome9_specialise.c',
     'chrome9_tcl.c',
     'chrome9_vs_texture.c',
+    chrome9_sw_files,
   ),
-  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux,
+                         inc_gallium_drivers],
+  c_args : chrome9_sw_args,
   dependencies : [dep_libdrm, idep_nir, idep_mesautil],
   gnu_symbol_visibility : 'hidden',
 )
 
 driver_chrome9 = declare_dependency(
   compile_args : '-DGALLIUM_CHROME9',
-  link_with : libchrome9,
+  link_with : [libchrome9, chrome9_sw_libs],
+  dependencies : chrome9_sw_deps,
 )
 
 chrome9_screen_smoke = executable(
