@@ -144,6 +144,14 @@ select only the first lane correctly.  Conversely XXXX would violate the
 vendor inactive-lane image.  This is a byte-level compiler requirement, not
 a cosmetic canonicalization.
 
+The same Linux production compiler was also run for destination widths one,
+two, and four.  It emits predicate/arm images `X000/X000`, `XX00/XY00`, and
+`XXXX/XYZW`, respectively, with destination masks `1`, `3`, and `f`.  All
+four objects retain active tuple `(0,4,0,0)` and controls
+`90050000/91000000/92000005`.  The expanded corpus and checker therefore
+qualify the generic rule "broadcast X only over live lanes, ZERO-pad the
+rest" for widths 1--4; the rule is no longer an extrapolation from vec3.
+
 The three source constants in the corpus are deliberately materialized into
 TEMP registers before CMP.  The live VX900 limit is three *distinct constant
 registers in one MAD/CMP record*, not three operands.  A real select may use
