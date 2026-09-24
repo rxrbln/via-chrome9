@@ -212,6 +212,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED	(1ULL << 53)
 /* Generic fragment programs may read normalized vertex primary color D1. */
 #define DRM_CHROME9_CAP_FRAGMENT_PRIMARY		(1ULL << 54)
+/* Generic fragment descriptors may name sparse logical texture units. */
+#define DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES	(1ULL << 55)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -965,6 +967,7 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 #define DRM_CHROME9_FRAGMENT_MAX_TRIANGLES	128U
 #define DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS	12U
 #define DRM_CHROME9_FRAGMENT_ABI_VERSION		1U
+#define DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES	2U
 
 #define DRM_CHROME9_FRAGMENT_DEPTH	(1U << 0)
 #define DRM_CHROME9_FRAGMENT_BLEND	(1U << 1)
@@ -1085,6 +1088,7 @@ struct drm_chrome9_fragment_texture_state {
 	__s32 min_lod_s5_5;
 	__s32 max_lod_s5_5;
 	__u32 border_color;
+	/* ABI v1: zero.  ABI v2: logical texture unit, 0..7. */
 	__u32 reserved0;
 	__u32 level_offset[DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS];
 	__u32 level_pitch[DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS];
