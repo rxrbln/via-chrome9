@@ -400,5 +400,8 @@ expected host BGRA=cc334d66
 If float4 restores Y/Z while float3 does not, the remaining fault is in the
 float3 width/link closure.  If both retain only T2.x, the failure is below the
 width encoding and instead implicates physical slot-two routing/A90 or the
-native class-3 source path.  This is a proposed guarded cold-boot pair, not a
-silicon result; no GPU submission was made during this audit.
+native class-3 source path.  `tools/re/chrome9_t2_route_guard_smoke.c`
+implements the pair as `--float3` and `--float4`, including BGRA8, D16,
+exterior, and guard checks.  It passes a strict host build.  This is a
+proposed guarded cold-boot pair, not a silicon result; no GPU submission was
+made during this audit.
