@@ -128,10 +128,20 @@ as a valid two-varying program.  A repeat of the checked-in probe with
 `tex-manager: remap logical=1 -> -1`; the latter is truncated to the six-bit
 native id 63.  The isolated emitter call never registered T1 with the texture
 slot manager, so this is a probe-setup failure, not evidence of a silicon
-two-varying limit.  Recover a correctly linked two-varying object by
-registering both inputs in the offline compiler's manager before emission,
-then running configuration-two finalization, before admitting that operand
-pairing.
+two-varying limit.  The opt-in `CHROME9_INTERNAL_SLT_REGISTER_T1=1` probe
+variant registers both inputs before `stmSetRegMgr_invi`, asserts `T1 -> 1`,
+then runs configuration-two finalization and emits:
+
+```text
+SLT oC0,T0,T1 (both inputs registered, configuration 2)
+  02c10538 302c0924 00f0c005 00000320
+  01409240 30140b6d 00f20c05 00090820
+  active=(1,13,1,0), A90=90040003 A91=91000000 A92=92000002
+```
+
+The corrected B source is file 3, id 1, with its release marker, matching
+production SGE's two-varying linkage.  This is an offline compiler oracle,
+not a silicon test; native SLT numeric semantics remain unqualified.
 
 The first record computes `src0 + -src1` into special scratch r12.  Decoding
 the second gives A=r12/release, C=native ZERO, B=native ONE, subop 9, so the
@@ -141,9 +151,10 @@ Special-r12 allocation explains the active temporary high-water 13 and the
 `90040000` resource bucket, matching the established FLR/POW/NRM special
 scratch family.
 
-The constant and one-varying rows provide compiler-shape oracles, but they
-remain silicon-unqualified and use r12, which the current generic allocator
-does not expose.  The malformed two-varying row provides no execution oracle.
+The constant, one-varying, and corrected two-varying rows provide compiler-
+shape oracles, but they remain silicon-unqualified and use r12, which the
+current generic allocator does not expose.  The malformed historical row
+provides no execution oracle.
 Do not invent a one-record SLT or silently substitute SUB+CMP.  A future
 semantic SLT opcode must own this two-record expansion, special scratch
 reservation, and dependency finalization in the kernel.
