@@ -328,8 +328,13 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
    vs->max_hw_atomic_counter_buffers = 0;
 
    fs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
-   fs->max_instructions = 32;
-   fs->max_alu_instructions = 32;
+   /* The generic ABI accepts up to 96 ALUs and 32 TEX records.  A computed
+    * TEX can add an ALU bridge, and constant-port legalization can add MOVs;
+    * programs exceeding either native store are rejected by the compiler.
+    * The legacy draw path retains its smaller advertised limit. */
+   fs->max_instructions =
+      (screen->capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) ? 96 : 32;
+   fs->max_alu_instructions = fs->max_instructions;
    fs->max_inputs =
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
       3 : 2;
@@ -357,7 +362,13 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       fs_samplers = debug_fs_samplers;
    fs->max_texture_samplers = fs_samplers;
    fs->max_sampler_views = fs_samplers;
-   if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) {
+   /* Repeated fetches share descriptors but occupy separate TAU records.
+    * Keep this limit independent of the number of sampler slots. */
+   if (screen->capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) {
+      fs->max_tex_instructions = 32;
+      fs->max_tex_indirections = 1;
+   } else if (screen->capabilities &
+              DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) {
       fs->max_tex_instructions = fs->max_texture_samplers;
       fs->max_tex_indirections = 1;
    }

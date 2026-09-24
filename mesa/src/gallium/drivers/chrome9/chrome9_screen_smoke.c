@@ -7427,8 +7427,11 @@ main(int argc, char **argv)
           screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
        (screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers < 3 ||
         screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views < 3 ||
-        screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions < 3)) {
-      fputs("structured fragment three-sampler caps missing\n", stderr);
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions != 32 ||
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_instructions != 96 ||
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_alu_instructions != 96)) {
+      fputs("structured fragment instruction or sampler caps missing\n",
+            stderr);
       screen->destroy(screen);
       return 1;
    }
