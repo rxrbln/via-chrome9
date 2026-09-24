@@ -138,15 +138,18 @@ enum chrome9_prof_phase {
 	CHROME9_PROF_ENTRY,	/* ioctl copy-in and validation */
 	CHROME9_PROF_COMPILE,	/* PS and VS compilers */
 	CHROME9_PROF_MAP,	/* lookup, pages, lock, vmap, finite check */
-	CHROME9_PROF_FLUSH,	/* GART mapping, guards, CPU cache flush */
+	CHROME9_PROF_GART,	/* SF draw-cache mapping acquire */
+	CHROME9_PROF_FLUSH,	/* guards and CPU cache flush */
 	CHROME9_PROF_BUILD,	/* command stream build */
 	CHROME9_PROF_GPU,	/* append and wait for retirement */
-	CHROME9_PROF_RETIRE,	/* flush back, guard verify, unmap */
+	CHROME9_PROF_VERIFY,	/* flush back, guard verify, mapping release */
+	CHROME9_PROF_RETIRE,	/* unlock, vunmap, object and fence release */
 	CHROME9_PROF_COUNT,
 };
 
 static const char *const chrome9_prof_names[CHROME9_PROF_COUNT] = {
-	"entry", "compile", "map", "flush", "build", "gpu", "retire",
+	"entry", "compile", "map", "gart", "flush", "build", "gpu", "verify",
+	"retire",
 };
 static u64 chrome9_prof_ns[CHROME9_PROF_COUNT];
 static u64 chrome9_prof_jobs;
@@ -6141,6 +6144,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			ret = -EINVAL;
 			goto out_unmap;
 		}
+		chrome9_bo_hold_kmap(to_chrome9_bo(objects[i]));
 	}
 	if (tcl && tcl->buffer_count &&
 	    !chrome9_tcl_buffers_finite(tcl, job->fragment_maps, buffer_object,
@@ -6165,6 +6169,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		if (ret)
 			goto out_prepublication;
 	}
+	chrome9_prof_mark(CHROME9_PROF_GART);
 	for (i = 0; i < object_count; i++) {
 		if (i >= buffer_first) {
 			chrome9_cache_flush((u8 *)job->fragment_maps[i].vaddr +
@@ -6280,6 +6285,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		chrome9_sf_resync_object_locked(engine, objects[i]);
 	}
 	chrome9_job_release_mappings_locked(engine, job);
+	chrome9_prof_mark(CHROME9_PROF_VERIFY);
 	signal = true;
 	goto out_unlock_submit;
 

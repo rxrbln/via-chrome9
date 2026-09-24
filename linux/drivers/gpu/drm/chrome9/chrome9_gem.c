@@ -39,6 +39,45 @@ struct chrome9_framebuffer {
 	unsigned int pin_count;
 };
 
+static void chrome9_gem_free(struct drm_gem_object *obj)
+{
+	struct chrome9_bo *bo = to_chrome9_bo(obj);
+
+	if (!iosys_map_is_null(&bo->kmap)) {
+		dma_resv_lock(obj->resv, NULL);
+		drm_gem_shmem_vunmap_locked(&bo->base, &bo->kmap);
+		dma_resv_unlock(obj->resv);
+	}
+	drm_gem_shmem_object_free(obj);
+}
+
+static const struct drm_gem_object_funcs chrome9_gem_funcs = {
+	.free = chrome9_gem_free,
+	.print_info = drm_gem_shmem_object_print_info,
+	.pin = drm_gem_shmem_object_pin,
+	.unpin = drm_gem_shmem_object_unpin,
+	.get_sg_table = drm_gem_shmem_object_get_sg_table,
+	.vmap = drm_gem_shmem_object_vmap,
+	.vunmap = drm_gem_shmem_object_vunmap,
+	.mmap = drm_gem_shmem_object_mmap,
+	.vm_ops = &drm_gem_shmem_vm_ops,
+};
+
+/*
+ * Keep one kernel mapping reference for the object's lifetime, so per-job
+ * vmap/vunmap only count uses instead of rebuilding and tearing down the
+ * page table range (TLB flush) on every draw.  Caller holds the resv lock.
+ */
+void chrome9_bo_hold_kmap(struct chrome9_bo *bo)
+{
+	struct iosys_map map;
+
+	if (!iosys_map_is_null(&bo->kmap) || drm_gem_is_imported(&bo->base.base))
+		return;
+	if (!drm_gem_shmem_vmap_locked(&bo->base, &map))
+		bo->kmap = map;
+}
+
 struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,
 						 size_t size)
 {
@@ -46,6 +85,7 @@ struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,
 
 	if (!bo)
 		return ERR_PTR(-ENOMEM);
+	bo->base.base.funcs = &chrome9_gem_funcs;
 	/* Implicit until userspace opts in; nothing is known about caches. */
 	bo->cpu_dirty = true;
 	return &bo->base.base;

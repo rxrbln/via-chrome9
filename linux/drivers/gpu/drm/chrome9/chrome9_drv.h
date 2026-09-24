@@ -3,6 +3,7 @@
 #ifndef __CHROME9_DRV_H__
 #define __CHROME9_DRV_H__
 
+#include <linux/iosys-map.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/vgaarb.h>
@@ -167,7 +168,11 @@ struct chrome9_bo {
 	bool cpu_dirty;
 	/* The device wrote since the last CPU invalidate. */
 	bool device_written;
+	/* Kernel mapping kept from the first job until the object is freed. */
+	struct iosys_map kmap;
 };
+
+void chrome9_bo_hold_kmap(struct chrome9_bo *bo);
 
 static inline struct chrome9_bo *to_chrome9_bo(struct drm_gem_object *obj)
 {
