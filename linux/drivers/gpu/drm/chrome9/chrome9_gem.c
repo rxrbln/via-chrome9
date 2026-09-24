@@ -29,6 +29,7 @@
 #define CHROME9_SCANOUT_PITCH_MAX	0x3ff8U
 #define CHROME9_DMA32_SCANOUT_MAX_SIZE \
 	((u64)CHROME9_SCANOUT_PITCH_MAX * CHROME9_SCANOUT_MAX_HEIGHT)
+#define CHROME9_CURSOR_BYTES	(64U * 64U * 4U)
 
 struct chrome9_framebuffer {
 	struct drm_framebuffer base;
@@ -47,6 +48,18 @@ chrome9_gem_set_dma32(struct drm_gem_shmem_object *shmem_obj)
 	/* drm_gem_get_pages() requires this zone to remain stable thereafter. */
 	mapping_set_gfp_mask(mapping,
 			     (mask & ~GFP_ZONEMASK) | __GFP_DMA32);
+}
+
+struct drm_gem_object *chrome9_gem_cursor_create(struct drm_device *drm)
+{
+	struct drm_gem_shmem_object *shmem;
+
+	shmem = drm_gem_shmem_create(drm, CHROME9_CURSOR_BYTES);
+	if (IS_ERR(shmem))
+		return ERR_CAST(shmem);
+	/* Cursor SF PTEs are 32-bit even when scanout uses a wider DMA mask. */
+	chrome9_gem_set_dma32(shmem);
+	return &shmem->base;
 }
 
 static inline struct chrome9_framebuffer *
@@ -174,7 +187,13 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 	u64 modifier;
 	int ret;
 
-	if (info->format != DRM_FORMAT_XRGB8888 || info->num_planes != 1)
+	if ((info->format != DRM_FORMAT_XRGB8888 &&
+	     info->format != DRM_FORMAT_ARGB8888) || info->num_planes != 1)
+		return ERR_PTR(-EINVAL);
+	/* ARGB is exposed only for the bounded IGA1 cursor, never scanout. */
+	if (info->format == DRM_FORMAT_ARGB8888 &&
+	    (mode_cmd->width > 64 || mode_cmd->height > 64 ||
+	     mode_cmd->offsets[0]))
 		return ERR_PTR(-EINVAL);
 	if (mode_cmd->flags & ~DRM_MODE_FB_MODIFIERS)
 		return ERR_PTR(-EINVAL);

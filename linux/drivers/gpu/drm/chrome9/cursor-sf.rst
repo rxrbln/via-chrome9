@@ -1,0 +1,45 @@
+Chrome9 VX900 IGA1 ARGB cursor
+===============================
+
+The IGA1 hardware-icon cursor is opt-in with ``cursor_sf=1``.  The default is
+off until its SF image-address domain and channel order pass a bounded silicon
+oracle.  It does not enable IGA2 cursor hardware.
+
+The cursor plane accepts linear ARGB8888 images up to 64 by 64 pixels.  It
+copies each *new framebuffer* into the inactive of two permanently SF-pinned
+64-by-64 images, synchronizes CPU writes for the display fetcher, hides the
+old cursor, waits for the next IGA1 blank, changes the image base, then shows
+the new cursor.  The two private mappings stay pinned through KMS teardown;
+they are released only after successful restoration of the saved display
+state.  Movement-only commits change position and clipped origin without
+copying image data or waiting for a blank.
+
+The legacy cursor ioctl's hotspot is metadata: CRTC X/Y already describe the
+image's top-left corner.  MMIO 02fc is used only for clipping when X or Y is
+negative; it is not the hotspot.  Userspace changing pixels in place within
+the *same* framebuffer must submit a new framebuffer for this shadow-copy
+path to refresh the image.  An explicit DIRTYFB refresh is future work.
+
+``tools/chrome9_cursor_sf_oracle.c`` is the bounded DRM-master test.  It never
+programs a primary framebuffer or a mode.  It shows an ARGB pattern, moves it
+through positive and clipped-negative positions, switches to a second image,
+then hides it.  Only run it with an active IGA1 CRTC and no X server holding
+DRM master.  Compare 02f0/02f4/02f8/02fc readback, the external display, and
+the immediate kernel log; retain the known-good module for rollback.  Any
+timeout or register mismatch is a failed qualification, not permission to
+turn on ``cursor_sf`` by default.
+
+The first 2026-09-24 VX900 run passed the register oracle under an existing
+1024-by-768 IGA1 fbdev mode: image A at (100,100) produced control
+``36000005``, SF base ``20014000``, position ``00640064``, origin zero;
+moving A to (-8,-12) kept that base and produced position zero, origin
+``0008000c``.  Image B changed the base to ``20010000`` at (180,120), and
+hide cleared bits 2 and 0 to ``36000000``.  Six ``-ENOSPC`` SF-pin messages
+at kernel times 9263.757--9263.795 came from the *old* module while X was
+shutting down, before the opt-in module initialized at 9264.068.  None
+recurred during the cursor test or after known-good X restoration at
+9270--9271; there was no new fault, timeout, or quarantine record.  This
+proves programming/readback and safe handoff, not
+that the image's RGB/alpha pixels were visibly fetched: the available KVM
+capture does not support this output mode.  Do not enable the opt-in by
+default on register evidence alone.

@@ -104,6 +104,7 @@ static inline u32 chrome9_iga2_base_pack(u32 old, u32 byte_address)
 struct drm_file;
 struct drm_format_info;
 struct drm_framebuffer;
+struct drm_gem_object;
 struct drm_mode_create_dumb;
 struct drm_mode_fb_cmd2;
 struct chrome9_engine;
@@ -127,6 +128,7 @@ struct chrome9_device {
 	struct chrome9_engine *engine;
 	bool kms_shutdown;
 	struct drm_simple_display_pipe display_pipe;
+	struct drm_plane cursor_plane;
 	struct drm_connector display_connector;
 };
 
@@ -158,6 +160,7 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
 int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 			    struct drm_mode_create_dumb *args);
+struct drm_gem_object *chrome9_gem_cursor_create(struct drm_device *drm);
 struct drm_framebuffer *
 chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		      const struct drm_format_info *info,
