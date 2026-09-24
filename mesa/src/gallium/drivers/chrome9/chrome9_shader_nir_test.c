@@ -907,6 +907,186 @@ check_function_medium_sqrt_boundary(struct chrome9_context *context)
    return valid;
 }
 
+static nir_shader *
+make_ideas_logo_shadow_fragment(float alpha_reference, unsigned sample_lane,
+                                bool reverse_predicate)
+{
+   /* Exact linked fragment expression.  A8, NEAREST, and REPEAT belong to
+    * the sampler view/state, not to the NIR texture instruction. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-ideas-logo-shadow");
+   nir_def *position = nir_load_frag_coord(&b);
+   nir_def *transform = nir_load_ubo(
+      &b, 2, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      .align_mul = 16, .range_base = 0, .range = 8);
+   nir_def *y = nir_fadd(&b,
+      nir_fmul(&b, nir_channel(&b, position, 1),
+                    nir_channel(&b, transform, 0)),
+      nir_channel(&b, transform, 1));
+   nir_def *coordinate = nir_fmul(&b,
+      nir_vec2(&b, nir_channel(&b, position, 0), y),
+      nir_imm_vec2(&b, 1.0f / 32.0f, 1.0f / 32.0f));
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+
+   b.shader->info.io_lowered = true;
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coordinate);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_def *sampled = nir_channel(&b, &tex->def, sample_lane);
+   nir_def *reference = nir_imm_float(&b, alpha_reference);
+
+   nir_discard_if(&b, reverse_predicate ?
+      nir_flt(&b, reference, sampled) : nir_flt(&b, sampled, reference));
+   nir_store_output(&b, &tex->def, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static bool
+ideas_immediate_equals(const struct chrome9_shader *shader,
+                       const struct chrome9_ps_source *source,
+                       unsigned lane, uint32_t value)
+{
+   return source->file == CHROME9_PS_SOURCE_CONSTANT &&
+      source->id < 32 && source->swizzle[lane] < 4 &&
+      (shader->native_fs.immediate_mask & (1u << source->id)) &&
+      shader->native_fs.immediate[source->id][source->swizzle[lane]] == value;
+}
+
+static bool
+check_ideas_logo_shadow_compilation(struct chrome9_context *context)
+{
+   struct chrome9_shader shader = { 0 }, wrong_reference = { 0 };
+   struct chrome9_shader reversed = { 0 }, non_alpha = { 0 };
+   nir_shader *nir = make_ideas_logo_shadow_fragment(0.5f, 3, false);
+   nir_shader *negative = make_ideas_logo_shadow_fragment(0.25f, 3, false);
+   nir_shader *reversed_nir = make_ideas_logo_shadow_fragment(0.5f, 3, true);
+   nir_shader *non_alpha_nir = make_ideas_logo_shadow_fragment(0.5f, 0, false);
+   const struct chrome9_ps_instruction *p = shader.semantic_fs_ir.instruction;
+   bool valid;
+
+   if (setenv("CHROME9_EXPERIMENTAL_TEXKILL", "1", 1)) {
+      ralloc_free(non_alpha_nir);
+      ralloc_free(reversed_nir);
+      ralloc_free(negative);
+      ralloc_free(nir);
+      return false;
+   }
+   context->fragment_kill = true;
+   chrome9_compile_fs_nir(context, &shader, nir);
+   chrome9_compile_fs_nir(context, &wrong_reference, negative);
+   chrome9_compile_fs_nir(context, &reversed, reversed_nir);
+   chrome9_compile_fs_nir(context, &non_alpha, non_alpha_nir);
+   /* This is the exact source-order semantic chain: transformed Y, X/Y
+    * assembly, normalized sample, sampled-alpha KILL, then sampled color. */
+   valid = shader.supported && shader.semantic_fs_valid &&
+      shader.fragment_program == CHROME9_FS_COMPILED_ALU &&
+      shader.semantic_fs_ir.count == 9 &&
+      shader.semantic_input_mask == 0 &&
+      shader.semantic_varying_mask == 0 &&
+      shader.semantic_sampler_mask == 1 &&
+      shader.semantic_uniform_mask == 1 &&
+      p[0].op == CHROME9_PS_OPCODE_MUL &&
+      p[0].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[0].destination.writemask == 1 &&
+      p[0].source[0].file == CHROME9_PS_SOURCE_POSITION &&
+      p[0].source[0].swizzle[0] == CHROME9_PS_SWIZZLE_Y &&
+      p[0].source[1].file == CHROME9_PS_SOURCE_CONSTANT &&
+      p[0].source[1].id == 0 &&
+      p[0].source[1].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+      p[1].op == CHROME9_PS_OPCODE_ADD &&
+      p[1].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[1].destination.writemask == 1 &&
+      p[1].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[1].source[0].id == p[0].destination.id &&
+      p[1].source[0].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+      p[1].source[1].file == CHROME9_PS_SOURCE_CONSTANT &&
+      p[1].source[1].id == 0 &&
+      p[1].source[1].swizzle[0] == CHROME9_PS_SWIZZLE_Y &&
+      p[2].op == CHROME9_PS_OPCODE_MOV &&
+      p[2].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[2].destination.writemask == 1 &&
+      p[2].source[0].file == CHROME9_PS_SOURCE_POSITION &&
+      p[2].source[0].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+      p[3].op == CHROME9_PS_OPCODE_MOV &&
+      p[3].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[3].destination.id == p[2].destination.id &&
+      p[3].destination.writemask == 2 &&
+      p[3].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[3].source[0].id == p[1].destination.id &&
+      p[3].source[0].swizzle[1] == CHROME9_PS_SWIZZLE_X &&
+      p[4].op == CHROME9_PS_OPCODE_MUL &&
+      p[4].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[4].destination.writemask == 3 &&
+      p[4].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[4].source[0].id == p[2].destination.id &&
+      p[4].source[0].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+      p[4].source[0].swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+      ideas_immediate_equals(&shader, &p[4].source[1], 0, 0x3d000000) &&
+      ideas_immediate_equals(&shader, &p[4].source[1], 1, 0x3d000000) &&
+      p[5].op == CHROME9_PS_OPCODE_TEX && p[5].sampler == 0 &&
+      p[5].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[5].destination.writemask == 0xf &&
+      p[5].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[5].source[0].id == p[4].destination.id &&
+      p[5].source[0].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+      p[5].source[0].swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+      p[5].source[0].swizzle[2] == CHROME9_PS_SWIZZLE_ZERO &&
+      p[5].source[0].swizzle[3] == CHROME9_PS_SWIZZLE_ONE &&
+      p[6].op == CHROME9_PS_OPCODE_SUB &&
+      p[6].destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      p[6].destination.writemask == 0xf &&
+      p[6].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[6].source[0].id == p[5].destination.id &&
+      ideas_immediate_equals(&shader, &p[6].source[1], 0, 0x3f000000) &&
+      p[7].op == CHROME9_PS_OPCODE_KILL &&
+      p[7].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[7].source[0].id == p[6].destination.id &&
+      p[8].op == CHROME9_PS_OPCODE_MOV &&
+      p[8].destination.file == CHROME9_PS_DESTINATION_COLOR &&
+      p[8].destination.id == 0 &&
+      p[8].destination.writemask == 0xf &&
+      !p[8].destination.saturate &&
+      p[8].source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      p[8].source[0].id == p[5].destination.id &&
+      !p[8].source[0].modifier &&
+      !wrong_reference.supported && !wrong_reference.semantic_fs_valid &&
+      !reversed.supported && !reversed.semantic_fs_valid &&
+      !non_alpha.supported && !non_alpha.semantic_fs_valid;
+   if (valid)
+      for (unsigned lane = 0; lane < 4; lane++)
+         valid &= p[6].source[0].swizzle[lane] ==
+                     CHROME9_PS_SWIZZLE_W &&
+                  p[6].source[1].swizzle[lane] ==
+                     p[6].source[1].swizzle[0] &&
+                  p[7].source[0].swizzle[lane] == lane &&
+                  p[8].source[0].swizzle[lane] == lane;
+   if (!valid)
+      fprintf(stderr, "ideas logo-shadow compilation failed: "
+              "supported=%u semantic=%u ir=%u inputs=%x varyings=%x "
+              "samplers=%x uniforms=%x wrong=%u/%u reversed=%u/%u "
+              "nonalpha=%u/%u\n",
+              shader.supported, shader.semantic_fs_valid,
+              shader.semantic_fs_ir.count, shader.semantic_input_mask,
+              shader.semantic_varying_mask, shader.semantic_sampler_mask,
+              shader.semantic_uniform_mask,
+              wrong_reference.supported, wrong_reference.semantic_fs_valid,
+              reversed.supported, reversed.semantic_fs_valid,
+              non_alpha.supported, non_alpha.semantic_fs_valid);
+   ralloc_free(non_alpha_nir);
+   ralloc_free(reversed_nir);
+   ralloc_free(negative);
+   ralloc_free(nir);
+   return valid;
+}
+
 int
 main(void)
 {
@@ -995,8 +1175,9 @@ main(void)
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
        !check_function_medium_sqrt_boundary(&context) ||
+       !check_ideas_logo_shadow_compilation(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, Blinn-Phong shape, function-medium sqrt boundary, and blur compilation passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur compilation passed");
    return 0;
 }
