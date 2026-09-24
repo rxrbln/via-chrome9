@@ -210,6 +210,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_FRAGMENT_POSITION		(1ULL << 52)
 /* Fragment L0 may target a guarded BO with additional trailing mip storage. */
 #define DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED	(1ULL << 53)
+/* Generic fragment programs may read normalized vertex primary color D1. */
+#define DRM_CHROME9_CAP_FRAGMENT_PRIMARY		(1ULL << 54)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -997,6 +999,8 @@ enum drm_chrome9_fragment_file {
 	DRM_CHROME9_FRAGMENT_FILE_CONSTANT = 2,
 	/* Native fragment position, not a vertex varying; index must be zero. */
 	DRM_CHROME9_FRAGMENT_FILE_POSITION = 3,
+	/* Normalized vertex primary color D1, native v0; index must be zero. */
+	DRM_CHROME9_FRAGMENT_FILE_PRIMARY = 4,
 };
 
 #define DRM_CHROME9_FRAGMENT_DEST_TEMP	0
