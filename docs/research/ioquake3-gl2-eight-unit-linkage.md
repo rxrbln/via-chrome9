@@ -1,10 +1,11 @@
 # Chrome9 GL2 sampler limits and eight-unit linkage
 
 Status: ioquake3 source-exact startup audit, VX900-manual packet derivation,
-and fresh Windows/Linux compiler replay, 2026-09-21.  Texture stages zero and
-one are live.  Stages two through seven and the five-TAU object below are not
-silicon-proven.  The current default limit of two remains truthful; the
-existing environment override is diagnostic only.
+and fresh Windows/Linux compiler replay, 2026-09-21; current Mesa compiler
+boundary refreshed 2026-09-24.  Texture stages zero through two have bounded
+structured-path evidence.  Stages three through seven and the five-TAU object
+below are not silicon-proven.  The current production limit of three remains
+truthful; the existing environment override is diagnostic only.
 
 ## What ioquake3 actually needs to start
 
@@ -13,7 +14,7 @@ The audited renderer is ioquake3 commit
 specular and deluxe mapping, disable cube mapping and use sunlight mode one.
 The lightall initializer visits permutation indices in increasing order.
 
-The first shader exceeding Chrome9's current two-fragment-sampler cap is
+The first shader exceeding Chrome9's current three-fragment-sampler cap is
 `LIGHTDEF_USE_LIGHTMAP`, index one.  Its active uniforms are:
 
 ```text
@@ -48,6 +49,102 @@ classifier which silently drops other valid three-to-eight-sampler draws does
 not satisfy that contract.  Promote the default only after state, lifetime,
 compiler and representative program coverage exist; otherwise keep this an
 explicit diagnostic probe.
+
+## Current first-default-permutation compiler boundary
+
+The source-order index-one program above is also the first useful default
+world permutation, not merely a sampler-cap counterexample.  The available
+local ioquake3 tree is shallow commit `5883936`; its lightall sources and
+feature construction match the source lines audited at `93abc60`, but the
+older commit object is not present locally.  The byte identities below are
+therefore explicitly for `5883936` and must not be relabelled as a capture of
+`93abc60`.
+
+The probe used the default semantic defines:
+
+```text
+USE_LIGHT USE_LIGHTMAP USE_DELUXEMAP USE_NORMALMAP USE_SPECULARMAP
+r_deluxeSpecular=0.300000 GLOSS_IS_SMOOTHNESS
+```
+
+The raw source SHA-256 values are:
+
+```text
+lightall_vp.glsl  a59b8a25c7f85be6d90076c0248c278cc984813ec9325bdb192ec2074233e1dc
+lightall_fp.glsl  46b1467726d01d81ddb1f217f519aa7851790831b10715076fed8f8df4aa58a3
+```
+
+The linked fragment object has five dense samplers, logical units zero
+through four, and six smooth vec4 declarations.  Only three lanes of VAR5 are
+live, so the exact smooth interface is 23 components:
+
+```text
+VAR0  packed diffuse/lightmap coordinates, xy/zw
+VAR1  vertex color
+VAR2  normal.xyz and view.x
+VAR3  tangent.xyz and view.y
+VAR4  bitangent.xyz and view.z
+VAR5  light direction.xyz
+FACE  gl_FrontFacing system value, flat per primitive
+```
+
+The non-sampler store uses three vec4s (`u_EnableTextures`, `u_NormalScale`,
+`u_SpecularScale`) plus the integer alpha mode: 13 components.  This fits the
+32-vector constant store.  The current link fails first at five samplers
+versus the advertised three.  A diagnostic sampler override can pass that
+link check, but does not qualify five descriptor stages or the six-varying
+draw layout.
+
+After mechanically applying the semantically exact alpha-mode-zero variant,
+the linked fragment NIR has source BLAKE3 words:
+
+```text
+b74fa228 0463e837 19ff85e8 95d43a83
+eeab1fd8 4f324902 fb56f997 33ce7ba0
+```
+
+Its operation inventory is 95 ALU nodes plus five ordinary 2D TEX:
+
+```text
+32 MUL, 18 ADD, 8 DP3, 7 NEG, 7 MAX, 6 MIN, 4 RSQ,
+3 MOV, 2 RCP, 2 vec2, and one each b2b1, BCSEL, POW,
+SQRT, vec3 and vec4
+```
+
+This is already close to the 96-ALU store before native expansion.  POW
+becomes LOG2/MUL/EXP2, adding two records relative to its NIR node; SQRT still
+needs a conformant lowering; constructors may fold into swizzles or require
+MOVs.  An exact final native count and twelve-register physical-temp high-
+water cannot be claimed until those semantic blockers lower successfully.
+
+The first current backend rejection after mode-zero specialization is not an
+unknown lighting opcode.  `gl_FrontFacing` appears as a FACE `load_input`,
+then drives `bcsel(face, -normal, normal)`.  `chrome9_compile_ps_nir()` admits
+smooth interpolated inputs but not the FACE system load, so it rejects before
+emitting a semantic object.  Even if the value were exposed as an ordinary
+source, the only current BCSEL lowering is a bounded floating `fge` select on
+a proven unit interval; it does not implement a boolean front-face select.
+The next independent arithmetic reject is the unlowered SQRT used to
+reconstruct normal Z.  The current compiler result is therefore exact and
+empty: `supported=0`, `semantic=0`, zero semantic records, zero ALU and zero
+TAU.  No partial native object is evidence of fit.
+
+The generic implementation ladder is:
+
+1. retain alpha mode in the draw-time variant key and prove mode zero removes
+   all three `terminate_if` side effects;
+2. expose per-primitive FACE semantics without an application key, and lower
+   the sign selection exactly for both front and back triangles;
+3. lower finite nonnegative SQRT through a qualified sequence and reject
+   exceptional domains until characterized;
+4. rerun allocation and require final ALU `<=96`, TEX `=5`, physical temps in
+   range, varying mask `0x3f`, sampler mask `0x1f`, and no spill;
+5. only then promote five dense descriptors and six float varyings, followed
+   by distinct-color front/back pixel oracles and stale-state closure.
+
+Do not solve this boundary by forcing all triangles front-facing, dropping
+the normal/deluxe/specular samples, or selecting the reduced two-texture
+object.  Those change the default shader rather than implement it.
 
 ## Hardware namespace and image state
 
