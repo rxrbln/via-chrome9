@@ -2123,6 +2123,49 @@ int chrome9_fragment_selftest(void)
 			},
 		},
 	};
+	static const struct drm_chrome9_fragment_instruction split_t2[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0x1, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_W,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0x2, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 1,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_W,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0x4, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 2,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 },
+			},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0x8, 0 },
+			.src = {
+				{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 2,
+				  { DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_W }, 0, 0 },
+			},
+		},
+	};
 	static const struct drm_chrome9_fragment_instruction resource_repeat[] = {
 		{
 			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
@@ -2199,6 +2242,12 @@ int chrome9_fragment_selftest(void)
 		{ 0x01c00530, 0x301c0053, 0x00f2c005, 0x000d0020 },
 		{ 0x02c10530, 0x30140924, 0x00f20005, 0x00000060 },
 		{ 0x02c20530, 0x30140924, 0x00f20105, 0x00000820 },
+	};
+	static const u32 expected_split_t2_alu[][4] = {
+		{ 0x01c00530, 0xd01c0053, 0x0012c076, 0x000d0820 },
+		{ 0x01c00530, 0xd01c0053, 0x0022c1ae, 0x000d0820 },
+		{ 0x01c00530, 0x501c0053, 0x0040c2b4, 0x000d0820 },
+		{ 0x01c00530, 0xb01c0053, 0x0082c2b6, 0x000d0820 },
 	};
 	static const u32 constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4];
 	struct chrome9_fragment_program *program;
@@ -2377,6 +2426,20 @@ int chrome9_fragment_selftest(void)
 	    program->alu_count != ARRAY_SIZE(expected_resource_chain_alu) ||
 	    memcmp(program->alu, expected_resource_chain_alu,
 		   sizeof(expected_resource_chain_alu))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = chrome9_fragment_compile(split_t2, ARRAY_SIZE(split_t2),
+		constants, 0, 0, 3, program);
+	if (ret || program->active_texture_count != 3 ||
+	    program->varying_count != 3 || program->varying_width[0] != 4 ||
+	    program->varying_width[1] != 4 || program->varying_width[2] != 4 ||
+	    program->alu_count != ARRAY_SIZE(expected_split_t2_alu) ||
+	    memcmp(program->alu, expected_split_t2_alu,
+		   sizeof(expected_split_t2_alu)) ||
+	    program->controls[0] != 0x90058007 ||
+	    program->controls[1] != 0x91000000 ||
+	    program->controls[2] != 0x92000004) {
 		ret = -EINVAL;
 		goto out;
 	}
