@@ -91,6 +91,12 @@ module_param_named(ps_add, chrome9_ps_add, bool, 0400);
 MODULE_PARM_DESC(ps_add,
 		 "Enable the pre-promotion structured pixel ADD opcode (default: false)");
 
+static bool chrome9_fragment_sparse_textures;
+module_param_named(fragment_sparse_textures,
+	chrome9_fragment_sparse_textures, bool, 0400);
+MODULE_PARM_DESC(fragment_sparse_textures,
+	"Enable unqualified sparse fragment sampler ABI v2 (default: false)");
+
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
@@ -229,6 +235,7 @@ struct chrome9_draw_request {
 	const struct chrome9_fragment_program *fragment_program;
 	u64 fragment_texture_size[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_texture_count;
+	u8 fragment_texture_units[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_depth_format;
 	u32 ps_program[4];
 	u32 ps_constant_c0[4];
@@ -1945,6 +1952,40 @@ chrome9_fragment_rt_format(u32 format)
 	return &chrome9_fragment_rt_formats[format];
 }
 
+static void chrome9_emit_fragment_texture(u32 **cursor,
+	const struct drm_chrome9_fragment_texture_state *texture,
+	u32 texture_base, u32 unit)
+{
+	u32 width = texture->width >> texture->first_level;
+	u32 height = texture->height >> texture->first_level;
+	u32 log_size = ilog2(max(height, 1U)) << 4 |
+		ilog2(max(width, 1U));
+	u32 level_count = texture->last_level - texture->first_level;
+	u32 mip[8];
+	u32 image[] = {
+		(texture_base + texture->level_offset[texture->first_level]) >> 8,
+		0x18001101, 0x20000000 | height << 12 | width,
+		0x21000001, 0x22000000 |
+		(is_power_of_2(width) && is_power_of_2(height) ? BIT(15) : 0) |
+		log_size,
+		0x30000000 | chrome9_fragment_texture_format(texture->format) << 16 |
+		(texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ?
+		 0x2000 : 0),
+	};
+	u32 sampler[4];
+
+	chrome9_fragment_sampler_state(texture, sampler);
+	chrome9_emit_header2(cursor, 0x440, 0x0000043c,
+		unit << 24 | 0x00020000, image, ARRAY_SIZE(image));
+	if (level_count) {
+		chrome9_fragment_mip_state(texture, mip);
+		chrome9_emit_header3(cursor, 0x10030000 | unit << 3, mip,
+			ARRAY_SIZE(mip));
+	}
+	chrome9_emit_header2(cursor, 0x440, 0x0000043c,
+		unit << 24 | 0x20020000, sampler, ARRAY_SIZE(sampler));
+}
+
 static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	const struct chrome9_draw_request *request, struct chrome9_job *job,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
@@ -2089,39 +2130,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     destination_state, destination_count);
 	for (i = 0; i < request->fragment_texture_count; i++) {
-		const struct drm_chrome9_fragment_texture_state *texture =
-			&request->fragment_textures[i];
-		u32 width = texture->width >> texture->first_level;
-		u32 height = texture->height >> texture->first_level;
-		u32 log_size = ilog2(max(height, 1U)) << 4 |
-			ilog2(max(width, 1U));
-		u32 level_count = texture->last_level - texture->first_level;
-		u32 mip[8];
-		u32 image[] = {
-			(texture_base[i] + texture->level_offset[texture->first_level]) >> 8,
-			0x18001101, 0x20000000 | height << 12 | width,
-			0x21000001, 0x22000000 |
-			(is_power_of_2(width) && is_power_of_2(height) ? BIT(15) : 0) |
-			log_size,
-			0x30000000 | chrome9_fragment_texture_format(texture->format) << 16 |
-			(texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ?
-			 0x2000 : 0),
-		};
-		u32 sampler[4];
-
-		chrome9_fragment_sampler_state(texture, sampler);
-
-		chrome9_emit_header2(&p, 0x440, 0x0000043c,
-				     i << 24 | 0x00020000, image,
-				     ARRAY_SIZE(image));
-		if (level_count) {
-			chrome9_fragment_mip_state(texture, mip);
-			chrome9_emit_header3(&p, 0x10030000 | i << 3, mip,
-					     ARRAY_SIZE(mip));
-		}
-		chrome9_emit_header2(&p, 0x440, 0x0000043c,
-				     i << 24 | 0x20020000, sampler,
-				     ARRAY_SIZE(sampler));
+		chrome9_emit_fragment_texture(&p, &request->fragment_textures[i],
+			texture_base[i], request->fragment_texture_units[i]);
 	}
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     common, common_count);
@@ -3663,6 +3673,11 @@ bool chrome9_rhw_chain_enabled(void)
 bool chrome9_ps_add_enabled(void)
 {
 	return READ_ONCE(chrome9_ps_add);
+}
+
+bool chrome9_fragment_sparse_textures_enabled(void)
+{
+	return READ_ONCE(chrome9_fragment_sparse_textures);
 }
 
 static int chrome9_fragment_texture_selftest(void);
@@ -7080,7 +7095,7 @@ int chrome9_draw_textured_triangle_blend_ioctl(struct drm_device *drm,
 
 static int chrome9_validate_fragment_texture(
 	const struct drm_chrome9_fragment_texture_state *texture,
-	u64 *object_size)
+	u64 *object_size, bool sparse_textures)
 {
 	u64 base_offset;
 	u64 end = 0;
@@ -7126,7 +7141,9 @@ static int chrome9_validate_fragment_texture(
 	    texture->min_lod_s5_5 < 0 || texture->max_lod_s5_5 < 0 ||
 	    (texture->min_lod_s5_5 & 31) ||
 	    (texture->max_lod_s5_5 & 31) || texture->border_color ||
-	    texture->reserved0 ||
+	    (sparse_textures ?
+	     texture->reserved0 >= DRM_CHROME9_FRAGMENT_MAX_TEXTURES :
+	     texture->reserved0) ||
 	    memchr_inv(texture->reserved, 0, sizeof(texture->reserved)))
 		return -EINVAL;
 	level_count = texture->last_level - texture->first_level;
@@ -7209,6 +7226,8 @@ static int chrome9_fragment_texture_selftest(void)
 	};
 	u32 sampler[4];
 	u32 mip[8];
+	u32 packet[40] __aligned(16);
+	u32 *cursor;
 	u64 object_size;
 	unsigned int i;
 	int ret;
@@ -7230,7 +7249,7 @@ static int chrome9_fragment_texture_selftest(void)
 						     4 * PAGE_SIZE, true))
 		return -EINVAL;
 
-	ret = chrome9_validate_fragment_texture(&texture, &object_size);
+	ret = chrome9_validate_fragment_texture(&texture, &object_size, false);
 	if (ret)
 		return ret;
 	chrome9_fragment_sampler_state(&texture, sampler);
@@ -7239,6 +7258,26 @@ static int chrome9_fragment_texture_selftest(void)
 	    memcmp(sampler, expected_sampler, sizeof(expected_sampler)) ||
 	    mip[0] != 0x40000020 || memchr_inv(mip + 1, 0,
 					       7 * sizeof(*mip)))
+		return -EINVAL;
+	/* Both ABIs use compact BO addresses.  Only the packet's image,
+	 * mipmap and sampler selectors change to the logical unit in v2. */
+	cursor = packet;
+	chrome9_emit_fragment_texture(&cursor, &texture, 0x4000, 0);
+	if (cursor != packet + 32 || packet[2] != 0x00020000 ||
+	    packet[4] != 0x50 || packet[14] != 0x10030000 ||
+	    packet[26] != 0x20020000)
+		return -EINVAL;
+	texture.reserved0 = 5;
+	if (chrome9_validate_fragment_texture(&texture, &object_size, false) !=
+	    -EINVAL ||
+	    chrome9_validate_fragment_texture(&texture, &object_size, true))
+		return -EINVAL;
+	cursor = packet;
+	chrome9_emit_fragment_texture(&cursor, &texture, 0x4000,
+		texture.reserved0);
+	if (cursor != packet + 32 || packet[2] != 0x05020000 ||
+	    packet[4] != 0x50 || packet[14] != 0x10030028 ||
+	    packet[26] != 0x25020000)
 		return -EINVAL;
 
 	for (i = 0; i < ARRAY_SIZE(formats); i++) {
@@ -7260,13 +7299,15 @@ static int chrome9_fragment_texture_selftest(void)
 		texture.level_offset[1] = 3 * PAGE_SIZE;
 		texture.level_pitch[1] =
 			ALIGN((texture.width >> 1) * formats[i].bytes_per_pixel, 32);
-		ret = chrome9_validate_fragment_texture(&texture, &object_size);
+		ret = chrome9_validate_fragment_texture(&texture, &object_size,
+			false);
 		if (ret || object_size != 5 * PAGE_SIZE ||
 		    chrome9_fragment_texture_format(texture.format) !=
 			formats[i].image)
 			return -EINVAL;
 		texture.level_pitch[0] += 32;
-		if (chrome9_validate_fragment_texture(&texture, &object_size) !=
+		if (chrome9_validate_fragment_texture(&texture, &object_size,
+			false) !=
 		    -EINVAL)
 			return -EINVAL;
 	}
@@ -7306,12 +7347,17 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 	u64 surface_size;
 	u64 total_size;
 	u32 vertex_count;
+	u32 descriptor_mask = 0;
 	bool depth = args->flags & DRM_CHROME9_FRAGMENT_DEPTH;
 	bool blend = args->flags & DRM_CHROME9_FRAGMENT_BLEND;
+	bool sparse_textures = args->abi_version ==
+		DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES;
 	unsigned int i;
 	int ret;
 
-	if (args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION ||
+	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
+	     !sparse_textures) ||
+	    (sparse_textures && !chrome9_fragment_sparse_textures_enabled()) ||
 	    args->reserved0 || args->pad ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    chrome9_validate_depth_flags(args->flags, allowed_flags) ||
@@ -7394,10 +7440,20 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 			goto out_free;
 		}
 		for (i = 0; i < args->texture_count; i++) {
+			u32 unit = sparse_textures ? textures[i].reserved0 : i;
+
+			if (unit >= DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
+			    (sparse_textures && i &&
+			     unit <= request.fragment_texture_units[i - 1])) {
+				ret = -EINVAL;
+				goto out_free;
+			}
 			ret = chrome9_validate_fragment_texture(&textures[i],
-				&request.fragment_texture_size[i]);
+				&request.fragment_texture_size[i], sparse_textures);
 			if (ret)
 				goto out_free;
+			request.fragment_texture_units[i] = unit;
+			descriptor_mask |= BIT(unit);
 			if (check_add_overflow(total_size,
 				request.fragment_texture_size[i], &total_size)) {
 				ret = -E2BIG;
@@ -7456,9 +7512,15 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 		ret = -ENOMEM;
 		goto out_free;
 	}
-	ret = chrome9_fragment_compile(instructions, args->instruction_count,
-		constants, args->constant_count, args->texture_count,
-		args->varying_count, program);
+	if (sparse_textures)
+		ret = chrome9_fragment_compile_sparse(instructions,
+			args->instruction_count, constants, args->constant_count,
+			args->texture_count, descriptor_mask, args->varying_count,
+			program);
+	else
+		ret = chrome9_fragment_compile(instructions,
+			args->instruction_count, constants, args->constant_count,
+			args->texture_count, args->varying_count, program);
 	if (ret)
 		goto out_free;
 	request.fragment_vertices = vertices;

@@ -28,6 +28,11 @@ int chrome9_fragment_compile(
 	u32 instruction_count, const u32 *constants, u32 constant_count,
 	u32 texture_count, u32 varying_count,
 	struct chrome9_fragment_program *program);
+int chrome9_fragment_compile_sparse(
+	const struct drm_chrome9_fragment_instruction *instructions,
+	u32 instruction_count, const u32 *constants, u32 constant_count,
+	u32 texture_count, u32 descriptor_mask, u32 varying_count,
+	struct chrome9_fragment_program *program);
 int chrome9_fragment_selftest(void);
 
 #endif

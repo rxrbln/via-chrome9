@@ -180,7 +180,7 @@ static u8 chrome9_fragment_alu_component_mask(
 
 static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	u32 instruction_count, u32 constant_count, u32 texture_count,
-	u32 varying_count)
+	u32 descriptor_mask, bool sparse_textures, u32 varying_count)
 {
 	u8 output_mask = 0;
 	u32 alu_count = 0;
@@ -258,7 +258,11 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			return -EINVAL;
 		if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX) {
 			if (++tau_count > DRM_CHROME9_FRAGMENT_MAX_TAU ||
-			    instruction->sampler >= texture_count ||
+			    (sparse_textures ?
+			     (instruction->sampler >=
+			      DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
+			      !(descriptor_mask & BIT(instruction->sampler))) :
+			     instruction->sampler >= texture_count) ||
 			    instruction->dst.file != DRM_CHROME9_FRAGMENT_DEST_TEMP ||
 			    instruction->dst.modifier ||
 			    instruction->dst.writemask != 0xf)
@@ -348,7 +352,11 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			return -EINVAL;
 	if (constant_count != (state->constant_mask ?
 		fls(state->constant_mask) : 0) ||
-	    texture_count != (state->sampler_mask ? fls(state->sampler_mask) : 0))
+	    (sparse_textures ?
+	     (state->sampler_mask != descriptor_mask ||
+	      texture_count != hweight32(descriptor_mask)) :
+	     texture_count != (state->sampler_mask ?
+		fls(state->sampler_mask) : 0)))
 		return -EINVAL;
 	for (i = 0; i < instruction_count; i++) {
 		const struct drm_chrome9_fragment_instruction *instruction =
@@ -1154,10 +1162,11 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	return 0;
 }
 
-int chrome9_fragment_compile(
+static int chrome9_fragment_compile_internal(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,
-	u32 texture_count, u32 varying_count,
+	u32 texture_count, u32 descriptor_mask, bool sparse_textures,
+	u32 varying_count,
 	struct chrome9_fragment_program *program)
 {
 	struct chrome9_fragment_state state = {
@@ -1169,7 +1178,8 @@ int chrome9_fragment_compile(
 	memset(program, 0, sizeof(*program));
 	program->stage0_coordinate = 0xff;
 	ret = chrome9_fragment_validate(&state, instruction_count,
-		constant_count, texture_count, varying_count);
+		constant_count, texture_count, descriptor_mask,
+		sparse_textures, varying_count);
 	if (ret)
 		return ret;
 	for (i = 0; i < constant_count * 4; i++)
@@ -1193,6 +1203,28 @@ int chrome9_fragment_compile(
 		memcpy(program->constants, constants,
 		       constant_count * 4 * sizeof(*constants));
 	return chrome9_fragment_encode(&state, program, instruction_count);
+}
+
+int chrome9_fragment_compile(
+	const struct drm_chrome9_fragment_instruction *instructions,
+	u32 instruction_count, const u32 *constants, u32 constant_count,
+	u32 texture_count, u32 varying_count,
+	struct chrome9_fragment_program *program)
+{
+	return chrome9_fragment_compile_internal(instructions, instruction_count,
+		constants, constant_count, texture_count, 0, false,
+		varying_count, program);
+}
+
+int chrome9_fragment_compile_sparse(
+	const struct drm_chrome9_fragment_instruction *instructions,
+	u32 instruction_count, const u32 *constants, u32 constant_count,
+	u32 texture_count, u32 descriptor_mask, u32 varying_count,
+	struct chrome9_fragment_program *program)
+{
+	return chrome9_fragment_compile_internal(instructions, instruction_count,
+		constants, constant_count, texture_count, descriptor_mask, true,
+		varying_count, program);
 }
 
 static bool
@@ -2488,6 +2520,8 @@ int chrome9_fragment_selftest(void)
 		{ 0x01c00530, 0xb01c0053, 0x0082c2b6, 0x000d0820 },
 	};
 	static const u32 constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4];
+	struct drm_chrome9_fragment_instruction sparse_sampler[
+		ARRAY_SIZE(swizzled_texture)];
 	struct chrome9_fragment_program *program;
 	int ret;
 
@@ -2542,6 +2576,29 @@ int chrome9_fragment_selftest(void)
 	    program->active_texture_count != 1 || program->varying_count != 1 ||
 	    program->varying_width[0] != 2 ||
 	    program->controls[0] != 0x90018000) {
+		ret = -EINVAL;
+		goto out;
+	}
+	memcpy(sparse_sampler, swizzled_texture, sizeof(sparse_sampler));
+	sparse_sampler[0].sampler = 5;
+	ret = chrome9_fragment_compile_sparse(sparse_sampler,
+		ARRAY_SIZE(sparse_sampler), constants, 0, 1, BIT(5), 1,
+		program);
+	if (ret || program->texture_count != 1 || program->tau_count != 1 ||
+	    program->tau[0] != 0x351101b5 ||
+	    program->active_texture_count != 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (chrome9_fragment_compile(sparse_sampler,
+		ARRAY_SIZE(sparse_sampler), constants, 0, 1, 1,
+		program) != -EINVAL ||
+	    chrome9_fragment_compile_sparse(sparse_sampler,
+		ARRAY_SIZE(sparse_sampler), constants, 0, 1, BIT(4), 1,
+		program) != -EINVAL ||
+	    chrome9_fragment_compile_sparse(sparse_sampler,
+		ARRAY_SIZE(sparse_sampler), constants, 0, 2,
+		BIT(4) | BIT(5), 1, program) != -EINVAL) {
 		ret = -EINVAL;
 		goto out;
 	}
