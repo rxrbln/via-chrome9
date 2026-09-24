@@ -7009,7 +7009,7 @@ smoke_d24_sample_produced_depth(struct pipe_screen *screen,
             exterior == 0xffff0000U &&
             ccontext->submitted_triangles == submitted + 2 &&
             ccontext->rejected_triangles == rejected &&
-            ccontext->submitted_program_batches == batches + 2 &&
+            ccontext->submitted_program_batches == batches + 1 &&
             !memcmp((const uint8_t *)ccolor->bo.map + ccolor->data_offset,
                     color_copy, ccolor->data_size) &&
             !memcmp((const uint8_t *)cdepth->bo.map + cdepth->data_offset,
@@ -7088,7 +7088,7 @@ smoke_d24_sample_produced_depth(struct pipe_screen *screen,
             z16_pixels[60 * (cz16->stride / 2) + 60] <= 0x8001U &&
             ccontext->submitted_triangles == submitted + 2 &&
             ccontext->rejected_triangles == rejected &&
-            ccontext->submitted_program_batches == batches + 2 &&
+            ccontext->submitted_program_batches == batches + 1 &&
             !memcmp((const uint8_t *)cdepth->bo.map + cdepth->data_offset,
                     depth_copy, cdepth->data_size) &&
             !memcmp((const uint8_t *)ccolor->bo.map + ccolor->data_offset,
