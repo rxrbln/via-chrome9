@@ -103,19 +103,30 @@ constant mask      0xe0000007
 ```
 
 The current whole-vector physical allocator fails at semantic record 34; its
-unscheduled live-set peak is 15 vectors at record 67.  Six active coordinate
-inputs select a hardware resource bucket limited to six physical temporary
-vectors.  Culling-specialized FACE removes the semantic-system-value stop but
-does not prove this program allocatable.
+unscheduled live-set peak is 15 vectors at record 67.  The earlier six-temp
+claim for six coordinate inputs was incorrect: the valid zero resource bucket
+handles the six-input/ten-temp production compiler differential.  The
+current kernel still limits allocation to twelve physical vectors.
+Culling-specialized FACE removes the semantic-system-value stop but does not
+prove this program allocatable.
 
-The next major generic backend slice is therefore dependency-aware scheduling
-plus channel-granular allocation/source rewriting.  The proprietary Linux
-compiler has explicit `TryAllocChn_invi`, `RenameSrcChannel_invi` and
-`stmPPS_ShrinkSrcChn_invi` passes, which is positive evidence for channel
-rather than whole-vector allocation.  Promotion requires a final object with
-at most 96 ALU, exactly five TEX, correct port classes, no undefined lanes,
-and physical high-water at most six.  Default lightall must remain rejected
-until that object and a guarded distinct-color pixel oracle both pass.
+The next major generic backend slice is dependency-aware semantic scheduling
+followed by a whole-vector allocation replay.  The isolated Mesa scheduler
+now reorders the same 100 records without cloning or deleting an operation:
+95 ALU, five TEX, and an allocate-before-release peak of nine live vectors.
+Its fail-closed domain is one terminal full-mask COLOR write, no KILL, no dead
+record, disjoint partial TEMP definitions, and a complete TEMP dependency
+DAG.  It therefore does not move side effects or silently discard work.
+Channel-granular allocation/source rewriting is not yet shown necessary for
+this permutation.
+The proprietary Linux compiler has `TryAllocChn_invi`,
+`RenameSrcChannel_invi` and `stmPPS_ShrinkSrcChn_invi` passes for broader
+packing.  Promotion requires a final object with at most 96 ALU, exactly
+five TEX, correct port classes, no undefined lanes, and physical high-water
+at most twelve.  This scheduler is not yet called by the production compiler,
+and FACE/alpha specialization is still separate.  Default lightall must
+remain rejected until the complete integrated object and a guarded distinct-
+color pixel oracle both pass.
 
 ## Evidence
 
@@ -127,6 +138,9 @@ until that object and a guarded distinct-color pixel oracle both pass.
 - Exact resource replay:
   `/tmp/chrome9-lightall-resource-probe` and
   `ioquake3-gl2-eight-unit-linkage.md`.
+- Exact scheduler corpus and result:
+  `chrome9_ps_schedule_test.c`, 100 records, peak nine; cross Meson test
+  `chrome9-ps-schedule` passes.  This is host evidence, not a GPU result.
 - Draw ordering and two-sided marker proof:
   `chrome9-draw-twoside-face-sign.md`.
 - Native vFace negative differential:
