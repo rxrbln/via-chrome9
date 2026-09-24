@@ -298,8 +298,9 @@ ambient + diffuse = (.1,.2,.3) + (.1,.2,.3) = (.2,.4,.6)
 alpha              = .75 - .3 + .4*.4 = .61
 ```
 
-Allowing two UNORM conversion steps of tolerance, the expected host BGRA
-word is `9c26261d`. The tool also requires D16 near `8000`, untouched
+Including the source texels' UNORM8 quantization, the nearest host BGRA word
+is `9b27261d`; the checker allows two bytes of output-conversion tolerance
+per lane. The tool also requires D16 near `8000`, untouched
 triangle exterior, intact leading/trailing guards on color, depth, and both
 sources, and byte-identical source BOs. It builds with strict host warnings.
 It has not been submitted to a GPU; run it once only after a known-good
