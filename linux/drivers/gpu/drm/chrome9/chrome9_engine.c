@@ -503,6 +503,21 @@ static void chrome9_emit_header3(u32 **cursor, u32 paratype,
 	*cursor = p;
 }
 
+/*
+ * Client-derived vertex data must travel in a counted H3 packet, as the
+ * vendor drivers send it.  In an uncounted H2 packet the command regulator
+ * ends the payload at the next 16-byte aligned FE-prefixed dword, so a
+ * vertex colour such as feff0000 was decoded as a command header.  Builders
+ * validate their H2-shaped layout first and then rewrite the header here.
+ */
+static void chrome9_count_vertex_payload(u32 *header, u32 dwords)
+{
+	header[0] = 0xfe03043c;
+	header[1] = dwords;
+	header[2] = 0x00000000;
+	header[3] = 0xcc000000;
+}
+
 static int chrome9_fe33_encode(u32 record[4], u32 id, dma_addr_t address)
 {
 	if (!id || !IS_ALIGNED(address, CHROME9_FE33_SLOT_SIZE) ||
@@ -1161,6 +1176,7 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	      body[54] != (0x24000000 | vertex_count) ||
 	      body[164] != 0xfe020440 || body[167] != 0xcc000000)))
 		return -EINVAL;
+	chrome9_count_vertex_payload(body + 160 + delta, vertex_count * 6);
 	ret = chrome9_emit_3d_tail(engine, job, &p);
 	if (ret)
 		return ret;
@@ -1325,6 +1341,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	u32 *base = staging;
 	u32 *body;
 	u32 *p;
+	u32 *vertex_header;
 	u32 delta = 0;
 	u32 depth_delta = 0;
 	u32 mip_delta = mip ? 12 : 0;
@@ -1476,6 +1493,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 				     replace_program, ARRAY_SIZE(replace_program));
 	}
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00000000, NULL, 0);
+	vertex_header = p - 4;
 	for (i = 0; i < vertex_count; i++) {
 		const struct drm_chrome9_textured_vertex *src =
 			request->textured_batch_vertices ?
@@ -1553,6 +1571,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	    body[196 + delta + depth_delta + mip_delta] !=
 		0xfe020440)
 		return -EINVAL;
+	chrome9_count_vertex_payload(vertex_header, vertex_count * 8);
 	ret = chrome9_emit_3d_tail(engine, job, &p);
 	if (ret)
 		return ret;
@@ -1652,6 +1671,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
+	u32 *vertex_header;
 	u32 delta = 0;
 	u32 depth_delta = 0;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
@@ -1809,6 +1829,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 			     selected_program, selected_program_count);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00000000,
 			     vertices, ARRAY_SIZE(vertices));
+	vertex_header = p - ARRAY_SIZE(vertices) - 4;
 	if (p - body != 262 + delta + depth_delta + program_delta ||
 	    body[4] != destination_state[0] ||
 	    body[6] != destination_state[2] ||
@@ -1863,6 +1884,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	    body[228 + delta + depth_delta + program_delta] != 0xfe020440 ||
 	    body[230 + delta + depth_delta + program_delta] != 0x00000000)
 		return -EINVAL;
+	chrome9_count_vertex_payload(vertex_header, ARRAY_SIZE(vertices));
 	ret = chrome9_emit_3d_tail(engine, job, &p);
 	if (ret)
 		return ret;
@@ -2428,6 +2450,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	u32 vs_control[] = { 0 };
 	u32 *base = engine->run_staging_cpu;
 	u32 *p = base;
+	u32 *vertex_header;
 	u32 destination_count;
 	u32 common_count = 7;
 	u32 vertex_count = request->triangle_count * 3;
@@ -2563,10 +2586,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 				     program->tau_count);
 	while (!IS_ALIGNED((unsigned long)p, 16))
 		*p++ = 0xcc000000;
-	*p++ = 0xfe020440;
-	*p++ = 0x0000043c;
-	*p++ = 0x00000000;
-	*p++ = 0xcc000000;
+	vertex_header = p;
+	p += 4;
 	for (i = 0; i < vertex_count; i++) {
 		const struct drm_chrome9_fragment_vertex *vertex =
 			&request->fragment_vertices[i];
@@ -2587,6 +2608,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 				*p++ = vertex->varying[logical][component];
 		}
 	}
+	chrome9_count_vertex_payload(vertex_header, p - vertex_header - 4);
 	ret = chrome9_emit_3d_tail(engine, job, &p);
 	if (ret)
 		return ret;
@@ -2740,6 +2762,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	      body[108] != (0x80000000 | request->height) ||
 	      body[168] != 0xfe020440)))
 		return -EINVAL;
+	chrome9_count_vertex_payload(body + 164 + delta, vertex_count * 6);
 	ret = chrome9_emit_3d_tail(engine, job, &p);
 	if (ret)
 		return ret;
