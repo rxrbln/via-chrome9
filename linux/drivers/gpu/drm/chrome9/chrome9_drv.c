@@ -2631,7 +2631,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			if (chrome9_hw_tcl_enabled())
 				args->value |= DRM_CHROME9_CAP_VERTEX_PROGRAM |
 					DRM_CHROME9_CAP_VERTEX_BUFFERS |
-					DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE;
+					DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE |
+					DRM_CHROME9_CAP_VERTEX_BATCH;
 			/* VERTEX_TWO_SIDE: oBFD selection not yet seen on silicon. */
 			if (chrome9_fragment_sparse_textures_enabled())
 				args->value |=
@@ -2731,6 +2732,9 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_GEM_CPU_ACCESS,
 			  chrome9_gem_cpu_access_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_VERTEX_PROGRAMS,
+			  chrome9_draw_vertex_programs_ioctl,
 			  DRM_RENDER_ALLOW),
 };
 

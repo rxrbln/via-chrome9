@@ -32,6 +32,8 @@ int chrome9_engine_display_begin(struct chrome9_device *cdev);
 void chrome9_engine_display_end(struct chrome9_device *cdev);
 int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
+int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
+				       struct drm_file *file);
 int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 				      struct drm_file *file);
 int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,

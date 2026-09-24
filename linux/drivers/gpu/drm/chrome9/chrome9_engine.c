@@ -255,8 +255,7 @@ struct chrome9_fence {
 struct chrome9_sf_mapping;
 
 /* Destination, depth, textures and the stage B vertex buffers. */
-#define CHROME9_FRAGMENT_MAX_OBJECTS \
-	(2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES + DRM_CHROME9_VERTEX_MAX_INPUTS)
+#define CHROME9_FRAGMENT_MAX_OBJECTS	64
 
 struct chrome9_job {
 	struct chrome9_fence fence;
@@ -3301,24 +3300,6 @@ static int chrome9_fragment_segment_end(struct chrome9_engine *engine,
 		CHROME9_RUN_STAGING_SIZE, pause, &job->segment_stop);
 }
 
-static int chrome9_build_fragment_program(struct chrome9_engine *engine,
-	const struct chrome9_draw_request *request, struct chrome9_job *job,
-	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-	const u32 *element_address, u32 *pause)
-{
-	u32 *p;
-	int ret;
-
-	if (!engine->run_staging_cpu)
-		return -EINVAL;
-	p = chrome9_fragment_segment_begin(engine);
-	ret = chrome9_emit_fragment_draw(request, target, depth, texture_base,
-		element_address, &p, chrome9_fragment_segment_limit(engine));
-	if (ret)
-		return ret;
-	return chrome9_fragment_segment_end(engine, job, p, pause);
-}
-
 static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 		const struct chrome9_draw_request *request,
 		struct chrome9_job *job, u32 target, u32 depth, u32 *pause)
@@ -6124,80 +6105,155 @@ static bool chrome9_fragment_destination_size_valid(u64 actual, u64 required,
 	return actual > required && IS_ALIGNED(actual, PAGE_SIZE);
 }
 
-static int chrome9_submit_fragment_program(struct drm_device *drm,
-		struct drm_file *file, const struct chrome9_draw_request *request)
-{
-	struct chrome9_device *cdev = to_chrome9(drm);
-	const struct chrome9_tcl_draw *tcl = request->tcl;
-	struct drm_gem_object *objects[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
-	u64 object_sizes[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
-	u64 mapping_sizes[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
-	u32 bases[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
-	u32 texture_bases[DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
-	u64 element_start[DRM_CHROME9_VERTEX_MAX_INPUTS] = { };
-	u32 element_address[DRM_CHROME9_VERTEX_MAX_INPUTS] = { };
-	u32 buffer_object[DRM_CHROME9_VERTEX_MAX_INPUTS] = { };
+enum chrome9_fragment_object_kind {
+	CHROME9_OBJECT_DESTINATION,
+	CHROME9_OBJECT_DEPTH,
+	CHROME9_OBJECT_TEXTURE,
+	CHROME9_OBJECT_VERTEX,
+};
+
+/* Per-call bookkeeping of a fragment submission, kept off the stack. */
+struct chrome9_fragment_submit {
+	struct drm_gem_object *objects[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u64 object_sizes[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u64 mapping_sizes[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u32 bases[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u8 kind[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u32 handle[CHROME9_FRAGMENT_MAX_OBJECTS];
 	/* Byte range the fetcher reads per vertex object; only it is flushed. */
 	u64 object_low[CHROME9_FRAGMENT_MAX_OBJECTS];
-	u64 object_high[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
-	u32 buffer_first;
+	u64 object_high[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u8 texture_object[DRM_CHROME9_VERTEX_MAX_BATCH]
+			[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	u32 buffer_object[DRM_CHROME9_VERTEX_MAX_BATCH]
+			 [DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u64 element_start[DRM_CHROME9_VERTEX_MAX_BATCH]
+			 [DRM_CHROME9_VERTEX_MAX_INPUTS];
+};
+
+/* Object index of handle among kind, appended when new; U32_MAX if full. */
+static u32 chrome9_fragment_submit_object(struct drm_file *file,
+		struct chrome9_fragment_submit *sub, u32 *count, u32 handle,
+		u8 kind, u64 size)
+{
+	u32 i;
+
+	for (i = 0; i < *count; i++)
+		if (sub->kind[i] == kind && sub->handle[i] == handle)
+			return i;
+	if (*count >= CHROME9_FRAGMENT_MAX_OBJECTS)
+		return U32_MAX;
+	i = (*count)++;
+	sub->kind[i] = kind;
+	sub->handle[i] = handle;
+	sub->objects[i] = drm_gem_object_lookup(file, handle);
+	sub->object_sizes[i] = sub->objects[i] && !size ?
+		sub->objects[i]->size : size;
+	return i;
+}
+
+/*
+ * Submit fragment draws that share one destination and depth buffer (and
+ * their formats).  Objects are looked up, mapped, cache-maintained and
+ * verified once; the draws are packed into as few staging segments as fit,
+ * each retired before the next is built.
+ */
+static int chrome9_submit_fragment_programs(struct drm_device *drm,
+		struct drm_file *file,
+		const struct chrome9_draw_request *const *requests, u32 count)
+{
+	const struct chrome9_draw_request *request = requests[0];
+	struct chrome9_device *cdev = to_chrome9(drm);
+	struct chrome9_fragment_submit *sub;
+	struct drm_gem_object **objects;
+	u64 *object_sizes, *mapping_sizes;
+	u32 texture_bases[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	u32 element_address[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	struct chrome9_engine *engine;
 	struct chrome9_job *job = NULL;
 	struct drm_exec exec;
 	u64 mapped_size = 0;
 	u32 object_count = 1;
 	u32 depth_index = U32_MAX;
-	u32 pause;
+	u32 pause, r, next;
 	long wait;
 	bool exec_initialized = false;
 	bool device_owned = false;
 	bool signal = false;
 	bool quarantine = false;
 	bool must_quarantine;
-	unsigned int i;
+	unsigned int i, t;
 	int dev_idx;
 	int ret;
 
-	if (!drm_dev_enter(drm, &dev_idx))
+	if (!count || count > DRM_CHROME9_VERTEX_MAX_BATCH)
+		return -EINVAL;
+	sub = kvzalloc(sizeof(*sub), GFP_KERNEL);
+	if (!sub)
+		return -ENOMEM;
+	objects = sub->objects;
+	object_sizes = sub->object_sizes;
+	mapping_sizes = sub->mapping_sizes;
+	if (!drm_dev_enter(drm, &dev_idx)) {
+		kvfree(sub);
 		return -ENODEV;
+	}
 	engine = READ_ONCE(cdev->engine);
 	if (!engine || !chrome9_engine_ready(cdev)) {
 		ret = -EIO;
 		goto out_dev_exit;
 	}
+	sub->kind[0] = CHROME9_OBJECT_DESTINATION;
 	objects[0] = drm_gem_object_lookup(file, request->destination_handle);
 	object_sizes[0] = request->object_size;
 	if (request->flags & DRM_CHROME9_FRAGMENT_DEPTH) {
 		depth_index = object_count++;
+		sub->kind[depth_index] = CHROME9_OBJECT_DEPTH;
 		objects[depth_index] = drm_gem_object_lookup(file,
 							      request->depth_handle);
 		object_sizes[depth_index] = request->depth_object_size;
 	}
-	for (i = 0; i < request->fragment_texture_count; i++) {
-		objects[object_count] = drm_gem_object_lookup(file,
-			request->fragment_textures[i].handle);
-		object_sizes[object_count] = request->fragment_texture_size[i];
-		object_count++;
-	}
-	/* Stage B vertex buffers are plain, unguarded read-only objects;
-	 * bindings of one handle share its object. */
-	buffer_first = object_count;
-	for (i = 0; tcl && i < tcl->buffer_count; i++) {
-		unsigned int j;
+	for (r = 0; r < count; r++) {
+		const struct chrome9_draw_request *req = requests[r];
+		const struct chrome9_tcl_draw *tcl = req->tcl;
 
-		for (j = 0; j < i; j++)
-			if (tcl->buffers[j].handle == tcl->buffers[i].handle)
-				break;
-		if (j < i) {
-			buffer_object[i] = buffer_object[j];
-			continue;
+		if (req->destination_handle != request->destination_handle ||
+		    req->object_size != request->object_size ||
+		    (req->flags ^ request->flags) &
+		    (DRM_CHROME9_FRAGMENT_DEPTH |
+		     DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED) ||
+		    req->depth_handle != request->depth_handle ||
+		    req->depth_object_size != request->depth_object_size) {
+			ret = -EINVAL;
+			goto out_put_objects;
 		}
-		buffer_object[i] = object_count;
-		objects[object_count] = drm_gem_object_lookup(file,
-			tcl->buffers[i].handle);
-		if (objects[object_count])
-			object_sizes[object_count] = objects[object_count]->size;
-		object_count++;
+		for (t = 0; t < req->fragment_texture_count; t++) {
+			i = chrome9_fragment_submit_object(file, sub,
+				&object_count, req->fragment_textures[t].handle,
+				CHROME9_OBJECT_TEXTURE,
+				req->fragment_texture_size[t]);
+			if (i == U32_MAX) {
+				ret = -E2BIG;
+				goto out_put_objects;
+			}
+			if (object_sizes[i] != req->fragment_texture_size[t]) {
+				ret = -EINVAL;
+				goto out_put_objects;
+			}
+			sub->texture_object[r][t] = i;
+		}
+		/* Stage B vertex buffers are plain, unguarded read-only
+		 * objects; bindings of one handle share its object. */
+		for (t = 0; tcl && t < tcl->buffer_count; t++) {
+			i = chrome9_fragment_submit_object(file, sub,
+				&object_count, tcl->buffers[t].handle,
+				CHROME9_OBJECT_VERTEX, 0);
+			if (i == U32_MAX) {
+				ret = -E2BIG;
+				goto out_put_objects;
+			}
+			sub->buffer_object[r][t] = i;
+		}
 	}
 	for (i = 0; i < object_count; i++) {
 		unsigned int j;
@@ -6217,7 +6273,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			goto out_put_objects;
 		}
 		mapping_sizes[i] = objects[i]->size;
-		/* Read-only textures may alias each other, never a render target. */
+		/* Read-only objects may alias each other, never a target. */
 		for (j = 0; j < i; j++)
 			if (objects[i] == objects[j] &&
 			    (i == 0 || i == depth_index ||
@@ -6230,16 +6286,20 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			ret = -E2BIG;
 			goto out_put_objects;
 		}
+		sub->object_low[i] = U64_MAX;
 	}
 	if (mapped_size > SZ_64M - CHROME9_RING_SIZE) {
 		ret = -E2BIG;
 		goto out_put_objects;
 	}
-	if (tcl && tcl->buffer_count) {
-		for (i = 0; i < ARRAY_SIZE(object_low); i++)
-			object_low[i] = U64_MAX;
-		ret = chrome9_tcl_buffer_bounds(tcl, objects, buffer_object,
-				element_start, object_low, object_high);
+	for (r = 0; r < count; r++) {
+		const struct chrome9_tcl_draw *tcl = requests[r]->tcl;
+
+		if (!tcl || !tcl->buffer_count)
+			continue;
+		ret = chrome9_tcl_buffer_bounds(tcl, objects,
+				sub->buffer_object[r], sub->element_start[r],
+				sub->object_low, sub->object_high);
 		if (ret)
 			goto out_put_objects;
 	}
@@ -6295,11 +6355,15 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		}
 		chrome9_bo_hold_kmap(to_chrome9_bo(objects[i]));
 	}
-	if (tcl && tcl->buffer_count &&
-	    !chrome9_tcl_buffers_finite(tcl, job->fragment_maps, buffer_object,
-					element_start)) {
-		ret = -EINVAL;
-		goto out_unmap;
+	for (r = 0; r < count; r++) {
+		const struct chrome9_tcl_draw *tcl = requests[r]->tcl;
+
+		if (tcl && tcl->buffer_count &&
+		    !chrome9_tcl_buffers_finite(tcl, job->fragment_maps,
+				sub->buffer_object[r], sub->element_start[r])) {
+			ret = -EINVAL;
+			goto out_unmap;
+		}
 	}
 	chrome9_prof_mark(CHROME9_PROF_MAP);
 
@@ -6314,23 +6378,24 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	job->flags = request->flags;
 	for (i = 0; i < object_count; i++) {
 		ret = chrome9_job_acquire_mapping_locked(engine, job, objects[i],
-				job->fragment_sgts[i], &bases[i]);
+				job->fragment_sgts[i], &sub->bases[i]);
 		if (ret)
 			goto out_prepublication;
 	}
 	chrome9_prof_mark(CHROME9_PROF_GART);
 	for (i = 0; i < object_count; i++) {
-		if (i >= buffer_first) {
+		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
+		ktime_t t0 = ktime_get(), t1;
+
+		if (sub->kind[i] == CHROME9_OBJECT_VERTEX) {
 			chrome9_cache_flush((u8 *)job->fragment_maps[i].vaddr +
-					    object_low[i],
-					    object_high[i] - object_low[i]);
+					    sub->object_low[i],
+					    sub->object_high[i] -
+					    sub->object_low[i]);
 			dma_sync_sgtable_for_device(&cdev->pdev->dev,
 				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 			continue;
 		}
-		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
-		ktime_t t0 = ktime_get(), t1;
-
 		/* Verified guards without CPU writes since need no rewrite. */
 		if (bo->explicit_access && !bo->cpu_dirty &&
 		    bo->guard_object_size == object_sizes[i] &&
@@ -6379,52 +6444,74 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			(i == 0 || i == depth_index) ? DMA_RESV_USAGE_WRITE :
 							  DMA_RESV_USAGE_READ);
 	job->fence_attached = true;
-	for (i = 0; i < request->fragment_texture_count; i++)
-		texture_bases[i] = bases[buffer_first -
-			request->fragment_texture_count + i];
-	for (i = 0; tcl && tcl->buffer_count && i < tcl->element_count; i++)
-		element_address[i] = bases[buffer_object[
-			tcl->element_buffer[i]]] + element_start[i];
-	job->cookie = engine->last_cookie == 0x00010001 ?
-		      0x00020002 : 0x00010001;
-	job->fence_id = 0;
-	job->retirement_proven = false;
 	chrome9_prof_mark(CHROME9_PROF_FLUSH);
-	ret = chrome9_build_fragment_program(engine, request, job,
-		bases[0] + PAGE_SIZE,
-		depth_index == U32_MAX ? 0 : bases[depth_index] + PAGE_SIZE,
-		texture_bases, tcl && tcl->buffer_count ? element_address : NULL,
-		&pause);
-	if (ret)
-		goto out_prepublication;
-	chrome9_prof_mark(CHROME9_PROF_BUILD);
-	ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
-		CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
-	chrome9_prof_mark(CHROME9_PROF_APPEND);
-	if (ret) {
-		if (!must_quarantine)
+	for (next = 0; next < count; ) {
+		const u32 *limit = chrome9_fragment_segment_limit(engine);
+		u32 *p = chrome9_fragment_segment_begin(engine);
+		u32 first = next;
+
+		for (; next < count; next++) {
+			const struct chrome9_draw_request *req = requests[next];
+			const struct chrome9_tcl_draw *tcl = req->tcl;
+
+			for (t = 0; t < req->fragment_texture_count; t++)
+				texture_bases[t] =
+					sub->bases[sub->texture_object[next][t]];
+			for (t = 0; tcl && tcl->buffer_count &&
+				    t < tcl->element_count; t++)
+				element_address[t] = sub->bases[
+					sub->buffer_object[next]
+						[tcl->element_buffer[t]]] +
+					sub->element_start[next][t];
+			ret = chrome9_emit_fragment_draw(req,
+				sub->bases[0] + PAGE_SIZE,
+				depth_index == U32_MAX ? 0 :
+				sub->bases[depth_index] + PAGE_SIZE,
+				texture_bases,
+				tcl && tcl->buffer_count ? element_address : NULL,
+				&p, limit);
+			/* A full segment is retired before the next draw. */
+			if (ret == -E2BIG && next > first)
+				break;
+			if (ret)
+				goto out_prepublication;
+		}
+		job->cookie = engine->last_cookie == 0x00010001 ?
+			      0x00020002 : 0x00010001;
+		job->fence_id = 0;
+		job->retirement_proven = false;
+		ret = chrome9_fragment_segment_end(engine, job, p, &pause);
+		if (ret)
 			goto out_prepublication;
-		dma_fence_set_error(&job->fence.base, -ETIME);
-		job->published = true;
-		chrome9_quarantine_job_locked(engine, job);
-		quarantine = true;
-		goto out_unlock_submit;
+		chrome9_prof_mark(CHROME9_PROF_BUILD);
+		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
+			CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
+		chrome9_prof_mark(CHROME9_PROF_APPEND);
+		if (ret) {
+			if (!must_quarantine)
+				goto out_prepublication;
+			dma_fence_set_error(&job->fence.base, -ETIME);
+			job->published = true;
+			chrome9_quarantine_job_locked(engine, job);
+			quarantine = true;
+			goto out_unlock_submit;
+		}
+		ret = chrome9_wait_job(engine, job);
+		if (ret) {
+			dma_fence_set_error(&job->fence.base, -ETIME);
+			chrome9_quarantine_job_locked(engine, job);
+			quarantine = true;
+			goto out_unlock_submit;
+		}
+		chrome9_prof_mark(CHROME9_PROF_GPU);
+		job->retirement_proven = true;
+		engine->last_cookie = job->cookie;
 	}
-	ret = chrome9_wait_job(engine, job);
-	if (ret) {
-		dma_fence_set_error(&job->fence.base, -ETIME);
-		chrome9_quarantine_job_locked(engine, job);
-		quarantine = true;
-		goto out_unlock_submit;
-	}
-	chrome9_prof_mark(CHROME9_PROF_GPU);
-	job->retirement_proven = true;
-	engine->last_cookie = job->cookie;
 	for (i = 0; i < object_count; i++) {
-		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
-			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
 
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
+			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 		/* The job writes only its color and depth destinations. */
 		if (i != 0 && i != depth_index)
 			continue;
@@ -6523,7 +6610,14 @@ out_put_objects:
 			drm_gem_object_put(objects[i]);
 out_dev_exit:
 	drm_dev_exit(dev_idx);
+	kvfree(sub);
 	return ret;
+}
+
+static int chrome9_submit_fragment_program(struct drm_device *drm,
+		struct drm_file *file, const struct chrome9_draw_request *request)
+{
+	return chrome9_submit_fragment_programs(drm, file, &request, 1);
 }
 
 int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
@@ -8864,9 +8958,30 @@ static int chrome9_fragment_texture_selftest(void)
 	return 0;
 }
 
-static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
-				 struct drm_chrome9_draw_fragment_program *args,
-				 struct chrome9_tcl_draw *tcl)
+/* Everything one fragment draw owns between validation and submission. */
+struct chrome9_fragment_draw {
+	struct chrome9_draw_request request;
+	struct drm_chrome9_fragment_instruction *instructions;
+	struct drm_chrome9_fragment_texture_state *textures;
+	struct drm_chrome9_fragment_vertex *vertices;
+	struct chrome9_fragment_program *program;
+	u32 *constants;
+};
+
+static void chrome9_fragment_draw_fini(struct chrome9_fragment_draw *d)
+{
+	kvfree(d->program);
+	kvfree(d->vertices);
+	kfree(d->textures);
+	kfree(d->constants);
+	kfree(d->instructions);
+	memset(d, 0, sizeof(*d));
+}
+
+/* Validate, copy and compile one fragment draw into d->request. */
+static int chrome9_fragment_draw_prepare(struct drm_device *drm,
+		struct drm_chrome9_draw_fragment_program *args,
+		struct chrome9_tcl_draw *tcl, struct chrome9_fragment_draw *d)
 {
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(args->destination_format);
@@ -9126,9 +9241,13 @@ static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 	request.fragment_textures = textures;
 	request.fragment_program = program;
 	chrome9_prof_mark(CHROME9_PROF_COMPILE);
-	ret = chrome9_submit_fragment_program(drm, file, &request);
-	chrome9_prof_mark(CHROME9_PROF_RETIRE);
-	chrome9_prof_job(drm);
+	d->request = request;
+	d->instructions = instructions;
+	d->textures = textures;
+	d->vertices = vertices;
+	d->program = program;
+	d->constants = constants;
+	return 0;
 
 out_free:
 	kvfree(program);
@@ -9136,6 +9255,22 @@ out_free:
 	kfree(textures);
 	kfree(constants);
 	kfree(instructions);
+	return ret;
+}
+
+static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
+				 struct drm_chrome9_draw_fragment_program *args,
+				 struct chrome9_tcl_draw *tcl)
+{
+	struct chrome9_fragment_draw d = { };
+	int ret = chrome9_fragment_draw_prepare(drm, args, tcl, &d);
+
+	if (ret)
+		return ret;
+	ret = chrome9_submit_fragment_program(drm, file, &d.request);
+	chrome9_prof_mark(CHROME9_PROF_RETIRE);
+	chrome9_prof_job(drm);
+	chrome9_fragment_draw_fini(&d);
 	return ret;
 }
 
@@ -9271,10 +9406,29 @@ static bool chrome9_tcl_vertices_finite(const struct chrome9_tcl_draw *tcl)
 	return true;
 }
 
-int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
-				      struct drm_file *file)
+/* The allocations a validated TCL draw keeps until it is submitted. */
+struct chrome9_tcl_owned {
+	struct chrome9_tcl_draw *tcl;
+	struct drm_chrome9_vertex_instruction *instructions;
+	u32 *constants;
+	u32 *vertices;
+};
+
+static void chrome9_tcl_fini(struct chrome9_tcl_owned *o)
 {
-	struct drm_chrome9_draw_vertex_program *args = data;
+	if (o->tcl)
+		kvfree(o->tcl->indices);
+	kvfree(o->vertices);
+	kfree(o->constants);
+	kfree(o->instructions);
+	kvfree(o->tcl);
+	memset(o, 0, sizeof(*o));
+}
+
+/* Validate and copy one DRAW_VERTEX_PROGRAM draw's vertex half. */
+static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
+			       struct chrome9_tcl_owned *o)
+{
 	struct drm_chrome9_vertex_instruction *instructions = NULL;
 	struct drm_chrome9_vertex_element *elements = NULL;
 	struct drm_chrome9_vertex_buffer *buffers = NULL;
@@ -9286,9 +9440,6 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	unsigned int i;
 	int ret;
 
-	if (!chrome9_hw_tcl_enabled())
-		return -EOPNOTSUPP;
-	chrome9_prof_start();
 	if (stage_b) {
 		if (args->vertex_count || args->vertex_stride ||
 		    args->vertices_ptr ||
@@ -9438,7 +9589,14 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 			goto out_free;
 		}
 	}
-	ret = chrome9_draw_fragment(drm, file, &args->fragment, tcl);
+	o->tcl = tcl;
+	o->instructions = instructions;
+	o->constants = constants;
+	o->vertices = vertices;
+	kvfree(indices);
+	kfree(buffers);
+	kfree(elements);
+	return 0;
 
 out_free:
 	if (tcl)
@@ -9450,6 +9608,85 @@ out_free:
 	kfree(instructions);
 	kfree(elements);
 	kvfree(tcl);
+	return ret;
+}
+
+int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
+				      struct drm_file *file)
+{
+	struct drm_chrome9_draw_vertex_program *args = data;
+	struct chrome9_tcl_owned o = { };
+	int ret;
+
+	if (!chrome9_hw_tcl_enabled())
+		return -EOPNOTSUPP;
+	chrome9_prof_start();
+	ret = chrome9_tcl_prepare(args, &o);
+	if (ret)
+		return ret;
+	ret = chrome9_draw_fragment(drm, file, &args->fragment, o.tcl);
+	chrome9_tcl_fini(&o);
+	return ret;
+}
+
+/*
+ * Several DRAW_VERTEX_PROGRAM draws with one destination and depth buffer
+ * in one submission: objects are mapped and verified once and the draws
+ * share staging segments.
+ */
+int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
+				       struct drm_file *file)
+{
+	struct drm_chrome9_draw_vertex_programs *args = data;
+	struct drm_chrome9_draw_vertex_program *draws;
+	const struct chrome9_draw_request **requests = NULL;
+	struct chrome9_fragment_draw *fragments = NULL;
+	struct chrome9_tcl_owned *owned = NULL;
+	u32 r, prepared = 0;
+	int ret;
+
+	if (!chrome9_hw_tcl_enabled())
+		return -EOPNOTSUPP;
+	if (!args->count || args->count > DRM_CHROME9_VERTEX_MAX_BATCH ||
+	    args->flags || memchr_inv(args->reserved, 0, sizeof(args->reserved)))
+		return -EINVAL;
+	chrome9_prof_start();
+	draws = vmemdup_array_user(u64_to_user_ptr(args->draws_ptr), args->count,
+				   sizeof(*draws));
+	if (IS_ERR(draws))
+		return PTR_ERR(draws);
+	requests = kvcalloc(args->count, sizeof(*requests), GFP_KERNEL);
+	fragments = kvcalloc(args->count, sizeof(*fragments), GFP_KERNEL);
+	owned = kvcalloc(args->count, sizeof(*owned), GFP_KERNEL);
+	if (!requests || !fragments || !owned) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (r = 0; r < args->count; r++, prepared++) {
+		ret = chrome9_tcl_prepare(&draws[r], &owned[r]);
+		if (ret)
+			goto out;
+		ret = chrome9_fragment_draw_prepare(drm, &draws[r].fragment,
+						    owned[r].tcl, &fragments[r]);
+		if (ret) {
+			chrome9_tcl_fini(&owned[r]);
+			goto out;
+		}
+		requests[r] = &fragments[r].request;
+	}
+	ret = chrome9_submit_fragment_programs(drm, file, requests,
+					       args->count);
+	chrome9_prof_mark(CHROME9_PROF_RETIRE);
+	chrome9_prof_job(drm);
+out:
+	for (r = 0; r < prepared; r++) {
+		chrome9_fragment_draw_fini(&fragments[r]);
+		chrome9_tcl_fini(&owned[r]);
+	}
+	kvfree(owned);
+	kvfree(fragments);
+	kvfree(requests);
+	kvfree(draws);
 	return ret;
 }
 
