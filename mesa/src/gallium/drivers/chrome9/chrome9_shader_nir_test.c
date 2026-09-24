@@ -807,6 +807,106 @@ check_blinn_phong_integer_power(struct chrome9_context *context)
    return valid;
 }
 
+static nir_shader *
+make_function_medium_fragment(const nir_shader_compiler_options *shader_options)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, shader_options, "chrome9-function-medium-five");
+   nir_def *position = nir_load_frag_coord(&b);
+   nir_def *d = nir_ffract(&b, nir_fmul(&b,
+      nir_fmul(&b, nir_channel(&b, position, 0),
+               nir_imm_float(&b, 0.0001f)),
+      nir_channel(&b, position, 1)));
+
+   b.shader->info.io_lowered = true;
+   for (unsigned i = 0; i < 5; i++) {
+      nir_def *a = nir_ffract(&b, nir_fmul(&b, nir_imm_float(&b, 3.0f), d));
+
+      d = nir_ffract(&b, nir_fsqrt(&b, nir_fmul(&b, a, a)));
+   }
+   nir_store_output(&b, nir_vec4(&b, d, d, d, nir_imm_float(&b, 1.0f)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static unsigned
+count_alu_op(nir_shader *nir, nir_op op)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, nir)
+      nir_foreach_block(block, impl)
+         nir_foreach_instr(instr, block)
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == op)
+               count++;
+   return count;
+}
+
+static bool
+check_function_medium_sqrt_boundary(struct chrome9_context *context)
+{
+   /* This is a compiler-only preview.  The repeated RSQ/RCP hardware gate
+    * must pass before the production options may enable lower_fsqrt. */
+   static const nir_shader_compiler_options sqrt_options = {
+      .lower_uniforms_to_ubo = true,
+      .lower_fsqrt = true,
+   };
+   struct chrome9_shader current = { 0 }, lowered = { 0 };
+   nir_shader *nir = make_function_medium_fragment(&options);
+   nir_shader *preview = make_function_medium_fragment(&sqrt_options);
+   unsigned sqrt_before = count_alu_op(nir, nir_op_fsqrt);
+   unsigned sqrt_after, rsq_after, rcp_after;
+   unsigned mul = 0, frc = 0, rsq = 0, rcp = 0, mov = 0;
+   bool valid;
+
+   chrome9_compile_fs_nir(context, &current, nir);
+   /* Use Mesa's standard algebraic fsqrt lowering, not a Chrome9 test-only
+    * opcode substitution.  Remove dead pre-lowering nodes before compiling. */
+   nir_opt_algebraic(preview);
+   nir_opt_dce(preview);
+   sqrt_after = count_alu_op(preview, nir_op_fsqrt);
+   rsq_after = count_alu_op(preview, nir_op_frsq);
+   rcp_after = count_alu_op(preview, nir_op_frcp);
+   chrome9_compile_fs_nir(context, &lowered, preview);
+   for (unsigned i = 0; i < lowered.semantic_fs_ir.count; i++) {
+      switch (lowered.semantic_fs_ir.instruction[i].op) {
+      case CHROME9_PS_OPCODE_MUL: mul++; break;
+      case CHROME9_PS_OPCODE_FRC: frc++; break;
+      case CHROME9_PS_OPCODE_RSQ: rsq++; break;
+      case CHROME9_PS_OPCODE_RCP: rcp++; break;
+      case CHROME9_PS_OPCODE_MOV: mov++; break;
+      default: break;
+      }
+   }
+   valid = sqrt_before == 5 && !current.supported &&
+      !current.semantic_fs_valid && sqrt_after == 0 &&
+      rsq_after == 5 && rcp_after == 5 &&
+      lowered.supported && lowered.semantic_fs_valid &&
+      lowered.fragment_program == CHROME9_FS_COMPILED_ALU &&
+      lowered.semantic_fs_ir.count == 36 &&
+      mul == 12 && frc == 11 && rsq == 5 && rcp == 5 && mov == 3 &&
+      lowered.semantic_input_mask == 0 &&
+      lowered.semantic_varying_mask == 0 &&
+      lowered.semantic_sampler_mask == 0;
+   if (!valid)
+      fprintf(stderr, "function-medium sqrt boundary failed: "
+              "sqrt=%u->%u rsq=%u rcp=%u current=%u/%u "
+              "preview=%u/%u/%u ir=%u histogram=%u/%u/%u/%u/%u\n",
+              sqrt_before, sqrt_after, rsq_after, rcp_after,
+              current.supported, current.semantic_fs_valid,
+              lowered.supported, lowered.semantic_fs_valid,
+              lowered.fragment_program, lowered.semantic_fs_ir.count,
+              mul, frc, rsq, rcp, mov);
+   ralloc_free(preview);
+   ralloc_free(nir);
+   return valid;
+}
+
 int
 main(void)
 {
@@ -894,8 +994,9 @@ main(void)
        !check_canonical_uniform_select_context() ||
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
+       !check_function_medium_sqrt_boundary(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, Blinn-Phong shape, and blur compilation passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, Blinn-Phong shape, function-medium sqrt boundary, and blur compilation passed");
    return 0;
 }
