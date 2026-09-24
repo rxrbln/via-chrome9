@@ -156,13 +156,24 @@ offset plus `0x100`, exactly matching this layout.  The final end rounds to
    broader legacy-format mip envelope; either qualify those formats
    separately or narrow/document the ABI consistently.
 
-5. **The offline self-test does not cover the dangerous boundary.**
+5. **The kernel does not mirror Mesa's proven X8Z24 sampler restriction.**
+   Mesa permits raw X8Z24 only with nearest minification/magnification, no
+   mip filtering, and one level at `chrome9_draw.c:1009..1018`.  The kernel
+   rejects a multi-level X8Z24 descriptor at
+   `chrome9_engine.c:7095..7099`, but still accepts linear min/mag filtering
+   for its single level because the generic filter checks at `:7076..7078`
+   allow both codes for every format.  Refract asks for nearest, so its exact
+   state is unaffected.  Until a bounded raw-depth linear-filter oracle
+   exists, the render-node validator should enforce the same nearest-only
+   rule instead of relying on Mesa to do so.
+
+6. **The offline self-test does not cover the dangerous boundary.**
    The existing 64x32 BGRA test stops at L1 and checks only one H3 entry and
    sampler words.  It does not check NPOT A20/A22 construction, a rectangular
    full chain, L8-to-L9 adjacency, L10/L11, or rejection of a malformed
    implicit tail.
 
-6. **L9--L11 remain unmeasured on silicon.**
+7. **L9--L11 remain unmeasured on silicon.**
    The kernel validation and Mesa layout are mutually exact, but successful
    validation proves only that a command is bounded.  The actual hardware
    addition from L8 to the implicit tail must still be observed.
