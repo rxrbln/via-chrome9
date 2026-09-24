@@ -339,3 +339,27 @@ llvmpipe offset 486 (GL2).  Texture means were computed with Pillow over
 the full decoded `killsky_1.jpg`/`killsky_2.jpg` from `/tmp/pak0.pk3`.
 The high-frequency measure is the mean of |dx| + |dy| of the luminance
 over the grey-floor box x 3-20 %, y 87-98 %.
+
+## Sky stage 2 investigation (2026-09-24, silicon)
+
+* Matched reference: llvmpipe with `+set r_ext_framebuffer_object 0` gives a
+  sky mean of R 71.9 in the q3dm1 start view; Chrome9 gives 41.6, i.e. the
+  `killsky_2` additive stage contributes nothing.
+* Not the depth format (X8Z24 and Z16 identical), not `ad64c2f` (reverting it
+  changes nothing), not texture wrap (`tools/re/chrome9_gl_wrap_smoke.c`
+  passes REPEAT/MIRRORED/CLAMP on silicon), and not the plain far-plane
+  `GL_LEQUAL` equality (`chrome9_gl_depthfar_smoke.c` passes at depth range
+  1.0/0.5/0.0).
+* `CHROME9_DEBUG_FS_MARK` bisection: only fragment shader index 161 (GL2
+  generic `tex.rgb * var_Color.rgb`, inlined alpha-test mode) changes the sky;
+  marking the additive shaders seen in ONE/ONE draws (96/98/99, other
+  effects at depth 0.75-0.99) does not.  No triangle is rejected during
+  normal play (per-site counters), so the second stage is either not issued
+  through the cmd22 path or contributes a zero colour.
+* Reject counters also showed that ioquake3's SIGTERM handler re-enters the
+  driver mid-ioctl during shutdown; those rejects are harness artifacts
+  (Mesa `354f6df` fails closed instead of overrunning the batch).
+
+Next step: log every draw with the sky shader index (no budget) including
+blend, depth flags and first-vertex colour/z, to see whether stage 2 reaches
+the kernel and with which colour.
