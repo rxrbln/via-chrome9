@@ -1,10 +1,10 @@
 # ioquake3 GL2 alpha-mode and culled-face boundary
 
-Status: current-source and exact linked-NIR audit, 2026-09-24.  This is an
-offline compiler design.  No target draw was issued and no production source
-was changed.
+Status: current-source and exact linked-NIR audit, 2026-09-24.  Direct-UBO
+terminate-leaf and constant-FACE specialization are implemented and
+host-tested.  No target draw of default lightall was issued.
 
-## Current first compiler stop
+## Alpha mode zero is closed offline
 
 The historical one-vec4 fragment-uniform link failure is no longer the
 current boundary.  Capability `FRAGMENT_CONSTANTS_32` exposes 32 vec4s or 128
@@ -14,7 +14,7 @@ samplers.  The default renderer needs six smooth vec4 inputs and at most six
 simultaneous samplers with logical indices through six, so those two resource
 limits now fit.
 
-The first unmodified default-lightall backend stop is its runtime integer
+The first unmodified default-lightall backend stop was its runtime integer
 `u_AlphaTest` tree:
 
 ```text
@@ -24,23 +24,20 @@ mode == 3: terminate if alpha < 0.5
 ```
 
 The linked NIR is a straight-line block with three `terminate_if`
-intrinsics.  The current generic inlinable-uniform walker finds uniform leaves
-in ordinary control flow but not in those predicates.  The unspecialized
-program therefore reaches semantic lowering with all three side effects and
-rejects before FACE or arithmetic allocation.  Existing ioquake packed
-generic and reduced-lightmap classifiers handle this exact tree only for
-their closed one- and two-texture shapes; they do not make arbitrary
-five-sampler lightall executable.
+intrinsics.  Mesa commit `04a35c3` extends the generic inlinable-uniform
+walker to collect only direct constant-buffer-zero leaves reached from those
+predicates.  Its standalone exact-shape test proves that mode zero folds all
+three side effects away, while modes one, two, and three retain exactly one
+dynamic terminate each.  Indirect addressing, a nonzero UBO, and unrelated
+dynamic values do not enter the variant key.
 
-The generic closure is to include direct constant-buffer-zero leaves reached
-from `terminate_if` predicates in the fragment variant key.  Over-keying is
-safe: after inlining and normal constant folding, mode zero must remove all
-three side effects; any remaining predicate still passes through the normal
-fail-closed compiler.  Missing/short/indirect storage and unknown integer
+This remains fail closed at integration boundaries: after inlining and normal
+constant folding, any remaining predicate still passes through the normal
+unsupported-operation path.  Missing/short storage and unknown integer
 values reject before draw.  Modes one through three remain separate alpha-
-test qualification work; mode zero is the first useful default-world gate.
+test qualification work; only mode zero is closed by this slice.
 
-## Next exact stop: FACE
+## Constant FACE is closed offline
 
 After exact mode-zero specialization, the linked program loads FACE for:
 
@@ -73,12 +70,18 @@ one semantic face is culled, every published fragment has the opposite FACE
 value even for clipped triangles.  `front_ccw` changes which physical winding
 belongs to the semantic class, but not the table above.
 
-The implementation must clone the private fragment variant at draw time,
-constant-fold only the recognized FACE value, and key/cache it by the
-semantic cull result.  It must not mutate canonical NIR or the application's
-rasterizer object.  Cull-none stays unsupported until the COLOR/BCOLOR or a
-native BFC route is qualified.  An arbitrary FACE use may use the same
-constant only under the same cull proof; without that proof it still rejects.
+Mesa commit `e5617b5` implements the target-independent NIR part.  Its helper
+replaces both `load_front_face` and `load_front_face_fsign`, then runs the same
+stable specialization fold used for uniform variants.  Its standalone test
+proves both representations become `+1.0` for a surviving front face and
+`-1.0` for a surviving back face.
+
+Draw integration must still clone the private fragment variant, key/cache it
+by the three-state semantic face mode, and call the helper only for FRONT or
+BACK.  It must not mutate canonical NIR or the application's rasterizer
+object.  Cull-none stays unsupported until the COLOR/BCOLOR or a native BFC
+route is qualified.  An arbitrary FACE use may use the same constant only
+under the same cull proof; without that proof it still rejects.
 
 The host regression uses opposite-winding triangles, toggles `front_ccw`, and
 includes one clipped triangle.  With BACK culling, every emitted fragment
@@ -124,9 +127,9 @@ The proprietary Linux compiler has `TryAllocChn_invi`,
 packing.  Promotion requires a final object with at most 96 ALU, exactly
 five TEX, correct port classes, no undefined lanes, and physical high-water
 at most twelve.  This scheduler is not yet called by the production compiler,
-and FACE/alpha specialization is still separate.  Default lightall must
-remain rejected until the complete integrated object and a guarded distinct-
-color pixel oracle both pass.
+and the FACE/alpha helpers still require draw-time variant integration.
+Default lightall must remain rejected until the complete integrated object
+and a guarded distinct-color pixel oracle both pass.
 
 ## Evidence
 
@@ -141,6 +144,8 @@ color pixel oracle both pass.
 - Exact scheduler corpus and result:
   `chrome9_ps_schedule_test.c`, 100 records, peak nine; cross Meson test
   `chrome9-ps-schedule` passes.  This is host evidence, not a GPU result.
+- Generic specialization tests: Mesa commits `04a35c3` and `e5617b5`;
+  `chrome9-specialise-test` passes under the matching T2 sysroot loader.
 - Draw ordering and two-sided marker proof:
   `chrome9-draw-twoside-face-sign.md`.
 - Native vFace negative differential:
