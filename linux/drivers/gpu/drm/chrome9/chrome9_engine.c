@@ -57,6 +57,10 @@
 #define CHROME9_DRAW_CACHE_MAX_ENTRIES	64U
 #define CHROME9_DRAW_CACHE_MAX_PAGES	(CHROME9_GART_ENTRIES - \
 					 CHROME9_RING_PAGES)
+#define CHROME9_FE33_SYSTEM_WRITE	0xfe330004U
+#define CHROME9_FE33_WAIT_3D		0x00200000U
+#define CHROME9_FE33_SLOT_SIZE		16U
+#define CHROME9_FE33_CANARY		0x5afe3300U
 
 static_assert(IS_ALIGNED(CHROME9_PRIME_PAUSE, 16));
 static_assert(IS_ALIGNED(CHROME9_PRIME_STOP, 16));
@@ -97,6 +101,11 @@ module_param_named(fragment_sparse_textures,
 	chrome9_fragment_sparse_textures, bool, 0400);
 MODULE_PARM_DESC(fragment_sparse_textures,
 	"Enable unqualified sparse fragment sampler ABI v2 (default: false)");
+
+static bool chrome9_fe33_fence;
+module_param_named(fe33_fence, chrome9_fe33_fence, bool, 0400);
+MODULE_PARM_DESC(fe33_fence,
+	"Require a coherent FE330004 3D completion write per 3D job (default: false)");
 
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
@@ -142,6 +151,7 @@ struct chrome9_job {
 	struct list_head quarantine_link;
 	unsigned int sf_mapping_count;
 	u32 cookie;
+	u32 fence_id;
 	u32 flags;
 	u32 segment_pause;
 	u32 segment_stop;
@@ -311,6 +321,11 @@ struct chrome9_engine {
 	dma_addr_t ring_dma;
 	void *staging_cpu;
 	void *run_staging_cpu;
+	u32 *fence_cpu;
+	dma_addr_t fence_dma;
+	u32 fence_last_id;
+	u64 fence_count;
+	u64 fence_canary_faults;
 	void __iomem *gart;
 	void *gart_saved;
 	resource_size_t gart_offset;
@@ -485,6 +500,109 @@ static void chrome9_emit_header3(u32 **cursor, u32 paratype,
 	*cursor = p;
 }
 
+static int chrome9_fe33_encode(u32 record[4], u32 id, dma_addr_t address)
+{
+	if (!id || !IS_ALIGNED(address, CHROME9_FE33_SLOT_SIZE) ||
+	    upper_32_bits(address) ||
+	    address > U32_MAX - (CHROME9_FE33_SLOT_SIZE - 1))
+		return -EINVAL;
+	record[0] = CHROME9_FE33_SYSTEM_WRITE;
+	record[1] = CHROME9_FE33_WAIT_3D | (id & 0xff) << 24;
+	record[2] = (id >> 8) | ((u32)address & 0x00000ff0) << 20;
+	record[3] = ((u32)address >> 12) & 0x000fffff;
+	return 0;
+}
+
+static void chrome9_fe33_decode(const u32 record[4], u32 *id, u32 *address)
+{
+	*id = (record[2] & 0x00ffffff) << 8 | record[1] >> 24;
+	*address = record[3] << 12 | (record[2] >> 24) << 4;
+}
+
+static int chrome9_fe33_selftest(void)
+{
+	static const u32 golden[4] = {
+		0xfe330004, 0x78200000, 0x12123456, 0x00001088,
+	};
+	u32 record[4];
+	u32 address;
+	u32 id;
+
+	if (chrome9_fe33_encode(record, 0x12345678, 0x01088120) ||
+	    memcmp(record, golden, sizeof(golden)))
+		return -EINVAL;
+	chrome9_fe33_decode(record, &id, &address);
+	if (id != 0x12345678 || address != 0x01088120)
+		return -EINVAL;
+	if (chrome9_fe33_encode(record, 0xffffffff, 0xfffffff0))
+		return -EINVAL;
+	chrome9_fe33_decode(record, &id, &address);
+	if (id != 0xffffffff || address != 0xfffffff0)
+		return -EINVAL;
+	if (!chrome9_fe33_encode(record, 0, 0x1000) ||
+	    !chrome9_fe33_encode(record, 1, 0x1008) ||
+	    !chrome9_fe33_encode(record, 1, (dma_addr_t)0xfffffff8) ||
+	    (sizeof(dma_addr_t) > 4 &&
+	     !chrome9_fe33_encode(record, 1, (dma_addr_t)BIT_ULL(32))))
+		return -EINVAL;
+	return 0;
+}
+
+/* Reserve a fresh ID, poison the coherent slot and emit FE330004 after the body. */
+static int chrome9_emit_fe33(struct chrome9_engine *engine,
+			     struct chrome9_job *job, u32 **cursor)
+{
+	u32 record[4];
+	u32 *p = *cursor;
+	u32 id;
+	int ret;
+
+	job->fence_id = 0;
+	if (!engine->fence_cpu)
+		return 0;
+	lockdep_assert_held(&engine->submit_lock);
+	if (engine->fence_last_id == U32_MAX)
+		return -ENOSPC;
+	id = engine->fence_last_id + 1;
+	ret = chrome9_fe33_encode(record, id, engine->fence_dma);
+	if (ret)
+		return ret;
+	engine->fence_last_id = id;
+	WRITE_ONCE(engine->fence_cpu[0], ~id);
+	WRITE_ONCE(engine->fence_cpu[1], CHROME9_FE33_CANARY + 1);
+	WRITE_ONCE(engine->fence_cpu[2], CHROME9_FE33_CANARY + 2);
+	WRITE_ONCE(engine->fence_cpu[3], CHROME9_FE33_CANARY + 3);
+	/* The poison must be visible before the segment can be fetched. */
+	dma_wmb();
+	while (!IS_ALIGNED((unsigned long)p, CHROME9_FE33_SLOT_SIZE))
+		*p++ = 0xcc000000;
+	memcpy(p, record, sizeof(record));
+	*cursor = p + ARRAY_SIZE(record);
+	job->fence_id = id;
+	return 0;
+}
+
+static int chrome9_emit_3d_tail(struct chrome9_engine *engine,
+				struct chrome9_job *job, u32 **cursor)
+{
+	static const u32 sync[] = { 0x6c, 0x00800000 };
+	static const u32 status[] = {
+		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
+	};
+	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
+	int ret;
+
+	ret = chrome9_emit_fe33(engine, job, cursor);
+	if (ret)
+		return ret;
+	chrome9_emit_header0(cursor, sync, ARRAY_SIZE(sync) / 2);
+	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
+			     status, ARRAY_SIZE(status));
+	chrome9_emit_header2(cursor, 0x420, 0x0000041c, 0x00300000, NULL, 0);
+	chrome9_emit_header0(cursor, cookie, ARRAY_SIZE(cookie) / 2);
+	return 0;
+}
+
 static int chrome9_finish_ring_sized(u32 *base, u32 *p, size_t capacity,
 				     u32 *pause, u32 *stop)
 {
@@ -559,13 +677,10 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 		0xff0000ff, 0xffff0000,
 	};
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 *base = engine->staging_cpu;
 	u32 *body;
 	u32 *p;
+	int ret;
 
 	memset(base, 0xcc, PAGE_SIZE);
 	p = base;
@@ -592,11 +707,9 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 		body[158] = 0x00f08005;
 		body[159] = 0x000d0820;
 	}
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
@@ -819,10 +932,6 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 				  u32 *pause)
 {
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
 	u32 *base = engine->staging_cpu;
 	u32 *body;
@@ -832,6 +941,7 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	u32 vertex_count = triangle_count * 3;
 	bool blend = chrome9_draw_has_blend(request);
 	unsigned int i;
+	int ret;
 
 	if (!triangle_count ||
 	    triangle_count > DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES)
@@ -913,11 +1023,9 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	      body[54] != (0x24000000 | vertex_count) ||
 	      body[164] != 0xfe020440 || body[167] != 0xcc000000)))
 		return -EINVAL;
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
@@ -1052,10 +1160,6 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		0x0140b6d0, 0x30040053, 0x00f20005, 0x00000820,
 	};
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
 	u32 destination_state[16];
 	u32 texture_state[6];
@@ -1105,6 +1209,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	unsigned int i;
 	u32 log_size = ilog2(request->texture_height) << 4 |
 		       ilog2(request->texture_width);
+	int ret;
 
 	if (!base || !triangle_count || triangle_count > max_triangles)
 		return -E2BIG;
@@ -1310,11 +1415,9 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 	    body[196 + delta + depth_delta + mip_delta] !=
 		0xfe020440)
 		return -EINVAL;
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	if (chrome9_finish_ring_sized(base, p, staging_size, pause,
 				      &job->segment_stop))
 		return -E2BIG;
@@ -1393,10 +1496,6 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		0xcccccccc, 0xdddddddd,
 	};
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
 	u32 destination_state[16];
 	u32 image[2][6];
@@ -1451,6 +1550,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 				      request->texture2_mag_filter };
 	const u32 wrap_s[2] = { request->wrap_s, request->texture2_wrap_s };
 	const u32 wrap_t[2] = { request->wrap_t, request->texture2_wrap_t };
+	int ret;
 
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
@@ -1625,11 +1725,9 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 	    body[228 + delta + depth_delta + program_delta] != 0xfe020440 ||
 	    body[230 + delta + depth_delta + program_delta] != 0x00000000)
 		return -EINVAL;
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
@@ -2170,16 +2268,12 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	};
 	static const u32 vs_integer_constants[] = { 0, 0, 0, 0 };
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
 	/* VX900 HPSLocationReg: direct PEY, TS-ZTAG deadlock ECO enabled. */
 	static const u32 misc_location[] = { 0x8a020000 };
 	const struct chrome9_fragment_program *program = request->fragment_program;
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(request->destination_format);
 	struct chrome9_blend_words blend_words;
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 destination_state[16];
 	u32 config[10];
 	u32 common[32] = {
@@ -2355,11 +2449,9 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 				*p++ = vertex->varying[logical][component];
 		}
 	}
-	chrome9_emit_header0(&p, sync, 1);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, 1);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	return chrome9_finish_ring_sized(base, p, CHROME9_RUN_STAGING_SIZE,
 					 pause, &job->segment_stop);
 }
@@ -2369,10 +2461,6 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 		struct chrome9_job *job, u32 target, u32 depth, u32 *pause)
 {
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	struct chrome9_blend_words blend_words;
 	bool run = request->kind ==
 		CHROME9_DRAW_IMMEDIATE_TRIANGLE_D16_RHW_RUN ||
@@ -2514,11 +2602,9 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	      body[108] != (0x80000000 | request->height) ||
 	      body[168] != 0xfe020440)))
 		return -EINVAL;
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	ret = chrome9_finish_ring_sized(base, p, staging_size, pause,
 				       &job->segment_stop);
 	if (ret)
@@ -2564,10 +2650,6 @@ static int chrome9_build_depth_oracle(struct chrome9_engine *engine,
 				      u32 depth, u32 *pause)
 {
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 *base = engine->staging_cpu;
 	u32 *p;
 	int ret;
@@ -2581,11 +2663,9 @@ static int chrome9_build_depth_oracle(struct chrome9_engine *engine,
 	ret = chrome9_emit_depth_body(&p, target, depth, 0x00ff00);
 	if (ret)
 		return ret;
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
@@ -2619,10 +2699,6 @@ static int chrome9_build_blend_oracle(struct chrome9_engine *engine,
 				      u32 *pause)
 {
 	static const u32 sync[] = { 0x6c, 0x00800000 };
-	static const u32 status[] = {
-		0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
-	};
-	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 *base = engine->staging_cpu;
 	u32 *p;
 	int ret;
@@ -2636,11 +2712,9 @@ static int chrome9_build_blend_oracle(struct chrome9_engine *engine,
 	ret = chrome9_emit_blend_body(&p, target, 0x00ff00);
 	if (ret)
 		return ret;
-	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
-			     status, ARRAY_SIZE(status));
-	chrome9_emit_header2(&p, 0x420, 0x0000041c, 0x00300000, NULL, 0);
-	chrome9_emit_header0(&p, cookie, ARRAY_SIZE(cookie) / 2);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
+	if (ret)
+		return ret;
 	return chrome9_finish_ring(base, p, pause, &job->segment_stop);
 }
 
@@ -3749,7 +3823,7 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 			    struct chrome9_job *job)
 {
 	struct chrome9_device *cdev = engine->cdev;
-	const char *phase = "cookie";
+	const char *phase = "fe33";
 	u32 cookie;
 	u32 cr_status;
 	u32 engine_status;
@@ -3757,6 +3831,29 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 	u32 value;
 	int ret;
 
+	if (job->fence_id) {
+		ret = read_poll_timeout(READ_ONCE, value, value == job->fence_id,
+					10, CHROME9_HW_TIMEOUT_US, false,
+					engine->fence_cpu[0]);
+		if (ret)
+			goto timeout;
+		dma_rmb();
+		if (!engine->fence_count++)
+			dev_info(&cdev->pdev->dev,
+				 "FE33 first 3D completion id=%08x slot=%pad kind=%u\n",
+				 job->fence_id, &engine->fence_dma, job->kind);
+		if (READ_ONCE(engine->fence_cpu[1]) != CHROME9_FE33_CANARY + 1 ||
+		    READ_ONCE(engine->fence_cpu[2]) != CHROME9_FE33_CANARY + 2 ||
+		    READ_ONCE(engine->fence_cpu[3]) != CHROME9_FE33_CANARY + 3) {
+			engine->fence_canary_faults++;
+			dev_warn_ratelimited(&cdev->pdev->dev,
+				"FE33 id=%08x wrote beyond its ID dword: %08x %08x %08x\n",
+				job->fence_id, READ_ONCE(engine->fence_cpu[1]),
+				READ_ONCE(engine->fence_cpu[2]),
+				READ_ONCE(engine->fence_cpu[3]));
+		}
+	}
+	phase = "cookie";
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_2D_REG_DST_POS, value,
 				 value == job->cookie, 10,
 				 CHROME9_HW_TIMEOUT_US);
@@ -3787,6 +3884,16 @@ timeout:
 		phase, job->fence.base.seqno, job->kind, job->flags,
 		engine->ring_epoch, cookie, job->cookie, cr_current,
 		job->ring_pause, job->ring_stop, cr_status, engine_status);
+	if (job->fence_id)
+		dev_err(&cdev->pdev->dev,
+			"FE33 id=%08x slot=%pad [%08x %08x %08x %08x] 0494=%08x 040c=%08x\n",
+			job->fence_id, &engine->fence_dma,
+			READ_ONCE(engine->fence_cpu[0]),
+			READ_ONCE(engine->fence_cpu[1]),
+			READ_ONCE(engine->fence_cpu[2]),
+			READ_ONCE(engine->fence_cpu[3]),
+			readl(cdev->mmio + CHROME9_REG_CURRENT_FENCE),
+			readl(cdev->mmio + CHROME9_REG_ENGINE_ERROR));
 	if (!(cr_current & 3) && cr_current < CHROME9_RING_SIZE) {
 		u32 first = cr_current >= CHROME9_CR_READ_AHEAD ?
 			    cr_current - CHROME9_CR_READ_AHEAD : 0;
@@ -3886,6 +3993,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 			"fragment FE configuration self-test failed: %d\n", ret);
 		return ret;
 	}
+	ret = chrome9_fe33_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev, "FE33 encoder self-test failed: %d\n",
+			ret);
+		return ret;
+	}
 	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
 	cdev->mmio = chrome9_iomap_bar_once(cdev->pdev, 1);
 	cdev->vram = chrome9_iomap_bar_once(cdev->pdev, 2);
@@ -3937,6 +4050,23 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	    engine->ring_dma > U32_MAX - CHROME9_RING_SIZE) {
 		ret = -ERANGE;
 		goto err_free_ring;
+	}
+	if (chrome9_fe33_fence) {
+		/* Direct PCI-master target: never an SF/GART page. */
+		engine->fence_cpu = dma_alloc_coherent(&cdev->pdev->dev,
+						       PAGE_SIZE,
+						       &engine->fence_dma,
+						       GFP_KERNEL);
+		if (!engine->fence_cpu) {
+			ret = -ENOMEM;
+			goto err_free_ring;
+		}
+		if (!IS_ALIGNED(engine->fence_dma, CHROME9_FE33_SLOT_SIZE) ||
+		    upper_32_bits(engine->fence_dma) ||
+		    engine->fence_dma > U32_MAX - (PAGE_SIZE - 1)) {
+			ret = -ERANGE;
+			goto err_free_ring;
+		}
 	}
 	engine->staging_cpu = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!engine->staging_cpu) {
@@ -4002,8 +4132,9 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	engine->module_hold = true;
 	engine->ready = true;
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine ready: GART=%#llx ring=%pad\n",
-		 (unsigned long long)engine->gart_offset, &engine->ring_dma);
+		 "persistent SF engine ready: GART=%#llx ring=%pad fe33=%s\n",
+		 (unsigned long long)engine->gart_offset, &engine->ring_dma,
+		 engine->fence_cpu ? "on" : "off");
 	return 0;
 
 err_restore_gart:
@@ -4019,6 +4150,9 @@ err_free_ring:
 	vfree(engine->run_staging_cpu);
 	if (engine->staging_cpu)
 		free_page((unsigned long)engine->staging_cpu);
+	if (engine->fence_cpu)
+		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->fence_cpu,
+				  engine->fence_dma);
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
 			  engine->ring_cpu, engine->ring_dma);
 err_free_saved:
@@ -4128,6 +4262,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	job->flags = request->flags;
 	job->cookie = engine->last_cookie == 0x00010001 ?
 		      0x00020002 : 0x00010001;
+	job->fence_id = 0;
 	ret = chrome9_job_acquire_mapping_locked(engine, job, obj, job->sgt,
 						 &target);
 	if (ret)
@@ -4640,6 +4775,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		 */
 		job->cookie = engine->last_cookie == 0x00010001 ?
 			      0x00020002 : 0x00010001;
+		job->fence_id = 0;
 		job->retirement_proven = false;
 		if (segment->kind == CHROME9_DRAW_COPY_RECT)
 			ret = chrome9_build_copy_rect(engine, segment, job, target,
@@ -5040,6 +5176,7 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			request->fragment_texture_count + i];
 	job->cookie = engine->last_cookie == 0x00010001 ?
 		      0x00020002 : 0x00010001;
+	job->fence_id = 0;
 	job->retirement_proven = false;
 	ret = chrome9_build_fragment_program(engine, request, job,
 		bases[0] + PAGE_SIZE,
@@ -7787,16 +7924,21 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (!engine->was_master)
 		pci_clear_master(cdev->pdev);
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu\n",
+		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu fe33=%llu/%u fe33_canary_faults=%llu\n",
 		 engine->append_count, engine->wrap_count, engine->ring_epoch,
 		 engine->draw_cache_hits, engine->draw_cache_misses,
 		 engine->draw_cache_scanout_hits, engine->draw_cache_evictions,
 		 engine->gart_update_count, engine->gart_pte_write_count,
-		 engine->gart_vga_acquire_count, engine->gart_flush_count);
+		 engine->gart_vga_acquire_count, engine->gart_flush_count,
+		 engine->fence_count, engine->fence_last_id,
+		 engine->fence_canary_faults);
 	mutex_unlock(&engine->submit_lock);
 	cdev->engine = NULL;
 	vfree(engine->run_staging_cpu);
 	free_page((unsigned long)engine->staging_cpu);
+	if (engine->fence_cpu)
+		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->fence_cpu,
+				  engine->fence_dma);
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
 			  engine->ring_cpu, engine->ring_dma);
 	kvfree(engine->gart_saved);
