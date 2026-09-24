@@ -1043,10 +1043,15 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 
 				if (instruction->op >= DRM_CHROME9_FRAGMENT_OP_EXP2 &&
 				    instruction->op <= DRM_CHROME9_FRAGMENT_OP_RSQ) {
+					/* Scalar ALU reads W; vendor encodes its unused
+					 * XYZ selectors as ZERO, not X. */
 					packed.swizzle[3] = packed.swizzle[0];
-					packed.swizzle[0] = 0;
-					packed.swizzle[1] = 0;
-					packed.swizzle[2] = 0;
+					packed.swizzle[0] =
+						DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+					packed.swizzle[1] =
+						DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+					packed.swizzle[2] =
+						DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
 				}
 				if (instruction->op == DRM_CHROME9_FRAGMENT_OP_DP3)
 					packed.swizzle[3] =
@@ -1795,12 +1800,12 @@ static int chrome9_fragment_vec3_cmp_selftest(
 			},
 		}, {
 			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
-			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0x7, 0 },
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
 			.src = {{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 3,
 				  { DRM_CHROME9_FRAGMENT_SWIZZLE_X,
 				    DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
 				    DRM_CHROME9_FRAGMENT_SWIZZLE_Z,
-				    DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0 }},
+				    DRM_CHROME9_FRAGMENT_SWIZZLE_ONE }, 0, 0 }},
 		},
 	};
 	static const u32 expected_alu[][4] = {
@@ -1808,7 +1813,7 @@ static int chrome9_fragment_vec3_cmp_selftest(
 		{ 0x01c00530, 0x501c0053, 0x00708105, 0x000d0060 },
 		{ 0x01c00530, 0x501c0053, 0x00708205, 0x000d00a0 },
 		{ 0x02020550, 0x50201055, 0x00720000, 0x000900e0 },
-		{ 0x01c00530, 0x501c0053, 0x00720305, 0x000d0820 },
+		{ 0x01c00530, 0x401c0053, 0x00f20305, 0x000d0820 },
 	};
 	static const u32 expected_controls[] = {
 		0x90050000, 0x91000000, 0x92000005, 0x93000000,
@@ -2585,11 +2590,13 @@ int chrome9_fragment_selftest(void)
 	}
 	memcpy(sparse_sampler, swizzled_texture, sizeof(sparse_sampler));
 	sparse_sampler[0].sampler = 5;
+	/* XYXY coordinate, physical destination zero, coordinate zero and
+	 * sparse sampler five encode as 0x35100115. */
 	ret = chrome9_fragment_compile_sparse(sparse_sampler,
 		ARRAY_SIZE(sparse_sampler), constants, 0, 1, BIT(5), 1,
 		program);
 	if (ret || program->texture_count != 1 || program->tau_count != 1 ||
-	    program->tau[0] != 0x351101b5 ||
+	    program->tau[0] != 0x35100115 ||
 	    program->active_texture_count != 1) {
 		ret = -EINVAL;
 		goto out;
