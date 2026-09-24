@@ -394,12 +394,14 @@ Keep programmable A00 on the compiler-derived active texture-temporary
 resource count; neither compact descriptor population nor logical sampler
 high-water is its input.  The 32-TEX instruction capacity is likewise
 separate from this stage namespace and from the currently promoted three
-sampler slots.  Terrain's five fragment samplers therefore remain a future
-capability gate even after the ABI representation is correct.
+sampler slots.  Terrain's five-stage envelope still needs silicon and
+shader/resource qualification beyond ABI representation; the first routing
+qualification is below.
 
-On 2026-09-24 the guarded three-texture test gained `--s5` and `--s0-s5`
-modes (`tools/re/chrome9_three_texture_guard_smoke.c`, tools commits
-`9451cd9`, `ed47142`, and `5eda1e5`).  The first submits ABI v2 with one
+On 2026-09-24 the guarded three-texture test gained `--s5`, `--s0-s5`, and
+`--sparse-five` modes (`tools/re/chrome9_three_texture_guard_smoke.c`, tools
+commits `9451cd9`, `ed47142`, `5eda1e5`, and `6434701`).  The first submits
+ABI v2 with one
 compact BGRA descriptor labelled logical unit 5 and one `TEX s5`; the second
 submits descriptors `[0,5]` with both TEX records and a bounded ADD.  The
 oracles check expected interior pixels, every four-pixel exterior margin,
@@ -415,11 +417,17 @@ glamor and the render node, and logged no new GPU fault.  Under the GPU lock,
 the dense three-texture baseline, logical s5, a dense post-baseline, logical
 s0+s5, and another dense post-baseline all passed on VX900 with exact expected
 colors and intact guards/sources.  The s5 result was repeated with the pair
-binary before the pair was submitted.  Logs are under
+binary before the pair was submitted.  The five-stage `[0,1,2,4,5]` successor
+then passed with distinct source contributions weighted by
+`1,.5,.25,.125,.0625`, producing BGRA `00504430`; the same binary's dense
+baseline passed both before and after it.  The five-stage draw and both
+baselines returned success with zero new kernel fault/timeout messages and X
+and the render node healthy.  Logs are under
 `/root/tmp/chrome9-live/sparse-s5-20260924/`; the handoff log is also in
-`artifacts/2026-09-24/cursor-sf/`.  This proves the first two high-slot
-rungs and the return to a dense draw, not the five-stage terrain envelope or
-independent high-slot coordinate/filter/mip behavior.
+`artifacts/2026-09-24/cursor-sf/`.  This proves all three high-slot descriptor
+rungs and return to a dense draw, but not terrain's full shader, its
+independent high-slot coordinates, filtering, mip chains, or render-to-texture
+sequence.
 
 ## Multi-source resource-state tables
 
