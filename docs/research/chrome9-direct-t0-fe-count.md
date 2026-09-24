@@ -229,8 +229,15 @@ submission predates that commit: those packets wrote only the first A01
 consumer field (for example `01002523`) while the proprietary writer packs
 the subsequent physical T1/T2 fields into the remaining A01 bytes.  For
 three float4 ALU inputs and no sampler, current setup emits
-`A01=012a2523` and explicitly resets A02/A03.  The earlier timeouts therefore
-do not qualify the corrected A00 plus ordered-consumer tuple.  The next live
-discriminator is still the byte-checked one-record MAD, but on a module
-containing both fixes; stop after the first timeout rather than replaying the
-older split-write matrix.
+`A01=012b2723` and explicitly resets A02/A03.  (`012a2523` is the distinct
+mixed-width `{4,2,3}` case, not this full-float4 program.)
+
+The combined correction was subsequently tested once with A00=`00000011`,
+A01=`012b2723`, and the same byte-exact production MAD.  It still timed out in
+the command-22 cookie wait after a known-good baseline; the engine was
+quarantined without a retry.  Thus both earlier identified state defects were
+real, but neither is sufficient to close the three-coordinate path.  Exact
+fault data and the bounded three-record successor are recorded in
+`raster-front-end-oracles.md`.  Do not replay the one-record MAD or the older
+split-write matrix while the remaining full draw-image/class3-source
+differential is unknown.
