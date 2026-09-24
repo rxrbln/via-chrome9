@@ -626,3 +626,50 @@ diagnostic value from no draw.
 This is the smallest source-backed separator between projected-Z/threshold
 transport and X8Z24 sample-lane transport; it needs a focused compiler
 self-test and independent packet review before a fresh-boot run.
+
+### Live threshold/sample diagnostic, 2026-09-24
+
+The reviewed five-instruction diagnostic was run once on the current VX900
+module with `cursor_sf=Y` and `fragment_sparse_textures=Y`.  It completed
+without a kernel fault, preserved D16 (`8000`), all checked source/BO guards
+and the full exterior margin, and left Xorg and `renderD128` available.  It
+failed the numeric check with these host BGRA words:
+
+| Rectangle | Expected | Actual |
+|---|---:|---:|
+| low source depth, W=+1 | `008c3300` | `00ffcc00` |
+| high source depth, W=+1 | `008ccc00` | `00ffcc00` |
+| low source depth, W=-1 | `008c3300` | `00003300` |
+
+The binary SHA-256 was
+`9b7bd09144bd377912aea09a85c2bc66d810a2f280f4cdb40d42d48183b28f6a`.
+The target log is
+`/root/tmp/chrome9-live/shadow-inspect-20260924/inspect.log`; the immediate
+dmesg delta was empty.  A previously passing sparse-s5 texture draw also
+passed afterward without a fault.
+
+The raw test initially used replicated ZZZZ and XXXX source swizzles for its
+scalar threshold ADD.  Linux 5.75's exact shadow record instead normalizes
+the unused lanes to Z000 and X000.  A second, independently reviewed draw
+changed only those inactive selectors; its source is tools commit `93d51f5`
+and its binary SHA-256 is
+`9258d0b1780f267fb7a92d218d751fb8d023b7706bed17d14bc353a3b995d427`.
+The three actual colors were unchanged, and its immediate dmesg delta was
+again empty.  The scalar inactive-lane difference is therefore not
+sufficient to explain this diagnostic failure.  Current Mesa already
+zero-pads scalar ALU sources, so the second form is the relevant one for
+the production shader.
+
+The red lane saturating to `ff` for W=+1 and to zero for W=-1 is consistent
+with the old `RCP(W)` temporary being read in place of the biased projected
+depth.  The green lane is also consistent with sampling at `1/W` rather than
+at the projected S coordinate, but S=.25 lies on a two-texel nearest-filter
+boundary; that lane alone is weaker evidence.  These are **inferences from
+pixels**, not a proven allocator or FE fault.  The five-instruction diagnostic
+has a smaller physical-register high-water and shorter TEMP lifetime than
+the eight-instruction proprietary full-shadow object, so its A90 bucket and
+bridge release bit cannot be compared to that full object as if the programs
+were otherwise identical.  A source-equivalent five-instruction Linux
+configuration-two replay, with per-instruction physical IDs and release
+bits, is the next offline gate.  Do not change A28, the computed bridge, or
+the resource bucket based on these pixels alone.
