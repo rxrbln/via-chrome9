@@ -7224,7 +7224,15 @@ chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
       *fence = NULL;
       if (f) {
          pipe_reference_init(&f->reference, 1);
-         pipe_resource_reference(&f->resource, ctx->last_target);
+         /* A sequence number covers exactly the jobs flushed so far;
+          * waiting for the target to idle would also wait for later
+          * frames and serialise CPU and GPU. */
+         if (chrome9_screen_has_capability2(pipe->screen,
+                                            DRM_CHROME9_CAP2_FENCE_SEQNO))
+            f->has_seqno = chrome9_fence_last(
+               pipe->screen->get_screen_fd(pipe->screen), &f->seqno);
+         if (!f->has_seqno)
+            pipe_resource_reference(&f->resource, ctx->last_target);
          *fence = (struct pipe_fence_handle *)f;
       }
    }

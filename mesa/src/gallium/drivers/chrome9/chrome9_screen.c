@@ -299,6 +299,9 @@ chrome9_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
    struct chrome9_fence *f = (struct chrome9_fence *)fence;
 
    (void)ctx;
+   if (f && f->has_seqno)
+      return chrome9_fence_wait(chrome9_screen(screen)->fd, f->seqno,
+                                MIN2(timeout, (uint64_t)INT64_MAX));
    (void)timeout;
    if (!f || !f->resource ||
        !chrome9_screen_has_capability(screen,

@@ -132,6 +132,29 @@ chrome9_bo_create(int fd, uint64_t size, uint32_t flags,
 }
 
 bool
+chrome9_fence_last(int fd, uint64_t *seqno)
+{
+   struct drm_chrome9_fence args = { .op = DRM_CHROME9_FENCE_OP_LAST };
+
+   if (drmIoctl(fd, DRM_IOCTL_CHROME9_FENCE, &args))
+      return false;
+   *seqno = args.seqno;
+   return true;
+}
+
+bool
+chrome9_fence_wait(int fd, uint64_t seqno, uint64_t timeout_ns)
+{
+   struct drm_chrome9_fence args = {
+      .op = DRM_CHROME9_FENCE_OP_WAIT,
+      .seqno = seqno,
+      .timeout_ns = timeout_ns,
+   };
+
+   return drmIoctl(fd, DRM_IOCTL_CHROME9_FENCE, &args) == 0;
+}
+
+bool
 chrome9_bo_info(int fd, const struct chrome9_bo *bo, uint32_t *flags)
 {
    struct drm_chrome9_gem_info args = { .handle = bo->handle };

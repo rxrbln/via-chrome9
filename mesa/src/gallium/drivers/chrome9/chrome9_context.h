@@ -180,6 +180,9 @@ struct chrome9_vertex_elements {
 struct chrome9_fence {
    struct pipe_reference reference;
    struct pipe_resource *resource;
+   /* Engine sequence number of the last job before the flush. */
+   uint64_t seqno;
+   bool has_seqno;
 };
 
 struct chrome9_context {
