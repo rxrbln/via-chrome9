@@ -4,6 +4,30 @@ Status: design only.  No target access, no driver source changes.  All
 statements are from the local Mesa 26.2.2 tree, the local chrome9 kernel
 tree and the T2 sysroot.  Estimates are marked as such.
 
+**Implementation status (2026-09-24 evening, `gallium/chrome9` `c49c7b6`,
+Mesa `41073a9`).**  Built in `objs-chrome9-llvm` with
+`cross-t2-chrome9-llvm.ini` (adds `--sysroot` link arguments; only the
+host-side chrome9 test executables still fail to link against the sysroot
+libLLVM, the driver library links).  Differences from this design:
+
+* Resource aliases are per draw sequence: created on demand, released with
+  all llvmpipe bindings in `chrome9_sw_finish()`, so no alias outlives its
+  chrome9 BO and no `content_seq` tracking is needed.  Mipmapped textures are
+  copied on every fallback draw.
+* CSO/shader twins live in a pointer hash table in the llvmpipe context and
+  are dropped from each chrome9 delete hook (`chrome9_sw_forget`).
+* R8 materialized: gallivm's `no_integers` path crashed (`cast_type`) on the
+  chrome9-finalized FS, which keeps native 1-bit booleans.  Shader clones
+  are compiled under llvmpipe's own `nir_options`; the chrome9 lowering only
+  float-encodes integer uniforms, which stays correct.
+* Selection: unsupported FS (as designed) **and** vertex shaders that sample
+  textures (the Gallium draw path interprets them per vertex; 25k-triangle
+  terrain mesh took about 20 s per frame).
+
+Result: glmark2 terrain renders at about 0.56 s per frame (noise pass
+90 ms warm, 0.78 s with the first LLVM compile), matching llvmpipe
+(`artifacts/2026-09-24/tcl/glmark2-terrain-swfb-vs-llvmpipe.png`).
+
 Path abbreviations used in citations:
 
 | Prefix | Path |
