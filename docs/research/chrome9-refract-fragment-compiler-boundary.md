@@ -97,12 +97,16 @@ contains no scene name, shader hash, or application-specific branch.
 
 `tools/re/chrome9_normalize_guard_smoke.c --refract-negative` implements the
 bounded negative-domain run without enabling the production selector.  It
-uses `k=(-.25,+0,.25,.5625)`, eagerly evaluates four scalar RSQ/RCP chains,
-then applies `CMP(k,candidate,c0.x=0)`.  The mathematical RGBA result is
-`(0,0,.5,.75)`, ideal host BGRA8888 `0xbf000080`; the checker retains exact
-zero red/green, bounded UNORM tolerance for blue/alpha, D16, exterior, and BO
-guard checks.  It emits an explicit cold-boot/bracket/quarantine warning and
-has only been host-built and dry-started, not submitted to a GPU.
+draws four disjoint rectangles with constant
+`k=(-.25,+0,.25,.5625)`.  Every rectangle executes the same single X-only
+`RSQ; RCP; CMP(k,candidate,c0.x=0); MOV` chain with vendor 000X inactive
+selectors, avoiding the unresolved partial-lane unary pattern from the older
+combined sqrt test.  The expected grayscale results are `0,0,.5,.75`, ideal
+host words `00000000,00000000,80808080,bfbfbfbf`; the checker retains exact
+zero checks, bounded UNORM tolerance for the positive controls, D16,
+rectangle-gap/exterior, and BO guard checks.  It emits an explicit
+cold-boot/bracket/quarantine warning and has only been host-built and
+dry-started, not submitted to a GPU.
 
 ## Result
 
