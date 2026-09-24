@@ -2955,16 +2955,22 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
    struct chrome9_ps_source lhs, rhs, true_value, false_value;
    struct chrome9_ps_instruction *subtract, *conditional;
    uint8_t condition_temp, result_temp;
-   unsigned value;
+   unsigned components = def->num_components, value;
    unsigned range_budget = CHROME9_PS_MAX_INSTRUCTIONS;
    float boundary;
 
-   if (select->op != nir_op_bcsel || def->num_components != 1 ||
+   if (select->op != nir_op_bcsel || !components || components > 4 ||
        !select->src[0].src.ssa ||
        select->src[0].src.ssa->bit_size != 1 ||
        select->src[0].swizzle[0] >=
           select->src[0].src.ssa->num_components)
       return false;
+   /* One scalar predicate is broadcast across the live result lanes.
+    * A vector predicate requires distinct comparisons and cannot use this
+    * single native CMP record. */
+   for (unsigned c = 1; c < components; c++)
+      if (select->src[0].swizzle[c] != select->src[0].swizzle[0])
+         return false;
    predicate = nir_scalar_resolved(select->src[0].src.ssa,
                                    select->src[0].swizzle[0]);
    if (predicate.comp || nir_def_instr(predicate.def)->type !=
@@ -3005,9 +3011,9 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
    subtract->source[0] = lhs;
    subtract->source[1] = rhs;
 
-   if (!chrome9_ps_lower_alu_source(builder, &select->src[1], 1,
+   if (!chrome9_ps_lower_alu_source(builder, &select->src[1], components,
                                     &true_value) ||
-       !chrome9_ps_lower_alu_source(builder, &select->src[2], 1,
+       !chrome9_ps_lower_alu_source(builder, &select->src[2], components,
                                     &false_value) ||
        builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
        builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
@@ -3019,12 +3025,12 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
       return false;
    conditional->destination.file = CHROME9_PS_DESTINATION_TEMP;
    conditional->destination.id = result_temp;
-   conditional->destination.writemask = 1;
+   conditional->destination.writemask = (1u << components) - 1;
    conditional->source[0].file = CHROME9_PS_SOURCE_TEMP;
    conditional->source[0].id = condition_temp;
-   conditional->source[0].swizzle[0] = CHROME9_PS_SWIZZLE_X;
-   for (unsigned c = 1; c < 4; c++)
-      conditional->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+   for (unsigned c = 0; c < 4; c++)
+      conditional->source[0].swizzle[c] = c < components ?
+         CHROME9_PS_SWIZZLE_X : CHROME9_PS_SWIZZLE_ZERO;
    conditional->source[1] = true_value;
    conditional->source[2] = false_value;
 
@@ -3032,9 +3038,9 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
    builder->value[value].def = def;
    builder->value[value].source.file = CHROME9_PS_SOURCE_TEMP;
    builder->value[value].source.id = result_temp;
-   builder->value[value].source.swizzle[0] = CHROME9_PS_SWIZZLE_X;
-   for (unsigned c = 1; c < 4; c++)
-      builder->value[value].source.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
+   for (unsigned c = 0; c < 4; c++)
+      builder->value[value].source.swizzle[c] = c < components ?
+         c : CHROME9_PS_SWIZZLE_ZERO;
    builder->value[value].complete = true;
    *source = builder->value[value].source;
    return true;

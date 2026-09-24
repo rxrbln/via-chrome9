@@ -465,6 +465,64 @@ check_separable_blur_compilation(struct chrome9_context *context)
    return valid;
 }
 
+static bool
+check_vector_conditional_compilation(struct chrome9_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-vector-conditional");
+   struct chrome9_shader shader = { 0 };
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_def *condition = nir_fge(
+      &b, nir_ffract(&b, nir_channel(&b, color, 0)),
+      nir_imm_float(&b, 0.5f));
+   nir_def *selected = nir_bcsel(
+      &b, condition,
+      nir_imm_vec3(&b, 0.25f, 0.5f, 0.75f),
+      nir_imm_vec3(&b, 0.75f, 0.25f, 0.5f));
+   bool found = false;
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b,
+      nir_channel(&b, selected, 0), nir_channel(&b, selected, 1),
+      nir_channel(&b, selected, 2), nir_imm_float(&b, 1.0f)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &shader.semantic_fs_ir.instruction[i];
+      const struct chrome9_ps_source *predicate = &instruction->source[0];
+
+      if (instruction->op != CHROME9_PS_OPCODE_CMP)
+         continue;
+      found = instruction->destination.writemask == 0x7 &&
+         predicate->file == CHROME9_PS_SOURCE_TEMP &&
+         predicate->swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+         predicate->swizzle[1] == CHROME9_PS_SWIZZLE_X &&
+         predicate->swizzle[2] == CHROME9_PS_SWIZZLE_X &&
+         predicate->swizzle[3] == CHROME9_PS_SWIZZLE_ZERO;
+      for (unsigned arm = 1; arm <= 2; arm++)
+         found &= instruction->source[arm].swizzle[3] ==
+                  CHROME9_PS_SWIZZLE_ZERO;
+   }
+   if (!shader.supported || !shader.semantic_fs_valid ||
+       !shader.native_fs_valid || !found)
+      fprintf(stderr, "vector conditional compilation failed: "
+              "supported=%u semantic=%u native=%u ir=%u found=%u\n",
+              shader.supported, shader.semantic_fs_valid,
+              shader.native_fs_valid, shader.semantic_fs_ir.count, found);
+   ralloc_free(b.shader);
+   return shader.supported && shader.semantic_fs_valid &&
+          shader.native_fs_valid && found;
+}
+
 int
 main(void)
 {
@@ -544,8 +602,9 @@ main(void)
        !check_scalar_literal_packing(&context, false, 65, false) ||
        !check_reordered_vector_literals(&context) ||
        !check_packed_alpha_kill(&context) ||
+       !check_vector_conditional_compilation(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, packed literals, and blur compilation passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, and blur compilation passed");
    return 0;
 }
