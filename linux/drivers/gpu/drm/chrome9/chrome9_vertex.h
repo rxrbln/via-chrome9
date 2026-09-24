@@ -22,8 +22,8 @@ struct chrome9_vertex_program {
 int chrome9_vertex_compile(
 	const struct drm_chrome9_vertex_instruction *instructions,
 	u32 instruction_count, const struct chrome9_fragment_program *fragment,
-	u32 input_count, u32 constant_first, u32 constant_count,
-	struct chrome9_vertex_program *program);
+	u32 input_count, const u8 *input_lanes, u32 constant_first,
+	u32 constant_count, struct chrome9_vertex_program *program);
 int chrome9_vertex_selftest(void);
 
 #endif

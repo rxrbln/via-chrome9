@@ -22,6 +22,7 @@ bool chrome9_textured_triangle_mip_enabled(void);
 bool chrome9_rhw_chain_enabled(void);
 bool chrome9_ps_add_enabled(void);
 bool chrome9_fragment_sparse_textures_enabled(void);
+bool chrome9_hw_tcl_enabled(void);
 int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 		   struct chrome9_sf_mapping **mapping);
 void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping);
@@ -31,6 +32,8 @@ int chrome9_engine_display_begin(struct chrome9_device *cdev);
 void chrome9_engine_display_end(struct chrome9_device *cdev);
 int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
+int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
+				      struct drm_file *file);
 int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,
 				struct drm_file *file);
 int chrome9_draw_triangle_blend_ioctl(struct drm_device *drm, void *data,

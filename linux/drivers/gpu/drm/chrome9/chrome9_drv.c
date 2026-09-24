@@ -2624,6 +2624,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 				DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED;
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_PRIMARY;
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_STENCIL;
+			if (chrome9_hw_tcl_enabled())
+				args->value |= DRM_CHROME9_CAP_VERTEX_PROGRAM;
 			if (chrome9_fragment_sparse_textures_enabled())
 				args->value |=
 					DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES;
@@ -2716,6 +2718,9 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_FRAGMENT_PROGRAM,
 			  chrome9_draw_fragment_program_ioctl,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_VERTEX_PROGRAM,
+			  chrome9_draw_vertex_program_ioctl,
 			  DRM_RENDER_ALLOW),
 };
 

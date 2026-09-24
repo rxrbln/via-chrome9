@@ -108,6 +108,17 @@ module_param_named(fe33_fence, chrome9_fe33_fence, bool, 0400);
 MODULE_PARM_DESC(fe33_fence,
 	"Require a coherent FE330004 3D completion write per 3D job (default: false)");
 
+static bool chrome9_hw_tcl;
+module_param_named(hw_tcl, chrome9_hw_tcl, bool, 0400);
+MODULE_PARM_DESC(hw_tcl,
+	"Enable the pre-promotion hardware vertex program ioctl (default: false)");
+
+/* RE knob: OR the open A61 bits 17:16 into TCL programs; bit 18 hangs. */
+static uint chrome9_tcl_a61_or;
+module_param_named(tcl_a61_or, chrome9_tcl_a61_or, uint, 0600);
+MODULE_PARM_DESC(tcl_a61_or,
+	"Debug: OR A61 bits 17:16 into hardware vertex programs (default: 0)");
+
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
@@ -194,6 +205,25 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_FRAGMENT_PROGRAM,
 };
 
+/* Stage A hardware TCL: compiled VS, raw vertices and viewport rows. */
+struct chrome9_tcl_draw {
+	struct chrome9_vertex_program program;
+	const struct drm_chrome9_vertex_instruction *instructions;
+	u32 instruction_count;
+	const u32 *constants;
+	u32 constant_first;
+	u32 constant_count;
+	const u32 *vertices;
+	u32 vertex_count;
+	u32 stride_dw;
+	u32 element_count;
+	u8 element_format[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u8 element_offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	/* Rows 256..258: viewport scale, offset and the snap bias. */
+	u32 rows[12];
+};
+
 struct chrome9_draw_request {
 	enum chrome9_draw_kind kind;
 	u32 destination_handle;
@@ -245,6 +275,7 @@ struct chrome9_draw_request {
 	const struct drm_chrome9_fragment_vertex *fragment_vertices;
 	const struct drm_chrome9_fragment_texture_state *fragment_textures;
 	const struct chrome9_fragment_program *fragment_program;
+	const struct chrome9_tcl_draw *tcl;
 	u64 fragment_texture_size[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_texture_count;
 	u8 fragment_texture_units[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
@@ -1970,6 +2001,30 @@ static u32 chrome9_fragment_consumer_width(u32 producer_width,
 	return min(producer_width, cap);
 }
 
+/* A25/A26 describe the VS producer, A28/A29 the PS consumer. */
+static void chrome9_fragment_link_words(u32 varying_count,
+		const u8 *varying_width, u32 texture_count, const u8 *alu_width,
+		u32 link[4])
+{
+	unsigned int varying;
+
+	link[0] = 0x25f60000;
+	link[1] = 0x26000000;
+	link[2] = 0x28ff0000;
+	link[3] = 0x29000000;
+	for (varying = 0; varying < varying_count; varying++) {
+		u32 shift = 12 - 4 * (varying & 3);
+		u32 producer = chrome9_fragment_varying_link(
+			varying_width[varying]);
+		u32 consumer = chrome9_fragment_varying_link(
+			chrome9_fragment_consumer_width(varying_width[varying],
+				texture_count, alu_width, varying));
+
+		link[varying < 4 ? 0 : 1] |= producer << shift;
+		link[varying < 4 ? 2 : 3] |= consumer << shift;
+	}
+}
+
 static u32 chrome9_fragment_raster_state(
 		u32 varying_count, const u8 *varying_width, u32 texture_count,
 		const u8 *alu_width, u32 vertex_count,
@@ -1985,10 +2040,7 @@ static u32 chrome9_fragment_raster_state(
 		0x51000000, 0x52147fff,
 	};
 	u32 vertex_stride = 6;
-	u32 a25 = 0x25f60000;
-	u32 a26 = 0x26000000;
-	u32 a28 = 0x28ff0000;
-	u32 a29 = 0x29000000;
+	u32 link[4];
 	u32 offset = 6;
 	unsigned int i;
 
@@ -2019,27 +2071,12 @@ static u32 chrome9_fragment_raster_state(
 	raster[i++] = 0x20000000;
 	raster[i++] = 0x23004f02;
 	raster[i++] = 0x24000000 | vertex_count;
-	for (unsigned int varying = 0; varying < varying_count; varying++) {
-		u32 shift = 12 - 4 * (varying & 3);
-		u32 producer = chrome9_fragment_varying_link(
-			varying_width[varying]);
-		/* A25/A26 describe the VS producer, A28/A29 the PS consumer. */
-		u32 consumer = chrome9_fragment_varying_link(
-			chrome9_fragment_consumer_width(varying_width[varying],
-				texture_count, alu_width, varying));
-
-		if (varying < 4) {
-			a25 |= producer << shift;
-			a28 |= consumer << shift;
-		} else {
-			a26 |= producer << shift;
-			a29 |= consumer << shift;
-		}
-	}
-	raster[i++] = a25;
-	raster[i++] = a26;
-	raster[i++] = a28;
-	raster[i++] = a29;
+	chrome9_fragment_link_words(varying_count, varying_width, texture_count,
+				    alu_width, link);
+	raster[i++] = link[0];
+	raster[i++] = link[1];
+	raster[i++] = link[2];
+	raster[i++] = link[3];
 	raster[i++] = 0x40800000;
 	raster[i++] = 0x41400000;
 	raster[i++] = 0x4200493f;
@@ -2054,6 +2091,108 @@ static u32 chrome9_fragment_raster_state(
 	raster[i++] = 0x51000000;
 	raster[i++] = 0x52147fff;
 	return i;
+}
+
+#define CHROME9_TCL_RASTER_WORDS	48
+
+/*
+ * Stage A TCL raster/FVF block: raw application elements feed v0..vN-1,
+ * the output linkage stays byte-identical to the post-TNL path and
+ * A40..A48 carry the clip engine's copy of rows 256/257.
+ */
+static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
+		const struct chrome9_tcl_draw *tcl,
+		u32 raster[CHROME9_TCL_RASTER_WORDS])
+{
+	u32 outputs = fp->varying_count ? 3 + fp->varying_count : 5;
+	u32 link[4];
+	unsigned int e, i = 0;
+
+	raster[i++] = (tcl->element_count - 1) << 8 | tcl->stride_dw;
+	for (e = 0; e < tcl->element_count; e++)
+		raster[i++] = (1 + e) << 24 | tcl->element_offset[e] << 12 |
+			      e << 8 | tcl->element_format[e];
+	/* Superset of the input and output masks; the vendor quad uses 1f. */
+	raster[i++] = 0x12000000 |
+		      GENMASK(max(outputs, tcl->element_count) - 1, 0);
+	raster[i++] = tcl->program.a61 |
+		      (READ_ONCE(chrome9_tcl_a61_or) & GENMASK(17, 16));
+	raster[i++] = tcl->program.a62;
+	raster[i++] = 0x20000000;
+	raster[i++] = 0x23004f02;
+	raster[i++] = 0x24000000 | tcl->vertex_count;
+	if (fp->varying_count) {
+		chrome9_fragment_link_words(fp->varying_count, fp->varying_width,
+					    fp->texture_count,
+					    fp->varying_alu_width, link);
+		memcpy(raster + i, link, sizeof(link));
+		i += ARRAY_SIZE(link);
+	} else {
+		raster[i++] = 0x25f6cc00;
+		raster[i++] = 0x28ffcc00;
+	}
+	for (e = 0; e < 3; e++) {
+		u32 scale = tcl->rows[e];
+		u32 offset = tcl->rows[4 + e];
+
+		raster[i++] = (0x40 + 3 * e) << 24 | (scale & 0x00ffffff);
+		raster[i++] = (0x41 + 3 * e) << 24 | (offset & 0x00ffffff);
+		raster[i++] = (0x42 + 3 * e) << 24 | (offset >> 24) << 8 |
+			      scale >> 24;
+	}
+	raster[i++] = 0x49000000;
+	raster[i++] = 0x50000000;
+	raster[i++] = 0x51000000;
+	raster[i++] = 0x52147fff;
+	return i;
+}
+
+/* The proven VS oracle rows: 32x32 viewport, 786432 snap bias. */
+static int chrome9_tcl_raster_selftest(void)
+{
+	static const u32 expected[] = {
+		0x00000206, 0x010000c2, 0x020041d1, 0x030052d1,
+		0x1200001f, 0x61800000, 0x62208002, 0x20000000,
+		0x23004f02, 0x24000003, 0x25f6cc00, 0x28ffcc00,
+		0x40800000, 0x414000f8, 0x42004941, 0x43800000,
+		0x444000f8, 0x450049c1, 0x46800000, 0x47000000,
+		0x4800003f, 0x49000000, 0x50000000, 0x51000000,
+		0x52147fff,
+	};
+	static const u32 rows[] = {
+		0x41800000, 0xc1800000, 0x3f800000, 0x00000000,
+		0x494000f8, 0x494000f8, 0x00000000, 0x00000000,
+		0x49400000, 0x49400000, 0x00000000, 0x00000000,
+	};
+	struct chrome9_fragment_program *fp;
+	struct chrome9_tcl_draw *tcl;
+	u32 raster[CHROME9_TCL_RASTER_WORDS];
+	int ret = -EINVAL;
+
+	fp = kzalloc(sizeof(*fp), GFP_KERNEL);
+	tcl = kzalloc(sizeof(*tcl), GFP_KERNEL);
+	if (!fp || !tcl) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	tcl->element_count = 3;
+	tcl->stride_dw = 6;
+	tcl->vertex_count = 3;
+	tcl->element_format[0] = 0xc2;
+	tcl->element_format[1] = 0xd1;
+	tcl->element_format[2] = 0xd1;
+	tcl->element_offset[1] = 4;
+	tcl->element_offset[2] = 5;
+	tcl->program.a61 = 0x61800000;
+	tcl->program.a62 = 0x62208002;
+	memcpy(tcl->rows, rows, sizeof(rows));
+	if (chrome9_tcl_raster_state(fp, tcl, raster) == ARRAY_SIZE(expected) &&
+	    !memcmp(raster, expected, sizeof(expected)))
+		ret = 0;
+out:
+	kfree(tcl);
+	kfree(fp);
+	return ret;
 }
 
 static int chrome9_fragment_raster_selftest(void)
@@ -2074,6 +2213,9 @@ static int chrome9_fragment_raster_selftest(void)
 	u32 count;
 	unsigned int varying_count;
 
+	count = chrome9_tcl_raster_selftest();
+	if (count)
+		return count;
 	count = chrome9_fragment_raster_state(0, NULL, 0, NULL, 3, raster);
 	if (count != ARRAY_SIZE(expected_zero_varying) ||
 	    memcmp(raster, expected_zero_varying,
@@ -2432,6 +2574,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	/* VX900 HPSLocationReg: direct PEY, TS-ZTAG deadlock ECO enabled. */
 	static const u32 misc_location[] = { 0x8a020000 };
 	const struct chrome9_fragment_program *program = request->fragment_program;
+	const struct chrome9_tcl_draw *tcl = request->tcl;
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(request->destination_format);
 	struct chrome9_blend_words blend_words;
@@ -2446,7 +2589,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x81000000 | request->width,
 		chrome9_scissor_y(request), chrome9_scissor_x(request),
 	};
-	u32 raster[40];
+	u32 raster[CHROME9_TCL_RASTER_WORDS];
 	u32 vs_program[4 * (4 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)] = { 0 };
 	u32 vs_control[] = { 0 };
 	u32 *base = engine->run_staging_cpu;
@@ -2454,7 +2597,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	u32 *vertex_header;
 	u32 destination_count;
 	u32 common_count = 7;
-	u32 vertex_count = request->triangle_count * 3;
+	u32 vertex_count = tcl ? tcl->vertex_count : request->triangle_count * 3;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 		DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	u32 raster_count;
@@ -2463,7 +2606,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	unsigned int i;
 	int ret;
 
-	if (!base || !program || !request->fragment_vertices || !rt_format)
+	if (!base || !program || (!request->fragment_vertices && !tcl) ||
+	    !rt_format)
 		return -EINVAL;
 	ret = chrome9_fragment_fe_config(program->active_texture_count,
 		program->texture_count, program->varying_count,
@@ -2527,10 +2671,17 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 			blend_words.a33 : 0x33007000;
 	}
 
+	/* Vendor hardware TCL: type-01 A01 clip engine (bit 11) plus bit 20. */
+	if (tcl)
+		common[4] |= 0x00100800;
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
-	raster_count = chrome9_fragment_raster_state(program->varying_count,
-		program->varying_width, program->texture_count,
-		program->varying_alu_width, vertex_count, raster);
+	if (tcl)
+		raster_count = chrome9_tcl_raster_state(program, tcl, raster);
+	else
+		raster_count = chrome9_fragment_raster_state(
+			program->varying_count, program->varying_width,
+			program->texture_count, program->varying_alu_width,
+			vertex_count, raster);
 	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
 	for (i = 0; i < program->varying_count; i++) {
 		u32 *record = vs_program + 16 + i * 4;
@@ -2564,16 +2715,31 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 					     &program->constants[16][0],
 					     (program->constant_count - 16) * 4);
 	}
-	chrome9_emit_header3(&p, 0x32030400, vs_float_constants,
-			     ARRAY_SIZE(vs_float_constants));
+	if (tcl && tcl->constant_count)
+		chrome9_emit_header3(&p, 0x32030000 + 4 * tcl->constant_first,
+				     tcl->constants, 4 * tcl->constant_count);
+	if (tcl)
+		chrome9_emit_header3(&p, 0x32030400, tcl->rows,
+				     ARRAY_SIZE(tcl->rows));
+	else
+		chrome9_emit_header3(&p, 0x32030400, vs_float_constants,
+				     ARRAY_SIZE(vs_float_constants));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x33030000,
 			     vs_integer_constants, ARRAY_SIZE(vs_integer_constants));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     clip, ARRAY_SIZE(clip));
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
-			     vs_program, 4 * (4 + program->varying_count));
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
-			     vs_control, ARRAY_SIZE(vs_control));
+	if (tcl) {
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
+				     &tcl->program.records[0][0],
+				     4 * tcl->program.record_count);
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
+				     &tcl->program.a60, 1);
+	} else {
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
+				     vs_program, 4 * (4 + program->varying_count));
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
+				     vs_control, ARRAY_SIZE(vs_control));
+	}
 	if (program->controls[0] & BIT(19))
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 				     misc_location, ARRAY_SIZE(misc_location));
@@ -2589,7 +2755,17 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		*p++ = 0xcc000000;
 	vertex_header = p;
 	p += 4;
-	for (i = 0; i < vertex_count; i++) {
+	if (tcl) {
+		u32 dwords = vertex_count * tcl->stride_dw;
+
+		/* Keep room for the tail, PAUSE/STOP and the read-ahead. */
+		if (p + dwords + CHROME9_CR_READ_AHEAD / 4 + 0x100 >
+		    base + CHROME9_RUN_STAGING_SIZE / 4)
+			return -E2BIG;
+		memcpy(p, tcl->vertices, dwords * sizeof(*p));
+		p += dwords;
+	}
+	for (i = 0; !tcl && i < vertex_count; i++) {
 		const struct drm_chrome9_fragment_vertex *vertex =
 			&request->fragment_vertices[i];
 		unsigned int varying;
@@ -7853,10 +8029,10 @@ static int chrome9_fragment_texture_selftest(void)
 	return 0;
 }
 
-int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
-					struct drm_file *file)
+static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
+				 struct drm_chrome9_draw_fragment_program *args,
+				 struct chrome9_tcl_draw *tcl)
 {
-	struct drm_chrome9_draw_fragment_program *args = data;
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(args->destination_format);
 	struct drm_chrome9_fragment_instruction *instructions = NULL;
@@ -7905,9 +8081,12 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 	    chrome9_validate_depth_flags(args->flags, allowed_flags) ||
 	    (!depth && (args->flags & (DRM_CHROME9_DEPTH_FUNC_MASK |
 				       DRM_CHROME9_DEPTH_READ_ONLY))) ||
-	    !args->destination_handle || !args->triangle_count ||
-	    args->triangle_count > DRM_CHROME9_FRAGMENT_MAX_TRIANGLES ||
-	    !args->vertices_ptr || !args->instructions_ptr ||
+	    !args->destination_handle ||
+	    (tcl ? args->triangle_count || args->vertices_ptr :
+	     !args->triangle_count ||
+	     args->triangle_count > DRM_CHROME9_FRAGMENT_MAX_TRIANGLES ||
+	     !args->vertices_ptr) ||
+	    !args->instructions_ptr ||
 	    !args->instruction_count ||
 	    args->instruction_count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS ||
 	    args->constant_count > DRM_CHROME9_FRAGMENT_MAX_CONSTANTS ||
@@ -8011,48 +8190,50 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 		ret = -E2BIG;
 		goto out_free;
 	}
-	vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
-		vertex_count, sizeof(*vertices));
-	if (IS_ERR(vertices)) {
-		ret = PTR_ERR(vertices);
-		vertices = NULL;
-		goto out_free;
-	}
-	for (i = 0; i < vertex_count; i++) {
-		unsigned int varying;
-
-		if (!chrome9_coordinate_valid(vertices[i].x_16_16, args->width) ||
-		    !chrome9_coordinate_valid(vertices[i].y_16_16, args->height) ||
-		    vertices[i].z_16_16 < 0 || vertices[i].z_16_16 > 0x10000 ||
-		    !chrome9_rhw_valid(vertices[i].rhw_float)) {
-			ret = -EINVAL;
+	if (!tcl) {
+		vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+			vertex_count, sizeof(*vertices));
+		if (IS_ERR(vertices)) {
+			ret = PTR_ERR(vertices);
+			vertices = NULL;
 			goto out_free;
 		}
-		for (varying = 0; varying < args->varying_count; varying++) {
-			unsigned int component;
+		for (i = 0; i < vertex_count; i++) {
+			unsigned int varying;
 
-			for (component = 0; component < 4; component++)
-				if (!chrome9_float_finite(
-					vertices[i].varying[varying][component])) {
+			if (!chrome9_coordinate_valid(vertices[i].x_16_16, args->width) ||
+			    !chrome9_coordinate_valid(vertices[i].y_16_16, args->height) ||
+			    vertices[i].z_16_16 < 0 || vertices[i].z_16_16 > 0x10000 ||
+			    !chrome9_rhw_valid(vertices[i].rhw_float)) {
+				ret = -EINVAL;
+				goto out_free;
+			}
+			for (varying = 0; varying < args->varying_count; varying++) {
+				unsigned int component;
+
+				for (component = 0; component < 4; component++)
+					if (!chrome9_float_finite(
+						vertices[i].varying[varying][component])) {
+						ret = -EINVAL;
+						goto out_free;
+					}
+			}
+			for (; varying < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; varying++)
+				if (memchr_inv(vertices[i].varying[varying], 0,
+					       sizeof(vertices[i].varying[varying]))) {
 					ret = -EINVAL;
 					goto out_free;
 				}
 		}
-		for (; varying < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; varying++)
-			if (memchr_inv(vertices[i].varying[varying], 0,
-				       sizeof(vertices[i].varying[varying]))) {
+		for (i = 0; i < vertex_count; i += 3)
+			if (!chrome9_triangle_nondegenerate(
+				vertices[i].x_16_16, vertices[i].y_16_16,
+				vertices[i + 1].x_16_16, vertices[i + 1].y_16_16,
+				vertices[i + 2].x_16_16, vertices[i + 2].y_16_16)) {
 				ret = -EINVAL;
 				goto out_free;
 			}
 	}
-	for (i = 0; i < vertex_count; i += 3)
-		if (!chrome9_triangle_nondegenerate(
-			vertices[i].x_16_16, vertices[i].y_16_16,
-			vertices[i + 1].x_16_16, vertices[i + 1].y_16_16,
-			vertices[i + 2].x_16_16, vertices[i + 2].y_16_16)) {
-			ret = -EINVAL;
-			goto out_free;
-		}
 	program = kvzalloc(sizeof(*program), GFP_KERNEL);
 	if (!program) {
 		ret = -ENOMEM;
@@ -8069,6 +8250,16 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 			args->texture_count, args->varying_count, program);
 	if (ret)
 		goto out_free;
+	if (tcl) {
+		ret = chrome9_vertex_compile(tcl->instructions,
+			tcl->instruction_count, program, tcl->element_count,
+			tcl->input_lanes, tcl->constant_first,
+			tcl->constant_count, &tcl->program);
+		if (ret)
+			goto out_free;
+		request.triangle_count = tcl->vertex_count / 3;
+		request.tcl = tcl;
+	}
 	request.fragment_vertices = vertices;
 	request.fragment_textures = textures;
 	request.fragment_program = program;
@@ -8080,6 +8271,190 @@ out_free:
 	kfree(textures);
 	kfree(constants);
 	kfree(instructions);
+	return ret;
+}
+
+int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
+					struct drm_file *file)
+{
+	return chrome9_draw_fragment(drm, file, data, NULL);
+}
+
+bool chrome9_hw_tcl_enabled(void)
+{
+	return READ_ONCE(chrome9_hw_tcl);
+}
+
+/* Raw stage A payload bound; the rest of the 64-KiB segment is state. */
+#define CHROME9_TCL_MAX_VERTEX_BYTES	(40U * 1024)
+
+/*
+ * Final float bits from userspace (no kernel FPU): finite, |sx|,|sy| <=
+ * 2048, |sz|,|oz| <= 1, ox/oy inside the [2^19, 2^20) snap domain.
+ */
+static bool chrome9_tcl_viewport_valid(const u32 viewport[8])
+{
+	unsigned int i;
+
+	for (i = 0; i < 6; i++)
+		if (!chrome9_float_finite(viewport[i]))
+			return false;
+	return (viewport[0] & 0x7fffffff) <= 0x45000000 &&
+	       (viewport[1] & 0x7fffffff) <= 0x45000000 &&
+	       (viewport[2] & 0x7fffffff) <= 0x3f800000 &&
+	       (viewport[5] & 0x7fffffff) <= 0x3f800000 &&
+	       viewport[3] >> 23 == 0x92 && viewport[4] >> 23 == 0x92 &&
+	       !viewport[6] && !viewport[7];
+}
+
+static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
+		const struct drm_chrome9_vertex_element *elements, u32 stride)
+{
+	static const u8 native[] = { 0x02, 0x42, 0x82, 0xc2, 0xd1 };
+	static const u8 dwords[] = { 1, 2, 3, 4, 1 };
+	unsigned int e;
+
+	for (e = 0; e < tcl->element_count; e++) {
+		const struct drm_chrome9_vertex_element *element = &elements[e];
+
+		if (element->format >= ARRAY_SIZE(native) || element->buffer ||
+		    element->reserved || !IS_ALIGNED(element->offset, 4) ||
+		    element->offset > stride - 4 * dwords[element->format])
+			return -EINVAL;
+		tcl->element_format[e] = native[element->format];
+		tcl->element_offset[e] = element->offset / 4;
+		tcl->input_lanes[e] = element->format ==
+			DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM ? 0xf :
+			GENMASK(dwords[element->format] - 1, 0);
+	}
+	return 0;
+}
+
+static bool chrome9_tcl_vertices_finite(const struct chrome9_tcl_draw *tcl)
+{
+	unsigned int v, e, c;
+
+	for (v = 0; v < tcl->vertex_count; v++) {
+		const u32 *vertex = tcl->vertices + v * tcl->stride_dw;
+
+		for (e = 0; e < tcl->element_count; e++) {
+			if (tcl->element_format[e] == 0xd1)
+				continue;
+			for (c = 0; c < hweight8(tcl->input_lanes[e]); c++)
+				if (!chrome9_float_finite(
+					vertex[tcl->element_offset[e] + c]))
+					return false;
+		}
+	}
+	return true;
+}
+
+int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
+				      struct drm_file *file)
+{
+	struct drm_chrome9_draw_vertex_program *args = data;
+	struct drm_chrome9_vertex_instruction *instructions = NULL;
+	struct drm_chrome9_vertex_element *elements = NULL;
+	struct chrome9_tcl_draw *tcl = NULL;
+	u32 *constants = NULL;
+	u32 *vertices = NULL;
+	unsigned int i;
+	int ret;
+
+	if (!chrome9_hw_tcl_enabled())
+		return -EOPNOTSUPP;
+	if (args->abi_version != DRM_CHROME9_VERTEX_ABI_VERSION ||
+	    args->flags || args->index_count || args->index_size ||
+	    args->buffer_count || args->base_vertex || args->indices_ptr ||
+	    args->buffers_ptr ||
+	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
+	    !args->instruction_count ||
+	    args->instruction_count > DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS ||
+	    !args->element_count ||
+	    args->element_count > DRM_CHROME9_VERTEX_MAX_INPUTS ||
+	    args->constant_first > DRM_CHROME9_VERTEX_MAX_CONSTANTS ||
+	    args->constant_count >
+		DRM_CHROME9_VERTEX_MAX_CONSTANTS - args->constant_first ||
+	    !!args->constants_ptr != !!args->constant_count ||
+	    !args->vertex_count || args->vertex_count % 3 ||
+	    args->vertex_count > DRM_CHROME9_VERTEX_MAX_VERTICES ||
+	    !IS_ALIGNED(args->vertex_stride, 4) || args->vertex_stride < 4 ||
+	    args->vertex_stride > 4 * 127 ||
+	    args->vertex_count * args->vertex_stride >
+		CHROME9_TCL_MAX_VERTEX_BYTES ||
+	    !args->instructions_ptr || !args->elements_ptr ||
+	    !args->vertices_ptr ||
+	    !chrome9_tcl_viewport_valid(args->viewport))
+		return -EINVAL;
+	tcl = kvzalloc(sizeof(*tcl), GFP_KERNEL);
+	if (!tcl)
+		return -ENOMEM;
+	tcl->instruction_count = args->instruction_count;
+	tcl->element_count = args->element_count;
+	tcl->constant_first = args->constant_first;
+	tcl->constant_count = args->constant_count;
+	tcl->vertex_count = args->vertex_count;
+	tcl->stride_dw = args->vertex_stride / 4;
+	for (i = 0; i < 3; i++) {
+		tcl->rows[i] = args->viewport[i];
+		tcl->rows[4 + i] = args->viewport[3 + i];
+	}
+	tcl->rows[8] = 0x49400000;
+	tcl->rows[9] = 0x49400000;
+
+	elements = memdup_array_user(u64_to_user_ptr(args->elements_ptr),
+		args->element_count, sizeof(*elements));
+	if (IS_ERR(elements)) {
+		ret = PTR_ERR(elements);
+		elements = NULL;
+		goto out_free;
+	}
+	ret = chrome9_tcl_elements(tcl, elements, args->vertex_stride);
+	if (ret)
+		goto out_free;
+	instructions = memdup_array_user(u64_to_user_ptr(args->instructions_ptr),
+		args->instruction_count, sizeof(*instructions));
+	if (IS_ERR(instructions)) {
+		ret = PTR_ERR(instructions);
+		instructions = NULL;
+		goto out_free;
+	}
+	tcl->instructions = instructions;
+	if (args->constant_count) {
+		constants = memdup_array_user(u64_to_user_ptr(args->constants_ptr),
+			args->constant_count, 4 * sizeof(*constants));
+		if (IS_ERR(constants)) {
+			ret = PTR_ERR(constants);
+			constants = NULL;
+			goto out_free;
+		}
+		for (i = 0; i < 4 * args->constant_count; i++)
+			if (!chrome9_float_finite(constants[i])) {
+				ret = -EINVAL;
+				goto out_free;
+			}
+		tcl->constants = constants;
+	}
+	vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+		args->vertex_count, args->vertex_stride);
+	if (IS_ERR(vertices)) {
+		ret = PTR_ERR(vertices);
+		vertices = NULL;
+		goto out_free;
+	}
+	tcl->vertices = vertices;
+	if (!chrome9_tcl_vertices_finite(tcl)) {
+		ret = -EINVAL;
+		goto out_free;
+	}
+	ret = chrome9_draw_fragment(drm, file, &args->fragment, tcl);
+
+out_free:
+	kvfree(vertices);
+	kfree(constants);
+	kfree(instructions);
+	kfree(elements);
+	kvfree(tcl);
 	return ret;
 }
 
