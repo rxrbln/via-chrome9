@@ -262,6 +262,84 @@ size equality at `:4719..4722`.  The full-size mip-capable RT therefore fails
 with `-EINVAL`; its destination-size contract must accept and validate the
 complete guarded BO without weakening either guard.
 
+### Narrow extended-destination ABI
+
+The safe change is opt-in; silently replacing the existing equality test with
+`actual >= required` would weaken every version-one caller.  Reserve fragment
+flag bit 2 for a semantic such as
+`DRM_CHROME9_FRAGMENT_DESTINATION_TRAILING_STORAGE` and capability bit 53 for
+`DRM_CHROME9_CAP_FRAGMENT_DESTINATION_TRAILING_STORAGE`.  The flag says only
+that the destination GEM object contains page-aligned private storage after
+the guarded L0 span.  It does not make the kernel infer or trust a userspace
+mip layout.
+
+Keep two sizes throughout `chrome9_submit_fragment_program`:
+
+* `required_sizes[0]` remains the ioctl-derived L0 span
+  `ALIGN(pitch * height, PAGE_SIZE) + 2 * PAGE_SIZE`;
+* `mapping_sizes[i]` is the actual `objects[i]->size` used for the aggregate
+  64-MiB limit, cache maintenance and DMA ownership; and
+* without the new flag, and for depth and every texture with either flag
+  value, require `mapping_sizes[i] == required_sizes[i]` exactly.  Only
+  destination index zero with the new flag may use
+  `mapping_sizes[0] > required_sizes[0]`; both values must be page aligned.
+
+The current source sites which must retain this distinction are:
+
+```text
+chrome9_drm.h:963..966       ABI flags (bit 2 is free)
+chrome9_drm.h:208..210       capability tail (bit 53 is free)
+chrome9_drv.c:2492..2544     capability advertisement
+chrome9_engine.c:7246..7260 allowed_flags validation
+chrome9_engine.c:7294..7299 required L0-span computation
+chrome9_engine.c:4698..4738 object lookup, equality and aggregate-size cap
+chrome9_engine.c:4809..4812 pre-draw guards/cache publication
+chrome9_engine.c:4854..4863 post-draw cache/guard verification
+chrome9_engine.c:4887..4892 error-path cache maintenance
+```
+
+Reservation and DMA synchronization already cover the whole GEM object and
+need no range relaxation.  The destination remains a WRITE reservation, the
+GPU address remains `base + PAGE_SIZE`, and feedback-alias rejection remains
+unchanged.  Cache flushes must change from the required span to the actual
+mapping span; otherwise later mip bytes are outside the explicit CPU/device
+ownership transition.
+
+Prepare and verify both destination extents:
+
+```text
+prepare/verify(map, required_sizes[0])  -> leading + internal L0 guard
+prepare/verify(map, mapping_sizes[0])   -> leading + final object guard
+```
+
+For ordinary destinations the extents are equal, so the existing behavior is
+identical.  For an extended destination the duplicate leading-guard write is
+harmless and the two trailing guard pages are disjoint.  This also keeps a
+GPU overrun into L1 distinguishable from an overrun past the complete object.
+
+The acceptance predicate should have a pure startup self-test with these
+vectors (all sizes page aligned): exact/no-flag passes; larger/no-flag fails;
+equal/flag fails; smaller/flag fails; and larger/flag passes.  A subsequent
+guarded userspace test should use a 64x32 BGRA two-level allocation:
+
+```text
+required L0 span = 0x4000
+actual BO size   = 0x6000
+leading guard    = [0x0000,0x1000)
+L0 pixels        = [0x1000,0x3000)
+internal guard   = [0x3000,0x4000)
+L1 payload       = [0x4000,0x4800)
+padding          = [0x4800,0x5000)
+final guard      = [0x5000,0x6000)
+```
+
+Render a constant color to L0 with an independent X8Z24 target.  Require L0
+and depth correctness, all three color guards, both depth guards, and the L1
+payload/padding poison unchanged.  The same ioctl without the opt-in flag must
+return `-EINVAL` before any GPU submission.  This is the minimal proof that
+full-object acceptance did not turn the private mip tail into an unguarded
+renderable range.
+
 Mesa also still rejects the eventual consumer before submission:
 `chrome9_draw.c:696..744` restricts mip sampling to square POT BGRX resources
 no larger than 512, while refract's stage 1 is 1600x1200 BGRA and extends to
