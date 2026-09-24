@@ -1,7 +1,8 @@
 # ioquake3 GL2 pshadow compiler boundary
 
-Status: exact default-source link and offline Chrome9 rejection audit,
-2026-09-24.  No program described here has been submitted to the GPU.
+Status: exact default-source link, offline Chrome9 rejection audit, and
+isolated sample-equality KILL silicon qualification, 2026-09-24.  The full
+pshadow program has not been submitted to the GPU.
 
 ## Exact default object
 
@@ -133,3 +134,19 @@ Passing shader link, producing a semantic stream, or retiring a draw without
 pixel checks is not sufficient.  The default object remains unsupported until
 the equality KILL and full pshadow readback gates pass.
 
+## Isolated equality-KILL silicon result
+
+The guarded raw cmd22 oracle from tools commit `fe21059` was submitted once on
+VX900 under the exclusive GPU lock.  Binary SHA-256 was
+`4899a7f19304a94889ffe618d5cbcb8c924dab8f3292b899c67817cc550aa6b7`.
+It passed the exact boundary: normalized 254/255 survived while normalized
+1.0 was discarded.  D16, destination guards, and the immutable source image
+all passed.  The ioctl returned zero, `/dev/dri/renderD128` remained present,
+and the immediate dmesg delta was empty.
+
+Target evidence is retained under
+`/root/tmp/chrome9-live/ioquake-gl2-pshadow-20260924/` as `equal-one.log`,
+`equal-one.sha256`, and the before/after/delta dmesg logs.  This qualifies the
+three-record SUB/ABS/CMP predicate plus broadcast KILL for normalized sampled
+values; it does not qualify the complete pshadow arithmetic, `fsign`, or its
+full draw-domain proof.
