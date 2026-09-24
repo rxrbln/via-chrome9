@@ -192,3 +192,22 @@ The same restructuring must cover restore error handling.  The current
 back saved SR6C (`chrome9_engine.c:2822-2828`), leaving table write protection
 cleared.  Protection restoration must be unconditional once it was cleared,
 independent of whether the bounded completion wait succeeds.
+
+## Bounded hardware validation
+
+The revised kernel requests SR6F, restores SR6C write protection, and then
+performs the bounded SR6F completion wait in all three GART PTE-update paths.
+The target was cold-power-cycled after the preceding quarantined timeout, and
+the staged module had SHA-256
+`83a0d6b47e4473a86db0899fd7ceb6995c35434ff207f6e11872f96eda52310a`.
+Probe and native IGA1 KMS succeeded. The guarded primary-color draw changed
+exactly 1,176 intended pixels and no exterior pixels. Xorg initialized
+glamor and AIGLX with the Chrome9 Mesa driver.
+
+The exact 20-second `glxgears` regression that previously produced
+`SR6F=80` completed with three five-second samples at 96.633, 96.309, and
+96.356 FPS and no GART error. A separate 45-second bounded run produced
+eight samples between 96.462 and 96.771 FPS, again with no GART,
+bind-cleanup, draw, or job-timeout message. `timeout` exited with status 124
+as expected; there was no application draw error. These runs support the
+corrected ordering but do not prove every workload or recovery path.
