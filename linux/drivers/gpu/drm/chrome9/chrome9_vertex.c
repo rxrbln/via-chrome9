@@ -39,6 +39,8 @@
 #define CHROME9_VS_DEST_POSITION	0xa0U
 #define CHROME9_VS_LITERAL_ONE		0x00206490U
 #define CHROME9_VS_LITERAL_ZERO		0x00206db4U
+/* (0, 0, 0, 1): selectors ZERO, ZERO, ZERO, ONE. */
+#define CHROME9_VS_LITERAL_W1		0x00206db0U
 /* Op 28/29: taken and not-taken displacements in bits 18:10 of dwords 1
  * and 2; DRM_CHROME9_VERTEX_MAX_RECORDS keeps them below 512. */
 #define CHROME9_VS_FLOW_TAKEN		0x00280000U
@@ -891,11 +893,11 @@ int chrome9_vertex_compile(
 		if (ret)
 			goto out;
 	}
-	/* Sprite-replaced coordinates keep a defined VS output. */
+	/* Sprite-replaced coordinates default to the GL (s, t, 0, 1) form. */
 	for (i = 0; i < fragment->varying_count; i++) {
 		if (!(sprite_mask & BIT(fragment->varying_logical[i])))
 			continue;
-		record[0] = CHROME9_VS_LITERAL_ZERO;
+		record[0] = CHROME9_VS_LITERAL_W1;
 		record[3] = chrome9_vertex_dest_word(CHROME9_VS_NATIVE_MOV, false,
 				CHROME9_VS_DEST_T + i,
 				GENMASK(fragment->varying_width[i] - 1, 0));
@@ -1376,12 +1378,12 @@ static const u32 point_size_rec[][4] = {
 	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008422f },
 	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008423f },
 };
-/* Sprite coordinate T0: the VS write is dropped and zero-filled. */
+/* Sprite coordinate T0: the VS write is dropped and (0, 0, 0, 1)-filled. */
 static const u32 sprite_rec[][4] = {
 	{ 0x0008014c, 0, 0, 0x00080a0f },
 	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008422f },
 	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008423f },
-	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x00080283 },
+	{ CHROME9_VS_LITERAL_W1, 0, 0, 0x00080283 },
 };
 static const struct drm_chrome9_vertex_instruction bad_point_size_insn[] = {
 	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),

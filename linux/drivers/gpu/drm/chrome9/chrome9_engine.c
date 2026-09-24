@@ -67,7 +67,7 @@
 #define CHROME9_QUERY_CANARY		0x0cc10000U
 /* Reset, snapshot and optional sync, headers and alignment included. */
 #define CHROME9_QUERY_STATE_DWORDS	16U
-#define CHROME9_QUERY_SNAPSHOT_DWORDS	40U
+#define CHROME9_QUERY_SNAPSHOT_DWORDS	48U
 /* Last GART entry: the SF snapshot page, never handed to draw mappings. */
 #define CHROME9_QUERY_SF_INDEX		(CHROME9_GART_ENTRIES - 1)
 
@@ -83,7 +83,19 @@
 #define CHROME9_QUERY_RE_SF		BIT(3)
 #define CHROME9_QUERY_RE_PPC		BIT(4)
 #define CHROME9_QUERY_RE_WATCH		BIT(5)
-#define CHROME9_QUERY_RE_MASK		GENMASK(5, 0)
+/* 64: CR engine-idle group (as before PAUSE/STOP) before the snapshot. */
+#define CHROME9_QUERY_RE_IDLE		BIT(6)
+#define CHROME9_QUERY_RE_MASK		GENMASK(6, 0)
+/* PPC counter selector of the submission, bits 12:8 of the sampled re. */
+#define CHROME9_QUERY_RE_PPC_TYPE(re)	((re) >> 8 & 0x1f)
+
+/* Silicon: the type 17h address is a byte address, not the manual's
+ * dword units (a dword-unit field landed at a quarter of the slot). */
+static uint chrome9_occlusion_ppc_type = 0x17;
+module_param_named(occlusion_ppc_type, chrome9_occlusion_ppc_type, uint,
+		   0600);
+MODULE_PARM_DESC(occlusion_ppc_type,
+	"Debug: PPC counter written back with occlusion_re bit 16 (default: 0x17 HZOcclusionCNT)");
 
 static uint chrome9_occlusion_re;
 module_param_named(occlusion_re, chrome9_occlusion_re, uint, 0600);
@@ -1041,8 +1053,10 @@ static const u32 chrome9_occlusion_reset[] = {
 /*
  * Vendor query end: type-10 read-back of type-01 A1C to the byte address
  * in A21/A22.  RE_DRAIN (also occlusion_query=2) first drains the 3D
- * pipeline as the tail does.  RE_PPC instead fires the manual's PPC type 17h
- * (HZOcclusionCNT) write-back with its dword address and SL/SF location.
+ * pipeline as the tail does, RE_IDLE adds the CR engine-idle group.
+ * RE_PPC instead fires a PPC write-back (type 17h HZOcclusionCNT unless
+ * occlusion_ppc_type says otherwise) to the SL or SF byte address; RE_DWORDS
+ * gives both address forms in the manual's dword units.
  */
 static void chrome9_emit_occlusion_snapshot(u32 **cursor, u32 address,
 					    u32 re)
@@ -1057,13 +1071,17 @@ static void chrome9_emit_occlusion_snapshot(u32 **cursor, u32 address,
 		0xcccccccc, 0xcccccccc,
 	};
 	u32 ppc[] = {
-		0x01000017, 0x02000000 | ((address >> 2) & 0x00ffffff),
+		0x01000000 | CHROME9_QUERY_RE_PPC_TYPE(re),
+		0x02000000 | (a & 0x00ffffff),
 		0x03000000 | (re & CHROME9_QUERY_RE_SF ? 1U << 22 : 0) |
-		BIT(8) | (address >> 26), 0xcccccccc,
+		BIT(8) | a >> 24, 0xcccccccc,
 	};
 
 	if (re & CHROME9_QUERY_RE_DRAIN)
 		chrome9_emit_header0(cursor, sync, ARRAY_SIZE(sync) / 2);
+	if (re & CHROME9_QUERY_RE_IDLE)
+		chrome9_emit_header2(cursor, 0x420, 0x0000041c, 0x00300000,
+				     NULL, 0);
 	if (re & CHROME9_QUERY_RE_PPC) {
 		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00080000, ppc,
 				     ARRAY_SIZE(ppc));
@@ -1089,7 +1107,7 @@ static int chrome9_occlusion_selftest(void)
 	};
 	static const u32 ppc_sf[] = {
 		0xfe020440, 0x0000043c, 0x00080000, 0xcc000000,
-		0x01000017, 0x0248d158, 0x03400100, 0xcccccccc,
+		0x01000017, 0x02234560, 0x03400101, 0xcccccccc,
 	};
 	u32 packet[CHROME9_QUERY_SNAPSHOT_DWORDS] __aligned(16);
 	u32 *cursor = packet;
@@ -1114,9 +1132,20 @@ static int chrome9_occlusion_selftest(void)
 	cursor = packet;
 	chrome9_emit_occlusion_snapshot(&cursor, 0x01234560,
 					CHROME9_QUERY_RE_PPC |
-					CHROME9_QUERY_RE_SF);
-	return cursor == packet + ARRAY_SIZE(ppc_sf) &&
-	       !memcmp(packet, ppc_sf, sizeof(ppc_sf)) ? 0 : -EINVAL;
+					CHROME9_QUERY_RE_SF | 0x17 << 8);
+	if (cursor != packet + ARRAY_SIZE(ppc_sf) ||
+	    memcmp(packet, ppc_sf, sizeof(ppc_sf)))
+		return -EINVAL;
+	/* Pixel counter, dword units, SL, after the idle group. */
+	cursor = packet;
+	chrome9_emit_occlusion_snapshot(&cursor, 0x01234560,
+					CHROME9_QUERY_RE_PPC |
+					CHROME9_QUERY_RE_DWORDS |
+					CHROME9_QUERY_RE_IDLE | 0x06 << 8);
+	return cursor == packet + 12 && packet[0] == 0xfe020420 &&
+	       packet[2] == 0x00300000 && packet[4] == 0xfe020440 &&
+	       packet[8] == 0x01000006 && packet[9] == 0x0248d158 &&
+	       packet[10] == 0x03000100 ? 0 : -EINVAL;
 }
 
 static int chrome9_finish_ring_sized(u32 *base, u32 *p, size_t capacity,
@@ -7328,6 +7357,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		goto out_unmap;
 	job->query_re = (READ_ONCE(chrome9_occlusion_re) &
 			 CHROME9_QUERY_RE_MASK) |
+			(READ_ONCE(chrome9_occlusion_ppc_type) & 0x1f) << 8 |
 			(chrome9_occlusion_query_mode() == 2 ?
 			 CHROME9_QUERY_RE_DRAIN : 0);
 
