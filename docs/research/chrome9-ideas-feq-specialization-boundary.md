@@ -36,6 +36,71 @@ select trees be replaced by their light-vector operands.  Application source
 inspection is an oracle for the expected result, not a production compiler
 predicate.
 
+## Current specialized bind, 2026-09-24
+
+The draw-time uniform-predicate finder has since advanced beyond the original
+snapshot described below.  In a one-frame `ideas` run it keyed UBO dword
+offsets `{3,7,11}` to exact zero, then constant-folded all three light-W
+equalities, their general reciprocal arms, and the Boolean conjunctions.  The
+logo-shadow program (`program=28`, 11 ALU plus one TEX) compiled successfully;
+the first fragment program actually bound and rejected was instead the
+three-light lamp specialization.
+
+Its captured NIR is in
+`/root/tmp/chrome9-live/ideas-kill-20260924/ideas-one-frame.log` and has source
+BLAKE3 words:
+
+```text
+58557edd 2eab1772 eb3c62b6 00c61868
+ef79a373 82a55503 90bd4936 8de934a0
+```
+
+The exact first unsupported value is now one shared predicate:
+
+```text
+eq_vertex = feq T1.z, 0                 // preserve:inf,nan
+light0    = bcsel(eq_vertex.xxx, c0.xyz - position.xyz, c0.xyz)
+light1    = bcsel(eq_vertex.xxx, c1.xyz - position.xyz, c1.xyz)
+light2    = bcsel(eq_vertex.xxx, c2.xyz - position.xyz, c2.xyz)
+```
+
+`T1.z` is the packed `vertex_position.w` component.  The rejection is not the
+reviewed POSITION/A8/TEXKILL logo-shadow object and no longer involves a
+dynamic light-W equality or `iand`.  The rest of the captured lamp is
+straight-line DP3/RSQ/MUL/ADD/MAX plus three finite integer POW20 chains.
+After replacing each POW20 with five MUL records and accounting for the two
+mixed-vector assemblies, the remaining equality/select lowering is expected
+to stay below the 96-record semantic limit.  Exact compiler allocation and
+controls must still be replayed before claiming that fit.
+
+### Generic fail-closed successor
+
+An unrestricted FEQ lowering remains invalid.  A bounded successor can avoid
+application and shader identities by attaching a draw-time domain proof to a
+direct smooth-input component:
+
+1. Accept only `feq(input_component, +/-0)` whose result is broadcast to
+   side-effect-free `bcsel` users, and reject explicit denormal-preserve mode.
+2. Form one reusable condition with `ABS(input); SUB(0,abs)`.  This avoids the
+   still-unqualified native NEG source modifier.  Emit one native CMP per
+   result width using the proved live-lane/X-broadcast/ZERO-padding rule.
+3. Record the input component in semantic metadata.  For every queued
+   triangle require the three post-VS values to be bit-identical
+   normal-or-zero before using this program; otherwise reject that draw.
+   Existing positive-finite RHW and finite-varying validation remains in
+   force.
+
+The bit-identical triangle rule is deliberately stronger than checking that
+each vertex is merely finite: it excludes NaN/Inf, a varying sign crossing,
+and a subnormal approach to zero across interpolation.  It admits the lamp's
+exact-one T1.z producer without teaching the fragment compiler about affine
+matrices or glmark2.  Native finite ABS, SUB, CMP signed-zero selection, and
+vec1--vec4 CMP packing already have independent production/live evidence.
+Before product use, an offline regression must assert the complete specialized
+lamp record count, physical high-water, A90--A92 controls, the shared condition
+being emitted once, and rejection when any triangle vertex violates the
+recorded input-domain requirement.
+
 ## Exact captured NIR contract
 
 The post-option lamp NIR is `/tmp/ideas-lamp-post.nir`, SHA-256
