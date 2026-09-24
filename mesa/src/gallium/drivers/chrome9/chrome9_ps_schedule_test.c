@@ -151,18 +151,22 @@ int
 main(void)
 {
    struct chrome9_ps_ir input, scheduled, rejected;
+   unsigned input_peak = 0;
    unsigned peak = 0;
    unsigned tex = 0;
 
    build_lightall(&input);
    if (input.count != 100 ||
+       !chrome9_ps_ir_temp_pressure(&input, &input_peak) ||
+       input_peak != 15 ||
        !chrome9_schedule_ps_ir(&input, &scheduled, &peak) ||
        peak != 9 || scheduled.count != input.count ||
        scheduled.instruction[scheduled.count - 1].destination.file !=
           CHROME9_PS_DESTINATION_COLOR ||
        !same_multiset(&input, &scheduled)) {
-      fprintf(stderr, "lightall schedule failed: count=%u peak=%u\n",
-              scheduled.count, peak);
+      fprintf(stderr,
+              "lightall schedule failed: count=%u input=%u peak=%u\n",
+              scheduled.count, input_peak, peak);
       return 1;
    }
    for (unsigned i = 0; i < scheduled.count; i++)
@@ -186,7 +190,7 @@ main(void)
       return 1;
    }
 
-   printf("chrome9 ps schedule: lightall count=100 alu=95 tex=5 peak=%u\n",
-          peak);
+   printf("chrome9 ps schedule: lightall count=100 alu=95 tex=5 "
+          "pressure=%u->%u\n", input_peak, peak);
    return 0;
 }

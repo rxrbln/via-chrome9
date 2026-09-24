@@ -79,6 +79,67 @@ instruction_temp_uses(const struct chrome9_ps_instruction *instruction,
 }
 
 bool
+chrome9_ps_ir_temp_pressure(const struct chrome9_ps_ir *ir,
+                            unsigned *peak_live)
+{
+   unsigned last_use[CHROME9_PS_MAX_VIRTUAL_TEMPS];
+   bool allocated[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
+   bool live[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
+   unsigned live_count = 0;
+   unsigned peak = 0;
+
+   if (!ir || !peak_live || !ir->count ||
+       ir->count > CHROME9_PS_MAX_INSTRUCTIONS)
+      return false;
+   for (unsigned temp = 0; temp < CHROME9_PS_MAX_VIRTUAL_TEMPS; temp++)
+      last_use[temp] = UINT_MAX;
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction = &ir->instruction[i];
+      unsigned sources = source_count(instruction->op);
+
+      if (!sources)
+         return false;
+      for (unsigned s = 0; s < sources; s++) {
+         const struct chrome9_ps_source *source = &instruction->source[s];
+
+         if (source->file != CHROME9_PS_SOURCE_TEMP)
+            continue;
+         if (source->id >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         last_use[source->id] = i;
+      }
+   }
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction = &ir->instruction[i];
+
+      if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP) {
+         unsigned temp = instruction->destination.id;
+
+         if (temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         if (!allocated[temp]) {
+            allocated[temp] = true;
+            live[temp] = true;
+            live_count++;
+            if (peak < live_count)
+               peak = live_count;
+         }
+      }
+      for (unsigned s = 0; s < source_count(instruction->op); s++) {
+         const struct chrome9_ps_source *source = &instruction->source[s];
+
+         if (source->file == CHROME9_PS_SOURCE_TEMP && live[source->id] &&
+             last_use[source->id] == i) {
+            live[source->id] = false;
+            live_count--;
+         }
+      }
+   }
+   *peak_live = peak;
+   return true;
+}
+
+bool
 chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
                        struct chrome9_ps_ir *output,
                        unsigned *peak_live)

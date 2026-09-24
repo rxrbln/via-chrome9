@@ -5,6 +5,11 @@
 
 #include "chrome9_shader_offline.h"
 
+/* Replay the kernel allocator's allocate-before-release TEMP pressure for an
+ * existing instruction order. */
+bool chrome9_ps_ir_temp_pressure(const struct chrome9_ps_ir *ir,
+                                 unsigned *peak_live);
+
 /* Reorder a completed, side-effect-free semantic fragment program to reduce
  * whole-vector TEMP pressure.  This pass deliberately has a narrower domain
  * than the compiler: it accepts only one terminal full-mask COLOR write and
