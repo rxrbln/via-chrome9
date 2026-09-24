@@ -2752,23 +2752,11 @@ static bool
 chrome9_ps_source_modifier_allowed(enum chrome9_ps_opcode op,
                                    unsigned source)
 {
-   /* The C operand has no qualified NEG encoding on this generation.  ABS
-    * also expands its input into A/C/B in the kernel compiler. */
-   switch (op) {
-   case CHROME9_PS_OPCODE_MUL:
-   case CHROME9_PS_OPCODE_MIN:
-   case CHROME9_PS_OPCODE_MAX:
-   case CHROME9_PS_OPCODE_DP3:
-   case CHROME9_PS_OPCODE_DP4:
-      return source != 1;
-   case CHROME9_PS_OPCODE_MAD:
-   case CHROME9_PS_OPCODE_CMP:
-      return source != 1;
-   case CHROME9_PS_OPCODE_ABS:
-      return false;
-   default:
-      return true;
-   }
+   /* Only the A operand of MAD and CMP has a silicon-qualified NEG source
+    * modifier.  Keep every other opcode/slot on the explicit MUL(-1)
+    * fallback until its native modifier is qualified independently. */
+   return source == 0 &&
+          (op == CHROME9_PS_OPCODE_MAD || op == CHROME9_PS_OPCODE_CMP);
 }
 
 static bool
@@ -2837,9 +2825,11 @@ chrome9_ps_immediate(struct chrome9_ps_nir_builder *builder,
 
 static bool
 chrome9_ps_fuse_source_saturate(struct chrome9_ps_nir_builder *builder,
+                                nir_def *source_def,
                                 const struct chrome9_ps_source *source)
 {
    struct chrome9_ps_instruction *definition = NULL;
+   bool direct = false;
    uint8_t selected = 0;
 
    if (source->file != CHROME9_PS_SOURCE_TEMP || source->modifier)
@@ -2848,6 +2838,20 @@ chrome9_ps_fuse_source_saturate(struct chrome9_ps_nir_builder *builder,
       if (source->swizzle[c] < CHROME9_PS_SWIZZLE_ONE)
          selected |= 1u << source->swizzle[c];
    if (!selected)
+      return false;
+   /* MOV/vec aliases may lower to an older physical TEMP.  Saturating that
+    * TEMP would also clamp the producer's unsaturated users.  Require this
+    * exact SSA definition to own the physical result being modified. */
+   for (unsigned i = 0; i < builder->value_count; i++) {
+      if (builder->value[i].complete &&
+          builder->value[i].def == source_def &&
+          builder->value[i].source.file == source->file &&
+          builder->value[i].source.id == source->id) {
+         direct = true;
+         break;
+      }
+   }
+   if (!direct)
       return false;
    for (unsigned i = 0; i < builder->ir.count; i++) {
       struct chrome9_ps_instruction *instruction =
@@ -3507,7 +3511,8 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
        chrome9_ps_lower_alu_source(builder, &alu->src[0], components,
                                     &operands[0]) &&
        builder->value_count < CHROME9_PS_MAX_INSTRUCTIONS &&
-       chrome9_ps_fuse_source_saturate(builder, &operands[0])) {
+       chrome9_ps_fuse_source_saturate(builder, alu->src[0].src.ssa,
+                                        &operands[0])) {
       value = builder->value_count++;
       builder->value[value].def = def;
       builder->value[value].source = operands[0];
@@ -3655,7 +3660,6 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       op = CHROME9_PS_OPCODE_SUB;
       source_count = 2;
       break;
-   case nir_op_fmad:
    case nir_op_ffma:
       op = CHROME9_PS_OPCODE_MAD;
       source_count = 3;
@@ -3996,7 +4000,6 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
          op = CHROME9_PS_OPCODE_SUB;
          source_count = 2;
          break;
-      case nir_op_fmad:
       case nir_op_ffma:
          op = CHROME9_PS_OPCODE_MAD;
          source_count = 3;
@@ -4228,6 +4231,9 @@ chrome9_nir_rewrite_shared_saturate_max(nir_builder *b, nir_instr *instr,
             inner = inner ? NULL : candidate;
       }
       if (uses != 2 || !inner)
+         continue;
+      if (inner->instr.block != maximum->instr.block ||
+          !nir_instr_is_before(&inner->instr, &maximum->instr))
          continue;
       /* sat(max(x, .25)) == sat(max(sat(x), .25)).  Redirecting the
        * shared MAX input makes x single-use, so both SATs can fuse into

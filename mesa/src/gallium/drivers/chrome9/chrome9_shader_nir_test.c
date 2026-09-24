@@ -1734,7 +1734,9 @@ enum compact_alu_case {
    COMPACT_FNEG_C_SLOT,
    COMPACT_FSAT,
    COMPACT_FSAT_MULTI_USE,
+   COMPACT_FSAT_ALIAS,
    COMPACT_SHARED_FSAT,
+   COMPACT_SHARED_FSAT_REVERSE,
    COMPACT_FDOT2,
 };
 
@@ -1771,11 +1773,27 @@ make_compact_alu_fragment(enum compact_alu_case test)
       result = nir_fadd(&b, product, nir_fsat(&b, product));
       break;
    }
+   case COMPACT_FSAT_ALIAS: {
+      nir_def *product = nir_fmul(&b, a, c);
+      nir_def *alias = nir_mov(&b, product);
+
+      result = nir_fadd(&b, product, nir_fsat(&b, alias));
+      break;
+   }
    case COMPACT_SHARED_FSAT: {
       nir_def *dot = nir_fdot3(&b, a, c);
       nir_def *inner = nir_fsat(&b, dot);
       nir_def *outer = nir_fsat(&b, nir_fmax(&b, dot,
                                               nir_imm_float(&b, 0.25f)));
+
+      result = nir_vec4(&b, inner, outer, inner, outer);
+      break;
+   }
+   case COMPACT_SHARED_FSAT_REVERSE: {
+      nir_def *dot = nir_fdot3(&b, a, c);
+      nir_def *maximum = nir_fmax(&b, dot, nir_imm_float(&b, 0.25f));
+      nir_def *inner = nir_fsat(&b, dot);
+      nir_def *outer = nir_fsat(&b, maximum);
 
       result = nir_vec4(&b, inner, outer, inner, outer);
       break;
@@ -1829,12 +1847,14 @@ check_compact_alu_lowering(struct chrome9_context *context)
          for (unsigned s = 0; s < 3; s++)
             negated += !!instruction->source[s].modifier;
       }
-      bool valid = shader.supported && shader.semantic_fs_valid;
+      bool valid = test == COMPACT_FMAD ?
+         !shader.supported && !shader.semantic_fs_valid :
+         shader.supported && shader.semantic_fs_valid;
       if (test == COMPACT_FMAD)
-         valid &= shader.semantic_fs_ir.count == 1 && mad == 1;
+         valid &= mad == 0;
       else if (test == COMPACT_FNEG)
-         valid &= shader.semantic_fs_ir.count == 1 && add == 1 &&
-                  !multiply && negated == 1;
+         valid &= shader.semantic_fs_ir.count == 2 && add == 1 &&
+                  multiply == 1 && negated == 0;
       else if (test == COMPACT_FNEG_C_SLOT)
          valid &= shader.semantic_fs_ir.count == 2 && multiply == 2 &&
                   negated == 0;
@@ -1844,8 +1864,13 @@ check_compact_alu_lowering(struct chrome9_context *context)
       else if (test == COMPACT_FSAT_MULTI_USE)
          valid &= shader.semantic_fs_ir.count == 3 && multiply == 1 &&
                   add == 1 && saturated_mov == 1 && !saturated_multiply;
+      else if (test == COMPACT_FSAT_ALIAS)
+         valid &= shader.semantic_fs_ir.count == 3 && multiply == 1 &&
+                  add == 1 && saturated_mov == 1 && !saturated_multiply;
       else if (test == COMPACT_SHARED_FSAT)
          valid &= dp3_sat == 1 && max_sat == 1;
+      else if (test == COMPACT_SHARED_FSAT_REVERSE)
+         valid &= dp3_sat == 0 && max_sat == 1 && saturated_mov == 1;
       else {
          const struct chrome9_ps_instruction *dot =
             &shader.semantic_fs_ir.instruction[0];
