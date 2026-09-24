@@ -134,9 +134,9 @@ MODULE_PARM_DESC(hw_tcl,
  * the SF destination (local frame buffer fill-rate measurement). */
 /* Draw objects are cache-maintained by the kernel, so their SF pages may
  * be mapped without the snoop (cached) PTE bit. */
-static bool chrome9_gart_nosnoop;
+static bool chrome9_gart_nosnoop = true;
 module_param_named(gart_nosnoop, chrome9_gart_nosnoop, bool, 0400);
-MODULE_PARM_DESC(gart_nosnoop, "Map draw objects with non-snooped GART PTEs (default: false)");
+MODULE_PARM_DESC(gart_nosnoop, "Map draw objects with non-snooped GART PTEs (default: true)");
 
 static ulong chrome9_vram_target_test;
 module_param_named(vram_target_test, chrome9_vram_target_test, ulong, 0600);
