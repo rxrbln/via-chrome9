@@ -273,6 +273,30 @@ Do not promote shadow's `preserve:inf` comparison from this gate. Conversely,
 do not claim that ordinary finite RCP or finite SUB is broken; both are
 outside what this single exceptional-value result distinguishes.
 
+The next bounded discriminator is `chrome9_cmp_guard_smoke --rcp-sign`.
+It removes SUB entirely and constructs one TEMP with four partial native RCP
+writes from `(+0,-0,+2,-2)`, followed by the already-live sign CMP. The
+proprietary RCP emitters do not inspect runtime constant bits or select a
+value-dependent opcode: Linux `stmPPS_RCP_PS20_invi` at `0x0016abe0` and
+Windows `0x10219920` both emit subop 6 with the source selector and ordinary
+destination mask. The earlier infinity gate already showed that partial
+TEMP RCP of zero retires, while the finite +/-2 lanes avoid exceptional
+arithmetic and control the same native subop and CMP orientation.
+
+With false `.25` and true `.75`, sign-preserving RCP predicts RGBA
+`(.25,.75,.25,.75)`, host BGRA `bf40bf40`. The result separates the main
+possibilities without another matrix:
+
+* zero lanes false/false and finite lanes false/true: RCP loses `-0` only;
+* both zero and finite pairs false/true: RCP preserves sign and the preceding
+  SUB path lost the distinction;
+* both pairs false/false: native RCP does not preserve negative sign in this
+  path, so it cannot implement shadow projection generally;
+* any other pattern is an unclassified RCP/CMP behavior and remains closed.
+
+The five-record test retains the existing BGRA+D16 guard/exterior checks and
+builds with strict warnings. It has not been submitted to the GPU.
+
 ### Runnable subnormal gate
 
 `tools/re/chrome9_cmp_guard_smoke.c` now implements the two finite
