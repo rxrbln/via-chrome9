@@ -1,8 +1,10 @@
 # Chrome9 glmark2 function-medium fragment gate
 
-Status: source-exact and Mesa-26.2.2 offline-NIR audit plus a failed guarded
-silicon gate, 2026-09-24.  The combined square-root oracle timed out and
-quarantined the engine.  Do not enable the lowering generally.
+Status: source-exact and Mesa-26.2.2 offline-NIR audit plus narrowed guarded
+silicon gates, 2026-09-24.  Isolated finite-positive and positive-zero scalar
+square roots pass, but the older combined multi-lane oracle timed out and
+quarantined the engine.  Do not enable the lowering generally until the
+source-shaped repeated scalar gate passes.
 
 ## Exact scene source
 
@@ -251,7 +253,7 @@ zero as for `.25`.  They do not insert a zero test, clamp, or alternate
 instruction.  The tool prints a cold-boot wedge warning before submission.
 Run it only after the finite-positive X-only gate retires, bracket it with a
 known-good draw, and quarantine the engine immediately on timeout.  It passes
-a strict host build and has not been submitted to the GPU by this audit.
+a strict host build.
 
 ### Finite-positive silicon result
 
@@ -265,13 +267,80 @@ SHA-256
 
 This closes the X-mask RSQ/RCP opcode order, scalar TEMP forward, three-record
 controls/resource bucket, and finite-positive numerical path.  It does not
-rehabilitate the timed-out combined oracle.  Function-medium's optimized NIR
-is scalar, so Y/Z/W partial destinations are not required for this scene and
-should be deferred.  Its recurrence can produce exact zero after `fract`, so
-the next relevant gate is the isolated X-only `RSQ(+0) -> RCP -> MOV`, with
-the same three-record envelope and no CMP or split COLOR writes.  The vendor
-fog compiler reaches zero through MOV_SAT and then emits unguarded RSQ/RCP,
-while refract eagerly emits the pair even for negative k; this supports the
-packet shape but is not silicon proof.  Treat the zero-only gate as a known
-wedge risk on a recoverable fresh boot.  `.lower_fsqrt` remains disabled until
-that isolated zero path retires correctly.
+rehabilitate the timed-out combined oracle.
+
+### Positive-zero silicon result
+
+On the same fresh-boot module build `83a0d6`, the visible-write
+`--sqrt-x-zero` gate also retired.  Its color payload was prefilled with
+`5a91c3e7`; all interior samples changed to exact zero, while D16, the
+triangle exterior, and both BO guards remained intact.  Known-good baselines
+passed before and after, and dmesg gained no timeout or engine fault.  The
+target log is `/root/tmp/chrome9-live/sqrt-lower/sqrt-x-zero.log`; the tested
+tool binary SHA-256 begins `008b6da`.
+
+This is silicon proof that an isolated X-mask `RCP(RSQ(+0))` chain is safe and
+numerically returns positive zero through the final scalar MOV.  The zero
+endpoint therefore was not sufficient to cause the older 12-record timeout.
+That failure still contains three independent variables absent from both
+passing gates: serial Y/Z/W partial destination writes, a longer mixed-lane
+chain, and the SUB/CMP plus split-COLOR tail.  Function-medium's optimized NIR
+is scalar, so Y/Z/W partial destinations and the CMP discriminator are not
+requirements for this scene and should be deferred.
+
+## Source-shaped five-step scalar gate
+
+The next relevant discriminator repeats the exact scalar body used by the
+scene, rather than reconstructing four roots in different vector lanes:
+
+```text
+repeat five times:
+    d = FRC(3.0 * d)
+    d = FRC(RCP(RSQ(d * d)))
+MOV color, d.xxxx
+```
+
+The Linux 5.75 production compiler was run offline with this exact PS 2.0
+sequence and configuration-two finalization.  It emits 31 ALU records, no
+TAU, active resources `(1,3,1,0)`, A90=`90058001`, and A92=`9200001f`.
+The first iteration is byte-exact:
+
+```text
+0140b6d0 d008016d 0012c016 00000020  MUL  T0.x,3
+01c00530 d01c0053 00100016 000e0060  FRC
+0140b6d0 d000116d 00100116 00000020  MUL  x,x
+01c00530 801c0053 001000b6 000700a0  RSQ
+01c00530 801c0053 001002b6 00060020  RCP
+01c00530 d01c0053 00100016 000e0060  FRC
+```
+
+The fifth iteration has the same schedule.  Its last RCP/FRC gain the normal
+last-use bits and the object terminates with:
+
+```text
+01c00530 801c0053 001202b6 00060020
+01c00530 d01c0053 00120016 000e0060
+01c00530 001c0053 00f20100 000d0820
+```
+
+`tools/re/chrome9_normalize_guard_smoke.c` now provides two offline-reviewed
+modes with this 31-instruction shape:
+
+- `--sqrt-chain5-positive` starts at exact `.25`.  The recurrence alternates
+  `.25,.75`, so the fifth result must be `.75` in all BGRA8 lanes.
+- `--sqrt-chain5-zero` starts at exact `+0`.  All five roots exercise the
+  qualified zero path, and the final write must replace a nonzero color
+  sentinel with exact zero.
+
+Both modes use SSA-distinct semantic temporaries so the kernel's production
+lifetime allocator is exercised.  They check a 3x3 interior sample grid,
+D16, untouched exterior pixels, and both color/depth guards.  A strict C11
+`-Wall -Wextra -Werror` host build passes.  Neither mode was submitted by this
+audit.
+
+This prefix omits only the already-qualified fragment-coordinate arithmetic
+and the output-vector assembly from the 36-ALU scene program.  The five-step
+positive gate should run first; the zero gate uses the identical packet shape
+and differs only in the scalar varying value and expected color.  Do not set
+`.lower_fsqrt` until these repeated scalar gates retire and a generated
+function-medium shader passes the bounded compiler/resource checks.
