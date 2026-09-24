@@ -158,6 +158,11 @@ static int chrome9_vertex_validate_source(struct chrome9_vertex_state *state,
 	for (lane = 0; lane < 4; lane++)
 		if (src->swizzle[lane] > DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO)
 			return -EINVAL;
+	/* Silicon: the scalar unit reads constants incorrectly (RCP(1.25) =
+	 * 1/1.5); temps and inputs are exact. */
+	if (chrome9_vertex_scalar_op(insn->op) &&
+	    src->file == DRM_CHROME9_VERTEX_FILE_CONSTANT)
+		return -EINVAL;
 	if (chrome9_vertex_scalar_op(insn->op))
 		for (lane = 1; lane < 4; lane++)
 			if (src->swizzle[lane] != src->swizzle[0])
@@ -187,9 +192,9 @@ static int chrome9_vertex_validate_source(struct chrome9_vertex_state *state,
 }
 
 /*
- * Silicon: two distinct constants in one record both read the last one
- * (MAD v,c0,c1 = v*c1+c1), so one constant row per record.  Inputs keep
- * the corpus limit of two until measured.
+ * Silicon: two distinct constants or two distinct inputs in one record
+ * both read the last one (MAD v,c0,c1 = v*c1+c1), so one row of each per
+ * record.  Distinct temps are fine.
  */
 static int chrome9_vertex_validate_ports(
 	const struct drm_chrome9_vertex_instruction *insn, unsigned int count)
@@ -211,7 +216,7 @@ static int chrome9_vertex_validate_ports(
 			if (j == i)
 				distinct++;
 		}
-		if (distinct > (file == DRM_CHROME9_VERTEX_FILE_CONSTANT ? 1 : 2))
+		if (distinct > 1)
 			return -EINVAL;
 	}
 	return 0;
@@ -599,10 +604,17 @@ VS_ONE(sub, SUB, VS_R(INPUT, 0), VS_R(CONSTANT, 0), {}, 2,
        0x0008014c, 0x00206490, 0x0040014d, 0x0004010f);
 VS_ONE(mul, MUL, VS_R(INPUT, 0), VS_R(CONSTANT, 0), {}, 2,
        0x0008014c, 0x0040014c, 0x00206db4, 0x0004010f);
-VS_ONE(mad, MAD, VS_R(INPUT, 0), VS_R(CONSTANT, 0), VS_R(INPUT, 1), 3,
-       0x0008014c, 0x0040014c, 0x0008414c, 0x0004010f);
+VS_ONE(mad, MAD, VS_R(INPUT, 0), VS_R(CONSTANT, 0), VS_R(INPUT, 0), 3,
+       0x0008014c, 0x0040014c, 0x0008014c, 0x0004010f);
 static const struct drm_chrome9_vertex_instruction bad_constants_insn[] = {
 	VS_I(MAD, VS_POS, VS_R(INPUT, 0), VS_R(CONSTANT, 0), VS_R(CONSTANT, 1)),
+};
+static const struct drm_chrome9_vertex_instruction bad_inputs_insn[] = {
+	VS_I(ADD, VS_POS, VS_R(INPUT, 0), VS_R(INPUT, 1)),
+};
+static const struct drm_chrome9_vertex_instruction bad_scalar_constant_insn[] = {
+	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
+	VS_I(RCP, VS_DST(VARYING, 0, 3, 0), VS_S(CONSTANT, 0, X)),
 };
 VS_ONE(dp3, DP3, VS_R(INPUT, 0), VS_R(CONSTANT, 0), {}, 2,
        0x00080154, 0x00400154, 0, 0x0006010f);
@@ -635,8 +647,8 @@ VS_ONE(neg_src0, MOV, VS_N(INPUT, 0), {}, {}, 1,
 VS_ONE(neg_src1_mul, MUL, VS_R(INPUT, 0), VS_N(CONSTANT, 0), {}, 2,
        0x0008014c, 0x0040014d, 0x00206db4, 0x0004010f);
 VS_ONE(neg_src2_mad, MAD, VS_R(INPUT, 0), VS_R(CONSTANT, 0),
-       VS_N(INPUT, 1), 3,
-       0x0008014c, 0x0040014c, 0x0008414d, 0x0004010f);
+       VS_N(INPUT, 0), 3,
+       0x0008014c, 0x0040014c, 0x0008014d, 0x0004010f);
 VS_ONE(swz_yzxw, MOV, VS_SRC(INPUT, 0, Y, Z, X, W, 0), {}, {}, 1,
        0x00080a0c, 0, 0, 0x0008010f);
 VS_ONE(swz_wzyx, MOV, VS_SRC(INPUT, 0, W, Z, Y, X, 0), {}, {}, 1,
@@ -646,11 +658,11 @@ VS_ONE(swz_xxyy, MOV, VS_SRC(INPUT, 0, X, X, Y, Y, 0), {}, {}, 1,
 
 static const struct drm_chrome9_vertex_instruction sat_mad_insn[] = {
 	VS_I(MAD, VS_DST(TEMP, 0, 0xf, DRM_CHROME9_FRAGMENT_DEST_SAT),
-	     VS_R(INPUT, 0), VS_R(CONSTANT, 0), VS_R(INPUT, 1)),
+	     VS_R(INPUT, 0), VS_R(CONSTANT, 0), VS_R(INPUT, 0)),
 	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
 };
 static const u32 sat_mad_rec[][4] = {
-	{ 0x0008014c, 0x0040014c, 0x0008414c, 0x0004410f },
+	{ 0x0008014c, 0x0040014c, 0x0008014c, 0x0004410f },
 	{ 0x0010014c, 0, 0, 0x00080a0f },
 };
 
@@ -780,7 +792,7 @@ static const struct chrome9_vertex_case chrome9_vertex_cases[] = {
 	VS_CASE(add, 1, 1, false, 0, 0),
 	VS_CASE(sub, 1, 1, false, 0, 0),
 	VS_CASE(mul, 1, 1, false, 0, 0),
-	VS_CASE(mad, 2, 1, false, 0, 0),
+	VS_CASE(mad, 1, 1, false, 0, 0),
 	VS_CASE(dp3, 1, 1, false, 0, 0),
 	VS_CASE(dp4, 1, 1, false, 0, 0),
 	VS_CASE(min, 1, 1, false, 0, 0),
@@ -796,12 +808,14 @@ static const struct chrome9_vertex_case chrome9_vertex_cases[] = {
 	VS_CASE(sgn, 1, 0, false, 0, 0),
 	VS_CASE(neg_src0, 1, 0, false, 0, 0),
 	VS_CASE(neg_src1_mul, 1, 1, false, 0, 0),
-	VS_CASE(neg_src2_mad, 2, 1, false, 0, 0),
+	VS_CASE(neg_src2_mad, 1, 1, false, 0, 0),
 	VS_CASE(swz_yzxw, 1, 0, false, 0, 0),
 	VS_CASE(swz_wzyx, 1, 0, false, 0, 0),
 	VS_CASE(swz_xxyy, 1, 0, false, 0, 0),
-	VS_CASE(sat_mad, 2, 1, false, 0, 0),
+	VS_CASE(sat_mad, 1, 1, false, 0, 0),
 	VS_BAD(bad_constants, 1, 2, false, 0),
+	VS_BAD(bad_inputs, 2, 0, false, 0),
+	VS_BAD(bad_scalar_constant, 1, 1, false, 1),
 	VS_CASE(mov_opos_v0, 1, 0, false, 0, 0),
 	VS_CASE(out_d0, 2, 0, true, 0, 1),
 	VS_CASE(m4x4, 1, 4, false, 0, 3),

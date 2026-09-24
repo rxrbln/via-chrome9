@@ -217,6 +217,7 @@ struct chrome9_tcl_draw {
 	u32 vertex_count;
 	u32 stride_dw;
 	u32 element_count;
+	u32 cull;
 	u8 element_format[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 element_offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
@@ -2119,7 +2120,9 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		      (READ_ONCE(chrome9_tcl_a61_or) & GENMASK(17, 16));
 	raster[i++] = tcl->program.a62;
 	raster[i++] = 0x20000000;
-	raster[i++] = 0x23004f02;
+	/* A23 bit 8 selects the culled physical winding: set = CCW. */
+	raster[i++] = tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ?
+		      0x23004e02 : 0x23004f02;
 	raster[i++] = 0x24000000 | tcl->vertex_count;
 	if (fp->varying_count) {
 		chrome9_fragment_link_words(fp->varying_count, fp->varying_width,
@@ -2673,7 +2676,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	/* Vendor hardware TCL: type-01 A01 clip engine (bit 11) plus bit 20. */
 	if (tcl)
-		common[4] |= 0x00100800;
+		common[4] |= 0x00100800 | (tcl->cull ? BIT(7) : 0);
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	if (tcl)
 		raster_count = chrome9_tcl_raster_state(program, tcl, raster);
@@ -8364,7 +8367,10 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	if (!chrome9_hw_tcl_enabled())
 		return -EOPNOTSUPP;
 	if (args->abi_version != DRM_CHROME9_VERTEX_ABI_VERSION ||
-	    args->flags || args->index_count || args->index_size ||
+	    (args->flags & ~(DRM_CHROME9_VERTEX_CULL_CW |
+			     DRM_CHROME9_VERTEX_CULL_CCW)) ||
+	    hweight32(args->flags) > 1 ||
+	    args->index_count || args->index_size ||
 	    args->buffer_count || args->base_vertex || args->indices_ptr ||
 	    args->buffers_ptr ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
@@ -8390,6 +8396,7 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	if (!tcl)
 		return -ENOMEM;
 	tcl->instruction_count = args->instruction_count;
+	tcl->cull = args->flags;
 	tcl->element_count = args->element_count;
 	tcl->constant_first = args->constant_first;
 	tcl->constant_count = args->constant_count;
