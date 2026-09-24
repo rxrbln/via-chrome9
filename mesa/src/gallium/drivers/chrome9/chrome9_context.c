@@ -4082,6 +4082,24 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
 static bool
 chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
                           nir_def *def, struct chrome9_ps_source *source);
+/* The hardware's guarded projector form: coordinate varying.xy over the
+ * same varying's W. */
+static bool
+chrome9_ps_identity_projector(const nir_tex_instr *tex, int coord,
+                              int projector,
+                              const struct chrome9_ps_source *coordinate)
+{
+   nir_scalar x = nir_scalar_resolved(tex->src[coord].src.ssa, 0);
+   nir_scalar y = nir_scalar_resolved(tex->src[coord].src.ssa, 1);
+   nir_scalar q = nir_scalar_resolved(tex->src[projector].src.ssa, 0);
+
+   return coordinate->file == CHROME9_PS_SOURCE_TEXTURE &&
+          coordinate->swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+          coordinate->swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+          x.def == q.def && y.def == q.def &&
+          x.comp == 0 && y.comp == 1 && q.comp == 3;
+}
+
 
 /* CHROME9_DEBUG_REJECT prints each rejected def, innermost first. */
 static bool
@@ -4224,11 +4242,77 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
             return false;
       if (!chrome9_ps_lower_def(builder, tex->src[coord].src.ssa,
                                 &coordinate) ||
-          (coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
-           coordinate.file != CHROME9_PS_SOURCE_TEMP) ||
           coordinate.swizzle[0] > CHROME9_PS_SWIZZLE_W ||
           coordinate.swizzle[1] > CHROME9_PS_SWIZZLE_W)
          return false;
+      if (projector >= 0 &&
+          !chrome9_ps_identity_projector(tex, coord, projector,
+                                         &coordinate)) {
+         struct chrome9_ps_source q;
+         struct chrome9_ps_instruction *rcp, *mul;
+         uint8_t rcp_temp, coord_temp;
+
+         /* General projective lookup: TEX samples coord.xy * (1 / q)
+          * through the computed-coordinate bridge. */
+         if (tex->num_srcs != 2 ||
+             tex->src[projector].src.ssa->num_components != 1 ||
+             !chrome9_ps_lower_def(builder, tex->src[projector].src.ssa,
+                                   &q) ||
+             builder->next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS - 2)
+            return false;
+         rcp_temp = builder->next_temp++;
+         coord_temp = builder->next_temp++;
+         rcp = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_RCP);
+         if (!rcp)
+            return false;
+         rcp->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         rcp->destination.id = rcp_temp;
+         rcp->destination.writemask = 0x1;
+         rcp->source[0] = q;
+         mul = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MUL);
+         if (!mul)
+            return false;
+         mul->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         mul->destination.id = coord_temp;
+         mul->destination.writemask = 0x3;
+         mul->source[0] = coordinate;
+         mul->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+         mul->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ZERO;
+         memset(&mul->source[1], 0, sizeof(mul->source[1]));
+         mul->source[1].file = CHROME9_PS_SOURCE_TEMP;
+         mul->source[1].id = rcp_temp;
+         for (unsigned c = 0; c < 4; c++)
+            mul->source[1].swizzle[c] = c < 2 ? CHROME9_PS_SWIZZLE_X :
+                                        CHROME9_PS_SWIZZLE_ZERO;
+         memset(&coordinate, 0, sizeof(coordinate));
+         coordinate.file = CHROME9_PS_SOURCE_TEMP;
+         coordinate.id = coord_temp;
+         coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+         coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
+         projector = -1;
+      }
+      if (coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
+          coordinate.file != CHROME9_PS_SOURCE_TEMP) {
+         /* Constant or uniform coordinates reach TEX through a TEMP. */
+         struct chrome9_ps_instruction *move;
+
+         if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         move = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+         if (!move)
+            return false;
+         move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         move->destination.id = builder->next_temp++;
+         move->destination.writemask = 0x3;
+         move->source[0] = coordinate;
+         move->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+         move->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ZERO;
+         memset(&coordinate, 0, sizeof(coordinate));
+         coordinate.file = CHROME9_PS_SOURCE_TEMP;
+         coordinate.id = move->destination.id;
+         coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+         coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
+      }
       if (projector >= 0) {
          struct chrome9_ps_source q;
 

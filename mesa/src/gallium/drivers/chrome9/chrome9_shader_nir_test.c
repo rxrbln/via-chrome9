@@ -257,7 +257,18 @@ check_identity_projector_compilation(struct chrome9_context *context)
             bool valid;
 
             chrome9_compile_fs_nir(context, &shader, nir);
-            valid = wrong_lane ? !shader.semantic_fs_valid :
+            /* A projector other than the coordinate varying's W takes the
+             * general RCP/MUL computed-coordinate path. */
+            valid = wrong_lane ?
+               shader.supported && shader.semantic_fs_valid &&
+               !shader.semantic_identity_projector_input_mask &&
+               shader.semantic_fs_ir.count >= 4 &&
+               shader.semantic_fs_ir.instruction[0].op ==
+                  CHROME9_PS_OPCODE_RCP &&
+               shader.semantic_fs_ir.instruction[1].op ==
+                  CHROME9_PS_OPCODE_MUL &&
+               shader.semantic_fs_ir.instruction[2].op ==
+                  CHROME9_PS_OPCODE_TEX :
                shader.supported && shader.semantic_fs_valid &&
                shader.semantic_input_mask == 1 &&
                shader.semantic_varying_mask == 1 &&
@@ -285,7 +296,10 @@ check_identity_projector_compilation(struct chrome9_context *context)
       bool valid;
 
       chrome9_compile_fs_nir(context, &shader, nir);
-      valid = wrong ? !shader.semantic_fs_valid :
+      /* A mismatched second projector takes the general divide path. */
+      valid = wrong ?
+         shader.supported && shader.semantic_fs_valid &&
+         shader.semantic_identity_projector_input_mask == (1u << 3) :
          shader.supported && shader.semantic_fs_valid &&
          shader.semantic_input_mask == 1 &&
          shader.semantic_varying_mask == 3 &&
