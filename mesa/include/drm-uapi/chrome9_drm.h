@@ -1315,7 +1315,7 @@ struct drm_chrome9_vertex_buffer {
  * element from buffers[element.buffer] at offset + element.offset +
  * (index + base_vertex) * stride through index_count 16- or 32-bit
  * triangle list indices.  Offsets and strides are dword aligned, strides
- * 4..2044 bytes.
+ * 0..2044 bytes; stride 0 repeats one element for every vertex.
  */
 struct drm_chrome9_draw_vertex_program {
 	struct drm_chrome9_draw_fragment_program fragment;
