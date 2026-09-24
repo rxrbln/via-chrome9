@@ -164,8 +164,11 @@ struct chrome9_bo {
 	struct drm_gem_shmem_object base;
 	/* Userspace brackets its CPU accesses with GEM_CPU_ACCESS. */
 	bool explicit_access;
-	/* CPU caches may hold dirty lines: flush before device use. */
+	/* CPU caches may hold dirty lines in [dirty_low, dirty_high): flush
+	 * them before device use. */
 	bool cpu_dirty;
+	u64 dirty_low;
+	u64 dirty_high;
 	/* The device wrote since the last CPU invalidate. */
 	bool device_written;
 	/* Kernel mapping kept from the first job until the object is freed. */

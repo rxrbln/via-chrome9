@@ -4581,8 +4581,10 @@ static void chrome9_flush_map_guards(struct iosys_map *map, u64 size)
  * Invalidate lines older than the device's writes (caller holds the resv
  * lock) and optionally leave the explicit protocol.
  */
-static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo)
+static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo, u64 offset,
+				      u64 size)
 {
+	u64 object_size = bo->base.base.size;
 	struct iosys_map map;
 	int ret;
 
@@ -4592,10 +4594,25 @@ static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo)
 	if (ret)
 		return ret;
 	if (!map.is_iomem)
-		chrome9_cache_flush(map.vaddr, bo->base.base.size);
+		chrome9_cache_flush((u8 *)map.vaddr + offset, size);
 	drm_gem_shmem_vunmap_locked(&bo->base, &map);
-	bo->device_written = false;
+	/* Lines outside a partial range may still predate device writes. */
+	if (!offset && size == object_size)
+		bo->device_written = false;
 	return 0;
+}
+
+/* Record CPU stores to [offset, offset + size) for the next device use. */
+static void chrome9_bo_cpu_dirty(struct chrome9_bo *bo, u64 offset, u64 size)
+{
+	if (!bo->cpu_dirty) {
+		bo->dirty_low = offset;
+		bo->dirty_high = offset + size;
+	} else {
+		bo->dirty_low = min(bo->dirty_low, offset);
+		bo->dirty_high = max(bo->dirty_high, offset + size);
+	}
+	bo->cpu_dirty = true;
 }
 
 /* KMS scanout reads the pages without announcing CPU or device access. */
@@ -4604,9 +4621,9 @@ void chrome9_bo_force_implicit(struct drm_gem_object *obj)
 	struct chrome9_bo *bo = to_chrome9_bo(obj);
 
 	dma_resv_lock(obj->resv, NULL);
-	chrome9_bo_cpu_sync_locked(bo);
+	chrome9_bo_cpu_sync_locked(bo, 0, obj->size);
 	bo->explicit_access = false;
-	bo->cpu_dirty = true;
+	chrome9_bo_cpu_dirty(bo, 0, obj->size);
 	dma_resv_unlock(obj->resv);
 }
 
@@ -4618,6 +4635,7 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 			    DRM_CHROME9_GEM_CPU_PREPARE_WRITE;
 	struct drm_gem_object *obj;
 	struct chrome9_bo *bo;
+	u64 size;
 	long wait;
 	int ret;
 
@@ -4630,10 +4648,12 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 	obj = drm_gem_object_lookup(file, args->handle);
 	if (!obj)
 		return -ENOENT;
-	if (obj->dev != drm || drm_gem_is_imported(obj)) {
+	if (obj->dev != drm || drm_gem_is_imported(obj) ||
+	    args->offset > obj->size || args->size > obj->size - args->offset) {
 		ret = -EINVAL;
 		goto out_put;
 	}
+	size = args->size ? args->size : obj->size - args->offset;
 	bo = to_chrome9_bo(obj);
 	ret = dma_resv_lock_interruptible(obj->resv, NULL);
 	if (ret)
@@ -4645,14 +4665,16 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 		goto out_unlock;
 	}
 	/* Invalidate lines that may predate the device's writes. */
-	if (args->flags & (prepare | DRM_CHROME9_GEM_CPU_IMPLICIT)) {
-		ret = chrome9_bo_cpu_sync_locked(bo);
-		if (ret)
-			goto out_unlock;
-	}
-	if (args->flags & (DRM_CHROME9_GEM_CPU_PREPARE_WRITE |
-			   DRM_CHROME9_GEM_CPU_EXPLICIT))
-		bo->cpu_dirty = true;
+	if (args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT)
+		ret = chrome9_bo_cpu_sync_locked(bo, 0, obj->size);
+	else if (args->flags & prepare)
+		ret = chrome9_bo_cpu_sync_locked(bo, args->offset, size);
+	if (ret)
+		goto out_unlock;
+	if (args->flags & DRM_CHROME9_GEM_CPU_EXPLICIT)
+		chrome9_bo_cpu_dirty(bo, 0, obj->size);
+	else if (args->flags & DRM_CHROME9_GEM_CPU_PREPARE_WRITE)
+		chrome9_bo_cpu_dirty(bo, args->offset, size);
 	if (args->flags & DRM_CHROME9_GEM_CPU_EXPLICIT)
 		bo->explicit_access = true;
 	if (args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT)
@@ -6440,12 +6462,27 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			t1 = ktime_get();
 			chrome9_prof_sub_ns[0] += ktime_to_ns(ktime_sub(t1, t0));
 		} else {
-			chrome9_cache_flush(job->fragment_maps[i].vaddr,
-					    mapping_sizes[i]);
+			/* Explicit objects flush only their announced range. */
+			u64 low = bo->explicit_access ? bo->dirty_low : 0;
+			u64 high = bo->explicit_access ?
+				   min(bo->dirty_high, mapping_sizes[i]) :
+				   mapping_sizes[i];
+
+			if (bo->explicit_access) {
+				chrome9_flush_map_guards(&job->fragment_maps[i],
+							 object_sizes[i]);
+				if (mapping_sizes[i] != object_sizes[i])
+					chrome9_flush_map_guards(
+						&job->fragment_maps[i],
+						mapping_sizes[i]);
+			}
+			if (high > low)
+				chrome9_cache_flush((u8 *)job->fragment_maps[i].vaddr +
+						    low, high - low);
 			bo->cpu_dirty = false;
 			t1 = ktime_get();
 			chrome9_prof_sub_ns[1] += ktime_to_ns(ktime_sub(t1, t0));
-			chrome9_prof_full_bytes += mapping_sizes[i];
+			chrome9_prof_full_bytes += high - low;
 			chrome9_prof_full_kind[(bo->explicit_access ? 3 : 0) +
 				(i == 0 ? 0 : i == depth_index ? 1 : 2)]++;
 		}

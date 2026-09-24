@@ -88,6 +88,7 @@ struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,
 	bo->base.base.funcs = &chrome9_gem_funcs;
 	/* Implicit until userspace opts in; nothing is known about caches. */
 	bo->cpu_dirty = true;
+	bo->dirty_high = U64_MAX;
 	return &bo->base.base;
 }
 
