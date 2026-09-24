@@ -9,6 +9,9 @@ targets.
 
 ## Documents
 
+- [chrome9-render-status-20260924.md](chrome9-render-status-20260924.md)
+  records FE33 on silicon, the full glmark2 matrix, llvmpipe pixel
+  comparisons, ioquake3 GL1/GL2 q3dm1 renders and the fixes they drove.
 - [chrome9-handoff-2026-09-24.md](chrome9-handoff-2026-09-24.md) is the
   current resume point: goal, live module, uncommitted stencil and select
   work, ranked next steps and target safety rules.
