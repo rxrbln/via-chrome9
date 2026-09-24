@@ -38,6 +38,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_VERTEX_PROGRAMS	0x20
 #define DRM_CHROME9_GEM_INFO	0x21
 #define DRM_CHROME9_QUERY	0x22
+#define DRM_CHROME9_FENCE	0x23
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -129,6 +130,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_QUERY \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_QUERY, \
 		 struct drm_chrome9_query)
+#define DRM_IOCTL_CHROME9_FENCE \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_FENCE, \
+		 struct drm_chrome9_fence)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -281,6 +285,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_POLYGON_MODE		(1ULL << 11)
 /* GEM_CPU_ACCESS NOWAIT. */
 #define DRM_CHROME9_CAP2_GEM_CPU_NOWAIT		(1ULL << 12)
+/* DRM_CHROME9_FENCE sequence number fences. */
+#define DRM_CHROME9_CAP2_FENCE_SEQNO		(1ULL << 13)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1584,6 +1590,23 @@ struct drm_chrome9_draw_vertex_programs {
 	__u32 flags;
 	__u64 draws_ptr;	/* struct drm_chrome9_draw_vertex_program[count] */
 	__u64 reserved[2];
+};
+
+/*
+ * Engine sequence numbers increase with every submitted job and retire in
+ * order.  LAST returns the sequence number of the most recently submitted
+ * job, WAIT waits up to timeout_ns until every job up to seqno retired
+ * (-ETIME on timeout, -EIO if the engine stopped).
+ */
+#define DRM_CHROME9_FENCE_OP_LAST	0U
+#define DRM_CHROME9_FENCE_OP_WAIT	1U
+
+struct drm_chrome9_fence {
+	__u32 op;
+	__u32 flags;
+	__u64 seqno;
+	__u64 timeout_ns;
+	__u64 reserved;
 };
 
 #if defined(__cplusplus)
