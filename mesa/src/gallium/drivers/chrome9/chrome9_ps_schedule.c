@@ -7,6 +7,9 @@
 
 #define CHROME9_PS_SCHEDULE_WORDS \
    ((CHROME9_PS_MAX_INSTRUCTIONS + 63) / 64)
+#define CHROME9_PS_SCHEDULE_TARGET 12
+/* Hard bound for the fallback's O(variants * instruction_count^2) work. */
+#define CHROME9_PS_SCHEDULE_VARIANTS 8192
 
 struct chrome9_ps_schedule_node {
    uint64_t dependency[CHROME9_PS_SCHEDULE_WORDS];
@@ -139,6 +142,125 @@ chrome9_ps_ir_temp_pressure(const struct chrome9_ps_ir *ir,
    return true;
 }
 
+static bool
+chrome9_schedule_ps_attempt(
+   const struct chrome9_ps_ir *original,
+   const struct chrome9_ps_schedule_node node[CHROME9_PS_MAX_INSTRUCTIONS],
+   const unsigned total_uses[CHROME9_PS_MAX_VIRTUAL_TEMPS],
+   struct chrome9_ps_ir *output, unsigned *peak_live, unsigned variant)
+{
+   uint64_t done[CHROME9_PS_SCHEDULE_WORDS] = { 0 };
+   unsigned remaining_uses[CHROME9_PS_MAX_VIRTUAL_TEMPS];
+   bool live[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
+   unsigned live_count = 0;
+   unsigned peak = 0;
+   uint32_t diversity = variant * 0x9e3779b9u + 1;
+
+   memcpy(remaining_uses, total_uses, sizeof(remaining_uses));
+   memset(output, 0, sizeof(*output));
+   for (unsigned out = 0; out < original->count; out++) {
+      unsigned best = UINT_MAX;
+      int best_delta = INT_MIN;
+      int best_score = INT_MIN;
+      unsigned best_follow = 0;
+      unsigned best_height = 0;
+
+      for (unsigned i = 0; i < original->count; i++) {
+         const struct chrome9_ps_instruction *instruction;
+         bool seen[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
+         unsigned killed = 0;
+         unsigned follow = 0;
+         unsigned birth = 0;
+
+         if (test_bit(done, i) || !dependencies_done(&node[i], done))
+            continue;
+         instruction = &original->instruction[i];
+         if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+             remaining_uses[instruction->destination.id] &&
+             !live[instruction->destination.id])
+            birth = 1;
+         for (unsigned s = 0; s < source_count(instruction->op); s++) {
+            const struct chrome9_ps_source *source = &instruction->source[s];
+            unsigned uses;
+
+            if (source->file != CHROME9_PS_SOURCE_TEMP || seen[source->id])
+               continue;
+            seen[source->id] = true;
+            uses = instruction_temp_uses(instruction, source->id);
+            if (remaining_uses[source->id] == uses)
+               killed++;
+            if (live[source->id])
+               follow++;
+         }
+
+         int delta = (int)killed - (int)birth;
+
+         if (!variant) {
+            if (best == UINT_MAX || delta > best_delta ||
+                (delta == best_delta && follow > best_follow) ||
+                (delta == best_delta && follow == best_follow &&
+                 node[i].height > best_height) ||
+                (delta == best_delta && follow == best_follow &&
+                 node[i].height == best_height && i < best)) {
+               best = i;
+               best_delta = delta;
+               best_follow = follow;
+               best_height = node[i].height;
+            }
+         } else {
+            /* Deterministic bounded retries diversify legal ready-node
+             * choices only after the fast critical-path greedy pass misses
+             * the twelve-register hardware envelope. */
+            diversity ^= diversity << 13;
+            diversity ^= diversity >> 17;
+            diversity ^= diversity << 5;
+            int score = 20 * delta + 5 * (int)follow +
+                        (int)(diversity % 19);
+
+            if (best == UINT_MAX || score > best_score ||
+                (score == best_score && i < best)) {
+               best = i;
+               best_score = score;
+            }
+         }
+      }
+      if (best == UINT_MAX)
+         return false;
+
+      const struct chrome9_ps_instruction *instruction =
+         &original->instruction[best];
+
+      output->instruction[out] = *instruction;
+      set_bit(done, best);
+      if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+          remaining_uses[instruction->destination.id] &&
+          !live[instruction->destination.id]) {
+         live[instruction->destination.id] = true;
+         live_count++;
+         if (peak < live_count)
+            peak = live_count;
+      }
+      for (unsigned s = 0; s < source_count(instruction->op); s++) {
+         const struct chrome9_ps_source *source = &instruction->source[s];
+
+         if (source->file != CHROME9_PS_SOURCE_TEMP)
+            continue;
+         if (!remaining_uses[source->id])
+            return false;
+         remaining_uses[source->id]--;
+         if (!remaining_uses[source->id] && live[source->id]) {
+            live[source->id] = false;
+            live_count--;
+         }
+      }
+   }
+   output->count = original->count;
+   if (live_count)
+      return false;
+   *peak_live = peak;
+   return true;
+}
+
 bool
 chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
                        struct chrome9_ps_ir *output,
@@ -147,15 +269,12 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
    struct chrome9_ps_schedule_node node[CHROME9_PS_MAX_INSTRUCTIONS] = { 0 };
    uint64_t definition[CHROME9_PS_MAX_VIRTUAL_TEMPS]
                       [CHROME9_PS_SCHEDULE_WORDS] = { 0 };
-   uint64_t done[CHROME9_PS_SCHEDULE_WORDS] = { 0 };
    uint64_t reachable[CHROME9_PS_SCHEDULE_WORDS] = { 0 };
    uint8_t defined_components[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
-   unsigned remaining_uses[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
-   bool live[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
-   struct chrome9_ps_ir original;
+   unsigned total_uses[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
+   struct chrome9_ps_ir original, candidate;
    unsigned color = UINT_MAX;
-   unsigned live_count = 0;
-   unsigned peak = 0;
+   unsigned best_peak;
 
    if (!input || !output || !input->count ||
        input->count > CHROME9_PS_MAX_INSTRUCTIONS)
@@ -214,7 +333,7 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
             node[i].dependency[w] |= definition[source->id][w];
          if (test_bit(node[i].dependency, i))
             return false;
-         remaining_uses[source->id]++;
+         total_uses[source->id]++;
       }
    }
 
@@ -266,89 +385,27 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
          break;
    }
 
-   memset(output, 0, sizeof(*output));
-   for (unsigned out = 0; out < original.count; out++) {
-      unsigned best = UINT_MAX;
-      int best_delta = INT_MIN;
-      unsigned best_follow = 0;
-      unsigned best_height = 0;
+   if (!chrome9_schedule_ps_attempt(&original, node, total_uses, output,
+                                    &best_peak, 0))
+      return false;
+   if (best_peak > CHROME9_PS_SCHEDULE_TARGET) {
+      for (unsigned variant = 1;
+           variant <= CHROME9_PS_SCHEDULE_VARIANTS; variant++) {
+         unsigned candidate_peak;
 
-      for (unsigned i = 0; i < original.count; i++) {
-         const struct chrome9_ps_instruction *instruction;
-         bool seen[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
-         unsigned killed = 0;
-         unsigned follow = 0;
-         unsigned birth = 0;
-
-         if (test_bit(done, i) || !dependencies_done(&node[i], done))
-            continue;
-         instruction = &original.instruction[i];
-         if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
-             remaining_uses[instruction->destination.id] &&
-             !live[instruction->destination.id])
-            birth = 1;
-         for (unsigned s = 0; s < source_count(instruction->op); s++) {
-            const struct chrome9_ps_source *source = &instruction->source[s];
-            unsigned uses;
-
-            if (source->file != CHROME9_PS_SOURCE_TEMP || seen[source->id])
-               continue;
-            seen[source->id] = true;
-            uses = instruction_temp_uses(instruction, source->id);
-            if (remaining_uses[source->id] == uses)
-               killed++;
-            if (live[source->id])
-               follow++;
-         }
-
-         int delta = (int)killed - (int)birth;
-
-         if (best == UINT_MAX || delta > best_delta ||
-             (delta == best_delta && follow > best_follow) ||
-             (delta == best_delta && follow == best_follow &&
-              node[i].height > best_height) ||
-             (delta == best_delta && follow == best_follow &&
-              node[i].height == best_height && i < best)) {
-            best = i;
-            best_delta = delta;
-            best_follow = follow;
-            best_height = node[i].height;
-         }
-      }
-      if (best == UINT_MAX)
-         return false;
-
-      const struct chrome9_ps_instruction *instruction =
-         &original.instruction[best];
-
-      output->instruction[out] = *instruction;
-      set_bit(done, best);
-      if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
-          remaining_uses[instruction->destination.id] &&
-          !live[instruction->destination.id]) {
-         live[instruction->destination.id] = true;
-         live_count++;
-         if (peak < live_count)
-            peak = live_count;
-      }
-      for (unsigned s = 0; s < source_count(instruction->op); s++) {
-         const struct chrome9_ps_source *source = &instruction->source[s];
-
-         if (source->file != CHROME9_PS_SOURCE_TEMP)
-            continue;
-         if (!remaining_uses[source->id])
+         if (!chrome9_schedule_ps_attempt(&original, node, total_uses,
+                                          &candidate, &candidate_peak,
+                                          variant))
             return false;
-         remaining_uses[source->id]--;
-         if (!remaining_uses[source->id] && live[source->id]) {
-            live[source->id] = false;
-            live_count--;
+         if (candidate_peak < best_peak) {
+            *output = candidate;
+            best_peak = candidate_peak;
          }
+         if (best_peak <= CHROME9_PS_SCHEDULE_TARGET)
+            break;
       }
    }
-   output->count = original.count;
-   if (live_count)
-      return false;
    if (peak_live)
-      *peak_live = peak;
+      *peak_live = best_peak;
    return true;
 }
