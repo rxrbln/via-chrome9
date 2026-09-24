@@ -867,6 +867,11 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		fvf[7] = vs->a62;
 		fvf[10] = vs->a24;
 	}
+	if (vs && vs->vertex_address) {
+		/* SF memory type (A00[16:15] = 01) and 16-bit indices (A20). */
+		fvf[0] |= BIT(15);
+		fvf[8] |= 1;
+	}
 	if (vs && vs->clip) {
 		/*
 		 * The clip engine reads its own copy of rows 256/257: low 24
@@ -923,9 +928,33 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x20030000,
 			     constants32 ? ps_program_c15_c16 : ps_program,
 			     ARRAY_SIZE(ps_program));
-	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00000000,
-			     vs ? vs->vertices : vertices,
-			     vs ? vs->vertex_dwords : ARRAY_SIZE(vertices));
+	if (vs && vs->vertex_address) {
+		unsigned int count = vs->a24 & 0xffffff;
+		u32 streams[3], draw[4], indices[2];
+
+		/* One stream slot per element: 1-KiB base | stride in dwords. */
+		for (i = 0; i < ARRAY_SIZE(streams); i++)
+			streams[i] = vs->vertex_address | vs->vertex_dwords / count;
+		chrome9_emit_header3(cursor, 0x30030000, streams,
+				     ARRAY_SIZE(streams));
+		draw[0] = 0x2c000000 | (count - 1);
+		draw[1] = 0x2d000000;
+		draw[2] = 0x2e000000;
+		draw[3] = vs->a24;
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
+				     draw, ARRAY_SIZE(draw));
+		for (i = 0; i < ARRAY_SIZE(indices); i++)
+			indices[i] = 2 * i < count ?
+				     (2 * i + 1 < count ? (2 * i + 1) << 16 : 0) |
+				     2 * i : 0;
+		chrome9_emit_header3(cursor, 0x00000000, indices,
+				     DIV_ROUND_UP(count, 2));
+	} else {
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00000000,
+				     vs ? vs->vertices : vertices,
+				     vs ? vs->vertex_dwords :
+					  ARRAY_SIZE(vertices));
+	}
 	if (constants32) {
 		/* A program switch replays the complete compiler control object. */
 		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,

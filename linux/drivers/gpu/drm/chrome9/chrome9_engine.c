@@ -670,14 +670,24 @@ static int chrome9_build_prime(struct chrome9_engine *engine,
 				    DRM_CHROME9_FIXED_QUAD_VS_M4X4 | \
 				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE | \
 				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR | \
-				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL)
+				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL | \
+				    DRM_CHROME9_FIXED_QUAD_VS_FETCH)
 
 /*
  * Byte-exact vendor compiler records (hw-TCL corpus out_d0_d1 and
  * m4x4_r0_v0_c0, each ending in the five-record position finalizer) and
  * STM_ViewPort_INV rows for a 32x32 window target.
  */
-static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
+/* Clip-space W=1 quad TL, TR, BR, BL: position, oD0, oD1. */
+static const u32 chrome9_vs_oracle_quad[] = {
+	0xbf800000, 0x3f800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+	0x3f800000, 0x3f800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+	0x3f800000, 0xbf800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+	0xbf800000, 0xbf800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+};
+
+static void chrome9_fixed_vs_oracle(u32 flags, u32 target,
+				    struct chrome9_quad_vs *vs)
 {
 	static const u32 internal[] = {
 		0x41800000, 0xc1800000, 0x3f800000, 0x00000000,
@@ -714,12 +724,6 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 		0x00000000, 0xbd800000, 0x00000000, 0x3f800000,
 		0x00000000, 0x00000000, 0x3f800000, 0x00000000,
 		0x00000000, 0x00000000, 0x00000000, 0x3f800000,
-	};
-	static const u32 clip_w1[] = {
-		0xbf800000, 0x3f800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
-		0x3f800000, 0x3f800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
-		0x3f800000, 0xbf800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
-		0xbf800000, 0xbf800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
 	};
 	static const u32 clip_w2[] = {
 		0xc0000000, 0x40000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
@@ -767,7 +771,7 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 		       flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ? clip_wide :
 		       flags & (DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
 				DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL) ?
-		       clip_near : clip_w1;
+		       clip_near : chrome9_vs_oracle_quad;
 	vs->a24 = flags & (DRM_CHROME9_FIXED_QUAD_VS_HALF |
 			   DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
 			   DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL) ?
@@ -775,6 +779,8 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 	vs->clip = flags & (DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE |
 			    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
 			    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL);
+	if (flags == DRM_CHROME9_FIXED_QUAD_VS_FETCH)
+		vs->vertex_address = target + 2 * PAGE_SIZE;
 	/* Also execute the first MOV clip-position(32) <- scratch tail. */
 	if (flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL)
 		vs->a60++;
@@ -806,7 +812,7 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 	if (flags & CHROME9_FIXED_QUAD_VS_MASK) {
 		struct chrome9_quad_vs vs;
 
-		chrome9_fixed_vs_oracle(flags, &vs);
+		chrome9_fixed_vs_oracle(flags, target, &vs);
 		chrome9_emit_3d_quad_h6_vs(&p, target, &vs);
 		goto tail;
 	}
@@ -4408,6 +4414,10 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 			chrome9_prepare_blend_oracle(job);
 		else
 			chrome9_prepare_target(job);
+		if (request->flags == DRM_CHROME9_FIXED_QUAD_VS_FETCH)
+			memcpy((u8 *)job->map.vaddr + 3 * PAGE_SIZE,
+			       chrome9_vs_oracle_quad,
+			       sizeof(chrome9_vs_oracle_quad));
 	} else {
 		chrome9_prepare_surface_guards(job);
 	}
@@ -5421,7 +5431,9 @@ int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 		.destination_handle = args->destination_handle,
 		.flags = args->flags,
 		.object_size = args->flags == DRM_CHROME9_FIXED_QUAD_DEPTH_ORACLE ?
-			       6U * PAGE_SIZE : CHROME9_FIXED_BO_SIZE,
+			       6U * PAGE_SIZE :
+			       args->flags == DRM_CHROME9_FIXED_QUAD_VS_FETCH ?
+			       4U * PAGE_SIZE : CHROME9_FIXED_BO_SIZE,
 	};
 
 	if ((args->flags != 0 &&

@@ -200,6 +200,8 @@ struct chrome9_quad_vs {
 	unsigned int vertex_dwords;
 	u32 a24;
 	bool clip;
+	/* Nonzero: 1-KiB aligned SF address of the vertices, fetched by index. */
+	u32 vertex_address;
 };
 
 void chrome9_emit_3d_quad_h6_vs(u32 **cursor, unsigned long target,
