@@ -89,3 +89,29 @@ medium-complexity variant exited without a kernel fault but reported
 fragment program`. It remains an explicit compiler-feature gap, not a
 passed scene. The target logs are `function-low-five-validate.log` and
 `function-medium-five-validate.log` in the same staging directory.
+
+## 2026-09-24 medium-function hardware validation
+
+The new Mesa library (SHA-256
+`a6d61f4f4666934a6eaec603eadf919867637e8ff667e5f223e3db79890c4136`)
+enables standard NIR `fsqrt` lowering in the Chrome9 production compiler. It
+was staged at `/root/tmp/chrome9-live/function-sqrt-20260924/` with the
+scalar-selector-corrected kernel module (SHA-256
+`f7e0c4023d813182842b7142e1943c2e01e384003abe6230b0c788e2bf83fcfb`).
+Xorg PID 995 mapped that exact Gallium library, initialized glamor with the
+lab-only GL 2.1 override, and initialized AIGLX through the previously built
+Chrome9 DRI shim at `/root/tmp/chrome9-live/dri/chrome9_dri.so`.
+
+Under that persistent X session, one frame of
+`glmark2 --validate -b texture:nframes=1:texture-filter=nearest` reported
+`Validation: Success`. The previously failing exact medium scene,
+`glmark2 --validate -b function:fragment-complexity=medium:fragment-steps=5:vertex-complexity=medium:vertex-steps=5:nframes=1`,
+then reported `Validation: Success` at 800x600. A second texture-nearest
+validation also succeeded afterward. The bounded Chrome9 dmesg check found no
+timeout, quarantine, engine error, fault, or draw rejection, and Xorg stayed
+alive. Logs are `texture-nearest-validate.log`,
+`function-medium-validate.log`, and `texture-after-function.log` in that
+staging directory.
+
+The complete glmark2 scene set and larger function variants remain unverified;
+this result closes only the exact five-step medium function regression.
