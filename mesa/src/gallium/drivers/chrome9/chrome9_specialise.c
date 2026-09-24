@@ -350,6 +350,29 @@ chrome9_replace_front_face(nir_builder *b, nir_intrinsic_instr *intr,
       replacement = nir_imm_floatN_t(b, front_face ? 1.0 : -1.0,
                                      intr->def.bit_size);
       break;
+   case nir_intrinsic_load_input:
+      if (b->shader->info.stage != MESA_SHADER_FRAGMENT ||
+          intr->def.num_components != 1 ||
+          nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_FACE ||
+          nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) !=
+             nir_type_bool)
+         return false;
+      replacement = nir_imm_boolN_t(b, front_face, intr->def.bit_size);
+      break;
+   case nir_intrinsic_load_deref: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = nir_intrinsic_get_var(intr, 0);
+
+      if (b->shader->info.stage != MESA_SHADER_FRAGMENT || !deref ||
+          deref->deref_type != nir_deref_type_var || !var ||
+          var->data.mode != nir_var_shader_in ||
+          var->data.location != VARYING_SLOT_FACE ||
+          !glsl_type_is_boolean(glsl_without_array(var->type)) ||
+          intr->def.num_components != 1)
+         return false;
+      replacement = nir_imm_boolN_t(b, front_face, intr->def.bit_size);
+      break;
+   }
    default:
       return false;
    }

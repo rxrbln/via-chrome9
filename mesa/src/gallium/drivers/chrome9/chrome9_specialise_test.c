@@ -203,22 +203,37 @@ build_alpha_mode_terminates(void)
    return b.shader;
 }
 
-/* Exercise both NIR FACE forms.  The boolean form chooses the same numeric
- * sign exposed directly by load_front_face_fsign. */
+/* Exercise system-value, fsign, IO-lowered, and deref FACE forms.  Each
+ * boolean form chooses the same numeric sign exposed directly by fsign. */
 static nir_shader *
 build_front_face_pair(void)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
                                                    &options,
                                                    "front-face-pair");
+   nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
+                                           glsl_bool_type(), "face");
    nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
-                                            glsl_vec2_type(), "out");
+                                            glsl_vec4_type(), "out");
+
+   in->data.location = VARYING_SLOT_FACE;
    nir_def *face = nir_load_front_face(&b, 1);
    nir_def *from_bool = nir_bcsel(&b, face, nir_imm_float(&b, 1.0f),
                                   nir_imm_float(&b, -1.0f));
    nir_def *from_fsign = nir_load_front_face_fsign(&b);
+   nir_def *input_face = nir_load_input(
+      &b, 1, 32, nir_imm_int(&b, 0), .dest_type = nir_type_bool32,
+      .io_semantics.location = VARYING_SLOT_FACE);
+   nir_def *from_input = nir_bcsel(&b, input_face,
+                                   nir_imm_float(&b, 1.0f),
+                                   nir_imm_float(&b, -1.0f));
+   nir_def *from_deref = nir_bcsel(&b, nir_load_var(&b, in),
+                                   nir_imm_float(&b, 1.0f),
+                                   nir_imm_float(&b, -1.0f));
 
-   nir_store_var(&b, out, nir_vec2(&b, from_bool, from_fsign), 0x3);
+   nir_store_var(&b, out,
+                 nir_vec4(&b, from_bool, from_fsign,
+                          from_input, from_deref), 0xf);
    nir_validate_shader(b.shader, "Chrome9 FACE specialization input");
    return b.shader;
 }
@@ -341,10 +356,13 @@ check_front_face(nir_shader *canonical, bool front_face)
             nir_def *value = intr->src[1].ssa;
 
             saw_store = true;
-            if (!nir_def_is_const(value) || value->num_components != 2 ||
-                nir_src_comp_as_uint(nir_src_for_ssa(value), 0) != expected ||
-                nir_src_comp_as_uint(nir_src_for_ssa(value), 1) != expected)
+            if (!nir_def_is_const(value) || value->num_components != 4)
                valid = false;
+            else
+               for (unsigned c = 0; c < 4; c++)
+                  if (nir_src_comp_as_uint(nir_src_for_ssa(value), c) !=
+                      expected)
+                     valid = false;
          }
       }
    }
