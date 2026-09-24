@@ -520,29 +520,34 @@ passes. Current Mesa already requires one full `store_output` and appends one
 terminal full-mask COLOR instruction, so this boundary removes only raw,
 unqualified diagnostic forms. KILL may still precede the terminal store.
 
-The next prefix discriminator must avoid partial COLOR entirely. One bounded
-shape is:
+The next prefix discriminator must avoid partial COLOR entirely and must not
+extend the projected-coordinate TEMP lifetime across TEX. One bounded shape
+reconstructs projected Z from the already-live threshold after sampling:
 
 ```text
-t4 = (projected_z, sample, 0, 0)
-t5 = (0, 0, threshold, 1)
-oC0 = t4 + t5
+t4 = (threshold, 0, 0, 0) - (bias, 0, 0, 0)
+t5 = t4 + (0, sample, 0, 0)
+t6 = (0, 0, threshold, 0) + (0, 0, 0, 1)
+oC0 = t5 + t6
 ```
 
-Use full XYZW destinations for both packing temporaries and the single final
-COLOR store. Current allocation gives physical high-water four and this
-source-exact candidate:
+Use full XYZW destinations for all three packing temporaries and the single
+final COLOR store. Unlike the first candidate, this preserves the retiring
+full shadow program's T1 last use at the computed-coordinate TEX and does not
+keep T1 live into the post-TAU ALU phase. Current allocation gives physical
+high-water four and this source-exact candidate:
 
 ```text
 01c00530 b01c0053 0010c0b6 00060020
 0140b6d0 30000000 0072c005 00000060
 00800000 20140924 00100149 00000020
-01c00530 c01c0053 00f00106 000d0460  # bridge, t1 remains live
-0202a2d0 d0140924 00f00156 000000e0  # t4
-0080b6b0 50140924 00f200b4 00000060  # t5
+01c00530 c01c0053 00f00106 000d0460  # bridge
+800016d0 d0140924 00f08016 00000060  # t4
+0202a2d0 30140924 00f00105 000000e0  # t5
+0080b6b0 50140924 00f200b4 00000060  # t6
 02010530 30140924 00f20305 00000820  # one full terminal oC0
 TAU 301211b0
-A90..A95 90058001 91000002 92010007 93000001 94000000 95000008
+A90..A95 90058001 91000002 92010008 93000001 94000000 95000008
 ```
 
 For the first rectangle its expected logical RGBA is approximately
