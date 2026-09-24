@@ -98,6 +98,12 @@ A92=92000016
 A93..A9b phase words zero apart from their type-byte prefixes
 ```
 
+This input route does not depend on the unresolved three-varying T2 path.
+The same one-slot float3 T0 producer/ALU-consumer closure already passed the
+guarded `varying_xyzx` silicon gate with 1,176 correct pixels and intact
+guards (`chrome9-packed-varying-linkage.md`).  Blinn adds ALU length and temp
+pressure, not a new FE varying class.
+
 The durable schedule is
 `chrome9-blinn-phong-inf-semantic.tsv`.  The offline checker
 `tools/re/chrome9_blinn_phong_resource_check.py` independently applies the
