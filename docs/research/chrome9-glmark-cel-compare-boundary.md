@@ -233,10 +233,20 @@ A90=90048000 A91=91000000 A92=92000008
 that exact semantic program using only normal uploaded constants.  It accepts
 only a uniform `(0,0)` default-FTZ or `(1,1)` preserve result, while rejecting
 both mixed outcomes, and retains the existing D16, exterior and BO-guard
-checks.  This is an offline-prepared test: it has not been submitted to a
-GPU.  `tools/re/chrome9_vec3_cmp_production_check.py` separately locks the
+checks.  `tools/re/chrome9_vec3_cmp_production_check.py` separately locks the
 five-record vec3 CMP corpus, inactive lanes, active-resource tuple, and full
 A90--A9a tail.
+
+The reviewed oracle was subsequently submitted once on VX900 under the
+exclusive GPU lock.  Binary SHA-256 was
+`185d067b7e3dece934670a651f2eec4079126fd2c1b5c66579460625fecce943`.
+It returned zero with host BGRA `ff000000`: both the scaled DP3-survival lane
+and the SUB/CMP strict-positive lane were zero, proving consistent default
+FTZ behavior for this exact producer/consumer boundary.  D16, exterior, and
+all BO guards passed; X and `/dev/dri/renderD128` remained present and the
+immediate dmesg delta was empty.  Logs are retained in
+`/root/tmp/chrome9-live/cel-ftz-20260924/`.  This does not qualify a
+denormal-preserving execution mode or comparisons with unbounded overflow.
 
 Before enabling the whole shader, use three guarded stages:
 
@@ -268,9 +278,11 @@ select.
 
 ## Ranked implementation consequence
 
-The first useful change is not another ALU opcode.  It is a generic,
-fail-closed vector compare/select lowering with a defined-finite/default-FTZ
-domain proof, followed by the side-effect-free Boolean-AND rewrite.  This
-same machinery is reusable by finite lighting shaders; it must remain
-separate from the narrower FRC threshold proof used by `conditionals` and
-from the projected-depth proof used by `shadow`.
+Mesa Chrome9 commit `722d91b` now implements the first deliberately narrow
+part: a generic defined-finite/nonnegative DAG proof and vector
+`fge(x, positive-normal constant)` lowering, with raw signed inputs,
+zero/negative thresholds, and exceptional-value-preserving producers kept
+closed.  The next useful change is dynamic positive-normal FLT, followed by
+the zero-threshold signed-unit proof and side-effect-free Boolean-AND rewrite.
+This machinery remains separate from the narrower FRC threshold proof used
+by `conditionals` and from the projected-depth proof used by `shadow`.
