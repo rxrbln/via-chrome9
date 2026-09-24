@@ -486,6 +486,13 @@ MOV oC0.z, T2.x       # repeat with T2.y, then T2.z
 MOV oC0.w, T2.w
 ```
 
+At the structured-UAPI boundary these scalar moves must carry the exact
+masked-lane tuples `T0.w000`, `T1.0w00`, `T2.00{x|y|z}0`, and `T2.000w`.
+Supplying replicated selectors such as `T0.wwww` is semantically equivalent
+at the D3D level but is not byte-equivalent in this encoder: inactive source
+lanes are still packed unless userspace explicitly selects ZERO.  The tuples
+above are what produce the records below.
+
 Linux 5.75 configuration two emits the T2.x form exactly as:
 
 ```text
