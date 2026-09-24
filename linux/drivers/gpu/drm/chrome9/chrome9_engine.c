@@ -4672,6 +4672,14 @@ static void chrome9_copy_rect_cache_flush(struct chrome9_job *job,
 	u8 *destination = (u8 *)job->map.vaddr + (unguarded ? 0 : PAGE_SIZE);
 	u8 *source = (u8 *)job->depth_map.vaddr + PAGE_SIZE;
 	size_t row_bytes = request->copy_width * sizeof(u32);
+	struct chrome9_bo *dst_bo = to_chrome9_bo(&job->destination->base);
+	struct chrome9_bo *src_bo = to_chrome9_bo(&job->depth->base);
+	/* Explicit objects without CPU stores need no row maintenance; an
+	 * explicit destination is invalidated at its next CPU access. */
+	bool dst_rows = !dst_bo->explicit_access ||
+			(!after_device && dst_bo->cpu_dirty);
+	bool src_rows = !after_device &&
+			(!src_bo->explicit_access || src_bo->cpu_dirty);
 	unsigned int y;
 
 	/*
@@ -4693,16 +4701,19 @@ static void chrome9_copy_rect_cache_flush(struct chrome9_job *job,
 				    request->depth_object_size - PAGE_SIZE,
 				    PAGE_SIZE);
 	}
-	for (y = 0; y < request->copy_height; y++) {
-		clflush_cache_range(destination +
-			(request->destination_y + y) * request->pitch +
-			request->destination_x * sizeof(u32), row_bytes);
-		if (!after_device)
+	for (y = 0; (dst_rows || src_rows) && y < request->copy_height; y++) {
+		if (dst_rows)
+			clflush_cache_range(destination +
+				(request->destination_y + y) * request->pitch +
+				request->destination_x * sizeof(u32), row_bytes);
+		if (src_rows)
 			clflush_cache_range(source +
 				(request->source_y + y) * request->texture_pitch +
 				request->source_x * sizeof(u32), row_bytes);
 	}
 #endif
+	if (after_device && dst_bo->explicit_access)
+		dst_bo->device_written = true;
 	mb();
 }
 
