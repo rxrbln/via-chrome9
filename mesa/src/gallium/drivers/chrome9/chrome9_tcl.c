@@ -23,6 +23,8 @@
 #include "util/u_math.h"
 #include "util/u_debug.h"
 #include "util/u_memory.h"
+#include "util/u_inlines.h"
+#include "util/u_upload_mgr.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -1315,18 +1317,61 @@ tcl_fetch_vertex(const struct tcl_stream *streams, unsigned inputs,
    return out - start;
 }
 
+/* Upper bound for one client-array span copied into the stream uploader. */
+#define TCL_MAX_UPLOAD_BYTES (4U << 20)
+
 /*
- * Stage B: every element is fetched by the hardware from its GEM buffer.
- * Elements of one BO and stride share a kernel buffer entry; the binding
- * offset folds into the element offset.
+ * Stage B vertex range: the draw's biased index minimum and maximum.  The
+ * indices sent are rebased to the minimum, so buffer entries start at the
+ * minimum vertex and client arrays upload only the referenced span.
  */
 static bool
-tcl_bind_buffers(const struct chrome9_context *ctx, unsigned inputs,
-                 const struct tcl_stream *streams,
+tcl_index_range(const struct pipe_draw_info *info,
+                const struct pipe_draw_start_count_bias *range,
+                const uint8_t *indices, uint32_t *min, uint32_t *max)
+{
+   int64_t lo = INT64_MAX, hi = INT64_MIN;
+
+   if (!info->index_size) {
+      *min = range->start;
+      *max = range->start + range->count - 1;
+      return range->count && *max >= *min;
+   }
+   for (unsigned i = 0; i < range->count; i++) {
+      const unsigned position = range->start + i;
+      int64_t value = info->index_size == 1 ? indices[position] :
+                      info->index_size == 2 ?
+                      ((const uint16_t *)indices)[position] :
+                      ((const uint32_t *)indices)[position];
+
+      value += range->index_bias;
+      lo = MIN2(lo, value);
+      hi = MAX2(hi, value);
+   }
+   if (lo < 0 || hi > UINT32_MAX || lo > hi)
+      return false;
+   *min = lo;
+   *max = hi;
+   return true;
+}
+
+/*
+ * Stage B: every element is fetched by the hardware from a GEM buffer.
+ * Elements of one BO (or one client array) and stride share a kernel
+ * buffer entry.  Client arrays are copied, from the minimum to the
+ * maximum vertex, into the stream uploader; uploads[] holds the
+ * references until the draw is submitted.
+ */
+static bool
+tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
+                 const struct tcl_stream *streams, uint32_t min, uint32_t max,
                  struct drm_chrome9_vertex_element *elements,
                  struct drm_chrome9_vertex_buffer *buffers,
-                 unsigned *buffer_count)
+                 unsigned *buffer_count, struct pipe_resource **uploads)
 {
+   const void *user[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   uint64_t low[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   uint64_t high[DRM_CHROME9_VERTEX_MAX_INPUTS];
    unsigned n = 0;
 
    for (unsigned k = 0; k < inputs; k++) {
@@ -1335,49 +1380,83 @@ tcl_bind_buffers(const struct chrome9_context *ctx, unsigned inputs,
          &ctx->vertex_buffers[el->vertex_buffer_index];
       const unsigned stride = el->src_stride;
       const uint64_t offset = (uint64_t)vb->buffer_offset + el->src_offset;
-      uint32_t handle;
+      const void *array = vb->is_user_buffer ? vb->buffer.user : NULL;
+      uint32_t handle = 0;
       unsigned b;
 
-      if (vb->is_user_buffer || !vb->buffer.resource || !streams[k].dwords ||
+      if ((!array && !vb->buffer.resource) || !streams[k].dwords ||
           stride < 4 || stride > 2044 || stride % 4 || offset % 4 ||
           offset > UINT32_MAX)
          return false;
-      handle = chrome9_resource(vb->buffer.resource)->bo.handle;
+      if (!array)
+         handle = chrome9_resource(vb->buffer.resource)->bo.handle;
       for (b = 0; b < n; b++)
-         if (buffers[b].handle == handle && buffers[b].stride == stride)
+         if (buffers[b].stride == stride &&
+             (array ? user[b] == array : !user[b] && buffers[b].handle == handle))
             break;
       if (b == n) {
          buffers[n].handle = handle;
          buffers[n].stride = stride;
-         buffers[n].offset = 0;
+         buffers[n].offset = (uint64_t)min * stride;
+         user[n] = array;
+         low[n] = UINT64_MAX;
+         high[n] = 0;
          n++;
       }
+      low[b] = MIN2(low[b], offset);
+      high[b] = MAX2(high[b], offset + 4 * streams[k].dwords);
       elements[k].format = streams[k].drm_format;
       elements[k].buffer = b;
       elements[k].reserved = 0;
       elements[k].offset = offset;
    }
+   for (unsigned b = 0; b < n; b++) {
+      const uint64_t span = (uint64_t)(max - min) * buffers[b].stride +
+                            high[b] - low[b];
+      unsigned out_offset;
+
+      if (!user[b])
+         continue;
+      if (span > TCL_MAX_UPLOAD_BYTES)
+         return false;
+      u_upload_data_ref(ctx->base.stream_uploader, 0, span, 4,
+                        (const uint8_t *)user[b] +
+                           (uint64_t)min * buffers[b].stride + low[b],
+                        &out_offset, &uploads[b]);
+      if (!uploads[b])
+         return false;
+      buffers[b].handle = chrome9_resource(uploads[b])->bo.handle;
+      /* Vertex 0 of the rebased range now starts at out_offset. */
+      buffers[b].offset = out_offset;
+      for (unsigned k = 0; k < inputs; k++)
+         if (elements[k].buffer == b)
+            elements[k].offset -= low[b];
+   }
+   u_upload_unmap(ctx->base.stream_uploader);
    *buffer_count = n;
    return true;
 }
 
 /*
- * Stage B draw: triangle list indices (provoking vertex last) in chunks.
- * Returns false only when nothing was submitted, so stage A can retry.
+ * Stage B draw: triangle list indices (provoking vertex last) rebased to
+ * min, in chunks.  Returns false only when nothing was submitted, so
+ * stage A can retry.
  */
 static bool
 tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *range,
-                 const uint8_t *indices, unsigned triangles,
+                 const uint8_t *indices, unsigned triangles, uint32_t min,
                  struct chrome9_tcl_state *state,
                  struct drm_chrome9_draw_vertex_program *draw)
 {
    const unsigned per_chunk = DRM_CHROME9_VERTEX_MAX_INDICES / 3;
+   const int64_t bias = (int64_t)(info->index_size ? range->index_bias : 0) -
+                        min;
    unsigned done = 0;
 
    draw->index_size = 4;
    draw->indices_ptr = (uintptr_t)state->indices;
-   draw->base_vertex = info->index_size ? range->index_bias : 0;
+   draw->base_vertex = 0;
    while (done < triangles) {
       const unsigned count = MIN2(per_chunk, triangles - done);
       unsigned n = 0;
@@ -1388,15 +1467,15 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          tcl_triangle(info->mode, t, ctx->rasterizer->flatshade_first, v);
          for (unsigned i = 0; i < 3; i++) {
             const unsigned position = range->start + v[i];
+            int64_t value = position;
 
             if (info->index_size == 1)
-               state->indices[n++] = indices[position];
+               value = indices[position];
             else if (info->index_size == 2)
-               state->indices[n++] = ((const uint16_t *)indices)[position];
+               value = ((const uint16_t *)indices)[position];
             else if (info->index_size == 4)
-               state->indices[n++] = ((const uint32_t *)indices)[position];
-            else
-               state->indices[n++] = position;
+               value = ((const uint32_t *)indices)[position];
+            state->indices[n++] = value + bias;
          }
       }
       draw->index_count = n;
@@ -1404,9 +1483,9 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          ctx->tcl_buffer_rejects++;
          if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
             fprintf(stderr, "chrome9: TCL buffers rejected (%s): buffers=%u "
-                            "indices=%u base_vertex=%d textures=%u\n",
-                    strerror(errno), draw->buffer_count, n,
-                    draw->base_vertex, state->fragment.draw.texture_count);
+                            "indices=%u min=%u textures=%u\n",
+                    strerror(errno), draw->buffer_count, n, min,
+                    state->fragment.draw.texture_count);
          if (!done)
             return false;
          CHROME9_REJECT(ctx, triangles - done);
@@ -1682,6 +1761,7 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    const char *why;
    bool flat;
    unsigned triangles, stride, per_chunk, buffer_count, done = 0;
+   uint32_t index_min, index_max;
 
    if (!ctx->tcl_enabled)
       return false;
@@ -1745,12 +1825,21 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    draw.constant_count = p->uniform_rows + p->immediate_count;
    draw.constants_ptr = draw.constant_count ? (uintptr_t)state->constants : 0;
    if (ctx->tcl_buffers &&
-       tcl_bind_buffers(ctx, p->input_count, streams, elements, buffers,
-                        &buffer_count)) {
-      draw.buffer_count = buffer_count;
-      draw.buffers_ptr = (uintptr_t)buffers;
-      if (tcl_draw_buffers(ctx, info, range, indices, triangles, state,
-                           &draw)) {
+       tcl_index_range(info, range, indices, &index_min, &index_max)) {
+      struct pipe_resource *uploads[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
+      bool drawn = tcl_bind_buffers(ctx, p->input_count, streams, index_min,
+                                    index_max, elements, buffers,
+                                    &buffer_count, uploads);
+
+      if (drawn) {
+         draw.buffer_count = buffer_count;
+         draw.buffers_ptr = (uintptr_t)buffers;
+         drawn = tcl_draw_buffers(ctx, info, range, indices, triangles,
+                                  index_min, state, &draw);
+      }
+      for (unsigned b = 0; b < ARRAY_SIZE(uploads); b++)
+         pipe_resource_reference(&uploads[b], NULL);
+      if (drawn) {
          ctx->tcl_triangles += triangles;
          return true;
       }
