@@ -27,6 +27,16 @@ static const struct chrome9_texture_format_info texture_formats[] = {
      { D(0), D(1), D(2), O } },
    { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4,
      { D(0), Z, Z, O } },
+   /* The DXT1 decoder always applies punch-through alpha; the fragment
+    * path forces A = 1 for the RGB view. */
+   { PIPE_FORMAT_DXT1_RGB, DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGB, 8,
+     { D(0), D(1), D(2), O } },
+   { PIPE_FORMAT_DXT1_RGBA, DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGBA, 8,
+     { D(0), D(1), D(2), D(3) } },
+   { PIPE_FORMAT_DXT3_RGBA, DRM_CHROME9_FRAGMENT_TEXTURE_DXT3, 16,
+     { D(0), D(1), D(2), D(3) } },
+   { PIPE_FORMAT_DXT5_RGBA, DRM_CHROME9_FRAGMENT_TEXTURE_DXT5, 16,
+     { D(0), D(1), D(2), D(3) } },
 };
 #undef Z
 #undef O
@@ -54,6 +64,36 @@ chrome9_format_storage_cpp(enum pipe_format format)
    if (chrome9_format_is_d24(format))
       return 4;
    return 0;
+}
+
+bool
+chrome9_format_is_dxt(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_DXT1_RGB || format == PIPE_FORMAT_DXT1_RGBA ||
+          format == PIPE_FORMAT_DXT3_RGBA || format == PIPE_FORMAT_DXT5_RGBA;
+}
+
+unsigned
+chrome9_format_block_dim(enum pipe_format format)
+{
+   return chrome9_format_is_dxt(format) ? 4 : 1;
+}
+
+unsigned
+chrome9_format_level_pitch(enum pipe_format format, unsigned width)
+{
+   const unsigned block = chrome9_format_block_dim(format);
+
+   return ALIGN_POT((width + block - 1) / block *
+                    chrome9_format_storage_cpp(format), 32);
+}
+
+unsigned
+chrome9_format_level_rows(enum pipe_format format, unsigned height)
+{
+   const unsigned block = chrome9_format_block_dim(format);
+
+   return (height + block - 1) / block;
 }
 
 bool

@@ -272,6 +272,44 @@ check_depth_view_swizzles(void)
    return true;
 }
 
+/* DXT1 RGB: the decoder's punch-through alpha is replaced by one. */
+static bool
+check_opaque_alpha_swizzle(void)
+{
+   struct drm_chrome9_fragment_instruction instructions[2] = {
+      {
+         .op = DRM_CHROME9_FRAGMENT_OP_TEX,
+         .sampler = 1,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 3, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_VARYING, 0, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      }, {
+         .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_TEMP, 3, { 3, 2, 1, 0 }, 0, 0 },
+         },
+      },
+   };
+   uint8_t view[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+
+   view[1][0] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[1][1] = DRM_CHROME9_FRAGMENT_SWIZZLE_Y;
+   view[1][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_Z;
+   view[1][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+   CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 2, 2, view));
+   CHECK(instructions[1].src[0].swizzle[0] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
+   CHECK(instructions[1].src[0].swizzle[1] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_Z);
+   CHECK(instructions[1].src[0].swizzle[2] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_Y);
+   CHECK(instructions[1].src[0].swizzle[3] ==
+         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+   return true;
+}
+
 static bool
 check_depth_kill_swizzles(void)
 {
@@ -425,6 +463,7 @@ main(void)
    return !(check_direct_texture_order() && check_sparse_sampler_ids() &&
             check_computed_texture_order() && check_kill_conversion() &&
             check_depth_view_swizzles() && check_depth_kill_swizzles() &&
+            check_opaque_alpha_swizzle() &&
             check_position_xy() && check_primary_color() &&
             check_constant_ports());
 }

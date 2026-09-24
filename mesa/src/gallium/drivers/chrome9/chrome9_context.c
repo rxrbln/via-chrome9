@@ -2793,6 +2793,7 @@ struct chrome9_ps_nir_builder {
    uint32_t equal_zero_input_mask;
    uint32_t identity_projector_input_mask;
    uint32_t unit_interval_input_mask;
+   uint8_t cube_sampler_mask;
    struct {
       nir_def *predicate;
       uint8_t temp;
@@ -4368,11 +4369,16 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       struct chrome9_ps_source coordinate;
       int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
       int projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
+      /* The cube lookup is selected by the texture state; TEX reads STR. */
+      const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+      const unsigned lanes = cube ? 3 : 2;
 
-      if (tex->op != nir_texop_tex || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+      if (tex->op != nir_texop_tex ||
+          (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && !cube) ||
           tex->is_array || tex->is_shadow || tex->texture_index >= 8 ||
           tex->sampler_index != tex->texture_index || coord < 0 ||
-          tex->src[coord].src.ssa->num_components != 2 ||
+          tex->src[coord].src.ssa->num_components != lanes ||
+          (cube && projector >= 0) ||
           builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
           builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
          return false;
@@ -4382,8 +4388,35 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       if (!chrome9_ps_lower_def(builder, tex->src[coord].src.ssa,
                                 &coordinate) ||
           coordinate.swizzle[0] > CHROME9_PS_SWIZZLE_W ||
-          coordinate.swizzle[1] > CHROME9_PS_SWIZZLE_W)
+          coordinate.swizzle[1] > CHROME9_PS_SWIZZLE_W ||
+          (cube && coordinate.swizzle[2] > CHROME9_PS_SWIZZLE_W))
          return false;
+      if (cube && coordinate.file != CHROME9_PS_SOURCE_TEMP &&
+          (coordinate.file != CHROME9_PS_SOURCE_TEXTURE ||
+           coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
+           coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y ||
+           coordinate.swizzle[2] != CHROME9_PS_SWIZZLE_Z)) {
+         /* A direct cube coordinate is the varying's XYZ; anything else
+          * reaches TEX as STR of a computed TEMP. */
+         struct chrome9_ps_instruction *move;
+
+         if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         move = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+         if (!move)
+            return false;
+         move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         move->destination.id = builder->next_temp++;
+         move->destination.writemask = 0x7;
+         move->source[0] = coordinate;
+         move->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ZERO;
+         memset(&coordinate, 0, sizeof(coordinate));
+         coordinate.file = CHROME9_PS_SOURCE_TEMP;
+         coordinate.id = move->destination.id;
+         coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+         coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
+         coordinate.swizzle[2] = CHROME9_PS_SWIZZLE_Z;
+      }
       if (projector >= 0 &&
           !chrome9_ps_identity_projector(tex, coord, projector,
                                          &coordinate)) {
@@ -4430,7 +4463,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
          projector = -1;
       }
-      if (coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
+      if (!cube && coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
           coordinate.file != CHROME9_PS_SOURCE_TEMP) {
          /* Constant or uniform coordinates reach TEX through a TEMP. */
          struct chrome9_ps_instruction *move;
@@ -4471,7 +4504,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
             return false;
          builder->identity_projector_input_mask |=
             1u << (coordinate.id * 4 + 3);
-      } else if (coordinate.file == CHROME9_PS_SOURCE_TEXTURE &&
+      } else if (!cube && coordinate.file == CHROME9_PS_SOURCE_TEXTURE &&
                  (coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
                   coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y)) {
          /* Like D3D9 texld, a direct coordinate is the varying's XY; the
@@ -4513,7 +4546,12 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       texture->destination.id = temp;
       texture->destination.writemask = 0xf;
       texture->source[0] = coordinate;
-      if (coordinate.file == CHROME9_PS_SOURCE_TEMP) {
+      if (cube) {
+         builder->cube_sampler_mask |= 1u << tex->sampler_index;
+         texture->source[0].swizzle[3] =
+            coordinate.file == CHROME9_PS_SOURCE_TEMP ?
+            CHROME9_PS_SWIZZLE_ONE : CHROME9_PS_SWIZZLE_W;
+      } else if (coordinate.file == CHROME9_PS_SOURCE_TEMP) {
          /* 2D TEX reads XY.  An XY-only computed TEMP must not appear to
           * read undefined Z/W lanes during kernel validation. */
          texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
@@ -4978,6 +5016,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint32_t *equal_zero_input_mask,
                        uint32_t *identity_projector_input_mask,
                        uint32_t *unit_interval_input_mask,
+                       uint8_t *cube_sampler_mask,
                        bool allow_kill,
                        bool *lowered)
 {
@@ -5145,6 +5184,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    *identity_projector_input_mask =
       builder.identity_projector_input_mask;
    *unit_interval_input_mask = builder.unit_interval_input_mask;
+   *cube_sampler_mask = builder.cube_sampler_mask;
    *lowered = true;
    bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
 
@@ -5374,6 +5414,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      &shader->semantic_equal_zero_input_mask,
                                      &shader->semantic_identity_projector_input_mask,
                                      &shader->semantic_unit_interval_input_mask,
+                                     &shader->semantic_cube_sampler_mask,
                                      ctx->fragment_kill,
                                      &lowered);
    if (lowered) {
@@ -5736,6 +5777,7 @@ chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
    variant->semantic_input_mask = shader->semantic_input_mask;
    variant->semantic_varying_mask = shader->semantic_varying_mask;
    variant->semantic_sampler_mask = shader->semantic_sampler_mask;
+   variant->semantic_cube_sampler_mask = shader->semantic_cube_sampler_mask;
    variant->semantic_equal_zero_input_mask =
       shader->semantic_equal_zero_input_mask;
    variant->semantic_identity_projector_input_mask =
@@ -5765,6 +5807,7 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
    shader->semantic_input_mask = variant->semantic_input_mask;
    shader->semantic_varying_mask = variant->semantic_varying_mask;
    shader->semantic_sampler_mask = variant->semantic_sampler_mask;
+   shader->semantic_cube_sampler_mask = variant->semantic_cube_sampler_mask;
    shader->semantic_equal_zero_input_mask =
       variant->semantic_equal_zero_input_mask;
    shader->semantic_identity_projector_input_mask =
@@ -6159,14 +6202,20 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
    struct chrome9_context *ctx = chrome9_context(pipe);
    struct chrome9_sampler_view *cview = CALLOC_STRUCT(chrome9_sampler_view);
    struct pipe_sampler_view *view = cview ? &cview->base : NULL;
-   bool supported = view && texture && texture->target == PIPE_TEXTURE_2D &&
-                    templ->target == PIPE_TEXTURE_2D &&
+   /* A cube view covers all six faces of a guarded cube resource. */
+   const bool cube = texture && texture->target == PIPE_TEXTURE_CUBE &&
+                     templ->target == PIPE_TEXTURE_CUBE &&
+                     chrome9_resource(texture)->guarded;
+   bool supported = view && texture &&
+                    ((texture->target == PIPE_TEXTURE_2D &&
+                      templ->target == PIPE_TEXTURE_2D) || cube) &&
                     templ->format == texture->format &&
                     chrome9_texture_format_info(templ->format) &&
                     !templ->u.tex.first_level &&
                     templ->u.tex.last_level <= texture->last_level &&
                     !templ->u.tex.first_layer &&
-                    !templ->u.tex.last_layer &&
+                    templ->u.tex.last_layer ==
+                       (cube ? texture->array_size - 1 : 0) &&
                     chrome9_texture_swizzle_supported(
                        templ->format, templ->swizzle_r, templ->swizzle_g,
                        templ->swizzle_b, templ->swizzle_a);
@@ -6368,7 +6417,8 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
    ctx->render_target_stale = false;
    pipe_resource_reference(&ctx->render_target, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
-   if (color && surface->format == color->format && !surface->level &&
+   if (color && color->target != PIPE_TEXTURE_CUBE &&
+       surface->format == color->format && !surface->level &&
        !surface->first_layer && !surface->last_layer) {
       struct chrome9_resource *resource = chrome9_resource(color);
 

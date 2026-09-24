@@ -28,6 +28,10 @@ main(void)
       { PIPE_FORMAT_L8A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8A8, 2 },
       { PIPE_FORMAT_B5G6R5_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_RGB565, 2 },
       { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4 },
+      { PIPE_FORMAT_DXT1_RGB, DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGB, 8 },
+      { PIPE_FORMAT_DXT1_RGBA, DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGBA, 8 },
+      { PIPE_FORMAT_DXT3_RGBA, DRM_CHROME9_FRAGMENT_TEXTURE_DXT3, 16 },
+      { PIPE_FORMAT_DXT5_RGBA, DRM_CHROME9_FRAGMENT_TEXTURE_DXT5, 16 },
    };
 
    for (unsigned i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
@@ -45,6 +49,34 @@ main(void)
    CHECK(chrome9_texture_swizzle_supported(
       PIPE_FORMAT_B8G8R8X8_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
       PIPE_SWIZZLE_Z, PIPE_SWIZZLE_1));
+   /* Vendor block-row pitch ALIGN(ALIGN(w, 4) * bpp / 2, 32). */
+   CHECK(chrome9_format_level_pitch(PIPE_FORMAT_B8G8R8X8_UNORM, 17) == 96);
+   CHECK(chrome9_format_level_pitch(PIPE_FORMAT_DXT1_RGB, 32) == 64);
+   CHECK(chrome9_format_level_pitch(PIPE_FORMAT_DXT1_RGB, 16) == 32);
+   CHECK(chrome9_format_level_pitch(PIPE_FORMAT_DXT1_RGBA, 1) == 32);
+   CHECK(chrome9_format_level_pitch(PIPE_FORMAT_DXT5_RGBA, 64) == 256);
+   CHECK(chrome9_format_level_pitch(PIPE_FORMAT_DXT3_RGBA, 8) == 32);
+   CHECK(chrome9_format_level_rows(PIPE_FORMAT_DXT5_RGBA, 1) == 1);
+   CHECK(chrome9_format_level_rows(PIPE_FORMAT_DXT5_RGBA, 10) == 3);
+   CHECK(chrome9_format_level_rows(PIPE_FORMAT_L8_UNORM, 10) == 10);
+   /* POT DXT1 32x32 chain at whole block rows, as the kernel self-test. */
+   {
+      static const unsigned offset[] = { 0, 0x200, 0x280, 0x2c0, 0x2e0, 0x300 };
+      unsigned cursor = 0;
+
+      for (unsigned level = 0; level < 6; level++) {
+         CHECK(cursor == offset[level]);
+         cursor += chrome9_format_level_pitch(PIPE_FORMAT_DXT1_RGB,
+                                              32 >> level) *
+                   chrome9_format_level_rows(PIPE_FORMAT_DXT1_RGB,
+                                             32 >> level);
+      }
+   }
+   CHECK(chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_DXT1_RGB, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
+      PIPE_SWIZZLE_Z, PIPE_SWIZZLE_1));
+   CHECK(chrome9_format_is_dxt(PIPE_FORMAT_DXT3_RGBA) &&
+         !chrome9_format_is_dxt(PIPE_FORMAT_DXT1_SRGB));
    CHECK(!chrome9_texture_swizzle_supported(
       PIPE_FORMAT_A8_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
       PIPE_SWIZZLE_Z, PIPE_SWIZZLE_1));

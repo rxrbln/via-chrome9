@@ -502,8 +502,8 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
    return alias;
 }
 
-/* Mipmapped textures: llvmpipe needs its own packed layout; copy the
- * current contents for every fallback draw. */
+/* Mipmapped, cube and block-compressed textures: llvmpipe needs its own
+ * layout; copy the current contents for every fallback draw. */
 static struct pipe_resource *
 chrome9_sw_texture(struct chrome9_sw_context *sw,
                    struct pipe_resource *resource)
@@ -512,7 +512,8 @@ chrome9_sw_texture(struct chrome9_sw_context *sw,
    struct pipe_resource templ = *resource;
    struct pipe_resource *copy;
 
-   if (!resource->last_level)
+   if (!resource->last_level && resource->target != PIPE_TEXTURE_CUBE &&
+       !util_format_is_compressed(resource->format))
       return chrome9_sw_alias(sw, resource, 0);
    chrome9_resource_cpu_access(res, false);
    templ.bind = PIPE_BIND_SAMPLER_VIEW;
@@ -521,18 +522,21 @@ chrome9_sw_texture(struct chrome9_sw_context *sw,
    copy = sw->screen->resource_create(sw->screen, &templ);
    if (!copy)
       return NULL;
-   for (unsigned level = 0; level <= resource->last_level; level++) {
-      struct pipe_box box;
-      unsigned height = util_format_get_nblocksy(resource->format,
-         u_minify(resource->height0, level));
+   for (unsigned layer = 0; layer < resource->array_size; layer++)
+      for (unsigned level = 0; level <= resource->last_level; level++) {
+         struct pipe_box box;
+         unsigned height = util_format_get_nblocksy(resource->format,
+            u_minify(resource->height0, level));
 
-      u_box_2d(0, 0, u_minify(resource->width0, level),
-               u_minify(resource->height0, level), &box);
-      sw->lp->texture_subdata(sw->lp, copy, level, PIPE_MAP_WRITE, &box,
-                              (uint8_t *)res->bo.map + res->level_offset[level],
-                              res->level_stride[level],
-                              res->level_stride[level] * height);
-   }
+         u_box_2d_zslice(0, 0, layer, u_minify(resource->width0, level),
+                         u_minify(resource->height0, level), &box);
+         sw->lp->texture_subdata(sw->lp, copy, level, PIPE_MAP_WRITE, &box,
+                                 (uint8_t *)res->bo.map +
+                                    res->level_offset[level] +
+                                    layer * res->layer_stride,
+                                 res->level_stride[level],
+                                 res->level_stride[level] * height);
+      }
    return copy;
 }
 

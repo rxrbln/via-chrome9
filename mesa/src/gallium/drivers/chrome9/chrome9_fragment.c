@@ -382,9 +382,7 @@ chrome9_fragment_apply_depth_swizzles(
       if (!(depth_sampler_mask & (1u << unit)))
          continue;
       for (unsigned lane = 0; lane < 4; lane++)
-         if (swizzle[unit][lane] != DRM_CHROME9_FRAGMENT_SWIZZLE_X &&
-             swizzle[unit][lane] != DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO &&
-             swizzle[unit][lane] != DRM_CHROME9_FRAGMENT_SWIZZLE_ONE)
+         if (swizzle[unit][lane] > DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO)
             return false;
          else
             depth_lane[unit][lane] = swizzle[unit][lane];

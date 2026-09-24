@@ -71,6 +71,7 @@ struct chrome9_fs_variant {
    uint16_t semantic_input_mask;
    uint16_t semantic_varying_mask;
    uint8_t semantic_sampler_mask;
+   uint8_t semantic_cube_sampler_mask;
    /* Direct varying lanes used by equality-to-zero selects.  The draw path
     * proves exact signed zero or unit-magnitude values before submission. */
    uint32_t semantic_equal_zero_input_mask;
@@ -112,6 +113,8 @@ struct chrome9_shader {
    uint16_t semantic_input_mask;
    uint16_t semantic_varying_mask;
    uint8_t semantic_sampler_mask;
+   /* Samplers read by a cube TEX (three coordinate lanes). */
+   uint8_t semantic_cube_sampler_mask;
    uint32_t semantic_equal_zero_input_mask;
    uint32_t semantic_identity_projector_input_mask;
    uint32_t semantic_unit_interval_input_mask;

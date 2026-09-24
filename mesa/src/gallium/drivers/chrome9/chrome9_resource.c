@@ -30,11 +30,14 @@
 #define CHROME9_MAX_BUFFER_SIZE (256ULL * 1024 * 1024)
 #define CHROME9_MAX_SURFACE_DIMENSION 2048
 #define CHROME9_MIP_ALIGNMENT 256
+/* The level table holds eight successors of each face root. */
+#define CHROME9_CUBE_MAX_LEVELS 9
 
 struct chrome9_resource_layout {
    uint32_t level_stride[PIPE_MAX_TEXTURE_LEVELS];
    uint64_t level_offset[PIPE_MAX_TEXTURE_LEVELS];
    uint64_t level_size[PIPE_MAX_TEXTURE_LEVELS];
+   uint64_t layer_stride;
    uint64_t allocation_size;
    bool guarded;
 };
@@ -64,10 +67,37 @@ chrome9_u64_align(uint64_t value, uint64_t alignment, uint64_t *result)
    return true;
 }
 
+/*
+ * Vendor cube layout (sfmCalcMipSize_inv, sfmCalcCubeTextureOffset_inv):
+ * levels of one face packed with ALIGN(h, 8) rows, the face stride is
+ * their 256-byte aligned sum, faces follow the leading guard page.
+ */
 static bool
-chrome9_resource_layout(const struct pipe_resource *templ,
+chrome9_resource_cube_layout(const struct pipe_resource *templ,
+                             uint64_t page_size,
+                             struct chrome9_resource_layout *layout)
+{
+   uint64_t face = 0;
+
+   for (unsigned level = 0; level <= templ->last_level; level++) {
+      layout->level_offset[level] = page_size + face;
+      face += (uint64_t)layout->level_stride[level] *
+              ALIGN_POT(u_minify(templ->height0, level), 8);
+   }
+   layout->layer_stride = ALIGN_POT(face, CHROME9_MIP_ALIGNMENT);
+   layout->allocation_size = ALIGN_POT(page_size + 6 * layout->layer_stride,
+                                       page_size) + page_size;
+   layout->guarded = true;
+   return layout->allocation_size <= CHROME9_MAX_BUFFER_SIZE;
+}
+
+static bool
+chrome9_resource_layout(struct pipe_screen *screen,
+                        const struct pipe_resource *templ,
                         struct chrome9_resource_layout *layout)
 {
+   const bool cube = templ->target == PIPE_TEXTURE_CUBE;
+   const bool dxt = chrome9_format_is_dxt(templ->format);
    uint64_t aligned_level0_size;
    uint64_t cursor;
    unsigned cpp;
@@ -84,13 +114,17 @@ chrome9_resource_layout(const struct pipe_resource *templ,
    }
 
    cpp = chrome9_format_storage_cpp(templ->format);
-   if (!chrome9_is_surface_target(templ->target) ||
+   if ((!chrome9_is_surface_target(templ->target) && !cube) ||
        !cpp ||
        (chrome9_format_is_d24(templ->format) &&
         (templ->target != PIPE_TEXTURE_2D || templ->last_level)) ||
+       (dxt && templ->target != PIPE_TEXTURE_2D) ||
+       (cube && (templ->width0 != templ->height0 ||
+                 !util_is_power_of_two_nonzero(templ->width0) ||
+                 templ->last_level >= CHROME9_CUBE_MAX_LEVELS)) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
-       templ->depth0 != 1 || templ->array_size != 1 ||
+       templ->depth0 != 1 || templ->array_size != (cube ? 6 : 1) ||
        templ->last_level >= PIPE_MAX_TEXTURE_LEVELS ||
        (templ->target == PIPE_TEXTURE_RECT && templ->last_level) ||
        templ->last_level > util_logbase2(MAX2(templ->width0, templ->height0)) ||
@@ -102,14 +136,25 @@ chrome9_resource_layout(const struct pipe_resource *templ,
        page_size > UINT32_MAX || page_size < CHROME9_MIP_ALIGNMENT)
       return false;
 
+   /* DXT mip chains exist only in the sampler-derived POT layout. */
+   if (dxt && templ->last_level &&
+       (!chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_DXT_MIP) ||
+        !util_is_power_of_two_nonzero(templ->width0) ||
+        !util_is_power_of_two_nonzero(templ->height0)))
+      return false;
+
    for (unsigned level = 0; level <= templ->last_level; level++) {
       const unsigned width = u_minify(templ->width0, level);
       const unsigned height = u_minify(templ->height0, level);
 
-      layout->level_stride[level] = ALIGN_POT(width * cpp, 32);
+      layout->level_stride[level] =
+         chrome9_format_level_pitch(templ->format, width);
       layout->level_size[level] =
-         (uint64_t)layout->level_stride[level] * height;
+         (uint64_t)layout->level_stride[level] *
+         chrome9_format_level_rows(templ->format, height);
    }
+   if (cube)
+      return chrome9_resource_cube_layout(templ, page_size, layout);
 
    /* Cross-process image paths do not reliably preserve a non-zero plane
     * offset when they fall back from DRI3 modifiers to the legacy single-FD
@@ -121,7 +166,7 @@ chrome9_resource_layout(const struct pipe_resource *templ,
     */
    if ((templ->bind & PIPE_BIND_SHARED) &&
        !(templ->flags & CHROME9_RESOURCE_FLAG_CANONICAL_SHARED)) {
-      if (templ->last_level ||
+      if (templ->last_level || dxt ||
           !chrome9_u64_align(layout->level_size[0], page_size,
                              &layout->allocation_size) ||
           layout->allocation_size > CHROME9_MAX_BUFFER_SIZE)
@@ -181,6 +226,7 @@ chrome9_resource_apply_layout(struct chrome9_resource *resource,
    resource->stride = layout->level_stride[0];
    resource->data_offset = layout->level_offset[0];
    resource->data_size = layout->level_size[0];
+   resource->layer_stride = layout->layer_stride;
    resource->guarded = layout->guarded;
 }
 
@@ -258,6 +304,28 @@ chrome9_format_supported(struct pipe_screen *screen,
                 screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_D16) &&
              (bindings & PIPE_BIND_DEPTH_STENCIL) &&
              !(bindings & ~depth_bindings);
+   /* Cube maps and DXT need the generic fragment program, which carries
+    * the texture target and block layout.  The state tracker also asks
+    * for RENDER_TARGET on cube maps; faces are never hardware targets
+    * (chrome9_set_framebuffer_state). */
+   if (target == PIPE_TEXTURE_CUBE)
+      return chrome9_screen_has_capability2(screen,
+                                            DRM_CHROME9_CAP2_CUBE_MAP) &&
+             chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
+             !chrome9_format_is_dxt(format) &&
+             !(bindings & ~(sampler_bindings | PIPE_BIND_RENDER_TARGET)) &&
+             chrome9_format_supported(screen, format, PIPE_TEXTURE_2D,
+                                      sample_count, storage_sample_count,
+                                      bindings);
+   if (chrome9_format_is_dxt(format))
+      return target == PIPE_TEXTURE_2D &&
+             chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_DXT) &&
+             chrome9_screen_has_capability2(screen,
+                                            DRM_CHROME9_CAP2_DXT_MIP) &&
+             chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
+             !(bindings & ~sampler_bindings);
    if (!chrome9_is_surface_target(target))
       return false;
    if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
@@ -329,7 +397,7 @@ chrome9_can_create_resource(struct pipe_screen *screen,
                                     templ->nr_samples,
                                     templ->nr_storage_samples, templ->bind))
       return false;
-   return chrome9_resource_layout(templ, &layout);
+   return chrome9_resource_layout(screen, templ, &layout);
 }
 
 /*
@@ -379,7 +447,7 @@ chrome9_resource_create(struct pipe_screen *screen,
       create_flags |= DRM_CHROME9_GEM_CREATE_GUARDED_SHARED;
    }
    if (!chrome9_can_create_resource(screen, templ) ||
-       !chrome9_resource_layout(&layout_templ, &layout))
+       !chrome9_resource_layout(screen, &layout_templ, &layout))
       goto fail;
 
    /* Only the exported, offset-zero KMS allocation needs constrained pages.
@@ -438,7 +506,8 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    if (!whandle || whandle->type != WINSYS_HANDLE_TYPE_FD ||
        (whandle->modifier != DRM_FORMAT_MOD_LINEAR &&
         whandle->modifier != DRM_FORMAT_MOD_INVALID) ||
-       !chrome9_resource_layout(templ, &layout) || templ->last_level ||
+       !chrome9_resource_layout(screen, templ, &layout) ||
+       templ->last_level ||
        templ->target == PIPE_BUFFER ||
        (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         templ->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
@@ -479,7 +548,7 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
                  screen, DRM_CHROME9_CAP2_GUARDED_SHARED) &&
               chrome9_bo_info(fd, &resource->bo, &bo_flags) &&
               (bo_flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) &&
-              chrome9_resource_layout(&guarded_templ, &guarded) &&
+              chrome9_resource_layout(screen, &guarded_templ, &guarded) &&
               whandle->stride == guarded.level_stride[0] &&
               resource->bo.size == guarded.allocation_size) {
       chrome9_resource_apply_layout(resource, &guarded);
@@ -583,6 +652,8 @@ chrome9_transfer_box_valid(const struct pipe_resource *resource,
 {
    unsigned width;
    unsigned height;
+   unsigned layers;
+   unsigned block;
 
    if (level > resource->last_level || !box || box->x < 0 || box->y < 0 ||
        box->z < 0 ||
@@ -596,11 +667,22 @@ chrome9_transfer_box_valid(const struct pipe_resource *resource,
 
    width = u_minify(resource->width0, level);
    height = u_minify(resource->height0, level);
-   return chrome9_is_surface_target(resource->target) && box->z == 0 &&
-          box->depth == 1 && (unsigned)box->x <= width &&
+   layers = resource->target == PIPE_TEXTURE_CUBE ? resource->array_size : 1;
+   block = chrome9_format_block_dim(resource->format);
+   /* Block formats map whole blocks; the last one may overhang the edge. */
+   return (chrome9_is_surface_target(resource->target) ||
+           resource->target == PIPE_TEXTURE_CUBE) &&
+          (unsigned)box->z < layers && box->depth >= 1 &&
+          (unsigned)box->depth <= layers - (unsigned)box->z &&
+          (unsigned)box->x <= width &&
           (unsigned)box->width <= width - (unsigned)box->x &&
           (unsigned)box->y <= height &&
-          (unsigned)box->height <= height - (unsigned)box->y;
+          (unsigned)box->height <= height - (unsigned)box->y &&
+          !(box->x % block) && !(box->y % block) &&
+          (!(box->width % block) ||
+           (unsigned)(box->x + box->width) == width) &&
+          (!(box->height % block) ||
+           (unsigned)(box->y + box->height) == height);
 }
 
 static void *
@@ -637,6 +719,7 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
       offset = box->x;
    } else {
       const unsigned cpp = chrome9_format_storage_cpp(resource->format);
+      const unsigned block = chrome9_format_block_dim(resource->format);
 
       if (!cpp) {
          pipe_resource_reference(&transfer->resource, NULL);
@@ -645,11 +728,13 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
       }
 
       transfer->stride = cresource->level_stride[level];
-      transfer->layer_stride = cresource->level_size[level];
+      transfer->layer_stride = cresource->layer_stride ?
+         cresource->layer_stride : cresource->level_size[level];
 
       offset = cresource->level_offset[level] +
-               (uint64_t)box->y * cresource->level_stride[level] +
-               (uint64_t)box->x * cpp;
+               (uint64_t)box->z * cresource->layer_stride +
+               (uint64_t)(box->y / block) * cresource->level_stride[level] +
+               (uint64_t)(box->x / block) * cpp;
    }
    if (offset > cresource->bo.size) {
       pipe_resource_reference(&transfer->resource, NULL);
@@ -679,28 +764,30 @@ struct chrome9_mipmap_mapping {
 
 static bool
 chrome9_mipmap_level_valid(const struct chrome9_resource *resource,
-                           unsigned level, unsigned cpp)
+                           unsigned level, unsigned layer, unsigned cpp)
 {
    const unsigned width = u_minify(resource->base.width0, level);
    const unsigned height = u_minify(resource->base.height0, level);
+   const uint64_t offset = resource->level_offset[level] +
+                           (uint64_t)layer * resource->layer_stride;
 
    return resource->level_stride[level] >= width * cpp &&
           resource->level_size[level] >=
              (uint64_t)resource->level_stride[level] * height &&
-          resource->level_offset[level] <= resource->bo.size &&
-          resource->level_size[level] <=
-             resource->bo.size - resource->level_offset[level];
+          offset <= resource->bo.size &&
+          resource->level_size[level] <= resource->bo.size - offset;
 }
 
 static bool
 chrome9_mipmap_map_level(struct pipe_context *pipe,
                          struct chrome9_resource *resource, unsigned level,
-                         unsigned usage, unsigned cpp,
+                         unsigned layer, unsigned usage, unsigned cpp,
                          struct chrome9_mipmap_mapping *mapping)
 {
    const unsigned width = u_minify(resource->base.width0, level);
    const unsigned height = u_minify(resource->base.height0, level);
    const struct pipe_box box = {
+      .z = layer,
       .width = width,
       .height = height,
       .depth = 1,
@@ -724,10 +811,11 @@ chrome9_mipmap_map_level(struct pipe_context *pipe,
     * would make the state tracker enter util_gen_mipmap(), while this bounded
     * driver intentionally has no generic blit callback yet. */
    if (!resource->bo.map ||
-       !chrome9_mipmap_level_valid(resource, level, cpp))
+       !chrome9_mipmap_level_valid(resource, level, layer, cpp))
       return false;
    mapping->data = (uint8_t *)resource->bo.map +
-                   resource->level_offset[level];
+                   resource->level_offset[level] +
+                   (uint64_t)layer * resource->layer_stride;
    mapping->stride = resource->level_stride[level];
    return true;
 }
@@ -842,6 +930,47 @@ chrome9_mipmap_packed_level(enum pipe_format format, unsigned cpp,
    }
 }
 
+/* Box-filter one level of one layer from its predecessor. */
+static bool
+chrome9_mipmap_downsample(struct pipe_context *pipe,
+                          struct chrome9_resource *resource,
+                          enum pipe_format format, unsigned cpp,
+                          unsigned level, unsigned layer)
+{
+   const struct pipe_resource *pres = &resource->base;
+   const unsigned source_width = u_minify(pres->width0, level - 1);
+   const unsigned source_height = u_minify(pres->height0, level - 1);
+   const unsigned destination_width = u_minify(pres->width0, level);
+   const unsigned destination_height = u_minify(pres->height0, level);
+   struct chrome9_mipmap_mapping source;
+   struct chrome9_mipmap_mapping destination;
+
+   if (!chrome9_mipmap_map_level(pipe, resource, level - 1, layer,
+                                 PIPE_MAP_READ, cpp, &source))
+      return false;
+   if (!chrome9_mipmap_map_level(pipe, resource, level, layer,
+                                 PIPE_MAP_WRITE, cpp, &destination)) {
+      chrome9_mipmap_unmap_level(pipe, &source);
+      return false;
+   }
+
+   if (format == PIPE_FORMAT_Z16_UNORM)
+      chrome9_mipmap_z16_level(&source, source_width, source_height,
+                               &destination, destination_width,
+                               destination_height);
+   else if (cpp == 4)
+      chrome9_mipmap_bgra_level(format, &source, source_width,
+                                source_height, &destination,
+                                destination_width, destination_height);
+   else
+      chrome9_mipmap_packed_level(format, cpp, &source, source_width,
+                                  source_height, &destination,
+                                  destination_width, destination_height);
+   chrome9_mipmap_unmap_level(pipe, &destination);
+   chrome9_mipmap_unmap_level(pipe, &source);
+   return true;
+}
+
 bool
 chrome9_generate_mipmap(struct pipe_context *pipe,
                         struct pipe_resource *pres,
@@ -855,59 +984,34 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
 
    format_info = chrome9_texture_format_info(format);
    if (!pipe || !pres || !pipe->texture_map || !pipe->texture_unmap ||
-       pres->target != PIPE_TEXTURE_2D || pres->depth0 != 1 ||
-       pres->array_size != 1 || pres->nr_samples > 1 ||
+       (pres->target != PIPE_TEXTURE_2D &&
+        pres->target != PIPE_TEXTURE_CUBE) || pres->depth0 != 1 ||
+       pres->nr_samples > 1 ||
        pres->nr_storage_samples > 1 || format != pres->format ||
-       format == PIPE_FORMAT_X8Z24_UNORM ||
+       format == PIPE_FORMAT_X8Z24_UNORM || chrome9_format_is_dxt(format) ||
        (!format_info && format != PIPE_FORMAT_Z16_UNORM) ||
        base_level > last_level || last_level > pres->last_level ||
-       first_layer || last_layer)
+       first_layer > last_layer || last_layer >= pres->array_size)
       return false;
 
    resource = chrome9_resource(pres);
    cpp = format_info ? format_info->bytes_per_pixel : 2;
    if (!resource->guarded || !resource->bo.map)
       return false;
-   for (unsigned level = base_level; level <= last_level; level++)
-      if (!chrome9_mipmap_level_valid(resource, level, cpp))
-         return false;
+   for (unsigned layer = first_layer; layer <= last_layer; layer++)
+      for (unsigned level = base_level; level <= last_level; level++)
+         if (!chrome9_mipmap_level_valid(resource, level, layer, cpp))
+            return false;
 
    /* The first level may still be queued in a retained GPU draw batch. */
    chrome9_draw_flush_batch(chrome9_context(pipe));
    chrome9_resource_cpu_access(resource, true);
 
-   for (unsigned level = base_level + 1; level <= last_level; level++) {
-      const unsigned source_width = u_minify(pres->width0, level - 1);
-      const unsigned source_height = u_minify(pres->height0, level - 1);
-      const unsigned destination_width = u_minify(pres->width0, level);
-      const unsigned destination_height = u_minify(pres->height0, level);
-      struct chrome9_mipmap_mapping source;
-      struct chrome9_mipmap_mapping destination;
-
-      if (!chrome9_mipmap_map_level(pipe, resource, level - 1,
-                                    PIPE_MAP_READ, cpp, &source))
-         return false;
-      if (!chrome9_mipmap_map_level(pipe, resource, level, PIPE_MAP_WRITE,
-                                    cpp, &destination)) {
-         chrome9_mipmap_unmap_level(pipe, &source);
-         return false;
-      }
-
-      if (format == PIPE_FORMAT_Z16_UNORM)
-         chrome9_mipmap_z16_level(&source, source_width, source_height,
-                                  &destination, destination_width,
-                                  destination_height);
-      else if (cpp == 4)
-         chrome9_mipmap_bgra_level(format, &source, source_width,
-                                   source_height, &destination,
-                                   destination_width, destination_height);
-      else
-         chrome9_mipmap_packed_level(format, cpp, &source, source_width,
-                                     source_height, &destination,
-                                     destination_width, destination_height);
-      chrome9_mipmap_unmap_level(pipe, &destination);
-      chrome9_mipmap_unmap_level(pipe, &source);
-   }
+   for (unsigned layer = first_layer; layer <= last_layer; layer++)
+      for (unsigned level = base_level + 1; level <= last_level; level++)
+         if (!chrome9_mipmap_downsample(pipe, resource, format, cpp, level,
+                                        layer))
+            return false;
    return true;
 }
 

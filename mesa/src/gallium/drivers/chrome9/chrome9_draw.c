@@ -1100,7 +1100,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              textures[unit]->bo.handle == (*target)->bo.handle ||
              (*depth_active &&
               textures[unit]->bo.handle == (*depth)->bo.handle) ||
-             source->target != PIPE_TEXTURE_2D ||
+             (source->target != PIPE_TEXTURE_2D &&
+              (source->target != PIPE_TEXTURE_CUBE ||
+               !chrome9_use_generic_fragment_program(ctx))) ||
              (!chrome9_use_generic_fragment_program(ctx) ?
                 (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
                  source->format != PIPE_FORMAT_B8G8R8A8_UNORM) : !format) ||
@@ -1110,9 +1112,16 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              !textures[unit]->bo.handle ||
              (textures[unit]->data_offset & 0xff) ||
              textures[unit]->stride !=
-                ALIGN_POT(source->width0 * format->bytes_per_pixel, 32) ||
+                chrome9_format_level_pitch(source->format, source->width0) ||
              textures[unit]->data_size <
-                (uint64_t)textures[unit]->stride * source->height0)
+                (uint64_t)textures[unit]->stride *
+                chrome9_format_level_rows(source->format, source->height0))
+            return false;
+         /* The TEX coordinate width follows the shader's sampler type. */
+         *reason = "texture-target";
+         if (chrome9_use_generic_fragment_program(ctx) &&
+             !!(ctx->fs->semantic_cube_sampler_mask & (1u << logical)) !=
+                (source->target == PIPE_TEXTURE_CUBE))
             return false;
          *reason = "mip-view-state";
          if (source->format == PIPE_FORMAT_X8Z24_UNORM &&
@@ -1257,6 +1266,10 @@ chrome9_fragment_unit_interval_texture(enum pipe_format format)
    case PIPE_FORMAT_L8A8_UNORM:
    case PIPE_FORMAT_B5G6R5_UNORM:
    case PIPE_FORMAT_X8Z24_UNORM:
+   case PIPE_FORMAT_DXT1_RGB:
+   case PIPE_FORMAT_DXT1_RGBA:
+   case PIPE_FORMAT_DXT3_RGBA:
+   case PIPE_FORMAT_DXT5_RGBA:
       return true;
    default:
       return false;
@@ -1423,6 +1436,16 @@ chrome9_generic_fragment_state(
       const struct pipe_sampler_view *view =
          crender->ctx->sampler_views[logical];
 
+      if (textures[unit]->base.format == PIPE_FORMAT_DXT1_RGB) {
+         static const uint8_t opaque[4] = {
+            DRM_CHROME9_FRAGMENT_SWIZZLE_X, DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+            DRM_CHROME9_FRAGMENT_SWIZZLE_Z, DRM_CHROME9_FRAGMENT_SWIZZLE_ONE,
+         };
+
+         depth_sampler_mask |= 1u << logical;
+         memcpy(depth_swizzle[logical], opaque, sizeof(opaque));
+         continue;
+      }
       if (textures[unit]->base.format != PIPE_FORMAT_X8Z24_UNORM)
          continue;
       if (!view)
@@ -1486,6 +1509,13 @@ chrome9_generic_fragment_state(
       texture_state[unit].mip_filter = samplers[unit]->mip_filter;
       texture_state[unit].wrap_s = samplers[unit]->wrap_s;
       texture_state[unit].wrap_t = samplers[unit]->wrap_t;
+      if (resource->target == PIPE_TEXTURE_CUBE) {
+         /* No seamless filtering: face coordinates clamp to the edge. */
+         texture_state[unit].target = DRM_CHROME9_FRAGMENT_TARGET_CUBE;
+         texture_state[unit].face_stride = textures[unit]->layer_stride;
+         texture_state[unit].wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+         texture_state[unit].wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+      }
       texture_state[unit].lod_bias_s5_5 = CLAMP(
          lroundf(samplers[unit]->base.lod_bias * 32.0f), -512, 511);
       texture_state[unit].min_lod_s5_5 = CLAMP(

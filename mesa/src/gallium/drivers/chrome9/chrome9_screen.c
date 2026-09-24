@@ -520,6 +520,12 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    caps->device_id = screen->device_id;
    caps->endianness = PIPE_ENDIAN_NATIVE;
    caps->max_texture_2d_size = 2048;
+   /* Nine levels: every face root has eight level-table successors. */
+   if (chrome9_screen_has_capability2(&screen->base,
+                                      DRM_CHROME9_CAP2_CUBE_MAP) &&
+       chrome9_screen_has_capability(&screen->base,
+                                     DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM))
+      caps->max_texture_cube_levels = 9;
    caps->max_render_targets = 1;
    /* The bounded draw paths support a 16-bit Z buffer with both 32-bit
     * XRGB and BGRA color targets.  DRI needs this explicit contract or it
