@@ -133,10 +133,61 @@ The exact production-compiler vFace differential and the bounded synthetic
 face-sign resource experiment are documented in
 `chrome9-vface-normal-sign-boundary.md`.  In particular, vFace and vPos
 compile byte-identically even in the actual vec3 CMP shape, so POSITION/MISC
-must not be exposed as FACE.  The synthetic sign form removes FACE and leaves
-95 ALU plus five TEX nodes after SQRT lowering, but a final native count still
-requires the same sampler and uniform lowering that the Mesa state tracker
-performs before driver compilation.
+must not be exposed as FACE.
+
+The resource experiment is now closed through the actual state-tracker
+lowering sequence, rather than the earlier raw linked-NIR approximation.  It
+uses these deliberately non-production sources:
+
+```text
+synthetic-face VS SHA-256
+3afed6042934313a00bfd8416d42e76f321b5809574dd1e5952b765371edb793
+synthetic-face FS SHA-256
+dc623f4baf85ef408aabe8a856867688dc636753054eaac85928184f91a8fdc7
+linked FS NIR BLAKE3
+0dadc9ae c424498f f40534ee 1d6d0277
+bc825969 60085bbb 1eb193de b51a203a
+```
+
+The VS carries a caller-supplied `+1/-1` face sign in the otherwise dead
+`var_LightDir.w`; the FS computes
+`surfNormal = -var_LightDir.w * var_Normal.xyz`.  This remains only a
+resource discriminator because an ordinary VS cannot know post-clipping
+primitive facing.  The probe then runs the same `nir_lower_io`,
+`nir_lower_uniforms_to_ubo` and `gl_nir_lower_samplers` sequence as
+`m9_fs_compile_test.cpp::lower_like_st()`, enables the already qualified
+nonnegative `fsqrt -> frsq+frcp` lowering, and invokes the current Chrome9
+semantic compiler.
+
+The exact semantic result is:
+
+```text
+100 ordered records = 95 ALU + 5 TEX
+varying mask          0x003f (six generic varyings)
+sampler mask          0x1f   (five dense samplers)
+uniform mask          0x00000007
+constant mask         0xe0000007
+virtual SSA temps     96
+```
+
+Therefore 96 ALU and 32 TEX are sufficient for this transformed permutation;
+the instruction stores are not its next resource gate.  Native allocation is.
+Replaying the kernel's allocate-before-release interval rule over that exact
+semantic stream reaches all twelve physical temporaries and fails while
+allocating record 34; the complete unscheduled SSA order has a peak live set
+of 15 at record 67.  Moreover six active direct varying coordinates select
+the kernel's largest resource bucket, which permits at most six physical
+temporaries.
+
+Thus merely extending the native encoder from 12 registers would still not
+make the object submit-safe.  A generic scheduler must sink definitions,
+shorten live ranges, or recompute/spill values until the physical high-water
+is at most six, while preserving all 95 ALU and five texture results.
+
+This does not remove the earlier API gates: production still truthfully
+advertises three fragment inputs and three sampler slots.  The discriminator
+only proves that, after those route and descriptor paths are generalized,
+raising the ALU cap is not the required fix.
 
 The generic implementation ladder is:
 
@@ -146,8 +197,9 @@ The generic implementation ladder is:
    the sign selection exactly for both front and back triangles;
 3. lower finite nonnegative SQRT through a qualified sequence and reject
    exceptional domains until characterized;
-4. rerun allocation and require final ALU `<=96`, TEX `=5`, physical temps in
-   range, varying mask `0x3f`, sampler mask `0x1f`, and no spill;
+4. schedule the exact semantic DAG and require final ALU `<=96`, TEX `=5`,
+   physical high-water `<=6` for the six-coordinate resource bucket, varying
+   mask `0x3f`, sampler mask `0x1f`, and no unmodelled spill;
 5. only then promote five dense descriptors and six float varyings, followed
    by distinct-color front/back pixel oracles and stale-state closure.
 
