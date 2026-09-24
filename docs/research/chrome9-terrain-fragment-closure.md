@@ -316,5 +316,6 @@ It has not been submitted to hardware.
 Only after this gate and the four-slot varying linkage pass should the full
 main fragment object be captured to establish exact final ALU/TAU counts and
 physical-temp high-water.  Fragment closure still does not enable the scene:
-software vertex texture sampling, six-slot sampler/view state, sparse logical
-unit binding, mip/R2T chains and the broader caps remain independent gates.
+software vertex texture sampling, five dense shader sampler/view slots,
+application-unit remapping, mip/R2T chains and the broader caps remain
+independent gates.
