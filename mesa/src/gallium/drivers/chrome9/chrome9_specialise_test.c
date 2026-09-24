@@ -176,6 +176,33 @@ build_vector_uniform_select(void)
    return b.shader;
 }
 
+/* Float-lowered shape of ioquake3's integer alpha-mode tree.  The mode is a
+ * direct CB0 leaf while alpha remains a per-fragment input. */
+static nir_shader *
+build_alpha_mode_terminates(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                   &options,
+                                                   "alpha-mode-terminates");
+   nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
+                                           glsl_float_type(), "alpha");
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                            glsl_float_type(), "out");
+   nir_def *mode = nir_load_ubo_vec4(&b, 1, 32, nir_imm_int(&b, 0),
+                                     nir_imm_int(&b, 0));
+   nir_def *alpha = nir_load_var(&b, in);
+
+   nir_discard_if(&b, nir_iand(&b, nir_ieq_imm(&b, mode, 1),
+                                nir_feq_imm(&b, alpha, 0.0f)));
+   nir_discard_if(&b, nir_iand(&b, nir_ieq_imm(&b, mode, 2),
+                                nir_fge_imm(&b, alpha, 0.5f)));
+   nir_discard_if(&b, nir_iand(&b, nir_ieq_imm(&b, mode, 3),
+                                nir_flt_imm(&b, alpha, 0.5f)));
+   nir_store_var(&b, out, alpha, 1);
+   nir_validate_shader(b.shader, "Chrome9 alpha mode specialization input");
+   return b.shader;
+}
+
 static unsigned
 alu_op_count(nir_shader *nir, nir_op op)
 {
@@ -255,6 +282,41 @@ if_count(nir_shader *nir)
    return count;
 }
 
+static unsigned
+terminate_count(nir_shader *nir)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, nir)
+      nir_foreach_block(block, impl)
+         nir_foreach_instr(instr, block)
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_terminate_if)
+               count++;
+   return count;
+}
+
+static bool
+check_alpha_mode(nir_shader *canonical, unsigned mode,
+                 unsigned expected_terminates)
+{
+   uint32_t value = float_bits((float)mode);
+   nir_shader *variant = nir_shader_clone(NULL, canonical);
+   bool valid;
+
+   chrome9_nir_inline_uniforms(variant, &value);
+   nir_validate_shader(variant, "Chrome9 specialized alpha mode");
+   valid = terminate_count(variant) == expected_terminates;
+   if (!valid) {
+      fprintf(stderr, "alpha mode %u: terminates=%u expected=%u\n",
+              mode, terminate_count(variant), expected_terminates);
+      nir_print_shader(variant, stderr);
+   }
+   ralloc_free(variant);
+   return valid;
+}
+
 static void
 check_count(nir_shader *canonical, float count, bool expect_loop)
 {
@@ -292,6 +354,20 @@ main(void)
    check_count(nir, 32.0f, false);
    check_count(nir, 33.0f, true);
 
+   ralloc_free(nir);
+
+   nir = build_alpha_mode_terminates();
+   chrome9_nir_lower_integers(nir);
+   chrome9_nir_find_inlinable_uniforms(nir);
+   if (nir->info.num_inlinable_uniforms != 1 ||
+       nir->info.inlinable_uniform_dw_offsets[0] != 0 ||
+       !check_alpha_mode(nir, 0, 0) ||
+       !check_alpha_mode(nir, 1, 1) ||
+       !check_alpha_mode(nir, 2, 1) ||
+       !check_alpha_mode(nir, 3, 1)) {
+      fprintf(stderr, "alpha mode terminate specialization failed\n");
+      return 1;
+   }
    ralloc_free(nir);
 
    nir = build_vector_uniform_select();

@@ -140,6 +140,30 @@ chrome9_loop_bound_uniforms(struct exec_list *body, bool in_loop,
    }
 }
 
+/* A terminate predicate normally combines a uniform mode with per-fragment
+ * data, so it cannot fold as a whole until the uniform leaf is inlined.  Like
+ * a loop bound, collect only direct CB0 leaves and leave every dynamic value
+ * untouched. */
+static void
+chrome9_terminate_uniforms(nir_shader *nir, uint16_t *dwords,
+                           unsigned *count)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+
+            if (intr->intrinsic != nir_intrinsic_terminate_if)
+               continue;
+            chrome9_bound_dwords(nir_get_scalar(intr->src[0].ssa, 0),
+                                  dwords, count, 0);
+         }
+      }
+   }
+}
+
 /* nir_lower_int_to_float also converts the integer element index of a
  * load_ubo_vec4.  It is an address, not shader data, and must stay integer. */
 static bool
@@ -192,8 +216,10 @@ chrome9_nir_find_inlinable_uniforms(nir_shader *nir)
    }
    nir_foreach_function_impl(impl, nir)
       chrome9_loop_bound_uniforms(&impl->body, false, dwords, &count);
+   chrome9_terminate_uniforms(nir, dwords, &count);
    /* Loop bounds are required for an unrolled straight-line program.  Give
-    * them priority over select predicates in the four-dword variant key. */
+    * them priority over terminate and select predicates in the four-dword
+    * variant key. */
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {

@@ -12,8 +12,9 @@ struct nir_shader;
  * element indices used only for addressing. */
 void chrome9_nir_lower_integers(struct nir_shader *nir);
 
-/* Record only CB0 dwords that decide eliminable control flow.  Mesa's state
- * tracker uses this metadata to deliver their current raw values through
+/* Record only direct CB0 dwords that decide eliminable control flow or are
+ * uniform leaves of a mixed terminate predicate.  Mesa's state tracker uses
+ * this metadata to deliver their current raw values through
  * pipe_context::set_inlinable_constants. */
 void chrome9_nir_find_inlinable_uniforms(struct nir_shader *nir);
 
