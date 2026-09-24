@@ -670,7 +670,8 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
    *successor = false;
    if (!state)
       return true;
-   if (state->independent_blend_enable || state->logicop_enable ||
+   /* With one render target independent blending changes nothing. */
+   if (state->logicop_enable ||
        state->alpha_to_coverage ||
        state->alpha_to_coverage_dither || state->alpha_to_one ||
        state->max_rt || state->advanced_blend_func ||

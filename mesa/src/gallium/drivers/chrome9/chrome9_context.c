@@ -5441,6 +5441,79 @@ chrome9_tgsi_fs_passthrough(const struct tgsi_token *tokens)
    return valid && input >= 0 && output >= 0 && moves == 1;
 }
 
+/*
+ * The blitter's TGSI clear programs: no output at all (depth/stencil
+ * clears) or MOV OUT[color0], CONST[n] (color clears).  Returns -1 when
+ * neither, else the constant register (0 for the empty program with
+ * *empty set).
+ */
+static int
+chrome9_tgsi_fs_clear(const struct tgsi_token *tokens, bool *empty)
+{
+   struct tgsi_parse_context parse;
+   int output = -1, constant = -1;
+   unsigned instructions = 0;
+   bool valid = tokens && tgsi_parse_init(&parse, tokens) == TGSI_PARSE_OK;
+
+   if (!valid)
+      return -1;
+   while (!tgsi_parse_end_of_tokens(&parse) && valid) {
+      const union tgsi_full_token *token;
+
+      tgsi_parse_token(&parse);
+      token = &parse.FullToken;
+      switch (token->Token.Type) {
+      case TGSI_TOKEN_TYPE_DECLARATION: {
+         const struct tgsi_full_declaration *decl = &token->FullDeclaration;
+
+         if (decl->Declaration.File != TGSI_FILE_OUTPUT)
+            break;
+         if (output >= 0 || !decl->Declaration.Semantic ||
+             decl->Semantic.Name != TGSI_SEMANTIC_COLOR ||
+             decl->Semantic.Index || decl->Range.First != decl->Range.Last)
+            valid = false;
+         output = decl->Range.First;
+         break;
+      }
+      case TGSI_TOKEN_TYPE_INSTRUCTION: {
+         const struct tgsi_full_instruction *inst =
+            &token->FullInstruction;
+         const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+         const struct tgsi_src_register *src = &inst->Src[0].Register;
+
+         if (inst->Instruction.Opcode == TGSI_OPCODE_END)
+            break;
+         if (inst->Instruction.Opcode != TGSI_OPCODE_MOV || instructions++ ||
+             dst->File != TGSI_FILE_OUTPUT || dst->Index != output ||
+             dst->WriteMask != TGSI_WRITEMASK_XYZW || dst->Indirect ||
+             src->File != TGSI_FILE_CONSTANT || src->Indirect ||
+             src->Negate || src->Absolute ||
+             (src->Dimension && inst->Src[0].Dimension.Index) ||
+             src->SwizzleX != TGSI_SWIZZLE_X ||
+             src->SwizzleY != TGSI_SWIZZLE_Y ||
+             src->SwizzleZ != TGSI_SWIZZLE_Z ||
+             src->SwizzleW != TGSI_SWIZZLE_W || src->Index >= 32)
+            valid = false;
+         constant = src->Index;
+         break;
+      }
+      case TGSI_TOKEN_TYPE_PROPERTY:
+      case TGSI_TOKEN_TYPE_IMMEDIATE:
+         break;
+      default:
+         valid = false;
+         break;
+      }
+   }
+   tgsi_parse_free(&parse);
+   if (!valid)
+      return -1;
+   *empty = output < 0 && !instructions;
+   if (*empty)
+      return 0;
+   return output >= 0 && instructions == 1 ? constant : -1;
+}
+
 /* MOV oC0, primary: passthrough programs the semantic lowering skips. */
 static void
 chrome9_semantic_primary_passthrough(struct chrome9_shader *shader)
@@ -5460,12 +5533,48 @@ chrome9_semantic_primary_passthrough(struct chrome9_shader *shader)
    shader->semantic_passthrough = true;
 }
 
+/* MOV oC0, CB0[constant]: the blitter's color clear. */
+static void
+chrome9_semantic_constant_color(struct chrome9_shader *shader,
+                                unsigned constant)
+{
+   struct chrome9_ps_instruction *mov = &shader->semantic_fs_ir.instruction[0];
+
+   memset(&shader->semantic_fs_ir, 0, sizeof(shader->semantic_fs_ir));
+   mov->op = CHROME9_PS_OPCODE_MOV;
+   mov->destination.file = CHROME9_PS_DESTINATION_COLOR;
+   mov->destination.writemask = 0xf;
+   mov->source[0].file = CHROME9_PS_SOURCE_CONSTANT;
+   mov->source[0].id = constant;
+   for (unsigned i = 0; i < 4; i++)
+      mov->source[0].swizzle[i] = i;
+   shader->semantic_fs_ir.count = 1;
+   shader->semantic_input_mask = 0;
+   shader->semantic_constant_mask = 1u << constant;
+   shader->semantic_fs_valid = true;
+   shader->fragment_program = CHROME9_FS_COMPILED_ALU;
+   shader->supported = true;
+}
+
 void
 chrome9_compile_fs_nir(struct chrome9_context *ctx,
                        struct chrome9_shader *shader, nir_shader *nir)
 {
    bool straight_line = chrome9_fs_straight_line_entrypoint(nir, NULL, NULL);
 
+   /* No color, depth or discard output (depth/stencil-only passes such as
+    * the blitter's clears): the color the program writes is masked off. */
+   if (straight_line && !nir->info.fs.uses_discard &&
+       !(nir->info.outputs_written &
+         (BITFIELD64_BIT(FRAG_RESULT_COLOR) |
+          BITFIELD64_BIT(FRAG_RESULT_DATA0) |
+          BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+          BITFIELD64_BIT(FRAG_RESULT_STENCIL)))) {
+      chrome9_semantic_primary_passthrough(shader);
+      shader->fragment_program = CHROME9_FS_PRIMARY_COLOR;
+      shader->supported = true;
+      return;
+   }
    shader->fragment_program = straight_line ?
       chrome9_fs_classify(nir, &shader->literal_color) :
       CHROME9_FS_UNSUPPORTED;
@@ -5778,17 +5887,20 @@ chrome9_create_fs_state(struct pipe_context *pipe,
                  shader->native_fs.constant_mask,
                  shader->native_fs.immediate_mask);
    } else if (state->type == PIPE_SHADER_IR_TGSI) {
-      shader->supported = chrome9_tgsi_fs_passthrough(state->tokens);
+      bool empty = false;
+      int constant = chrome9_tgsi_fs_clear(state->tokens, &empty);
+
+      shader->supported = chrome9_tgsi_fs_passthrough(state->tokens) ||
+                          empty;
       shader->fragment_program = shader->supported ?
          CHROME9_FS_PRIMARY_COLOR : CHROME9_FS_UNSUPPORTED;
-      /* The same MOV oC0, primary the NIR path lowers, for generic draws. */
+      /* The same MOV oC0, primary the NIR path lowers, for generic draws;
+       * an empty program's color is masked off by its blend state. */
       if (shader->supported)
          chrome9_semantic_primary_passthrough(shader);
+      else if (constant >= 0 && ctx->draw_fragment_program)
+         chrome9_semantic_constant_color(shader, constant);
    }
-   if (!shader->nir && shader->supported && !shader->native_fs_valid)
-      shader->native_fs_valid = chrome9_compile_native_fs(
-         ctx, shader, state->type == PIPE_SHADER_IR_NIR ?
-                      state->ir.nir : NULL);
    if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false) &&
        shader->supported)
       fprintf(stderr, "chrome9: native FS valid=%u nir=%u alu=%u tau=%u\n",
@@ -6346,6 +6458,138 @@ chrome9_clear_target_masked(struct chrome9_resource *target,
    }
 }
 
+/*
+ * Full-surface clears as one DRAW_FRAGMENT_PROGRAM rectangle, so the CPU
+ * neither writes the surfaces nor forces whole-surface cache flushes: the
+ * program writes CB constant 0, depth runs ALWAYS with writes and stencil
+ * REPLACEs.  Scissored, masked or inexact clears stay on the CPU.
+ */
+static bool
+chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
+                  uint32_t color_mask, uint8_t stencil_mask,
+                  const struct pipe_scissor_state *scissor,
+                  const union pipe_color_union *color, double depth,
+                  unsigned stencil)
+{
+   const struct pipe_framebuffer_state *fb = &ctx->framebuffer;
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   const bool clear_color = buffers & PIPE_CLEAR_COLOR0;
+   const bool clear_depth = buffers & PIPE_CLEAR_DEPTH;
+   const bool clear_stencil = buffers & PIPE_CLEAR_STENCIL;
+   struct chrome9_resource *target = ctx->render_target ?
+      chrome9_resource(ctx->render_target) : NULL;
+   struct chrome9_resource *zs = fb->zsbuf.texture ?
+      chrome9_resource(fb->zsbuf.texture) : NULL;
+   struct drm_chrome9_fragment_instruction mov = {
+      .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+      .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+      .src = { { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0, { 0, 1, 2, 3 },
+                 0, 0 } },
+   };
+   struct drm_chrome9_draw_fragment_program draw = { 0 };
+   struct drm_chrome9_fragment_vertex vertices[6];
+   static const unsigned corner[6][2] = {
+      { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 },
+   };
+   uint32_t constant[4];
+   int32_t z = 0;
+
+   if (!ctx->draw_fragment_program || !target || !target->guarded ||
+       target->base.last_level || !fb->width || !fb->height ||
+       target->base.width0 != fb->width || target->base.height0 != fb->height ||
+       (target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        target->base.format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+       (scissor && (scissor->minx || scissor->miny ||
+                    scissor->maxx < fb->width || scissor->maxy < fb->height)) ||
+       (clear_color && ((color_mask & 0xf) != 0xf || !fb->nr_cbufs)) ||
+       (clear_stencil && stencil_mask != 0xff))
+      return false;
+   if (clear_depth || clear_stencil) {
+      const bool d24 = zs && chrome9_format_is_d24(zs->base.format);
+
+      if (!zs || !zs->guarded || zs->base.last_level ||
+          zs->base.width0 != fb->width || zs->base.height0 != fb->height ||
+          (!d24 && zs->base.format != PIPE_FORMAT_Z16_UNORM) ||
+          (clear_stencil &&
+           (zs->base.format != PIPE_FORMAT_S8_UINT_Z24_UNORM ||
+            !ctx->fragment_stencil)) ||
+          (!clear_depth && (!ctx->depth_read_only_supported ||
+                            !ctx->depth_always_supported)) ||
+          depth < 0.0 || depth > 1.0)
+         return false;
+      /* Window z is 16.16: a D24 value must be exact in 16 bits. */
+      z = (int32_t)(depth * 65536.0 + 0.5);
+      if (clear_depth && d24 && fabs(z / 65536.0 - depth) > 1e-9)
+         return false;
+      draw.depth_handle = zs->bo.handle;
+      draw.depth_pitch = zs->stride;
+      draw.depth_format = d24 ? DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 :
+                                DRM_CHROME9_FRAGMENT_DEPTH_D16;
+      draw.flags |= DRM_CHROME9_FRAGMENT_DEPTH |
+                    DRM_CHROME9_COMPARE_ALWAYS << DRM_CHROME9_DEPTH_FUNC_SHIFT |
+                    (clear_depth ? 0 : DRM_CHROME9_DEPTH_READ_ONLY);
+      if (clear_stencil) {
+         struct drm_chrome9_stencil_face face = {
+            .func = DRM_CHROME9_COMPARE_ALWAYS,
+            .fail_op = DRM_CHROME9_STENCIL_OP_REPLACE,
+            .zfail_op = DRM_CHROME9_STENCIL_OP_REPLACE,
+            .zpass_op = DRM_CHROME9_STENCIL_OP_REPLACE,
+            .ref = stencil & 0xff,
+            .value_mask = 0xff,
+            .write_mask = 0xff,
+         };
+
+         draw.flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+         draw.stencil.cw = face;
+         draw.stencil.ccw = face;
+      }
+   }
+   /* Keep the color store off unless color is cleared. */
+   draw.flags |= DRM_CHROME9_FRAGMENT_BLEND;
+   draw.blend.rgb_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+   draw.blend.rgb_dst_factor = DRM_CHROME9_BLEND_FACTOR_ZERO;
+   draw.blend.alpha_src_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+   draw.blend.alpha_dst_factor = DRM_CHROME9_BLEND_FACTOR_ZERO;
+   draw.blend.color_mask = clear_color ?
+      DRM_CHROME9_COLOR_MASK_R | DRM_CHROME9_COLOR_MASK_G |
+      DRM_CHROME9_COLOR_MASK_B | DRM_CHROME9_COLOR_MASK_A : 0;
+   for (unsigned c = 0; c < 4; c++)
+      memcpy(&constant[c], &color->f[c], sizeof(constant[c]));
+   memset(vertices, 0, sizeof(vertices));
+   for (unsigned v = 0; v < 6; v++) {
+      vertices[v].x_16_16 = (int32_t)(corner[v][0] * fb->width << 16) - 0x8000;
+      vertices[v].y_16_16 = (int32_t)(corner[v][1] * fb->height << 16) - 0x8000;
+      vertices[v].z_16_16 = z;
+      vertices[v].rhw_float = 0x3f800000;
+   }
+   draw.abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION;
+   draw.destination_handle = target->bo.handle;
+   draw.width = target->base.width0;
+   draw.height = target->base.height0;
+   draw.destination_pitch = target->stride;
+   draw.destination_format =
+      target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+      DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+      DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+   draw.instruction_count = 1;
+   draw.instructions_ptr = (uintptr_t)&mov;
+   draw.constant_count = 1;
+   draw.constants_ptr = (uintptr_t)constant;
+   draw.triangle_count = 2;
+   draw.vertices_ptr = (uintptr_t)vertices;
+   if (clear_color) {
+      ctx->render_target_stale = false;
+   } else {
+      /* The color store is masked off, but the target stays bound. */
+      chrome9_context_prepare_render_target(ctx);
+   }
+   if (!chrome9_draw_fragment_program(fd, &draw))
+      return false;
+   if (clear_color)
+      chrome9_context_render_target_written(ctx);
+   return true;
+}
+
 static void
 chrome9_clear(struct pipe_context *pipe, unsigned buffers,
               uint32_t color_mask, uint8_t stencil_mask,
@@ -6359,6 +6603,11 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
 
    chrome9_draw_flush_batch(ctx);
    if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)))
+      return;
+   if (!(buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)) &&
+       debug_get_bool_option("CHROME9_GPU_CLEAR", true) &&
+       chrome9_clear_gpu(ctx, buffers, color_mask, stencil_mask, scissor,
+                         color, depth, stencil))
       return;
    if (buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)) {
       chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
@@ -6647,6 +6896,39 @@ chrome9_flush_resource(struct pipe_context *pipe,
    chrome9_flush_render_target(chrome9_context(pipe));
 }
 
+/* No queries, conditional rendering or stream output: the blitter still
+ * calls these around its draws. */
+static void
+chrome9_set_active_query_state(struct pipe_context *pipe, bool enable)
+{
+   (void)pipe;
+   (void)enable;
+}
+
+static void
+chrome9_render_condition(struct pipe_context *pipe,
+                         struct pipe_query *query, bool condition,
+                         enum pipe_render_cond_flag mode)
+{
+   (void)pipe;
+   (void)query;
+   (void)condition;
+   (void)mode;
+}
+
+static void
+chrome9_set_stream_output_targets(struct pipe_context *pipe, unsigned count,
+                                  struct pipe_stream_output_target **targets,
+                                  const unsigned *offsets,
+                                  enum mesa_prim output_prim)
+{
+   (void)pipe;
+   (void)count;
+   (void)targets;
+   (void)offsets;
+   (void)output_prim;
+}
+
 static void
 chrome9_set_blend_color(struct pipe_context *pipe,
                         const struct pipe_blend_color *color)
@@ -6886,6 +7168,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_stencil_ref = chrome9_set_stencil_ref;
    ctx->base.set_sample_mask = chrome9_set_sample_mask;
    ctx->base.set_polygon_stipple = chrome9_set_polygon_stipple;
+   ctx->base.set_active_query_state = chrome9_set_active_query_state;
+   ctx->base.render_condition = chrome9_render_condition;
+   ctx->base.set_stream_output_targets = chrome9_set_stream_output_targets;
    ctx->base.set_debug_callback = u_default_set_debug_callback;
    ctx->base.resource_release = u_default_resource_release;
    chrome9_init_context_resource_functions(&ctx->base);
