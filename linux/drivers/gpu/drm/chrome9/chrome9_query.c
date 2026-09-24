@@ -21,7 +21,7 @@
 #define CHROME9_QUERY_WAIT_TIMEOUT	msecs_to_jiffies(5000)
 
 static uint chrome9_occlusion_query;
-module_param_named(occlusion_query, chrome9_occlusion_query, uint, 0400);
+module_param_named(occlusion_query, chrome9_occlusion_query, uint, 0600);
 MODULE_PARM_DESC(occlusion_query,
 	"Pre-promotion occlusion queries: 0 off, 1 vendor counter snapshot, 2 snapshot after a 3D sync (default: 0)");
 

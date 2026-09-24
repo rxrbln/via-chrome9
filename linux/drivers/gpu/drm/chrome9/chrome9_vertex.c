@@ -17,9 +17,14 @@
 #define CHROME9_VERTEX_NO_PHYSICAL	0xff
 #define CHROME9_VERTEX_FINALIZER_RECORDS 5U
 #define CHROME9_VERTEX_INACTIVE_TAILS	2U
+/* D3D9 vs_2_0 static flow control nesting limit. */
+#define CHROME9_VERTEX_MAX_FLOW_DEPTH	4U
+#define CHROME9_VERTEX_NO_DEF		0xffffU
 
 #define CHROME9_VS_UNIFIED_INPUT	32U
 #define CHROME9_VS_UNIFIED_TEMP		64U
+#define CHROME9_VS_UNIFIED_INT		96U
+#define CHROME9_VS_UNIFIED_BOOL		112U
 #define CHROME9_VS_UNIFIED_LITERAL	129U
 #define CHROME9_VS_UNIFIED_CONSTANT	256U
 #define CHROME9_VS_DEST_TEMP		0x10U
@@ -34,6 +39,14 @@
 #define CHROME9_VS_DEST_POSITION	0xa0U
 #define CHROME9_VS_LITERAL_ONE		0x00206490U
 #define CHROME9_VS_LITERAL_ZERO		0x00206db4U
+/* Op 28/29: taken and not-taken displacements in bits 18:10 of dwords 1
+ * and 2; DRM_CHROME9_VERTEX_MAX_RECORDS keeps them below 512. */
+#define CHROME9_VS_FLOW_TAKEN		0x00280000U
+#define CHROME9_VS_FLOW_NOT_TAKEN	0x00300000U
+#define CHROME9_VS_ELSE_SOURCE		0x0020a490U
+#define CHROME9_VS_IDENTITY		0x14cU
+/* REP reads i#.xyz0 (vendor rep/loop records). */
+#define CHROME9_VS_INT_SELECT		0x154U
 
 enum {
 	CHROME9_VS_NATIVE_MAD = 2,
@@ -50,6 +63,8 @@ enum {
 	CHROME9_VS_NATIVE_LOG2 = 18,
 	CHROME9_VS_NATIVE_RCP = 20,
 	CHROME9_VS_NATIVE_RSQ = 21,
+	CHROME9_VS_NATIVE_LOOP = 28,
+	CHROME9_VS_NATIVE_BRANCH = 29,
 };
 
 static const u8 chrome9_vertex_source_count[DRM_CHROME9_VERTEX_OP_COUNT] = {
@@ -97,6 +112,18 @@ static const u32 chrome9_vertex_finalizer[CHROME9_VERTEX_FINALIZER_RECORDS][4] =
 	{ 0x0020014c, 0x00000000, 0x00000000, 0x0008020f },
 };
 
+/* One open REP or IF: defined lanes at entry and after the first arm,
+ * and the native records to patch. */
+struct chrome9_vertex_frame {
+	u8 op;
+	bool has_else;
+	u32 start;
+	u32 record;
+	u32 else_record;
+	u8 entry[DRM_CHROME9_VERTEX_MAX_TEMPS + 1];
+	u8 then[DRM_CHROME9_VERTEX_MAX_TEMPS + 1];
+};
+
 struct chrome9_vertex_state {
 	const struct drm_chrome9_vertex_instruction *instructions;
 	u32 instruction_count;
@@ -106,6 +133,7 @@ struct chrome9_vertex_state {
 	u32 constant_end;
 	u8 defined[DRM_CHROME9_VERTEX_MAX_TEMPS + 1];
 	u16 last_touch[DRM_CHROME9_VERTEX_MAX_TEMPS + 1];
+	u16 first_def[DRM_CHROME9_VERTEX_MAX_TEMPS + 1];
 	u8 physical[DRM_CHROME9_VERTEX_MAX_TEMPS + 1];
 	u16 physical_live;
 	u32 physical_high_water;
@@ -128,11 +156,20 @@ struct chrome9_vertex_state {
 	u8 writemask[DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS];
 	bool position_direct;
 	int last_input_record;
+	struct chrome9_vertex_frame *frames;
+	u32 max_depth;
+	u32 depth;
+	bool dynamic;
 };
 
 static bool chrome9_vertex_scalar_op(u8 op)
 {
-	return op >= DRM_CHROME9_VERTEX_OP_RCP;
+	return op >= DRM_CHROME9_VERTEX_OP_RCP && op <= DRM_CHROME9_VERTEX_OP_LOG2;
+}
+
+static bool chrome9_vertex_flow_op(u8 op)
+{
+	return op >= DRM_CHROME9_VERTEX_OP_REP;
 }
 
 /* DP3 ignores W on both sources, DPH forces source 0 W to one. */
@@ -272,9 +309,15 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	case DRM_CHROME9_VERTEX_DEST_TEMP:
 		if (dst->index >= DRM_CHROME9_VERTEX_MAX_TEMPS)
 			return -EINVAL;
-		defined = &state->defined[dst->index];
 		state->last_touch[dst->index] = instruction;
-		break;
+		if (state->first_def[dst->index] == CHROME9_VERTEX_NO_DEF)
+			state->first_def[dst->index] = instruction;
+		/* Flow regions may rewrite a temp (loop-carried values). */
+		if (state->defined[dst->index] & mask && !state->depth)
+			return -EINVAL;
+		state->defined[dst->index] |= mask;
+		state->writemask[instruction] = mask;
+		return 0;
 	case DRM_CHROME9_VERTEX_DEST_POSITION:
 		if (dst->index)
 			return -EINVAL;
@@ -342,6 +385,97 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	return 0;
 }
 
+/* REP reads i#, IF b# or, with the RE knob, a temporary. */
+static int chrome9_vertex_validate_condition(struct chrome9_vertex_state *state,
+	const struct drm_chrome9_vertex_instruction *insn, u32 instruction)
+{
+	const struct drm_chrome9_vertex_source *src = &insn->src[0];
+	u8 file = insn->op == DRM_CHROME9_VERTEX_OP_REP ?
+		  DRM_CHROME9_VERTEX_FILE_INT : DRM_CHROME9_VERTEX_FILE_BOOL;
+	unsigned int lane;
+
+	if (src->modifier || src->reserved)
+		return -EINVAL;
+	if (src->file == file) {
+		for (lane = 0; lane < 4; lane++)
+			if (src->swizzle[lane] != lane)
+				return -EINVAL;
+		return src->index < (file == DRM_CHROME9_VERTEX_FILE_INT ?
+				     DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS :
+				     DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS) ?
+		       0 : -EINVAL;
+	}
+	/* The lane op 29 tests is unknown; the knob passes the swizzle. */
+	if (insn->op != DRM_CHROME9_VERTEX_OP_IF || !state->dynamic ||
+	    src->file != DRM_CHROME9_VERTEX_FILE_TEMP ||
+	    !chrome9_vertex_selected(insn, 0))
+		return -EINVAL;
+	return chrome9_vertex_validate_source(state, insn, 0, instruction);
+}
+
+static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
+	const struct drm_chrome9_vertex_instruction *insn, u32 instruction)
+{
+	bool opens = insn->op == DRM_CHROME9_VERTEX_OP_REP ||
+		     insn->op == DRM_CHROME9_VERTEX_OP_IF;
+	struct chrome9_vertex_frame *frame;
+	unsigned int s, t;
+	int ret;
+
+	if (!state->max_depth || memchr_inv(&insn->dst, 0, sizeof(insn->dst)))
+		return -EINVAL;
+	for (s = opens; s < ARRAY_SIZE(insn->src); s++)
+		if (memchr_inv(&insn->src[s], 0, sizeof(insn->src[s])))
+			return -EINVAL;
+	if (opens) {
+		if (state->depth == state->max_depth)
+			return -EINVAL;
+		ret = chrome9_vertex_validate_condition(state, insn, instruction);
+		if (ret)
+			return ret;
+		frame = &state->frames[state->depth++];
+		frame->op = insn->op;
+		frame->has_else = false;
+		frame->start = instruction;
+		memcpy(frame->entry, state->defined, sizeof(frame->entry));
+		return 0;
+	}
+	if (!state->depth)
+		return -EINVAL;
+	frame = &state->frames[state->depth - 1];
+	switch (insn->op) {
+	case DRM_CHROME9_VERTEX_OP_ELSE:
+		if (frame->op != DRM_CHROME9_VERTEX_OP_IF || frame->has_else)
+			return -EINVAL;
+		frame->has_else = true;
+		memcpy(frame->then, state->defined, sizeof(frame->then));
+		memcpy(state->defined, frame->entry, sizeof(frame->entry));
+		return 0;
+	case DRM_CHROME9_VERTEX_OP_ENDIF:
+		if (frame->op != DRM_CHROME9_VERTEX_OP_IF)
+			return -EINVAL;
+		/* Only lanes written on both arms become defined. */
+		for (t = 0; t < ARRAY_SIZE(state->defined); t++)
+			state->defined[t] = frame->has_else ?
+				state->defined[t] & frame->then[t] :
+				frame->entry[t];
+		break;
+	default:
+		if (frame->op != DRM_CHROME9_VERTEX_OP_REP)
+			return -EINVAL;
+		/* The body may run zero times; a temp defined before the loop
+		 * and touched inside stays live until its end. */
+		for (t = 0; t < ARRAY_SIZE(state->defined); t++)
+			if (state->first_def[t] < frame->start &&
+			    state->last_touch[t] > frame->start)
+				state->last_touch[t] = instruction;
+		memcpy(state->defined, frame->entry, sizeof(frame->entry));
+		break;
+	}
+	state->depth--;
+	return 0;
+}
+
 static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 	const struct chrome9_fragment_program *fragment)
 {
@@ -356,13 +490,27 @@ static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 		if (insn->op >= DRM_CHROME9_VERTEX_OP_COUNT ||
 		    insn->reserved0 || insn->reserved1)
 			return -EINVAL;
+		if (chrome9_vertex_flow_op(insn->op)) {
+			ret = chrome9_vertex_validate_flow(state, insn, i);
+			if (ret)
+				return ret;
+			continue;
+		}
 		count = chrome9_vertex_source_count[insn->op];
+		/* Inside flow control: temps only, inputs read before. */
+		if (state->depth &&
+		    insn->dst.file != DRM_CHROME9_VERTEX_DEST_TEMP)
+			return -EINVAL;
 		for (s = 0; s < ARRAY_SIZE(insn->src); s++) {
 			if (s >= count) {
 				if (memchr_inv(&insn->src[s], 0, sizeof(insn->src[s])))
 					return -EINVAL;
 				continue;
 			}
+			if (state->depth &&
+			    insn->src[s].file == DRM_CHROME9_VERTEX_FILE_INPUT &&
+			    chrome9_vertex_selected(insn, s))
+				return -EINVAL;
 			ret = chrome9_vertex_validate_source(state, insn, s, i);
 			if (ret)
 				return ret;
@@ -374,7 +522,7 @@ static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 		if (ret)
 			return ret;
 	}
-	if (state->position_mask != 0xf ||
+	if (state->depth || state->position_mask != 0xf ||
 	    (fragment->primary_used && state->primary_mask != 0xf) ||
 	    (state->two_side && fragment->primary_used &&
 	     state->back_mask != 0xf) ||
@@ -573,6 +721,75 @@ static int chrome9_vertex_encode(struct chrome9_vertex_state *state,
 	return chrome9_vertex_emit(state, program, record);
 }
 
+/* Op 28 (REP) and op 29 (IF, ELSE) records; ENDIF/ENDREP patch them. */
+static int chrome9_vertex_encode_flow(struct chrome9_vertex_state *state,
+	const struct drm_chrome9_vertex_instruction *insn, u32 instruction,
+	struct chrome9_vertex_program *program)
+{
+	const struct drm_chrome9_vertex_source *src = &insn->src[0];
+	u32 here = program->record_count, record[4] = { 0 }, t;
+	struct chrome9_vertex_frame *frame;
+	int ret = 0;
+
+	switch (insn->op) {
+	case DRM_CHROME9_VERTEX_OP_REP:
+	case DRM_CHROME9_VERTEX_OP_IF:
+		frame = &state->frames[state->depth++];
+		frame->record = here;
+		frame->has_else = false;
+		if (insn->op == DRM_CHROME9_VERTEX_OP_REP) {
+			record[0] = (CHROME9_VS_UNIFIED_INT + src->index) << 14 |
+				    CHROME9_VS_INT_SELECT;
+			record[3] = CHROME9_VS_NATIVE_LOOP << 17;
+		} else {
+			record[0] = src->file == DRM_CHROME9_VERTEX_FILE_BOOL ?
+				(CHROME9_VS_UNIFIED_BOOL + src->index) << 14 |
+				CHROME9_VS_IDENTITY :
+				chrome9_vertex_source_word(state, insn, 0, false);
+			record[3] = CHROME9_VS_NATIVE_BRANCH << 17;
+		}
+		record[1] = CHROME9_VS_FLOW_TAKEN | 1 << 10;
+		record[2] = CHROME9_VS_FLOW_NOT_TAKEN;
+		ret = chrome9_vertex_emit(state, program, record);
+		break;
+	case DRM_CHROME9_VERTEX_OP_ELSE:
+		frame = &state->frames[state->depth - 1];
+		program->records[frame->record][2] = CHROME9_VS_FLOW_NOT_TAKEN |
+			(here + 1 - frame->record) << 10;
+		frame->has_else = true;
+		frame->else_record = here;
+		record[0] = CHROME9_VS_ELSE_SOURCE;
+		record[1] = CHROME9_VS_FLOW_TAKEN;
+		record[3] = CHROME9_VS_NATIVE_BRANCH << 17;
+		ret = chrome9_vertex_emit(state, program, record);
+		break;
+	case DRM_CHROME9_VERTEX_OP_ENDIF:
+		frame = &state->frames[--state->depth];
+		if (frame->has_else)
+			program->records[frame->else_record][1] =
+				CHROME9_VS_FLOW_TAKEN |
+				(here - frame->else_record) << 10;
+		else
+			program->records[frame->record][2] =
+				CHROME9_VS_FLOW_NOT_TAKEN |
+				(here - frame->record) << 10;
+		break;
+	default:
+		frame = &state->frames[--state->depth];
+		/* Zero-length bodies are not in the vendor corpus. */
+		if (here == frame->record + 1)
+			return -EINVAL;
+		program->records[frame->record][2] = CHROME9_VS_FLOW_NOT_TAKEN |
+			(here - frame->record - 1) << 10;
+		break;
+	}
+	if (ret)
+		return ret;
+	for (t = 0; t < DRM_CHROME9_VERTEX_MAX_TEMPS; t++)
+		chrome9_vertex_release(state, t, instruction);
+	return 0;
+}
+
 /*
  * Compile a validated semantic vertex program into native records: user
  * records, oD0/oD1 literal fills, the position move and the vendor
@@ -585,7 +802,8 @@ int chrome9_vertex_compile(
 	u32 instruction_count, const struct chrome9_fragment_program *fragment,
 	u32 input_count, const u8 *input_lanes, u32 constant_first,
 	u32 constant_count, bool two_side, u32 clip_mask, bool point_size,
-	u32 sprite_mask, struct chrome9_vertex_program *program)
+	u32 sprite_mask, const struct chrome9_vertex_flow *flow,
+	struct chrome9_vertex_program *program)
 {
 	static const u32 fill_d0[4] = { CHROME9_VS_LITERAL_ZERO, 0, 0,
 		CHROME9_VS_NATIVE_MOV << 17 | BIT(14) | CHROME9_VS_DEST_D0 << 4 | 0xf };
@@ -628,7 +846,19 @@ int chrome9_vertex_compile(
 	state->sprite_mask = sprite_mask;
 	memset(state->physical, CHROME9_VERTEX_NO_PHYSICAL,
 	       sizeof(state->physical));
+	memset(state->first_def, 0xff, sizeof(state->first_def));
 	memset(program, 0, sizeof(*program));
+	if (flow && flow->max_depth) {
+		state->max_depth = min(flow->max_depth,
+				       CHROME9_VERTEX_MAX_FLOW_DEPTH);
+		state->dynamic = flow->dynamic;
+		state->frames = kcalloc(state->max_depth,
+					sizeof(*state->frames), GFP_KERNEL);
+		if (!state->frames) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
 
 	ret = chrome9_vertex_validate(state, fragment);
 	if (ret)
@@ -637,7 +867,10 @@ int chrome9_vertex_compile(
 	/* The deferred position move is the last reader of the hidden temp. */
 	state->last_touch[CHROME9_VERTEX_POSITION_TEMP] = instruction_count;
 	for (i = 0; i < instruction_count; i++) {
-		ret = chrome9_vertex_encode(state, &instructions[i], i, program);
+		ret = chrome9_vertex_flow_op(instructions[i].op) ?
+		      chrome9_vertex_encode_flow(state, &instructions[i], i,
+						 program) :
+		      chrome9_vertex_encode(state, &instructions[i], i, program);
 		if (ret)
 			goto out;
 	}
@@ -701,6 +934,7 @@ int chrome9_vertex_compile(
 		       state->last_input_record;
 	ret = 0;
 out:
+	kfree(state->frames);
 	kfree(state);
 	return ret;
 }
@@ -1003,7 +1237,7 @@ static int chrome9_vertex_check(const struct chrome9_vertex_case *c,
 	}
 	ret = chrome9_vertex_compile(c->insn, c->count, fragment, c->inputs,
 				     NULL, 0, c->constants, false, 0, false, 0,
-				     program);
+				     NULL, program);
 	if (ret != c->result)
 		return -EIO;
 	if (ret)
@@ -1066,7 +1300,7 @@ static int chrome9_vertex_live_selftest(u32 live,
 
 	memset(fragment, 0, sizeof(*fragment));
 	if (chrome9_vertex_compile(insn, count, fragment, 1, NULL, 0, live,
-				   false, 0, false, 0, program)) {
+				   false, 0, false, 0, NULL, program)) {
 		ret = live > CHROME9_VERTEX_PHYSICAL_TEMPS ? 0 : -EIO;
 		goto out;
 	}
@@ -1174,40 +1408,40 @@ static int chrome9_vertex_twoside_clip_selftest(
 	memset(fragment, 0, sizeof(*fragment));
 	fragment->primary_used = true;
 	if (chrome9_vertex_compile(back_primary_insn, 3, fragment, 2, NULL, 0, 1,
-				   true, 0, false, 0, program) ||
+				   true, 0, false, 0, NULL, program) ||
 	    chrome9_vertex_expect(program, back_primary_rec,
 				  ARRAY_SIZE(back_primary_rec), 0x61880000,
 				  0x62108001))
 		return -EIO;
 	/* BACK_PRIMARY needs a BFC flag; the flag needs a complete write. */
 	if (chrome9_vertex_compile(back_primary_insn, 3, fragment, 2, NULL, 0, 1,
-				   false, 0, false, 0, program) != -EINVAL ||
+				   false, 0, false, 0, NULL, program) != -EINVAL ||
 	    chrome9_vertex_compile(back_primary_insn, 2, fragment, 2, NULL, 0, 1,
-				   true, 0, false, 0, program) != -EINVAL)
+				   true, 0, false, 0, NULL, program) != -EINVAL)
 		return -EIO;
 	/* Without a PRIMARY consumer both colors and A61[19] disappear. */
 	fragment->primary_used = false;
 	if (chrome9_vertex_compile(back_primary_insn, 3, fragment, 2, NULL, 0, 1,
-				   true, 0, false, 0, program) ||
+				   true, 0, false, 0, NULL, program) ||
 	    program->a61 != 0x61800000 || program->record_count != 8)
 		return -EIO;
 
 	fragment->varying_count = 1;
 	fragment->varying_width[0] = 2;
 	if (chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
-				   0xb, false, 0, program) ||
+				   0xb, false, 0, NULL, program) ||
 	    chrome9_vertex_expect(program, clip_rec, ARRAY_SIZE(clip_rec),
 				  0x61800000, 0x62108004))
 		return -EIO;
 	/* Enabled but unwritten plane, invalid plane, UCP budget. */
 	if (chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
-				   0x1b, false, 0, program) != -EINVAL ||
+				   0x1b, false, 0, NULL, program) != -EINVAL ||
 	    chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
-				   0x4b, false, 0, program) != -EINVAL)
+				   0x4b, false, 0, NULL, program) != -EINVAL)
 		return -EIO;
 	fragment->varying_count = 7;
 	if (chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
-				   0x0f, false, 0, program) != -E2BIG)
+				   0x0f, false, 0, NULL, program) != -E2BIG)
 		return -EIO;
 	return 0;
 }
@@ -1220,28 +1454,248 @@ static int chrome9_vertex_point_selftest(
 	fragment->varying_count = 1;
 	fragment->varying_width[0] = 2;
 	if (chrome9_vertex_compile(point_size_insn, 3, fragment, 2, NULL, 0, 0,
-				   false, 0, true, 0, program) ||
+				   false, 0, true, 0, NULL, program) ||
 	    chrome9_vertex_expect(program, point_size_rec,
 				  ARRAY_SIZE(point_size_rec), 0x61800000,
 				  0x62108002))
 		return -EIO;
 	/* Unused point size is dropped; a used one must be written once. */
 	if (chrome9_vertex_compile(point_size_insn, 3, fragment, 2, NULL, 0, 0,
-				   false, 0, false, 0, program) ||
+				   false, 0, false, 0, NULL, program) ||
 	    program->record_count != 4 + CHROME9_VERTEX_FINALIZER_RECORDS ||
 	    chrome9_vertex_compile(point_size_insn, 2, fragment, 2, NULL, 0, 0,
-				   false, 0, true, 0, program) != -EINVAL ||
+				   false, 0, true, 0, NULL, program) != -EINVAL ||
 	    chrome9_vertex_compile(bad_point_size_insn, 2, fragment, 2, NULL,
-				   0, 0, false, 0, true, 0, program) != -EINVAL)
+				   0, 0, false, 0, true, 0, NULL, program) != -EINVAL)
 		return -EIO;
 	if (chrome9_vertex_compile(point_size_insn, 3, fragment, 2, NULL, 0, 0,
-				   false, 0, false, 0x1, program) ||
+				   false, 0, false, 0x1, NULL, program) ||
 	    chrome9_vertex_expect(program, sprite_rec, ARRAY_SIZE(sprite_rec),
 				  0x61800000, 0x62108000) ||
 	    chrome9_vertex_compile(point_size_insn, 1, fragment, 2, NULL, 0, 0,
-				   false, 0, false, 0x1, program) ||
+				   false, 0, false, 0x1, NULL, program) ||
 	    chrome9_vertex_compile(point_size_insn, 3, fragment, 2, NULL, 0, 0,
-				   false, 0, false, 0x100, program) != -EINVAL)
+				   false, 0, false, 0x100, NULL, program) != -EINVAL)
+		return -EIO;
+	return 0;
+}
+
+#define VS_F(o, ...) { .op = DRM_CHROME9_VERTEX_OP_##o, .src = { __VA_ARGS__ } }
+
+/* if_b0, if_else_b0 and rep_i0 vendor corpus rows (rep_i0 ends in v0). */
+static const struct drm_chrome9_vertex_instruction if_b0_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ENDIF),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+static const u32 if_b0_rec[][4] = {
+	{ 0x0008014c, 0, 0, 0x0008010f },
+	{ 0x001c014c, 0x00280400, 0x00300800, 0x003a0000 },
+	{ 0x0010014c, 0x00206490, 0x0040014c, 0x0004010f },
+	{ 0x0010014c, 0, 0, 0x00080a0f },
+};
+static const struct drm_chrome9_vertex_instruction if_else_b0_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ELSE),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 1)),
+	VS_F(ENDIF),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+static const u32 if_else_b0_rec[][4] = {
+	{ 0x0008014c, 0, 0, 0x0008010f },
+	{ 0x001c014c, 0x00280400, 0x00300c00, 0x003a0000 },
+	{ 0x0010014c, 0x00206490, 0x0040014c, 0x0004010f },
+	{ 0x0020a490, 0x00280800, 0x00000000, 0x003a0000 },
+	{ 0x0010014c, 0x00206490, 0x0040414c, 0x0004010f },
+	{ 0x0010014c, 0, 0, 0x00080a0f },
+};
+static const struct drm_chrome9_vertex_instruction rep_i0_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(CONSTANT, 0)),
+	VS_F(REP, VS_R(INT, 0)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 1)),
+	VS_F(ENDREP),
+	VS_I(ADD, VS_POS, VS_R(TEMP, 0), VS_R(INPUT, 0)),
+};
+static const u32 rep_i0_rec[][4] = {
+	{ 0x0040014c, 0, 0, 0x0008010f },
+	{ 0x00180154, 0x00280400, 0x00300400, 0x00380000 },
+	{ 0x0010014c, 0x00206490, 0x0040414c, 0x0004010f },
+	{ 0x0010014c, 0x00206490, 0x0008014c, 0x00040a0f },
+};
+/* T0 is last read inside the loop; T2 must not take its register. */
+static const struct drm_chrome9_vertex_instruction rep_carry_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_I(MOV, VS_T(1), VS_R(CONSTANT, 0)),
+	VS_F(REP, VS_R(INT, 0)),
+	VS_I(ADD, VS_T(2), VS_R(TEMP, 0), VS_R(CONSTANT, 1)),
+	VS_I(ADD, VS_T(1), VS_R(TEMP, 1), VS_R(TEMP, 2)),
+	VS_F(ENDREP),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
+};
+/* RE rung F3 form: IF on r0.x. */
+static const struct drm_chrome9_vertex_instruction if_temp_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_I(MOV, VS_T(1), VS_R(CONSTANT, 0)),
+	VS_F(IF, VS_S(TEMP, 0, X)),
+	VS_I(ADD, VS_T(1), VS_R(TEMP, 1), VS_R(CONSTANT, 1)),
+	VS_F(ENDIF),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
+};
+static const struct drm_chrome9_vertex_instruction nested_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(REP, VS_R(INT, 1)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(IF, VS_R(BOOL, 3)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 1)),
+	VS_F(ENDIF),
+	VS_F(ENDREP),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+static const struct drm_chrome9_vertex_instruction both_arms_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(MOV, VS_T(1), VS_R(TEMP, 0)),
+	VS_F(ELSE),
+	VS_I(ADD, VS_T(1), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ENDIF),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_endif_insn[] = {
+	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
+	VS_F(ENDIF),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_open_insn[] = {
+	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_input_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(CONSTANT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(INPUT, 0)),
+	VS_F(ENDIF),
+	VS_I(ADD, VS_POS, VS_R(TEMP, 0), VS_R(INPUT, 0)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_output_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+	VS_F(ENDIF),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_one_arm_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 0)),
+	VS_I(MOV, VS_T(1), VS_R(TEMP, 0)),
+	VS_F(ENDIF),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_zero_trip_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(REP, VS_R(INT, 0)),
+	VS_I(ADD, VS_T(1), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ENDREP),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_empty_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(REP, VS_R(INT, 0)),
+	VS_F(ENDREP),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_rep_bool_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(REP, VS_R(BOOL, 0)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ENDREP),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_b16_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(IF, VS_R(BOOL, 16)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ENDIF),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+static const struct drm_chrome9_vertex_instruction bad_flow_twice_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
+};
+
+/* User records, oD0/oD1 fills and the finalizer of a flow program. */
+static int chrome9_vertex_flow_expect(const struct chrome9_vertex_program *program,
+				      const u32 (*expected)[4], u32 count)
+{
+	if (program->record_count != count + 2 + CHROME9_VERTEX_FINALIZER_RECORDS ||
+	    memcmp(program->records, expected, count * sizeof(expected[0])) ||
+	    memcmp(program->records[count + 2], chrome9_vertex_finalizer,
+		   sizeof(chrome9_vertex_finalizer)))
+		return -EIO;
+	return 0;
+}
+
+#define VS_FLOW(insn, flow, constants) \
+	chrome9_vertex_compile(insn, ARRAY_SIZE(insn), fragment, 1, NULL, 0, \
+			       constants, false, 0, false, 0, flow, program)
+
+static int chrome9_vertex_flow_selftest(struct chrome9_fragment_program *fragment,
+					struct chrome9_vertex_program *program)
+{
+	static const struct chrome9_vertex_flow depth1 = { 1, false };
+	static const struct chrome9_vertex_flow depth2 = { 2, false };
+	static const struct chrome9_vertex_flow dynamic = { 1, true };
+	static const u32 if_temp_rec[4] = {
+		0x00100000, 0x00280400, 0x00300800, 0x003a0000,
+	};
+
+	memset(fragment, 0, sizeof(*fragment));
+	if (VS_FLOW(if_b0_insn, &depth1, 1) ||
+	    chrome9_vertex_flow_expect(program, if_b0_rec,
+				       ARRAY_SIZE(if_b0_rec)) ||
+	    program->a62 != 0x62008000 ||
+	    VS_FLOW(if_else_b0_insn, &depth1, 2) ||
+	    chrome9_vertex_flow_expect(program, if_else_b0_rec,
+				       ARRAY_SIZE(if_else_b0_rec)) ||
+	    VS_FLOW(rep_i0_insn, &depth1, 2) ||
+	    chrome9_vertex_flow_expect(program, rep_i0_rec,
+				       ARRAY_SIZE(rep_i0_rec)) ||
+	    program->a62 != 0x62008003)
+		return -EIO;
+	/* Loop-carried T0/T1 keep r0/r1 up to ENDREP; T2 gets r2. */
+	if (VS_FLOW(rep_carry_insn, &depth1, 2) ||
+	    program->physical_temps != 3 ||
+	    program->records[2][2] != 0x00300800 ||
+	    program->records[3][0] != 0x0010014c ||
+	    program->records[3][3] != 0x0004012f)
+		return -EIO;
+	if (VS_FLOW(if_temp_insn, &depth1, 2) != -EINVAL ||
+	    VS_FLOW(if_temp_insn, &dynamic, 2) ||
+	    memcmp(program->records[2], if_temp_rec, sizeof(if_temp_rec)))
+		return -EIO;
+	if (VS_FLOW(nested_insn, &depth1, 2) != -EINVAL ||
+	    VS_FLOW(nested_insn, &depth2, 2) ||
+	    program->records[1][0] != 0x00184154 ||
+	    program->records[1][2] != 0x00300c00 ||
+	    program->records[3][0] != 0x001cc14c ||
+	    program->records[3][2] != 0x00300800)
+		return -EIO;
+	if (VS_FLOW(both_arms_insn, &depth1, 1) ||
+	    VS_FLOW(if_b0_insn, NULL, 1) != -EINVAL ||
+	    VS_FLOW(bad_flow_endif_insn, &depth1, 0) != -EINVAL ||
+	    VS_FLOW(bad_flow_open_insn, &depth1, 1) != -EINVAL ||
+	    VS_FLOW(bad_flow_input_insn, &depth1, 1) != -EINVAL ||
+	    VS_FLOW(bad_flow_output_insn, &depth1, 0) != -EINVAL ||
+	    VS_FLOW(bad_flow_one_arm_insn, &depth1, 0) != -EINVAL ||
+	    VS_FLOW(bad_flow_zero_trip_insn, &depth1, 1) != -EINVAL ||
+	    VS_FLOW(bad_flow_empty_insn, &depth1, 0) != -EINVAL ||
+	    VS_FLOW(bad_flow_rep_bool_insn, &depth1, 1) != -EINVAL ||
+	    VS_FLOW(bad_flow_b16_insn, &depth1, 1) != -EINVAL ||
+	    VS_FLOW(bad_flow_twice_insn, &depth1, 0) != -EINVAL)
 		return -EIO;
 	return 0;
 }
@@ -1273,10 +1727,10 @@ int chrome9_vertex_selftest(void)
 	memset(fragment, 0, sizeof(*fragment));
 	if (chrome9_vertex_compile(mov_opos_v0_insn, 1, fragment, 1,
 				   (const u8[]){ 0x3 }, 0, 0, false, 0, false, 0,
-				   program) != -EINVAL ||
+				   NULL, program) != -EINVAL ||
 	    chrome9_vertex_compile(mov_opos_v0_insn, 1, fragment, 1,
 				   (const u8[]){ 0xf }, 0, 0, false, 0, false, 0,
-				   program)) {
+				   NULL, program)) {
 		pr_err("chrome9: vertex self-test input lanes failed\n");
 		ret = -EIO;
 		goto out;
@@ -1289,6 +1743,11 @@ int chrome9_vertex_selftest(void)
 	ret = chrome9_vertex_point_selftest(fragment, program);
 	if (ret) {
 		pr_err("chrome9: vertex self-test point size/sprite failed\n");
+		goto out;
+	}
+	ret = chrome9_vertex_flow_selftest(fragment, program);
+	if (ret) {
+		pr_err("chrome9: vertex self-test static flow failed\n");
 		goto out;
 	}
 	for (i = 0; i < ARRAY_SIZE(live); i++) {

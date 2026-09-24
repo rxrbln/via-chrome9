@@ -8,6 +8,14 @@
 
 struct chrome9_fragment_program;
 
+/* Static flow control accepted by chrome9_vertex_compile(). */
+struct chrome9_vertex_flow {
+	/* Maximum REP/IF nesting; zero rejects every flow op. */
+	u32 max_depth;
+	/* RE: IF may test a temporary (rung F3). */
+	bool dynamic;
+};
+
 struct chrome9_vertex_program {
 	u32 record_count;
 	u32 active_count;
@@ -24,7 +32,8 @@ int chrome9_vertex_compile(
 	u32 instruction_count, const struct chrome9_fragment_program *fragment,
 	u32 input_count, const u8 *input_lanes, u32 constant_first,
 	u32 constant_count, bool two_side, u32 clip_mask, bool point_size,
-	u32 sprite_mask, struct chrome9_vertex_program *program);
+	u32 sprite_mask, const struct chrome9_vertex_flow *flow,
+	struct chrome9_vertex_program *program);
 int chrome9_vertex_selftest(void);
 
 #endif
