@@ -462,3 +462,56 @@ three physical inputs retired but produced black.  No manual or proprietary
 packet differential is presently known, so do not change A09, FVF masks,
 A00, or A90 from this timeout alone.  A complete vendor draw-state comparison
 must precede any further hardware discriminator.
+
+### Split-output float4 T2 discriminator
+
+The complete comparison qualifies the earlier multi-record result in one
+important way.  Its recorded FE image had A01=`01002521`, while all three
+inputs were float4.  The recovered programmable triangle-list writer and the
+later live T0-width result require A01=`01002523` for an ALU-only float4 T0.
+The current FE builder now emits that corrected value.  Consequently the old
+three-record black draw does not qualify the corrected A01=`...23`
+three-coordinate closure, even though its fragment object, A00, A08/A09,
+FVF, VS outputs, and A90--A92 were vendor-exact.
+
+A safer corrected-state discriminator avoids both temporary forwarding and a
+single instruction with three simultaneous class-3 sources.  Four disjoint
+partial COLOR moves retain physical T0/T1/T2 and declare every producer
+float4 by reading W from each lower input and W from T2:
+
+```text
+MOV oC0.x, T0.w
+MOV oC0.y, T1.w
+MOV oC0.z, T2.x       # repeat with T2.y, then T2.z
+MOV oC0.w, T2.w
+```
+
+Linux 5.75 configuration two emits the T2.x form exactly as:
+
+```text
+01c00530 d01c0053 0012c076 000d0820
+01c00530 d01c0053 0022c1ae 000d0820
+01c00530 501c0053 0040c2b4 000d0820
+01c00530 b01c0053 0082c2b6 000d0820
+
+active-resource-counts=(3,0,3,0)
+A90=90058007 A91=91000000 A92=92000004
+```
+
+The T2.y form changes only the third record's second word from `501c0053` to
+`d01c0053`.  The T2.z form changes only that record to
+`01c00530 501c0053 0040c2b5 000d0820`.  The Windows compiler independently
+emits the same opcode, output masks, source IDs, and swizzles; its exposed
+callback object precedes the Linux configuration-two last-use pass and thus
+lacks only A-source release bit `00020000` in the first, second, and fourth
+records.  This is corroboration of the semantic records, not a replacement
+for the Linux execution image.
+
+Use T0.w=`.1`, T1.w=`.3`, and T2=`(.2,.4,.6,.8)`.  The three expected BGRA8
+words are respectively `cc1a4d33`, `cc1a4d66`, and `cc1a4d99` within normal
+UNORM8 conversion tolerance.  Distinct unused components in T0 and T1 turn
+each result into an alias fingerprint as well.  The full surrounding closure
+must be FE A00=`00000031`, A01=`01002523`, A08=`08030303`,
+A09=`09000003`, FVF A25/A28=`...fff0`, the three float4 VS copies, and
+A60=`60800006`.  This discriminator is source-backed and host-only; it has
+not been submitted to the GPU by this audit.
