@@ -529,12 +529,10 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    if (!out_transfer || !chrome9_transfer_box_valid(resource, level, box))
       return NULL;
 
-   /* A D24 attachment may still be in a retained triangle batch.  The
-    * ioctl itself is synchronous, but a direct persistent mapping is not a
-    * synchronization point until that batch has been submitted. */
-   if (chrome9_format_is_d24(resource->format) &&
-       !(usage & PIPE_MAP_UNSYNCHRONIZED))
-      chrome9_draw_flush_batch(chrome9_context(pipe));
+   /* Retained triangle batches and the shadow color target are not visible
+    * through a direct persistent mapping until submitted and resolved. */
+   if (resource->target != PIPE_BUFFER)
+      chrome9_context_sync_resource(chrome9_context(pipe), resource, usage);
 
    transfer = CALLOC_STRUCT(pipe_transfer);
    if (!transfer)

@@ -257,6 +257,9 @@ chrome9_context_depth_target(struct chrome9_context *ctx);
 void chrome9_context_render_target_written(struct chrome9_context *ctx);
 void chrome9_context_render_target_direct_written(struct chrome9_context *ctx);
 void chrome9_context_prepare_render_target(struct chrome9_context *ctx);
+void chrome9_context_sync_resource(struct chrome9_context *ctx,
+                                   struct pipe_resource *resource,
+                                   unsigned usage);
 void chrome9_compile_fs_nir(struct chrome9_context *ctx,
                             struct chrome9_shader *shader,
                             struct nir_shader *nir);

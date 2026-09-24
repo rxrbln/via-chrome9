@@ -84,6 +84,26 @@ chrome9_context_render_target_written(struct chrome9_context *ctx)
       ctx->render_target_dirty = true;
 }
 
+/* A synchronized CPU map observes all queued draws; the displayed target
+ * additionally receives the shadow copy, and a CPU write makes it stale. */
+void
+chrome9_context_sync_resource(struct chrome9_context *ctx,
+                              struct pipe_resource *resource, unsigned usage)
+{
+   struct pipe_resource *external;
+
+   if (usage & PIPE_MAP_UNSYNCHRONIZED)
+      return;
+   chrome9_draw_flush_batch(ctx);
+   external = ctx->framebuffer.nr_cbufs ?
+              ctx->framebuffer.cbufs[0].texture : NULL;
+   if (!external || resource != external || external == ctx->render_target)
+      return;
+   chrome9_flush_render_target(ctx);
+   if (usage & PIPE_MAP_WRITE)
+      ctx->render_target_stale = true;
+}
+
 void
 chrome9_context_render_target_direct_written(struct chrome9_context *ctx)
 {
