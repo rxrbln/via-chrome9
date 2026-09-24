@@ -132,31 +132,34 @@ chrome9_resource_layout(const struct pipe_resource *templ,
    }
 
    layout->level_offset[0] = page_size;
-   if (!chrome9_u64_align(layout->level_size[0], page_size,
-                          &aligned_level0_size) ||
-       !chrome9_u64_add(layout->level_offset[0], aligned_level0_size,
-                        &cursor) ||
-       !chrome9_u64_add(cursor, page_size, &cursor))
-      return false;
+   if (!templ->last_level) {
+      /* One leading guard, L0 rows, page padding, trailing guard. */
+      if (!chrome9_u64_align(layout->level_size[0], page_size,
+                             &aligned_level0_size) ||
+          !chrome9_u64_add(layout->level_offset[0], aligned_level0_size,
+                           &cursor) ||
+          !chrome9_u64_add(cursor, page_size, &cursor))
+         return false;
+   } else {
+      /* The sampler derives each level of a POT texture right after the
+       * previous one's rows; NPOT levels come from its 256-byte granular
+       * address table. */
+      const bool pot = util_is_power_of_two_nonzero(templ->width0) &&
+                       util_is_power_of_two_nonzero(templ->height0);
 
-   /* Keep the old level-zero object byte-for-byte: one leading guard,
-    * canonical L0 rows, page padding, then its guard.  Mip levels begin only
-    * after that internal guard.  A final guard terminates the complete BO.
-    * Before submitting such a BO, the kernel must accept/map its actual size
-    * instead of requiring the smaller two-guard L0 size, while continuing to
-    * protect the internal L0 guard as well as the final BO guard. */
-   for (unsigned level = 1; level <= templ->last_level; level++) {
-      if (!chrome9_u64_align(cursor, CHROME9_MIP_ALIGNMENT,
-                             &layout->level_offset[level]) ||
-          !chrome9_u64_add(layout->level_offset[level],
-                           layout->level_size[level], &cursor))
+      cursor = layout->level_offset[0];
+      for (unsigned level = 0; level <= templ->last_level; level++) {
+         if (level && !pot &&
+             !chrome9_u64_align(cursor, CHROME9_MIP_ALIGNMENT, &cursor))
+            return false;
+         layout->level_offset[level] = cursor;
+         if (!chrome9_u64_add(cursor, layout->level_size[level], &cursor))
+            return false;
+      }
+      if (!chrome9_u64_align(cursor, page_size, &cursor) ||
+          !chrome9_u64_add(cursor, page_size, &cursor))
          return false;
    }
-
-   if (templ->last_level &&
-       (!chrome9_u64_align(cursor, page_size, &cursor) ||
-        !chrome9_u64_add(cursor, page_size, &cursor)))
-      return false;
    if (cursor > CHROME9_MAX_BUFFER_SIZE)
       return false;
 
