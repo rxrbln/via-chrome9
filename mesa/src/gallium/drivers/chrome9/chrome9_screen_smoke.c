@@ -2900,11 +2900,8 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
          chrome9_context(context)->submitted_program_batches;
       uint64_t rhw_runs = chrome9_context(context)->submitted_rhw_runs;
       uint64_t rejected = chrome9_context(context)->rejected_triangles;
-      const struct chrome9_shader *shader = program_c0_fs;
-      /* cmd22 submits each triangle; the older cmd19 path batches both. */
-      unsigned expected_program_batches =
-         chrome9_context(context)->draw_fragment_program &&
-         shader->semantic_fs_valid && !shader->semantic_input_mask ? 2 : 1;
+      /* Both the compiled and generic program paths retain the two
+       * triangles in one immutable-state batch. */
       uint32_t pixel;
 
       context->bind_blend_state(context, blend_handle);
@@ -2931,7 +2928,7 @@ run_pipe_triangle(struct pipe_screen *screen, struct pipe_resource *resource,
                chrome9_context(context)->submitted_triangles ==
                   submitted + 2 &&
                chrome9_context(context)->submitted_program_batches ==
-                  program_batches + expected_program_batches &&
+                  program_batches + 1 &&
                chrome9_context(context)->submitted_rhw_runs == rhw_runs &&
                chrome9_context(context)->rejected_triangles == rejected &&
                smoke_guard_pages_match(draw_surface) &&
@@ -5977,7 +5974,7 @@ smoke_a8_generic_texture(struct pipe_screen *screen)
                          sample_xy[i][0]];
    passed = ccontext->submitted_triangles == submitted + 2 &&
             ccontext->rejected_triangles == rejected &&
-            ccontext->submitted_program_batches == batches + 2 &&
+            ccontext->submitted_program_batches == batches + 1 &&
             smoke_guard_pages_match(ctarget) &&
             smoke_guard_pages_match(ctexture) &&
             !memcmp(source, source_copy, ctexture->data_size);

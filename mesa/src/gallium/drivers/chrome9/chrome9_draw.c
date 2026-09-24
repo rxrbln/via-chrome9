@@ -7,6 +7,7 @@
 #include "chrome9_drm.h"
 #include "chrome9_format.h"
 #include "chrome9_fragment.h"
+#include "chrome9_public.h"
 #include "chrome9_resource.h"
 
 #include <errno.h>
@@ -1184,15 +1185,23 @@ chrome9_queue_generic_triangle(
       const struct pipe_sampler_view *view =
          crender->ctx->sampler_views[logical];
       unsigned last_level;
+      unsigned view_last_level;
       int max_lod;
 
       if (!view || !format || view->u.tex.first_level)
          return false;
-      last_level = view->u.tex.last_level;
-      max_lod = last_level * 32;
-      if (last_level != resource->last_level ||
-          last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS)
+      view_last_level = view->u.tex.last_level;
+      last_level = resource->last_level;
+      /* The kernel validates the descriptor against the full guarded BO.
+       * A base-only view may still use that physical mip layout when mip
+       * sampling is disabled; clamp its logical LOD to level zero.  Other
+       * partial views need separate validation before they can be exposed. */
+      if (last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
+          (view_last_level != last_level &&
+           (view_last_level || samplers[unit]->mip_filter !=
+              DRM_CHROME9_TEXTURE_MIP_FILTER_NONE)))
          return false;
+      max_lod = view_last_level * 32;
       texture_state[unit].handle = textures[unit]->bo.handle;
       texture_state[unit].format = format->drm_format;
       texture_state[unit].width = resource->width0;
@@ -1253,6 +1262,14 @@ chrome9_queue_generic_triangle(
    draw.depth_handle = depth_active ? depth->bo.handle : 0;
    draw.flags = (depth_active ? DRM_CHROME9_FRAGMENT_DEPTH | depth_flags : 0) |
                 (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
+   if (target->base.last_level) {
+      if (!target->guarded ||
+          !chrome9_screen_has_capability(
+             crender->ctx->base.screen,
+             DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))
+         return false;
+      draw.flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
+   }
    /* The count and user pointers are filled only when the batch is flushed.
     * Keeping them zero makes the rest of this structure a comparable state
     * key, including target, depth, blend and scissor state. */

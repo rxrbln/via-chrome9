@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
 
-#include "chrome9_resource.h"
+#include "chrome9_context.h"
 #include "chrome9_format.h"
+#include "chrome9_resource.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +28,7 @@ struct test_map_record {
 };
 
 struct test_context {
-   struct pipe_context base;
+   struct chrome9_context chrome9;
    void *(*original_map)(struct pipe_context *, struct pipe_resource *,
                          unsigned, unsigned, const struct pipe_box *,
                          struct pipe_transfer **);
@@ -287,13 +288,14 @@ test_format(enum pipe_format format)
    test_fill_level0(&resource, expected, format);
    test_generate_expected(&resource, expected, format);
 
-   chrome9_init_context_resource_functions(&test.base);
-   test.original_map = test.base.texture_map;
-   test.original_unmap = test.base.texture_unmap;
-   test.base.texture_map = test_texture_map;
-   test.base.texture_unmap = test_texture_unmap;
-   if (!test.base.generate_mipmap(&test.base, &resource.base, format, 0,
-                                  TEST_LAST_LEVEL, 0, 0)) {
+   chrome9_init_context_resource_functions(&test.chrome9.base);
+   test.original_map = test.chrome9.base.texture_map;
+   test.original_unmap = test.chrome9.base.texture_unmap;
+   test.chrome9.base.texture_map = test_texture_map;
+   test.chrome9.base.texture_unmap = test_texture_unmap;
+   if (!test.chrome9.base.generate_mipmap(
+          &test.chrome9.base, &resource.base, format, 0,
+          TEST_LAST_LEVEL, 0, 0)) {
       fprintf(stderr, "generate_mipmap rejected format %u\n", format);
       goto out;
    }

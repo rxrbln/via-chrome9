@@ -771,6 +771,9 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
       if (!chrome9_mipmap_level_valid(resource, level, cpp))
          return false;
 
+   /* The first level may still be queued in a retained GPU draw batch. */
+   chrome9_draw_flush_batch(chrome9_context(pipe));
+
    for (unsigned level = base_level + 1; level <= last_level; level++) {
       const unsigned source_width = u_minify(pres->width0, level - 1);
       const unsigned source_height = u_minify(pres->height0, level - 1);
