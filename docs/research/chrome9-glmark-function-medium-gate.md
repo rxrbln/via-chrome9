@@ -1,8 +1,8 @@
 # Chrome9 glmark2 function-medium fragment gate
 
-Status: source-exact and Mesa-26.2.2 offline-NIR audit plus guarded oracle
-source, 2026-09-24.  No GPU command was submitted for this audit.  The
-square-root chain remains a guarded silicon gate before enabling it generally.
+Status: source-exact and Mesa-26.2.2 offline-NIR audit plus a failed guarded
+silicon gate, 2026-09-24.  The combined square-root oracle timed out and
+quarantined the engine.  Do not enable the lowering generally.
 
 ## Exact scene source
 
@@ -182,3 +182,40 @@ infinity handling, or a global IEEE exceptional-value claim.  The broader
 refract and fog gates remain documented in
 `chrome9-refract-fragment-compiler-boundary.md` and
 `ioquake3-gl2-fogpass-native-design.md`.
+
+## Live timeout and narrowed qualification order
+
+The first bounded `--sqrt-lower` run was bracketed by a passing known-good
+baseline, but the oracle itself timed out.  The kernel reported:
+
+```text
+phase=cookie seq=16343 kind=22 flags=0x101 epoch=3337
+current=0x2380 pause=0x2370 stop=0x23f0
+cr=80000000 engine=00001711
+```
+
+The engine was quarantined immediately.  No post-oracle baseline or other GPU
+work was attempted on that boot.  The preserved log is
+`/root/tmp/chrome9-live/sqrt-lower/dmesg-after-timeout.log`, SHA-256
+`16cb7fb072b539927ce2850b17110d6f668bde5013eff762b0a1013e836f29fa`.
+The available ring window contains only the final ALUs and vertices, so the
+cursor does not localize which scalar record stopped execution.
+
+Static replay does not expose a resource-envelope error.  The program uses
+one direct T0 resource, four physical temporaries at peak, no TAU, and the
+ordinary controls A90=`90058001`, A91=`91000000`, A92=`9200000c`.  Twelve
+ALUs fit the UAPI limits.  The disjoint COLOR.x and COLOR.yzw writes are legal
+and occur at the tail.  However, the first ALU is `RSQ T0.x` with T0.x=`+0`,
+followed by X-mask RCP.  Native RSQ/RCP partial destination masks for Y/Z/W
+are compiler-byte-backed but remain independently silicon-unqualified.
+
+The combined test therefore proves neither that zero is solely responsible
+nor that partial masks are safe.  The safe next order, each as a separate
+bounded gate after a cold recovery, is:
+
+1. finite-positive, X-only `RSQ -> RCP`;
+2. `+0`, X-only `RSQ -> RCP`, treated as a wedge-risk gate; and
+3. finite Y/Z/W partial destination masks only after both X-only cases retire.
+
+Until those gates separate the failure, `.lower_fsqrt` must remain disabled
+and function-medium remains fail-closed.
