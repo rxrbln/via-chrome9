@@ -2647,7 +2647,10 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 	case DRM_CHROME9_PARAM_CAPABILITIES2:
 		args->value = DRM_CHROME9_CAP2_GUARDED_SHARED;
 		if (chrome9_engine_ready(cdev) && chrome9_hw_tcl_enabled())
-			args->value |= DRM_CHROME9_CAP2_VERTEX_TOPOLOGY;
+			args->value |= DRM_CHROME9_CAP2_VERTEX_TOPOLOGY |
+				       DRM_CHROME9_CAP2_NATIVE_POINTS |
+				       DRM_CHROME9_CAP2_NATIVE_LINES |
+				       DRM_CHROME9_CAP2_POLYGON_MODE;
 		if (chrome9_engine_ready(cdev))
 			args->value |= chrome9_engine_capabilities2();
 		break;

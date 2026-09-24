@@ -134,6 +134,10 @@ MODULE_PARM_DESC(dxt,
 #define CHROME9_TCL_RE_A23_CULL_CW	BIT(6)
 /* 128 vendor single-color layout: no oD1/oD3 records, no Cs in A25/A28. */
 #define CHROME9_TCL_RE_NO_SECONDARY	BIT(7)
+/* 256 point sprites with A01[21] only, no A2F write (ladder L-S1); 512
+ * lines and wireframe from vertex a to b (A01[23] clear, rung L3). */
+#define CHROME9_TCL_RE_NO_A2F		BIT(8)
+#define CHROME9_TCL_RE_LINE_AB		BIT(9)
 
 /*
  * Debug: fragment/TCL job phase profile.  With profile=N every N jobs log
@@ -374,8 +378,17 @@ struct chrome9_tcl_draw {
 	u32 stride_dw;
 	u32 element_count;
 	u32 cull;
-	/* A20 vertex cycle bits of a strip or fan. */
+	/* A20 vertex cycle bits of a strip, fan or line strip. */
 	u32 topology;
+	enum { CHROME9_TCL_TRIANGLES, CHROME9_TCL_POINTS, CHROME9_TCL_LINES } raster;
+	/* A23[6:0] of a non-filled polygon mode, zero for fill. */
+	u32 polygon;
+	/* A2A/A2B point size words when the draw rasterizes points. */
+	u32 point_words[2];
+	bool point_size_vertex;
+	/* Logical varyings replaced by point sprite coordinates. */
+	u32 sprite_mask;
+	u32 primitive_count;
 	/* Enabled user clip planes (DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE). */
 	u32 clip_mask;
 	/* chrome9_tcl_re sampled once per ioctl. */
@@ -2411,6 +2424,34 @@ static u32 chrome9_tcl_stream_slot(u32 address, u32 stride)
 }
 
 /*
+ * A23: bit 8 selects the culled physical winding (set = CCW), bits 14:12
+ * Gouraud (4) or flat from vertex A (1, points), B (2, lines) or C (3,
+ * triangles); [3:0] point 0, line 1, triangle 2, or the polygon mode.
+ */
+static u32 chrome9_tcl_a23(const struct chrome9_tcl_draw *tcl)
+{
+	bool flat = tcl->cull & DRM_CHROME9_VERTEX_FLAT;
+	u32 a23 = (tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ||
+		   tcl->re & CHROME9_TCL_RE_A23_CULL_CW ?
+		   0x23004e02 : 0x23004f02) & ~GENMASK(14, 12);
+
+	switch (tcl->raster) {
+	case CHROME9_TCL_POINTS:
+		return (a23 & ~GENMASK(3, 0)) | 0x1000;
+	case CHROME9_TCL_LINES:
+		return (a23 & ~GENMASK(3, 0)) | 1 | (flat ? 0x2000 : 0x4000);
+	default:
+		break;
+	}
+	if (tcl->polygon)
+		a23 = (a23 & ~GENMASK(6, 0)) | tcl->polygon;
+	return a23 | (tcl->re & CHROME9_TCL_RE_A23_2FRENDER ? BIT(4) : 0) |
+	       (flat ? 0x3000 : 0x4000) |
+	       /* A23[7]: set = CCW triangles take oBFD (vendor front CW). */
+	       (tcl->cull & DRM_CHROME9_VERTEX_BFC_CCW ? BIT(7) : 0);
+}
+
+/*
  * Stage A TCL raster/FVF block: raw application elements feed v0..vN-1,
  * the output linkage stays byte-identical to the post-TNL path and
  * A40..A48 carry the clip engine's copy of rows 256/257.
@@ -2444,15 +2485,7 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	/* A20[0] index mode, A20[1] 32-bit indices. */
 	raster[i++] = (addresses ? 0x20000001 | (tcl->index32 ? 2 : 0) :
 		       0x20000000) | tcl->topology;
-	/* A23 bit 8 selects the culled physical winding (set = CCW); bits
-	 * 14:12 select Gouraud (4) or flat from the third vertex C (3). */
-	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ||
-			tcl->re & CHROME9_TCL_RE_A23_CULL_CW ?
-			0x23004e02 : 0x23004f02) & ~GENMASK(14, 12)) |
-		      (tcl->re & CHROME9_TCL_RE_A23_2FRENDER ? BIT(4) : 0) |
-		      (tcl->cull & DRM_CHROME9_VERTEX_FLAT ? 0x3000 : 0x4000) |
-		      /* A23[7]: set = CCW triangles take oBFD (vendor front CW). */
-		      (tcl->cull & DRM_CHROME9_VERTEX_BFC_CCW ? BIT(7) : 0);
+	raster[i++] = chrome9_tcl_a23(tcl);
 	raster[i++] = 0x24000000 |
 		      (addresses ? tcl->index_count : tcl->vertex_count);
 	if (fp->varying_count || groups) {
@@ -2478,10 +2511,27 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		raster[i++] = 0x25f6cc00;
 		raster[i++] = 0x28ffcc00;
 	}
-	if (tcl->re & CHROME9_TCL_RE_NO_SECONDARY)
-		for (e = 0; e < i; e++)
-			if (raster[e] >> 24 == 0x25 || raster[e] >> 24 == 0x28)
-				raster[e] &= ~BIT(17);
+	for (e = 0; e < i; e++) {
+		if (tcl->re & CHROME9_TCL_RE_NO_SECONDARY &&
+		    (raster[e] >> 24 == 0x25 || raster[e] >> 24 == 0x28))
+			raster[e] &= ~BIT(17);
+		/* A25[19]: the primitive vertex carries the VS point size. */
+		if (tcl->point_size_vertex && raster[e] >> 24 == 0x25)
+			raster[e] |= BIT(19);
+	}
+	if (tcl->point_words[0]) {
+		raster[i++] = tcl->point_words[0];
+		raster[i++] = tcl->point_words[1];
+	}
+	/* A2F: vendor defaults plus sprite enables per packed coordinate. */
+	if (tcl->sprite_mask && !(tcl->re & CHROME9_TCL_RE_NO_A2F)) {
+		u32 a2f = 0x2f582000;
+
+		for (e = 0; e < fp->varying_count; e++)
+			if (tcl->sprite_mask & BIT(fp->varying_logical[e]))
+				a2f |= BIT(e);
+		raster[i++] = a2f;
+	}
 	for (e = 0; e < 3; e++) {
 		u32 scale = tcl->rows[e];
 		u32 offset = tcl->rows[4 + e];
@@ -2496,6 +2546,123 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	raster[i++] = 0x51000000;
 	raster[i++] = 0x52147fff;
 	return i;
+}
+
+static u32 chrome9_tcl_unbias(u32 bits);
+static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *args,
+				u32 count, struct chrome9_tcl_draw *tcl);
+
+static int chrome9_tcl_topology_case(struct drm_chrome9_draw_vertex_program *args,
+				     struct chrome9_tcl_draw *tcl, u32 topology,
+				     u32 count, u32 flags, u32 point_size,
+				     u32 raster)
+{
+	memset(tcl, 0, sizeof(*tcl));
+	args->topology = topology;
+	args->flags = flags;
+	args->point_size = point_size;
+	args->raster_flags = raster;
+	return chrome9_tcl_topology(args, count, tcl);
+}
+
+/* Topology and raster flag validation, snap-bias removal for points. */
+static int chrome9_tcl_topology_selftest(void)
+{
+	static const struct {
+		u32 topology, count, flags, point_size, raster;
+		int result;
+		u32 primitives, a20, polygon, a2a, a2b;
+	} cases[] = {
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, 0, 0x40800000, 0,
+		  0, 1, 0, 0, 0x2a408000, 0x2b408000 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 2, DRM_CHROME9_VERTEX_FLAT,
+		  0x42000000, DRM_CHROME9_RASTER_POINT_SIZE_VERTEX |
+		  DRM_CHROME9_RASTER_POINT_SPRITE | DRM_CHROME9_RASTER_SPRITE_MASK(5),
+		  0, 2, 0, 0, 0x2a420000, 0x2b3f8000 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, DRM_CHROME9_VERTEX_CULL_CW,
+		  0, 0, -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, 0, 0x3f000000, 0,
+		  -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, 0, 0x45800000, 0,
+		  -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, 0, 0x7fc00000, 0,
+		  -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, 0, 0,
+		  DRM_CHROME9_RASTER_POINT_SPRITE, -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST, 1, 0, 0, BIT(1), -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST, 3, 0, 0, 0, -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST, 4, DRM_CHROME9_VERTEX_FLAT,
+		  0, 0, 0, 2 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST, 2, 0, 0x40800000, 0,
+		  -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST, 2, 0, 0,
+		  DRM_CHROME9_RASTER_POINT_SIZE_VERTEX, -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP, 1, 0, 0, 0, -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP, 5, 0, 0, 0,
+		  0, 4, 0x206000 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP, 2, 0, 0,
+		  DRM_CHROME9_RASTER_POLYGON_CW(DRM_CHROME9_POLYGON_LINE), -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST, 3, 0, 0x40800000, 0,
+		  -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST, 6,
+		  DRM_CHROME9_VERTEX_CULL_CCW, 0,
+		  DRM_CHROME9_RASTER_POLYGON_CW(DRM_CHROME9_POLYGON_POINT) |
+		  DRM_CHROME9_RASTER_POLYGON_CCW(DRM_CHROME9_POLYGON_POINT),
+		  0, 2, 0, 7, 0x2a3f8000, 0x2b3f8000 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP, 4, 0, 0,
+		  DRM_CHROME9_RASTER_POLYGON_CCW(DRM_CHROME9_POLYGON_LINE),
+		  0, 2, 0x1c7800, 0x16 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN, 3, 0, 0,
+		  DRM_CHROME9_RASTER_POLYGON_CW(DRM_CHROME9_POLYGON_LINE) |
+		  DRM_CHROME9_RASTER_POLYGON_CCW(DRM_CHROME9_POLYGON_LINE),
+		  0, 1, 0x1c5c00, 6 },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST, 3, 0, 0,
+		  DRM_CHROME9_RASTER_POLYGON_CW(DRM_CHROME9_POLYGON_POINT) |
+		  DRM_CHROME9_RASTER_POLYGON_CCW(DRM_CHROME9_POLYGON_LINE), -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST, 3, 0, 0,
+		  DRM_CHROME9_RASTER_POLYGON_CW(3), -EINVAL },
+		{ DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST, 3, 0, 0,
+		  DRM_CHROME9_RASTER_POINT_SPRITE | DRM_CHROME9_RASTER_SPRITE_MASK(1),
+		  -EINVAL },
+		{ 6, 3, 0, 0, 0, -EINVAL },
+	};
+	struct drm_chrome9_draw_vertex_program *args;
+	struct chrome9_tcl_draw *tcl;
+	unsigned int i;
+	int ret = -EINVAL;
+
+	args = kzalloc(sizeof(*args), GFP_KERNEL);
+	tcl = kzalloc(sizeof(*tcl), GFP_KERNEL);
+	if (!args || !tcl) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		if (chrome9_tcl_topology_case(args, tcl, cases[i].topology,
+				cases[i].count, cases[i].flags,
+				cases[i].point_size, cases[i].raster) !=
+		    cases[i].result)
+			goto out;
+		if (cases[i].result)
+			continue;
+		if (tcl->primitive_count != cases[i].primitives ||
+		    tcl->topology != cases[i].a20 ||
+		    tcl->polygon != cases[i].polygon ||
+		    tcl->point_words[0] != cases[i].a2a ||
+		    tcl->point_words[1] != cases[i].a2b)
+			goto out;
+	}
+	/* ox = 786432 + 31.5, + 15.5, - 0.5 and exactly the bias. */
+	if (chrome9_tcl_unbias(0x494001f8) != 0x41fc0000 ||
+	    chrome9_tcl_unbias(0x494000f8) != 0x41780000 ||
+	    chrome9_tcl_unbias(0x493ffff8) != 0xbf000000 ||
+	    chrome9_tcl_unbias(0x49400000))
+		goto out;
+	ret = 0;
+out:
+	kfree(tcl);
+	kfree(args);
+	return ret;
 }
 
 /* The proven VS oracle rows: 32x32 viewport, 786432 snap bias. */
@@ -2572,7 +2739,47 @@ static int chrome9_tcl_raster_selftest(void)
 	    raster[10] != 0x25f6cc00 || raster[11] != 0x26000000 ||
 	    raster[12] != 0x28ffc000 || raster[13] != 0x29000000)
 		goto out;
-	ret = 0;
+	/* Size-4 clamp points from the VS with a T0 sprite: A25[19], A2A/A2B
+	 * after the link words, A2F; without A2F under the RE knob. */
+	tcl->cull = 0;
+	tcl->clip_mask = 0;
+	tcl->raster = CHROME9_TCL_POINTS;
+	tcl->point_words[0] = 0x2a408000;
+	tcl->point_words[1] = 0x2b3f8000;
+	tcl->point_size_vertex = true;
+	tcl->sprite_mask = 0x1;
+	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
+		ARRAY_SIZE(expected) + 5 ||
+	    raster[7] != 0x20000000 || raster[8] != 0x23001f00 ||
+	    raster[10] != 0x25fec000 || raster[12] != 0x28ffc000 ||
+	    raster[14] != 0x2a408000 || raster[15] != 0x2b3f8000 ||
+	    raster[16] != 0x2f582001 || raster[17] != 0x40800000)
+		goto out;
+	tcl->re = CHROME9_TCL_RE_NO_A2F;
+	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
+		ARRAY_SIZE(expected) + 4 || raster[16] != 0x40800000)
+		goto out;
+	/* Flat line strip from vertex B; filled CCW with wireframe CW. */
+	tcl->re = 0;
+	tcl->raster = CHROME9_TCL_LINES;
+	tcl->topology = 0x206000;
+	tcl->cull = DRM_CHROME9_VERTEX_FLAT;
+	tcl->point_words[0] = 0;
+	tcl->point_size_vertex = false;
+	tcl->sprite_mask = 0;
+	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
+		ARRAY_SIZE(expected) + 2 ||
+	    raster[7] != 0x20206000 || raster[8] != 0x23002f01 ||
+	    raster[10] != 0x25f6c000)
+		goto out;
+	tcl->raster = CHROME9_TCL_TRIANGLES;
+	tcl->topology = 0;
+	tcl->cull = DRM_CHROME9_VERTEX_CULL_CW;
+	tcl->polygon = 0x52;
+	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
+		ARRAY_SIZE(expected) + 2 || raster[8] != 0x23004e52)
+		goto out;
+	ret = chrome9_tcl_topology_selftest();
 out:
 	kfree(tcl);
 	kfree(fp);
@@ -3258,7 +3465,11 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	if (tcl)
 		common[4] |= (tcl->re & CHROME9_TCL_RE_CLIP_OFF ? 0 : 0x00100800) |
 			     (tcl->cull & (DRM_CHROME9_VERTEX_CULL_CW |
-					   DRM_CHROME9_VERTEX_CULL_CCW) ? BIT(7) : 0);
+					   DRM_CHROME9_VERTEX_CULL_CCW) ? BIT(7) : 0) |
+			     (tcl->sprite_mask ? BIT(21) : 0);
+	if (tcl && tcl->re & CHROME9_TCL_RE_LINE_AB &&
+	    (tcl->raster == CHROME9_TCL_LINES || tcl->polygon))
+		common[4] &= ~BIT(23);
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	if (tcl)
 		raster_count = chrome9_tcl_raster_state(program, tcl,
@@ -9769,7 +9980,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 			tcl->constant_count,
 			tcl->cull & (DRM_CHROME9_VERTEX_BFC_CW |
 				     DRM_CHROME9_VERTEX_BFC_CCW),
-			tcl->clip_mask, &tcl->program);
+			tcl->clip_mask, tcl->point_size_vertex,
+			tcl->sprite_mask, &tcl->program);
 		if (ret)
 			goto out_free;
 		if (tcl->re & CHROME9_TCL_RE_NO_SECONDARY) {
@@ -9795,8 +10007,7 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 			for (i = 0; i < tcl->program.record_count; i++)
 				if ((tcl->program.records[i][3] >> 4 & 0xff) == 0x24)
 					tcl->program.records[i][3] &= ~BIT(14);
-		request.triangle_count = tcl->topology ? tcl->vertex_count - 2 :
-				tcl->vertex_count / 3;
+		request.triangle_count = tcl->primitive_count;
 		request.tcl = tcl;
 	}
 	request.fragment_vertices = vertices;
@@ -9868,6 +10079,111 @@ static bool chrome9_tcl_viewport_valid(const u32 viewport[8])
 	       (viewport[5] & 0x7fffffff) <= 0x3f800000 &&
 	       viewport[3] >> 23 == 0x92 && viewport[4] >> 23 == 0x92 &&
 	       !viewport[6] && !viewport[7];
+}
+
+/*
+ * A validated ox/oy lies in [2^19, 2^20), so its mantissa counts 1/16
+ * pixel steps above 2^19: return the float bits of ox - 786432 exactly.
+ */
+static u32 chrome9_tcl_unbias(u32 bits)
+{
+	s32 n = (s32)(bits & 0x7fffff) - 0x400000;
+	u32 m = n < 0 ? -n : n, e;
+
+	if (!n)
+		return 0;
+	e = fls(m) - 1;
+	return (n < 0 ? BIT(31) : 0) | (127 + e - 4) << 23 |
+	       ((m << (23 - e)) & 0x7fffff);
+}
+
+/*
+ * Topology, primitive count and raster state of one draw.  Points take
+ * point_size (A2A width, A2B height; with POINT_SIZE_VERTEX the max and
+ * min clamp) as float s[8].15, i.e. the float bits >> 8.
+ */
+static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *args,
+				u32 count, struct chrome9_tcl_draw *tcl)
+{
+	const u32 face = DRM_CHROME9_VERTEX_CULL_CW | DRM_CHROME9_VERTEX_CULL_CCW |
+			 DRM_CHROME9_VERTEX_BFC_CW | DRM_CHROME9_VERTEX_BFC_CCW;
+	u32 raster = args->raster_flags;
+	u32 cw = raster >> 16 & 3, ccw = raster >> 18 & 3;
+	u32 sprite = raster >> 8 & 0xff;
+	u32 size = args->point_size ?: 0x3f800000;
+	bool points;
+
+	if (raster & ~(DRM_CHROME9_RASTER_POINT_SPRITE |
+		       DRM_CHROME9_RASTER_POINT_SIZE_VERTEX | GENMASK(19, 8)) ||
+	    cw > DRM_CHROME9_POLYGON_POINT || ccw > DRM_CHROME9_POLYGON_POINT ||
+	    (cw == DRM_CHROME9_POLYGON_POINT) != (ccw == DRM_CHROME9_POLYGON_POINT) ||
+	    size < 0x3f800000 || size > 0x45000000)
+		return -EINVAL;
+	switch (args->topology) {
+	case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST:
+		if (count % 3)
+			return -EINVAL;
+		tcl->primitive_count = count / 3;
+		break;
+	case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP:
+	case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN:
+		if (count < 3 || args->flags & (DRM_CHROME9_VERTEX_BFC_CW |
+						DRM_CHROME9_VERTEX_BFC_CCW))
+			return -EINVAL;
+		/* A20 cycles: strip even (a, b, c) odd (b, a, c), fan (0, b, c). */
+		tcl->topology = args->topology ==
+			DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP ?
+			0x1c7800 : 0x1c5c00;
+		tcl->primitive_count = count - 2;
+		break;
+	case DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST:
+		tcl->raster = CHROME9_TCL_POINTS;
+		tcl->primitive_count = count;
+		break;
+	case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST:
+		if (count % 2)
+			return -EINVAL;
+		tcl->raster = CHROME9_TCL_LINES;
+		tcl->primitive_count = count / 2;
+		break;
+	case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP:
+		if (count < 2)
+			return -EINVAL;
+		/* A20 cycles: a from the previous b, b new. */
+		tcl->topology = 0x206000;
+		tcl->raster = CHROME9_TCL_LINES;
+		tcl->primitive_count = count - 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+	points = tcl->raster == CHROME9_TCL_POINTS ||
+		 cw == DRM_CHROME9_POLYGON_POINT;
+	if ((tcl->raster && (args->flags & face || cw || ccw)) ||
+	    (!points && args->point_size) ||
+	    (tcl->raster != CHROME9_TCL_POINTS &&
+	     raster & (DRM_CHROME9_RASTER_POINT_SPRITE |
+		       DRM_CHROME9_RASTER_POINT_SIZE_VERTEX)) ||
+	    !(raster & DRM_CHROME9_RASTER_POINT_SPRITE) != !sprite)
+		return -EINVAL;
+	/* A23[3:0] (CCW with bit 4) 2 fill, 6 wireframe, 7 point triangle;
+	 * A23[6:5] CW with bit 4: 00 fill, 10 wireframe. */
+	if (cw == ccw)
+		tcl->polygon = cw == DRM_CHROME9_POLYGON_LINE ? 6 :
+			       cw == DRM_CHROME9_POLYGON_POINT ? 7 : 0;
+	else
+		tcl->polygon = BIT(4) |
+			       (ccw == DRM_CHROME9_POLYGON_LINE ? 6 : 2) |
+			       (cw == DRM_CHROME9_POLYGON_LINE ? BIT(6) : 0);
+	if (points) {
+		tcl->point_size_vertex = raster &
+					 DRM_CHROME9_RASTER_POINT_SIZE_VERTEX;
+		tcl->point_words[0] = 0x2a000000 | size >> 8;
+		tcl->point_words[1] = 0x2b000000 |
+			(tcl->point_size_vertex ? 0x3f800000 : size) >> 8;
+	}
+	tcl->sprite_mask = sprite;
+	return 0;
 }
 
 
@@ -9999,18 +10315,10 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 	u32 *constants = NULL;
 	u32 *vertices = NULL;
 	bool stage_b = args->buffer_count;
-	bool list = args->topology == DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST;
 	u32 count = stage_b ? args->index_count : args->vertex_count;
 	unsigned int i;
 	int ret;
 
-	if ((!list &&
-	     args->topology != DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP &&
-	     args->topology != DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN) ||
-	    (list ? count % 3 : count < 3 ||
-	     args->flags & (DRM_CHROME9_VERTEX_BFC_CW |
-			    DRM_CHROME9_VERTEX_BFC_CCW)))
-		return -EINVAL;
 	if (stage_b) {
 		if (args->vertex_count || args->vertex_stride ||
 		    args->vertices_ptr ||
@@ -10061,11 +10369,9 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		return -ENOMEM;
 	tcl->instruction_count = args->instruction_count;
 	tcl->cull = args->flags;
-	/* A20 cycles: strip even (a, b, c) odd (b, a, c), fan (0, b, c). */
-	tcl->topology = args->topology ==
-			DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP ? 0x1c7800 :
-			args->topology ==
-			DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN ? 0x1c5c00 : 0;
+	ret = chrome9_tcl_topology(args, count, tcl);
+	if (ret)
+		goto out_free;
 	tcl->clip_mask = args->clip_distance_mask;
 	tcl->re = READ_ONCE(chrome9_tcl_re);
 	tcl->element_count = args->element_count;
@@ -10077,8 +10383,14 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		tcl->rows[i] = args->viewport[i];
 		tcl->rows[4 + i] = args->viewport[3 + i];
 	}
-	tcl->rows[8] = 0x49400000;
-	tcl->rows[9] = 0x49400000;
+	/* Points snap without the 786432 bias (vendor STM_ViewPort_INV). */
+	if (tcl->point_words[0]) {
+		tcl->rows[4] = chrome9_tcl_unbias(tcl->rows[4]);
+		tcl->rows[5] = chrome9_tcl_unbias(tcl->rows[5]);
+	} else {
+		tcl->rows[8] = 0x49400000;
+		tcl->rows[9] = 0x49400000;
+	}
 	if (stage_b) {
 		tcl->buffer_count = args->buffer_count;
 		tcl->index_count = args->index_count;
