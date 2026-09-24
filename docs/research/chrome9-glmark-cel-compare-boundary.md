@@ -157,17 +157,51 @@ RCP/sign probe does not qualify defined infinities.  Therefore the compiler
 must not turn the shapes above into an unrestricted implementation of NIR
 `fge`/`flt` carrying arbitrary local FP controls.
 
-For this exact linked NIR, every comparison leaf is a finite uploaded
-varying or finite literal, or is produced by arithmetic which does not
-preserve an exceptional result.  The comparison nodes request
-`preserve:inf` but not denormal preservation; the shader-wide float-control
-mode is zero.  That makes a bounded *default-mode defined-finite producer*
-analysis the smallest generic successor: admit a predicate only when its two
-operands are defined finite on every defined path, use the established FTZ
-comparison behavior, and continue rejecting direct defined infinities,
-preserve-denorm modes, and NaNs.  This proof must follow NIR definitions; a
-finite upload check alone is insufficient because intermediate arithmetic
-may request exceptional-value preservation.
+Finite producers alone are **not** enough: two distinct finite normals can
+subtract to a subnormal, and the live SUB/CMP probe shows such a result may
+flush to zero.  The cel predicates divide into narrower classes:
+
+* `%23 >= .1` is subtraction-sign safe.  Around the normal binary32 constant
+  `.1`, adjacent representable values differ by many orders of magnitude
+  more than the smallest normal.  Any other finite value is farther away.
+* `%31 < (.1 + .3*maxNdotL)` has the same property on every defined finite
+  path.  MAX makes its contribution nonnegative, so the dynamic right side
+  is at least `.1`; two unequal representable values in that positive-normal
+  region cannot differ by a subnormal amount.  Overflow in the unqualified
+  producer is already undefined rather than a defined infinity reaching the
+  compare.
+* `.5 < %48` is safe by the same normal-constant spacing argument.
+* `0 < %19` remains different.  `%19=dot(N,L)` may approach zero by
+  cancellation, so it can be a subnormal before the strict comparison.  A
+  zero threshold supplies no spacing floor.  This predicate needs a DP3
+  output/FTZ consistency gate before it can use SUB+CMP.
+
+All four comparison nodes request `preserve:inf` but not denormal
+preservation; the shader-wide float-control mode is zero.  Their direct
+leaves are finite varyings/literals, and any exceptional intermediate that
+does not request preservation is undefined, but that observation discharges
+only Inf/NaN handling.  It does not discharge subtraction underflow.  A
+generic proof must therefore track both defined exceptional values and a
+normal-distance/range fact; a finite upload check alone is insufficient.
+
+The smallest zero-threshold discriminator should make the DP3 result itself
+subnormal from normal inputs, for example `2^-70 * 2^-70 = 2^-140`, then
+observe two paths in one guarded draw:
+
+```text
+d = DP3((2^-70,0,0), (2^-70,0,0))
+survives = MUL(MUL(d, 2^70), 2^70)       # 1 if preserved, 0 if FTZ
+selected = strict_positive_via_SUB_CMP(d) # 1 only when d compares > 0
+```
+
+Pack `survives` and `selected` into different color lanes.  `(0,0)` is a
+consistent default-FTZ result; `(1,1)` is a consistent preserve result;
+`(1,0)` proves the introduced SUB loses a DP3 value that the original
+comparison could observe and is a hard rejection.  `(0,1)` is unclassified.
+Use only exact power-of-two normal literals, check D16/exterior/guards, and
+bracket the draw with known-good programs.  This is the one new numerical
+gate required by the cel predicate set; it does not enable preserve-denorm
+execution mode, which Chrome9 continues to reject.
 
 Before enabling the whole shader, use three guarded stages:
 
