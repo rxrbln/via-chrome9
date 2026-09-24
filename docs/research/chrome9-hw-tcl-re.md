@@ -1,0 +1,749 @@
+# Chrome9 HD hardware TCL: vertex shader, fetch and draw RE
+
+Status: reverse-engineering ahead of implementation, 2026-09-24.  No row in
+this note has executed on VX900 silicon in the new driver; nothing here was
+run on the target.  The goal it serves is native vertex processing (the
+programmable VS plus fixed-function transform/lighting lowered to the VS)
+instead of Gallium `draw`, for glxgears above 100 fps and ioquake3 GL1/GL2.
+
+It consolidates and extends [via-5.75-shader-re.md](via-5.75-shader-re.md),
+[shader-isa.md](shader-isa.md), [shader-upload-oracles.md](shader-upload-oracles.md),
+[chrome9-vs-varying-fvf.md](chrome9-vs-varying-fvf.md),
+[general-shader-runtime-contract.md](general-shader-runtime-contract.md) and
+[indexed-vbo-topology-plan.md](indexed-vbo-topology-plan.md).  Where this
+note corrects one of them, the correction is called out in
+[Corrections to earlier notes](#corrections-to-earlier-notes).
+
+## Evidence classes and binaries
+
+| label | meaning |
+|---|---|
+| **dynamic** | produced by calling the vendor code on this host (native 32-bit `dlopen`, or Wine for the Windows UMD); byte-exact, reproducible |
+| **static** | read from disassembly/decompilation; addresses given |
+| **cross** | the Linux 5.75 and Windows 2015 code agree independently |
+| **inference** | a reasoned interpretation; never used as a byte recipe on its own |
+| **silicon** | executed on VX900 (only the existing Xorg/post-TNL oracles) |
+
+Addresses are file VMAs of
+`binary/5.75.32.87a-u910-55689/bin/via_chrome9_dri.so` (32-bit, symbols,
+BuildID `f140f76c...`) unless prefixed `VTGUModeDX32A.dll:`.  Ghidra outputs
+kept under `~/tmp/re-tcl/*/` are shifted by `+0x10000` relative to these
+addresses.
+
+Tools added for this note (all hardware-free, GPL-2):
+
+| tool | purpose |
+|---|---|
+| [`tools/re/chrome9_tcl_vs_oracle_probe.c`](../../tools/re/chrome9_tcl_vs_oracle_probe.c) | Linux PVSCP parser, validator, dispatcher, postprocess on raw vs_2_0 tokens; prints native records, metadata and the input remap |
+| [`tools/re/chrome9_tcl_vs_oracle_wine.c`](../../tools/re/chrome9_tcl_vs_oracle_wine.c) | same four stages of the Windows compiler under Wine, interchange directory from `CHROME9_VS_DIR` |
+| [`tools/re/chrome9_tcl_vs_oracle.py`](../../tools/re/chrome9_tcl_vs_oracle.py) | vs_2_0 mini-assembler, 86-case corpus generator, `--check` (regression) and `--cross` (Linux/Windows) |
+| [`chrome9-hw-tcl-vs-corpus.json`](chrome9-hw-tcl-vs-corpus.json) | the byte-exact Linux+Windows corpus (SHA-256 `e80a79f4...a7af`) |
+| [`tools/re/chrome9_tcl_const_viewport_probe.c`](../../tools/re/chrome9_tcl_const_viewport_probe.c) | runs `STM_ViewPort_INV`; prints internal constant rows 256..258 and A40..A48 |
+| [`tools/re/chrome9_tcl_stream_probe.c`](../../tools/re/chrome9_tcl_stream_probe.c) | runs `stmUpdateVertexInput_H5`; prints A00..A10, A12, A62 and the `3003` stream words |
+| [`tools/re/chrome9_tcl_ffvs_gl_probe.c`](../../tools/re/chrome9_tcl_ffvs_gl_probe.c) | runs the real GL fixed-function state updaters and `__glFFVSGenerate`, captures the vs_2_0 tokens, compiles them and prints records plus the constant image |
+| [`tools/re/chrome9_tcl_ffvs_corpus.py`](../../tools/re/chrome9_tcl_ffvs_corpus.py), [`chrome9_tcl_ffvs_disasm.py`](../../tools/re/chrome9_tcl_ffvs_disasm.py) | 19-key fixed-function golden replay (all pass) and token/record disassembly |
+| [`tools/re/chrome9_tcl_win_model.py`](../../tools/re/chrome9_tcl_win_model.py) | Python model of the Windows declaration, stream, viewport and draw recipes (self-test reproduces Xorg A40..A42) |
+
+Running the 32-bit DSO natively needs only `libexpat.so.1` and `libdrm.so.2`
+from the i786 T2 sysroot on `LD_LIBRARY_PATH` (copied to `~/tmp/re-tcl/lib32`);
+mixing the sysroot libc with the host loader fails.  Reproduce the corpus:
+
+```sh
+gcc -m32 -O1 -o ~/tmp/re-tcl/A/oracle tools/re/chrome9_tcl_vs_oracle_probe.c -ldl
+clang --target=i686-w64-windows-gnu -fuse-ld=lld -nostdlib \
+  -Wl,--no-insert-timestamp -Wl,-entry,mainCRTStartup -Wl,-subsystem,console \
+  -L/usr/lib64/wine/i386-windows tools/re/chrome9_tcl_vs_oracle_wine.c \
+  -lkernel32 -o ~/tmp/re-tcl/A/w/probe.exe
+LD_LIBRARY_PATH=~/tmp/re-tcl/lib32 python3 tools/re/chrome9_tcl_vs_oracle.py \
+  --probe ~/tmp/re-tcl/A/oracle --wine-exe ~/tmp/re-tcl/A/w/probe.exe \
+  --wine-dir $HOME/tmp/re-tcl/A/w --out corpus.json
+python3 tools/re/chrome9_tcl_vs_oracle.py --cross corpus.json
+```
+
+Probe SHA-256 in this run: Linux harness `f583dd81...0962`, Wine harness
+`ec17989d...5fe3`.  `--check` against the stored corpus reports
+`86 cases, 0 mismatches`.
+
+## Summary
+
+1. The vendor Linux GL driver does real hardware TCL: a programmable VS
+   store, a VS-emulated fixed-function pipeline, and hardware vertex fetch
+   from memory with one stream slot per element.  Indices are always inline
+   in the command stream, including generated `0,1,2,...` for non-indexed
+   draws (static).
+2. Encodings are recovered for every vs_2_0 instruction the vendor
+   compilers emit (both silently drop `ifc` and `breakc`); 86 compiler cases
+   are byte-identical between Linux and Windows in their semantic prefix
+   except two explained differences (cross, dynamic).  Execution semantics
+   of op 14 and of flow control remain unmeasured.
+3. A compiled VS always ends with a finalizer that converts clip-space
+   position to the raster position using internal constant rows 256/257
+   (unified sources 224/225), uploaded as 12 dwords at selector `32030400`.
+   Their exact viewport formula, including the `786432` sub-pixel snap bias
+   and the `-0.5` pixel-centre shift, is recovered and reproduced (static +
+   dynamic).
+4. User VS float constants start at selector `32030000`; the earlier
+   `32030400` user-constant statement was a count/selector mix-up (static).
+5. vs_3_0 has no hardware path; only VS 1.1/2.0 parsers exist, and the
+   2.0 parser ignores the version token (dynamic).
+
+## VS native instruction format
+
+Each instruction is four little-endian dwords: three source words and one
+destination/control word.  All field positions below are **cross** and
+**dynamic** (corpus), extending the table in via-5.75-shader-re.md.
+
+### Source word (dwords 0..2)
+
+| bits | field |
+|---:|---|
+| 0 | negate |
+| 13:11, 10:8, 7:5, 4:2 | X, Y, Z, W selector: 0..3 = x,y,z,w; 4 = literal 1.0; 5 = literal 0.0; 6/7 unassigned |
+| 22:14 | unified source index (9 bits) |
+| 31:23 | zero in every compiled record |
+
+Unified source namespace (dynamic unless noted):
+
+| unified | file | notes |
+|---:|---|---|
+| 0 | don't-care | only as op-26 third source in Linux output (see below) |
+| 32..47 | inputs v0..v15 | dense **first-use** order after `PVS_ReMapInputReg_H5i` (0x18faf0); `mov oPos,v3; mov oD0,v1` gives native v0,v1 |
+| 64..79 | temporaries r0..r15 | reallocated by lifetime (`VS_CalTempRegLifeCycle_H5i` 0x18e260, `VS_ReMapTempReg_H5i` 0x182980); source bits 18:14 hold the physical id |
+| 96..111 | i0..i15 | loop/rep counters only |
+| 112..127 | b0..b15 | A61[15:0] |
+| 128 | internal scratch | written by destination field `0x80`; used by every multi-record lowering and by the position finalizer |
+| 130 | literal-carrier | appears with all-literal selectors (`0020a490` = 1.0 vector) in branch records |
+| 224..255 | internal constant rows 256..287 | 224/225 viewport scale/offset, 226 bias, 227..232 user clip planes, 233 `(2,4,0.5,1/pi)`, 234/235 immediate integers (static, fork C) |
+| 256..511 | c0..c255 | row R at H3 selector `32030000 + 4*R` |
+
+The literal selectors mean one and zero independently of the register id:
+the compiler writes `00206490` (all ones) and `00206db4` (all zeros) with id
+129, but `PVS_SWZ_ICD` proves the id is irrelevant for literal lanes.
+
+### Destination/control word (dword 3)
+
+| bits | field |
+|---:|---|
+| 3:0 | write mask X=1, Y=2, Z=4, W=8 |
+| 11:4 | destination (8 bits, see table) |
+| 14 | saturate (also the CALL "push" flag on op 29) |
+| 21:17 | operation |
+| 23 | return-after-this-instruction (last record of a subroutine; `0084010f`) |
+| 27:24 | relative selector: 0 absolute, 4..7 = a0.x..a0.w, 8 = aL |
+
+| destination field | meaning |
+|---:|---|
+| `0x01` | a0 (MOVA only; mask selects components) |
+| `0x10..0x1f` | r0..r15 physical temporaries |
+| `0x20` | oPos (32), clip position |
+| `0x21` | raster position (33), written only by the finalizer |
+| `0x22`, `0x23` | oD0, oD1 (compiler always sets saturate) |
+| `0x26`, `0x27` | oFog (saturate except in context mode 8), oPts |
+| `0x28..0x2f` | oT0..oT7 |
+| `0x80` | internal scratch (read back as source 128) |
+| `0xa0` | user oPos write: scratch plus oPos bits (`PVS_oPosHandling_H5` sets bits 9:8=2 and bit 11 on every oPos write, 0x181c50) |
+
+Whether a `0xa0` write also reaches output 32 is **unknown**: the Linux
+finalizer's `MOV dest32, src128` records are uploaded but lie outside A60's
+active range, whereas in the CALL/RET variant the `MOV dest32,r1` is active.
+Reproduce the vendor records exactly rather than rely on either reading.
+
+### Operation selector (dword 3 bits 21:17)
+
+All rows are **dynamic + cross** (corpus case names in brackets) unless noted.
+Byte examples use `v0`/`c0` into `r0` (`...010f`).
+
+| op | name | example record | lowering notes |
+|---:|---|---|---|
+| 2 | MAD | `0008014c 0040014c 0040414c 0004010f` [mad] | ADD = `a*1+b` (`00206490`); SUB = ADD with negated src2; MUL = `a*b+0` (`00206db4`); DST = one MAD with literal lanes (`00082150 0040218c 00206db4`) |
+| 3 | DP4 | `0008014c 0040014c 00000000 0006010f` [dp4] | DP3 = DP4 with both sources' W selector literal 0 (`...0154`); DPH (GL) forces src0 W = 1 |
+| 4 | MOV | `0008014c 00000000 00000000 0008010f` [mov] | |
+| 5 | MOVA | `00080000 00000000 00000000 000a0011` [mova] | dest `0x01`, mask per component; D3D rounding semantics unmeasured |
+| 6 | FLR | `000c010f` (GL `PVS_FLR_ICD`, static/dynamic earlier) | GL ARL = FLR into scratch then MOVA |
+| 7 | FRC | `0008014c 00000000 00000000 000e010f` | |
+| 8 | MAX | `0008014c 0040014c 00000000 0010010f` | ABS = `MAX(a,-a)` |
+| 9 | MIN | `...0012010f` | |
+| 10 | SGE | `...0014010f` | |
+| 11 | SLT | `...0016010f` | |
+| 12 | SGN | `0008014c 00000000 00000000 0018010f` | D3D temp operands dropped |
+| 14 | finalizer only | `00200150 00101b6c 00201b6c 001c0107` | `op14(clip.xyz1, rcpw.wwww, clip.wwww)`; semantics unknown (guarded perspective multiply is an inference) |
+| 16 | EXP | `00080000 00000000 00000000 0020010f` | vs_2_0 EXPP also compiles to 16 |
+| 18 | LOG | `...0024010f` | vs_2_0 LOGP also compiles to 18 |
+| 20 | RCP | `00081b6c 00000000 00000000 0028010f` | scalar source, broadcast result |
+| 21 | RSQ | `00080000 00000000 00000000 002a010f` | |
+| 22 | SINCOS | `00200000 00000000 00000000 002c0103` | preceded by `MAD scratch = x * c233.w (1/pi) + 0`; D3D coefficient constants ignored |
+| 24 | LIT | `0008014c 00000000 00000000 0030010f` | |
+| 26 | matrix final | `0008014c 0040c14c 0000014c 0034010f` | last row of M4x4/M4x3/M3x4/M3x3/M3x2: dot product into the last masked lane, earlier lanes merged from scratch rows |
+| 28 | REP/LOOP | `00180154 00280400 00300400 00380000` | src0 = i#; dword2 bits 18:10 = body length (`end-start-1`) |
+| 29 | branch/IF/ELSE/CALL | `001c014c 00280400 00300800 003a0000` | see flow control |
+
+Multi-record lowerings (dynamic, byte-identical on both drivers):
+
+```text
+LRP r0,c0,v0,v1  0008014c 00206490 0008414d 0004080f   scratch = v0 - v1
+                 0040014c 0020014c 0008414c 0004010f   r0 = c0*scratch + v1
+POW r0,v0.x,c0.x 00080000 00080001 00000000 0010080f   scratch = |x|
+                 00200000 00000000 00000000 00240801   scratch.x = log
+                 00200000 00400000 00206db4 00040802   scratch.y = *c0.x
+                 00200924 00000000 00000000 0020010f   r0 = exp(scratch.y)
+NRM r0,v0        00080154 00080154 00000000 0006080f   scratch = dp3
+                 00201b6c 00000000 00000000 002a080f   scratch = rsq(w)
+                 0008014c 0020014c 00206db4 0004010f   r0 = v0*scratch
+CRS r0.xyz,v0,c0 00081034 00400a14 00206db4 00040807
+                 00080a14 00401034 00200155 00040107
+M4x4 r0,v0,c0    0008014c 0040014c 00000000 00060801   scratch.x
+                 0008014c 0040414c 00000000 00060802   scratch.y
+                 0008014c 0040814c 00000000 00060804   scratch.z
+                 0008014c 0040c14c 0000014c 0034010f   r0 (op 26)
+SINCOS r0.xy,v0.x 00080000 003a5b6c 00206db4 0004080f  scratch = x/pi
+                 00200000 00000000 00000000 002c0103
+```
+
+### Relative addressing, address register and flow control
+
+Dynamic, cross:
+
+```text
+mova a0.x,v0.x ; mov oPos,c5[a0.x]
+  00080000 00000000 00000000 000a0011
+  0041414c 00000000 00000000 04080a0f     # relative nibble 4 = a0.x
+mova a0,v0 ; mov oPos,c5[a0.y]      -> 000a001f, then nibble 5
+mova a0.z / a0.w                     -> 000a0014 / 000a0018, nibble 6 / 7
+loop aL,i0 ; add r0,r0,c1[aL]        -> body 0010014c 00206490 0040414c 0804010f
+```
+
+The relative selector is instruction-wide; a second relative source with a
+different component is silently lost (via-5.75-shader-re.md).
+
+Branches all use op 29 with a condition source and two 9-bit displacements in
+bits 18:10 of dword 1 (taken when the condition is true) and dword 2 (taken
+when false); the displacement words carry fixed upper bits (`0028xxxx`,
+`0030xxxx`):
+
+```text
+if b0; add; endif          001c014c 00280400 00300800 003a0000   true +1, false +2
+if b0; add; else; add; endif
+                           001c014c 00280400 00300c00 003a0000   false -> else+1
+                           0020a490 00280800 00000000 003a0000   ELSE: literal-true, +2
+call l0 (target +8)        0020a490 00282000 00300400 003a4000   bit 14 = push
+callnz l0,b0               001c014c 00282000 00300400 003a4000
+subroutine last record     0010014c 00206490 0040014c 0084010f   bit 23 = return
+rep i0 / loop aL,i0        00180154 00280400 00300400 00380000   dword2 = body length
+```
+
+The two-way reading of op 29 is an **inference** from these fixed forms;
+silicon branch/stack behaviour and latency are unmeasured.  Both vendor
+compilers silently drop `ifc` and `breakc` (the guarded body becomes
+unconditional; cases `ifc_lt`, `breakc_in_rep`), so neither is a usable
+oracle for those instructions.  A CALL program changes the finalizer: oPos
+goes to a temporary (`0008011f`), `MOV dest32,r1` becomes active and the
+finalizer works in the scratch register; object `+0` becomes the temp count
+2.
+
+### Limits
+
+| resource | limit | evidence |
+|---|---|---|
+| active records | A60[8:0] last index, 512 encodable | static; vendor masks, does not reject (via-5.75-shader-re.md) |
+| inputs | 16 (4-bit element VS-input field, 5-bit remap) | static |
+| temporaries | 16 native (4-bit dest id); `temps_16_live` compiles, object `+0 = 0x10` | dynamic; VS 2.0 exposes 12 |
+| float constants | 256 user rows + internal rows 256.. | static |
+| address register | a0.xyzw + aL | dynamic |
+| constants per instruction | three different c# in one MAD compile directly (`0040014c 0040414c 0040814c`) | dynamic; no port-limit splitting by the compiler, silicon unverified |
+
+The Linux object keeps 256 normalized and 295 native records without bound
+checks; Mesa must preflight (via-5.75-shader-re.md).
+
+## Compiler object metadata and activation words
+
+Dynamic (corpus `meta`), static sources from fork C:
+
+| object | meaning | consumer |
+|---:|---|---|
+| `+0x00` | physical temporaries used (minimum 1: the finalizer uses r0) | A61 bit 23 = (`+0 <= 8`) |
+| `+0x04` | output linkage descriptor (bit 2 oPos, 5 oPts, 6 oD0, 7 oD1, 13 oFog, 11:8 texcoord count, 2-bit widths at 16+2n) | A25/A26/A28[18:17] |
+| `+0x08` | never nonzero for vs_2_0 in 86 cases | A61[22:20] |
+| `+0x0c` | never nonzero for vs_2_0 | A61[19] |
+| `+0x10` | register-pressure-like value; `temps_12_live`=11, `temps_16_live`=15, one output =0, oPos+oD0 =1, 4 partial oPos DP4 + oD0 =4; **reads uninitialized state when no v# is used** (varies run to run) | A62[8:0] |
+| `+0x14` | active record count | A60[8:0] = `+0x14 - 1` |
+| `+0x18` | `ffffffff` (oPos temp index when redirected) | finalizer |
+| `+0x28` | `+0x14 - 1` | |
+| `+0x424` | uploaded records = active + 2 inactive tails | H3 `31030000` count/4 |
+
+Activation words (static, cross; `stmUpdateVS_inv` 0x17c4c0 and
+`VTGUModeDX32A.dll:0x1015ac6d..0x1015ad13`), saved image base `state+0x20bc`:
+
+```text
+A60 = 60800000 | (active - 1)            # bits 20:12 cleared, bit 23 set
+A61 = init | (temps <= 8) << 23 | (+8 & 7) << 20 | (+0xc != 0) << 19 | bool_mask
+A62 = init | (inputs - 1) << 20 | (+0x10 & 0x1ff)
+      # init: bit 15 set for 1106:7122 (bit 14 otherwise), inputs-1 = 0xf when none
+emit order: <3203 constants> A61 A62 A60 <31030000 upload>
+```
+
+A62[23:20] is the input-register count minus one written by
+`stmUpdateVertexInput_H5` (0x17d04a/0x17d2b0); this explains Xorg's
+`622081ff` (v0..v2) and `623081ff` (v0..v3).  A61 bits 18 and 16 follow an
+init-time manager flag (0x179313/0x178d15) whose meaning is open.
+
+## Position finalizer, viewport and internal constants
+
+Every compiled program appends (dynamic, Linux):
+
+```text
+00201b6c 00000000 00000000 00280108   RCP  r0.w   = 1 / src128.w
+00200150 00101b6c 00201b6c 001c0107   op14 r0.xyz = f(src128.xyz1, r0.wwww, src128.wwww)
+0010014c 00380150 00384154 0004021f   MAD  pos33  = r0 * src224.xyz1 + src225.xyz0
+0020014c 00000000 00000000 0008020f   MOV  dest32 = src128   (inactive)
+0020014c 00000000 00000000 0008020f   MOV  dest32 = src128   (inactive)
+```
+
+The Windows compiler prepends two records implementing the D3D-to-GL depth
+remap `z' = (z + w) * c233.z`:
+
+```text
+00201248 003a6d54 003a6db4 00040804   scratch.z = scratch.z * 0.5
+00201b6c 003a6d54 00201248 00040a04   scratch.z = scratch.w * 0.5 + scratch.z
+```
+
+The raster position is therefore `(x/w*sx+ox, y/w*sy+oy, z/w*sz+oz, 1/w)`,
+the same tuple the live post-TNL path feeds directly (Xorg VS writes
+destination 33 with `v0*src224.xyz1 + src225.xyz0`).  Feeding Gallium
+`draw` output through a compiled program would transform it twice.
+
+### Internal constant rows (static, fork C; cross with Windows)
+
+| row | unified | upload | contents | producer |
+|---:|---:|---|---|---|
+| 256 | 224 | `32030400`, 12 dw (rows 256..258) | `(sx, sy, sz, 0)` | `STM_ViewPort_INV` 0x1bab80; upload `stmUpdateVS_inv` 0x17c6a5/0x17c9ad |
+| 257 | 225 | same | `(ox, oy, oz, 0)` | same |
+| 258 | 226 | same | `(786432, 786432, 0, 0)`, zeros for points and A23 type 7 | same |
+| 259..264 | 227..232 | `3203040c`, 24 dw | user clip planes (DP4 per enabled plane into spare texcoord lanes) | `stmPVSUpdateDirtyConst_H5` 0x17be12/0x17c3d5 |
+| 265 | 233 | `32030424`, 12 dw (rows 265..267) | `40000000 40800000 3f000000 3ea2f983` = `(2, 4, 0.5, 1/pi)` | `stmInitChipImage_inv` 0x178d1c; upload 0x17bf2a |
+| 266..267 | 234..235 | `32030428`, 8 dw | the shader's `defi` values as floats | `PVSCP_VALIDATE_VS20_H5` 0x18fcb8 |
+
+Windows uploads the same 12 dwords at `VTGUModeDX32A.dll:0x1015ada1` and
+writes row 265 at `0x10155208`.
+
+Viewport formula for a GL window drawable (static decompile of
+`STM_ViewPort_INV`, `__glDpSTMUpdateViewport` 0x1ec240; dynamic via
+`chrome9_tcl_const_viewport_probe`):
+
+```text
+Ytop = drawable_height - glY - H           # caller converts GL bottom-left origin
+sx = W/2        ox = X    + W/2 - 0.5 + 786432
+sy = -H/2       oy = Ytop + H/2 - 0.5 + 786432
+sz = f - n      oz = n                      # f-n scaled by ctx+0x3838 when nonzero
+bias 786432 = 0x49400000 = 1.5*2^19 (1/16-pixel snap) only when A23 low nibble is
+not 0 (points) and not 7; rows 258.xy carry the same value.
+```
+
+Dynamic example, 640x480 window, triangles:
+`43a00000 c3700000 3f800000 00000000 | 494013f8 49400ef8 00000000 00000000 |
+49400000 49400000 00000000 00000000`.  For a renderbuffer/FBO the vendor
+uses `sy=+H/2`, `oy=H/2-Y`, which for `Y != 0` looks like a vendor quirk and
+is unverified.  GL's clip-space depth needs either the vendor `sz=f-n, oz=n`
+plus the two Windows remap records, or equivalently `sz=(f-n)/2,
+oz=(f+n)/2` with the Linux tail; the second form needs no extra records and
+no row 265.
+
+The same values also populate the fixed-function viewport words A40..A48
+(low 24 bits per word, high bytes packed in A42/A45/A48, e.g.
+`00a00000 004013f8 00004943 ...`); the programmable finalizer reads only
+rows 256/257.
+
+## VS constant uploads
+
+Static, fork C (`stmPVSUpdateDirtyConst_H5` 0x17bc60):
+
+```text
+full:   fe03043c 00000400 32030000 cc000000  <1024 dwords, c0..c255>
+dirty:  fe03043c <4*K>    32030000|(4*N)  cc000000  <cN..cN+K-1>
+ints:   fe03043c 00000010 33030000 cc000000  <16 packed XYZW bytes>   (Windows form)
+bools:  A61[15:0]
+```
+
+The earlier statement that the full user upload uses selector `32030400`
+confused the count `0400` with the selector.  There is no overlap between
+user constants and the internal rows.  Dirty flags are bytes at
+`ctx+0x4638`, scanned 32 at a time.
+
+## Vertex fetch: streams and declarations
+
+The hardware-TCL state table on H5/H6 (`0x427660..0x427c00`) has an empty
+`STM_SetStreamSource_H5` (0x1bb920); `STM_FVFSetting_H5` only marks state
+dirty.  The real builder is `stmUpdateVertexInput_H5` (0x17cbb0), installed
+by `stmCreate_inv` at 0x179e88.  `STM_SetStreamSource_INV`/`STM_FVFSetting_INV`
+belong to the non-TCL table and use the older A21/A22 single-stream words
+(static, fork B).  Windows `VTGUModeDX32A.dll:0x10159670` implements the same
+recipe (static, fork E), so the following is **cross**; the element and
+stream words were also produced **dynamically** by
+`chrome9_tcl_stream_probe`.
+
+```text
+element i (i = 0..15):
+  A(1+i)    = (1+i)<<24 | addr[9:2]<<12 | vs_input<<8 | format     # [23:20] = 0
+  stream[i] = (addr & 0xfffffc00) | ((stride >> 2) & 0x1ff)        # slot i = element i
+  addr      = buffer_gpu + stream_offset + element_offset + first_vertex*stride
+A00 = (A00 & 0xfffff080) | (elements-1)<<8 | sum(element dwords)
+      | [16:15]=01 for the H6/SF memory type (Linux: memory type 4 and ctx flag +0x69 bit 6)
+A12[15:0]    = mask of VS input registers used
+A62[23:20]   = input registers - 1
+fe03043c <n> 30030000 cc000000 <stream[0..n-1]>
+```
+
+* There is exactly one stream slot per element; the vendor never shares a
+  base between elements and never writes element bits 23:20.  Whether the
+  hardware reads 23:20 is unproven, so copy the vendor form.
+* Address bits 9:2 fold into the element word; bits 1:0 are dropped.  The
+  only stride check is `< 0x801` (`__glS3InvConfigVertexStream`), so a stride
+  of exactly 2048 encodes as pitch 0 (vendor bug); a constant (array-less)
+  attribute is a float4 in a buffer with stride 0 (`stream = ...00300000`
+  in the probe).
+* `vs_input` for a programmable VS is the index in the shader's dense
+  first-use input table (`parsed+0x15d8` count, 12-byte
+  `{usage, index, reg}` entries); for fixed function it is the dense rank of
+  the usage bit.  Windows assigns the index of the matching DCL and gives an
+  unmatched element index = DCL count.
+* First-vertex / base-vertex offsets are added to every element address,
+  i.e. re-folded into stream bases and element bits 19:12.
+
+Format byte: bits 7:6 = components-1, bits 5:0 = type (cross; Windows
+tables 0x103334b8/0x10333504, Linux `stmMapDeclFormat_invi_H5` 0x1760e0):
+
+| type | code | D3D bytes |
+|---|---:|---|
+| float32 | `02` | FLOAT1..4 `02 42 82 c2` |
+| half float | `04` | FLOAT16_2/4 `44 c4` |
+| UBYTE | `06` | UBYTE4 `c6` |
+| UBYTE normalized | `07` | UBYTE4N `c7` (GL UNSIGNED_BYTE[4] normalized) |
+| USHORT | `08` | not used by D3D |
+| USHORT normalized | `09` | USHORT2N/4N `49 c9` |
+| SHORT | `0a` | SHORT2/4 `4a ca` |
+| SHORT normalized | `0b` | SHORT2N/4N `4b cb` |
+| D3DCOLOR (BGRA, normalized) | `11` | `d1` |
+| packed 10:10:10 | `0c`, `0f` | UDEC3 `8c`, DEC3N `8f` |
+
+GL BYTE, INT, UINT and DOUBLE arrays are converted on the CPU
+(`conversion_table_inv` 0x3f8f60); the direct table is `stmtype_table_inv`
+0x3f8fc0.  GL attribute to usage: 0 POSITION, 1 BLENDWEIGHT, 2 NORMAL, 3/4
+COLOR0/1, 5 FOG, 8..15 TEXCOORD0..7, 16..31 generic (usage 2, index 0..15)
+(`stmdecl_usage_table` 0x429220).
+
+Dynamic example (float3 position + D3DCOLOR, one 16-byte interleaved buffer
+at GPU `0x00100000`, SF/H6 domain):
+
+```text
+A00=00008104 A01=01000082 A02=020031d1 A12=12000003 A62[23:20]=1
+fe03043c 00000002 30030000 cc000000 00100004 00100004
+first=3:  A01=0100c082 A02=0200f1d1 (streams unchanged)
+```
+
+## Draw packets and command order
+
+Every hardware-fetch draw is an **indexed** draw with inline indices (cross:
+Linux `__glS3H5DrawPrimitiveTriangleList` 0x1e7490 /
+`__glS3H5DrawIndexedPrimitiveTriangleList` 0x1e3240; Windows DrawPrimitive
+0x101b1b60, DrawIndexedPrimitive 0x101b15e0).  There is no index-buffer
+address in the H6 command set.
+
+```text
+A20[1:0] = 01 (16-bit) | 11 (32-bit); 00 = inline vertices
+A2D = 2d000000 | (min & 00ffffff)
+A2C = 2c000000 | (bound & 00ffffff)     # Linux: max index (inclusive)
+                                        # Windows: MinIndex + NumVertices (exclusive)
+A2E = 2e000000 | (max >> 24) << 8 | (min >> 24)
+per chunk:
+  fe020440 0000043c 00040000 cc000000  24<count> cc000000 ...
+  fe03043c <index dwords> 00000000 cc000000  <inline indices>
+```
+
+* Non-indexed draws generate indices `0..n-1` on the CPU, packed
+  `((i+1)<<16)|i`, 16-bit below 65536 vertices, else 32-bit.  The unused lane
+  of an odd count holds the next index, not zero; a new driver should write
+  zero (it lies outside A24).
+* Chunk size is bounded by command-buffer space, rounded to whole primitives:
+  lists to multiples of 3, strips overlap by 2, fans repeat the first index.
+* The Linux "`_VM`" variants (e.g. 0x1dfde0, 0x1da7a0) gather vertices on the
+  CPU into selector-0 inline packets; they are used for 8-bit indices, for
+  memory types 1/8, and for mixed memory types, because the A00 domain is
+  global.  `__glDpHwDrawTNLedPrim_Begin` (0x1fe1b0) is the software-VS route
+  with one pre-transformed stream.
+* The inclusive/exclusive A2C difference is unresolved; the inclusive Linux
+  value is the tighter one and matches the documented `{0,1,2}` oracle.
+
+Complete Windows per-draw emission order (static, fork E; validator
+0x100ff570, function table 0x103309c8 index 4):
+
+1. dirty handlers update the image only (viewport 0x101f7570, declaration
+   0x10159670, A20/A2C 0x101f5e20);
+2. `33030000` integer constants and A61 Boolean bits (0x101593b0);
+3. VS (0x1015abb0): `32030400` 12 internal dwords, user constants
+   (`32030000` full or dirty runs, then `3203040c` clip planes, `32030424`
+   or `32030428`), A61, A62, A60, then the `31030000` program;
+4. PS (0x1015b000): A90..A9b, `20030000`, `21030000`;
+5. state flush (0x10156b20, gathered by 0x10150be0): type-01 blocks, FE02,
+   `14030000`, `00030000`, `11030000`, type-04 A00..A1F (declaration),
+   A20..A3F (A25/A26/A28 linkage), A40..A5F (viewport), A60..A7F, FE00,
+   `3003` streams, per-unit texture state, `1003` mip tables;
+6. primitive packets (A24 + inline indices).
+
+The Linux flush (fork B) has the same relative order: type-01 groups, H3
+`1403/0003/1103`, dirty type-04 words, FE, `3003` streams, texture state.
+Windows also ORs `0x540000` into A00 on 1106:7122 (`0xa80000` on other
+chips) and initializes A28=`28f9ffff`, A52=`52147fff`; the A00 bits are not
+present in the live Xorg `00000206` word and are unexplained.
+
+## Fixed-function TCL emulated by the VS
+
+The vendor GL driver lowers fixed-function vertex state to a **vs_2_0 token
+stream** and compiles it with the same PVS compiler as user shaders (static
++ dynamic, fork D):
+
+* `__glDpUpdateVertexShaders` 0x1ef0c0 -> `__glFFVSUpdateVS` 0x24a5b0 ->
+  `__glFFVSNeedRegenerate` (256-bucket cache keyed by 24 state bytes) ->
+  `__glFFVSGenerate` 0x247570 -> `stmCreateVertexShaderFunc` 0x24939e ->
+  `PVScpCreateVSFunc` (parse/validate/dispatch/postprocess 0x181715..0x181747).
+* FF handles are negative; `hwctx+0x4fcd = handle>>31` selects
+  `stmPVSCompile_H5` in `stmUpdateVS_inv` 0x17c52a.  The older
+  `stmFFVS*_H5i` builders are reached only via `stmFFVSCompile_H5` for
+  non-negative D3D FVF handles and are not the GL lighting path (static,
+  medium confidence).
+* `__glFFVSLightCompute` points to `_Looped` for both chip groups
+  (0x1d8669, 0x1d878d): up to four lights of one type are unrolled; five or
+  more emit `defi i0,(N,0,1,0)` + `loop aL,i0` with aL-relative constants
+  (dynamic).  Vendor GL therefore relies on VS LOOP/aL, which is unproven
+  on silicon; a Mesa lowering should unroll.
+
+State key: 24 bytes at `hwobj+0x1c4+4`; lighting S+7 bit 7, fog S+7 bits
+6:4, local viewer S+7 bit 2, two-side S+7 bits 1:0, single-color S+7 bit 3,
+normalize S+0xf bit 7, per-type light counts in S+8/S+0xc, texgen 11 bits per
+unit from S+0xa, texture-matrix flags S+0xb/S+0xf.
+
+Constant map (index = vec4; static producers, dynamic values):
+
+| cN | contents |
+|---|---|
+| c4..c7 | modelview rows (`__glFFVSUpdateModelviewConst` 0x241d70) |
+| c8..c11 | MVP rows (`__glFFVSUpdateDelayConst` 0x2466c0) |
+| c12..c14 | normal matrix rows (scaled by 1/row length with RESCALE_NORMAL) |
+| c16, c17 | point size/min/max/clamped, distance attenuation |
+| c18 | `(0, 0.5, 1, -1)` (`__glFFVSInitConstant`) |
+| c19..c23.x | front diffuse, specular, emissive, ambient, shininess |
+| c24, c25 | front ambient x model ambient; c24 + emissive (scene color, w=0) |
+| c26..c32 | back-face equivalents of c19..c25 |
+| c33 | light-model ambient |
+| c34+k, c42+k, c50+k, c58+k | eye-space light position; attenuation (k0,k1,k2,spot exp); spot dir + cos(cutoff); half vector |
+| c66/74/82+k | front ambient/diffuse/specular light x material products |
+| c90/98/106+k | back products |
+| c114/122/130+k | raw light colors (color-material path) |
+| c204+4u..c207+4u | texture matrix of unit u |
+| c232 | fog `(density*log2e, end/(end-start), density, 1/(end-start))` |
+| c236+u | rectangle-texture scale `(1/w, 1/h, 0, 1)` |
+
+Vendor defects to avoid: every light's half vector reads c58 (light 0);
+unit 7's texture matrix (c232..c235) overlaps the fog constant c232.
+
+glxgears key (LIGHT0 directional, light specular default 1, normalize,
+cull, single color), 31 uploads, 29 active, `+0=5 +4=44 +10=6`, record
+SHA-256 prefix `2d27101e51e14dc9`; generated tokens and native records
+(dynamic, reproduced independently from fork D's probe):
+
+```text
+m4x4 r2,v0,c8 ; m3x3 r0.xyz,v1,c12 ; mov oPos,r2
+dp3 r0.w,r0,r0 ; rsq r0.w,r0.w ; mul r0.xyz,r0,r0.w
+mov r3,c25 ; mov r4,c18.x ; mov r2.xyz,c34 ; mov r5.xyz,c58
+dp3 r2.x,r2,r0 ; dp3 r2.y,r5,r0 ; mov r2.w,c23.x ; lit r2,r2
+mul r5,r2.y,c74 ; add r5,r5,c66 ; add r3,r5,r3
+mul r6,c82,r2.z ; add r4.xyz,r6,r4 ; mov r3.w,c19.w ; add_sat oD0,r3,r4
+
+0008014c 0042014c 00000000 00060801   0008014c 0042414c 00000000 00060802
+0008014c 0042814c 00000000 00060804   0008014c 0042c14c 0000014c 0034010f
+00084154 00430154 00000000 00060801   00084154 00434154 00000000 00060802
+00084154 00438154 0000014c 00340117   0010014c 00000000 00000000 00080a0f
+00104154 00104154 00000000 00060118   00105b6c 00000000 00000000 002a0118
+0010414c 00105b6c 00206db4 00040117   0046414c 00000000 00000000 0008012f
+00448000 00000000 00000000 0008013f   0048814c 00000000 00000000 00080107
+004e814c 00000000 00000000 00080147   00100154 00104154 00000000 00060101
+00110154 00104154 00000000 00060102   0045c000 00000000 00000000 00080108
+0010014c 00000000 00000000 0030010f   00100924 0052814c 00206db4 0004014f
+0011014c 00206490 0050814c 0004014f   0011014c 00206490 0010814c 0004012f
+0054814c 00101248 00206db4 0004011f   0010414c 00206490 0010c14c 00040137
+0044db6c 00000000 00000000 00080128   0010814c 00206490 0010c14c 0004422f
++ the five-record finalizer/tail
+```
+
+This production shader writes oPos (`0xa0`) before the M3x3 scratch rows
+are dead and before other scratch-free work; `PVS_oPosHandling_H5` redirects
+oPos to a temporary whenever a later record would write the scratch again.
+Because the shipped GL driver draws correctly with this code, the `0xa0`
+destination must deposit the clip position where the finalizer's source 128
+reads it (strong inference).  Its LIT and the diffuse/specular
+accumulation need numerical silicon checks.
+
+Other keys (all in the replay corpus): unlit position+color (11 uploads:
+`m4x4 r2,v0,c8; mov oPos,r2; mov_sat oD0,v1`), separate specular (oD1,
+32 uploads), no light specular (25), T0 passthrough (13), T0+T1 lightmap
+(15), linear fog (14; `MAD_sat oFog.x = -c232.w*|eye z| + c232.y`), the
+ioquake3 GL1 combination T0+T1+linear fog (18 uploads, `+4=2244`), point,
+spot, local viewer, color material, rescale and two-sided lighting.  Two-sided
+lighting writes the back color to ATTROUT 2 (native destination 36,
+`...0004424f`) and sets object `+0xc = 0x40`; A23 bit 7/back-color linkage
+remains unproven, so keep two-sided lighting in software.  EXP/EXP2 fog
+emits no oFog (the eye-z DP4 is dead code) and fog is computed elsewhere.
+
+For Mesa this is a template, not a dependency: Mesa already lowers
+fixed-function to NIR (`ffvertex_prog`), so the native backend only needs
+the NIR operations the vendor output uses (DP3/DP4, M4x4 via DP4, RSQ, MAD,
+MAX, LIT or its expansion, MOV with SAT to oD0).
+
+## Windows cross-check summary
+
+* The Windows D3D UMD implements the same stream, declaration, index and
+  constant recipes (section above) and the same activation order
+  A61/A62/A60 + `31030000` (static, fork E; `0x1015abb0`, `0x1015ac6d`).
+* Its compiler output is byte-identical to Linux for 75 of 86 corpus cases.
+  Nine differ only in the don't-care third source of the matrix-final op 26
+  (Linux `0000014c`, Windows `0020014c`); both drivers ship working, which
+  makes it very likely that op 26 ignores that register field (inference).
+  The two CALL cases differ only by the Windows depth-remap records inside
+  the relocated finalizer and the resulting call displacement (`00282c00`
+  versus `00282000`).  All metadata agree except `+0x14`, which is two larger
+  on Windows because of the two depth records (dynamic, `--cross`).
+* Windows viewport (0x101f7570): same scale/offset/bias/-0.5 rules; D3D
+  depth maps `sz = MaxZ-MinZ`, `oz = MinZ` after the `(z+w)/2` remap.
+  Pre-transformed default `s=(1,1,1)`, `o=(786432,786432,0)` is exactly the
+  Xorg c256/c257 pair.
+* Pixel Z clip A1E/A1F uses the same low-24/high-byte split; default
+  min=`ff000000`, max=`7f000000`, consistent with the kernel's `20007fff`.
+
+## Corrections to earlier notes
+
+1. **User VS float constants begin at `32030000`**, not `32030400`
+   (shader-isa.md "full vertex-float-constant path", general-shader-runtime-
+   contract.md).  `0x400` was the payload count.  Internal rows begin at
+   `32030400`; there is no overlap.
+2. shader-isa.md states that Linux reproduces the Windows one-light
+   lighting records byte-for-byte.  Two of them differ (op-26 third source
+   `0000014c` versus `0020014c`), reproducibly; see the Windows summary.
+3. The VS destination field is 8 bits (`dword3[11:4]`), not the 6-bit
+   `9:4` "unified index" of via-5.75-shader-re.md; `0x80` is the internal
+   scratch register, not a0.  `tools/chrome9_vs_decode.py` still decodes the
+   6-bit form and labels scratch writes as `a0` (not modified here).
+4. indexed-vbo-topology-plan.md: streams are one slot per element with
+   element bits 23:20 left zero, not a stream-ID palette; non-indexed
+   hardware draws also use generated inline indices; stride 2048 is not
+   encodable; pitch 0 is used for constant attributes.
+5. The full vs_2_0 path compiles EXPP/LOGP to the full-precision selectors
+   16/18; selectors 17/19 were seen only from direct emitter calls.
+6. general-shader-runtime-contract.md "r0..r11" is the VS 2.0 API budget;
+   the native file has 16 temporaries (`temps_16_live` compiles with object
+   `+0 = 0x10`, destinations `0x10..0x1f`).
+7. via-5.75-shader-re.md reports an end-of-body marker (dword3 bit 2) for
+   IF/REP bodies.  With full-mask bodies (`if_b0`, `rep_i0`) the body record
+   is identical to the unconditioned encoding; loop extent is carried only by
+   the op-28/29 displacement fields.
+8. A62[8:0] = object `+0x10` is not an output count; it behaves like a
+   register-pressure value and is nondeterministic for programs without any
+   `v#` read.
+
+## Open unknowns
+
+* op 14 semantics (only in the finalizer and `stmFFVS_Transform_H5i`
+  0x1a1b38); whether the `0xa0` destination also writes output 32; whether
+  the inactive `MOV dest32,src128` tails matter to the hardware.
+* Numerical behaviour of every VS op on silicon (LIT, EXP/LOG precision,
+  RCP/RSQ of 0/inf, SGE/SLT, FRC, MOVA rounding, SINCOS input in units of
+  pi).
+* Branch/loop/call execution (op 28/29, bit 14 push, bit 23 return), stack
+  depth and loop-counter semantics of i# `(count, start, step)`.
+* Whether three distinct constants (or inputs) per instruction execute
+  without port conflicts.
+* Object `+0x08`/`+0x0c` (A61[22:20]/[19]); `+0xc` is set to `0x40` by
+  two-sided FF lighting, `+0x08` never observed nonzero.  A61 bits 18/16.
+* Exact meaning of A62[8:0]; the vendor value is reproducible only for
+  programs that read at least one input.
+* Element bits 23:20 (unused by both vendors), A2C inclusive versus
+  exclusive, A00 `0x540000` (Windows, VX900 only), A23 low nibble 7 (no
+  bias), row 258 consumers, rows 266/267 in the Windows image.
+* FBO viewport `oy = H/2 - Y` for `Y != 0`.
+* Hardware behaviour for unaligned attributes (vendor drops address bits
+  1:0 silently) and stride not a multiple of four.
+
+## Recommended first silicon test
+
+Goal: execute the first compiler-generated VS on VX900 with the smallest
+possible diff from a silicon-proven body, so a failure isolates the VS
+store/finalizer/internal-constant path.  Vertex fetch from memory, user
+constants and texture are deliberately excluded.
+
+Base: the proven 188-dword Oracle A in [vp-stall-analysis.md](vp-stall-analysis.md)
+(32x32 target, 4 immediate six-dword vertices, declaration
+`00000206 010000c2 020041d0 030052d0`, A23 low nibble 2, A25/A26/A28
+unchanged).  Change only:
+
+1. Internal constants (dwords 76..87 grow by 4): viewport rows 256..258 for a
+   32x32 window-oriented target, exactly what `STM_ViewPort_INV` produces
+   (dynamic, `chrome9_tcl_const_viewport_probe 0 0 32 32 0 1 4 1 1`):
+
+   ```text
+   fe03043c 0000000c 32030400 cc000000
+   41800000 c1800000 3f800000 00000000     # sx=16  sy=-16 sz=1
+   494000f8 494000f8 00000000 00000000     # ox=oy=15.5+786432, oz=0
+   49400000 49400000 00000000 00000000     # row 258 bias
+   ```
+
+2. VS program: the compiled `mov oPos,v0; mov oD0,v1; mov oD1,v2`
+   (corpus `out_d0_d1`, identical on Linux and Windows apart from the tail),
+   eight uploaded records, keeping the proven H2 `31030000` framing:
+
+   ```text
+   fe020440 0000043c 31030000 cc000000
+   0008014c 00000000 00000000 00080a0f
+   0008414c 00000000 00000000 0008422f
+   0008814c 00000000 00000000 0008423f
+   00201b6c 00000000 00000000 00280108
+   00200150 00101b6c 00201b6c 001c0107
+   0010014c 00380150 00384154 0004021f
+   0020014c 00000000 00000000 0008020f
+   0020014c 00000000 00000000 0008020f
+   ```
+
+   It writes the same oD0/oD1 set as the Xorg program, so A25 `25f6cc00`,
+   A26 and A28 stay exactly as proven.
+
+3. Activation: `A60 = 60800005` (six active records), `A62 = 62208002`
+   (proven upper bits, compiler `+0x10 = 2`), `A61 = 61800000` unchanged
+   (one temporary, bit 23 set).
+4. Vertices become clip-space with W=1, the rest of each record unchanged:
+   TL `bf800000 3f800000 00000000 3f800000`, TR `3f800000 3f800000 ...`,
+   BR `3f800000 bf800000 ...`, BL `bf800000 bf800000 ...`, colors
+   `ffff0000 ffff0000`.
+
+Expected result: pixel-identical to the proven Oracle A (all 1024 pixels
+filled, same color, guards intact).  The arithmetic is exact in float:
+`-1*16 + 786447.5 = 786431.5`, the same raster X/Y the Xorg program
+computes from `-0.5*1 + 786432`, and raster W = 1/1.  Retirement, `040c`,
+CR/VP busy bits and D16/color guards use the established health checks.
+
+Follow-ups, one variable at a time:
+
+* **1b** W=2 (`x,y` doubled, `w=40000000`): same image; exercises RCP/op 14.
+* **1c** `A62` low nine `1ff` (Xorg value) versus `002`: identifies whether
+  the compiler value matters.
+* **1d** only the upper-left triangle half (distinct TL color) to prove the
+  `sy=-16` orientation.
+* **2** `m4x4 oPos,v0,c0` with a pixel-to-NDC matrix uploaded as
+  `fe03043c 00000010 32030000 cc000000 <c0..c3>` and pixel-space vertices:
+  first user constant upload and DP4/op 26.
+* **3** memory fetch: the same vertices in a guarded 1-KiB-aligned BO,
+  `A00=00008206`, `fe03043c 00000001 30030000 cc000000 <base|6>` extended to
+  one slot per element, `A20=20000001`, `A2C=2c000003`, `A2D/A2E` zero,
+  `A24=24000004` and inline 16-bit indices, per
+  [indexed-vbo-topology-plan.md](indexed-vbo-topology-plan.md) but with
+  per-element stream slots.
+* **4** the glxgears fixed-function program above with its constants, as
+  the first lighting/LIT numerical gate.
+
+Do not combine steps; stop on the first retirement timeout, nonzero `040c`,
+persistent busy bit or guard change.

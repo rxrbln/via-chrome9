@@ -1,5 +1,7 @@
 # Chrome9 vendor persistence and state-reuse audit
 
+> **Erratum (2026-09-24):** `__glS3InvDrawPrimitiveTriangleList` (`0x209d10`) is the software-VS (pre-transformed) emitter; VX900 (UMD family 8) uses the hardware-VS `__glS3H5DrawPrimitiveTriangleList` (`0x1e7490`).  See [chrome9-throughput-re.md](chrome9-throughput-re.md#3-linux-575-stack-vx900--umd-chip-family-8).
+
 ## Result
 
 The proprietary drivers do **not** rebuild SF translations or replay the

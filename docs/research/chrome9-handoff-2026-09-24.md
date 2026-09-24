@@ -1,10 +1,10 @@
 # Chrome9 development handoff — 2026-09-24
 
-Status: paused at the user's request.  All RE/build subagents were interrupted;
-no further GPU test was started after the request.  The full objective remains
-all glmark2 scenes, then ioquake3 GL1, then GL2, with conforming Mesa/kernel
-implementations and performance work where required.  This is not a claim of
-GL feature completion.
+Goal: ioquake3 GL1 and GL2 render the menu and first map; then hardware TCL
+(vertex shading still runs in Gallium Draw software); then glxgears >100 fps,
+ioquake3 GL1 >60 fps, GL2 >30 fps.  glmark2 work matters only where it
+unblocks generic paths ioquake3 needs.  This is not a claim of GL feature
+completion.
 
 ## Trees and current target
 
@@ -13,109 +13,157 @@ GL feature completion.
   nested Chrome9 repo at `drivers/gpu/drm/chrome9`.
 - Mesa: `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2`, with
   nested Chrome9 repo at `src/gallium/drivers/chrome9`.
+- Tools: `tools/` (own repo); research notes: `docs/` (own repo).
 - T2 sysroot: `/srv/t2/build/x86-64-desktop-26.9.15-desktop-x86-64-nocona-linux/`.
 - Test target: `root@192.168.2.60`, kernel `7.2.5-t2`, VX900 `1106:7122`.
-  Revalidate connectivity, module identity and GPU health before any new run.
-- At last read-only check: Xorg PID 8551, `renderD128` present, no new kernel
-  fault and no GPU-lock owner.  Live module Build ID
-  `5a605b25f17a6187da7abfcf5e7d69ab9e0e4001`, SHA-256
-  `07b1c6856c122daee7faf82070a0865332a80e235f1c0fce89c3f4f03a32b703`,
-  with `cursor_sf=Y` and `fragment_sparse_textures=Y`.
-- Target persistent artifacts are below `/root/tmp/chrome9-live/`, especially
-  `shadow-a28-20260924/`, `shadow-inspect-20260924/`, and
-  `sparse-s5-20260924/`.  Do not use a volatile target `/tmp` for handoff
-  artifacts.
+- Last live state: stencil module loaded, SHA-256
+  `2d8c0a158e59525f18ed5e3f6b44f8a539c77f10edec99db721c7dde3535fd0a`,
+  Build ID `b0b0a2e199cec812328724ad85e6749f99c8ec0d` (deployed 11:57 UTC),
+  Xorg PID 9392, no new kernel fault.  Revalidate connectivity, Build ID, Xorg
+  PID, `renderD128`, `lslocks` and the dmesg delta before any new run.
+- Rollback module (shadow fix only, no stencil): SHA-256
+  `76934b91623d4c22240dffc33285182f4308047039e1146ccf819fa08a7cc50f`,
+  Build ID `aec88bb5cd29c7afa5d44ec107ef1716193c5099`.
+- Target persistent artifacts are below `/root/tmp/chrome9-live/`; do not use
+  the volatile target `/tmp` for handoff artifacts.
 
-## Exact current evidence
+## Resolved: glmark2 shadow computed-coordinate blocker
 
-The Chrome9 command/GART, KMS/glamor, guarded 3D render, D16, blending,
-texture fetch and sparse five-texture paths have live coverage, but the
-renderer is not general or GL 2.1 conformant.  The current 2x1 X8Z24
-computed-coordinate shadow diagnostic is the immediate blocker:
+Kernel `561cc56` keeps the ALU-read W lane in the textured FE consumer width
+(A01-A03, A28/A29); `3926dbc` had capped it and dropped that lane.  The
+vendor-terminal, threshold/sample and complete projected-shadow oracles pass
+on silicon with the fixed module.  Mesa lowers `flt`/`iand`/`bcsel` into the
+matching nested-CMP graph.  Packets, hashes and the negative-run chain are in
+[`chrome9-glmark-shadow-depth-proxy.md`](chrome9-glmark-shadow-depth-proxy.md).
 
-| VX900 guarded test | Result |
-|---|---|
-| Four-op RCP/MUL/biased-ADD/full-COLOR without TEX | Pass, all BGRA lanes `8c` ±1; D16/guards/source intact |
-| Known-good sparse five-texture test after new module handoff | Pass, RGB `50/44/30` with guards/source intact |
-| Five-op threshold/sample inspection on old and A28-corrected modules | Same wrong pixels `00ffcc00`, `00ffcc00`, `00003300`; expected `008c3300`, `008ccc00`, `008c3300` |
-| Five-op inspection with vendor XYXY bridge on new module | Same wrong pixels; clean retirement, X/render healthy |
+With the matching Mesa library and `CHROME9_EXPERIMENTAL_X8Z24=1`, bounded
+`glmark2 shadow:nframes=1` no longer reports an unsupported shader or FBO
+error; it exits with `Validation: Unknown`, not a correctness pass.  Without
+the experimental depth gate the FBO is incomplete (`0x8cd6`), as expected.
 
-The A28/A29 source correction is kernel commit `3926dbc`; source, module build,
-and a native-object selftest are present.  The live A/B shows that A28 alone
-does not fix the pixels.  The vendor XYXY bridge alone also does not.  The
-Linux 5.75/Windows audit found no remaining descriptor/TAU byte difference
-for this test: X8Z24 image and clamp/nearest sampler, `TAU=301211b0`, PS
-controls and FE tuple match.  The inspection-only terminal ADD remains a
-native-program difference.  See
-[`chrome9-glmark-shadow-depth-proxy.md`](chrome9-glmark-shadow-depth-proxy.md)
-for packets, hashes, and the negative-run chain.
+## Stencil — uncommitted, kernel silicon-tested
 
-## Prepared next test — do not run while paused
+- UAPI: `DRM_CHROME9_FRAGMENT_STENCIL` flag, `DRM_CHROME9_STENCIL_OP_*`
+  (native order, INVERT=5), `struct drm_chrome9_stencil_state {cw, ccw}`
+  carved from `reserved[]` (struct size unchanged), cap bit 57
+  `DRM_CHROME9_CAP_FRAGMENT_STENCIL`.
+- Kernel (`chrome9_engine.c`, `chrome9_drv.c`): `chrome9_lower_stencil()`
+  (cw to A23/A24, ccw to A25/A26), `chrome9_validate_stencil()`,
+  `chrome9_stencil_selftest()`, A01 bit 4.  Stencil requires DEPTH with X8Z24
+  (A12=`123e0000` is D24S8).  Built W=1 clean; this is the live module above.
+- Oracle: `tools/re/chrome9_stencil_guard_smoke.c`, modes `--compare-mask`,
+  `--write-mask`, `--ops`, `--depth-fail`, `--faces`.  Built with host
+  `cc -Wall -Wextra -Werror`; every mode passed under the target GPU lock.
+  `--faces` confirms A23/A24 maps to screen-space clockwise winding.
+- Mesa, built in the T2 full build but **not yet GL stencil-tested**:
+  - `include/drm-uapi/chrome9_drm.h` synced with the kernel UAPI.
+  - `chrome9_format_is_d24()` covers X8Z24 and S8_UINT_Z24_UNORM (depth
+    31:8, stencil 7:0); S8Z24 is allocatable behind `CHROME9_EXPERIMENTAL_X8Z24`
+    plus `DRM_CHROME9_CAP_FRAGMENT_STENCIL`.
+  - `ctx->stencil_ref`, `ctx->fragment_stencil`; `chrome9_draw_state_supported`
+    admits stencil only on the generic fragment path with S8Z24 (stencil
+    without depth test runs as depth ALWAYS + READ_ONLY).
+  - `chrome9_triangle_stencil()` resolves the GL face per triangle like Draw's
+    cull stage and mirrors it into both native blocks, so native face
+    orientation does not matter; batches split on stencil differences through
+    the draw-struct key.
+  - `chrome9_clear`/`chrome9_clear_depth_stencil` do CPU stencil clears
+    honouring the write mask and per-channel masked 32-bpp colour clears via
+    `chrome9_clear_zs_target` and `chrome9_clear_target_masked`.  The old
+    `chrome9_clear_depth_target` has no remaining caller.
+- Next check: `tools/re/chrome9_gl_stencil_smoke.c` (GLX, run with
+  `CHROME9_EXPERIMENTAL_X8Z24=1`) exercises Gallium stencil state, clear and
+  renderbuffer paths end to end.  It has not run yet.
 
-Tools commit `2673e13` adds `--inspect-vendor-terminal` to
-`tools/re/chrome9_shadow_fragment_guard_smoke.c`.  It retains the guarded
-five-op prefix, vendor XYXY bridge, and exact vendor terminal
-`ADD oC0,r0.xxxx,r2.xxxx` (`02020000 00140924 00f20000 00000820`).
-Expected host BGRA is `bfbfbfbf`, `ffffffff`, `bfbfbfbf`, with one-byte
-tolerance, D16 `8000`, unchanged source and full BO/exterior guards.  The
-strict offline build passed; binary SHA-256 is
-`4f617495f56e66a44066db304a563429283e2f7c99a6d90b4524acb0f3083d97`.
-It is **not silicon-tested**.  The exact rebuild command from the workspace is:
+## General select lowering — uncommitted, offline-tested
 
-```sh
-cc -std=c11 -O2 -Wall -Wextra -Werror -Wpedantic -D__user= \
-  -I src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/include/uapi/drm \
-  tools/re/chrome9_shadow_fragment_guard_smoke.c \
-  -o /tmp/chrome9_shadow_fragment_guard_smoke_vendor_terminal
-```
+`chrome9_context.c`: `chrome9_ps_emit_predicate_select()` lowers a scalar
+boolean predicate without integer ops: `fge`/`flt` as SUB+CMP (arms exchanged
+for `flt`), `feq`/`fneu` as two ordered differences with nested CMP,
+`iand`/`ior` as nested CMP, `inot` by exchanging arms, constant booleans
+folded.  Operands must pass `chrome9_ps_default_finite`; `preserve_nan` is
+rejected.  `chrome9_ps_lower_general_select()` is the last `bcsel` fallback
+after the range-proven lowerings and also lowers `b2f32`.  The T2 Mesa full
+build and `chrome9-shader-nir-test` pass, with new cases for `b2f32(fge)`,
+`flt && fge`, `feq`, `fneu`, `ior`, `inot` and `preserve_nan` rejection; the
+old general-select expectation was updated.  Pixel correctness still needs a
+bounded scene comparison.  This covers roadmap G3's `b2f32(flt)`.
 
-On resumption, independently review this tool diff, revalidate the target,
-stage/hash-check the binary in target `/root/tmp`, and perform at most one
-bounded locked draw with immediate dmesg/X/render checks.  A pass would
-isolate the prior failure to the inspection-only terminal lane packing; a
-failure would keep the computed-TEX/phase or sample-return route open.  Do
-not turn either outcome into a product fix without a source-backed mechanism.
+## Completed read-only RE (this session)
+
+- [`chrome9-hw-tcl-re.md`](chrome9-hw-tcl-re.md) with
+  [`chrome9-hw-tcl-vs-corpus.json`](chrome9-hw-tcl-vs-corpus.json): VS ISA,
+  finaliser/viewport constants, VS constant selectors, per-element vertex
+  streams, inline-index draws, vendor fixed-function VS; the first silicon VS
+  test is defined but has not run.
+- [`ioquake3-blocker-roadmap-re.md`](ioquake3-blocker-roadmap-re.md): ranked
+  GL1/GL2 blockers; FACE back-colour producer (corpus
+  [`chrome9-face-bfc-oracle-corpus.tsv`](chrome9-face-bfc-oracle-corpus.tsv));
+  PS capacity is exactly 96 ALU + 32 TEX, 12 temps, no flow control, so extra
+  room must come from Mesa scheduling.
+- [`chrome9-throughput-re.md`](chrome9-throughput-re.md): every cmd22 ioctl
+  clflushes every target/depth/texture BO twice (about 9 MiB per ioctl at
+  1024x768; estimated 0.7-4.8 GiB per frame), plus a 64 KiB staging memset, a
+  per-ioctl fragment recompile and a synchronous 3-phase poll whose DST_POS
+  cookie allows one job in flight.  Ranked fixes: BO ownership tracking
+  instead of whole-object clflush, FE33 fence IDs with async retirement, one
+  multi-draw submit per flush, persistent command pages, compiled-program
+  cache, then VB draws with inline indices and HW VS.  Measure first with
+  debugfs phase counters.  Its errata for the PCI 7122 kickoff register
+  (`0xb8be0`, chip row 4) were added to `cr-pause-stop-lifecycle.md`,
+  `monotonic-command-ring.md`, `persistent-batched-submit-performance-plan.md`
+  and `vendor-state-reuse-performance-audit.md`.
+
+## Next steps, in order
+
+1. Run `chrome9_gl_stencil_smoke` on the target with the matching Mesa build;
+   then commit kernel, UAPI and Mesa stencil plus the general select lowering.
+2. ioquake3 GL1: kind-7 cookie timeout discriminators; uncapped q3dm1
+   reference frame (q3dm17 black space still needs a known-good reference, see
+   `ioquake3-gl1-shipped-material-add-census.md`).
+3. ioquake3 GL2 (first map on the no-FBO path; Mesa lacks
+   `mixed_framebuffer_sizes`): silicon pixel check of the lightall lightmap,
+   software two-sided FACE marker, alpha modes 1/2, uncapped GL2 run.
+4. Throughput: debugfs phase counters, then the ranked fixes above.
+5. Hardware TCL: first silicon VS test from `chrome9-hw-tcl-re.md`.
+
+Remaining glmark2 boundaries, relevant only where they share a generic path:
+terrain's noise pass exceeds the 96-record ALU store
+([`chrome9-glmark-terrain-scene-current-boundary.md`](chrome9-glmark-terrain-scene-current-boundary.md));
+refract has the default Z16 depth-sampling conflict and, with X8Z24, a
+zero-sign `bcsel(flt)` gap that the general select lowering may now cover.
+Gouraud cat and three vertex-loop variants report `Validation: Success`.
 
 ## Lock and rollback safety
 
-Every GPU draw uses the shared target lock
-`/tmp/chrome9-vx900-gpu.lock`, e.g. `flock -w 5 -x ... timeout -k 2s 12s`.
-For a script that starts Xorg, use **`flock -x -o`** so Xorg cannot inherit the
-lock descriptor.  The first A28 handoff accidentally used `flock -x` without
-`-o`; the next diagnostic waited on Xorg's inherited lock and never reached
-the GPU.  It was stopped; Xorg was restarted once under `flock --close`,
-restoring a free lock.  This was not a GPU wedge.  The hash-gated
-`tools/chrome9_shadow_a28_handoff.sh` now rejects an inherited lock FD and
-supports `deploy|rollback`, preserving cursor and sparse mode.  Never use the
-older cursor or sparse rollback scripts for this module: their target build
-or parameter mode differs.  Never force-unbind or unload after a failed
-quiesce/timeout; inspect and cold-boot if necessary.
+Every GPU draw uses the shared target lock `/tmp/chrome9-vx900-gpu.lock`,
+e.g. `flock -w 5 -x ... timeout -k 2s 12s`.  A script that starts Xorg must
+use **`flock -x -o`** so Xorg cannot inherit the lock descriptor; an inherited
+FD once blocked every later GPU test.  Module swaps use the generic
+hash-gated `tools/chrome9_module_handoff.sh` (NEW/OLD paths, SHA-256 and Build
+IDs from the environment, `deploy|rollback`, engine quiesce, rejects an
+inherited lock FD).  Never force-unbind or unload after a failed quiesce or
+timeout; inspect and cold-boot instead.
 
-## Other scene boundaries and priorities
+## Repository state
 
-- Gouraud cat and three vertex-loop variants have reported glmark2
-  `Validation: Success`; the native vertex/TCL backend is still absent, so
-  vertex shaders execute in Gallium Draw software.  Gouraud has a documented
-  16-triangle cmd22 batch performance cost.
-- Terrain's main linked pair compiles to 73 semantic records (68 ALU + 5 TEX)
-  but its earlier procedural noise pass first rejects 28 `b2f32(fge)` values
-  and has a lower bound of 100 non-fusible ALUs before other operations,
-  exceeding the current 96-record store.  Implementing only `b2f` cannot
-  complete the scene.  See
-  [`chrome9-glmark-terrain-scene-current-boundary.md`](chrome9-glmark-terrain-scene-current-boundary.md).
-- Refract still has the default Z16 depth-sampling conflict and, with X8Z24
-  enabled, a zero-sign `bcsel(flt)` fragment lowering gap.  Other glmark2
-  variants are not all validated; do not claim scene-wide completion.
-- ioquake3 GL1 material paths have partial live coverage, not full gameplay
-  correctness.  GL2 default lightall still has FACE/resource/compiler
-  blockers.  Keep the agreed scene order: complete glmark2, then GL1, then
-  GL2, while doing safe read-only RE ahead.
+Committed: kernel `3926dbc`, `561cc56`; tools `a806006`, `2673e13`, `47695b0`;
+Mesa Chrome9 `722d91b`, `d56f61f`; docs `469ebf9`.
 
-## Repository and ownership notes
+Uncommitted, this lane:
+- Kernel Chrome9: `chrome9_drv.c`, `chrome9_engine.c` (stencil); UAPI
+  `include/uapi/drm/chrome9_drm.h` in the untracked kernel tree.
+- Mesa: `include/drm-uapi/chrome9_drm.h`; Chrome9 `chrome9_context.[ch]`,
+  `chrome9_draw.c`, `chrome9_format.[ch]`, `chrome9_resource.c`,
+  `chrome9_shader_nir_test.c`.
+- Tools: `re/chrome9_stencil_guard_smoke.c`, `re/chrome9_gl_stencil_smoke.c`,
+  `re/chrome9_cmd22_cost_model.c`, `re/chrome9_face_bfc_oracle_check.py`,
+  `re/chrome9_tcl_*`, `re/chrome9_umd_*`, `re/chrome9_win_draw_submit_audit.py`.
 
-Relevant commits: kernel `3926dbc`; tools `f624356`, `affbd97`, `a806006`,
-`2673e13`; Mesa Chrome9 `722d91b`, `d56f61f`.  The research note and this
-handoff are in the `docs` nested repository.  At pause, the kernel Chrome9
-and Mesa Chrome9 nested repos were clean.  Preserve unrelated dirty work:
-`tools/chrome9_alpha_depth.c` and the existing modified/untracked research
-files outside the shadow note and this handoff belong to other lanes/the user.
+Preserve unrelated dirty work from other lanes: `tools/chrome9_alpha_depth.c`,
+and in `docs/research` the glmark2 notes and corpora dated 2026-09-23
+(`glmark2-generic-*`, `glmark2-framebuffer-raster-state-contract.md`,
+`chrome9-glmark-*-corpus.tsv`, `chrome9-glmark-blend-mip-closure.md`),
+`hardware-lab.md`, `chrome9-ps-component-allocation-boundary.md`,
+`ioquake3-gl2-eight-unit-linkage.md` and
+`ioquake3-gl1-shipped-material-add-census.md`.

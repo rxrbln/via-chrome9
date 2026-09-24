@@ -9,6 +9,9 @@ targets.
 
 ## Documents
 
+- [chrome9-handoff-2026-09-24.md](chrome9-handoff-2026-09-24.md) is the
+  current resume point: goal, live module, uncommitted stencil and select
+  work, ranked next steps and target safety rules.
 - [mesa-ps-encoder-v1.md](mesa-ps-encoder-v1.md) defines the first bounded
   Mesa NIR-to-native fragment encoder, operand packing, closed scheduler
   tuples, dependency constraints, and byte-exact golden tests.
@@ -465,6 +468,13 @@ targets.
   identifies ioquake3's exact default six-active/seven-logical sampler limit,
   derives Chrome9 stages 2..7 FE/FVF/VS state, records stage-7 and five-sample
   compiler objects, and orders guarded promotion without falsely exposing 8.
+- [ioquake3-blocker-roadmap-re.md](ioquake3-blocker-roadmap-re.md) ranks the
+  remaining ioquake3 GL1/GL2 first-map blockers and records the vendor
+  back-face-colour FACE producer, the D3DCAPS9/FORMATOP and ARB program
+  limits, and the absence of a larger PS store or PS flow control.
+- [chrome9-face-bfc-oracle-corpus.tsv](chrome9-face-bfc-oracle-corpus.tsv)
+  retains the byte-exact back-colour VS and face-sign PS compiler rows; replay
+  with [`../../tools/re/chrome9_face_bfc_oracle_check.py`](../../tools/re/chrome9_face_bfc_oracle_check.py).
 - [wine-closed-key-shader-differentials.md](wine-closed-key-shader-differentials.md)
   records reproducible Wine compiler differentials for the next closed
   fragment keys, exact Xorg two-texture alpha objects in both orientations,
@@ -609,6 +619,11 @@ targets.
   cache, batched PTE invalidation, eviction/quarantine rules, counters, and
   deployment order aimed at removing measured per-triangle submission cost
   without weakening hang containment.
+- [chrome9-throughput-re.md](chrome9-throughput-re.md) statically profiles
+  the current cmd22 path (whole-object clflush, synchronous retirement,
+  per-ioctl recompile), recovers the Linux 5.75 and Windows VX900 vertex
+  buffer, inline-index, batching, relocation and branch recipes, and ranks
+  throughput changes.
 - [single-32k-list-kernel-patch-audit.md](single-32k-list-kernel-patch-audit.md)
   turns the first untextured 32-KiB list into an exact kernel-only patch
   checklist, quantifies the live 34-triangle PTE/VGA/cache cost, specifies
@@ -643,6 +658,12 @@ targets.
   test strategy.
 - [registers/README.md](registers/README.md) defines the register database and
   coverage rules used to turn the manuals into an auditable specification.
+- [chrome9-hw-tcl-re.md](chrome9-hw-tcl-re.md) consolidates the hardware-TCL
+  reverse engineering: VS ISA, finalizer/viewport internal constants, VS
+  constant selectors, per-element vertex streams, inline-index draws,
+  vendor fixed-function VS shaders and the first silicon VS test; its
+  Linux/Windows compiler corpus is
+  [chrome9-hw-tcl-vs-corpus.json](chrome9-hw-tcl-vs-corpus.json).
 
 ## Evidence convention
 

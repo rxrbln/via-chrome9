@@ -1,5 +1,7 @@
 # Chrome9 CR PAUSE, STOP, and ring-replacement lifecycle
 
+> **Erratum (2026-09-24):** for PCI 7122 the Windows KMD uses chip row 4, whose kickoff is `0xb8be0` with 16-byte padding; `0xc8190` belongs to row 1 (1122/5122).  See [chrome9-throughput-re.md](chrome9-throughput-re.md#41-corrections-to-earlier-notes).  The live-proven 128-byte closure is unaffected.
+
 This note isolates the command-reader lifecycle needed after the live VX900
 post-gears timeout.  It deliberately does not propose accepting an active
 reader as complete.
