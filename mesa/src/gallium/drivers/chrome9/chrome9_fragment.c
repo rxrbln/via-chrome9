@@ -21,6 +21,16 @@ chrome9_fragment_sampler_slots_dense(uint8_t sampler_mask)
       sampler_mask)) - 1;
 }
 
+unsigned
+chrome9_fragment_descriptor_unit(uint8_t sampler_mask, unsigned descriptor)
+{
+   unsigned mask = sampler_mask;
+
+   for (unsigned i = 0; i < descriptor && mask; i++)
+      mask &= mask - 1;
+   return mask ? __builtin_ctz(mask) : DRM_CHROME9_FRAGMENT_MAX_TEXTURES;
+}
+
 static unsigned chrome9_fragment_source_count(enum chrome9_ps_opcode op);
 
 static bool

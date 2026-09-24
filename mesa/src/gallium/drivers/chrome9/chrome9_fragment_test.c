@@ -94,6 +94,14 @@ check_sparse_sampler_ids(void)
    CHECK(chrome9_fragment_sampler_slots_dense(0xff));
    CHECK(!chrome9_fragment_sampler_slots_dense(0x37));
    CHECK(!chrome9_fragment_sampler_slots_dense(0x80));
+   for (unsigned i = 0; i < 5; i++)
+      CHECK(chrome9_fragment_descriptor_unit(0x37, i) == logical[i]);
+   CHECK(chrome9_fragment_descriptor_unit(0x20, 0) == 5);
+   CHECK(chrome9_fragment_descriptor_unit(0x07, 2) == 2);
+   CHECK(chrome9_fragment_descriptor_unit(0x37, 5) ==
+         DRM_CHROME9_FRAGMENT_MAX_TEXTURES);
+   CHECK(chrome9_fragment_descriptor_unit(0, 0) ==
+         DRM_CHROME9_FRAGMENT_MAX_TEXTURES);
    for (unsigned i = 0; i < 5; i++) {
       ir.instruction[i].op = CHROME9_PS_OPCODE_TEX;
       ir.instruction[i].sampler = logical[i];

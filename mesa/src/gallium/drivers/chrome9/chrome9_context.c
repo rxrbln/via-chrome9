@@ -5013,6 +5013,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
          DRM_CHROME9_CAP_DRAW_PROGRAM_TRIANGLE_D16_RHW_BATCH);
    ctx->draw_fragment_program =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
+   ctx->fragment_sparse_textures =
+      !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =
