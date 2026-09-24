@@ -17,6 +17,15 @@
 #include "pipe/p_screen.h"
 #include "tgsi/tgsi_exec.h"
 
+static void
+set_identity_swizzle(struct pipe_sampler_view *view)
+{
+   view->swizzle_r = PIPE_SWIZZLE_X;
+   view->swizzle_g = PIPE_SWIZZLE_Y;
+   view->swizzle_b = PIPE_SWIZZLE_Z;
+   view->swizzle_a = PIPE_SWIZZLE_W;
+}
+
 static bool
 test_linear_mips(void)
 {
@@ -54,6 +63,7 @@ test_linear_mips(void)
    view.texture = &resource.base;
    view.target = resource.base.target;
    view.format = resource.base.format;
+   set_identity_swizzle(&view);
    view.u.tex.first_level = 1;
    view.u.tex.last_level = 2;
 
@@ -149,6 +159,8 @@ test_sampler(void)
    view5.texture = &resource5.base;
    view3.target = view5.target = PIPE_TEXTURE_2D;
    view3.format = view5.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+   set_identity_swizzle(&view3);
+   set_identity_swizzle(&view5);
    ctx.vs_sampler_views[3] = &view3;
    ctx.vs_sampler_views[5] = &view5;
    if (!chrome9_vs_texture_mapping(&view3, &ctx.vs_texture_mappings[3]) ||
@@ -198,7 +210,7 @@ test_sampler(void)
 }
 
 static nir_shader *
-make_two_sample_vertex_shader(bool explicit_lod)
+make_two_sample_vertex_shader(bool explicit_lod, bool sparse_slots)
 {
    static const nir_shader_compiler_options options = {0};
    nir_builder b = nir_builder_init_simple_shader(
@@ -207,7 +219,9 @@ make_two_sample_vertex_shader(bool explicit_lod)
       &b, 2, 32, nir_imm_int(&b, 0),
       .io_semantics.location = VERT_ATTRIB_TEX0);
    nir_def *sample[2];
-   const unsigned slots[2] = {3, 5};
+   const unsigned slots[2] = {
+      sparse_slots ? 3 : 0, sparse_slots ? 5 : 1,
+   };
 
    b.shader->info.io_lowered = true;
    for (unsigned i = 0; i < 2; i++) {
@@ -253,7 +267,7 @@ make_two_sample_vertex_shader(bool explicit_lod)
 }
 
 static bool
-test_draw_vertex_samples(bool explicit_lod)
+test_draw_vertex_samples(bool explicit_lod, bool sparse_slots)
 {
    uint8_t image3[160] = {0}, image5[160] = {0};
    struct chrome9_resource resource3 = {0}, resource5 = {0};
@@ -275,6 +289,8 @@ test_draw_vertex_samples(bool explicit_lod)
    struct draw_buffer_info constants[PIPE_MAX_CONSTANT_BUFFERS] = {0};
    float output[4][2][4] = {{{0}}};
    int position_slot = -1, varying_slot = -1;
+   const unsigned slot3 = sparse_slots ? 3 : 0;
+   const unsigned slot5 = sparse_slots ? 5 : 1;
    bool success = false;
 
    resource3.base.target = resource5.base.target = PIPE_TEXTURE_2D;
@@ -303,17 +319,19 @@ test_draw_vertex_samples(bool explicit_lod)
    view5.texture = &resource5.base;
    view3.target = view5.target = PIPE_TEXTURE_2D;
    view3.format = view5.format = PIPE_FORMAT_B8G8R8A8_UNORM;
-   ctx.vs_sampler_views[3] = &view3;
-   ctx.vs_sampler_views[5] = &view5;
-   if (!chrome9_vs_texture_mapping(&view3, &ctx.vs_texture_mappings[3]) ||
-       !chrome9_vs_texture_mapping(&view5, &ctx.vs_texture_mappings[5])) {
+   set_identity_swizzle(&view3);
+   set_identity_swizzle(&view5);
+   ctx.vs_sampler_views[slot3] = &view3;
+   ctx.vs_sampler_views[slot5] = &view5;
+   if (!chrome9_vs_texture_mapping(&view3, &ctx.vs_texture_mappings[slot3]) ||
+       !chrome9_vs_texture_mapping(&view5, &ctx.vs_texture_mappings[slot5])) {
       fputs("draw vertex texture mapping failed\n", stderr);
       return false;
    }
    state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_LINEAR;
    state.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
    state.wrap_s = state.wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
-   ctx.vs_sampler_states[3] = ctx.vs_sampler_states[5] = &state;
+   ctx.vs_sampler_states[slot3] = ctx.vs_sampler_states[slot5] = &state;
    ctx.base.screen = &screen;
    ctx.draw = draw_create_no_llvm(&ctx.base);
    if (!ctx.draw) {
@@ -327,7 +345,7 @@ test_draw_vertex_samples(bool explicit_lod)
    }
    draw_texture_sampler(ctx.draw, MESA_SHADER_VERTEX, ctx.vs_tgsi_sampler);
    draw_set_rasterizer_state(ctx.draw, &rasterizer, &rasterizer);
-   nir = make_two_sample_vertex_shader(explicit_lod);
+   nir = make_two_sample_vertex_shader(explicit_lod, sparse_slots);
    if (!nir)
       goto out;
    struct pipe_shader_state shader_state = {
@@ -340,8 +358,9 @@ test_draw_vertex_samples(bool explicit_lod)
    nir = NULL;
    if (!shader || shader->info.num_inputs != 1 ||
        shader->info.num_outputs != 2) {
-      fprintf(stderr, "vertex shader setup failed: explicit=%u shader=%p "
-              "inputs=%u outputs=%u\n", explicit_lod, (void *)shader,
+      fprintf(stderr, "vertex shader setup failed: explicit=%u sparse=%u "
+              "shader=%p inputs=%u outputs=%u\n", explicit_lod,
+              sparse_slots, (void *)shader,
               shader ? shader->info.num_inputs : 0,
               shader ? shader->info.num_outputs : 0);
       goto out;
@@ -371,8 +390,9 @@ test_draw_vertex_samples(bool explicit_lod)
                  fabsf(varying[1] - expected_varying_y[vertex]) < 0.0001f &&
                  varying[2] == 0.0f && varying[3] == 1.0f;
       if (!success)
-         fprintf(stderr, "vertex %u explicit=%u output pos=(%g,%g,%g,%g) "
-                 "varying=(%g,%g,%g,%g)\n", vertex, explicit_lod,
+         fprintf(stderr, "vertex %u explicit=%u sparse=%u "
+                 "output pos=(%g,%g,%g,%g) varying=(%g,%g,%g,%g)\n",
+                 vertex, explicit_lod, sparse_slots,
                  position[0], position[1], position[2], position[3],
                  varying[0], varying[1], varying[2], varying[3]);
    }
@@ -397,8 +417,13 @@ main(void)
       fputs("vertex texture callback failed\n", stderr);
       return 1;
    }
-   if (!test_draw_vertex_samples(false) ||
-       !test_draw_vertex_samples(true)) {
+   /* Raw NIR can name high slots; linked GL uses dense shader slots even
+    * when its sampler uniforms point at higher application texture units.
+    */
+   if (!test_draw_vertex_samples(false, true) ||
+       !test_draw_vertex_samples(true, true) ||
+       !test_draw_vertex_samples(false, false) ||
+       !test_draw_vertex_samples(true, false)) {
       fputs("chrome9 vertex texture mapping failed\n", stderr);
       return 1;
    }
