@@ -286,3 +286,48 @@ closed.  The next useful change is dynamic positive-normal FLT, followed by
 the zero-threshold signed-unit proof and side-effect-free Boolean-AND rewrite.
 This machinery remains separate from the narrower FRC threshold proof used
 by `conditionals` and from the projected-depth proof used by `shadow`.
+
+## Next bounded compiler contract
+
+The remaining three predicates can be admitted without an unrestricted
+ordered-compare lowering.  The next implementation should track two more
+generic facts:
+
+1. a normalized-vector component produced as
+   `x_i * rsq(dot(x,x))`, with the same source/swizzles on both dot operands
+   and no exceptional-value preservation request; and
+2. a positive-normal floor produced as `positive_normal + nonnegative`,
+   again with no exceptional-value preservation request.
+
+From those facts, a dot of two proved normalized vectors is a bounded signed
+value, while `.1 + .3*max(NdotL,0)` has a positive-normal floor.  They justify
+only these source forms:
+
+```text
+flt(positive_normal_constant, nonnegative)
+flt(bounded_normalized_dot, positive_normal_floor)
+flt(+0, bounded_normalized_dot)
+```
+
+The first covers `.5 < attenuation*specular`.  The second covers the outline
+test.  The last uses the live DP3/default-FTZ result above for `0 < NdotL`.
+All three still reject direct unbounded varyings, exceptional-preserving
+producer nodes, and a dynamic threshold lacking the positive floor.
+
+Native CMP selects C when the subtraction condition is nonnegative.  For
+`flt(a,b)`, emit `SUB(a,b)` but place the source true arm in CMP B and the
+false arm in C.  Equality then follows the false arm, so this is strict less
+than rather than less-or-equal.  Keep the existing live-lane predicate
+broadcast (`XXX0` for vec3) and inactive ZERO arm selectors.
+
+The final Boolean is value-only NIR.  The exact safe transformation is:
+
+```text
+bcsel(iand(a,b), t, f) -> bcsel(a, bcsel(b,t,f), f)
+```
+
+Require scalar Boolean `a` and `b`, side-effect-free SSA arms, and no
+terminate/discard dependence.  Regression cases must cover all four truth
+combinations and reject vector predicates.  After those pieces, the exact
+linked cel NIR must be recompiled and measured; source-level algebra alone
+does not prove its 12-physical-temporary fit.
