@@ -301,16 +301,18 @@ MOV color, d.xxxx
 ```
 
 The Linux 5.75 production compiler was run offline with this exact PS 2.0
-sequence and configuration-two finalization.  It emits 31 ALU records, no
-TAU, active resources `(1,3,1,0)`, A90=`90058001`, and A92=`9200001f`.
+sequence and configuration-two finalization.  Using the same alternating
+two-register schedule chosen by the kernel lifetime allocator, it emits 31
+ALU records, no TAU, active resources `(1,2,1,0)`, A90=`90058001`, and
+A92=`9200001f`.
 The first iteration is byte-exact:
 
 ```text
 0140b6d0 d008016d 0012c016 00000020  MUL  T0.x,3
 01c00530 d01c0053 00100016 000e0060  FRC
 0140b6d0 d000116d 00100116 00000020  MUL  x,x
-01c00530 801c0053 001000b6 000700a0  RSQ
-01c00530 801c0053 001002b6 00060020  RCP
+01c00530 801c0053 001000b6 00070060  RSQ
+01c00530 801c0053 001001b6 00060020  RCP
 01c00530 d01c0053 00100016 000e0060  FRC
 ```
 
@@ -318,7 +320,7 @@ The fifth iteration has the same schedule.  Its last RCP/FRC gain the normal
 last-use bits and the object terminates with:
 
 ```text
-01c00530 801c0053 001202b6 00060020
+01c00530 801c0053 001001b6 00060020
 01c00530 d01c0053 00120016 000e0060
 01c00530 001c0053 00f20100 000d0820
 ```
@@ -333,10 +335,18 @@ modes with this 31-instruction shape:
   sentinel with exact zero.
 
 Both modes use SSA-distinct semantic temporaries so the kernel's production
-lifetime allocator is exercised.  They check a 3x3 interior sample grid,
-D16, untouched exterior pixels, and both color/depth guards.  A strict C11
-`-Wall -Wextra -Werror` host build passes.  Neither mode was submitted by this
-audit.
+lifetime allocator is exercised.  Every masked scalar source is explicitly
+`(X,ZERO,ZERO,ZERO)`; only the terminal full-color MOV uses `XXXX`.  Kernel
+self-test `chrome9_fragment_sqrt_chain_selftest()` compiles this exact
+31-instruction semantic program and compares all 124 native ALU dwords plus
+A90--A92 with the production object above.  This catches inactive selector,
+physical lifetime, release-bit, control-count, and resource-bucket drift
+before engine initialization.
+
+The raw modes check a 3x3 interior sample grid, D16, untouched exterior
+pixels, and both color/depth guards.  A strict C11 `-Wall -Wextra -Werror`
+host build and the kernel object build pass.  Neither mode was submitted by
+this audit.
 
 This prefix omits only the already-qualified fragment-coordinate arithmetic
 and the output-vector assembly from the 36-ALU scene program.  The five-step
