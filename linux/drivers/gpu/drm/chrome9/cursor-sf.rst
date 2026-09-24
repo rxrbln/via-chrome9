@@ -52,9 +52,10 @@ crosshair to hand2 left the *final* SF base at ``20014000``.  That alone was
 ambiguous: two image commits can toggle the private slots twice.  A second,
 temporary diagnostic build traced the first nine cursor atomic updates,
 framebuffer IDs, upload counts, and CRC32 of the packed source and active
-private image.  Crosshair CRC ``990e6ecc`` changed to ``a6d49d9f`` on the
-first shape commit and to hand2 CRC ``0671ec7f`` on the next.  Each shape
-change uploaded the new image twice, switching slots 1->0->1, with source
+private image.  Crosshair CRC ``990e6ecc`` changed to hand2 CRC
+``a6d49d9f`` after ``XDefineCursor``.  The later ``XUndefineCursor``
+restored the default cursor with CRC ``0671ec7f``.  Each shape change
+uploaded the new image twice, switching slots 1->0->1, with source
 and active-image CRCs equal at every step.  Pure position commits used the
 same framebuffer, uploaded nothing, and retained equal CRCs.  Therefore the
 unchanged final base was valid double-buffer parity, not a stale cursor.
