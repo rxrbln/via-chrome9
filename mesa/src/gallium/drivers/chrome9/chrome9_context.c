@@ -12,6 +12,7 @@
 #include "chrome9_resource.h"
 #include "chrome9_specialise.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -20,6 +21,7 @@
 #include "nir_builder.h"
 #include "tgsi/tgsi_parse.h"
 #include "util/format/u_format.h"
+#include "util/hash_table.h"
 #include "util/u_draw.h"
 #include "util/u_debug.h"
 #include "util/u_debug_cb.h"
@@ -2574,8 +2576,15 @@ chrome9_backend_source(const nir_alu_src *source,
    return identity || chrome9_backend_alpha_leaf(leaf);
 }
 
+struct chrome9_ps_proof {
+   unsigned budget;
+   void *mem_ctx;
+   struct hash_table_u64 *memo;
+};
+
 struct chrome9_ps_nir_builder {
    struct chrome9_ps_ir ir;
+   struct chrome9_ps_proof proof;
    struct {
       nir_def *def;
       struct chrome9_ps_source source;
@@ -3104,20 +3113,246 @@ chrome9_ps_unit_interval(nir_scalar scalar, unsigned *budget)
  * without a local exceptional-value preservation request may still overflow
  * or hit an undefined domain, but that result is not observably constrained
  * by NIR and therefore does not invalidate a later default-mode comparison. */
+/* Memoized DAG proofs: each (def, component, property) is derived once and
+ * the budget bounds the number of distinct nodes, not the tree expansion. */
+enum chrome9_ps_proof_kind {
+   CHROME9_PS_PROOF_FINITE,
+   CHROME9_PS_PROOF_NONNEGATIVE,
+   CHROME9_PS_PROOF_BOUND,
+};
+
+#define CHROME9_PS_PROOF_NODES 4096
+
+/* The memo is allocated lazily on the shader's ralloc context. */
+static struct hash_table_u64 *
+chrome9_ps_proof_table(struct chrome9_ps_proof *proof)
+{
+   if (!proof->memo)
+      proof->memo = _mesa_hash_table_u64_create(proof->mem_ctx);
+   return proof->memo;
+}
+
+static uint64_t
+chrome9_ps_proof_key(nir_scalar scalar, enum chrome9_ps_proof_kind kind)
+{
+   return ((uint64_t)scalar.def->index << 8) | scalar.comp << 2 | kind;
+}
+
+/* Budget one node; bounds are recomputed but their nodes are counted. */
 static bool
-chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
-                                     unsigned components, unsigned *budget);
+chrome9_ps_proof_visit(struct chrome9_ps_proof *proof, nir_scalar scalar,
+                       enum chrome9_ps_proof_kind kind)
+{
+   (void)scalar;
+   (void)kind;
+   if (!proof->budget)
+      return false;
+   proof->budget--;
+   return true;
+}
 
 static bool
-chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
+chrome9_ps_proof_memo(struct chrome9_ps_proof *proof, nir_scalar scalar,
+                      enum chrome9_ps_proof_kind kind,
+                      bool (*derive)(nir_scalar, struct chrome9_ps_proof *))
+{
+   uint64_t key;
+   void *known;
+   bool result;
+
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   key = chrome9_ps_proof_key(scalar, kind);
+   if (!chrome9_ps_proof_table(proof))
+      return false;
+   known = _mesa_hash_table_u64_search(proof->memo, key);
+   if (known)
+      return known == (void *)(uintptr_t)2;
+   if (!chrome9_ps_proof_visit(proof, scalar, kind))
+      return false;
+   result = derive(scalar, proof);
+   _mesa_hash_table_u64_insert(proof->memo, key,
+                               (void *)(uintptr_t)(result ? 2 : 1));
+   return result;
+}
+
+static bool
+chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
+                                     unsigned components, struct chrome9_ps_proof *proof);
+
+static nir_scalar
+chrome9_ps_alu_scalar(nir_alu_instr *alu, unsigned source, unsigned comp)
+{
+   return nir_scalar_resolved(alu->src[source].src.ssa,
+                              alu->src[source].swizzle[comp]);
+}
+
+/* True when a and b are the same value up to sign (fneg/fabs chains). */
+static bool
+chrome9_ps_same_magnitude(nir_scalar a, nir_scalar b)
+{
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar *s = i ? &b : &a;
+
+      while (nir_def_instr(s->def)->type == nir_instr_type_alu) {
+         nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(s->def));
+
+         if (alu->op != nir_op_fneg && alu->op != nir_op_fabs &&
+             alu->op != nir_op_mov)
+            break;
+         *s = chrome9_ps_alu_scalar(alu, 0, s->comp);
+      }
+   }
+   return a.def == b.def && a.comp == b.comp;
+}
+
+/* Upper bound of |value| for a finite-input DAG, INFINITY when unknown.
+ * normalize()'s v * rsq(dot(v, v)) is bounded by one plus rounding. */
+static float
+chrome9_ps_magnitude_bound_uncached(nir_scalar scalar,
+                                    struct chrome9_ps_proof *proof);
+
+static float
+chrome9_ps_magnitude_bound(nir_scalar scalar, struct chrome9_ps_proof *proof)
+{
+   uint64_t key;
+   void *known;
+   float bound;
+   uint32_t bits;
+
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   key = chrome9_ps_proof_key(scalar, CHROME9_PS_PROOF_BOUND);
+   if (!chrome9_ps_proof_table(proof))
+      return INFINITY;
+   known = _mesa_hash_table_u64_search(proof->memo, key);
+   if (known) {
+      bits = (uint32_t)(uintptr_t)known;
+      memcpy(&bound, &bits, sizeof(bound));
+      return bound;
+   }
+   bound = chrome9_ps_magnitude_bound_uncached(scalar, proof);
+   memcpy(&bits, &bound, sizeof(bits));
+   _mesa_hash_table_u64_insert(proof->memo, key,
+                               (void *)(uintptr_t)((uint64_t)bits | 1ull << 32));
+   return bound;
+}
+
+static float
+chrome9_ps_magnitude_bound_uncached(nir_scalar scalar,
+                                    struct chrome9_ps_proof *proof)
+{
+   nir_alu_instr *alu;
+   float a, b;
+
+   if (!chrome9_ps_proof_visit(proof, scalar, CHROME9_PS_PROOF_BOUND))
+      return INFINITY;
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   if (scalar.def->bit_size != 32)
+      return INFINITY;
+   if (nir_scalar_is_const(scalar)) {
+      float value = fabsf(nir_scalar_as_float(scalar));
+
+      return isfinite(value) ? value : INFINITY;
+   }
+   if (nir_def_instr(scalar.def)->type != nir_instr_type_alu)
+      return INFINITY;
+   alu = nir_instr_as_alu(nir_def_instr(scalar.def));
+   switch (alu->op) {
+   case nir_op_mov:
+   case nir_op_fneg:
+   case nir_op_fabs:
+      return chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 0, scalar.comp), proof);
+   case nir_op_fsat:
+      return 1.0f;
+   case nir_op_fmin:
+   case nir_op_fmax:
+      a = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 0, scalar.comp), proof);
+      b = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 1, scalar.comp), proof);
+      return MAX2(a, b);
+   case nir_op_fadd:
+   case nir_op_fsub:
+      a = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 0, scalar.comp), proof);
+      b = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 1, scalar.comp), proof);
+      return a + b;
+   case nir_op_fmul:
+      for (unsigned s = 0; s < 2; s++) {
+         nir_scalar factor = chrome9_ps_alu_scalar(alu, 1 - s, scalar.comp);
+         nir_scalar vector = chrome9_ps_alu_scalar(alu, s, scalar.comp);
+         nir_alu_instr *rsq, *dot;
+         unsigned n;
+         bool matched = false;
+
+         if (nir_def_instr(factor.def)->type != nir_instr_type_alu)
+            continue;
+         rsq = nir_instr_as_alu(nir_def_instr(factor.def));
+         if (rsq->op != nir_op_frsq ||
+             nir_def_instr(rsq->src[0].src.ssa)->type != nir_instr_type_alu)
+            continue;
+         dot = nir_instr_as_alu(nir_def_instr(rsq->src[0].src.ssa));
+         if (dot->op != nir_op_fdot2 && dot->op != nir_op_fdot3 &&
+             dot->op != nir_op_fdot4)
+            continue;
+         n = dot->op == nir_op_fdot2 ? 2 : dot->op == nir_op_fdot3 ? 3 : 4;
+         for (unsigned c = 0; c < n && !matched; c++)
+            matched = chrome9_ps_same_magnitude(
+                         chrome9_ps_alu_scalar(dot, 0, c),
+                         chrome9_ps_alu_scalar(dot, 1, c)) &&
+                      chrome9_ps_same_magnitude(
+                         chrome9_ps_alu_scalar(dot, 0, c), vector);
+         for (unsigned c = 0; c < n && matched; c++)
+            matched = chrome9_ps_same_magnitude(
+               chrome9_ps_alu_scalar(dot, 0, c),
+               chrome9_ps_alu_scalar(dot, 1, c));
+         if (matched)
+            return 1.0f + 4.0f * FLT_EPSILON;
+      }
+      a = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 0, scalar.comp), proof);
+      b = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 1, scalar.comp), proof);
+      return a * b;
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4: {
+      unsigned n = alu->op == nir_op_fdot2 ? 2 :
+                   alu->op == nir_op_fdot3 ? 3 : 4;
+      float sum = 0.0f;
+
+      for (unsigned c = 0; c < n; c++)
+         sum += chrome9_ps_magnitude_bound(
+                   chrome9_ps_alu_scalar(alu, 0, c), proof) *
+                chrome9_ps_magnitude_bound(
+                   chrome9_ps_alu_scalar(alu, 1, c), proof);
+      return sum;
+   }
+   default:
+      return INFINITY;
+   }
+}
+
+static bool
+chrome9_ps_default_finite_uncached(nir_scalar scalar,
+                                   struct chrome9_ps_proof *proof);
+
+static bool
+chrome9_ps_default_finite(nir_scalar scalar, struct chrome9_ps_proof *proof)
+{
+   return chrome9_ps_proof_memo(proof, scalar, CHROME9_PS_PROOF_FINITE,
+                                chrome9_ps_default_finite_uncached);
+}
+
+static bool
+chrome9_ps_default_finite_uncached(nir_scalar scalar,
+                                   struct chrome9_ps_proof *proof)
 {
    nir_instr *instr;
    nir_alu_instr *alu;
    unsigned sources = 0;
 
-   if (!*budget)
-      return false;
-   (*budget)--;
    scalar = nir_scalar_resolved(scalar.def, scalar.comp);
    if (scalar.def->bit_size != 32 || scalar.comp >= scalar.def->num_components)
       return false;
@@ -3136,16 +3371,38 @@ chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
-   /* FMAX is handled below only after both inputs prove that no defined
-    * exceptional value reaches it, making its preserve request vacuous. */
-   if ((alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan) &&
-       alu->op != nir_op_fmax)
-      return false;
+   /* Value-preserving ops cannot create an exceptional value from finite
+    * inputs, so their preserve request is vacuous.  Other flagged arithmetic
+    * is admitted only when a magnitude bound excludes overflow. */
+   if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan) {
+      switch (alu->op) {
+      case nir_op_mov:
+      case nir_op_fneg:
+      case nir_op_fabs:
+      case nir_op_fsat:
+      case nir_op_fmin:
+      case nir_op_fmax:
+         break;
+      case nir_op_fadd:
+      case nir_op_fsub:
+      case nir_op_fmul:
+      case nir_op_fdot2:
+      case nir_op_fdot3:
+      case nir_op_fdot4:
+         if (chrome9_ps_magnitude_bound(scalar, proof) < FLT_MAX)
+            break;
+         FALLTHROUGH;
+      default:
+         return false;
+      }
+   }
    switch (alu->op) {
    case nir_op_mov:
    case nir_op_fneg:
    case nir_op_fabs:
    case nir_op_fsat:
+   case nir_op_fexp2:
+   case nir_op_flog2:
    case nir_op_frcp:
    case nir_op_frsq:
    case nir_op_fsqrt:
@@ -3157,6 +3414,7 @@ chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
    case nir_op_fmul:
    case nir_op_fmin:
    case nir_op_fmax:
+   case nir_op_fpow:
       sources = 2;
       break;
    case nir_op_fdot2:
@@ -3167,7 +3425,7 @@ chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
 
       for (unsigned s = 0; s < 2; s++)
          if (!chrome9_ps_default_finite_alu_source(alu, s, components,
-                                                    budget))
+                                                    proof))
             return false;
       return true;
    }
@@ -3180,7 +3438,7 @@ chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
              alu->src[s].src.ssa->num_components ||
           !chrome9_ps_default_finite(
              (nir_scalar) { alu->src[s].src.ssa,
-                            alu->src[s].swizzle[scalar.comp] }, budget))
+                            alu->src[s].swizzle[scalar.comp] }, proof))
          return false;
    }
    return true;
@@ -3188,7 +3446,7 @@ chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
 
 static bool
 chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
-                                     unsigned components, unsigned *budget)
+                                     unsigned components, struct chrome9_ps_proof *proof)
 {
    if (!alu->src[source].src.ssa ||
        alu->src[source].src.ssa->bit_size != 32)
@@ -3198,7 +3456,7 @@ chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
 
       if (component >= alu->src[source].src.ssa->num_components ||
           !chrome9_ps_default_finite(
-             (nir_scalar) { alu->src[source].src.ssa, component }, budget))
+             (nir_scalar) { alu->src[source].src.ssa, component }, proof))
          return false;
    }
    return true;
@@ -3207,14 +3465,24 @@ chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
 /* Prove a nonnegative result for the lighting DAG shapes emitted by generic
  * NIR.  This is a mathematical property, not an application/shader match. */
 static bool
-chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
+chrome9_ps_default_nonnegative_uncached(nir_scalar scalar,
+                                        struct chrome9_ps_proof *proof);
+
+static bool
+chrome9_ps_default_nonnegative(nir_scalar scalar,
+                               struct chrome9_ps_proof *proof)
+{
+   return chrome9_ps_proof_memo(proof, scalar, CHROME9_PS_PROOF_NONNEGATIVE,
+                                chrome9_ps_default_nonnegative_uncached);
+}
+
+static bool
+chrome9_ps_default_nonnegative_uncached(nir_scalar scalar,
+                                        struct chrome9_ps_proof *proof)
 {
    nir_instr *instr;
    nir_alu_instr *alu;
 
-   if (!*budget)
-      return false;
-   (*budget)--;
    scalar = nir_scalar_resolved(scalar.def, scalar.comp);
    if (scalar.def->bit_size != 32 || scalar.comp >= scalar.def->num_components)
       return false;
@@ -3238,7 +3506,7 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
          return false;
       return chrome9_ps_default_nonnegative(
          (nir_scalar) { alu->src[0].src.ssa,
-                        alu->src[0].swizzle[scalar.comp] }, budget);
+                        alu->src[0].swizzle[scalar.comp] }, proof);
    case nir_op_fabs:
    case nir_op_fsat:
       if (!alu->src[0].src.ssa ||
@@ -3247,7 +3515,7 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
          return false;
       return chrome9_ps_default_finite(
          (nir_scalar) { alu->src[0].src.ssa,
-                        alu->src[0].swizzle[scalar.comp] }, budget);
+                        alu->src[0].swizzle[scalar.comp] }, proof);
    case nir_op_fsqrt:
    case nir_op_frsq:
       if (!alu->src[0].src.ssa ||
@@ -3256,7 +3524,7 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
          return false;
       return chrome9_ps_default_nonnegative(
          (nir_scalar) { alu->src[0].src.ssa,
-                        alu->src[0].swizzle[scalar.comp] }, budget);
+                        alu->src[0].swizzle[scalar.comp] }, proof);
    case nir_op_fmul:
       if (!alu->src[0].src.ssa || !alu->src[1].src.ssa ||
           alu->src[0].swizzle[scalar.comp] >=
@@ -3266,10 +3534,10 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
          return false;
       return chrome9_ps_default_nonnegative(
                 (nir_scalar) { alu->src[0].src.ssa,
-                               alu->src[0].swizzle[scalar.comp] }, budget) &&
+                               alu->src[0].swizzle[scalar.comp] }, proof) &&
              chrome9_ps_default_nonnegative(
                 (nir_scalar) { alu->src[1].src.ssa,
-                               alu->src[1].swizzle[scalar.comp] }, budget);
+                               alu->src[1].swizzle[scalar.comp] }, proof);
    case nir_op_fmax: {
       if (!alu->src[0].src.ssa || !alu->src[1].src.ssa ||
           alu->src[0].swizzle[scalar.comp] >=
@@ -3281,11 +3549,11 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
                        alu->src[0].swizzle[scalar.comp] };
       nir_scalar b = { alu->src[1].src.ssa,
                        alu->src[1].swizzle[scalar.comp] };
-      bool a_nonnegative = chrome9_ps_default_nonnegative(a, budget);
-      bool b_nonnegative = chrome9_ps_default_nonnegative(b, budget);
+      bool a_nonnegative = chrome9_ps_default_nonnegative(a, proof);
+      bool b_nonnegative = chrome9_ps_default_nonnegative(b, proof);
 
-      if (!chrome9_ps_default_finite(a, budget) ||
-          !chrome9_ps_default_finite(b, budget))
+      if (!chrome9_ps_default_finite(a, proof) ||
+          !chrome9_ps_default_finite(b, proof))
          return false;
       return a_nonnegative || b_nonnegative;
    }
@@ -3301,7 +3569,7 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
       if (alu->src[0].src.ssa != alu->src[1].src.ssa)
          return false;
       return chrome9_ps_default_finite_alu_source(alu, 0, components,
-                                                   budget);
+                                                   proof);
    }
    default:
       return false;
@@ -3372,7 +3640,6 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
    uint8_t condition_temp;
    unsigned components = def->num_components;
    unsigned range_budget = CHROME9_PS_MAX_INSTRUCTIONS;
-   unsigned sign_budget = CHROME9_PS_MAX_INSTRUCTIONS;
    float boundary;
 
    if (select->op != nir_op_bcsel || !components || components > 4 ||
@@ -3413,7 +3680,7 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
    if (!((boundary >= 0.25f && boundary <= 0.75f &&
           chrome9_ps_unit_interval(bounded, &range_budget)) ||
          (boundary > 0.0f && isnormal(boundary) &&
-          chrome9_ps_default_nonnegative(bounded, &sign_budget))))
+          chrome9_ps_default_nonnegative(bounded, &builder->proof))))
       return false;
    if (!chrome9_ps_lower_alu_source(builder, &compare->src[0], 1, &lhs) ||
        !chrome9_ps_lower_alu_source(builder, &compare->src[1], 1, &rhs) ||
@@ -3617,7 +3884,6 @@ chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
    nir_alu_instr *alu;
    struct chrome9_ps_source inner;
    uint8_t condition, reverse;
-   unsigned finite_budget = CHROME9_PS_MAX_INSTRUCTIONS;
 
    if (depth > 8)
       return false;
@@ -3666,9 +3932,9 @@ chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
        alu->src[0].src.ssa->bit_size != 32 ||
        alu->src[1].src.ssa->bit_size != 32 ||
        !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 0),
-                                  &finite_budget) ||
+                                  &builder->proof) ||
        !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 1),
-                                  &finite_budget))
+                                  &builder->proof))
       return false;
    {
       /* Lower one component of each operand as a scalar source. */
@@ -3761,8 +4027,28 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
 }
 
 static bool
+chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
+                          nir_def *def, struct chrome9_ps_source *source);
+
+/* CHROME9_DEBUG_REJECT prints each rejected def, innermost first. */
+static bool
 chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                      struct chrome9_ps_source *source)
+{
+   if (chrome9_ps_lower_def_impl(builder, def, source))
+      return true;
+   if (def && debug_get_bool_option("CHROME9_DEBUG_REJECT", false)) {
+      fprintf(stderr, "chrome9: reject ir=%u temps=%u: ",
+              builder->ir.count, builder->next_temp);
+      nir_print_instr(nir_def_instr(def), stderr);
+      fputc('\n', stderr);
+   }
+   return false;
+}
+
+static bool
+chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
+                          nir_def *def, struct chrome9_ps_source *source)
 {
    nir_instr *instr;
    nir_alu_instr *alu;
@@ -4339,6 +4625,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    nir_def *result = NULL;
 
    *lowered = false;
+   builder.proof.budget = CHROME9_PS_PROOF_NODES;
+   builder.proof.mem_ctx = nir;
    if (!chrome9_fs_straight_line_entrypoint(nir, NULL, &block) ||
        nir->info.float_controls_execution_mode)
       return false;
@@ -4493,6 +4781,10 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    *unit_interval_input_mask = builder.unit_interval_input_mask;
    *lowered = true;
    bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
+
+   if (!compiled && debug_get_bool_option("CHROME9_DEBUG_REJECT", false))
+      fprintf(stderr, "chrome9: reject native compile ir=%u temps=%u\n",
+              builder.ir.count, builder.next_temp);
 
    memcpy(program->immediate, builder.immediate,
           sizeof(program->immediate));

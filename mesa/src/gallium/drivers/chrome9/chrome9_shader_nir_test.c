@@ -952,14 +952,105 @@ check_nonnegative_select_compilation(struct chrome9_context *context)
    return true;
 }
 
+static nir_def *
+flag_fp(nir_def *def, unsigned flags)
+{
+   nir_instr_as_alu(nir_def_instr(def))->fp_math_ctrl = flags;
+   return def;
+}
+
+/* glmark2 shading:shading=cel as linked by Mesa 26.2.2 (preserve flags
+ * included); straight-line lighting with three nested selects. */
+static bool
+check_cel_compilation(struct chrome9_context *context)
+{
+   const unsigned inf = nir_fp_preserve_inf;
+   const unsigned inf_nan = nir_fp_preserve_inf | nir_fp_preserve_nan;
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-cel");
+   struct chrome9_shader shader = { 0 };
+   nir_def *bary = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *v9 = nir_load_interpolated_input(
+      &b, 4, 32, bary, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_def *v11 = nir_load_interpolated_input(
+      &b, 3, 32, bary, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR1);
+   nir_def *zero = nir_imm_float(&b, 0.0f);
+   nir_def *tenth = nir_imm_float(&b, 0.1f);
+   nir_def *v12 = nir_vec4(&b, nir_channel(&b, v9, 3), nir_channel(&b, v11, 0),
+                           nir_channel(&b, v11, 1), nir_channel(&b, v11, 2));
+   nir_def *v12xyz = nir_trim_vector(&b, v12, 3);
+   nir_def *v9xyz = nir_trim_vector(&b, v9, 3);
+   nir_def *v13 = flag_fp(nir_fneg(&b, v12xyz), inf);
+   nir_def *v14 = nir_fadd(&b, nir_imm_vec3(&b, 4.0f, 3.0f, 1.0f), v13);
+   nir_def *v17 = nir_fmul(&b, v9xyz,
+                           nir_frsq(&b, nir_fdot3(&b, v9xyz, v9xyz)));
+   nir_def *v19 = nir_frsq(&b, nir_fdot3(&b, v14, v14));
+   nir_def *v20 = nir_fmul(&b, v14, v19);
+   nir_def *v21 = nir_fdot3(&b, v17, v20);
+   nir_def *v22 = flag_fp(nir_fmax(&b, v21, zero), inf_nan);
+   nir_def *v24 = nir_fmul(&b, nir_imm_float(&b, 5.196152f), v19);
+   nir_def *v25 = nir_fmul(&b, v24, v22);
+   nir_def *v26 = flag_fp(nir_fge(&b, v25, tenth), inf);
+   nir_def *v28 = nir_bcsel(&b, v26, nir_imm_vec3(&b, 0.0f, 0.6f, 0.0f),
+                            nir_imm_vec3(&b, 0.0f, 0.3f, 0.0f));
+   nir_def *v30 = nir_frsq(&b, nir_fdot3(&b, v13, v13));
+   nir_def *v31 = flag_fp(nir_fmul(&b, v12xyz, v30), inf);
+   nir_def *v32 = flag_fp(nir_fneg(&b, v31), inf);
+   nir_def *v33 = nir_fdot3(&b, v32, v17);
+   nir_def *v36 = nir_fadd(&b, tenth,
+                           nir_fmul(&b, v22, nir_imm_float(&b, 0.3f)));
+   nir_def *v37 = flag_fp(nir_flt(&b, v33, v36), inf);
+   nir_def *v39 = nir_bcsel(&b, v37, nir_imm_vec3(&b, 0.0f, 0.0f, 0.0f), v28);
+   nir_def *v40 = flag_fp(nir_fneg(&b, v20), inf);
+   nir_def *v41 = nir_fdot3(&b, v17, v40);
+   nir_def *v43 = nir_fmul(&b, nir_fmul(&b, v41, nir_imm_float(&b, 2.0f)),
+                           v17);
+   nir_def *v45 = nir_fadd(&b, v40, nir_fneg(&b, v43));
+   nir_def *v47 = flag_fp(nir_fmax(&b, zero, nir_fdot3(&b, v45, v32)),
+                          inf_nan);
+   nir_def *v48 = nir_fpow(&b, v47, nir_imm_float(&b, 10.0f));
+   nir_def *v49 = flag_fp(nir_flt(&b, zero, v21), inf);
+   nir_def *v51 = flag_fp(nir_flt(&b, nir_imm_float(&b, 0.5f),
+                                  nir_fmul(&b, v24, v48)), inf);
+   nir_def *v52 = nir_iand(&b, v49, v51);
+   nir_def *v55 = nir_fadd(&b, nir_imm_vec3(&b, 0.7f, 0.7f, 0.7f),
+                           nir_fmul(&b, nir_imm_float(&b, 0.3f), v39));
+   nir_def *v56 = nir_bcsel(&b, v52, v55, v39);
+   bool valid;
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b, nir_channel(&b, v56, 0),
+                                 nir_channel(&b, v56, 1),
+                                 nir_channel(&b, v56, 2),
+                                 nir_imm_float(&b, 1.0f)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   /* cmd22 submits the semantic IR; the kernel allocates native temps. */
+   valid = shader.supported && shader.semantic_fs_valid;
+   if (!valid)
+      fprintf(stderr, "cel compilation failed: supported=%u semantic=%u "
+              "native=%u ir=%u alu=%u\n", shader.supported,
+              shader.semantic_fs_valid, shader.native_fs_valid,
+              shader.semantic_fs_ir.count, shader.native_fs.alu_count);
+   ralloc_free(b.shader);
+   return valid;
+}
+
 static bool
 check_general_predicate_compilation(struct chrome9_context *context)
 {
    static const char *const names[] = {
       "b2f32-fge", "flt-and-bcsel", "feq-bcsel", "fneu-bcsel",
       "ior-bcsel", "inot-bcsel", "preserve-nan-rejected",
+      "preserve-inf-normalize", "preserve-inf-unbounded-rejected",
    };
-   static const unsigned min_compares[] = { 1, 2, 2, 2, 2, 1, 0 };
+   static const unsigned min_compares[] = { 1, 2, 2, 2, 2, 1, 0, 1, 0 };
 
    for (unsigned test = 0; test < ARRAY_SIZE(names); test++) {
       nir_builder b = nir_builder_init_simple_shader(
@@ -1000,6 +1091,26 @@ check_general_predicate_compilation(struct chrome9_context *context)
       case 5:
          predicate = nir_inot(&b, nir_flt(&b, ax, cx));
          break;
+      case 7:
+      case 8: {
+         /* GLSL tags neg/compare and normalize()'s folded multiply with
+          * preserve_inf; only the bounded normalize form is admitted. */
+         nir_def *v = nir_trim_vector(&b, a, 3);
+         nir_def *n = nir_fneg(&b, v);
+         nir_def *m;
+
+         nir_instr_as_alu(nir_def_instr(n))->fp_math_ctrl =
+            nir_fp_preserve_inf;
+         m = test == 7 ?
+            nir_fmul(&b, v, nir_frsq(&b, nir_fdot3(&b, n, n))) :
+            nir_fmul(&b, v, nir_trim_vector(&b, c, 3));
+         nir_instr_as_alu(nir_def_instr(m))->fp_math_ctrl =
+            nir_fp_preserve_inf;
+         predicate = nir_flt(&b, nir_fdot3(&b, m, n), cx);
+         nir_instr_as_alu(nir_def_instr(predicate))->fp_math_ctrl =
+            nir_fp_preserve_inf;
+         break;
+      }
       default:
          predicate = nir_fge(&b, ax, cx);
          nir_instr_as_alu(nir_def_instr(predicate))->fp_math_ctrl =
@@ -1024,7 +1135,8 @@ check_general_predicate_compilation(struct chrome9_context *context)
          compares += shader.semantic_fs_ir.instruction[i].op ==
                      CHROME9_PS_OPCODE_CMP;
       }
-      valid = test == 6 ? !shader.supported && !shader.semantic_fs_valid :
+      valid = test == 6 || test == 8 ?
+         !shader.supported && !shader.semantic_fs_valid :
          shader.supported && shader.semantic_fs_valid &&
          shader.native_fs_valid &&
          subtracts >= min_compares[test] &&
@@ -2165,6 +2277,7 @@ main(void)
        !check_vector_conditional_compilation(&context, 1, true) ||
        !check_nonnegative_select_compilation(&context) ||
        !check_general_predicate_compilation(&context) ||
+       !check_cel_compilation(&context) ||
        !check_equal_zero_select_compilation(&context, 0.0f, true) ||
        !check_equal_zero_select_compilation(&context, 1.0f, false) ||
        !check_canonical_uniform_select_context() ||
