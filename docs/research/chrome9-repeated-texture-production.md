@@ -264,6 +264,30 @@ The following negative cases are required before exposing the capability:
 * ABI v1 carrying a nonzero texture `reserved0`, ABI v2 on a kernel without
   the advertised capability, and any unknown ABI version.
 
+#### Implementation and qualification status (2026-09-24)
+
+The matching kernel and Mesa trees now implement this ABI-v2 layout without
+changing the ABI-v1 ioctl layout or semantics.  The kernel's
+`fragment_sparse_textures` module parameter defaults to false: without an
+explicit load-time opt-in, v2 ioctls are rejected and the v2 capability is
+not advertised.  Mesa uses v2 only for a genuinely sparse semantic sampler
+mask when that capability is present; dense generic draws continue using v1.
+
+The kernel compiler selftest checks a lone logical sampler five, its TAU
+sampler nibble, and missing/extra descriptor masks.  The engine selftest
+checks ABI-v1 reserved-zero validation and the image, mipmap, and sampler
+packet selectors for logical units zero and five against a single compact BO
+base.  Mesa's host fragment test checks the compact descriptor order for
+mask `0x37`, a lone sampler five, and out-of-range indices.  Both trees build;
+all seven Mesa Chrome9 offline tests pass with the T2 sysroot loader.
+
+These are static/build and host checks, **not** a high-slot GPU acceptance
+result.  The test target at `192.168.2.60` timed out over SSH during this
+implementation, so no v2 draw was submitted.  Keep the opt-in off for normal
+use until a guarded single-s5 draw, a sparse pair, the full five-stage
+distinct-color draw, and the six-to-one stale-state transition are verified
+on hardware.  Only then promote the capability to default-on.
+
 The offline ladder is deliberately split across layers:
 
 1. Host kernel tests reject duplicate, descending, and unit>=8 descriptor
