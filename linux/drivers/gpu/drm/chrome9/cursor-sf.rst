@@ -66,3 +66,19 @@ in the workspace and at
 ``/root/tmp/chrome9-live/cursor-sf-oracle-20260924/run-20260924-091438``
 on the target.  These checks prove the X cursor path updates the private
 pixels, but do not externally prove displayed RGB/alpha at 1024-by-768.
+
+After this qualification, the committed product module (Build ID
+``3d0ce5f8c16dbfb76ade68afa772cc7335c00d9c``) was loaded on the test
+target with ``cursor_sf=1`` and Xorg modesetting/glamor left running.  Its
+bounded X cursor test again passed movement/control readback; X :0 and
+``renderD128`` remained available, and no new GPU timeout, fault, or
+quarantine appeared in the handoff log.  The activation trace is archived at
+``artifacts/2026-09-24/cursor-sf/x-cursor-product-activation-20260924-092314.log``.
+The opt-in is a live-session choice; the module parameter still defaults to
+off.  To restore the exact known-good module/X on that target, hold the shared
+GPU lock while running the staged, hash-checked rollback script::
+
+  flock -x /tmp/chrome9-vx900-gpu.lock ssh root@192.168.2.60 \
+    'bash /root/tmp/chrome9-live/cursor-sf-oracle-20260924/chrome9_cursor_sf_rollback.sh'
+
+Do not force-unbind the GPU if quiesce or unload refuses the transition.
