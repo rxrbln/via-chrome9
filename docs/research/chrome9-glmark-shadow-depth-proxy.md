@@ -588,3 +588,37 @@ one and is otherwise dead. This one-word change aligns the prefix with the
 Linux production object and avoids every partial-COLOR hazard. It still needs
 independent packet review and the usual stop-on-timeout discipline before a
 single hardware run.
+
+The reviewed mask-only build was run once on the safe single-terminal-output
+kernel. It retired without a timeout or new Chrome9 fault, and the succeeding
+known-good texture baseline passed. The low-depth rectangle was unchanged:
+host BGRA remained `ff4d4d4d` with D16 `8000`, instead of `ff262626`.
+Therefore widening the projective MUL to full XYZW is **not sufficient**, and
+the lost-Z-from-mask hypothesis above is falsified as the complete cause. Keep
+the full vendor mask in future packets, but do not repeat this discriminator.
+
+The next exact isolation can expose threshold and sampled depth without any
+partial COLOR or extra TEMP packing. Retain RCP, full projective MUL,
+threshold ADD and computed TEX, then replace the complete compare tail with
+one full-mask terminal ADD:
+
+```text
+ADD oC0, threshold.x000, sample.0x00
+```
+
+This produces logical RGBA `(threshold,sample,0,0)`. The current encoder's
+source-exact terminal record is:
+
+```text
+0202a2d0 50140924 00f20016 00000820
+```
+
+The complete object has five ALUs, one TAU and controls
+`90058001/91000002/92010005/93000001`, with A95=`95000008`. Expected host
+BGRA words for the three guarded rectangles are approximately
+`008c3300`, `008ccc00`, and `00003300`, respectively: threshold `.5505` with
+samples `.2` and `.8`, then clamped-negative threshold with sample `.2` for
+W=-1. D16 still distinguishes a black-alpha diagnostic value from no draw.
+This is the smallest source-backed separator between projected-Z/threshold
+transport and X8Z24 sample-lane transport; it needs a focused compiler
+self-test and independent packet review before a fresh-boot run.
