@@ -172,6 +172,29 @@ and prove that `distance=0` removes FLT/SQRT/RCP/MIN/BCSEL while a positive
 distance either compiles through a separately qualified general selector or
 continues to fail closed.
 
+### Implementation progress (2026-09-24)
+
+Chrome9 now discovers wholly uniform scalar or vector `bcsel` predicates
+after collecting required loop bounds, so optional selects cannot displace a
+loop bound from the four-dword variant key.  A host NIR regression exercises
+the terrain-shaped `flt(0,distance)` select: distance zero removes the SQRT,
+RCP, MIN, and select arm; positive distance keeps the expensive arm, and a
+varying-dependent predicate is not keyed.  A separate regression covers
+vector predicates and four selects competing with a loop bound.
+
+Canonical fragment NIR is also compiled before creating variants.  If the
+dynamic program already has a supported native lowering, it remains the
+program for all uniform values instead of exhausting the 64-variant cache;
+the existing native unit-interval CMP path is a regression case.  Only a
+canonical program that cannot compile proceeds to draw-time specialization.
+
+The exact default terrain ShaderSource inputs have been regenerated at
+`/tmp/chrome9-terrain-final.vert` and `.frag`, matching the hashes above.
+The existing standalone linked-shader probe does not execute the new
+draw-time specialization, so the exact terrain post-inline semantic count and
+native compile result remain unverified.  This is compiler progress, not a
+terrain-scene or hardware acceptance claim.
+
 ## Proprietary uniform-POW oracle
 
 The exact proprietary bounded slice matching terrain's non-literal exponent
