@@ -2962,10 +2962,31 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 		unit << 24 | 0x20020000, sampler, ARRAY_SIZE(sampler));
 }
 
-static int chrome9_build_fragment_program(struct chrome9_engine *engine,
-	const struct chrome9_draw_request *request, struct chrome9_job *job,
+/*
+ * Worst-case dwords of one draw's state blocks (headers and their 16-byte
+ * alignment included); the vertex or index payload is checked separately.
+ */
+static u32 chrome9_fragment_state_bound(const struct chrome9_draw_request *request)
+{
+	const struct chrome9_fragment_program *program = request->fragment_program;
+	const struct chrome9_tcl_draw *tcl = request->tcl;
+
+	return 512 + 64 * request->fragment_texture_count +
+	       4 * program->constant_count + 4 * program->alu_count +
+	       program->tau_count +
+	       (tcl ? 4 * tcl->constant_count + 4 * tcl->program.record_count :
+		      4 * (4 + program->varying_count));
+}
+
+/*
+ * Emit one draw's complete state and its vertices (stage A, post-TNL) or
+ * stream slots and indices (stage B) at *cursor, never past limit.
+ * -E2BIG leaves *cursor unchanged so a batch can start a new segment.
+ */
+static noinline_for_stack int
+chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-	const u32 *element_address, u32 *pause)
+	const u32 *element_address, u32 **cursor, const u32 *limit)
 {
 	static const u32 destination_tail[] = {
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
@@ -2992,7 +3013,6 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		0x49400000, 0x49400000, 0x00000000, 0x00000000,
 	};
 	static const u32 vs_integer_constants[] = { 0, 0, 0, 0 };
-	static const u32 sync[] = { 0x6c, 0x00800000 };
 	/* VX900 HPSLocationReg: direct PEY, TS-ZTAG deadlock ECO enabled. */
 	static const u32 misc_location[] = { 0x8a020000 };
 	const struct chrome9_fragment_program *program = request->fragment_program;
@@ -3014,8 +3034,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	u32 raster[CHROME9_TCL_RASTER_WORDS];
 	u32 vs_program[4 * (4 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)] = { 0 };
 	u32 vs_control[] = { 0 };
-	u32 *base = engine->run_staging_cpu;
-	u32 *p = base;
+	u32 *p = *cursor;
 	u32 *vertex_header;
 	u32 destination_count;
 	u32 common_count = 7;
@@ -3028,9 +3047,10 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	unsigned int i;
 	int ret;
 
-	if (!base || !program || (!request->fragment_vertices && !tcl) ||
-	    !rt_format)
+	if (!program || (!request->fragment_vertices && !tcl) || !rt_format)
 		return -EINVAL;
+	if (p + chrome9_fragment_state_bound(request) > limit)
+		return -E2BIG;
 	ret = chrome9_fragment_fe_config(program->active_texture_count,
 		program->texture_count, program->varying_count,
 		program->varying_width, program->varying_alu_width, config);
@@ -3128,8 +3148,6 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 			GENMASK(program->varying_width[i] - 1, 0);
 	}
 
-	/* Every dword up to the read-ahead end is written explicitly. */
-	chrome9_emit_header0(&p, sync, 1);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     destination_state, destination_count);
 	for (i = 0; i < request->fragment_texture_count; i++) {
@@ -3192,9 +3210,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		u32 slots[DRM_CHROME9_VERTEX_MAX_INPUTS];
 		u32 draw[4];
 
-		/* Keep room for the tail, PAUSE/STOP and the read-ahead. */
-		if (p + 0x40 + tcl->index_dwords + CHROME9_CR_READ_AHEAD / 4 +
-		    0x100 > base + CHROME9_RUN_STAGING_SIZE / 4)
+		if (p + 0x40 + tcl->index_dwords > limit)
 			return -E2BIG;
 		for (i = 0; i < tcl->element_count; i++)
 			slots[i] = chrome9_tcl_stream_slot(element_address[i],
@@ -3209,11 +3225,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 				     draw, ARRAY_SIZE(draw));
 		chrome9_emit_header3(&p, 0x00000000, tcl->indices,
 				     tcl->index_dwords);
-		ret = chrome9_emit_3d_tail(engine, job, &p);
-		if (ret)
-			return ret;
-		return chrome9_finish_ring_sized(base, p,
-			CHROME9_RUN_STAGING_SIZE, pause, &job->segment_stop);
+		*cursor = p;
+		return 0;
 	}
 	while (!IS_ALIGNED((unsigned long)p, 16))
 		*p++ = 0xcc000000;
@@ -3222,12 +3235,18 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	if (tcl) {
 		u32 dwords = vertex_count * tcl->stride_dw;
 
-		/* Keep room for the tail, PAUSE/STOP and the read-ahead. */
-		if (p + dwords + CHROME9_CR_READ_AHEAD / 4 + 0x100 >
-		    base + CHROME9_RUN_STAGING_SIZE / 4)
+		if (p + dwords > limit)
 			return -E2BIG;
 		memcpy(p, tcl->vertices, dwords * sizeof(*p));
 		p += dwords;
+	}
+	if (!tcl) {
+		u32 width = 6;
+
+		for (i = 0; i < program->varying_count; i++)
+			width += program->varying_width[i];
+		if (p + vertex_count * width > limit)
+			return -E2BIG;
 	}
 	for (i = 0; !tcl && i < vertex_count; i++) {
 		const struct drm_chrome9_fragment_vertex *vertex =
@@ -3250,11 +3269,54 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		}
 	}
 	chrome9_count_vertex_payload(vertex_header, p - vertex_header - 4);
-	ret = chrome9_emit_3d_tail(engine, job, &p);
+	*cursor = p;
+	return 0;
+}
+
+/* One staging segment: sync, the draws, the 3D tail and PAUSE/STOP. */
+static u32 *chrome9_fragment_segment_begin(struct chrome9_engine *engine)
+{
+	static const u32 sync[] = { 0x6c, 0x00800000 };
+	u32 *p = engine->run_staging_cpu;
+
+	chrome9_emit_header0(&p, sync, 1);
+	return p;
+}
+
+/* Last dword a draw may use: the tail, PAUSE/STOP and read-ahead follow. */
+static const u32 *chrome9_fragment_segment_limit(struct chrome9_engine *engine)
+{
+	return (u32 *)engine->run_staging_cpu +
+	       (CHROME9_RUN_STAGING_SIZE - CHROME9_CR_READ_AHEAD) / 4 - 0x100;
+}
+
+static int chrome9_fragment_segment_end(struct chrome9_engine *engine,
+		struct chrome9_job *job, u32 *p, u32 *pause)
+{
+	int ret = chrome9_emit_3d_tail(engine, job, &p);
+
 	if (ret)
 		return ret;
-	return chrome9_finish_ring_sized(base, p, CHROME9_RUN_STAGING_SIZE,
-					 pause, &job->segment_stop);
+	return chrome9_finish_ring_sized(engine->run_staging_cpu, p,
+		CHROME9_RUN_STAGING_SIZE, pause, &job->segment_stop);
+}
+
+static int chrome9_build_fragment_program(struct chrome9_engine *engine,
+	const struct chrome9_draw_request *request, struct chrome9_job *job,
+	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+	const u32 *element_address, u32 *pause)
+{
+	u32 *p;
+	int ret;
+
+	if (!engine->run_staging_cpu)
+		return -EINVAL;
+	p = chrome9_fragment_segment_begin(engine);
+	ret = chrome9_emit_fragment_draw(request, target, depth, texture_base,
+		element_address, &p, chrome9_fragment_segment_limit(engine));
+	if (ret)
+		return ret;
+	return chrome9_fragment_segment_end(engine, job, p, pause);
 }
 
 static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
