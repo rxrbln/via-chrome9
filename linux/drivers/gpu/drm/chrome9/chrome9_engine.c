@@ -174,6 +174,8 @@ static u64 chrome9_prof_wait_ns[4];
 /* Full flushes by reason: implicit destination/depth/texture, dirty same. */
 static u64 chrome9_prof_full_kind[6];
 static u64 chrome9_prof_jobs;
+static u64 chrome9_prof_draws;
+static u64 chrome9_prof_segments;
 static ktime_t chrome9_prof_last;
 
 static void chrome9_prof_start(void)
@@ -224,6 +226,13 @@ static void chrome9_prof_job(struct drm_device *drm)
 		 div64_u64(chrome9_prof_wait_ns[2], 1000 * chrome9_prof_jobs),
 		 div64_u64(chrome9_prof_wait_ns[3], 1000 * chrome9_prof_jobs));
 	memset(chrome9_prof_wait_ns, 0, sizeof(chrome9_prof_wait_ns));
+	dev_info(drm->dev, "profile draws per job %llu.%02llu, segments per job %llu.%02llu\n",
+		 div64_u64(chrome9_prof_draws, chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_draws * 100, chrome9_prof_jobs) % 100,
+		 div64_u64(chrome9_prof_segments, chrome9_prof_jobs),
+		 div64_u64(chrome9_prof_segments * 100, chrome9_prof_jobs) % 100);
+	chrome9_prof_draws = 0;
+	chrome9_prof_segments = 0;
 	memset(chrome9_prof_sub_ns, 0, sizeof(chrome9_prof_sub_ns));
 	chrome9_prof_full_bytes = 0;
 	chrome9_prof_jobs = 0;
@@ -6483,6 +6492,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		ret = chrome9_fragment_segment_end(engine, job, p, &pause);
 		if (ret)
 			goto out_prepublication;
+		chrome9_prof_draws += next - first;
+		chrome9_prof_segments++;
 		chrome9_prof_mark(CHROME9_PROF_BUILD);
 		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
 			CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
