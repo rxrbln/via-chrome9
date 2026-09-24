@@ -343,6 +343,15 @@ A90--A92 with the production object above.  This catches inactive selector,
 physical lifetime, release-bit, control-count, and resource-bucket drift
 before engine initialization.
 
+Mesa Chrome9 commit `f836ff3` adds an offline test for the complete five-step
+fragment recurrence, including the fragment-coordinate prefix and RGB output
+assembly.  With the current production options it still rejects `fsqrt`.
+With test-local `lower_fsqrt` and Mesa's standard algebraic pass, all five
+roots become RSQ/RCP pairs and the semantic compiler accepts exactly 36 ALU
+records (12 MUL, 11 FRC, 5 RSQ, 5 RCP, 3 MOV), with no texture or varying
+resource.  The T2-loader test passes; this is compiler evidence only and does
+not enable square-root lowering in the production driver.
+
 The raw modes check a 3x3 interior sample grid, D16, untouched exterior
 pixels, and both color/depth guards.  A strict C11 `-Wall -Wextra -Werror`
 host build and the kernel object build pass.  Neither mode was submitted by
