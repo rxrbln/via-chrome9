@@ -134,12 +134,60 @@ object through the current Mesa native builder and current kernel compiler:
 every physical TEMP (`0x1ff`).  Its resource controls include
 `A92=9205005f` and `A93=9300001f`, matching six varying fields and five
 samplers.  No allocator, port, or upload-capacity blocker remains in that
-replay.  The shared Mesa worktree invokes the scheduler only after the
-original order exceeds twelve live TEMP vectors; that integration is not yet
-committed or target-qualified.  The FACE/alpha helpers still require
-draw-time variant integration.  Default lightall must remain rejected until
-the complete integrated object and a guarded distinct-color pixel oracle both
-pass.
+replay.  Mesa commit `fde983a` invokes a bounded deterministic scheduler only
+after the original order exceeds twelve live TEMP vectors.  The exact
+100-record corpus remains 95 ALU plus five TEX and schedules from peak 15 to
+peak nine without deleting or cloning an instruction.  This is committed host
+evidence, not a silicon result.  Default lightall must remain unqualified
+until the complete integrated object and a guarded distinct-color pixel
+oracle both pass.
+
+## Six-texture sunlight/shadow object
+
+The default sunlight/shadow lightall permutation is a distinct, tighter
+object.  Its linked NIR contains ordinary `fmad`, seven live source negations,
+and nine saturations.  Retaining separate MUL and MOV.SAT instructions exceeds
+the 96-ALU upload envelope.  Mesa commit `cecf7f6` implements four generic
+compactions required by the exact object:
+
+- map NIR `fmad` to the already qualified native MAD operation;
+- fold `fneg` only into native source slots with a NEG encoding, retaining the
+  explicit MUL(-1) fallback for the C slot and POSITION;
+- fuse a single-use `fsat` into its non-TEX producer destination;
+- rewrite the exact shared form
+  `sat(max(x,.25))` to `sat(max(sat(x),.25))`, allowing both producer SATs to
+  fuse.  This identity is valid for the finite, infinity and NaN cases of the
+  same NIR min/max/saturate operations.
+
+The resulting exact semantic corpus contains:
+
+```text
+records             101 = 95 ALU + 6 TEX
+source TEMP peak    15
+scheduled peak      12
+SAT destinations    9
+NEG sources         9
+varying count       7
+active TEX resource 7
+native result       96 ALU + 6 TAU
+```
+
+The scheduler regression preserves the instruction multiset and terminal
+COLOR write and produces the same output on repeated runs.  Replaying that
+scheduled object through the current kernel compiler succeeds with physical
+TEMP high-water 12, releases `p0..p11` (`0x00000fff`), and controls:
+
+```text
+9008007e 91800081 92060060 9300003f 94000000 95000840
+96000000 97800000 98000082 99000000 9a000000 9b000000
+```
+
+The focused host tests also prove that three-distinct-constant MAD still
+legalizes separately, multi-use saturation is not fused, and a negated native
+C operand keeps the safe two-instruction fallback.  Native debug tests and the
+matching cross Gallium build pass.  No six-texture sunlight/shadow packet has
+been submitted to VX900 silicon yet; this section proves compiler capacity and
+byte construction only.
 
 ## Evidence
 
@@ -152,8 +200,14 @@ pass.
   `/tmp/chrome9-lightall-resource-probe` and
   `ioquake3-gl2-eight-unit-linkage.md`.
 - Exact scheduler corpus and result:
-  `chrome9_ps_schedule_test.c`, 100 records, peak nine; cross Meson test
+  `chrome9_ps_schedule_test.c`, mode-zero 100 records peak 15 to nine and
+  sunlight/shadow 101 records peak 15 to twelve; cross Meson test
   `chrome9-ps-schedule` passes.  This is host evidence, not a GPU result.
+- Exact six-texture scheduled semantic object:
+  `/tmp/chrome9-shadow-scheduled-sem.txt`, SHA-256
+  `69745d5e179574747b90e0998bf291f738c072ec5f9ef19e6036f74eb69e69ff`;
+  native replay summary `/tmp/chrome9-shadow-native-replay.txt`, SHA-256
+  `cb48d369318c3319325e5d4bc400c17145be1bfe53e422f53a4b7d1ae5cead45`.
 - Native/kernel replay: `/tmp/chrome9-kernel-replay/replay.c`, SHA-256
   `16da371648c6146c20a74ddab9d99611d32c8e2c478a639e827da2be9c098df6`;
   replay binary SHA-256
