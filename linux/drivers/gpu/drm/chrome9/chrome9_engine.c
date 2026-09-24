@@ -2717,14 +2717,19 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	    count > CHROME9_GART_ENTRIES - first)
 		return -ERANGE;
 	engine->gart_update_count++;
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret)
 		return ret;
 	engine->gart_vga_acquire_count++;
 	saved_index = readb(cdev->mmio + CHROME9_SEQ_INDEX);
 	ret = chrome9_gart_wait_idle(cdev);
-	if (ret)
+	if (ret) {
+		dev_err_ratelimited(&cdev->pdev->dev,
+			"GART pre-write idle failed first=%u count=%u ret=%d SR6F=%02x\n",
+			first, count, ret,
+			readb(cdev->mmio + CHROME9_SEQ_DATA));
 		goto out_restore_index;
+	}
 	saved_6c = chrome9_seq_read(cdev, 0x6c);
 	chrome9_seq_write(cdev, 0x6c, saved_6c & ~BIT(7));
 	for (i = 0; i < count; i++)
@@ -2736,10 +2741,15 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	wmb();
 	engine->gart_flush_count++;
 	ret = chrome9_gart_flush(cdev);
+	if (ret)
+		dev_err_ratelimited(&cdev->pdev->dev,
+			"GART translation flush failed first=%u count=%u ret=%d SR6F=%02x\n",
+			first, count, ret,
+			readb(cdev->mmio + CHROME9_SEQ_DATA));
 	chrome9_seq_write(cdev, 0x6c, saved_6c);
 out_restore_index:
 	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	return ret;
 }
 
@@ -2751,7 +2761,7 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	unsigned int i;
 	int ret;
 
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret)
 		return ret;
 	engine->saved_seq_index = readb(cdev->mmio + CHROME9_SEQ_INDEX);
@@ -2785,7 +2795,7 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 		engine->gart_programmed = true;
 out_restore_index:
 	writeb(engine->saved_seq_index, cdev->mmio + CHROME9_SEQ_INDEX);
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	return ret;
 }
 
@@ -2796,7 +2806,7 @@ static int chrome9_gart_restore(struct chrome9_engine *engine)
 	u8 value;
 	int ret;
 
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret)
 		return ret;
 	index = readb(cdev->mmio + CHROME9_SEQ_INDEX);
@@ -2818,7 +2828,7 @@ static int chrome9_gart_restore(struct chrome9_engine *engine)
 	chrome9_seq_write(cdev, 0x6c, engine->saved_6c);
 out:
 	writeb(index, cdev->mmio + CHROME9_SEQ_INDEX);
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	return ret;
 }
 
@@ -3063,7 +3073,8 @@ chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
 			chrome9_take_quarantine_hold(engine);
 			mutex_unlock(&engine->vm_lock);
 			dev_crit(&engine->cdev->pdev->dev,
-				 "SF draw-cache bind cleanup failed; mapping retained for reboot\n");
+				 "SF draw-cache bind cleanup failed bind=%d cleanup=%d; mapping retained for reboot\n",
+				 ret, cleanup_ret);
 			return -EIO;
 		}
 		mapping->bound = false;
@@ -3215,7 +3226,8 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 				      &engine->scanout_mappings);
 			chrome9_take_quarantine_hold(engine);
 			dev_crit(&cdev->pdev->dev,
-				 "SF scanout bind cleanup failed; mapping retained for reboot\n");
+				 "SF scanout bind cleanup failed bind=%d cleanup=%d; mapping retained for reboot\n",
+				 ret, cleanup_ret);
 			mutex_unlock(&engine->vm_lock);
 			mutex_unlock(&engine->submit_lock);
 			return -EIO;

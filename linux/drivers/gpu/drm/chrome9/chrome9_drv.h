@@ -5,6 +5,7 @@
 
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/vgaarb.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_connector.h>
@@ -118,6 +119,8 @@ struct chrome9_device {
 	u64 sl_base;
 	resource_size_t scanout_offset;
 	resource_size_t scanout_size;
+	/* vgaarb permits nested same-device users; serialize SEQ index/data. */
+	struct mutex seq_lock;
 	/* Serializes CPU copies into the single BAR2 staging interval. */
 	struct mutex scanout_lock;
 	struct chrome9_kms_state *kms_state;
@@ -130,6 +133,22 @@ struct chrome9_device {
 static inline struct chrome9_device *to_chrome9(struct drm_device *drm)
 {
 	return container_of(drm, struct chrome9_device, drm);
+}
+
+static inline int chrome9_vga_seq_get(struct chrome9_device *cdev)
+{
+	int ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+
+	if (!ret)
+		mutex_lock(&cdev->seq_lock);
+	return ret;
+}
+
+static inline void chrome9_vga_seq_put(struct chrome9_device *cdev)
+{
+	lockdep_assert_held(&cdev->seq_lock);
+	mutex_unlock(&cdev->seq_lock);
+	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
 }
 
 int chrome9_detect_vram(struct chrome9_device *cdev);

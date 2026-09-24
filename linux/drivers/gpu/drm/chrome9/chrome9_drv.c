@@ -305,7 +305,7 @@ static int chrome9_recover_2d_engine(struct chrome9_device *cdev)
 
 	if (!chrome9_recover_2d)
 		return 0;
-	ret = vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "cannot lock VGA I/O for 2D recovery\n");
@@ -315,7 +315,7 @@ static int chrome9_recover_2d_engine(struct chrome9_device *cdev)
 	usleep_range(10, 20);
 	vga_io_wseq(0x4e, reset);
 	vga_io_w(VGA_SEQ_I, saved_index);
-	vga_put(pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 
 	dev_info(&pdev->dev,
 		 "pulsed documented SR4E 2D engine reset: old=%02x status=%08x\n",
@@ -455,7 +455,7 @@ int chrome9_detect_vram(struct chrome9_device *cdev)
 			(unsigned long long)aperture_size,
 			(unsigned long long)controller_size);
 
-	ret = vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "cannot lock VGA I/O for SR14 read\n");
@@ -472,7 +472,7 @@ int chrome9_detect_vram(struct chrome9_device *cdev)
 	cr_gating = vga_io_rseq(0x4f);
 	gfx_power = vga_io_rseq(0x59);
 	vga_io_w(VGA_SEQ_I, saved_index);
-	vga_put(pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	ret = pci_read_config_byte(pdev, 0xb0, &pci_b0);
 	if (ret)
 		dev_warn(&pdev->dev, "cannot read diagnostic PCI B0: %pe\n",
@@ -1620,7 +1620,7 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 	chrome9_flush_command_memory(ring, PAGE_SIZE);
 	dma_wmb();
 
-	ret = vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret)
 		goto out_free_ring;
 	seq_locked = true;
@@ -1657,7 +1657,7 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 	restore_6c = chrome9_seq_read_mmio(cdev, 0x6c) | BIT(7);
 	chrome9_seq_write_mmio(cdev, 0x6c, restore_6c);
 	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
-	vga_put(pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	seq_locked = false;
 
 	pci_read_config_word(pdev, PCI_COMMAND, &pci_command);
@@ -2014,7 +2014,7 @@ out_restore:
 		dev_crit(&pdev->dev,
 			 "CR is not safely retired; retaining ring/GART/BME until reboot\n");
 		if (seq_locked)
-			vga_put(pdev, VGA_RSRC_LEGACY_IO);
+			chrome9_vga_seq_put(cdev);
 		if (test_saved) {
 			memcpy_toio(test - guard_size, test_saved,
 				    CHROME9_SELFTEST_SIZE + 2 * guard_size);
@@ -2034,8 +2034,7 @@ out_restore:
 				     "VX900 PCIe GART/CR pause test requires reboot\n");
 	}
 	if (!seq_locked) {
-		int lock_ret = vga_get_uninterruptible(pdev,
-						   VGA_RSRC_LEGACY_IO);
+		int lock_ret = chrome9_vga_seq_get(cdev);
 
 		if (lock_ret) {
 			if (!ret)
@@ -2056,12 +2055,12 @@ out_restore:
 	chrome9_seq_write_mmio(cdev, 0x7b, saved_7b);
 	chrome9_seq_write_mmio(cdev, 0x6c, saved_6c);
 	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
-	vga_put(pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	seq_locked = false;
 
 out_free_ring:
 	if (seq_locked)
-		vga_put(pdev, VGA_RSRC_LEGACY_IO);
+		chrome9_vga_seq_put(cdev);
 	if (test_saved) {
 		memcpy_toio(test - guard_size, test_saved,
 			    CHROME9_SELFTEST_SIZE + 2 * guard_size);
@@ -2714,6 +2713,7 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	if (IS_ERR(cdev))
 		return PTR_ERR(cdev);
 	cdev->pdev = pdev;
+	mutex_init(&cdev->seq_lock);
 	ret = chrome9_read_status(cdev);
 	if (ret)
 		return ret;

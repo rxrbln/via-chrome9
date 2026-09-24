@@ -153,7 +153,7 @@ static int chrome9_ddc_pre_xfer(struct i2c_adapter *adapter)
 	int ret;
 
 	mutex_lock(&kms->lock);
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret) {
 		mutex_unlock(&kms->lock);
 		return ret;
@@ -165,7 +165,7 @@ static void chrome9_ddc_post_xfer(struct i2c_adapter *adapter)
 {
 	struct chrome9_device *cdev = i2c_get_adapdata(adapter);
 
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	mutex_unlock(&cdev->kms_state->lock);
 }
 
@@ -792,7 +792,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	mutex_lock(&kms->lock);
 	if (kms->iga1_enabled)
 		goto out_unlock_engine;
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret) {
 		dev_err(&cdev->pdev->dev, "cannot lock VGA I/O: %d\n", ret);
 		goto out_unlock_engine;
@@ -800,7 +800,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (!(vga_io_r(VGA_MIS_R) & VGA_MIS_COLOR)) {
 		dev_err(&cdev->pdev->dev,
 			"refusing IGA1 enable while VGA color I/O decode is off\n");
-		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+		chrome9_vga_seq_put(cdev);
 		goto out_unlock_engine;
 	}
 	/* Preserve firmware state only once, for final ownership handoff. */
@@ -811,7 +811,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 				  system_framebuffer);
 	if (ret) {
 		kms->flip_blocked = true;
-		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+		chrome9_vga_seq_put(cdev);
 		goto out_unlock_engine;
 	}
 	kms->iga1_enabled = true;
@@ -824,7 +824,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	/* Base readback occurred while blanked; CR17 has now latched new timing. */
 	retired_fb = kms->retired_fb;
 	kms->retired_fb = NULL;
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	dev_info(&cdev->pdev->dev,
 		 "IGA1 %ux%u@%u kHz output enabled at %s %#x pitch=%u\n",
 		 crtc_state->adjusted_mode.hdisplay,
@@ -869,7 +869,7 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 	mutex_lock(&kms->lock);
 	if (!kms->iga1_enabled)
 		goto out_unlock_engine;
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"cannot lock VGA I/O to disable IGA1: %d\n", ret);
@@ -891,7 +891,7 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 		kms->flip_blocked = true;
 		dev_crit(&cdev->pdev->dev,
 			 "IGA1 timing reset did not latch; scanout mapping retained\n");
-		vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+		chrome9_vga_seq_put(cdev);
 		goto out_unlock_engine;
 	}
 	kms->iga1_enabled = false;
@@ -908,7 +908,7 @@ static void chrome9_pipe_disable(struct drm_simple_display_pipe *pipe)
 		kms->blocked_event = NULL;
 	}
 	disabled = true;
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 	dev_info(&cdev->pdev->dev, "driver-owned IGA1 output disabled\n");
 
 out_unlock_engine:
@@ -1275,7 +1275,7 @@ int chrome9_kms_fini(struct chrome9_device *cdev)
 	mutex_lock(&kms->lock);
 	if (!kms->snapshot_valid)
 		goto out_unlock;
-	ret = vga_get_uninterruptible(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	ret = chrome9_vga_seq_get(cdev);
 	if (ret) {
 		dev_crit(&cdev->pdev->dev,
 			 "cannot lock VGA I/O for final IGA1 restore: %d\n", ret);
@@ -1292,7 +1292,7 @@ int chrome9_kms_fini(struct chrome9_device *cdev)
 	blocked_event = kms->blocked_event;
 	kms->blocked_event = NULL;
 	kms->flip_blocked = false;
-	vga_put(cdev->pdev, VGA_RSRC_LEGACY_IO);
+	chrome9_vga_seq_put(cdev);
 
 out_unlock:
 	mutex_unlock(&kms->lock);
