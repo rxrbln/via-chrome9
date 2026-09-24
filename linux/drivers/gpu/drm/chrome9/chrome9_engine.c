@@ -4663,12 +4663,22 @@ out_dev_exit:
 	return ret;
 }
 
+static bool chrome9_fragment_destination_size_valid(u64 actual, u64 required,
+						 bool extended)
+{
+	if (!extended)
+		return actual == required;
+
+	return actual > required && IS_ALIGNED(actual, PAGE_SIZE);
+}
+
 static int chrome9_submit_fragment_program(struct drm_device *drm,
 		struct drm_file *file, const struct chrome9_draw_request *request)
 {
 	struct chrome9_device *cdev = to_chrome9(drm);
 	struct drm_gem_object *objects[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
 	u64 object_sizes[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	u64 mapping_sizes[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
 	u32 bases[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
 	u32 texture_bases[DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
 	struct chrome9_engine *engine;
@@ -4717,10 +4727,16 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			goto out_put_objects;
 		}
 		if (objects[i]->dev != drm || drm_gem_is_imported(objects[i]) ||
-		    objects[i]->size != object_sizes[i]) {
+		    (i == 0 ?
+		     !chrome9_fragment_destination_size_valid(
+			objects[i]->size, object_sizes[i],
+			request->flags &
+			DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED) :
+		     objects[i]->size != object_sizes[i])) {
 			ret = -EINVAL;
 			goto out_put_objects;
 		}
+		mapping_sizes[i] = objects[i]->size;
 		/* Read-only textures may alias each other, never a render target. */
 		for (j = 0; j < i; j++)
 			if (objects[i] == objects[j] &&
@@ -4808,7 +4824,10 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	}
 	for (i = 0; i < object_count; i++) {
 		chrome9_prepare_map_guards(&job->fragment_maps[i], object_sizes[i]);
-		chrome9_cache_flush(job->fragment_maps[i].vaddr, object_sizes[i]);
+		if (mapping_sizes[i] != object_sizes[i])
+			chrome9_prepare_map_guards(&job->fragment_maps[i],
+					    mapping_sizes[i]);
+		chrome9_cache_flush(job->fragment_maps[i].vaddr, mapping_sizes[i]);
 		dma_sync_sgtable_for_device(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 	}
@@ -4853,13 +4872,16 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	for (i = 0; i < object_count; i++) {
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
-		chrome9_cache_flush(job->fragment_maps[i].vaddr, object_sizes[i]);
+		chrome9_cache_flush(job->fragment_maps[i].vaddr, mapping_sizes[i]);
 	}
 	dma_rmb();
 	device_owned = false;
 	for (i = 0; i < object_count; i++) {
 		if (!chrome9_verify_map_guards(&job->fragment_maps[i],
-					       object_sizes[i])) {
+					       object_sizes[i]) ||
+		    (mapping_sizes[i] != object_sizes[i] &&
+		     !chrome9_verify_map_guards(&job->fragment_maps[i],
+						mapping_sizes[i]))) {
 			ret = -EIO;
 			dma_fence_set_error(&job->fence.base, ret);
 		}
@@ -4888,7 +4910,7 @@ out_unmap:
 			dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 			chrome9_cache_flush(job->fragment_maps[i].vaddr,
-					    object_sizes[i]);
+					    mapping_sizes[i]);
 		}
 		mutex_lock(&engine->submit_lock);
 		for (i = 0; i < object_count; i++)
@@ -7173,6 +7195,23 @@ static int chrome9_fragment_texture_selftest(void)
 	unsigned int i;
 	int ret;
 
+	/* L0 of a 64x32 BGRA target occupies one 0x2000-byte image span
+	 * between two guard pages.  A mip-capable target has further storage
+	 * after that second guard, and a separate final guard page. */
+	if (!chrome9_fragment_destination_size_valid(4 * PAGE_SIZE,
+						      4 * PAGE_SIZE, false) ||
+	    chrome9_fragment_destination_size_valid(6 * PAGE_SIZE,
+						     4 * PAGE_SIZE, false) ||
+	    chrome9_fragment_destination_size_valid(4 * PAGE_SIZE,
+						     4 * PAGE_SIZE, true) ||
+	    chrome9_fragment_destination_size_valid(3 * PAGE_SIZE,
+						     4 * PAGE_SIZE, true) ||
+	    !chrome9_fragment_destination_size_valid(6 * PAGE_SIZE,
+						      4 * PAGE_SIZE, true) ||
+	    chrome9_fragment_destination_size_valid(6 * PAGE_SIZE + 1,
+						     4 * PAGE_SIZE, true))
+		return -EINVAL;
+
 	ret = chrome9_validate_fragment_texture(&texture, &object_size);
 	if (ret)
 		return ret;
@@ -7244,7 +7283,8 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 		.fragment_texture_count = args->texture_count,
 	};
 	u32 allowed_flags = DRM_CHROME9_FRAGMENT_DEPTH |
-		DRM_CHROME9_FRAGMENT_BLEND;
+		DRM_CHROME9_FRAGMENT_BLEND |
+		DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
 	u64 surface_size;
 	u64 total_size;
 	u32 vertex_count;
