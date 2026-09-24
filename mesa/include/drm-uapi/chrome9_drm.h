@@ -229,6 +229,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_VERTEX_PROGRAM		(1ULL << 58)
 /* DRAW_VERTEX_PROGRAM with GEM vertex buffers and indices (stage B). */
 #define DRM_CHROME9_CAP_VERTEX_BUFFERS		(1ULL << 59)
+/* DRAW_VERTEX_PROGRAM BACK_PRIMARY destination and BFC_* flags. */
+#define DRM_CHROME9_CAP_VERTEX_TWO_SIDE		(1ULL << 60)
+/* DRAW_VERTEX_PROGRAM CLIP_DISTANCE destination and clip_distance_mask. */
+#define DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE	(1ULL << 61)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1200,6 +1204,8 @@ struct drm_chrome9_draw_fragment_program {
 #define DRM_CHROME9_VERTEX_MAX_INPUTS		16U
 #define DRM_CHROME9_VERTEX_MAX_VERTICES		384U
 #define DRM_CHROME9_VERTEX_MAX_INDICES		12288U
+/* Hardware user clip planes: two FE coordinate groups of three lanes. */
+#define DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES	6U
 
 enum drm_chrome9_vertex_op {
 	DRM_CHROME9_VERTEX_OP_MOV = 0,
@@ -1243,6 +1249,13 @@ enum drm_chrome9_vertex_dest {
 	/* Logical fragment varying; every consumed lane must be written,
 	 * unconsumed varyings and lanes are dropped. */
 	DRM_CHROME9_VERTEX_DEST_VARYING = 3,
+	/* Saturated back-face primary color, index zero, every lane written
+	 * once; requires a BFC_* flag and is dropped with PRIMARY. */
+	DRM_CHROME9_VERTEX_DEST_BACK_PRIMARY = 4,
+	/* Clip distance, index = plane, writemask X only; enabled planes in
+	 * clip_distance_mask are written once, others are dropped.  Pixels
+	 * with a negative interpolated distance are discarded. */
+	DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE = 5,
 };
 
 /* Swizzles, NEG and SAT use the DRM_CHROME9_FRAGMENT_* values. */
@@ -1304,6 +1317,9 @@ struct drm_chrome9_vertex_buffer {
 #define DRM_CHROME9_VERTEX_CULL_CW	(1U << 0)
 #define DRM_CHROME9_VERTEX_CULL_CCW	(1U << 1)
 #define DRM_CHROME9_VERTEX_FLAT		(1U << 2)
+/* Screen winding whose triangles take BACK_PRIMARY instead of PRIMARY. */
+#define DRM_CHROME9_VERTEX_BFC_CW	(1U << 3)
+#define DRM_CHROME9_VERTEX_BFC_CCW	(1U << 4)
 
 /*
  * fragment carries the complete pixel state with vertices_ptr and
@@ -1338,7 +1354,10 @@ struct drm_chrome9_draw_vertex_program {
 	__u64 vertices_ptr;
 	__u64 indices_ptr;
 	__u64 buffers_ptr;
-	__u64 reserved[4];
+	/* Enabled CLIP_DISTANCE planes, bits below MAX_CLIP_DISTANCES. */
+	__u32 clip_distance_mask;
+	__u32 pad0;
+	__u64 reserved[3];
 };
 
 #if defined(__cplusplus)
