@@ -183,4 +183,25 @@ void chrome9_init_3d_h5s2vp1(struct chrome9_device *cdev);
 void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 			    bool system_framebuffer);
 
+/*
+ * Replacement VS state for the proven quad: compiled program, internal
+ * rows 256.., optional user constants c0.., A60/A62 and raw vertices.
+ */
+struct chrome9_quad_vs {
+	const u32 *internal;
+	unsigned int internal_dwords;
+	const u32 *user;
+	unsigned int user_dwords;
+	const u32 *program;
+	unsigned int program_dwords;
+	u32 a60;
+	u32 a62;
+	const u32 *vertices;
+	unsigned int vertex_dwords;
+	u32 a24;
+};
+
+void chrome9_emit_3d_quad_h6_vs(u32 **cursor, unsigned long target,
+				const struct chrome9_quad_vs *vs);
+
 #endif

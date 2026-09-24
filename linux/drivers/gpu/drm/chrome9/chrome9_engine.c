@@ -664,6 +664,93 @@ static int chrome9_build_prime(struct chrome9_engine *engine,
 	return chrome9_finish_ring(base, p, pause, stop);
 }
 
+#define CHROME9_FIXED_QUAD_VS_MASK (DRM_CHROME9_FIXED_QUAD_VS_ORACLE | \
+				    DRM_CHROME9_FIXED_QUAD_VS_W2 | \
+				    DRM_CHROME9_FIXED_QUAD_VS_HALF | \
+				    DRM_CHROME9_FIXED_QUAD_VS_M4X4)
+
+/*
+ * Byte-exact vendor compiler records (hw-TCL corpus out_d0_d1 and
+ * m4x4_r0_v0_c0, each ending in the five-record position finalizer) and
+ * STM_ViewPort_INV rows for a 32x32 window target.
+ */
+static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
+{
+	static const u32 internal[] = {
+		0x41800000, 0xc1800000, 0x3f800000, 0x00000000,
+		0x494000f8, 0x494000f8, 0x00000000, 0x00000000,
+		0x49400000, 0x49400000, 0x00000000, 0x00000000,
+	};
+	static const u32 passthrough[] = {
+		0x0008014c, 0x00000000, 0x00000000, 0x00080a0f,
+		0x0008414c, 0x00000000, 0x00000000, 0x0008422f,
+		0x0008814c, 0x00000000, 0x00000000, 0x0008423f,
+		0x00201b6c, 0x00000000, 0x00000000, 0x00280108,
+		0x00200150, 0x00101b6c, 0x00201b6c, 0x001c0107,
+		0x0010014c, 0x00380150, 0x00384154, 0x0004021f,
+		0x0020014c, 0x00000000, 0x00000000, 0x0008020f,
+		0x0020014c, 0x00000000, 0x00000000, 0x0008020f,
+	};
+	static const u32 m4x4[] = {
+		0x0008014c, 0x0040014c, 0x00000000, 0x00060801,
+		0x0008014c, 0x0040414c, 0x00000000, 0x00060802,
+		0x0008014c, 0x0040814c, 0x00000000, 0x00060804,
+		0x0008014c, 0x0040c14c, 0x0000014c, 0x0034010f,
+		0x0010014c, 0x00000000, 0x00000000, 0x00080a0f,
+		0x0008414c, 0x00000000, 0x00000000, 0x0008422f,
+		0x0008814c, 0x00000000, 0x00000000, 0x0008423f,
+		0x00201b6c, 0x00000000, 0x00000000, 0x00280108,
+		0x00200150, 0x00101b6c, 0x00201b6c, 0x001c0107,
+		0x0010014c, 0x00380150, 0x00384154, 0x0004021f,
+		0x0020014c, 0x00000000, 0x00000000, 0x0008020f,
+		0x0020014c, 0x00000000, 0x00000000, 0x0008020f,
+	};
+	/* Pixel (x, y, 0, 1) to clip space for a 32x32 target. */
+	static const u32 pixel_to_clip[] = {
+		0x3d800000, 0x00000000, 0x00000000, 0xbf800000,
+		0x00000000, 0xbd800000, 0x00000000, 0x3f800000,
+		0x00000000, 0x00000000, 0x3f800000, 0x00000000,
+		0x00000000, 0x00000000, 0x00000000, 0x3f800000,
+	};
+	static const u32 clip_w1[] = {
+		0xbf800000, 0x3f800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x3f800000, 0x3f800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x3f800000, 0xbf800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0xbf800000, 0xbf800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+	};
+	static const u32 clip_w2[] = {
+		0xc0000000, 0x40000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
+		0x40000000, 0x40000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
+		0x40000000, 0xc0000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
+		0xc0000000, 0xc0000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
+	};
+	static const u32 pixel[] = {
+		0x00000000, 0x00000000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x42000000, 0x00000000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x42000000, 0x42000000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x00000000, 0x42000000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+	};
+	bool matrix = flags == DRM_CHROME9_FIXED_QUAD_VS_M4X4;
+
+	memset(vs, 0, sizeof(*vs));
+	vs->internal = internal;
+	vs->internal_dwords = ARRAY_SIZE(internal);
+	vs->program = matrix ? m4x4 : passthrough;
+	vs->program_dwords = matrix ? ARRAY_SIZE(m4x4) : ARRAY_SIZE(passthrough);
+	/* Active records exclude the two inactive MOV tails. */
+	vs->a60 = 0x60800000 | (vs->program_dwords / 4 - 3);
+	vs->a62 = matrix ? 0x62208003 : 0x62208002;
+	if (matrix) {
+		vs->user = pixel_to_clip;
+		vs->user_dwords = ARRAY_SIZE(pixel_to_clip);
+	}
+	vs->vertices = matrix ? pixel :
+		       flags == DRM_CHROME9_FIXED_QUAD_VS_W2 ? clip_w2 : clip_w1;
+	vs->a24 = flags == DRM_CHROME9_FIXED_QUAD_VS_HALF ? 0x24000003 :
+							     0x24000004;
+	vs->vertex_dwords = (vs->a24 & 0xff) * 6;
+}
+
 static int chrome9_build_fixed(struct chrome9_engine *engine,
 			       struct chrome9_job *job, u32 target,
 			       u32 flags, u32 *pause)
@@ -686,6 +773,13 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 	p = base;
 	chrome9_emit_header0(&p, sync, ARRAY_SIZE(sync) / 2);
 	body = PTR_ALIGN(p, 16);
+	if (flags & CHROME9_FIXED_QUAD_VS_MASK) {
+		struct chrome9_quad_vs vs;
+
+		chrome9_fixed_vs_oracle(flags, &vs);
+		chrome9_emit_3d_quad_h6_vs(&p, target, &vs);
+		goto tail;
+	}
 	chrome9_emit_3d_quad_h6(&p, target, true);
 	if (p - body != 188)
 		return -EINVAL;
@@ -707,6 +801,7 @@ static int chrome9_build_fixed(struct chrome9_engine *engine,
 		body[158] = 0x00f08005;
 		body[159] = 0x000d0820;
 	}
+tail:
 	ret = chrome9_emit_3d_tail(engine, job, &p);
 	if (ret)
 		return ret;
@@ -3630,7 +3725,8 @@ static bool chrome9_verify_target(struct chrome9_job *job, u32 flags)
 		if (target[i] != CHROME9_TARGET_SENTINEL)
 			changed++;
 	}
-	if (flags == DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE)
+	if (flags == DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE ||
+	    flags == DRM_CHROME9_FIXED_QUAD_VS_HALF)
 		return changed >= 400 && changed <= 600 &&
 		       target[8 * CHROME9_TARGET_DIM + 24] !=
 			CHROME9_TARGET_SENTINEL &&
@@ -5298,7 +5394,10 @@ int chrome9_fixed_quad_ioctl(struct drm_device *drm, void *data,
 	     args->flags != DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE &&
 	     args->flags != DRM_CHROME9_FIXED_QUAD_CONSTANT_RED &&
 	     args->flags != DRM_CHROME9_FIXED_QUAD_DEPTH_ORACLE &&
-	     args->flags != DRM_CHROME9_FIXED_QUAD_BLEND_ORACLE) ||
+	     args->flags != DRM_CHROME9_FIXED_QUAD_BLEND_ORACLE &&
+	     hweight32(args->flags & CHROME9_FIXED_QUAD_VS_MASK) != 1) ||
+	    (args->flags & ~CHROME9_FIXED_QUAD_VS_MASK &&
+	     args->flags & CHROME9_FIXED_QUAD_VS_MASK) ||
 	    args->pad[0] || args->pad[1])
 		return -EINVAL;
 	return chrome9_submit_draw(drm, file, &request);

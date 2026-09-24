@@ -755,7 +755,8 @@ void chrome9_init_3d_h5s2vp1(struct chrome9_device *cdev)
 static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 					     unsigned long target,
 					     bool system_framebuffer,
-					     bool constants32)
+					     bool constants32,
+					     const struct chrome9_quad_vs *vs)
 {
 	static const u32 config[] = {
 		0x00000001, 0x01002521, 0x08010100, 0x05000000,
@@ -842,6 +843,7 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		0x41780000, 0x41fc0000, 0, 0x3f800000,
 		0xffff0000, 0xffff0000,
 	};
+	u32 fvf[ARRAY_SIZE(raster_fvf)];
 	u32 state[] = {
 		0x50000000 | (target >> 8),
 		0x51000000 | (system_framebuffer ? BIT(20) : 0),
@@ -857,8 +859,13 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 			     state, ARRAY_SIZE(state));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0xfe020000,
 			     config, ARRAY_SIZE(config));
+	memcpy(fvf, raster_fvf, sizeof(fvf));
+	if (vs) {
+		fvf[7] = vs->a62;
+		fvf[10] = vs->a24;
+	}
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
-			     raster_fvf, ARRAY_SIZE(raster_fvf));
+			     fvf, ARRAY_SIZE(fvf));
 	if (constants32) {
 		chrome9_emit_header3(cursor, 0x22030000, ps_constants_bank0,
 				     ARRAY_SIZE(ps_constants_bank0));
@@ -868,17 +875,25 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x22030000,
 				     ps_constants, ARRAY_SIZE(ps_constants));
 	}
-	chrome9_emit_header3(cursor, 0x32030400, vs_float_constants,
-			     ARRAY_SIZE(vs_float_constants));
+	if (vs && vs->user_dwords)
+		chrome9_emit_header3(cursor, 0x32030000, vs->user,
+				     vs->user_dwords);
+	if (vs)
+		chrome9_emit_header3(cursor, 0x32030400, vs->internal,
+				     vs->internal_dwords);
+	else
+		chrome9_emit_header3(cursor, 0x32030400, vs_float_constants,
+				     ARRAY_SIZE(vs_float_constants));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x33030000,
 			     vs_integer_constants,
 			     ARRAY_SIZE(vs_integer_constants));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
 			     clip, ARRAY_SIZE(clip));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x31030000,
-			     vs_program, ARRAY_SIZE(vs_program));
+			     vs ? vs->program : vs_program,
+			     vs ? vs->program_dwords : ARRAY_SIZE(vs_program));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
-			     vs_control, ARRAY_SIZE(vs_control));
+			     vs ? &vs->a60 : vs_control, 1);
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
 			     constants32 ? ps_control_ps20 : ps_control,
 			     constants32 ? ARRAY_SIZE(ps_control_ps20) :
@@ -887,7 +902,8 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 			     constants32 ? ps_program_c15_c16 : ps_program,
 			     ARRAY_SIZE(ps_program));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00000000,
-			     vertices, ARRAY_SIZE(vertices));
+			     vs ? vs->vertices : vertices,
+			     vs ? vs->vertex_dwords : ARRAY_SIZE(vertices));
 	if (constants32) {
 		/* A program switch replays the complete compiler control object. */
 		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
@@ -904,7 +920,13 @@ void chrome9_emit_3d_quad_h6(u32 **cursor, unsigned long target,
 			    bool system_framebuffer)
 {
 	chrome9_emit_3d_quad_h6_internal(cursor, target, system_framebuffer,
-					 false);
+					 false, NULL);
+}
+
+void chrome9_emit_3d_quad_h6_vs(u32 **cursor, unsigned long target,
+				const struct chrome9_quad_vs *vs)
+{
+	chrome9_emit_3d_quad_h6_internal(cursor, target, true, false, vs);
 }
 
 static void chrome9_emit_3d_texture_h6(u32 **cursor, unsigned long target,
@@ -1584,7 +1606,7 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 				do_3d_sf ? 2 * PAGE_SIZE :
 				chrome9_selftest_2d_offset,
 				do_3d_sf,
-				chrome9_selftest_3d_store == 7);
+				chrome9_selftest_3d_store == 7, NULL);
 		body_dwords = p - body;
 		if (body_dwords != (do_3d_texture ? 232 :
 				    chrome9_selftest_3d_store == 7 ? 372 : 188)) {
