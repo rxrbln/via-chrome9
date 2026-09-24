@@ -431,3 +431,34 @@ implements the pair as `--float3` and `--float4`, including BGRA8, D16,
 exterior, and guard checks.  It passes a strict host build.  This is a
 proposed guarded cold-boot pair, not a silicon result; no GPU submission was
 made during this audit.
+
+### Float4 one-MAD timeout
+
+The float4 half of that pair was attempted first on a fresh boot, using tools
+source `5164197` and binary SHA-256
+`b27cf358b4368cd0867f8d5e1eb970ad28c65ffc95291f78c2a67ddb4a11359d`.
+A known-good baseline passed, but the one-MAD draw timed out before readback:
+
+```text
+phase=cookie seq=9 kind=22 flags=0x101 epoch=0
+current=0x4b00 pause=0x4af0 stop=0x4b70
+cr=80000000 engine=00000711
+```
+
+The engine was quarantined and neither float3 nor any later GPU diagnostic was
+run on that boot.  The preserved log is
+`/root/tmp/chrome9-live/t2-route/dmesg-after-float4-timeout.log`, SHA-256
+`87760f2cab5181b230389171ec19ac0a995d97cf62cce7759e82a16a281bf6e8`.
+Its ring window contains the expected vertex payload: T0 all zero, T1 poison
+`(.7,.1,.9,.6)`, and T2 `(.2,.3,.4,.8)`.
+
+This eliminates float3-only width closure as a sufficient cause.  It also
+repeats the earlier one-record three-varying MAD timeout after replacing the
+old incorrect A00 resource count of three with the proprietary analyzer's
+count one, so A00 alone was not the cause.  The timeout is common to the
+simultaneous T0/T1/T2 class-3 MAD consumer and the three-coordinate FE/VS
+envelope.  By contrast, the earlier three-record MOV/ADD chain using the same
+three physical inputs retired but produced black.  No manual or proprietary
+packet differential is presently known, so do not change A09, FVF masks,
+A00, or A90 from this timeout alone.  A complete vendor draw-state comparison
+must precede any further hardware discriminator.
