@@ -596,6 +596,57 @@ therefore `00000011`, not `00000031`.  The timeout does not yet qualify or
 reject T2 linkage; a single corrected A00 discriminator after cold recovery
 is the bounded causal test.
 
+That corrected discriminator was run once on 2026-09-24 after the ordered-FE
+writer and scalar-selector startup corrections.  A known-good guarded
+`CMP`/TEMP baseline passed first.  The same one-record production MAD then
+timed out in the command-22 cookie wait; the engine was quarantined and no
+later GPU submissions were made on that boot.  The loaded diagnostic module
+had SHA-256
+`3b087cfa6e750b09d92c546479c7a0f326918926236c279a979972757df1d707`;
+its temporary logging does not change the draw packet.  The corresponding
+debug-free commit is `5656982`, whose staged but not loaded module has SHA-256
+`f7e0c4023d813182842b7142e1943c2e01e384003abe6230b0c788e2bf83fcfb`.
+The fault report was:
+
+```text
+phase=cookie seq=2 kind=22 flags=0x101 epoch=0
+cookie=00010001/00020002 current=0x1080 pause=0x1070 stop=0x10f0
+cr=80000000 engine=00000711 ring[0x1080]=fe020420
+```
+
+The preserved log is
+`/root/tmp/chrome9-live/bringup-20260924-0725/t2-float4-timeout-dmesg.txt`.
+Unlike the first run, the scheduled resource count was one, hence FE A00 was
+`00000011`; the current ordered input writer also programs all three direct
+float4 fields (`A01=012b2723`) rather than the historical single
+`01002521` field.  Therefore
+neither the old A00 overcount nor omission of A01 fields one/two is sufficient
+to explain the T2 hang.
+
+This is still not evidence that the one-record MAD encoding itself is wrong:
+the Linux production object and Windows compiler agree on the ALU and A90
+logical-use mask.  The unresolved boundary is the complete three-coordinate
+producer/consumer draw image or a silicon restriction on simultaneous A/C/B
+texture-class reads which the offline compiler does not expose.  Before any
+new live discriminator, compare the full proprietary draw-time image—not just
+the fragment object—against the clean-room FVF/VS/H6/config packet, and prove
+the transition from a known one-input draw restores every high-coordinate
+field.  Do not retry this packet or move to the four-record split-output form
+while that differential is unknown.
+
+The narrowest eventual discriminator is the already recovered three-record
+chain at lines 503--527, not another one-record MAD.  It retains the same
+three float4 producers and direct-use mask, but each ALU names at most one
+texture-class source.  Its production controls are
+`90058007/91000000/92000003`; the corrected draw image is
+`A00=00000031`, `A01=012b2723`, `A08=08030303`,
+`A09=09000003`, with A02/A03 reset.  An older run of this chain retired
+silently black under stale one-field A01 state rather than wedging, so it is a
+more bounded separator between FE route failure and simultaneous A/C/B
+texture-class consumption.  It still requires a cold healthy engine,
+known-good baselines, exact packet capture, and immediate quarantine on a
+timeout; this is a proposed discriminator, not a pass.
+
 ## Polygon offset / depth bias
 
 The manual gives the exact equation:
