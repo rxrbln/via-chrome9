@@ -213,8 +213,16 @@ uniform indices 0 through 4.  At draw time `st_atom_texture.c` and
 `st_atom_sampler.c` walk those dense `prog->SamplersUsed` slots and use
 `prog->SamplerUnits[slot]` to fetch application texture units 0,1,2,4,5,
 installing the selected views/states back at pipe slots 0 through 4.  The
-Chrome9 cap requirement is therefore five fragment slots, not application
-unit high-water six.
+active Chrome9 descriptor requirement is therefore five fragment slots, not
+application-unit high-water six.
+
+That active-slot result does not reduce the GLSL link-time resource limit.
+The exact artifact retains `num_textures=6` alongside
+`textures_used=samplers_used=0x1f`: Mesa checks the earlier linked
+`state.num_shader_samplers` against `MaxTextureImageUnits`, and the shared
+`tNormal` declaration contributes before its dead fragment-stage use is
+removed.  Terrain therefore requires a public FS link cap of six while the
+final cmd22 program consumes only five dense descriptors.
 
 The semantic stream uses virtual temporary ids 0 through 66.  A conservative
 component-lifetime reconstruction peaks at nine simultaneously live virtual
@@ -236,10 +244,10 @@ No DRM node or GPU was used.
 
 This closes the fragment semantic compiler gate, not the scene.  Public caps
 still expose three fragment inputs and three fragment sampler/view slots,
-while this shader needs four packed input slots and five dense fragment
-samplers; the terrain vertex shader also needs the still-disabled public
-vertex-texture path.  Uniform POW's LOG-zero numerical behavior remains a
-separate hardware correctness gate.
+while this shader needs four packed input slots, a link-time sampler limit of
+six, and five dense active fragment samplers; the terrain vertex shader also
+needs the still-disabled public vertex-texture path.  Uniform POW's LOG-zero
+numerical behavior remains a separate hardware correctness gate.
 
 ## Proprietary uniform-POW oracle
 
@@ -316,6 +324,6 @@ It has not been submitted to hardware.
 Only after this gate and the four-slot varying linkage pass should the full
 main fragment object be captured to establish exact final ALU/TAU counts and
 physical-temp high-water.  Fragment closure still does not enable the scene:
-software vertex texture sampling, five dense shader sampler/view slots,
-application-unit remapping, mip/R2T chains and the broader caps remain
-independent gates.
+software vertex texture sampling, a six-resource FS link cap with five dense
+active shader sampler/view slots, application-unit remapping, mip/R2T chains
+and the broader caps remain independent gates.

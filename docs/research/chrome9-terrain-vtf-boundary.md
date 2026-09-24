@@ -100,6 +100,7 @@ The linked main fragment shader has these source-exact resources:
 | resource | requirement |
 |---|---:|
 | active TEX instructions | 5 |
+| GLSL link-time FS sampler resources | 6 |
 | application texture units | 0, 1, 2, 4, 5 |
 | linked/Gallium FS sampler slots | 0, 1, 2, 3, 4 |
 | sampler/view slot count | 5 |
@@ -133,17 +134,26 @@ uniforms dense per-stage indices 0 through 4 from
 application units 0,1,2,4,5, and install the selected state back into pipe
 slots 0 through 4.  The exact linked Chrome9 fragment probe consequently
 reports `sampler_mask=0x1f`, not sparse `0x37`.  Terrain therefore needs five
-FS sampler/view slots, but it does not require the optional sparse-descriptor
-ABI.
+active FS sampler/view slots, but it does not require the optional
+sparse-descriptor ABI.
+
+The public link cap is nevertheless six.  The same exact linked artifact
+reports `num_textures=6` while `textures_used=samplers_used=0x1f` and its
+final five sampler variables have dense bindings 0 through 4.  Mesa checks
+the earlier `state.num_shader_samplers` against `MaxTextureImageUnits` in
+`gl_nir_link_uniforms.c:1990-2001`; the shared `tNormal` declaration still
+contributes there before its dead fragment-stage use is removed.  Thus cap
+promotion must distinguish the six link-time sampler resources from the five
+descriptors actually consumed by cmd22.
 
 The fragment ALU count and physical-temp pressure are intentionally not
 claimed closed by this audit.  The literal one-iteration light loop can
 unroll, and glmark uploads `pointLightDistance[0] = 0`, allowing the distance
 branch to specialize away, but a captured linked Chrome9 NIR object is still
 required to prove `ALU + computed-coordinate bridges <= 96` and at most 12
-simultaneously live physical temps.  The five-TEX, five-varying, five-slot and
-16-constant figures above are exact independently of that later compiler
-proof.
+simultaneously live physical temps.  The five-TEX, five-varying, six-resource
+link cap, five active slots and 16-constant figures above are exact
+independently of that later compiler proof.
 
 ## Completed bounded offline gate
 
