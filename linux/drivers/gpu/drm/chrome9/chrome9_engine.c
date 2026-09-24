@@ -213,6 +213,7 @@ struct chrome9_tcl_draw {
 	u32 element_count;
 	u32 cull;
 	u8 element_format[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u8 element_type[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 element_offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	/* Rows 256..258: viewport scale, offset and the snap bias. */
@@ -8441,27 +8442,64 @@ static bool chrome9_tcl_viewport_valid(const u32 viewport[8])
 	       !viewport[6] && !viewport[7];
 }
 
+/*
+ * Vertex element formats: native A(1+i) low byte (components-1 << 6 |
+ * type << 1 | normalize, VX900 manual), fetch dwords and which dwords hold
+ * float32 or float16 data for the stage A finite check.
+ */
+static const struct {
+	u8 native;
+	u8 dwords;
+	u8 float32;
+	u8 float16;
+} chrome9_tcl_formats[] = {
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT1] = { 0x02, 1, 1, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT2] = { 0x42, 2, 2, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT3] = { 0x82, 3, 3, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT4] = { 0xc2, 4, 4, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM] = { 0xd1, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM] = { 0xc7, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED] = { 0xc6, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM] = { 0x49, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM] = { 0xc9, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM] = { 0x4b, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM] = { 0xcb, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED] = { 0x4a, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED] = { 0xca, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT] = { 0x44, 1, 0, 1 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT] = { 0xc4, 2, 0, 2 },
+};
+
 static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
 		const struct drm_chrome9_vertex_element *elements, u32 stride)
 {
-	static const u8 native[] = { 0x02, 0x42, 0x82, 0xc2, 0xd1 };
-	static const u8 dwords[] = { 1, 2, 3, 4, 1 };
+	u32 fetched = 0;
 	unsigned int e;
 
 	for (e = 0; e < tcl->element_count; e++) {
 		const struct drm_chrome9_vertex_element *element = &elements[e];
 
-		if (element->format >= ARRAY_SIZE(native) || element->buffer ||
-		    element->reserved || !IS_ALIGNED(element->offset, 4) ||
-		    element->offset > stride - 4 * dwords[element->format])
+		if (element->format >= ARRAY_SIZE(chrome9_tcl_formats) ||
+		    element->buffer || element->reserved ||
+		    !IS_ALIGNED(element->offset, 4) ||
+		    element->offset >
+			stride - 4 * chrome9_tcl_formats[element->format].dwords)
 			return -EINVAL;
-		tcl->element_format[e] = native[element->format];
+		tcl->element_format[e] = chrome9_tcl_formats[element->format].native;
+		tcl->element_type[e] = element->format;
 		tcl->element_offset[e] = element->offset / 4;
-		tcl->input_lanes[e] = element->format ==
-			DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM ? 0xf :
-			GENMASK(dwords[element->format] - 1, 0);
+		/* The fetcher fills lanes a format lacks with (0, 0, 0, 1). */
+		tcl->input_lanes[e] = 0xf;
+		fetched += chrome9_tcl_formats[element->format].dwords;
 	}
-	return 0;
+	/* Inline vertices are parsed as the sum of element fetch dwords
+	 * (A00[6:0]); padding misaligns the stream and stops the engine. */
+	return fetched * 4 == stride ? 0 : -EINVAL;
+}
+
+static bool chrome9_tcl_half_finite(u32 value)
+{
+	return (value & 0x7c00) != 0x7c00 && (value & 0x7c000000) != 0x7c000000;
 }
 
 static bool chrome9_tcl_vertices_finite(const struct chrome9_tcl_draw *tcl)
@@ -8472,11 +8510,14 @@ static bool chrome9_tcl_vertices_finite(const struct chrome9_tcl_draw *tcl)
 		const u32 *vertex = tcl->vertices + v * tcl->stride_dw;
 
 		for (e = 0; e < tcl->element_count; e++) {
-			if (tcl->element_format[e] == 0xd1)
-				continue;
-			for (c = 0; c < hweight8(tcl->input_lanes[e]); c++)
-				if (!chrome9_float_finite(
-					vertex[tcl->element_offset[e] + c]))
+			const u32 *data = vertex + tcl->element_offset[e];
+			u8 type = tcl->element_type[e];
+
+			for (c = 0; c < chrome9_tcl_formats[type].float32; c++)
+				if (!chrome9_float_finite(data[c]))
+					return false;
+			for (c = 0; c < chrome9_tcl_formats[type].float16; c++)
+				if (!chrome9_tcl_half_finite(data[c]))
 					return false;
 		}
 	}
