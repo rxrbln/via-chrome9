@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include <linux/module.h>
 #include <linux/aperture.h>
@@ -2545,6 +2546,7 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			args->value |=
 				DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED;
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_PRIMARY;
+			args->value |= DRM_CHROME9_CAP_FRAGMENT_STENCIL;
 			if (chrome9_fragment_sparse_textures_enabled())
 				args->value |=
 					DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES;

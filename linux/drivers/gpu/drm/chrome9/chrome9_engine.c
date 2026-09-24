@@ -238,6 +238,7 @@ struct chrome9_draw_request {
 	u32 fragment_texture_count;
 	u8 fragment_texture_units[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_depth_format;
+	struct drm_chrome9_stencil_state stencil;
 	u32 ps_program[4];
 	u32 ps_constant_c0[4];
 	u32 triangle_count;
@@ -722,6 +723,68 @@ static u32 chrome9_depth_control_word(
 	if (!(request->flags & DRM_CHROME9_DEPTH_READ_ONLY))
 		word |= BIT(2);
 	return word;
+}
+
+/* A23/A24 carry the clockwise face and A25/A26 the counter-clockwise one;
+ * identical faces reproduce the vendor's one-sided mirroring.
+ */
+static void chrome9_lower_stencil(const struct drm_chrome9_stencil_state *state,
+				  u32 words[4])
+{
+	const struct drm_chrome9_stencil_face *face[2] = { &state->cw, &state->ccw };
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		words[2 * i] = (0x23 + 2 * i) << 24 | face[i]->ref << 16 |
+			face[i]->value_mask << 8 | face[i]->write_mask;
+		words[2 * i + 1] = (0x24 + 2 * i) << 24 | face[i]->func << 16 |
+			face[i]->fail_op << 6 | face[i]->zfail_op << 3 |
+			face[i]->zpass_op;
+	}
+}
+
+static int chrome9_validate_stencil(const struct drm_chrome9_stencil_state *state)
+{
+	const struct drm_chrome9_stencil_face *face[2] = { &state->cw, &state->ccw };
+	unsigned int i;
+
+	for (i = 0; i < 2; i++)
+		if (face[i]->func > DRM_CHROME9_COMPARE_ALWAYS ||
+		    face[i]->fail_op > DRM_CHROME9_STENCIL_OP_DECR_WRAP ||
+		    face[i]->zfail_op > DRM_CHROME9_STENCIL_OP_DECR_WRAP ||
+		    face[i]->zpass_op > DRM_CHROME9_STENCIL_OP_DECR_WRAP ||
+		    face[i]->pad)
+			return -EINVAL;
+	return 0;
+}
+
+static int chrome9_stencil_selftest(void)
+{
+	/* Neutral faces must reproduce the closed disabled block. */
+	static const struct drm_chrome9_stencil_state neutral = {
+		.cw = { DRM_CHROME9_COMPARE_ALWAYS, 0, 0, 0, 0, 0xff, 0xff, 0 },
+		.ccw = { DRM_CHROME9_COMPARE_ALWAYS, 0, 0, 0, 0, 0xff, 0xff, 0 },
+	};
+	static const struct drm_chrome9_stencil_state faces = {
+		.cw = { DRM_CHROME9_COMPARE_EQUAL, DRM_CHROME9_STENCIL_OP_INVERT,
+			DRM_CHROME9_STENCIL_OP_INCR_WRAP,
+			DRM_CHROME9_STENCIL_OP_REPLACE, 0xa5, 0xf0, 0x0f, 0 },
+		.ccw = { DRM_CHROME9_COMPARE_NEVER,
+			 DRM_CHROME9_STENCIL_OP_DECR_WRAP,
+			 DRM_CHROME9_STENCIL_OP_ZERO,
+			 DRM_CHROME9_STENCIL_OP_DECR_SAT, 0x5a, 0x0f, 0xf0, 0 },
+	};
+	u32 words[4];
+
+	chrome9_lower_stencil(&neutral, words);
+	if (words[0] != 0x2300ffff || words[1] != 0x24070000 ||
+	    words[2] != 0x2500ffff || words[3] != 0x26070000)
+		return -EINVAL;
+	chrome9_lower_stencil(&faces, words);
+	if (words[0] != 0x23a5f00f || words[1] != 0x24020172 ||
+	    words[2] != 0x255a0ff0 || words[3] != 0x260001cc)
+		return -EINVAL;
+	return 0;
 }
 
 static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
@@ -2193,8 +2256,14 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	memcpy(common + common_count, pixel_z_clip, sizeof(pixel_z_clip));
 	common_count += ARRAY_SIZE(pixel_z_clip);
 	if (depth_active) {
-		memcpy(common + common_count, neutral_stencil,
-		       sizeof(neutral_stencil));
+		if (request->flags & DRM_CHROME9_FRAGMENT_STENCIL) {
+			common[4] |= BIT(4);
+			chrome9_lower_stencil(&request->stencil,
+					      common + common_count);
+		} else {
+			memcpy(common + common_count, neutral_stencil,
+			       sizeof(neutral_stencil));
+		}
 		common_count += ARRAY_SIZE(neutral_stencil);
 		common[common_count++] = blend &&
 			(request->blend.flags &
@@ -3803,6 +3872,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"fragment raster-state self-test failed: %d\n", ret);
+		return ret;
+	}
+	ret = chrome9_stencil_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"stencil-state self-test failed: %d\n", ret);
 		return ret;
 	}
 	ret = chrome9_fragment_fe_config_selftest();
@@ -7426,6 +7501,7 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 		.depth_pitch = args->depth_pitch,
 		.destination_format = args->destination_format,
 		.fragment_depth_format = args->depth_format,
+		.stencil = args->stencil,
 		.scissor = args->scissor,
 		.blend = args->blend,
 		.triangle_count = args->triangle_count,
@@ -7433,7 +7509,9 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 	};
 	u32 allowed_flags = DRM_CHROME9_FRAGMENT_DEPTH |
 		DRM_CHROME9_FRAGMENT_BLEND |
-		DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
+		DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED |
+		DRM_CHROME9_FRAGMENT_STENCIL;
+	bool stencil = args->flags & DRM_CHROME9_FRAGMENT_STENCIL;
 	u64 surface_size;
 	u64 total_size;
 	u32 vertex_count;
@@ -7474,7 +7552,11 @@ int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 		(args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_D16 &&
 		 args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_X8Z24))) ||
 	    (!depth && (args->depth_handle || args->depth_pitch ||
-			   args->depth_format)))
+			   args->depth_format)) ||
+	    (stencil && (!depth ||
+		args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ||
+		chrome9_validate_stencil(&args->stencil))) ||
+	    (!stencil && memchr_inv(&args->stencil, 0, sizeof(args->stencil))))
 		return -EINVAL;
 	ret = chrome9_validate_scissor(&args->scissor, args->width,
 				       args->height);
