@@ -39,6 +39,7 @@ struct chrome9_fragment_state {
 	bool position_used;
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 alu_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u8 tex_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_varying[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_instruction[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
 	u8 coordinate_last_tau[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
@@ -348,6 +349,10 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 						return -EINVAL;
 				chrome9_fragment_note_varying(state, coordinate, 0x3,
 						      false);
+				state->tex_varying_width[coordinate->index] =
+					max3(state->tex_varying_width[coordinate->index],
+					     coordinate->swizzle[0] + 1,
+					     coordinate->swizzle[1] + 1);
 			} else {
 				bridge_count++;
 			}
@@ -356,6 +361,15 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	if (output_mask != 0xf || !alu_count ||
 	    alu_count + bridge_count > DRM_CHROME9_FRAGMENT_MAX_ALU)
 		return -EINVAL;
+	/*
+	 * The textured FE consumer carries three lanes unless the ALU reads
+	 * W.  A direct TEX coordinate from lane W (e.g. packed .zw) would sample
+	 * a dropped lane; userspace must bridge it through a TEMP.
+	 */
+	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; i++)
+		if (state->tex_varying_width[i] > 3 &&
+		    state->alu_varying_width[i] < 4)
+			return -EINVAL;
 	/* A vector operation defines its whole write mask even when a later
 	 * swizzle consumes only some lanes (for example raw depth sampled as
 	 * Gallium's (Z, 0, 0, 1)).  Reject a wholly dead temporary, not legal
