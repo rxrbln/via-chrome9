@@ -228,6 +228,12 @@ static bool chrome9_async_retire = true;
 module_param_named(async_retire, chrome9_async_retire, bool, 0600);
 MODULE_PARM_DESC(async_retire, "Retire fragment jobs asynchronously (default: true)");
 
+/* Omit repeated state groups between draws of one staging segment. */
+static bool chrome9_state_cache_enable;
+module_param_named(state_cache, chrome9_state_cache_enable, bool, 0600);
+MODULE_PARM_DESC(state_cache,
+		 "Omit state repeated within one command segment (default: false)");
+
 static uint chrome9_profile;
 module_param_named(profile, chrome9_profile, uint, 0600);
 MODULE_PARM_DESC(profile, "Debug: log fragment job phase times every N jobs");
@@ -262,6 +268,8 @@ static u64 chrome9_prof_full_kind[6];
 static u64 chrome9_prof_jobs;
 static u64 chrome9_prof_draws;
 static u64 chrome9_prof_segments;
+/* State cache: draws, dwords emitted and dwords omitted. */
+static u64 chrome9_prof_state[3];
 static ktime_t chrome9_prof_last;
 
 static void chrome9_prof_start(void)
@@ -325,6 +333,11 @@ static void chrome9_prof_job(struct drm_device *drm)
 		 div64_u64(chrome9_prof_draws * 100, n) % 100,
 		 div64_u64(chrome9_prof_segments, n),
 		 div64_u64(chrome9_prof_segments * 100, n) % 100);
+	dev_info(drm->dev, "profile state cache: draws %llu, emitted %llu omitted %llu dwords per job\n",
+		 div64_u64(chrome9_prof_state[0], n),
+		 div64_u64(chrome9_prof_state[1], n),
+		 div64_u64(chrome9_prof_state[2], n));
+	memset(chrome9_prof_state, 0, sizeof(chrome9_prof_state));
 	chrome9_prof_engine(drm);
 	chrome9_prof_draws = 0;
 	chrome9_prof_segments = 0;
@@ -3556,17 +3569,138 @@ static u32 chrome9_fragment_state_bound(const struct chrome9_draw_request *reque
 }
 
 /*
- * Emit one draw's complete state and its vertices (stage A, post-TNL) or
- * stream slots and indices (stage B) at *cursor, never past limit.
+ * State groups a segment-local cache may omit when a draw would re-emit
+ * the words of the group's previous emission in the same segment.
+ */
+enum chrome9_state_group {
+	CHROME9_GROUP_DESTINATION,
+	CHROME9_GROUP_COMMON,
+	CHROME9_GROUP_PS_CONSTANTS,
+	CHROME9_GROUP_VS_CONSTANTS,
+	CHROME9_GROUP_VS_ROWS,
+	CHROME9_GROUP_CLIP,
+	CHROME9_GROUP_TEXTURE,
+	CHROME9_GROUP_COUNT = CHROME9_GROUP_TEXTURE +
+			      DRM_CHROME9_FRAGMENT_MAX_TEXTURES,
+};
+
+/*
+ * Last emission of each group inside the current staging segment.  It is
+ * reset at every segment start and never outlives one segment, so no
+ * other context, ring wrap or reset can intervene.  The link group (FE,
+ * FVF/raster, VS program, A60, PS controls and program) is compared by its
+ * inputs because constant uploads sit between its blocks.
+ */
+struct chrome9_state_cache {
+	const u32 *start[CHROME9_GROUP_COUNT];
+	u32 dwords[CHROME9_GROUP_COUNT];
+	const struct chrome9_fragment_program *program;
+	const struct chrome9_tcl_draw *tcl;
+	u32 config[10];
+	u32 raster[CHROME9_TCL_RASTER_WORDS];
+	u32 raster_count;
+	/* Statistics: draws, and dwords emitted and omitted. */
+	u32 draws;
+	u32 emitted;
+	u32 omitted;
+	u32 pending;
+};
+
+static u32 *chrome9_group_begin(u32 **cursor)
+{
+	while (!IS_ALIGNED((unsigned long)*cursor, 16))
+		*(*cursor)++ = 0xcc000000;
+	return *cursor;
+}
+
+/*
+ * Drop the group just written when it repeats its previous emission;
+ * false when it was dropped.
+ */
+static bool chrome9_group_end(struct chrome9_state_cache *cache,
+			      enum chrome9_state_group group, u32 *start,
+			      u32 **cursor)
+{
+	u32 dwords = *cursor - start;
+
+	if (!cache || !dwords)
+		return dwords;
+	if (cache->start[group] && cache->dwords[group] == dwords &&
+	    !memcmp(cache->start[group], start, dwords * sizeof(u32))) {
+		*cursor = start;
+		cache->pending += dwords;
+		return false;
+	}
+	cache->start[group] = start;
+	cache->dwords[group] = dwords;
+	return true;
+}
+
+/* Raster words are self-addressed registers; A24 is the per-draw count. */
+static bool chrome9_raster_equal(const u32 *a, const u32 *b, u32 count)
+{
+	u32 i;
+
+	for (i = 0; i < count; i++)
+		if (a[i] != b[i] && (a[i] >> 24 != 0x24 || b[i] >> 24 != 0x24))
+			return false;
+	return true;
+}
+
+static bool chrome9_link_equal(const struct chrome9_state_cache *cache,
+		const struct chrome9_fragment_program *fp,
+		const struct chrome9_tcl_draw *tcl, const u32 *config,
+		const u32 *raster, u32 raster_count)
+{
+	const struct chrome9_fragment_program *old = cache->program;
+	const struct chrome9_vertex_program *vp, *ovp;
+
+	if (!old || !cache->tcl || !tcl ||
+	    raster_count != cache->raster_count ||
+	    memcmp(config, cache->config, sizeof(cache->config)) ||
+	    !chrome9_raster_equal(raster, cache->raster, raster_count) ||
+	    fp->alu_count != old->alu_count || fp->tau_count != old->tau_count ||
+	    memcmp(fp->controls, old->controls, sizeof(fp->controls)) ||
+	    memcmp(fp->alu, old->alu, fp->alu_count * sizeof(fp->alu[0])) ||
+	    memcmp(fp->tau, old->tau, fp->tau_count * sizeof(fp->tau[0])))
+		return false;
+	vp = &tcl->program;
+	ovp = &cache->tcl->program;
+	/* Bool constants live in A61 (raster words); int constants here. */
+	return vp->record_count == ovp->record_count && vp->a60 == ovp->a60 &&
+	       !memcmp(vp->records, ovp->records,
+		       vp->record_count * sizeof(vp->records[0])) &&
+	       tcl->int_upload == cache->tcl->int_upload &&
+	       (!tcl->int_upload ||
+		!memcmp(tcl->int_constants, cache->tcl->int_constants,
+			sizeof(tcl->int_constants)));
+}
+
+/*
+ * A query snapshot drains or reads back the 3D engine; the next draw
+ * re-emits all state instead of relying on it surviving that.
+ */
+static void chrome9_state_cache_forget(struct chrome9_state_cache *cache)
+{
+	memset(cache->start, 0, sizeof(cache->start));
+	cache->program = NULL;
+	cache->tcl = NULL;
+}
+
+/*
+ * Emit one draw's state and its vertices (stage A, post-TNL) or stream
+ * slots and indices (stage B) at *cursor, never past limit.  With a cache,
+ * stage B draws omit state groups that repeat within the segment.
  * A non-NULL query brackets the draw with a counter reset and a snapshot
- * to that SL address.  -E2BIG leaves *cursor unchanged so a batch can start
- * a new segment.
+ * to that SL address; both are per-draw actions outside every group.
+ * -E2BIG leaves *cursor unchanged so a batch can start a new segment; the
+ * caller then starts that segment with a reset cache.
  */
 static noinline_for_stack int
 chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
 	const u32 *element_address, const u32 *query, u32 query_re,
-	u32 **cursor, const u32 *limit)
+	struct chrome9_state_cache *cache, u32 **cursor, const u32 *limit)
 {
 	static const u32 destination_tail[] = {
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
@@ -3616,6 +3750,9 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 vs_control[] = { 0 };
 	u32 *p = *cursor;
 	u32 *vertex_header;
+	u32 *group;
+	bool link;
+	bool textures_written = false;
 	u32 destination_count;
 	u32 common_count = 7;
 	u32 vertex_count = tcl ? tcl->vertex_count : request->triangle_count * 3;
@@ -3733,23 +3870,48 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			GENMASK(program->varying_width[i] - 1, 0);
 	}
 
+	/* Stage A has no later A24 than the raster block's. */
+	if (!element_address)
+		cache = NULL;
+	if (cache)
+		cache->pending = 0;
+	/* Raster words include topology (A20), point/sprite (A2A, A2B, A2F). */
+	link = !cache || !chrome9_link_equal(cache, program, tcl, config,
+					     raster, raster_count);
+	/* The query counter reset is never cached. */
 	if (query)
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 				     chrome9_occlusion_reset,
 				     ARRAY_SIZE(chrome9_occlusion_reset));
+	group = chrome9_group_begin(&p);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     destination_state, destination_count);
+	chrome9_group_end(cache, CHROME9_GROUP_DESTINATION, group, &p);
+	/* Texture groups compare every emitted word: cube closure, 3D R size. */
 	for (i = 0; i < request->fragment_texture_count; i++) {
+		group = chrome9_group_begin(&p);
 		chrome9_emit_fragment_texture(&p, &request->fragment_textures[i],
 			texture_base[i], request->fragment_texture_units[i],
 			request->fragment_texture_flags[i]);
+		textures_written |= chrome9_group_end(cache,
+			CHROME9_GROUP_TEXTURE + request->fragment_texture_units[i],
+			group, &p);
 	}
+	group = chrome9_group_begin(&p);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     common, common_count);
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0xfe020000,
-			     config, ARRAY_SIZE(config));
-	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000, raster,
-			     raster_count);
+	chrome9_group_end(cache, CHROME9_GROUP_COMMON, group, &p);
+	/*
+	 * FE A00 bit 0 invalidates the texture cache: new image words take
+	 * effect only with it (silicon R2 "tex"), so re-emit FE config.
+	 */
+	if (link || textures_written)
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0xfe020000,
+				     config, ARRAY_SIZE(config));
+	if (link)
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000, raster,
+				     raster_count);
+	group = chrome9_group_begin(&p);
 	if (program->constant_count) {
 		u32 first = min(program->constant_count, 16U);
 
@@ -3760,25 +3922,37 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 					     &program->constants[16][0],
 					     (program->constant_count - 16) * 4);
 	}
+	chrome9_group_end(cache, CHROME9_GROUP_PS_CONSTANTS, group, &p);
+	group = chrome9_group_begin(&p);
 	if (tcl && tcl->constant_count)
 		chrome9_emit_header3(&p, 0x32030000 + 4 * tcl->constant_first,
 				     tcl->constants, 4 * tcl->constant_count);
+	chrome9_group_end(cache, CHROME9_GROUP_VS_CONSTANTS, group, &p);
+	group = chrome9_group_begin(&p);
 	if (tcl)
 		chrome9_emit_header3(&p, 0x32030400, tcl->rows,
 				     ARRAY_SIZE(tcl->rows));
 	else
 		chrome9_emit_header3(&p, 0x32030400, vs_float_constants,
 				     ARRAY_SIZE(vs_float_constants));
-	/* Client i# bytes may look like headers: counted H3 (Windows form). */
-	if (tcl && tcl->int_upload)
-		chrome9_emit_header3(&p, 0x33030000, tcl->int_constants,
-				     ARRAY_SIZE(tcl->int_constants));
-	else
-		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x33030000,
-				     vs_integer_constants,
-				     ARRAY_SIZE(vs_integer_constants));
+	chrome9_group_end(cache, CHROME9_GROUP_VS_ROWS, group, &p);
+	/* Flow int constants belong to the program: emitted with LINK. */
+	if (link) {
+		/* Client i# bytes may look like headers: counted H3 (Windows form). */
+		if (tcl && tcl->int_upload)
+			chrome9_emit_header3(&p, 0x33030000, tcl->int_constants,
+					     ARRAY_SIZE(tcl->int_constants));
+		else
+			chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x33030000,
+					     vs_integer_constants,
+					     ARRAY_SIZE(vs_integer_constants));
+	}
+	group = chrome9_group_begin(&p);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     clip, ARRAY_SIZE(clip));
+	chrome9_group_end(cache, CHROME9_GROUP_CLIP, group, &p);
+	if (!link)
+		goto draw;
 	if (tcl) {
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
 				     &tcl->program.records[0][0],
@@ -3802,6 +3976,14 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	if (program->tau_count)
 		chrome9_emit_header3(&p, 0x21030000, program->tau,
 				     program->tau_count);
+	if (cache) {
+		cache->program = program;
+		cache->tcl = tcl;
+		memcpy(cache->config, config, sizeof(cache->config));
+		memcpy(cache->raster, raster, raster_count * sizeof(*raster));
+		cache->raster_count = raster_count;
+	}
+draw:
 	if (element_address) {
 		u32 slots[DRM_CHROME9_VERTEX_MAX_INPUTS];
 		u32 draw[4];
@@ -3823,6 +4005,13 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 				     tcl->index_dwords);
 		if (query)
 			chrome9_emit_occlusion_snapshot(&p, *query, query_re);
+		if (cache) {
+			cache->draws++;
+			cache->emitted += p - *cursor;
+			cache->omitted += cache->pending;
+			if (query)
+				chrome9_state_cache_forget(cache);
+		}
 		*cursor = p;
 		return 0;
 	}
@@ -6813,6 +7002,7 @@ struct chrome9_fragment_submit {
 			 [DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u64 element_start[DRM_CHROME9_VERTEX_MAX_BATCH]
 			 [DRM_CHROME9_VERTEX_MAX_INPUTS];
+	struct chrome9_state_cache cache;
 };
 
 /* Object index of handle among kind, appended when new; U32_MAX if full. */
@@ -7489,7 +7679,14 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	for (next = 0, q = 0; next < count; ) {
 		const u32 *limit = chrome9_fragment_segment_limit(engine);
 		u32 *p = chrome9_fragment_segment_begin(engine);
+		struct chrome9_state_cache *cache = NULL;
 		u32 first = next;
+
+		/* Sampled once: a cache must see every draw of its segment. */
+		if (READ_ONCE(chrome9_state_cache_enable)) {
+			cache = &sub->cache;
+			memset(cache, 0, sizeof(*cache));
+		}
 
 		for (; next < count; next++) {
 			const struct chrome9_draw_request *req = requests[next];
@@ -7519,7 +7716,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
 				req->query ? &query_address : NULL,
-				job->query_re, &p, limit);
+				job->query_re, cache, &p, limit);
 			/* A full segment is retired before the next draw. */
 			if (ret == -E2BIG && next > first)
 				break;
@@ -7535,6 +7732,11 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			goto out_prepublication;
 		chrome9_prof_draws += next - first;
 		chrome9_prof_segments++;
+		if (cache) {
+			chrome9_prof_state[0] += cache->draws;
+			chrome9_prof_state[1] += cache->emitted;
+			chrome9_prof_state[2] += cache->omitted;
+		}
 		chrome9_prof_mark(CHROME9_PROF_BUILD);
 		chrome9_job_query_attach(job, first, next);
 		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
