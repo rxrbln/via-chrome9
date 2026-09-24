@@ -31,6 +31,7 @@
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
 #include "chrome9_fragment.h"
+#include "chrome9_vertex.h"
 
 #define CHROME9_GART_SIZE		SZ_64K
 #define CHROME9_GART_ENTRIES		(CHROME9_GART_SIZE / sizeof(u32))
@@ -4212,6 +4213,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"fragment FE configuration self-test failed: %d\n", ret);
+		return ret;
+	}
+	ret = chrome9_vertex_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"semantic vertex compiler self-test failed: %d\n", ret);
 		return ret;
 	}
 	ret = chrome9_fe33_selftest();

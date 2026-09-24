@@ -37,6 +37,7 @@ struct chrome9_fragment_state {
 	u8 position_id;
 	u8 position_slots[DRM_CHROME9_FRAGMENT_MAX_ALU];
 	bool position_used;
+	bool primary_used;
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 alu_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 tex_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
@@ -141,6 +142,7 @@ static int chrome9_fragment_validate_source(
 	case DRM_CHROME9_FRAGMENT_FILE_PRIMARY:
 		if (source->index)
 			return -EINVAL;
+		state->primary_used = true;
 		break;
 	}
 	return 0;
@@ -1129,6 +1131,7 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 	program->active_texture_count =
 		chrome9_fragment_active_texture_count(&resource);
 	program->tau_coordinate_mask = state->coordinate_mask;
+	program->primary_used = state->primary_used;
 	active0 = chrome9_fragment_active_coordinate_count(&resource) +
 		state->position_used;
 	bucket = chrome9_fragment_resource_bucket(active0, state->physical_high_water);
