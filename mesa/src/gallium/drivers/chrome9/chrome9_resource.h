@@ -26,6 +26,9 @@ struct chrome9_resource {
    /* The kernel defers cache maintenance; CPU accesses are bracketed with
     * chrome9_resource_cpu_access(). */
    bool explicit_access;
+   /* Counts announced CPU writes, so a render shadow can tell whether the
+    * surface changed since it was last synchronized. */
+   uint32_t cpu_write_generation;
 };
 
 void chrome9_resource_cpu_access(struct chrome9_resource *resource,

@@ -35,6 +35,35 @@
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 
+struct chrome9_shadow {
+   struct pipe_resource *shadow;
+   /* Drawable write generation both surfaces last agreed on. */
+   uint32_t synced_generation;
+   bool synced;
+};
+
+static struct chrome9_shadow *
+chrome9_shadow_entry(struct chrome9_context *ctx, struct pipe_resource *color)
+{
+   struct hash_entry *entry = ctx->shadows ?
+      _mesa_hash_table_search(ctx->shadows, color) : NULL;
+
+   return entry ? entry->data : NULL;
+}
+
+/* Record that the shadow and the drawable hold the same pixels. */
+static void
+chrome9_shadow_synced(struct chrome9_context *ctx, struct pipe_resource *color)
+{
+   struct chrome9_shadow *shadow = chrome9_shadow_entry(ctx, color);
+
+   if (shadow) {
+      shadow->synced_generation =
+         chrome9_resource(color)->cpu_write_generation;
+      shadow->synced = true;
+   }
+}
+
 static void
 chrome9_copy_surface(struct pipe_resource *destination,
                      struct pipe_resource *source)
@@ -64,8 +93,10 @@ chrome9_flush_render_target(struct chrome9_context *ctx)
        !ctx->framebuffer.nr_cbufs ||
        !(external = ctx->framebuffer.cbufs[0].texture))
       return;
-   if (external != ctx->render_target)
+   if (external != ctx->render_target) {
       chrome9_copy_surface(external, ctx->render_target);
+      chrome9_shadow_synced(ctx, external);
+   }
    ctx->render_target_dirty = false;
 }
 
@@ -125,8 +156,10 @@ chrome9_context_prepare_render_target(struct chrome9_context *ctx)
        !ctx->framebuffer.nr_cbufs ||
        !(external = ctx->framebuffer.cbufs[0].texture))
       return;
-   if (external != ctx->render_target)
+   if (external != ctx->render_target) {
       chrome9_copy_surface(ctx->render_target, external);
+      chrome9_shadow_synced(ctx, external);
+   }
    ctx->render_target_stale = false;
 }
 
@@ -6188,12 +6221,13 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
  * One guarded shadow per unguarded drawable, reused across binds.  Entries
  * whose drawable only this cache still references are dropped first.
  */
-static struct pipe_resource *
+static struct chrome9_shadow *
 chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
 {
    struct pipe_screen *screen = ctx->base.screen;
    struct pipe_resource templ = *color;
    struct pipe_resource *shadow;
+   struct chrome9_shadow *record;
    struct hash_entry *entry;
 
    if (!ctx->shadows &&
@@ -6201,12 +6235,13 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
       return NULL;
    hash_table_foreach(ctx->shadows, stale) {
       struct pipe_resource *key = (struct pipe_resource *)stale->key;
-      struct pipe_resource *old = stale->data;
+      struct chrome9_shadow *old = stale->data;
 
       if (p_atomic_read(&key->reference.count) > 1)
          continue;
       _mesa_hash_table_remove(ctx->shadows, stale);
-      pipe_resource_reference(&old, NULL);
+      pipe_resource_reference(&old->shadow, NULL);
+      FREE(old);
       pipe_resource_reference(&key, NULL);
    }
    entry = _mesa_hash_table_search(ctx->shadows, color);
@@ -6218,9 +6253,15 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
    shadow = screen->resource_create(screen, &templ);
    if (!shadow)
       return NULL;
+   record = CALLOC_STRUCT(chrome9_shadow);
+   if (!record) {
+      pipe_resource_reference(&shadow, NULL);
+      return NULL;
+   }
+   record->shadow = shadow;
    pipe_reference(NULL, &color->reference);
-   _mesa_hash_table_insert(ctx->shadows, color, shadow);
-   return shadow;
+   _mesa_hash_table_insert(ctx->shadows, color, record);
+   return record;
 }
 
 static void
@@ -6246,13 +6287,18 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
       if (resource->guarded) {
          pipe_resource_reference(&ctx->render_target, color);
       } else {
+         struct chrome9_shadow *shadow = chrome9_render_shadow(ctx, color);
+
          shadow_attempted = true;
          pipe_resource_reference(&ctx->render_target,
-                                 chrome9_render_shadow(ctx, color));
+                                 shadow ? shadow->shadow : NULL);
          /* The drawable's contents are copied in only when a draw or a
-          * partial clear needs them. */
+          * partial clear needs them and the drawable changed since the
+          * two last agreed. */
          if (ctx->render_target)
-            ctx->render_target_stale = true;
+            ctx->render_target_stale = !shadow->synced ||
+               shadow->synced_generation !=
+               chrome9_resource(color)->cpu_write_generation;
       }
    }
    if (!framebuffer->nr_cbufs && framebuffer->zsbuf.texture &&
@@ -6987,9 +7033,10 @@ chrome9_context_destroy(struct pipe_context *pipe)
    if (ctx->shadows) {
       hash_table_foreach(ctx->shadows, entry) {
          struct pipe_resource *key = (struct pipe_resource *)entry->key;
-         struct pipe_resource *shadow = entry->data;
+         struct chrome9_shadow *shadow = entry->data;
 
-         pipe_resource_reference(&shadow, NULL);
+         pipe_resource_reference(&shadow->shadow, NULL);
+         FREE(shadow);
          pipe_resource_reference(&key, NULL);
       }
       _mesa_hash_table_destroy(ctx->shadows, NULL);

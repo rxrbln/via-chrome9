@@ -463,6 +463,8 @@ chrome9_resource_cpu_access(struct chrome9_resource *resource, bool write)
 {
    struct pipe_screen *screen = resource->base.screen;
 
+   if (write)
+      resource->cpu_write_generation++;
    if (resource->explicit_access &&
        !chrome9_bo_cpu_access(screen->get_screen_fd(screen), &resource->bo,
                               write ? DRM_CHROME9_GEM_CPU_PREPARE_WRITE :
