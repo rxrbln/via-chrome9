@@ -54,6 +54,8 @@ struct chrome9_vbuf_render {
    enum mesa_prim prim;
    uint8_t *vertices;
    size_t capacity;
+   /* Bytes allocated at vertices; kept across batches. */
+   size_t allocated;
    uint16_t vertex_size;
    uint16_t vertex_count;
    struct drm_chrome9_draw_triangle_batch batch;
@@ -583,11 +585,17 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
       return false;
    size = (size_t)vertex_size * nr_vertices;
 
-   FREE(crender->vertices);
-   crender->vertices = size ? MALLOC(size) : NULL;
-   if (size && !crender->vertices) {
-      crender->capacity = 0;
-      return false;
+   /* Reuse the buffer: allocating and zero-faulting megabytes per batch
+    * dominated the software vertex path. */
+   if (size > crender->allocated) {
+      void *vertices = REALLOC(crender->vertices, crender->allocated, size);
+
+      if (!vertices) {
+         crender->capacity = 0;
+         return false;
+      }
+      crender->vertices = vertices;
+      crender->allocated = size;
    }
    crender->capacity = size;
    crender->vertex_size = vertex_size;
@@ -3433,8 +3441,6 @@ chrome9_vbuf_release_vertices(struct vbuf_render *render)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
 
-   FREE(crender->vertices);
-   crender->vertices = NULL;
    crender->capacity = 0;
    crender->vertex_count = 0;
 }
