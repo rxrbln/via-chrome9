@@ -411,7 +411,7 @@ static int chrome9_gart_wait_idle(struct chrome9_device *cdev)
 				  CHROME9_HW_TIMEOUT_US);
 }
 
-static int chrome9_gart_flush(struct chrome9_device *cdev)
+static int chrome9_gart_request_flush(struct chrome9_device *cdev)
 {
 	u8 value;
 	int ret;
@@ -421,9 +421,7 @@ static int chrome9_gart_flush(struct chrome9_device *cdev)
 		return ret;
 	value = readb(cdev->mmio + CHROME9_SEQ_DATA);
 	writeb(value | BIT(7), cdev->mmio + CHROME9_SEQ_DATA);
-	return readb_poll_timeout(cdev->mmio + CHROME9_SEQ_DATA, value,
-				  !(value & BIT(7)), 10,
-				  CHROME9_HW_TIMEOUT_US);
+	return 0;
 }
 
 static void chrome9_emit_header0(u32 **cursor, const u32 *pairs,
@@ -2740,13 +2738,16 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	/* Make every PTE visible before requesting the GTI translation flush. */
 	wmb();
 	engine->gart_flush_count++;
-	ret = chrome9_gart_flush(cdev);
+	ret = chrome9_gart_request_flush(cdev);
+	/* The VIA mapper re-protects SR6C immediately after requesting SR6F. */
+	chrome9_seq_write(cdev, 0x6c, saved_6c | BIT(7));
+	if (!ret)
+		ret = chrome9_gart_wait_idle(cdev);
 	if (ret)
 		dev_err_ratelimited(&cdev->pdev->dev,
 			"GART translation flush failed first=%u count=%u ret=%d SR6F=%02x\n",
 			first, count, ret,
-			readb(cdev->mmio + CHROME9_SEQ_DATA));
-	chrome9_seq_write(cdev, 0x6c, saved_6c);
+			chrome9_seq_read(cdev, 0x6f));
 out_restore_index:
 	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
 	chrome9_vga_seq_put(cdev);
@@ -2789,8 +2790,10 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	readl(engine->gart + (CHROME9_RING_PAGES - 1) * sizeof(u32));
 	/* Publish invalid defaults and ring PTEs before the GTI flush. */
 	wmb();
-	ret = chrome9_gart_flush(cdev);
+	ret = chrome9_gart_request_flush(cdev);
 	chrome9_seq_write(cdev, 0x6c, programmed_6c | BIT(7));
+	if (!ret)
+		ret = chrome9_gart_wait_idle(cdev);
 	if (!ret)
 		engine->gart_programmed = true;
 out_restore_index:
@@ -2819,7 +2822,10 @@ static int chrome9_gart_restore(struct chrome9_engine *engine)
 	readl(engine->gart + CHROME9_GART_SIZE - sizeof(u32));
 	/* Publish the restored table before invalidating cached translations. */
 	wmb();
-	ret = chrome9_gart_flush(cdev);
+	ret = chrome9_gart_request_flush(cdev);
+	chrome9_seq_write(cdev, 0x6c, value | BIT(7));
+	if (!ret)
+		ret = chrome9_gart_wait_idle(cdev);
 	if (ret)
 		goto out;
 	chrome9_seq_write(cdev, 0x6a, engine->saved_6a);
