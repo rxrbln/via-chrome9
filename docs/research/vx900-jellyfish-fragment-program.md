@@ -331,8 +331,15 @@ A second bounded packet replaced the alpha construction with a direct
 envelope.  V2.z was `0.4`, so BGRA8 alpha should have been `0x66`.  The draw
 retired but returned alpha `0x00`; RGB remained the same unresolved `6d3d08`
 and D16 remained `8000`.  Known-good draws passed before and after, with no
-new kernel fault.  This isolates at least one real differential below the
-CPU arithmetic reference: the third packed varying's Z component does not
-reach an ordinary fragment ALU in this envelope.  It does not yet distinguish
-FE producer width/link state from A90/resource routing or the native source
-selector, so none of those layers should be changed from this result alone.
+new kernel fault.
+
+A follow-up vector discriminator used `rgb = temp0.rgb + V2.xyz` and
+`alpha = V2.z`.  Relative to the prior `006d3d08` pixel it produced
+`00ad3d08`: only logical R increased by `0x40`; logical G, B, and A were
+unchanged, despite nominal V2=`(.2,.3,.4)`.  The result therefore must not be
+summarized as total T2-slot loss: at least the first component influences the
+ALU result, while the later components do not arrive with their declared
+float3 meaning.  This isolates a width/component-routing differential below
+the CPU arithmetic reference.  It does not yet distinguish FE producer
+width/link state from A90/resource routing or the native source selector, so
+none of those layers should be changed from this result alone.
