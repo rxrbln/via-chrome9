@@ -132,6 +132,84 @@ integer uniform load, three IEQ, one FEQ, one FGE, one FLT, one IAND, three
 1/0/2/3 and float `0x3f000000`.  There are no projectors and no fragment
 float constants.
 
+## Current semantic-compiler boundary
+
+This capture was rechecked against Chrome9 commit `23cbe36` after the generic
+structured backend grew to 96 ALU and 32 TEX records.  Capacity is not the
+first rejection.  The six captured programs use two varyings and two sampler
+slots, within the currently advertised three of each, and their color DAG is
+small.
+
+The first rejection is specialization discovery.  The linked capture has one
+straight-line block with three `terminate_if` intrinsics and no surviving
+`nir_if`.  `chrome9_nir_find_inlinable_uniforms()` discovers uniform leaves
+from `nir_if` conditions and loop exits; it does not inspect a
+`terminate_if` predicate.  Consequently `u_AlphaTest` does not enter the
+fragment variant key and the unspecialized three-predicate program reaches
+`chrome9_compile_ps_nir()`.
+
+That compiler rejects the first predicate with the normal configuration
+because native KILL is opt-in.  Enabling the diagnostic KILL path does not
+make this program admissible: the only qualified shape is one direct
+`tex2D(s0).a < 0.5` predicate, while lightall tests
+`tex2D(s0).a * VAR1.a` under three runtime modes.  The compiler also permits
+only one ordered KILL.  This is a semantic rejection, not an instruction-
+store overflow and not evidence for general native fragment control flow.
+
+The generic closure is to collect direct UBO leaves from `terminate_if`
+predicates with the same bounded walk already used for mixed loop-exit
+conditions.  It is safe for that walk to over-key a variant: after inlining,
+constant folding either deletes a predicate, leaves one independently
+qualified predicate, or compilation continues to fail closed.  Do not key on
+the uniform name, one of the six source hashes, or an ioquake program enum.
+In particular, mode zero must delete all three side effects before native
+lowering.
+
+An offline NIR-builder probe of the exact mode-zero dataflow, compiled by the
+same backend at `23cbe36`, produces:
+
+```text
+semantic instructions  8 = 2 TEX + 3 MUL + 3 MOV
+native stores          6 ALU, 2 TAU
+semantic varying mask  0x0003
+semantic sampler mask  0x0003
+A90..A93               90008002 91000001 92020006 93000002
+TAU                     201101f0 31130bf1
+ALU                     0140b6d0 50203055 0070c105 000000a0
+                        0140b6d0 50202055 00700105 00000020
+                        0140b6d0 d02c176d 00120176 00000120
+                        01c00530 501c0053 00720005 000d0160
+                        01c00530 801c0053 008204b6 000d0160
+                        01c00530 301c0053 00f20505 000d0820
+```
+
+The three MOVs reconstruct RGB plus the independently computed alpha; they
+must not be optimized into a four-channel texture product because lightmap
+alpha is absent from the source expression.  This result proves current
+compiler and store fit after specialization: 6/96 ALU, 2/32 TEX, two of
+three sampler slots, two of three varying slots, and six of eight advertised
+temporaries.  It does not by itself prove pixels or mutable-mode transitions
+on VX900.
+
+The bounded regression should build the captured predicate algebra with a
+dynamic sampled alpha and one direct mode uniform, then prove:
+
+1. discovery records only the mode dword, not the varying/sample leaves;
+2. mode zero removes every `terminate_if` and emits the eight-record object
+   above;
+3. modes one through three retain exactly their specified predicate and stay
+   unsupported until their multiplied-alpha compare is qualified;
+4. changing modes selects a different cached variant and returning to zero
+   restores the byte-identical no-KILL object;
+5. missing constant storage, a short range, or an unrepresentable key fails
+   before draw submission.
+
+Only after that host regression should a guarded live ladder test mode zero,
+then one discard mode, then `0 -> mode -> 0` state closure.  The first pixel
+oracle uses distinct unit-zero and unit-one colors plus nonwhite primary, so
+swapping a descriptor, consuming lightmap alpha, or routing VAR1 incorrectly
+cannot accidentally pass.
+
 The first bounded classifier should recognize this graph, not any of the six
 hashes.  Require one common four-lane input behind both coordinate pairs,
 with unit 0 taking exactly lanes xy and unit 1 exactly lanes zw.  Require a
@@ -152,10 +230,11 @@ either forbids reassociation, compile/select a complete object matching
 `diffuse * (primary * light)` instead.  Never reassociate across a saturation
 or partial write.
 
-## Post-TNL packing contract
+## Compatibility fixed-path post-TNL packing contract
 
-This shader is an important exception to both ordinary two-varying texture
-layout and the GL1 projected path:
+The packing below belongs to the older fixed-object compatibility program.
+It is an important exception to both ordinary two-varying texture layout and
+the GL1 projected path:
 
 ```text
 linked VAR0.xy -> immediate D3.s,t -> native oT0
@@ -189,7 +268,16 @@ The exact FE invariants are common A01 `01ce1540/4c/48`, FVF A02
 ordinary two-stage TAU linkage.  The old C0 A01 form makes D1 unnormalized
 and is not a legal shortcut.
 
-## Native program and format gate
+Do not impose this D1 quantization contract on the generic structured
+program.  The current semantic compiler represents the linked declarations
+literally: VAR0 is float texture input T0 and VAR1 is float texture input T1,
+with `semantic_varying_mask=0x3` and no primary-input bit.  The generic draw
+path therefore emits two `EMIT_4F` varying records.  This preserves arbitrary
+finite primary color and avoids the fixed path's UNORM8 round-trip gate.  A
+future linker rewrite to COL0 would be a distinct interface and must update
+the semantic mask and vertex layout together.
+
+## Compatibility fixed-object program and format gate
 
 Capability 25 selects the complete three-factor object on commands 0x0a,
 0x0d and 0x13.  The state-complete form is:

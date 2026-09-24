@@ -111,27 +111,29 @@ This directly proves that sparse logical sampler IDs remain sparse in the TAU
 sampler nibbles while sparse logical coordinate IDs are compacted separately.
 Neither `+40` nor A91 may be substituted for the logical sampler set.
 
-### Sparse sampler five still occupies FE consumer zero
+### Sparse sampler five does not select the FE consumer ordinal
 
 The Windows programmable draw writer closes the remaining front-end mapping
 ambiguity.  `VTGUModeDX32A.dll:0x101574a0..0x10157b13` reads the draw-state
-stage-enable mask at its second argument `+0x30`, visits logical stages zero
-through seven in order, and compacts only the enabled stages into a local
-coordinate-selector array.  This is not the PS compiler instance `+0x30`
-color-output-count field.  The bit-five case at
-`0x10157584..0x10157595` copies the logical-stage-five selector from context
+logical T-input-use mask at its second argument `+0x30`, visits T0 through T7
+in order, and compacts only the used texture-coordinate inputs into a local
+coordinate-selector array.  This is neither a sampler-enable mask nor the PS
+compiler instance `+0x30` color-output-count field.  The T5 case at
+`0x10157584..0x10157595` copies the logical-T5 selector from context
 `+0x2d54`.  With one active stage, the count-one jump-table entry at
 `0x1015769b..0x101576ad` enters the FE-stage-zero writer at
 `0x10157a8a`.  That writer updates A01 at hardware-image `+0x04`; it does not
-write stage five's field in A02.
+write the sixth physical consumer field in A02.
 
 The stage-zero writer takes the selected coordinate's producer width from
 context `+0x2d60[selector]`, caps it with `ComputeTexDim(ctx, 0)`, and packs
 the coordinate selector in A01 bits 4:2, perspective mode in bit 5, and
-dimension-minus-one in bits 1:0.  Thus the first active sampler occupies FE
-consumer position zero independently of its logical sampler nibble.  Later
-active samplers occupy the subsequent A01/A02/A03 fields in ascending logical
-sampler order.
+dimension-minus-one in bits 1:0.  Thus the first used logical T input occupies
+FE consumer position zero independently of the TAU's logical sampler nibble
+or instruction order.  "Used" includes a direct texture-class ALU source as
+well as a TAU coordinate.  Later distinct T inputs occupy the subsequent
+A01/A02/A03 fields in ascending logical T-register order.  Five sparse
+samplers which all read T0 still need one FE consumer field, not five.
 
 The Linux 5.75 compiler probe makes the single-stage value byte-exact.  For
 `TEX(s5,T5); MOV oC0,r0`, the production H5 texture-register manager reports
@@ -154,6 +156,27 @@ sampler nibbles and in the image/sampler state selectors.  A01=`01002535`
 would instead select un-compacted coordinate F and is not the production
 object for this one-resource program.
 
+Two production differentials prove that sampler order cannot select A01's
+first coordinate:
+
+```text
+TEX(s5,T5); MUL oC0,r0,T0
+  remap T0->0, T5->1; TAU 351011b5
+  +40 logical-use=21, +70 physical-use=2
+  A90/A91/A92/A93=90018001/91000002/92010001/93000001
+
+TEX(s0,T1); TEX(s5,T0); MUL oC0,r0,r1
+  remap T0->0, T1->1; TAU 301011b0 351101b5
+  +40 logical-use=3, +70 physical-use=3
+  A90/A91/A92/A93=90018000/91000003/92020001/93000002
+```
+
+In the first object the only sampler is s5 and its TEX coordinate is physical
+one, but A01 consumer zero is the earlier logical T0 ALU input at physical
+zero.  In the second, lowest sampler s0 reads physical T1 while higher sampler
+s5 reads physical T0; A01 consumer zero must still select physical zero.  The
+ordering is therefore neither TAU ordinal nor ascending sampler id.
+
 The current semantic compiler records `stage0_coordinate` only while
 encoding logical sampler zero.  Under sparse ABI v2 a first or lone TEX on
 logical sampler five therefore leaves it at `0xff`; the FE builder may then
@@ -161,10 +184,12 @@ fall back to varying zero.  That happens to produce the same A01 for the
 minimal one-varying float2 case, but it is not the vendor contract and becomes
 wrong when an earlier ALU-only varying has a different width or the sampled
 coordinate compacts to a later physical slot.  The source-backed invariant is
-to record the compact physical coordinate of the first active TEX in ascending
-logical sampler order, while preserving the logical sampler id in TAU and
-descriptor state.  Keep sparse hardware qualification default-off until this
-mapping is explicit and selftested.
+to collect every distinct direct texture-class varying input, from ALU and
+TAU records, in ascending logical varying order and carry its compact physical
+selector independently of logical sampler ids and TAU order.  The first
+selector feeds A01's first field; additional selectors feed subsequent
+A01/A02/A03 fields.  Keep sparse hardware qualification default-off until
+this mapping is explicit and selftested.
 
 ## Per-stage state namespace
 
