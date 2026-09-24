@@ -364,6 +364,8 @@ struct chrome9_tcl_draw {
 	u32 stride_dw;
 	u32 element_count;
 	u32 cull;
+	/* A20 vertex cycle bits of a strip or fan. */
+	u32 topology;
 	/* Enabled user clip planes (DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE). */
 	u32 clip_mask;
 	/* chrome9_tcl_re sampled once per ioctl. */
@@ -2397,8 +2399,8 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		      ~(tcl->re & CHROME9_TCL_RE_NO_A61_BFC ? BIT(19) : 0);
 	raster[i++] = tcl->program.a62;
 	/* A20[0] index mode, A20[1] 32-bit indices. */
-	raster[i++] = addresses ? 0x20000001 | (tcl->index32 ? 2 : 0) :
-		      0x20000000;
+	raster[i++] = (addresses ? 0x20000001 | (tcl->index32 ? 2 : 0) :
+		       0x20000000) | tcl->topology;
 	/* A23 bit 8 selects the culled physical winding (set = CCW); bits
 	 * 14:12 select Gouraud (4) or flat from the third vertex C (3). */
 	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ||
@@ -9456,7 +9458,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 			for (i = 0; i < tcl->program.record_count; i++)
 				if ((tcl->program.records[i][3] >> 4 & 0xff) == 0x24)
 					tcl->program.records[i][3] &= ~BIT(14);
-		request.triangle_count = tcl->vertex_count / 3;
+		request.triangle_count = tcl->topology ? tcl->vertex_count - 2 :
+				tcl->vertex_count / 3;
 		request.tcl = tcl;
 	}
 	request.fragment_vertices = vertices;
@@ -9659,22 +9662,31 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 	u32 *constants = NULL;
 	u32 *vertices = NULL;
 	bool stage_b = args->buffer_count;
+	bool list = args->topology == DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST;
+	u32 count = stage_b ? args->index_count : args->vertex_count;
 	unsigned int i;
 	int ret;
 
+	if ((!list &&
+	     args->topology != DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP &&
+	     args->topology != DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN) ||
+	    (list ? count % 3 : count < 3 ||
+	     args->flags & (DRM_CHROME9_VERTEX_BFC_CW |
+			    DRM_CHROME9_VERTEX_BFC_CCW)))
+		return -EINVAL;
 	if (stage_b) {
 		if (args->vertex_count || args->vertex_stride ||
 		    args->vertices_ptr ||
 		    args->buffer_count > args->element_count ||
 		    args->buffer_count > DRM_CHROME9_VERTEX_MAX_INPUTS ||
-		    !args->index_count || args->index_count % 3 ||
+		    !args->index_count ||
 		    args->index_count > DRM_CHROME9_VERTEX_MAX_INDICES ||
 		    (args->index_size != 2 && args->index_size != 4) ||
 		    !args->indices_ptr || !args->buffers_ptr)
 			return -EINVAL;
 	} else if (args->index_count || args->index_size ||
 		   args->base_vertex || args->indices_ptr || args->buffers_ptr ||
-		   !args->vertex_count || args->vertex_count % 3 ||
+		   !args->vertex_count ||
 		   args->vertex_count > DRM_CHROME9_VERTEX_MAX_VERTICES ||
 		   !IS_ALIGNED(args->vertex_stride, 4) ||
 		   args->vertex_stride < 4 || args->vertex_stride > 4 * 127 ||
@@ -9695,7 +9707,6 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 				     DRM_CHROME9_VERTEX_BFC_CCW)) > 1 ||
 	    (args->clip_distance_mask &
 	     ~GENMASK(DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES - 1, 0)) ||
-	    args->pad0 ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->instruction_count ||
 	    args->instruction_count > DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS ||
@@ -9713,6 +9724,11 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		return -ENOMEM;
 	tcl->instruction_count = args->instruction_count;
 	tcl->cull = args->flags;
+	/* A20 cycles: strip even (a, b, c) odd (b, a, c), fan (0, b, c). */
+	tcl->topology = args->topology ==
+			DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP ? 0x1c7800 :
+			args->topology ==
+			DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN ? 0x1c5c00 : 0;
 	tcl->clip_mask = args->clip_distance_mask;
 	tcl->re = READ_ONCE(chrome9_tcl_re);
 	tcl->element_count = args->element_count;
