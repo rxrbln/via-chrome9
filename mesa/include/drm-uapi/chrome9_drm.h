@@ -265,8 +265,8 @@ struct drm_chrome9_gem_create {
  * previous device use, and invalidates them after device writes only at the
  * next PREPARE_READ/PREPARE_WRITE.  Userspace must call PREPARE_* before
  * every CPU access through its mapping, and IMPLICIT before sharing the
- * object with a client that does not follow this protocol.  Creating a KMS
- * framebuffer from an object makes it implicit.
+ * object with a client that does not follow this protocol.  Scanout reads
+ * snoop the CPU caches and need no announcement.
  */
 #define DRM_CHROME9_GEM_CPU_EXPLICIT		(1U << 0)
 #define DRM_CHROME9_GEM_CPU_IMPLICIT		(1U << 1)
