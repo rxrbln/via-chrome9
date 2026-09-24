@@ -7,6 +7,7 @@
 #include "chrome9_context.h"
 #include "chrome9_draw.h"
 #include "chrome9_public.h"
+#include "chrome9_swfb.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -32,6 +33,8 @@
 #define CHROME9_MIP_ALIGNMENT 256
 /* The level table holds eight successors of each face root. */
 #define CHROME9_CUBE_MAX_LEVELS 9
+/* A21 carries at most 2048 slices. */
+#define CHROME9_MAX_VOLUME_DEPTH 2048
 
 struct chrome9_resource_layout {
    uint32_t level_stride[PIPE_MAX_TEXTURE_LEVELS];
@@ -91,12 +94,41 @@ chrome9_resource_cube_layout(const struct pipe_resource *templ,
    return layout->allocation_size <= CHROME9_MAX_BUFFER_SIZE;
 }
 
+/*
+ * Volume layout (sfm3DTextureBlt_inv): the slices of a level follow each
+ * other at the level's image size, levels follow their predecessor.  The
+ * sampler reads level zero; lower levels serve llvmpipe and transfers.
+ */
+static bool
+chrome9_resource_volume_layout(const struct pipe_resource *templ,
+                               uint64_t page_size,
+                               struct chrome9_resource_layout *layout)
+{
+   uint64_t cursor = page_size;
+   uint64_t size;
+
+   for (unsigned level = 0; level <= templ->last_level; level++) {
+      layout->level_offset[level] = cursor;
+      size = layout->level_size[level] * u_minify(templ->depth0, level);
+      if (!chrome9_u64_add(cursor, size, &cursor))
+         return false;
+   }
+   if (!chrome9_u64_align(cursor, page_size, &cursor) ||
+       !chrome9_u64_add(cursor, page_size, &cursor) ||
+       cursor > CHROME9_MAX_BUFFER_SIZE)
+      return false;
+   layout->allocation_size = cursor;
+   layout->guarded = true;
+   return true;
+}
+
 static bool
 chrome9_resource_layout(struct pipe_screen *screen,
                         const struct pipe_resource *templ,
                         struct chrome9_resource_layout *layout)
 {
    const bool cube = templ->target == PIPE_TEXTURE_CUBE;
+   const bool volume = templ->target == PIPE_TEXTURE_3D;
    const bool dxt = chrome9_format_is_dxt(templ->format);
    uint64_t aligned_level0_size;
    uint64_t cursor;
@@ -114,20 +146,28 @@ chrome9_resource_layout(struct pipe_screen *screen,
    }
 
    cpp = chrome9_format_storage_cpp(templ->format);
-   if ((!chrome9_is_surface_target(templ->target) && !cube) ||
+   if ((!chrome9_is_surface_target(templ->target) && !cube && !volume) ||
        !cpp ||
        (chrome9_format_is_d24(templ->format) &&
         (templ->target != PIPE_TEXTURE_2D || templ->last_level)) ||
        (dxt && templ->target != PIPE_TEXTURE_2D) ||
+       (volume && (!templ->depth0 ||
+                   templ->depth0 > CHROME9_MAX_VOLUME_DEPTH ||
+                   templ->last_level >
+                      util_logbase2(MAX3(templ->width0, templ->height0,
+                                         templ->depth0)))) ||
        (cube && (templ->width0 != templ->height0 ||
                  !util_is_power_of_two_nonzero(templ->width0) ||
                  templ->last_level >= CHROME9_CUBE_MAX_LEVELS)) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
-       templ->depth0 != 1 || templ->array_size != (cube ? 6 : 1) ||
+       (!volume && templ->depth0 != 1) ||
+       templ->array_size != (cube ? 6 : 1) ||
        templ->last_level >= PIPE_MAX_TEXTURE_LEVELS ||
        (templ->target == PIPE_TEXTURE_RECT && templ->last_level) ||
-       templ->last_level > util_logbase2(MAX2(templ->width0, templ->height0)) ||
+       (!volume &&
+        templ->last_level > util_logbase2(MAX2(templ->width0,
+                                               templ->height0))) ||
        templ->nr_samples > 1 || templ->nr_storage_samples > 1)
       return false;
 
@@ -155,6 +195,8 @@ chrome9_resource_layout(struct pipe_screen *screen,
    }
    if (cube)
       return chrome9_resource_cube_layout(templ, page_size, layout);
+   if (volume)
+      return chrome9_resource_volume_layout(templ, page_size, layout);
 
    /* Cross-process image paths do not reliably preserve a non-zero plane
     * offset when they fall back from DRI3 modifiers to the legacy single-FD
@@ -314,6 +356,19 @@ chrome9_format_supported(struct pipe_screen *screen,
              chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
              !chrome9_format_is_dxt(format) &&
+             !(bindings & ~(sampler_bindings | PIPE_BIND_RENDER_TARGET)) &&
+             chrome9_format_supported(screen, format, PIPE_TEXTURE_2D,
+                                      sample_count, storage_sample_count,
+                                      bindings);
+   /* The pixel engine samples POT level zero of a 3D texture, llvmpipe
+    * every other volume; slices render through a 2D shadow like cube
+    * faces. */
+   if (target == PIPE_TEXTURE_3D)
+      return (chrome9_screen_has_capability2(screen,
+                                             DRM_CHROME9_CAP2_TEXTURE_3D) ||
+              chrome9_sw_enabled()) &&
+             !chrome9_format_is_dxt(format) &&
+             !util_format_is_depth_or_stencil(format) &&
              !(bindings & ~(sampler_bindings | PIPE_BIND_RENDER_TARGET)) &&
              chrome9_format_supported(screen, format, PIPE_TEXTURE_2D,
                                       sample_count, storage_sample_count,
@@ -667,11 +722,14 @@ chrome9_transfer_box_valid(const struct pipe_resource *resource,
 
    width = u_minify(resource->width0, level);
    height = u_minify(resource->height0, level);
-   layers = resource->target == PIPE_TEXTURE_CUBE ? resource->array_size : 1;
+   layers = resource->target == PIPE_TEXTURE_CUBE ? resource->array_size :
+            resource->target == PIPE_TEXTURE_3D ?
+            u_minify(resource->depth0, level) : 1;
    block = chrome9_format_block_dim(resource->format);
    /* Block formats map whole blocks; the last one may overhang the edge. */
    return (chrome9_is_surface_target(resource->target) ||
-           resource->target == PIPE_TEXTURE_CUBE) &&
+           resource->target == PIPE_TEXTURE_CUBE ||
+           resource->target == PIPE_TEXTURE_3D) &&
           (unsigned)box->z < layers && box->depth >= 1 &&
           (unsigned)box->depth <= layers - (unsigned)box->z &&
           (unsigned)box->x <= width &&
@@ -732,7 +790,7 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
          cresource->layer_stride : cresource->level_size[level];
 
       offset = cresource->level_offset[level] +
-               (uint64_t)box->z * cresource->layer_stride +
+               (uint64_t)box->z * transfer->layer_stride +
                (uint64_t)(box->y / block) * cresource->level_stride[level] +
                (uint64_t)(box->x / block) * cpp;
    }
@@ -971,6 +1029,70 @@ chrome9_mipmap_downsample(struct pipe_context *pipe,
    return true;
 }
 
+/* 2x2x2 box filter of each 3D level from its predecessor. */
+static bool
+chrome9_generate_volume_mipmap(struct pipe_context *pipe,
+                               struct pipe_resource *pres,
+                               enum pipe_format format,
+                               unsigned base_level, unsigned last_level)
+{
+   const unsigned cpp = chrome9_format_storage_cpp(format);
+
+   if (!pipe->texture_map || !pipe->texture_unmap || format != pres->format ||
+       !cpp || util_format_is_compressed(format) ||
+       base_level > last_level || last_level > pres->last_level)
+      return false;
+   for (unsigned level = base_level + 1; level <= last_level; level++) {
+      const unsigned sw = u_minify(pres->width0, level - 1);
+      const unsigned sh = u_minify(pres->height0, level - 1);
+      const unsigned sd = u_minify(pres->depth0, level - 1);
+      const unsigned dw = u_minify(pres->width0, level);
+      const unsigned dh = u_minify(pres->height0, level);
+      const unsigned dd = u_minify(pres->depth0, level);
+      struct pipe_transfer *src_transfer, *dst_transfer;
+      struct pipe_box src_box, dst_box;
+      const uint8_t *src;
+      uint8_t *dst = NULL;
+
+      u_box_3d(0, 0, 0, sw, sh, sd, &src_box);
+      u_box_3d(0, 0, 0, dw, dh, dd, &dst_box);
+      src = pipe->texture_map(pipe, pres, level - 1, PIPE_MAP_READ, &src_box,
+                              &src_transfer);
+      if (src)
+         dst = pipe->texture_map(pipe, pres, level, PIPE_MAP_WRITE,
+                                 &dst_box, &dst_transfer);
+      if (!dst) {
+         if (src)
+            pipe->texture_unmap(pipe, src_transfer);
+         return false;
+      }
+      for (unsigned z = 0; z < dd; z++)
+         for (unsigned y = 0; y < dh; y++)
+            for (unsigned x = 0; x < dw; x++) {
+               float sum[4] = { 0 };
+               float texel[4];
+
+               for (unsigned i = 0; i < 8; i++) {
+                  const unsigned sx = MIN2(2 * x + (i & 1), sw - 1);
+                  const unsigned sy = MIN2(2 * y + (i >> 1 & 1), sh - 1);
+                  const unsigned sz = MIN2(2 * z + (i >> 2), sd - 1);
+
+                  util_format_unpack_rgba(format, texel,
+                     src + sz * src_transfer->layer_stride +
+                        sy * src_transfer->stride + sx * cpp, 1);
+                  for (unsigned c = 0; c < 4; c++)
+                     sum[c] += texel[c] * 0.125f;
+               }
+               util_format_pack_rgba(format,
+                  dst + z * dst_transfer->layer_stride +
+                     y * dst_transfer->stride + x * cpp, sum, 1);
+            }
+      pipe->texture_unmap(pipe, dst_transfer);
+      pipe->texture_unmap(pipe, src_transfer);
+   }
+   return true;
+}
+
 bool
 chrome9_generate_mipmap(struct pipe_context *pipe,
                         struct pipe_resource *pres,
@@ -982,6 +1104,10 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
    const struct chrome9_texture_format_info *format_info;
    unsigned cpp;
 
+   /* util_gen_mipmap would need pipe->blit, which this driver lacks. */
+   if (pipe && pres && pres->target == PIPE_TEXTURE_3D)
+      return chrome9_generate_volume_mipmap(pipe, pres, format, base_level,
+                                            last_level);
    format_info = chrome9_texture_format_info(format);
    if (!pipe || !pres || !pipe->texture_map || !pipe->texture_unmap ||
        (pres->target != PIPE_TEXTURE_2D &&

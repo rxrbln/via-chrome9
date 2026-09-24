@@ -520,6 +520,21 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    caps->device_id = screen->device_id;
    caps->endianness = PIPE_ENDIAN_NATIVE;
    caps->max_texture_2d_size = 2048;
+   /* 3D: POT level zero in the sampler, every other volume in llvmpipe. */
+   if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE &&
+       (chrome9_screen_has_capability2(&screen->base,
+                                       DRM_CHROME9_CAP2_TEXTURE_3D) ||
+        chrome9_sw_enabled()))
+      caps->max_texture_3d_levels = 12;
+   /* Without the hardware counter, llvmpipe renders and counts every
+    * draw of an active query. */
+   if (chrome9_screen_has_capability2(&screen->base,
+                                      DRM_CHROME9_CAP2_OCCLUSION_QUERY) ||
+       chrome9_sw_enabled()) {
+      caps->occlusion_query = true;
+      caps->conditional_render = true;
+      caps->conditional_render_inverted = true;
+   }
    /* Nine levels: every face root has eight level-table successors. */
    if (chrome9_screen_has_capability2(&screen->base,
                                       DRM_CHROME9_CAP2_CUBE_MAP) &&

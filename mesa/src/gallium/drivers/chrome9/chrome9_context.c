@@ -4,6 +4,7 @@
 #include "chrome9_context.h"
 
 #include "chrome9_draw.h"
+#include "chrome9_query.h"
 #include "chrome9_swfb.h"
 #include "chrome9_tcl.h"
 #include "chrome9_drm.h"
@@ -63,7 +64,9 @@ chrome9_subimage(struct pipe_resource *resource, unsigned level,
    struct chrome9_resource *res = chrome9_resource(resource);
 
    image->resource = res;
-   image->offset = res->level_offset[level] + layer * res->layer_stride;
+   /* 3D slices follow each other at the level's image size. */
+   image->offset = res->level_offset[level] + layer *
+      (res->layer_stride ? res->layer_stride : res->level_size[level]);
    image->stride = res->level_stride[level];
    image->width = u_minify(resource->width0, level);
    image->height = u_minify(resource->height0, level);
@@ -327,6 +330,8 @@ chrome9_count_reject(struct chrome9_context *ctx, const char *site,
    struct hash_entry *entry;
 
    ctx->rejected_triangles += count;
+   /* Tagged draws may have been lost: the counting interval is not exact. */
+   chrome9_query_mark_inexact(ctx);
    if (!ctx->reject_sites)
       return;
    entry = _mesa_hash_table_search(ctx->reject_sites, site);
@@ -462,6 +467,12 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
    case PIPE_TEX_WRAP_REPEAT: sampler->wrap_t = 2; break;
    case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_t = 3; break;
    default: sampler->supported = false; break;
+   }
+   switch (state->wrap_r) {
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE: sampler->wrap_r = 1; break;
+   case PIPE_TEX_WRAP_REPEAT: sampler->wrap_r = 2; break;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_r = 3; break;
+   default: sampler->wrap_r = 0; break;
    }
    if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
        state->unnormalized_coords || !isfinite(state->lod_bias) ||
@@ -2863,6 +2874,7 @@ struct chrome9_ps_nir_builder {
    uint32_t identity_projector_input_mask;
    uint32_t unit_interval_input_mask;
    uint8_t cube_sampler_mask;
+   uint8_t volume_sampler_mask;
    struct {
       nir_def *predicate;
       uint8_t temp;
@@ -4438,16 +4450,18 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       struct chrome9_ps_source coordinate;
       int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
       int projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
-      /* The cube lookup is selected by the texture state; TEX reads STR. */
-      const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
-      const unsigned lanes = cube ? 3 : 2;
+      /* Cube and 3D lookups are selected by the texture state; TEX reads
+       * STR. */
+      const bool volume = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
+      const bool str = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || volume;
+      const unsigned lanes = str ? 3 : 2;
 
       if (tex->op != nir_texop_tex ||
-          (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && !cube) ||
+          (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && !str) ||
           tex->is_array || tex->is_shadow || tex->texture_index >= 8 ||
           tex->sampler_index != tex->texture_index || coord < 0 ||
           tex->src[coord].src.ssa->num_components != lanes ||
-          (cube && projector >= 0) ||
+          (str && projector >= 0) ||
           builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
           builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
          return false;
@@ -4458,14 +4472,14 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
                                 &coordinate) ||
           coordinate.swizzle[0] > CHROME9_PS_SWIZZLE_W ||
           coordinate.swizzle[1] > CHROME9_PS_SWIZZLE_W ||
-          (cube && coordinate.swizzle[2] > CHROME9_PS_SWIZZLE_W))
+          (str && coordinate.swizzle[2] > CHROME9_PS_SWIZZLE_W))
          return false;
-      if (cube && coordinate.file != CHROME9_PS_SOURCE_TEMP &&
+      if (str && coordinate.file != CHROME9_PS_SOURCE_TEMP &&
           (coordinate.file != CHROME9_PS_SOURCE_TEXTURE ||
            coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
            coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y ||
            coordinate.swizzle[2] != CHROME9_PS_SWIZZLE_Z)) {
-         /* A direct cube coordinate is the varying's XYZ; anything else
+         /* A direct STR coordinate is the varying's XYZ; anything else
           * reaches TEX as STR of a computed TEMP. */
          struct chrome9_ps_instruction *move;
 
@@ -4532,7 +4546,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
          projector = -1;
       }
-      if (!cube && coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
+      if (!str && coordinate.file != CHROME9_PS_SOURCE_TEXTURE &&
           coordinate.file != CHROME9_PS_SOURCE_TEMP) {
          /* Constant or uniform coordinates reach TEX through a TEMP. */
          struct chrome9_ps_instruction *move;
@@ -4573,7 +4587,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
             return false;
          builder->identity_projector_input_mask |=
             1u << (coordinate.id * 4 + 3);
-      } else if (!cube && coordinate.file == CHROME9_PS_SOURCE_TEXTURE &&
+      } else if (!str && coordinate.file == CHROME9_PS_SOURCE_TEXTURE &&
                  (coordinate.swizzle[0] != CHROME9_PS_SWIZZLE_X ||
                   coordinate.swizzle[1] != CHROME9_PS_SWIZZLE_Y)) {
          /* Like D3D9 texld, a direct coordinate is the varying's XY; the
@@ -4615,8 +4629,11 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       texture->destination.id = temp;
       texture->destination.writemask = 0xf;
       texture->source[0] = coordinate;
-      if (cube) {
-         builder->cube_sampler_mask |= 1u << tex->sampler_index;
+      if (str) {
+         if (volume)
+            builder->volume_sampler_mask |= 1u << tex->sampler_index;
+         else
+            builder->cube_sampler_mask |= 1u << tex->sampler_index;
          texture->source[0].swizzle[3] =
             coordinate.file == CHROME9_PS_SOURCE_TEMP ?
             CHROME9_PS_SWIZZLE_ONE : CHROME9_PS_SWIZZLE_W;
@@ -5086,6 +5103,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint32_t *identity_projector_input_mask,
                        uint32_t *unit_interval_input_mask,
                        uint8_t *cube_sampler_mask,
+                       uint8_t *volume_sampler_mask,
                        bool allow_kill,
                        bool *lowered)
 {
@@ -5254,6 +5272,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       builder.identity_projector_input_mask;
    *unit_interval_input_mask = builder.unit_interval_input_mask;
    *cube_sampler_mask = builder.cube_sampler_mask;
+   *volume_sampler_mask = builder.volume_sampler_mask;
    *lowered = true;
    bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
 
@@ -5484,6 +5503,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      &shader->semantic_identity_projector_input_mask,
                                      &shader->semantic_unit_interval_input_mask,
                                      &shader->semantic_cube_sampler_mask,
+                                     &shader->semantic_volume_sampler_mask,
                                      ctx->fragment_kill,
                                      &lowered);
    if (lowered) {
@@ -5847,6 +5867,8 @@ chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
    variant->semantic_varying_mask = shader->semantic_varying_mask;
    variant->semantic_sampler_mask = shader->semantic_sampler_mask;
    variant->semantic_cube_sampler_mask = shader->semantic_cube_sampler_mask;
+   variant->semantic_volume_sampler_mask =
+      shader->semantic_volume_sampler_mask;
    variant->semantic_equal_zero_input_mask =
       shader->semantic_equal_zero_input_mask;
    variant->semantic_identity_projector_input_mask =
@@ -5877,6 +5899,8 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
    shader->semantic_varying_mask = variant->semantic_varying_mask;
    shader->semantic_sampler_mask = variant->semantic_sampler_mask;
    shader->semantic_cube_sampler_mask = variant->semantic_cube_sampler_mask;
+   shader->semantic_volume_sampler_mask =
+      variant->semantic_volume_sampler_mask;
    shader->semantic_equal_zero_input_mask =
       variant->semantic_equal_zero_input_mask;
    shader->semantic_identity_projector_input_mask =
@@ -6275,7 +6299,16 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
    const bool cube = texture && texture->target == PIPE_TEXTURE_CUBE &&
                      templ->target == PIPE_TEXTURE_CUBE &&
                      chrome9_resource(texture)->guarded;
-   bool supported = view && texture &&
+   /* Any 3D view is valid: the draw decides between the sampler and
+    * llvmpipe (chrome9_draw_needs_sw_textures). */
+   const bool volume = view && texture &&
+                       texture->target == PIPE_TEXTURE_3D &&
+                       templ->target == PIPE_TEXTURE_3D &&
+                       templ->format == texture->format &&
+                       templ->u.tex.first_level <= templ->u.tex.last_level &&
+                       templ->u.tex.last_level <= texture->last_level &&
+                       chrome9_resource(texture)->guarded;
+   bool supported = view && texture && !volume &&
                     ((texture->target == PIPE_TEXTURE_2D &&
                       templ->target == PIPE_TEXTURE_2D) || cube) &&
                     templ->format == texture->format &&
@@ -6291,6 +6324,7 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                        templ->format, templ->swizzle_r, templ->swizzle_g,
                        templ->swizzle_b, templ->swizzle_a);
 
+   supported |= volume;
    if (supported && !chrome9_resource(texture)->guarded) {
       struct pipe_resource shadow_templ = *texture;
 
@@ -6518,8 +6552,9 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
        surface->first_layer == surface->last_layer) {
       struct chrome9_resource *resource = chrome9_resource(color);
 
-      /* Other levels and cube faces render through a shadow. */
+      /* Other levels, cube faces and 3D slices render through a shadow. */
       if (resource->guarded && color->target != PIPE_TEXTURE_CUBE &&
+          color->target != PIPE_TEXTURE_3D &&
           !surface->level && !surface->first_layer) {
          pipe_resource_reference(&ctx->render_target, color);
       } else {
@@ -6885,6 +6920,8 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    struct pipe_resource *resource;
    unsigned x = 0, y = 0, width, height;
 
+   if (!chrome9_render_condition_passes(ctx))
+      return;
    chrome9_draw_flush_batch(ctx);
    if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)))
       return;
@@ -6937,7 +6974,8 @@ chrome9_clear_depth_stencil(struct pipe_context *pipe,
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
-   (void)render_condition;
+   if (render_condition && !chrome9_render_condition_passes(ctx))
+      return;
    chrome9_draw_flush_batch(ctx);
    if (!surface || !surface->texture ||
        !(clear_flags & PIPE_CLEAR_DEPTHSTENCIL)) {
@@ -6959,7 +6997,8 @@ chrome9_clear_render_target(struct pipe_context *pipe,
    struct chrome9_context *ctx = chrome9_context(pipe);
    struct pipe_resource *target;
 
-   (void)render_condition;
+   if (render_condition && !chrome9_render_condition_passes(ctx))
+      return;
    chrome9_draw_flush_batch(ctx);
    if (!surface || !surface->texture)
       return;
@@ -7067,6 +7106,8 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                         "indirect draws are not implemented");
       return;
    }
+   if (!chrome9_render_condition_passes(ctx))
+      return;
    if (!ctx->vs || !ctx->fs || !chrome9_select_fs_variant(ctx)) {
       /* Beyond the pixel engine: llvmpipe renders into the same BOs. */
       if (chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
@@ -7075,6 +7116,18 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                         "draw rejected: unsupported bounded fragment program");
       CHROME9_REJECT(ctx, draws[0].count);
       return;
+   }
+   /* Only generic fragment programs carry the query tag, and only with
+    * the hardware counter; 3D textures outside the sampler's contract need
+    * llvmpipe.  llvmpipe's query counts. */
+   if ((chrome9_query_counting(ctx) &&
+        (!ctx->occlusion_query ||
+         !chrome9_generic_fragment_program(ctx))) ||
+       chrome9_draw_needs_sw_textures(ctx)) {
+      if (chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+         return;
+      if (!ctx->occlusion_query || !chrome9_generic_fragment_program(ctx))
+         chrome9_query_mark_inexact(ctx);
    }
 
    /* Vertex texturing runs in the interpreter on the draw path; llvmpipe
@@ -7187,26 +7240,7 @@ chrome9_flush_resource(struct pipe_context *pipe,
    chrome9_flush_render_target(chrome9_context(pipe));
 }
 
-/* No queries, conditional rendering or stream output: the blitter still
- * calls these around its draws. */
-static void
-chrome9_set_active_query_state(struct pipe_context *pipe, bool enable)
-{
-   (void)pipe;
-   (void)enable;
-}
-
-static void
-chrome9_render_condition(struct pipe_context *pipe,
-                         struct pipe_query *query, bool condition,
-                         enum pipe_render_cond_flag mode)
-{
-   (void)pipe;
-   (void)query;
-   (void)condition;
-   (void)mode;
-}
-
+/* No stream output: the blitter still calls this around its draws. */
 static void
 chrome9_set_stream_output_targets(struct pipe_context *pipe, unsigned count,
                                   struct pipe_stream_output_target **targets,
@@ -7265,6 +7299,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
               ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
    chrome9_tcl_batch_destroy(ctx);
+   chrome9_query_context_destroy(ctx);
    chrome9_sw_context_destroy(ctx);
    if (ctx->reject_sites)
       _mesa_hash_table_destroy(ctx->reject_sites, NULL);
@@ -7426,6 +7461,10 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =
       !!(capabilities & DRM_CHROME9_CAP_SCISSOR);
+   ctx->occlusion_query = chrome9_screen_has_capability2(
+      screen, DRM_CHROME9_CAP2_OCCLUSION_QUERY);
+   ctx->texture_3d = chrome9_screen_has_capability2(
+      screen, DRM_CHROME9_CAP2_TEXTURE_3D);
    ctx->fragment_stencil =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_STENCIL);
    ctx->draw_limit = MAX2(debug_get_num_option("CHROME9_DRAW_LIMIT", 0), 0);
@@ -7480,8 +7519,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_stencil_ref = chrome9_set_stencil_ref;
    ctx->base.set_sample_mask = chrome9_set_sample_mask;
    ctx->base.set_polygon_stipple = chrome9_set_polygon_stipple;
-   ctx->base.set_active_query_state = chrome9_set_active_query_state;
-   ctx->base.render_condition = chrome9_render_condition;
+   chrome9_init_query_functions(ctx);
    ctx->base.set_stream_output_targets = chrome9_set_stream_output_targets;
    ctx->base.set_debug_callback = u_default_set_debug_callback;
    ctx->base.resource_release = u_default_resource_release;

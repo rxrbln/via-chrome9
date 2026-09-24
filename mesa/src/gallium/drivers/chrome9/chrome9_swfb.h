@@ -6,6 +6,7 @@
 #include <stdbool.h>
 
 struct chrome9_context;
+struct pipe_context;
 struct pipe_draw_info;
 struct pipe_draw_start_count_bias;
 struct pipe_resource;
@@ -22,6 +23,7 @@ bool chrome9_sw_draw_vbo(struct chrome9_context *ctx,
 void chrome9_sw_finish(struct chrome9_context *ctx);
 void chrome9_sw_forget(struct chrome9_context *ctx, const void *object);
 void chrome9_sw_context_destroy(struct chrome9_context *ctx);
+struct pipe_context *chrome9_sw_pipe(struct chrome9_context *ctx);
 #else
 static inline struct pipe_screen *chrome9_sw_screen_create(void) { return 0; }
 static inline bool chrome9_sw_enabled(void) { return false; }
@@ -41,6 +43,12 @@ chrome9_sw_forget(struct chrome9_context *ctx, const void *object)
    (void)ctx; (void)object;
 }
 static inline void chrome9_sw_context_destroy(struct chrome9_context *ctx) { (void)ctx; }
+static inline struct pipe_context *
+chrome9_sw_pipe(struct chrome9_context *ctx)
+{
+   (void)ctx;
+   return 0;
+}
 #endif
 
 #endif

@@ -55,6 +55,20 @@ _Static_assert(sizeof(struct drm_chrome9_vertex_instruction) == 32,
                "Chrome9 vertex instruction ABI size");
 _Static_assert(sizeof(struct drm_chrome9_draw_vertex_program) == 344,
                "Chrome9 vertex draw ABI size");
+_Static_assert(sizeof(struct drm_chrome9_query) == 48,
+               "Chrome9 query ABI size");
+
+/* 0 or the negative errno; interrupted waits restart. */
+int
+chrome9_query_ioctl(int fd, struct drm_chrome9_query *args)
+{
+   int ret;
+
+   do {
+      ret = ioctl(fd, DRM_IOCTL_CHROME9_QUERY, args);
+   } while (ret && (errno == EINTR || errno == EAGAIN));
+   return ret ? -errno : 0;
+}
 
 bool
 chrome9_get_param(int fd, uint32_t param, uint64_t *value)

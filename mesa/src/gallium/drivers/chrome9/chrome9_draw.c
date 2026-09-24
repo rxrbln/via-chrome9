@@ -10,6 +10,7 @@
 #include "chrome9_format.h"
 #include "chrome9_fragment.h"
 #include "chrome9_public.h"
+#include "chrome9_query.h"
 #include "chrome9_resource.h"
 #include "chrome9_swfb.h"
 
@@ -127,7 +128,7 @@ chrome9_fragment_texture_unit(const struct chrome9_context *ctx,
                                        descriptor) : descriptor;
 }
 
-static bool
+bool
 chrome9_generic_fragment_program(const struct chrome9_context *ctx)
 {
    return ctx->draw_fragment_program && ctx->fs &&
@@ -136,11 +137,51 @@ chrome9_generic_fragment_program(const struct chrome9_context *ctx)
            (ctx->fragment_primary && ctx->fs->semantic_input_mask == 1));
 }
 
+/* Draws of a counting query interval need the tag only this path carries. */
 static bool
 chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
 {
    return chrome9_generic_fragment_program(ctx) &&
-          !ctx->fs->semantic_passthrough;
+          (!ctx->fs->semantic_passthrough || chrome9_query_counting(ctx));
+}
+
+/*
+ * A shader-visible 3D view the sampler cannot take sends the draw to
+ * llvmpipe: native volumes are POT, level zero, without mip filtering
+ * (docs/research/chrome9-queries-msaa-3d-flow-re.md section 4).
+ */
+bool
+chrome9_draw_needs_sw_textures(const struct chrome9_context *ctx)
+{
+   const bool generic = chrome9_generic_fragment_program(ctx);
+
+   for (unsigned i = 0; i < ctx->num_sampler_views; i++) {
+      const struct pipe_sampler_view *view = ctx->sampler_views[i];
+      const struct pipe_resource *res = view ? view->texture : NULL;
+      const struct chrome9_sampler_state *sampler =
+         i < ctx->num_sampler_states ? ctx->sampler_states[i] : NULL;
+
+      if (!res || res->target != PIPE_TEXTURE_3D ||
+          (generic && !(ctx->fs->semantic_sampler_mask & (1u << i))))
+         continue;
+      if (!ctx->texture_3d || !generic ||
+          !(ctx->fs->semantic_volume_sampler_mask & (1u << i)) ||
+          !chrome9_texture_format_info(res->format) ||
+          !util_is_power_of_two_nonzero(res->width0) ||
+          !util_is_power_of_two_nonzero(res->height0) ||
+          !util_is_power_of_two_nonzero(res->depth0) ||
+          res->depth0 > 2048 || res->last_level ||
+          view->u.tex.first_level ||
+          !sampler || !sampler->supported || !sampler->wrap_r ||
+          (view->u.tex.last_level &&
+           sampler->mip_filter != DRM_CHROME9_TEXTURE_MIP_FILTER_NONE) ||
+          !chrome9_texture_swizzle_supported(view->format, view->swizzle_r,
+                                             view->swizzle_g,
+                                             view->swizzle_b,
+                                             view->swizzle_a))
+         return true;
+   }
+   return false;
 }
 
 static bool
@@ -1104,7 +1145,8 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              (*depth_active &&
               textures[unit]->bo.handle == (*depth)->bo.handle) ||
              (source->target != PIPE_TEXTURE_2D &&
-              (source->target != PIPE_TEXTURE_CUBE ||
+              ((source->target != PIPE_TEXTURE_CUBE &&
+                source->target != PIPE_TEXTURE_3D) ||
                !chrome9_use_generic_fragment_program(ctx))) ||
              (!chrome9_use_generic_fragment_program(ctx) ?
                 (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
@@ -1125,8 +1167,10 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          /* The TEX coordinate width follows the shader's sampler type. */
          *reason = "texture-target";
          if (chrome9_use_generic_fragment_program(ctx) &&
-             !!(ctx->fs->semantic_cube_sampler_mask & (1u << logical)) !=
-                (source->target == PIPE_TEXTURE_CUBE))
+             (!!(ctx->fs->semantic_cube_sampler_mask & (1u << logical)) !=
+                 (source->target == PIPE_TEXTURE_CUBE) ||
+              !!(ctx->fs->semantic_volume_sampler_mask & (1u << logical)) !=
+                 (source->target == PIPE_TEXTURE_3D)))
             return false;
          *reason = "mip-view-state";
          if (source->format == PIPE_FORMAT_X8Z24_UNORM &&
@@ -1480,6 +1524,7 @@ chrome9_generic_fragment_state(
                                                               unit);
       const struct pipe_sampler_view *view =
          crender->ctx->sampler_views[logical];
+      const bool volume = resource->target == PIPE_TEXTURE_3D;
       unsigned last_level;
       unsigned view_first_level;
       unsigned view_last_level;
@@ -1493,7 +1538,8 @@ chrome9_generic_fragment_state(
          return false;
       view_first_level = view->u.tex.first_level;
       view_last_level = view->u.tex.last_level;
-      last_level = resource->last_level;
+      /* The volume sampler reads level zero only (no volume mips). */
+      last_level = volume ? 0 : resource->last_level;
       /*
        * The descriptor always carries the whole chain; a partial view
        * clamps the hardware LOD, which counts from level 0, to its levels.
@@ -1505,9 +1551,10 @@ chrome9_generic_fragment_state(
           (view_first_level &&
            (samplers[unit]->mip_filter ==
                DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
-            samplers[unit]->mag_filter != samplers[unit]->min_filter)))
+            samplers[unit]->mag_filter != samplers[unit]->min_filter)) ||
+          (volume && (view_first_level || !samplers[unit]->wrap_r)))
          return false;
-      max_lod = view_last_level * 32;
+      max_lod = volume ? 0 : view_last_level * 32;
       texture_state[unit].handle = textures[unit]->bo.handle;
       if (chrome9_fragment_uses_sparse_abi(crender->ctx))
          texture_state[unit].reserved0 = logical;
@@ -1526,6 +1573,14 @@ chrome9_generic_fragment_state(
          texture_state[unit].face_stride = textures[unit]->layer_stride;
          texture_state[unit].wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
          texture_state[unit].wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+      }
+      if (volume) {
+         texture_state[unit].target = DRM_CHROME9_FRAGMENT_TARGET_3D;
+         texture_state[unit].face_stride = textures[unit]->level_size[0];
+         texture_state[unit].depth = resource->depth0;
+         texture_state[unit].wrap_r = samplers[unit]->wrap_r;
+         texture_state[unit].mip_filter =
+            DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
       }
       texture_state[unit].lod_bias_s5_5 = CLAMP(
          lroundf(samplers[unit]->base.lod_bias * 32.0f), -512, 511);
@@ -1581,6 +1636,9 @@ chrome9_generic_fragment_state(
    draw->abi_version = chrome9_fragment_uses_sparse_abi(crender->ctx) ?
       DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES :
       DRM_CHROME9_FRAGMENT_ABI_VERSION;
+   draw->query = chrome9_query_draw_id(crender->ctx);
+   if (draw->query)
+      draw->flags |= DRM_CHROME9_FRAGMENT_QUERY;
    if (blend_active)
       draw->blend = *blend;
    draw->scissor = *scissor;
@@ -3704,7 +3762,9 @@ chrome9_tcl_batch_flush(struct chrome9_context *ctx)
       return;
    if (b->count == 1 ? !chrome9_draw_vertex_program(fd, &b->draws[0]) :
        !chrome9_draw_vertex_programs(fd, b->draws, b->count)) {
-      /* Retry singly so one rejected draw loses only its triangles. */
+      /* Retry singly so one rejected draw loses only its triangles; the
+       * kernel may already have counted segments of the failed batch. */
+      chrome9_query_mark_inexact(ctx);
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr, "chrome9: DRAW_VERTEX_PROGRAMS of %u failed: %s\n",
                  b->count, strerror(errno));

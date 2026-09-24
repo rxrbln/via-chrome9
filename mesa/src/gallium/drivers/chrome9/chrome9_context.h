@@ -6,10 +6,14 @@
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "compiler/shader_info.h"
+#include "util/list.h"
+#include "util/u_dynarray.h"
 
 #include "chrome9_shader_offline.h"
 #include "chrome9_vs_texture.h"
 
+struct chrome9_query;
+struct chrome9_query_interval;
 struct draw_context;
 struct nir_shader;
 
@@ -72,6 +76,7 @@ struct chrome9_fs_variant {
    uint16_t semantic_varying_mask;
    uint8_t semantic_sampler_mask;
    uint8_t semantic_cube_sampler_mask;
+   uint8_t semantic_volume_sampler_mask;
    /* Direct varying lanes used by equality-to-zero selects.  The draw path
     * proves exact signed zero or unit-magnitude values before submission. */
    uint32_t semantic_equal_zero_input_mask;
@@ -115,6 +120,7 @@ struct chrome9_shader {
    uint8_t semantic_sampler_mask;
    /* Samplers read by a cube TEX (three coordinate lanes). */
    uint8_t semantic_cube_sampler_mask;
+   uint8_t semantic_volume_sampler_mask;
    uint32_t semantic_equal_zero_input_mask;
    uint32_t semantic_identity_projector_input_mask;
    uint32_t semantic_unit_interval_input_mask;
@@ -137,6 +143,8 @@ struct chrome9_sampler_state {
    uint8_t mip_filter;
    uint8_t wrap_s;
    uint8_t wrap_t;
+   /* Zero when R wrapping has no native mode; only 3D reads it. */
+   uint8_t wrap_r;
    bool supported;
 };
 
@@ -232,6 +240,20 @@ struct chrome9_context {
    bool alpha_test_supported;
    bool scissor_supported;
    bool fragment_stencil;
+   /* DRM_CHROME9_CAP2_OCCLUSION_QUERY and DRM_CHROME9_CAP2_TEXTURE_3D. */
+   bool occlusion_query;
+   bool texture_3d;
+   /* Active pipe queries and the counting interval their draws share. */
+   struct list_head active_queries;
+   struct list_head query_intervals;
+   struct chrome9_query_interval *query_interval;
+   /* Recycled kernel query ids. */
+   struct util_dynarray query_ids;
+   bool queries_paused;
+   bool query_inexact_reported;
+   struct chrome9_query *render_cond_query;
+   bool render_cond_condition;
+   enum pipe_render_cond_flag render_cond_mode;
    struct pipe_stencil_ref stencil_ref;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;

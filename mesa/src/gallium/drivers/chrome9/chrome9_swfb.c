@@ -18,6 +18,7 @@
 #include "chrome9_context.h"
 #include "chrome9_draw.h"
 #include "chrome9_public.h"
+#include "chrome9_query.h"
 #include "chrome9_resource.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
@@ -324,6 +325,12 @@ chrome9_sw_forget(struct chrome9_context *ctx, const void *object)
    _mesa_hash_table_remove(sw->objects, entry);
 }
 
+struct pipe_context *
+chrome9_sw_pipe(struct chrome9_context *ctx)
+{
+   return ctx->sw ? ctx->sw->lp : NULL;
+}
+
 void
 chrome9_sw_context_destroy(struct chrome9_context *ctx)
 {
@@ -442,8 +449,18 @@ chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
          shader.ir.nir->options =
             sw->screen->nir_options[kind == CHROME9_SW_VS ?
                                     MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT];
-         if (kind == CHROME9_SW_FS)
+         if (kind == CHROME9_SW_FS) {
+            /* Chrome9 takes the fragment position as a system value,
+             * llvmpipe as the POS input. */
+            const nir_lower_sysvals_to_varyings_options pos = {
+               .frag_coord = true,
+            };
+
             chrome9_sw_lower_face_input(shader.ir.nir);
+            if (nir_lower_sysvals_to_varyings(shader.ir.nir, &pos))
+               nir_shader_gather_info(shader.ir.nir,
+                  nir_shader_get_entrypoint(shader.ir.nir));
+         }
       }
       if (shader.ir.nir && debug_get_bool_option("CHROME9_SW_DUMP", false))
          nir_print_shader(shader.ir.nir, stderr);
@@ -480,7 +497,9 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
    chrome9_resource_cpu_access(res, bind != 0);
    if (entry)
       return entry->data;
-   if (!res->bo.map || resource->target == PIPE_BUFFER)
+   /* Cube faces and 3D slices have no level-0 display-target form. */
+   if (!res->bo.map || (resource->target != PIPE_TEXTURE_2D &&
+                        resource->target != PIPE_TEXTURE_RECT))
       return NULL;
    /* llvmpipe touches whole 4x4 blocks: the row overhang must stay in the
     * page padding before the guard page. */
@@ -502,17 +521,20 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
    return alias;
 }
 
-/* Mipmapped, cube and block-compressed textures: llvmpipe needs its own
- * layout; copy the current contents for every fallback draw. */
+/* Mipmapped, cube, 3D and block-compressed textures: llvmpipe needs its
+ * own layout; copy the current contents for every fallback draw.  *copied
+ * tells the caller that it owns the returned reference. */
 static struct pipe_resource *
 chrome9_sw_texture(struct chrome9_sw_context *sw,
-                   struct pipe_resource *resource)
+                   struct pipe_resource *resource, bool *copied)
 {
    struct chrome9_resource *res = chrome9_resource(resource);
    struct pipe_resource templ = *resource;
    struct pipe_resource *copy;
 
+   *copied = false;
    if (!resource->last_level && resource->target != PIPE_TEXTURE_CUBE &&
+       resource->target != PIPE_TEXTURE_3D &&
        !util_format_is_compressed(resource->format))
       return chrome9_sw_alias(sw, resource, 0);
    chrome9_resource_cpu_access(res, false);
@@ -522,6 +544,23 @@ chrome9_sw_texture(struct chrome9_sw_context *sw,
    copy = sw->screen->resource_create(sw->screen, &templ);
    if (!copy)
       return NULL;
+   *copied = true;
+   /* Volume slices are contiguous at each level's image size. */
+   if (resource->target == PIPE_TEXTURE_3D) {
+      for (unsigned level = 0; level <= resource->last_level; level++) {
+         struct pipe_box box;
+
+         u_box_3d(0, 0, 0, u_minify(resource->width0, level),
+                  u_minify(resource->height0, level),
+                  u_minify(resource->depth0, level), &box);
+         sw->lp->texture_subdata(sw->lp, copy, level, PIPE_MAP_WRITE, &box,
+                                 (uint8_t *)res->bo.map +
+                                    res->level_offset[level],
+                                 res->level_stride[level],
+                                 res->level_size[level]);
+      }
+      return copy;
+   }
    for (unsigned layer = 0; layer < resource->array_size; layer++)
       for (unsigned level = 0; level <= resource->last_level; level++) {
          struct pipe_box box;
@@ -551,10 +590,11 @@ chrome9_sw_bind_views(struct chrome9_sw_context *sw,
    for (unsigned i = 0; i < count; i++) {
       struct pipe_sampler_view templ;
       struct pipe_resource *texture;
+      bool copied;
 
       if (!views[i])
          continue;
-      texture = chrome9_sw_texture(sw, views[i]->texture);
+      texture = chrome9_sw_texture(sw, views[i]->texture, &copied);
       if (!texture) {
          ok = false;
          break;
@@ -563,7 +603,7 @@ chrome9_sw_bind_views(struct chrome9_sw_context *sw,
       templ.texture = NULL;
       templ.context = NULL;
       lp_views[i] = sw->lp->create_sampler_view(sw->lp, texture, &templ);
-      if (texture->last_level)
+      if (copied)
          pipe_resource_reference(&texture, NULL);
       chrome9_sw_hold(sw, views[i]->texture);
    }
@@ -745,6 +785,7 @@ chrome9_sw_draw_vbo(struct chrome9_context *ctx,
       lp_info.has_user_indices = true;
       lp_info.index.user = chrome9_resource(info->index.resource)->bo.map;
    }
+   chrome9_query_sw_begin(ctx, sw->lp);
    sw->lp->draw_vbo(sw->lp, &lp_info, drawid_offset, NULL, draws, num_draws);
    sw->pending = true;
    if (debug_get_bool_option("CHROME9_SW_SYNC", false))
