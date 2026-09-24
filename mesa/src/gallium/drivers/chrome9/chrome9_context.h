@@ -8,6 +8,7 @@
 #include "compiler/shader_info.h"
 
 #include "chrome9_shader_offline.h"
+#include "chrome9_vs_texture.h"
 
 struct draw_context;
 struct nir_shader;
@@ -196,6 +197,12 @@ struct chrome9_context {
    unsigned num_sampler_states;
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
    unsigned num_sampler_views;
+   struct pipe_sampler_state *vs_sampler_states[CHROME9_VS_MAX_SAMPLERS];
+   unsigned num_vs_sampler_states;
+   struct pipe_sampler_view *vs_sampler_views[CHROME9_VS_MAX_SAMPLERS];
+   unsigned num_vs_sampler_views;
+   struct chrome9_vs_texture_mapping vs_texture_mappings[CHROME9_VS_MAX_SAMPLERS];
+   struct tgsi_sampler *vs_tgsi_sampler;
 
    struct chrome9_shader *vs;
    struct chrome9_shader *fs;

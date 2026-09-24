@@ -313,15 +313,15 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
     * stages expose native integers.  Keep the draw module's vertex lowering
     * in that same representation while the fragment backend lacks them. */
    vs->integers = false;
-   /* The draw module executes vertex ALU and constant-buffer accesses, but
-    * Chrome9 does not wire its sampler, image, or shader-buffer interfaces.
-    * In particular, cso_unbind_context() calls those interfaces whenever the
-    * corresponding limits are nonzero.  Do not retain tgsi_exec's generic
-    * limits for interfaces which this pipe context does not install. */
+   /* Vertex texture callbacks are staged but not yet a public feature:
+    * preserve the zero cap until executable sampler and draw-module proofs
+    * cover the advertised operation and state envelope. */
    vs->max_tex_instructions = 0;
    vs->max_tex_indirections = 0;
    vs->max_texture_samplers = 0;
    vs->max_sampler_views = 0;
+   /* cso_unbind_context() calls these interfaces whenever the limits are
+    * nonzero; Chrome9 does not wire images or shader buffers. */
    vs->max_shader_buffers = 0;
    vs->max_shader_images = 0;
    vs->max_hw_atomic_counters = 0;

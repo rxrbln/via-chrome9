@@ -227,6 +227,20 @@ chrome9_bind_sampler_states(struct pipe_context *pipe,
    struct chrome9_context *ctx = chrome9_context(pipe);
    unsigned end;
 
+   if (shader == MESA_SHADER_VERTEX) {
+      if (start >= CHROME9_VS_MAX_SAMPLERS)
+         return;
+      end = MIN2(start + count, CHROME9_VS_MAX_SAMPLERS);
+      for (unsigned i = start; i < end; i++)
+         ctx->vs_sampler_states[i] = states ? states[i - start] : NULL;
+      ctx->num_vs_sampler_states = 0;
+      for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
+         if (ctx->vs_sampler_states[i])
+            ctx->num_vs_sampler_states = i + 1;
+      draw_set_samplers(ctx->draw, MESA_SHADER_VERTEX,
+                        ctx->vs_sampler_states, ctx->num_vs_sampler_states);
+      return;
+   }
    if (shader != MESA_SHADER_FRAGMENT || start >= PIPE_MAX_SAMPLERS)
       return;
    end = MIN2(start + count, PIPE_MAX_SAMPLERS);
@@ -242,10 +256,25 @@ static void
 chrome9_delete_sampler_state(struct pipe_context *pipe, void *state)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
+   bool vs_changed = false;
 
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       if (ctx->sampler_states[i] == state)
          ctx->sampler_states[i] = NULL;
+   for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++) {
+      if (ctx->vs_sampler_states[i] == state) {
+         ctx->vs_sampler_states[i] = NULL;
+         vs_changed = true;
+      }
+   }
+   if (vs_changed) {
+      ctx->num_vs_sampler_states = 0;
+      for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
+         if (ctx->vs_sampler_states[i])
+            ctx->num_vs_sampler_states = i + 1;
+      draw_set_samplers(ctx->draw, MESA_SHADER_VERTEX,
+                        ctx->vs_sampler_states, ctx->num_vs_sampler_states);
+   }
    ctx->num_sampler_states = 0;
    for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
       if (ctx->sampler_states[i])
@@ -4353,6 +4382,37 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
    bool report = count && !(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_BIND);
    unsigned end;
 
+   if (shader == MESA_SHADER_VERTEX) {
+      struct pipe_sampler_view *new_views[CHROME9_VS_MAX_SAMPLERS];
+      unsigned num_views = 0;
+
+      if (start >= CHROME9_VS_MAX_SAMPLERS)
+         return;
+      memcpy(new_views, ctx->vs_sampler_views, sizeof(new_views));
+      end = MIN2(start + count, CHROME9_VS_MAX_SAMPLERS);
+      for (unsigned i = start; i < end; i++)
+         new_views[i] = views ? views[i - start] : NULL;
+      end = MIN2(end + unbind_trailing, CHROME9_VS_MAX_SAMPLERS);
+      for (unsigned i = start + count; i < end; i++)
+         new_views[i] = NULL;
+      for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
+         if (new_views[i])
+            num_views = i + 1;
+      /* draw_set_sampler_views flushes old draw state.  Keep old views alive
+       * until after that flush before replacing our references. */
+      draw_set_sampler_views(ctx->draw, MESA_SHADER_VERTEX,
+                             new_views, num_views);
+      for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++) {
+         if (new_views[i] != ctx->vs_sampler_views[i])
+            pipe_sampler_view_reference(&ctx->vs_sampler_views[i],
+                                        new_views[i]);
+         if (!new_views[i])
+            memset(&ctx->vs_texture_mappings[i], 0,
+                   sizeof(ctx->vs_texture_mappings[i]));
+      }
+      ctx->num_vs_sampler_views = num_views;
+      return;
+   }
    if (shader != MESA_SHADER_FRAGMENT || start >= PIPE_MAX_SHADER_SAMPLER_VIEWS)
       return;
    end = MIN2(start + count, PIPE_MAX_SHADER_SAMPLER_VIEWS);
@@ -4685,6 +4745,49 @@ chrome9_refresh_sampler_shadows(struct chrome9_context *ctx)
 }
 
 static void
+chrome9_refresh_vs_textures(struct chrome9_context *ctx)
+{
+   static const uint8_t zero_texel[16];
+   uint32_t zero_stride[PIPE_MAX_TEXTURE_LEVELS] = {0};
+   struct pipe_resource *external = ctx->framebuffer.nr_cbufs ?
+      ctx->framebuffer.cbufs[0].texture : NULL;
+
+   if (!ctx->num_vs_sampler_views)
+      return;
+   /* Vertex fetch happens on the CPU.  Retire any preceding GPU writes
+    * before publishing the BO's persistent mapping to the draw module. */
+   chrome9_draw_flush_batch(ctx);
+   for (unsigned i = 0; i < ctx->num_vs_sampler_views; i++) {
+      struct pipe_sampler_view *view = ctx->vs_sampler_views[i];
+      struct chrome9_vs_texture_mapping *mapping =
+         &ctx->vs_texture_mappings[i];
+      struct pipe_sampler_view effective;
+
+      if (view && view->texture == external)
+         chrome9_flush_render_target(ctx);
+      if (view && view->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+          chrome9_sampler_view(view)->shadow) {
+         chrome9_copy_surface(chrome9_sampler_view(view)->shadow,
+                              view->texture);
+         effective = *view;
+         effective.texture = chrome9_sampler_view(view)->shadow;
+         view = &effective;
+      }
+      if (chrome9_vs_texture_mapping(view, mapping)) {
+         draw_set_mapped_texture(ctx->draw, MESA_SHADER_VERTEX, i,
+                                 mapping->width, mapping->height, 1,
+                                 mapping->first_level, mapping->last_level,
+                                 0, 0, mapping->base, mapping->row_stride,
+                                 mapping->img_stride, mapping->mip_offset);
+      } else {
+         draw_set_mapped_texture(ctx->draw, MESA_SHADER_VERTEX, i,
+                                 1, 1, 1, 0, 0, 0, 0, zero_texel,
+                                 zero_stride, zero_stride, zero_stride);
+      }
+   }
+}
+
+static void
 chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                  unsigned drawid_offset,
                  const struct pipe_draw_indirect_info *indirect,
@@ -4715,6 +4818,8 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                         "draw rejected: unsupported bounded fragment program");
       return;
    }
+
+   chrome9_refresh_vs_textures(ctx);
 
    for (unsigned i = 0; i < ctx->num_vertex_buffers; i++) {
       const struct pipe_vertex_buffer *vb = &ctx->vertex_buffers[i];
@@ -4842,6 +4947,9 @@ chrome9_context_destroy(struct pipe_context *pipe)
    }
    for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
       pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
+   for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
+      pipe_sampler_view_reference(&ctx->vs_sampler_views[i], NULL);
+   chrome9_vs_texture_sampler_destroy(ctx->vs_tgsi_sampler);
    FREE(ctx);
 }
 
@@ -4996,6 +5104,11 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->draw = draw_create(&ctx->base);
    if (!ctx->draw)
       goto fail;
+   ctx->vs_tgsi_sampler = chrome9_vs_texture_sampler_create(ctx);
+   if (!ctx->vs_tgsi_sampler)
+      goto fail;
+   draw_texture_sampler(ctx->draw, MESA_SHADER_VERTEX,
+                        ctx->vs_tgsi_sampler);
    draw_set_constant_buffer_stride(ctx->draw, sizeof(float));
    stage = chrome9_draw_vbuf_stage(ctx);
    if (!stage)

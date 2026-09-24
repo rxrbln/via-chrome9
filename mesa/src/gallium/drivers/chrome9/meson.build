@@ -13,6 +13,7 @@ libchrome9 = static_library(
     'chrome9_screen.c',
     'chrome9_shader_offline.c',
     'chrome9_specialise.c',
+    'chrome9_vs_texture.c',
   ),
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_nir, idep_mesautil],
@@ -51,6 +52,15 @@ chrome9_shader_offline_test = executable(
 )
 test('chrome9-shader-offline', chrome9_shader_offline_test,
      suite : ['chrome9'])
+
+chrome9_vs_texture_test = executable(
+  'chrome9-vs-texture-test',
+  ['chrome9_vs_texture.c', 'chrome9_vs_texture_test.c'],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  dependencies : [idep_mesautil],
+  install : false,
+)
+test('chrome9-vs-texture', chrome9_vs_texture_test, suite : ['chrome9'])
 
 chrome9_specialise_test = executable(
   'chrome9-specialise-test',
