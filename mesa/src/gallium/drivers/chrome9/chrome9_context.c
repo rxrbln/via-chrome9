@@ -6719,6 +6719,10 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->tcl_buffers = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_BUFFERS) &&
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
+   ctx->tcl_twoside = ctx->tcl_enabled &&
+      (capabilities & DRM_CHROME9_CAP_VERTEX_TWO_SIDE);
+   ctx->tcl_clip_distance = ctx->tcl_enabled &&
+      (capabilities & DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =

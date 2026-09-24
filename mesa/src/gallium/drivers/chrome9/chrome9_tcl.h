@@ -39,15 +39,21 @@ struct chrome9_tcl_program {
    uint8_t origin[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
    uint8_t origin_input[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
    uint8_t origin_lane[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+   /* Enabled planes the VS writes, and whether it writes BFC0. */
+   uint8_t clip_written;
+   bool back_primary;
 };
 
 #define CHROME9_TCL_MAX_KEY 16
 #define CHROME9_TCL_MAX_VARIANTS 32
 
-/* One compiled form: clip-z convention plus the folded control uniforms. */
+/* One compiled form: clip-z convention, output routing and the folded
+ * control uniforms. */
 struct chrome9_tcl_variant {
    struct chrome9_tcl_variant *next;
    bool clip_halfz;
+   bool twoside;
+   uint8_t clip_enable;
    uint32_t key[CHROME9_TCL_MAX_KEY];
    struct chrome9_tcl_program program;
 };
@@ -64,6 +70,7 @@ struct chrome9_tcl_shader {
 struct chrome9_tcl_shader *chrome9_tcl_shader_create(const struct nir_shader *nir);
 void chrome9_tcl_shader_destroy(struct chrome9_tcl_shader *shader);
 bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
+                         bool twoside, unsigned clip_enable,
                          unsigned key_count, const uint16_t *key_dword,
                          const uint32_t *key_value,
                          struct chrome9_tcl_program *program);

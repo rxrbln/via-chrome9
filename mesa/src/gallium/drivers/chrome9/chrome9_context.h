@@ -248,6 +248,9 @@ struct chrome9_context {
    bool tcl_enabled;
    /* Stage B: hardware vertex fetch from GEM buffers. */
    bool tcl_buffers;
+   /* Native back-face color (oBFD0) and user clip planes (FE A05). */
+   bool tcl_twoside;
+   bool tcl_clip_distance;
    struct chrome9_tcl_state *tcl_state;
    /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */
    struct chrome9_sw_context *sw;
