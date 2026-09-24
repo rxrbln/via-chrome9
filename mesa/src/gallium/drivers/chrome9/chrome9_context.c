@@ -64,24 +64,84 @@ chrome9_shadow_synced(struct chrome9_context *ctx, struct pipe_resource *color)
    }
 }
 
+/* CPU copy of the pixel rectangle rect between equal-format surfaces. */
 static void
-chrome9_copy_surface(struct pipe_resource *destination,
-                     struct pipe_resource *source)
+chrome9_copy_surface_rect(struct pipe_resource *destination,
+                          struct pipe_resource *source,
+                          const struct pipe_scissor_state *rect)
 {
    struct chrome9_resource *dst = chrome9_resource(destination);
    struct chrome9_resource *src = chrome9_resource(source);
    unsigned cpp = util_format_get_blocksize(source->format);
-   unsigned width = MIN2(destination->width0, source->width0) * cpp;
-   unsigned height = MIN2(destination->height0, source->height0);
+   unsigned maxx = MIN3(rect->maxx, destination->width0, source->width0);
+   unsigned maxy = MIN3(rect->maxy, destination->height0, source->height0);
    uint8_t *dst_map = (uint8_t *)dst->bo.map + dst->data_offset;
    const uint8_t *src_map = (const uint8_t *)src->bo.map + src->data_offset;
 
-   chrome9_resource_cpu_access(src, false);
-   chrome9_resource_cpu_access(dst, true);
+   if (rect->minx >= maxx || rect->miny >= maxy)
+      return;
+   chrome9_resource_cpu_access_range(src, false,
+      src->data_offset + (uint64_t)rect->miny * src->stride,
+      (uint64_t)(maxy - rect->miny) * src->stride);
+   chrome9_resource_cpu_access_range(dst, true,
+      dst->data_offset + (uint64_t)rect->miny * dst->stride,
+      (uint64_t)(maxy - rect->miny) * dst->stride);
+   for (unsigned y = rect->miny; y < maxy; y++)
+      memcpy(dst_map + (size_t)y * dst->stride + rect->minx * cpp,
+             src_map + (size_t)y * src->stride + rect->minx * cpp,
+             (maxx - rect->minx) * cpp);
+}
 
-   for (unsigned y = 0; y < height; y++)
-      memcpy(dst_map + (size_t)y * dst->stride,
-             src_map + (size_t)y * src->stride, width);
+static void
+chrome9_copy_surface(struct pipe_resource *destination,
+                     struct pipe_resource *source)
+{
+   const struct pipe_scissor_state all = {
+      0, 0, MIN2(destination->width0, source->width0),
+      MIN2(destination->height0, source->height0),
+   };
+
+   chrome9_copy_surface_rect(destination, source, &all);
+}
+
+/* Publish the guarded shadow into the unguarded drawable with the 2D
+ * engine; false leaves the copy to the CPU. */
+static bool
+chrome9_copy_surface_gpu(struct chrome9_context *ctx,
+                         struct pipe_resource *destination,
+                         struct pipe_resource *source)
+{
+   struct chrome9_resource *dst = chrome9_resource(destination);
+   struct chrome9_resource *src = chrome9_resource(source);
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   struct drm_chrome9_copy_rect copy = { 0 };
+
+   if (!ctx->copy_rect || !ctx->copy_rect_unguarded_destination ||
+       dst->guarded || !src->guarded || dst->data_offset ||
+       destination->format != source->format ||
+       (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        source->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+       destination->width0 != source->width0 ||
+       destination->height0 != source->height0 ||
+       dst->stride != ALIGN_POT(destination->width0 * 4, 32) ||
+       src->stride != ALIGN_POT(source->width0 * 4, 32) ||
+       !debug_get_bool_option("CHROME9_GPU_PUBLISH", false))
+      return false;
+   copy.destination_handle = dst->bo.handle;
+   copy.source_handle = src->bo.handle;
+   copy.flags = DRM_CHROME9_COPY_RECT_DESTINATION_UNGUARDED;
+   copy.width = source->width0;
+   copy.height = source->height0;
+   copy.destination_width = destination->width0;
+   copy.destination_height = destination->height0;
+   copy.destination_pitch = dst->stride;
+   copy.source_width = source->width0;
+   copy.source_height = source->height0;
+   copy.source_pitch = src->stride;
+   copy.format = source->format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+                 DRM_CHROME9_TEXTURE_FORMAT_BGRA8888 :
+                 DRM_CHROME9_TEXTURE_FORMAT_BGRX8888;
+   return chrome9_copy_rect(fd, &copy);
 }
 
 static void
@@ -94,7 +154,12 @@ chrome9_flush_render_target(struct chrome9_context *ctx)
        !(external = ctx->framebuffer.cbufs[0].texture))
       return;
    if (external != ctx->render_target) {
-      chrome9_copy_surface(external, ctx->render_target);
+      if (chrome9_copy_surface_gpu(ctx, external, ctx->render_target))
+         /* A device write: the drawable changed, but not by the CPU. */
+         chrome9_resource(external)->cpu_write_generation++;
+      else
+         chrome9_copy_surface_rect(external, ctx->render_target,
+                                   &ctx->render_dirty);
       chrome9_shadow_synced(ctx, external);
    }
    ctx->render_target_dirty = false;
@@ -113,11 +178,32 @@ chrome9_context_depth_target(struct chrome9_context *ctx)
              chrome9_resource(ctx->framebuffer.zsbuf.texture) : NULL;
 }
 
+/* A draw or clear wrote the bound target: grow the dirty rectangle by the
+ * scissor box, or to the whole target without scissoring. */
 void
 chrome9_context_render_target_written(struct chrome9_context *ctx)
 {
-   if (ctx->framebuffer.nr_cbufs)
-      ctx->render_target_dirty = true;
+   struct pipe_scissor_state box = {
+      0, 0, ctx->framebuffer.width, ctx->framebuffer.height,
+   };
+
+   if (!ctx->framebuffer.nr_cbufs)
+      return;
+   if (ctx->rasterizer && ctx->rasterizer->scissor && ctx->scissor_valid) {
+      box.minx = MIN2(ctx->scissor.minx, box.maxx);
+      box.miny = MIN2(ctx->scissor.miny, box.maxy);
+      box.maxx = MIN2(ctx->scissor.maxx, box.maxx);
+      box.maxy = MIN2(ctx->scissor.maxy, box.maxy);
+   }
+   if (!ctx->render_target_dirty) {
+      ctx->render_dirty = box;
+   } else {
+      ctx->render_dirty.minx = MIN2(ctx->render_dirty.minx, box.minx);
+      ctx->render_dirty.miny = MIN2(ctx->render_dirty.miny, box.miny);
+      ctx->render_dirty.maxx = MAX2(ctx->render_dirty.maxx, box.maxx);
+      ctx->render_dirty.maxy = MAX2(ctx->render_dirty.maxy, box.maxy);
+   }
+   ctx->render_target_dirty = true;
 }
 
 /* A synchronized CPU map observes all queued draws; the displayed target

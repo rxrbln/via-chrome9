@@ -179,6 +179,8 @@ struct chrome9_context {
    /* Guarded render shadows of unguarded drawables, keyed by drawable. */
    struct hash_table *shadows;
    bool render_target_dirty;
+   /* Pixels written since the last publish, when render_target_dirty. */
+   struct pipe_scissor_state render_dirty;
    bool render_target_stale;
    bool draw_triangle_d16;
    bool draw_triangle_d16_blend;

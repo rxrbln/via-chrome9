@@ -33,6 +33,9 @@ struct chrome9_resource {
 
 void chrome9_resource_cpu_access(struct chrome9_resource *resource,
                                  bool write);
+void chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
+                                       bool write, uint64_t offset,
+                                       uint64_t size);
 
 static inline struct chrome9_resource *
 chrome9_resource(struct pipe_resource *resource)

@@ -458,18 +458,29 @@ fail:
    return NULL;
 }
 
+/* Announce CPU access to bytes [offset, offset + size) of the BO (size 0:
+ * the whole object). */
 void
-chrome9_resource_cpu_access(struct chrome9_resource *resource, bool write)
+chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
+                                  bool write, uint64_t offset, uint64_t size)
 {
    struct pipe_screen *screen = resource->base.screen;
 
    if (write)
       resource->cpu_write_generation++;
    if (resource->explicit_access &&
-       !chrome9_bo_cpu_access(screen->get_screen_fd(screen), &resource->bo,
-                              write ? DRM_CHROME9_GEM_CPU_PREPARE_WRITE :
-                                      DRM_CHROME9_GEM_CPU_PREPARE_READ))
+       !chrome9_bo_cpu_access_range(screen->get_screen_fd(screen),
+                                    &resource->bo,
+                                    write ? DRM_CHROME9_GEM_CPU_PREPARE_WRITE :
+                                            DRM_CHROME9_GEM_CPU_PREPARE_READ,
+                                    offset, size))
       fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n", strerror(errno));
+}
+
+void
+chrome9_resource_cpu_access(struct chrome9_resource *resource, bool write)
+{
+   chrome9_resource_cpu_access_range(resource, write, 0, 0);
 }
 
 static bool
