@@ -274,6 +274,23 @@ deadlocked while re-entering Mesa texture deletion during shutdown; that
 user-process failure is distinct from command retirement and future bounded
 runs should use a hard timeout.
 
+A later `CHROME9_DRAW_LIMIT=32768`, `com_maxfps 5` run reached a coherent
+q3dm1 gameplay frame before its global triangle cap fired.  The target
+artifacts are `gl1-limit32768-earlyshot.log` (SHA-256
+`3cef56df008687ac4dc55ef53a61a28e42f0f84e7f4c2058bef931125f64525a`)
+and `gl1-limit32768-earlyshot.png` (SHA-256
+`f76ad570d50570ab94179258763f20c928b15e83804f7439a18b3c2ddfc5266f`)
+under `/root/tmp/chrome9-live/ioquake-projector-20260924/`.  The screenshot
+was captured and the log was checked while the game was still running;
+`entered the game` was present and the cap line had not yet appeared.  It
+shows courtyard geometry, sky, statues, weapon, HUD and textures in a complete
+640x480 game window.  The final log later reports the cap at triangle 32768;
+the kernel log still shows no Chrome9 fault or quarantine.  An earlier
+post-cap screenshot with a large red region and a wedge of world geometry
+was a frame interrupted by the global cap, not evidence of incorrect
+interpolation.  This single visual frame is a GL1 gameplay milestone, not
+a claim that every map, material, dynamic light or fog pass is validated.
+
 After these numeric pixel gates, source and current capability review find no
 deterministic generic-state rejection for the next q3dm1 material classes.
 The first
