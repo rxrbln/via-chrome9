@@ -36,6 +36,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_FRAGMENT_PROGRAM	0x1d
 #define DRM_CHROME9_DRAW_VERTEX_PROGRAM	0x1e
 #define DRM_CHROME9_GEM_CPU_ACCESS	0x1f
+#define DRM_CHROME9_DRAW_VERTEX_PROGRAMS	0x20
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -118,6 +119,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_GEM_CPU_ACCESS \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_GEM_CPU_ACCESS, \
 		struct drm_chrome9_gem_cpu_access)
+#define DRM_IOCTL_CHROME9_DRAW_VERTEX_PROGRAMS \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_VERTEX_PROGRAMS, \
+		struct drm_chrome9_draw_vertex_programs)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -239,6 +243,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE	(1ULL << 61)
 /* GEM_CPU_ACCESS: explicit CPU access bracketing defers cache flushes. */
 #define DRM_CHROME9_CAP_GEM_CPU_ACCESS		(1ULL << 62)
+/* DRAW_VERTEX_PROGRAMS: several TCL draws per submission. */
+#define DRM_CHROME9_CAP_VERTEX_BATCH		(1ULL << 63)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1229,6 +1235,8 @@ struct drm_chrome9_draw_fragment_program {
 #define DRM_CHROME9_VERTEX_MAX_INPUTS		16U
 #define DRM_CHROME9_VERTEX_MAX_VERTICES		384U
 #define DRM_CHROME9_VERTEX_MAX_INDICES		12288U
+/* Draws per DRAW_VERTEX_PROGRAMS call. */
+#define DRM_CHROME9_VERTEX_MAX_BATCH		64U
 /* Hardware user clip planes: two FE coordinate groups of three lanes. */
 #define DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES	6U
 
@@ -1383,6 +1391,18 @@ struct drm_chrome9_draw_vertex_program {
 	__u32 clip_distance_mask;
 	__u32 pad0;
 	__u64 reserved[3];
+};
+
+/*
+ * Draws executed in order.  Every draw names the same destination, depth
+ * buffer and their formats and sizes; at most 64 distinct objects in
+ * total (-E2BIG otherwise, submit fewer draws).
+ */
+struct drm_chrome9_draw_vertex_programs {
+	__u32 count;
+	__u32 flags;
+	__u64 draws_ptr;	/* struct drm_chrome9_draw_vertex_program[count] */
+	__u64 reserved[2];
 };
 
 #if defined(__cplusplus)
