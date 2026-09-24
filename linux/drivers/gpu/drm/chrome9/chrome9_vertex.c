@@ -109,6 +109,8 @@ struct chrome9_vertex_state {
 	u8 varying_mask[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 varying_packed[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u32 position_writes;
+	/* Effective destination mask; zero drops an unconsumed output. */
+	u8 writemask[DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS];
 	bool position_direct;
 	int last_input_record;
 };
@@ -258,17 +260,23 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 		state->position_writes++;
 		break;
 	case DRM_CHROME9_VERTEX_DEST_PRIMARY:
-		if (dst->index || !fragment->primary_used)
+		if (dst->index)
 			return -EINVAL;
+		/* Outputs are write-only: drop what the fragment ignores. */
+		if (!fragment->primary_used)
+			mask = 0;
 		defined = &state->primary_mask;
 		break;
 	case DRM_CHROME9_VERTEX_DEST_VARYING:
 		if (dst->index >= DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
 			return -EINVAL;
 		packed = chrome9_vertex_packed_varying(fragment, dst->index);
-		if (packed < 0 ||
-		    (mask & ~GENMASK(fragment->varying_width[packed] - 1, 0)))
-			return -EINVAL;
+		if (packed < 0) {
+			mask = 0;
+			defined = &state->primary_mask;
+			break;
+		}
+		mask &= GENMASK(fragment->varying_width[packed] - 1, 0);
 		state->varying_packed[dst->index] = packed;
 		defined = &state->varying_mask[packed];
 		break;
@@ -278,6 +286,7 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	if (*defined & mask)
 		return -EINVAL;
 	*defined |= mask;
+	state->writemask[instruction] = mask;
 	return 0;
 }
 
@@ -398,6 +407,14 @@ static int chrome9_vertex_encode(struct chrome9_vertex_state *state,
 
 	if (insn->dst.file == DRM_CHROME9_VERTEX_DEST_TEMP)
 		temp = insn->dst.index;
+	/* A dropped output still ends the lifetime of its sources. */
+	if (!state->writemask[instruction]) {
+		for (s = 0; s < count; s++)
+			if (insn->src[s].file == DRM_CHROME9_VERTEX_FILE_TEMP)
+				chrome9_vertex_release(state, insn->src[s].index,
+						       instruction);
+		return 0;
+	}
 	else if (insn->dst.file == DRM_CHROME9_VERTEX_DEST_POSITION &&
 		 !state->position_direct)
 		temp = CHROME9_VERTEX_POSITION_TEMP;
@@ -458,7 +475,7 @@ static int chrome9_vertex_encode(struct chrome9_vertex_state *state,
 		break;
 	}
 	record[3] = chrome9_vertex_dest_word(chrome9_vertex_native_op[insn->op],
-					     sat, dest, insn->dst.writemask);
+					     sat, dest, state->writemask[instruction]);
 	if (temp != U32_MAX)
 		chrome9_vertex_release(state, temp, instruction);
 	return chrome9_vertex_emit(state, program, record);
@@ -770,11 +787,16 @@ static const struct drm_chrome9_vertex_instruction bad_twice_insn[] = {
 static const struct drm_chrome9_vertex_instruction bad_no_input_insn[] = {
 	VS_I(MOV, VS_POS, VS_R(CONSTANT, 0)),
 };
-static const struct drm_chrome9_vertex_instruction bad_varying_insn[] = {
+/* Lanes and outputs the fragment program does not read are dropped. */
+static const struct drm_chrome9_vertex_instruction narrow_varying_insn[] = {
 	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
-	VS_I(MOV, VS_DST(VARYING, 0, 7, 0), VS_R(INPUT, 1)),
+	VS_I(MOV, VS_DST(VARYING, 0, 0xf, 0), VS_R(INPUT, 1)),
 	VS_I(MOV, VS_DST(VARYING, 1, 3, 0), VS_R(INPUT, 2)),
+	VS_I(MOV, VS_DST(VARYING, 5, 0xf, 0), VS_R(INPUT, 1)),
 };
+#define narrow_varying_rec out_t0_t1_rec
+#define drop_primary_insn out_d0_insn
+#define drop_primary_rec mov_opos_v0_rec
 static const struct drm_chrome9_vertex_instruction bad_unused_insn[] = {
 	VS_I(MOV, VS_POS, VS_R(INPUT, 0), VS_R(INPUT, 0)),
 };
@@ -829,11 +851,9 @@ static const struct chrome9_vertex_case chrome9_vertex_cases[] = {
 	VS_BAD(bad_window, 1, 4, false, 0),
 	VS_BAD(bad_twice, 1, 0, false, 0),
 	VS_BAD(bad_no_input, 1, 1, false, 0),
-	VS_BAD(bad_varying, 3, 0, false, 2),
+	VS_CASE(narrow_varying, 3, 0, false, 2, 2),
+	VS_CASE(drop_primary, 2, 0, false, 0, 0),
 	VS_BAD(bad_unused, 1, 0, false, 0),
-	/* PRIMARY write while the fragment program does not read it. */
-	{ "bad_primary", out_d0_insn, ARRAY_SIZE(out_d0_insn), 2, 0, false, 0,
-	  { 2, 2 }, NULL, 0, 0, -EINVAL },
 };
 
 static int chrome9_vertex_check(const struct chrome9_vertex_case *c,
