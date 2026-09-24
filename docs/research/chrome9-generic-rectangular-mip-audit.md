@@ -132,7 +132,20 @@ offset plus `0x100`, exactly matching this layout.  The final end rounds to
    parent BO reserved while expressing H3 offsets relative to the selected
    base; it cannot merely delete these checks.
 
-3. **The kernel format envelope is broader than its documentation.**
+3. **A direct nonzero-first-level request can emit a zero A20 dimension.**
+   Validation minifies each active level as
+   `max(texture->width >> i, 1)` / `max(texture->height >> i, 1)` at
+   `chrome9_engine.c:7113..7115`.  The packet builder instead computes the
+   selected dimensions with raw shifts at `:2096..2097` and writes those raw
+   values to A20 at `:2104`.  For example, a direct request describing
+   2048x1 with `first_level=last_level=1`, rebased so L1 starts at
+   `PAGE_SIZE`, passes the dimension/layout validator as 1024x1 but emits
+   A20 height zero.  Mesa's current rejection of nonzero first levels hides
+   this from Gallium, but the render-node ABI must fail closed independently.
+   Before enabling rebased views, make the emitter use `max(shifted, 1U)` for
+   both A20 dimensions and add this exact asymmetric case to the self-test.
+
+4. **The kernel format envelope is broader than its documentation.**
    The validator accepts mip chains for BGRX, BGRA, A8, L8, L8A8, and RGB565,
    rejecting mipmaps only for X8Z24 at `chrome9_engine.c:7054..7099`.
    Its self-test explicitly accepts one nonzero level for all four legacy
@@ -143,13 +156,13 @@ offset plus `0x100`, exactly matching this layout.  The final end rounds to
    broader legacy-format mip envelope; either qualify those formats
    separately or narrow/document the ABI consistently.
 
-4. **The offline self-test does not cover the dangerous boundary.**
+5. **The offline self-test does not cover the dangerous boundary.**
    The existing 64x32 BGRA test stops at L1 and checks only one H3 entry and
    sampler words.  It does not check NPOT A20/A22 construction, a rectangular
    full chain, L8-to-L9 adjacency, L10/L11, or rejection of a malformed
    implicit tail.
 
-5. **L9--L11 remain unmeasured on silicon.**
+6. **L9--L11 remain unmeasured on silicon.**
    The kernel validation and Mesa layout are mutually exact, but successful
    validation proves only that a command is bounded.  The actual hardware
    addition from L8 to the implicit tail must still be observed.
@@ -199,4 +212,3 @@ Only after that passes, test an L0/L1 trilinear footprint with
 `X8Z24 L0 + BGRA mip + plain BGRA L0`.  A timeout or engine error quarantines
 the context and keeps the feature disabled; a wrong color with clean idle
 status is a descriptor/LOD failure, not permission to force refract to L0.
-
