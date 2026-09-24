@@ -1275,6 +1275,17 @@ struct drm_chrome9_vertex_instruction {
 #define DRM_CHROME9_VERTEX_FORMAT_FLOAT3	2
 #define DRM_CHROME9_VERTEX_FORMAT_FLOAT4	3
 #define DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM	4
+/* Byte order as in memory: R first.  Missing lanes read (0, 0, 0, 1). */
+#define DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM	5
+#define DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED	6
+#define DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM	7
+#define DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM	8
+#define DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM	9
+#define DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM	10
+#define DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED	11
+#define DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED	12
+#define DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT	13
+#define DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT	14
 
 struct drm_chrome9_vertex_element {
 	__u8 format;
@@ -1299,7 +1310,12 @@ struct drm_chrome9_vertex_buffer {
  * triangle_count zero.  viewport holds the final float bits
  * sx sy sz ox oy oz 0 0, where ox/oy include the 786432 snap bias.
  * Stage A sends vertex_count raw vertices (triangle list) packed by
- * elements with offsets relative to one vertex; stage B is reserved.
+ * elements with offsets relative to one vertex.  Stage B (buffer_count
+ * non-zero, vertex_count/vertex_stride/vertices_ptr zero) fetches every
+ * element from buffers[element.buffer] at offset + element.offset +
+ * (index + base_vertex) * stride through index_count 16- or 32-bit
+ * triangle list indices.  Offsets and strides are dword aligned, strides
+ * 4..2044 bytes.
  */
 struct drm_chrome9_draw_vertex_program {
 	struct drm_chrome9_draw_fragment_program fragment;
