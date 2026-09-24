@@ -329,12 +329,33 @@ chrome9_can_create_resource(struct pipe_screen *screen,
    return chrome9_resource_layout(templ, &layout);
 }
 
+/*
+ * Shared single-level colour surfaces keep the guarded draw layout when the
+ * kernel resolves an external offset of 0 to the first row, so they need no
+ * render or sampler shadow.
+ */
+static bool
+chrome9_guarded_shared(struct pipe_screen *screen,
+                       const struct pipe_resource *templ)
+{
+   return (templ->bind & PIPE_BIND_SHARED) &&
+          !(templ->flags & CHROME9_RESOURCE_FLAG_CANONICAL_SHARED) &&
+          templ->target == PIPE_TEXTURE_2D && !templ->last_level &&
+          (templ->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+           templ->format == PIPE_FORMAT_B8G8R8A8_UNORM) &&
+          chrome9_screen_has_capability2(screen,
+                                         DRM_CHROME9_CAP2_GUARDED_SHARED) &&
+          debug_get_bool_option("CHROME9_GUARDED_SHARED", true);
+}
+
 struct pipe_resource *
 chrome9_resource_create(struct pipe_screen *screen,
                         const struct pipe_resource *templ)
 {
    struct chrome9_resource *resource;
    struct chrome9_resource_layout layout;
+   struct pipe_resource layout_templ = *templ;
+   bool guarded_shared;
    uint32_t create_flags = 0;
    int fd;
 
@@ -349,18 +370,24 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource = CALLOC_STRUCT(chrome9_resource);
    if (!resource)
       return NULL;
+   guarded_shared = chrome9_guarded_shared(screen, templ);
+   if (guarded_shared) {
+      layout_templ.flags |= CHROME9_RESOURCE_FLAG_CANONICAL_SHARED;
+      create_flags |= DRM_CHROME9_GEM_CREATE_GUARDED_SHARED;
+   }
    if (!chrome9_can_create_resource(screen, templ) ||
-       !chrome9_resource_layout(templ, &layout))
+       !chrome9_resource_layout(&layout_templ, &layout))
       goto fail;
 
    /* Only the exported, offset-zero KMS allocation needs constrained pages.
     * Keeping private guarded render/depth resources in ordinary memory avoids
     * consuming DMA32 for data which never becomes the persistent root scanout.
     */
-   if (!layout.guarded && (templ->bind & PIPE_BIND_SCANOUT) &&
+   if ((!layout.guarded || guarded_shared) &&
+       (templ->bind & PIPE_BIND_SCANOUT) &&
        chrome9_screen_has_capability(
           screen, DRM_CHROME9_CAP_GEM_DMA32_SCANOUT))
-      create_flags = DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT;
+      create_flags |= DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT;
 
    fd = screen->get_screen_fd(screen);
    if (fd < 0 ||
@@ -369,6 +396,7 @@ chrome9_resource_create(struct pipe_screen *screen,
       goto fail;
 
    chrome9_resource_apply_layout(resource, &layout);
+   resource->guarded_shared = guarded_shared;
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
@@ -397,7 +425,9 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
                              struct winsys_handle *whandle, unsigned usage)
 {
    struct chrome9_resource *resource;
-   struct chrome9_resource_layout layout;
+   struct chrome9_resource_layout layout, guarded;
+   struct pipe_resource guarded_templ = *templ;
+   uint32_t bo_flags = 0;
    uint64_t data_size;
    int fd;
 
@@ -436,10 +466,21 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
     * consumer can submit the BO directly and share its reservation object;
     * this avoids a stale userspace sampler copy.  Every tuple which is not
     * exact remains an ordinary unguarded external resource. */
+   guarded_templ.flags |= CHROME9_RESOURCE_FLAG_CANONICAL_SHARED;
    if (whandle->stride == layout.level_stride[0] &&
        whandle->offset == layout.level_offset[0] &&
        resource->bo.size == layout.allocation_size) {
       chrome9_resource_apply_layout(resource, &layout);
+   } else if (!whandle->offset &&
+              chrome9_screen_has_capability2(
+                 screen, DRM_CHROME9_CAP2_GUARDED_SHARED) &&
+              chrome9_bo_info(fd, &resource->bo, &bo_flags) &&
+              (bo_flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) &&
+              chrome9_resource_layout(&guarded_templ, &guarded) &&
+              whandle->stride == guarded.level_stride[0] &&
+              resource->bo.size == guarded.allocation_size) {
+      chrome9_resource_apply_layout(resource, &guarded);
+      resource->guarded_shared = true;
    } else {
       resource->stride = whandle->stride;
       resource->data_offset = whandle->offset;
@@ -518,7 +559,7 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
       whandle->handle = prime_fd;
    }
    whandle->stride = resource->stride;
-   whandle->offset = resource->data_offset;
+   whandle->offset = resource->guarded_shared ? 0 : resource->data_offset;
    whandle->modifier = DRM_FORMAT_MOD_LINEAR;
    return true;
 }

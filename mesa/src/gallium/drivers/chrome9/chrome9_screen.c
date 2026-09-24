@@ -39,6 +39,7 @@ struct chrome9_screen {
    uint32_t device_id;
    uint32_t revision;
    uint64_t capabilities;
+   uint64_t capabilities2;
    simple_mtx_t shared_lock;
    struct chrome9_shared_handle *shared_handles;
    /* llvmpipe fragment fallback, created on first use under shared_lock. */
@@ -200,6 +201,12 @@ bool
 chrome9_screen_has_capability(struct pipe_screen *screen, uint64_t capability)
 {
    return (chrome9_screen(screen)->capabilities & capability) == capability;
+}
+
+bool
+chrome9_screen_has_capability2(struct pipe_screen *screen, uint64_t capability)
+{
+   return (chrome9_screen(screen)->capabilities2 & capability) == capability;
 }
 
 static int
@@ -489,6 +496,8 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
           (DRM_CHROME9_CAP_GEM | DRM_CHROME9_CAP_GEM_SHMEM_CACHED))
       goto fail_fd;
    screen->capabilities = value;
+   if (chrome9_get_param(screen->fd, DRM_CHROME9_PARAM_CAPABILITIES2, &value))
+      screen->capabilities2 = value;
 
    screen->base.get_screen_fd = chrome9_screen_fd;
    u_init_pipe_screen_caps(&screen->base,

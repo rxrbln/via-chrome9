@@ -118,6 +118,17 @@ chrome9_bo_create(int fd, uint64_t size, uint32_t flags,
 }
 
 bool
+chrome9_bo_info(int fd, const struct chrome9_bo *bo, uint32_t *flags)
+{
+   struct drm_chrome9_gem_info args = { .handle = bo->handle };
+
+   if (drmIoctl(fd, DRM_IOCTL_CHROME9_GEM_INFO, &args))
+      return false;
+   *flags = args.flags;
+   return true;
+}
+
+bool
 chrome9_bo_export_fd(int fd, const struct chrome9_bo *bo, int *prime_fd)
 {
    if (!bo || !bo->handle || !prime_fd)

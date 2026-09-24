@@ -26,6 +26,8 @@ struct chrome9_resource {
    uint64_t data_offset;
    uint64_t data_size;
    bool guarded;
+   /* Guarded, yet external layout offset 0 names the first row. */
+   bool guarded_shared;
    /* The kernel defers cache maintenance; CPU accesses are bracketed with
     * chrome9_resource_cpu_access(). */
    bool explicit_access;
