@@ -37,8 +37,10 @@
 #define CHROME9_GART_ENTRIES		(CHROME9_GART_SIZE / sizeof(u32))
 #define CHROME9_GART_INVALID		0x80000000U
 #define CHROME9_GART_CACHED		BIT(25)
+/* Default and minimum ring; ring_pages may enlarge it up to the maximum. */
 #define CHROME9_RING_PAGES		16U
 #define CHROME9_RING_SIZE		(CHROME9_RING_PAGES * PAGE_SIZE)
+#define CHROME9_RING_MAX_PAGES		256U
 #define CHROME9_RUN_STAGING_SIZE	SZ_64K
 #define CHROME9_CR_READ_AHEAD		0x220U
 #define CHROME9_PRIME_PAUSE		0x70U
@@ -55,8 +57,8 @@
 #define CHROME9_TARGET_DIM		32U
 #define CHROME9_DEP_TIMEOUT		msecs_to_jiffies(5000)
 #define CHROME9_HW_TIMEOUT_US		100000
-#define CHROME9_DRAW_CACHE_MAX_PAGES	(CHROME9_GART_ENTRIES - \
-					 CHROME9_RING_PAGES - 1)
+#define CHROME9_DRAW_CACHE_MAX_PAGES(engine) \
+	(CHROME9_GART_ENTRIES - (engine)->ring_pages - 1)
 #define CHROME9_FE33_SYSTEM_WRITE	0xfe330004U
 #define CHROME9_FE33_WAIT_3D		0x00200000U
 #define CHROME9_FE33_SLOT_SIZE		16U
@@ -70,6 +72,10 @@
 #define CHROME9_QUERY_SNAPSHOT_DWORDS	48U
 /* Last GART entry: the SF snapshot page, never handed to draw mappings. */
 #define CHROME9_QUERY_SF_INDEX		(CHROME9_GART_ENTRIES - 1)
+#define CHROME9_MAX_INFLIGHT		64U
+/* Retire worker poll interval bounds once the expected job time passed. */
+#define CHROME9_RETIRE_MIN_US		50
+#define CHROME9_RETIRE_MAX_US		2000
 
 /*
  * Snapshot variants, sampled once per submission.  Production (knob 0):
@@ -169,6 +175,17 @@ module_param_named(dxt, chrome9_dxt, bool, 0400);
 MODULE_PARM_DESC(dxt,
 	"DXT1/DXT3/DXT5 fragment texture formats (default: true)");
 
+/* Published fragment jobs the ring may hold before a submitter waits. */
+static uint chrome9_max_inflight = 2;
+module_param_named(max_inflight, chrome9_max_inflight, uint, 0400);
+MODULE_PARM_DESC(max_inflight,
+	"Fragment/vertex program jobs in flight, 1..64 (default: 2)");
+
+static uint chrome9_ring_pages = 64;
+module_param_named(ring_pages, chrome9_ring_pages, uint, 0400);
+MODULE_PARM_DESC(ring_pages,
+	"Command ring pages, 16..256 (default: 64)");
+
 static bool chrome9_texture_3d = true;
 module_param_named(texture_3d, chrome9_texture_3d, bool, 0600);
 MODULE_PARM_DESC(texture_3d,
@@ -266,6 +283,18 @@ static u64 chrome9_prof_wait_ns[4];
 /* Full flushes by reason: implicit destination/depth/texture, dirty same. */
 static u64 chrome9_prof_full_kind[6];
 static u64 chrome9_prof_jobs;
+/* Causes of a queue drain, counted in engine->queue_drains. */
+enum chrome9_drain {
+	CHROME9_DRAIN_LOCK,
+	CHROME9_DRAIN_GART,
+	CHROME9_DRAIN_PREPARE,
+	CHROME9_DRAIN_WRAP,
+	CHROME9_DRAIN_SYNC,
+	CHROME9_DRAIN_SLOT,
+	CHROME9_DRAIN_QUERY,
+	CHROME9_DRAIN_ERROR,
+	CHROME9_DRAIN_COUNT,
+};
 static u64 chrome9_prof_draws;
 static u64 chrome9_prof_segments;
 /* State cache: draws, dwords emitted and dwords omitted. */
@@ -407,6 +436,8 @@ struct chrome9_job {
 	struct iosys_map fragment_maps[CHROME9_FRAGMENT_MAX_OBJECTS];
 	bool fragment_mapped[CHROME9_FRAGMENT_MAX_OBJECTS];
 	struct list_head quarantine_link;
+	/* Published and not yet retired, in ring order (engine->queue). */
+	struct list_head queue_link;
 	/* Asynchronously retired fragment submission and its objects. */
 	struct list_head reap_link;
 	struct chrome9_fragment_submit *fsub;
@@ -428,6 +459,8 @@ struct chrome9_job {
 	bool fence_attached;
 	bool published;
 	bool retirement_proven;
+	/* FE33 completion of fence_id already accounted. */
+	bool fence_seen;
 	struct chrome9_job_query *queries;
 	u32 query_count;
 	/* Snapshots before this index were read or dropped. */
@@ -642,8 +675,25 @@ struct chrome9_blend_words {
 struct chrome9_engine {
 	struct chrome9_device *cdev;
 	struct mutex submit_lock;
-	/* Published job whose retirement is pending (submit_lock). */
-	struct chrome9_job *inflight;
+	/* Published jobs whose retirement is pending, oldest first (submit_lock). */
+	struct list_head queue;
+	unsigned int queued;
+	unsigned int max_inflight;
+	/* Head of the queue since this time; bounds the asynchronous poll. */
+	ktime_t head_since;
+	/* Running average of the head job's duration, sizes worker sleeps. */
+	u32 job_us_avg;
+	/* Woken on every retirement; queueing submitters wait here. */
+	wait_queue_head_t retire_wq;
+	/* Cookies n | n << 16 for n in 1..cookie_span, FE33 slots per page. */
+	u32 cookie_span;
+	u32 fence_slots;
+	u32 ring_pages;
+	u32 ring_size;
+	/* Totals since load: drains by cause, live appends, full-queue waits. */
+	u64 queue_drains[CHROME9_DRAIN_COUNT];
+	u64 live_appends;
+	u64 full_waits;
 	/* Retired jobs whose object references drop after the unlock. */
 	struct list_head reaped;
 	struct work_struct retire_work;
@@ -720,18 +770,24 @@ struct chrome9_engine {
 	dma_addr_t query_sf_dma;
 };
 
-static void chrome9_engine_retire_locked(struct chrome9_engine *engine);
+static void chrome9_engine_retire_all_locked(struct chrome9_engine *engine);
+static void chrome9_engine_drain_locked(struct chrome9_engine *engine,
+					enum chrome9_drain cause);
+static void chrome9_engine_retire_head_locked(struct chrome9_engine *engine);
+static bool chrome9_engine_retire_completed_locked(
+		struct chrome9_engine *engine);
 static void chrome9_engine_reap(struct list_head *list);
 static void chrome9_retire_work(struct work_struct *work);
+static void chrome9_submit_unlock(struct chrome9_engine *engine);
 
 /*
- * Every submit_lock holder first retires a job left in flight, so the ring,
- * GART and cache invariants of the synchronous paths keep holding.
+ * Every submit_lock holder first retires all jobs left in flight, so the
+ * ring, GART and cache invariants of the synchronous paths keep holding.
  */
 static void chrome9_submit_lock(struct chrome9_engine *engine)
 {
 	mutex_lock(&engine->submit_lock);
-	chrome9_engine_retire_locked(engine);
+	chrome9_engine_drain_locked(engine, CHROME9_DRAIN_LOCK);
 }
 
 static int chrome9_submit_lock_interruptible(struct chrome9_engine *engine)
@@ -739,8 +795,41 @@ static int chrome9_submit_lock_interruptible(struct chrome9_engine *engine)
 	int ret = mutex_lock_interruptible(&engine->submit_lock);
 
 	if (!ret)
-		chrome9_engine_retire_locked(engine);
+		chrome9_engine_drain_locked(engine, CHROME9_DRAIN_LOCK);
 	return ret;
+}
+
+/*
+ * Queueing submitters retire finished jobs and wait only for a free slot:
+ * sleeping on retire_wq without submit_lock while the worker retires, or
+ * with one job in flight retiring it inline as before.
+ */
+static int chrome9_submit_lock_queue_interruptible(
+		struct chrome9_engine *engine)
+{
+	long wait;
+	int ret;
+
+	for (;;) {
+		ret = mutex_lock_interruptible(&engine->submit_lock);
+		if (ret)
+			return ret;
+		chrome9_engine_retire_completed_locked(engine);
+		if (engine->queued < engine->max_inflight)
+			return 0;
+		engine->full_waits++;
+		if (engine->max_inflight == 1) {
+			chrome9_engine_retire_head_locked(engine);
+			return 0;
+		}
+		chrome9_submit_unlock(engine);
+		queue_work(system_highpri_wq, &engine->retire_work);
+		wait = wait_event_interruptible_timeout(engine->retire_wq,
+				READ_ONCE(engine->queued) < engine->max_inflight,
+				usecs_to_jiffies(CHROME9_HW_TIMEOUT_US));
+		if (wait < 0)
+			return wait;
+	}
 }
 
 /* Object references of retired jobs drop outside the lock. */
@@ -764,6 +853,19 @@ static void chrome9_prof_engine(struct drm_device *drm)
 			 engine->draw_cache_hits, engine->draw_cache_scanout_hits,
 			 engine->draw_cache_misses, engine->draw_cache_evictions,
 			 engine->draw_cache_entries, engine->draw_cache_pages);
+	if (engine && engine->max_inflight > 1)
+		dev_info(drm->dev,
+			 "profile queue: head job %u us, live appends %llu, full waits %llu, drains lock %llu gart %llu prepare %llu wrap %llu sync %llu slot %llu query %llu error %llu\n",
+			 engine->job_us_avg, engine->live_appends,
+			 engine->full_waits,
+			 engine->queue_drains[CHROME9_DRAIN_LOCK],
+			 engine->queue_drains[CHROME9_DRAIN_GART],
+			 engine->queue_drains[CHROME9_DRAIN_PREPARE],
+			 engine->queue_drains[CHROME9_DRAIN_WRAP],
+			 engine->queue_drains[CHROME9_DRAIN_SYNC],
+			 engine->queue_drains[CHROME9_DRAIN_SLOT],
+			 engine->queue_drains[CHROME9_DRAIN_QUERY],
+			 engine->queue_drains[CHROME9_DRAIN_ERROR]);
 }
 
 struct chrome9_sf_mapping {
@@ -780,6 +882,94 @@ struct chrome9_sf_mapping {
 	bool quarantined;
 	bool draw_cached;
 };
+
+/*
+ * Completion cookies are n | n << 16 with n in 1..cookie_span.  The next
+ * cookie follows the newest published one, so the queued jobs and the last
+ * retired cookie always hold distinct values (span = max_inflight + 1).
+ */
+static u32 chrome9_cookie_after(u32 span, u32 cookie)
+{
+	u32 n = cookie & 0xffff;
+
+	if (cookie != (n | n << 16) || !n || n >= span)
+		n = 0;
+	n++;
+	return n | n << 16;
+}
+
+static u32 chrome9_next_cookie_locked(struct chrome9_engine *engine)
+{
+	lockdep_assert_held(&engine->submit_lock);
+	if (list_empty(&engine->queue))
+		return chrome9_cookie_after(engine->cookie_span,
+					    engine->last_cookie);
+	return chrome9_cookie_after(engine->cookie_span,
+				    list_last_entry(&engine->queue,
+						    struct chrome9_job,
+						    queue_link)->cookie);
+}
+
+/*
+ * Model of the queue's cookie window for max jobs in flight: the last
+ * retired and all queued cookies stay distinct, and one job in flight keeps
+ * the legacy 00010001/00020002 alternation.
+ */
+static int chrome9_cookie_model(u32 max, u32 last)
+{
+	u32 window[CHROME9_MAX_INFLIGHT];
+	unsigned int step, i, n = 0;
+	u32 cookie;
+
+	for (step = 0; step < 8 * (max + 1) * max; step++) {
+		/* Fill up, retire on every fifth step. */
+		if (n == max || (n && step % 5 == 4)) {
+			last = window[0];
+			memmove(window, window + 1, --n * sizeof(*window));
+			continue;
+		}
+		cookie = chrome9_cookie_after(max + 1, n ? window[n - 1] : last);
+		if (!(cookie & 0xffff) || (cookie & 0xffff) > max + 1 ||
+		    cookie == last)
+			return -EINVAL;
+		for (i = 0; i < n; i++)
+			if (window[i] == cookie)
+				return -EINVAL;
+		if (max == 1 &&
+		    cookie != (last == 0x00010001 ? 0x00020002 : 0x00010001))
+			return -EINVAL;
+		window[n++] = cookie;
+	}
+	return 0;
+}
+
+static int chrome9_cookie_selftest(void)
+{
+	static const u32 initial[] = {
+		0, 0x00010001, 0x00020002, 0x00410041, 0x00420042, 0xdeadbeef,
+	};
+	static const u32 depth[] = { 1, 2, 3, 8, CHROME9_MAX_INFLIGHT };
+	unsigned int d, v;
+
+	for (d = 0; d < ARRAY_SIZE(depth); d++)
+		for (v = 0; v < ARRAY_SIZE(initial); v++)
+			if (chrome9_cookie_model(depth[d], initial[v]))
+				return -EINVAL;
+	return 0;
+}
+
+/* One 16-byte FE33 slot per ID modulo fence_slots (>= max_inflight). */
+static u32 *chrome9_fence_slot(struct chrome9_engine *engine, u32 id)
+{
+	return engine->fence_cpu + (id % engine->fence_slots) *
+	       (CHROME9_FE33_SLOT_SIZE / sizeof(u32));
+}
+
+static dma_addr_t chrome9_fence_slot_dma(struct chrome9_engine *engine, u32 id)
+{
+	return engine->fence_dma +
+	       (dma_addr_t)(id % engine->fence_slots) * CHROME9_FE33_SLOT_SIZE;
+}
 
 static const char *chrome9_fence_get_driver_name(struct dma_fence *fence)
 {
@@ -801,6 +991,26 @@ static const struct dma_fence_ops chrome9_fence_ops = {
 	.get_timeline_name = chrome9_fence_get_timeline_name,
 	.release = chrome9_fence_release,
 };
+
+/* Seqnos follow ring order: fences are initialized under submit_lock. */
+static void chrome9_job_fence_init_locked(struct chrome9_engine *engine,
+					  struct chrome9_job *job)
+{
+	lockdep_assert_held(&engine->submit_lock);
+	spin_lock_init(&job->fence.lock);
+	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
+			 &job->fence.lock, engine->fence_context,
+			 atomic64_inc_return(&engine->fence_seqno));
+}
+
+/* The fence is the first member; a job without one is plain memory. */
+static void chrome9_job_put(struct chrome9_job *job)
+{
+	if (job->fence.base.ops)
+		dma_fence_put(&job->fence.base);
+	else
+		kfree(job);
+}
 
 static void chrome9_cache_flush(void *address, size_t size)
 {
@@ -1013,8 +1223,10 @@ static int chrome9_fe33_selftest(void)
 static int chrome9_emit_fe33(struct chrome9_engine *engine,
 			     struct chrome9_job *job, u32 **cursor)
 {
+	struct chrome9_job *queued;
 	u32 record[4];
 	u32 *p = *cursor;
+	u32 *slot;
 	u32 id;
 	int ret;
 
@@ -1025,14 +1237,26 @@ static int chrome9_emit_fe33(struct chrome9_engine *engine,
 	if (engine->fence_last_id == U32_MAX)
 		return -ENOSPC;
 	id = engine->fence_last_id + 1;
-	ret = chrome9_fe33_encode(record, id, engine->fence_dma);
+	/* IDs skipped by unpublished jobs can wrap onto a queued job's slot. */
+	list_for_each_entry(queued, &engine->queue, queue_link) {
+		if (queued->fence_id &&
+		    queued->fence_id % engine->fence_slots ==
+		    id % engine->fence_slots) {
+			chrome9_engine_drain_locked(engine, CHROME9_DRAIN_SLOT);
+			if (engine->wedged)
+				return -EIO;
+			break;
+		}
+	}
+	ret = chrome9_fe33_encode(record, id, chrome9_fence_slot_dma(engine, id));
 	if (ret)
 		return ret;
 	engine->fence_last_id = id;
-	WRITE_ONCE(engine->fence_cpu[0], ~id);
-	WRITE_ONCE(engine->fence_cpu[1], CHROME9_FE33_CANARY + 1);
-	WRITE_ONCE(engine->fence_cpu[2], CHROME9_FE33_CANARY + 2);
-	WRITE_ONCE(engine->fence_cpu[3], CHROME9_FE33_CANARY + 3);
+	slot = chrome9_fence_slot(engine, id);
+	WRITE_ONCE(slot[0], ~id);
+	WRITE_ONCE(slot[1], CHROME9_FE33_CANARY + 1);
+	WRITE_ONCE(slot[2], CHROME9_FE33_CANARY + 2);
+	WRITE_ONCE(slot[3], CHROME9_FE33_CANARY + 3);
 	/* The poison must be visible before the segment can be fetched. */
 	dma_wmb();
 	while (!IS_ALIGNED((unsigned long)p, CHROME9_FE33_SLOT_SIZE))
@@ -1040,6 +1264,7 @@ static int chrome9_emit_fe33(struct chrome9_engine *engine,
 	memcpy(p, record, sizeof(record));
 	*cursor = p + ARRAY_SIZE(record);
 	job->fence_id = id;
+	job->fence_seen = false;
 	return 0;
 }
 
@@ -4411,9 +4636,9 @@ static int chrome9_install_prime_ring(struct chrome9_engine *engine,
 	ring[0x84 / sizeof(*ring)] = 0x0000041c;
 	ring[0x88 / sizeof(*ring)] = 0x00300000;
 	ring[0x8c / sizeof(*ring)] = 0xcc000000;
-	chrome9_cache_flush(ring, CHROME9_RING_SIZE);
+	chrome9_cache_flush(ring, engine->ring_size);
 	dma_wmb();
-	chrome9_install_stopped_ring(cdev, 1, CHROME9_RING_SIZE,
+	chrome9_install_stopped_ring(cdev, 1, engine->ring_size,
 				     CHROME9_PRIME_PAUSE);
 	*published = true;
 
@@ -4477,7 +4702,7 @@ static void chrome9_fill_ring_dummy(struct chrome9_engine *engine)
 	u32 *ring = engine->ring_cpu;
 	unsigned int i;
 
-	for (i = 0; i < CHROME9_RING_SIZE / sizeof(*ring); i += 2) {
+	for (i = 0; i < engine->ring_size / sizeof(*ring); i += 2) {
 		ring[i] = 0xccccccc0;
 		ring[i + 1] = 0xddd00000;
 	}
@@ -4494,6 +4719,7 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	u32 status;
 	bool pid10_published;
 	bool prime_published;
+	bool wrap;
 	int ret;
 
 	lockdep_assert_held(&engine->submit_lock);
@@ -4503,20 +4729,36 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	    job->segment_stop - segment_pause < 0x20 ||
 	    check_add_overflow((size_t)job->segment_stop,
 			       (size_t)CHROME9_CR_READ_AHEAD, &copy_len) ||
-	    copy_len > source_capacity || copy_len > CHROME9_RING_SIZE)
+	    copy_len > source_capacity || copy_len > engine->ring_size)
 		return -E2BIG;
-
-	status = readl(cdev->mmio + CHROME9_REG_CR_STATUS);
-	if (!(status & BIT(31)) ||
-	    (readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS) &
-	     CHROME9_ENGINE_WORK_MASK))
-		return -EBUSY;
 
 	append = engine->append;
 	/* Equality is an exact fit: the copied read-ahead closure ends at A62. */
-	if (append > CHROME9_RING_SIZE - copy_len) {
-		if (copy_len > CHROME9_RING_SIZE - CHROME9_WRAP_APPEND)
-			return -E2BIG;
+	wrap = append > engine->ring_size - copy_len;
+	if (wrap && copy_len > engine->ring_size - CHROME9_WRAP_APPEND)
+		return -E2BIG;
+	/* The wrap's PID10 STOP and reinstall need every queued job retired. */
+	if (wrap) {
+		chrome9_engine_drain_locked(engine, CHROME9_DRAIN_WRAP);
+		if (engine->wedged)
+			return -EIO;
+	}
+	/*
+	 * An empty queue keeps the proven owned-PAUSE precondition.  Queued jobs
+	 * make this a live A64/A65 advance: the new bytes lie beyond the
+	 * published closure and its read-ahead, which stay immutable.
+	 */
+	if (list_empty(&engine->queue)) {
+		status = readl(cdev->mmio + CHROME9_REG_CR_STATUS);
+		if (!(status & BIT(31)) ||
+		    (readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS) &
+		     CHROME9_ENGINE_WORK_MASK))
+			return -EBUSY;
+	} else {
+		engine->live_appends++;
+	}
+
+	if (wrap) {
 		ret = chrome9_stop_active_ring(engine, &pid10_published);
 		if (ret) {
 			*must_quarantine = pid10_published;
@@ -4639,7 +4881,6 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 {
 	struct chrome9_device *cdev = engine->cdev;
-	u32 ptes[CHROME9_RING_PAGES];
 	u8 programmed_6c;
 	u8 request;
 	unsigned int i;
@@ -4666,16 +4907,15 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	/* Unused entries translate to the scratch page, never 80000000. */
 	for (i = 0; i < CHROME9_GART_ENTRIES; i++)
 		writel(engine->scratch_pte, engine->gart + i * sizeof(u32));
-	for (i = 0; i < CHROME9_RING_PAGES; i++) {
-		ptes[i] = lower_32_bits((engine->ring_dma + i * PAGE_SIZE) >>
-					    PAGE_SHIFT) & 0x3fffffff;
-		writel(ptes[i], engine->gart + i * sizeof(u32));
-	}
+	for (i = 0; i < engine->ring_pages; i++)
+		writel(lower_32_bits((engine->ring_dma + i * PAGE_SIZE) >>
+				     PAGE_SHIFT) & 0x3fffffff,
+		       engine->gart + i * sizeof(u32));
 	if (engine->query_sf_cpu)
 		writel(lower_32_bits(engine->query_sf_dma >> PAGE_SHIFT) &
 		       0x3fffffff,
 		       engine->gart + CHROME9_QUERY_SF_INDEX * sizeof(u32));
-	readl(engine->gart + (CHROME9_RING_PAGES - 1) * sizeof(u32));
+	readl(engine->gart + (engine->ring_pages - 1) * sizeof(u32));
 	/* Publish scratch defaults and ring PTEs before the GTI flush. */
 	wmb();
 	request = chrome9_gart_request_flush(cdev);
@@ -4906,13 +5146,17 @@ chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
 		return 0;
 	}
 
+	/* GART updates keep the proven idle-engine precondition. */
+	chrome9_engine_drain_locked(engine, CHROME9_DRAIN_GART);
+	if (engine->wedged)
+		return -EIO;
 	engine->draw_cache_misses++;
 	page_count = object->size >> PAGE_SHIFT;
-	if (page_count > CHROME9_DRAW_CACHE_MAX_PAGES)
+	if (page_count > CHROME9_DRAW_CACHE_MAX_PAGES(engine))
 		return -E2BIG;
 	/* The cache is bounded by its GART pages only. */
 	while (engine->draw_cache_pages >
-	       CHROME9_DRAW_CACHE_MAX_PAGES - page_count) {
+	       CHROME9_DRAW_CACHE_MAX_PAGES(engine) - page_count) {
 		ret = chrome9_draw_mapping_evict_lru_locked(engine);
 		if (ret)
 			return ret;
@@ -5610,7 +5854,7 @@ static void chrome9_capture_timeout_segment(struct chrome9_engine *engine,
 {
 	u32 start = job->ring_pause - job->segment_pause;
 	u32 end = min_t(u32, job->ring_stop + CHROME9_CR_READ_AHEAD,
-			CHROME9_RING_SIZE);
+			engine->ring_size);
 	size_t size;
 	u32 *copy;
 
@@ -5655,11 +5899,39 @@ ssize_t chrome9_engine_read_timeout_segment(struct chrome9_device *cdev,
 	return ret;
 }
 
+/* Account a proven FE33 completion and check the slot's canaries. */
+static void chrome9_fence_completed(struct chrome9_engine *engine,
+				    struct chrome9_job *job)
+{
+	struct chrome9_device *cdev = engine->cdev;
+	u32 *slot = chrome9_fence_slot(engine, job->fence_id);
+	dma_addr_t slot_dma = chrome9_fence_slot_dma(engine, job->fence_id);
+
+	if (job->fence_seen)
+		return;
+	job->fence_seen = true;
+	if (!engine->fence_count++)
+		dev_info(&cdev->pdev->dev,
+			 "FE33 first 3D completion id=%08x slot=%pad kind=%u\n",
+			 job->fence_id, &slot_dma, job->kind);
+	if (READ_ONCE(slot[1]) != CHROME9_FE33_CANARY + 1 ||
+	    READ_ONCE(slot[2]) != CHROME9_FE33_CANARY + 2 ||
+	    READ_ONCE(slot[3]) != CHROME9_FE33_CANARY + 3) {
+		engine->fence_canary_faults++;
+		dev_warn_ratelimited(&cdev->pdev->dev,
+			"FE33 id=%08x wrote beyond its ID dword: %08x %08x %08x\n",
+			job->fence_id, READ_ONCE(slot[1]), READ_ONCE(slot[2]),
+			READ_ONCE(slot[3]));
+	}
+}
+
 static int chrome9_wait_job(struct chrome9_engine *engine,
 			    struct chrome9_job *job)
 {
 	struct chrome9_device *cdev = engine->cdev;
 	const char *phase = "fe33";
+	u32 *slot = NULL;
+	dma_addr_t slot_dma = 0;
 	u32 cookie;
 	u32 cr_status;
 	u32 engine_status;
@@ -5669,26 +5941,14 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 	int ret;
 
 	if (job->fence_id) {
+		slot = chrome9_fence_slot(engine, job->fence_id);
+		slot_dma = chrome9_fence_slot_dma(engine, job->fence_id);
 		ret = read_poll_timeout(READ_ONCE, value, value == job->fence_id,
-					10, CHROME9_HW_TIMEOUT_US, false,
-					engine->fence_cpu[0]);
+					10, CHROME9_HW_TIMEOUT_US, false, slot[0]);
 		if (ret)
 			goto timeout;
 		dma_rmb();
-		if (!engine->fence_count++)
-			dev_info(&cdev->pdev->dev,
-				 "FE33 first 3D completion id=%08x slot=%pad kind=%u\n",
-				 job->fence_id, &engine->fence_dma, job->kind);
-		if (READ_ONCE(engine->fence_cpu[1]) != CHROME9_FE33_CANARY + 1 ||
-		    READ_ONCE(engine->fence_cpu[2]) != CHROME9_FE33_CANARY + 2 ||
-		    READ_ONCE(engine->fence_cpu[3]) != CHROME9_FE33_CANARY + 3) {
-			engine->fence_canary_faults++;
-			dev_warn_ratelimited(&cdev->pdev->dev,
-				"FE33 id=%08x wrote beyond its ID dword: %08x %08x %08x\n",
-				job->fence_id, READ_ONCE(engine->fence_cpu[1]),
-				READ_ONCE(engine->fence_cpu[2]),
-				READ_ONCE(engine->fence_cpu[3]));
-		}
+		chrome9_fence_completed(engine, job);
 	}
 	now = ktime_get();
 	chrome9_prof_wait_ns[0] += ktime_to_ns(ktime_sub(now, t));
@@ -5727,26 +5987,23 @@ timeout:
 	engine_status = readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS);
 	cr_current = readl(cdev->mmio + CHROME9_REG_FE_TRANSSET);
 	dev_err(&cdev->pdev->dev,
-		"job timeout phase=%s seq=%llu kind=%u flags=%#x epoch=%u cookie=%08x/%08x current=%08x pause=%#x stop=%#x cr=%08x engine=%08x\n",
+		"job timeout phase=%s seq=%llu kind=%u flags=%#x epoch=%u cookie=%08x/%08x current=%08x pause=%#x stop=%#x cr=%08x engine=%08x queued=%u\n",
 		phase, job->fence.base.seqno, job->kind, job->flags,
 		engine->ring_epoch, cookie, job->cookie, cr_current,
-		job->ring_pause, job->ring_stop, cr_status, engine_status);
-	if (job->fence_id)
+		job->ring_pause, job->ring_stop, cr_status, engine_status,
+		engine->queued);
+	if (slot)
 		dev_err(&cdev->pdev->dev,
 			"FE33 id=%08x slot=%pad [%08x %08x %08x %08x] 0494=%08x 040c=%08x\n",
-			job->fence_id, &engine->fence_dma,
-			READ_ONCE(engine->fence_cpu[0]),
-			READ_ONCE(engine->fence_cpu[1]),
-			READ_ONCE(engine->fence_cpu[2]),
-			READ_ONCE(engine->fence_cpu[3]),
+			job->fence_id, &slot_dma, READ_ONCE(slot[0]),
+			READ_ONCE(slot[1]), READ_ONCE(slot[2]), READ_ONCE(slot[3]),
 			readl(cdev->mmio + CHROME9_REG_CURRENT_FENCE),
 			readl(cdev->mmio + CHROME9_REG_ENGINE_ERROR));
 	chrome9_capture_timeout_segment(engine, job);
-	if (!(cr_current & 3) && cr_current < CHROME9_RING_SIZE) {
+	if (!(cr_current & 3) && cr_current < engine->ring_size) {
 		u32 first = cr_current >= CHROME9_CR_READ_AHEAD ?
 			    cr_current - CHROME9_CR_READ_AHEAD : 0;
-		u32 last = min_t(u32, cr_current + 0x20,
-				 CHROME9_RING_SIZE);
+		u32 last = min_t(u32, cr_current + 0x20, engine->ring_size);
 		u32 *ring = engine->ring_cpu;
 
 		dma_rmb();
@@ -5870,6 +6127,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 			ret);
 		return ret;
 	}
+	ret = chrome9_cookie_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev, "completion cookie self-test failed: %d\n",
+			ret);
+		return ret;
+	}
 	ret = chrome9_occlusion_selftest();
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
@@ -5903,8 +6166,18 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	mutex_init(&engine->submit_lock);
 	mutex_init(&engine->vm_lock);
 	INIT_LIST_HEAD(&engine->quarantine);
+	INIT_LIST_HEAD(&engine->queue);
+	init_waitqueue_head(&engine->retire_wq);
+	engine->job_us_avg = 1000;
 	INIT_LIST_HEAD(&engine->reaped);
 	INIT_WORK(&engine->retire_work, chrome9_retire_work);
+	engine->max_inflight = clamp(chrome9_max_inflight, 1U,
+				     CHROME9_MAX_INFLIGHT);
+	engine->cookie_span = engine->max_inflight + 1;
+	engine->fence_slots = engine->max_inflight;
+	engine->ring_pages = clamp(chrome9_ring_pages, CHROME9_RING_PAGES,
+				   CHROME9_RING_MAX_PAGES);
+	engine->ring_size = engine->ring_pages * PAGE_SIZE;
 	INIT_LIST_HEAD(&engine->scanout_mappings);
 	INIT_LIST_HEAD(&engine->draw_mappings);
 	engine->fence_context = dma_fence_context_alloc(1);
@@ -5928,7 +6201,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	}
 	memcpy_fromio(engine->gart_saved, engine->gart, CHROME9_GART_SIZE);
 	engine->ring_cpu = dma_alloc_coherent(&cdev->pdev->dev,
-					      CHROME9_RING_SIZE,
+					      engine->ring_size,
 					      &engine->ring_dma, GFP_KERNEL);
 	if (!engine->ring_cpu) {
 		ret = -ENOMEM;
@@ -5936,7 +6209,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	}
 	if (!IS_ALIGNED(engine->ring_dma, PAGE_SIZE) ||
 	    upper_32_bits(engine->ring_dma) ||
-	    engine->ring_dma > U32_MAX - CHROME9_RING_SIZE) {
+	    engine->ring_dma > U32_MAX - engine->ring_size) {
 		ret = -ERANGE;
 		goto err_free_ring;
 	}
@@ -6016,13 +6289,13 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	chrome9_fill_ring_dummy(engine);
 	memcpy(engine->ring_cpu, engine->staging_cpu,
 	       stop + CHROME9_CR_READ_AHEAD);
-	chrome9_cache_flush(engine->ring_cpu, CHROME9_RING_SIZE);
+	chrome9_cache_flush(engine->ring_cpu, engine->ring_size);
 	dma_wmb();
 	pci_read_config_word(cdev->pdev, PCI_COMMAND, &command);
 	engine->was_master = command & PCI_COMMAND_MASTER;
 	pci_set_master(cdev->pdev);
 	engine->ring_published = true;
-	chrome9_install_stopped_ring(cdev, 1, CHROME9_RING_SIZE, pause);
+	chrome9_install_stopped_ring(cdev, 1, engine->ring_size, pause);
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, status,
 				 status & BIT(31), 10, CHROME9_HW_TIMEOUT_US);
 	if (!ret)
@@ -6037,8 +6310,8 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 			 "persistent CR prime timed out; retained for reboot\n");
 		return 0;
 	}
-	drm_mm_init(&engine->sf_mm, CHROME9_RING_SIZE,
-		    SZ_64M - CHROME9_RING_SIZE - PAGE_SIZE);
+	drm_mm_init(&engine->sf_mm, engine->ring_size,
+		    SZ_64M - engine->ring_size - PAGE_SIZE);
 	engine->mm_initialized = true;
 	engine->append = chrome9_ring_append_after(stop);
 	engine->active_pause = pause;
@@ -6049,9 +6322,10 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	engine->module_hold = true;
 	engine->ready = true;
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine ready: GART=%#llx ring=%pad fe33=%s\n",
+		 "persistent SF engine ready: GART=%#llx ring=%pad/%u KiB fe33=%s max_inflight=%u\n",
 		 (unsigned long long)engine->gart_offset, &engine->ring_dma,
-		 engine->fence_cpu ? "on" : "off");
+		 engine->ring_size / SZ_1K, engine->fence_cpu ? "on" : "off",
+		 engine->max_inflight);
 	return 0;
 
 err_restore_gart:
@@ -6077,7 +6351,7 @@ err_free_ring:
 	if (engine->fence_cpu)
 		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->fence_cpu,
 				  engine->fence_dma);
-	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
+	dma_free_coherent(&cdev->pdev->dev, engine->ring_size,
 			  engine->ring_cpu, engine->ring_dma);
 err_free_saved:
 	kvfree(engine->gart_saved);
@@ -6105,12 +6379,15 @@ static int chrome9_gart_kick(struct chrome9_engine *engine)
 	lockdep_assert_held(&engine->submit_lock);
 	if (!p || engine->stopping || engine->wedged)
 		return -EIO;
+	/* Queued jobs already generate GTI traffic. */
+	if (!list_empty(&engine->queue))
+		return -EBUSY;
 	job = kzalloc_obj(*job);
 	if (!job)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&job->quarantine_link);
-	job->cookie = engine->last_cookie == 0x00010001 ?
-		      0x00020002 : 0x00010001;
+	INIT_LIST_HEAD(&job->queue_link);
+	job->cookie = chrome9_next_cookie_locked(engine);
 	cookie[0] = CHROME9_2D_REG_DST_POS;
 	cookie[1] = job->cookie;
 	memset(p, 0xcc, PAGE_SIZE);
@@ -6198,16 +6475,13 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 		goto out_put_object;
 	}
 	INIT_LIST_HEAD(&job->quarantine_link);
+	INIT_LIST_HEAD(&job->queue_link);
 	job->destination = to_drm_gem_shmem_obj(obj);
 	job->sgt = drm_gem_shmem_get_pages_sgt(job->destination);
 	if (IS_ERR(job->sgt)) {
 		ret = PTR_ERR(job->sgt);
 		goto out_free_job;
 	}
-	spin_lock_init(&job->fence.lock);
-	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
-			 &job->fence.lock, engine->fence_context,
-			 atomic64_inc_return(&engine->fence_seqno));
 	resv = obj->resv;
 	ret = dma_resv_lock_interruptible(resv, NULL);
 	if (ret)
@@ -6232,14 +6506,14 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
 		goto out_vunmap;
+	chrome9_job_fence_init_locked(engine, job);
 	if (engine->stopping || engine->wedged || !engine->ready) {
 		ret = -EIO;
 		goto out_unlock_submit;
 	}
 	job->kind = request->kind;
 	job->flags = request->flags;
-	job->cookie = engine->last_cookie == 0x00010001 ?
-		      0x00020002 : 0x00010001;
+	job->cookie = chrome9_next_cookie_locked(engine);
 	job->fence_id = 0;
 	ret = chrome9_job_acquire_mapping_locked(engine, job, obj, job->sgt,
 						 &target);
@@ -6339,7 +6613,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	dma_fence_signal(&job->fence.base);
 	job->destination = NULL;
 	drm_gem_object_put(obj);
-	dma_fence_put(&job->fence.base);
+	chrome9_job_put(job);
 	goto out_dev_exit;
 
 out_prepublication:
@@ -6367,7 +6641,7 @@ out_unlock_resv:
 out_put_fence:
 	job->destination = NULL;
 	drm_gem_object_put(obj);
-	dma_fence_put(&job->fence.base);
+	chrome9_job_put(job);
 	goto out_dev_exit;
 
 out_free_job:
@@ -6506,6 +6780,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		goto out_put_objects;
 	}
 	INIT_LIST_HEAD(&job->quarantine_link);
+	INIT_LIST_HEAD(&job->queue_link);
 	job->destination = to_drm_gem_shmem_obj(obj);
 	job->depth = to_drm_gem_shmem_obj(depth_obj);
 	if (three_objects)
@@ -6536,10 +6811,6 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 			goto out_free_job;
 		}
 	}
-	spin_lock_init(&job->fence.lock);
-	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
-			 &job->fence.lock, engine->fence_context,
-			 atomic64_inc_return(&engine->fence_seqno));
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT,
 		      four_objects ? 4 : three_objects ? 3 : 2);
 	exec_initialized = true;
@@ -6636,6 +6907,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
 		goto out_unmap;
+	chrome9_job_fence_init_locked(engine, job);
 	if (engine->stopping || engine->wedged || !engine->ready) {
 		ret = -EIO;
 		goto out_unlock_submit;
@@ -6755,8 +7027,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		 * previous cookie could make the retirement poll pass before the
 		 * newly published packet executes.
 		 */
-		job->cookie = engine->last_cookie == 0x00010001 ?
-			      0x00020002 : 0x00010001;
+		job->cookie = chrome9_next_cookie_locked(engine);
 		job->fence_id = 0;
 		job->retirement_proven = false;
 		if (segment->kind == CHROME9_DRAW_COPY_RECT)
@@ -6960,7 +7231,7 @@ out_exec:
 		drm_gem_object_put(texture2_obj);
 	drm_gem_object_put(depth_obj);
 	drm_gem_object_put(obj);
-	dma_fence_put(&job->fence.base);
+	chrome9_job_put(job);
 	goto out_dev_exit;
 
 out_free_job:
@@ -7313,25 +7584,152 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 	return ret;
 }
 
-/* Wait for and finish the in-flight job, if any (submit_lock held). */
-static void chrome9_engine_retire_locked(struct chrome9_engine *engine)
+/*
+ * Non-blocking retirement proof of a queued job: its exact FE33 ID, then its
+ * own or a later queued cookie in DST_POS (the ring executes in order and
+ * each tail orders the cookie after 006c 3D idle).  The tail job also needs
+ * the owned PAUSE and non-CR idle, exactly as chrome9_wait_job().
+ */
+static bool chrome9_job_done_locked(struct chrome9_engine *engine,
+				    struct chrome9_job *job)
 {
-	struct chrome9_job *job = engine->inflight;
+	struct chrome9_device *cdev = engine->cdev;
+	struct chrome9_job *later = job;
+	u32 value;
 
-	if (!job)
-		return;
-	engine->inflight = NULL;
-	if (chrome9_wait_job(engine, job)) {
-		/* The quarantined job keeps its objects until teardown. */
-		dma_fence_set_error(&job->fence.base, -ETIME);
-		chrome9_quarantine_job_locked(engine, job);
-		return;
-	}
+	lockdep_assert_held(&engine->submit_lock);
+	if (job->fence_id &&
+	    READ_ONCE(chrome9_fence_slot(engine, job->fence_id)[0]) !=
+	    job->fence_id)
+		return false;
+	dma_rmb();
+	value = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
+	list_for_each_entry_from(later, &engine->queue, queue_link)
+		if (later->cookie == value)
+			break;
+	if (list_entry_is_head(later, &engine->queue, queue_link))
+		return false;
+	if (!list_is_last(&job->queue_link, &engine->queue))
+		return true;
+	return (readl(cdev->mmio + CHROME9_REG_CR_STATUS) & BIT(31)) &&
+	       !(readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS) &
+		 CHROME9_ENGINE_WORK_MASK);
+}
+
+/* Post-job work of a proven queued job, then its fence in ring order. */
+static void chrome9_job_retire_locked(struct chrome9_engine *engine,
+				      struct chrome9_job *job)
+{
+	ktime_t now = ktime_get();
+	s64 us = ktime_us_delta(now, engine->head_since);
+
+	list_del_init(&job->queue_link);
+	WRITE_ONCE(engine->queued, engine->queued - 1);
+	engine->job_us_avg = (7 * engine->job_us_avg +
+			      clamp_t(s64, us, 1, CHROME9_HW_TIMEOUT_US)) / 8;
+	engine->head_since = now;
+	if (job->fence_id)
+		chrome9_fence_completed(engine, job);
 	job->retirement_proven = true;
 	engine->last_cookie = job->cookie;
 	chrome9_fragment_job_finish_locked(engine, job);
 	dma_fence_signal(&job->fence.base);
 	list_add_tail(&job->reap_link, &engine->reaped);
+	wake_up_all(&engine->retire_wq);
+}
+
+/* Unproven jobs keep their objects and mappings until teardown. */
+static void chrome9_queue_quarantine_locked(struct chrome9_engine *engine,
+					    struct chrome9_job *job)
+{
+	struct chrome9_job *next;
+
+	list_for_each_entry_safe_from(job, next, &engine->queue, queue_link) {
+		list_del_init(&job->queue_link);
+		WRITE_ONCE(engine->queued, engine->queued - 1);
+		dma_fence_set_error(&job->fence.base, -ETIME);
+		chrome9_quarantine_job_locked(engine, job);
+	}
+	wake_up_all(&engine->retire_wq);
+}
+
+/*
+ * Wait for the tail with the full bounded oracle, then retire every queued
+ * job in ring order.  After a timeout the proven prefix still retires; the
+ * first unproven job and everything behind it are quarantined.
+ */
+static void chrome9_engine_retire_all_locked(struct chrome9_engine *engine)
+{
+	struct chrome9_job *tail, *job, *next;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (list_empty(&engine->queue))
+		return;
+	tail = list_last_entry(&engine->queue, struct chrome9_job, queue_link);
+	ret = chrome9_wait_job(engine, tail);
+	list_for_each_entry_safe(job, next, &engine->queue, queue_link) {
+		if (job == tail ? ret : !chrome9_job_done_locked(engine, job)) {
+			if (job != tail)
+				dev_err(&engine->cdev->pdev->dev,
+					"queued job unproven seq=%llu fe33=%08x cookie=%08x/%08x tail=%d\n",
+					job->fence.base.seqno, job->fence_id,
+					readl(engine->cdev->mmio +
+					      CHROME9_2D_REG_DST_POS),
+					job->cookie, ret);
+			chrome9_queue_quarantine_locked(engine, job);
+			return;
+		}
+		chrome9_job_retire_locked(engine, job);
+	}
+}
+
+static void chrome9_engine_drain_locked(struct chrome9_engine *engine,
+					enum chrome9_drain cause)
+{
+	if (list_empty(&engine->queue))
+		return;
+	engine->queue_drains[cause]++;
+	chrome9_engine_retire_all_locked(engine);
+}
+
+/* Blocking retirement of the oldest job; always removes it from the queue. */
+static void chrome9_engine_retire_head_locked(struct chrome9_engine *engine)
+{
+	struct chrome9_job *head;
+	bool done;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (list_empty(&engine->queue))
+		return;
+	head = list_first_entry(&engine->queue, struct chrome9_job, queue_link);
+	if (list_is_last(&head->queue_link, &engine->queue) ||
+	    read_poll_timeout(chrome9_job_done_locked, done, done, 10,
+			      CHROME9_HW_TIMEOUT_US, false, engine, head)) {
+		chrome9_engine_retire_all_locked(engine);
+		return;
+	}
+	chrome9_job_retire_locked(engine, head);
+}
+
+/* Retire every proven job from the head; true while jobs remain queued. */
+static bool chrome9_engine_retire_completed_locked(
+		struct chrome9_engine *engine)
+{
+	struct chrome9_job *job, *next;
+
+	lockdep_assert_held(&engine->submit_lock);
+	list_for_each_entry_safe(job, next, &engine->queue, queue_link) {
+		if (!chrome9_job_done_locked(engine, job))
+			break;
+		chrome9_job_retire_locked(engine, job);
+	}
+	/* A head beyond its hardware budget takes the bounded, logged wait. */
+	if (!list_empty(&engine->queue) &&
+	    ktime_us_delta(ktime_get(), engine->head_since) >
+	    CHROME9_HW_TIMEOUT_US)
+		chrome9_engine_retire_head_locked(engine);
+	return !list_empty(&engine->queue);
 }
 
 static void chrome9_engine_reap(struct list_head *list)
@@ -7353,13 +7751,81 @@ static void chrome9_engine_reap(struct list_head *list)
 	}
 }
 
+/*
+ * Sleep through most of the head job's expected time, then back off
+ * geometrically: a late completion is noticed within 1/8 of its runtime.
+ */
+static unsigned long chrome9_retire_delay_us(struct chrome9_engine *engine)
+{
+	s64 elapsed = ktime_us_delta(ktime_get(), engine->head_since);
+	s64 left = (s64)engine->job_us_avg - elapsed;
+
+	if (left > CHROME9_RETIRE_MIN_US)
+		return min_t(s64, left - left / 8, CHROME9_HW_TIMEOUT_US);
+	return clamp_t(s64, elapsed / 8, CHROME9_RETIRE_MIN_US,
+		       CHROME9_RETIRE_MAX_US);
+}
+
 static void chrome9_retire_work(struct work_struct *work)
 {
 	struct chrome9_engine *engine =
 		container_of(work, struct chrome9_engine, retire_work);
+	unsigned long delay;
+	bool pending;
 
-	chrome9_submit_lock(engine);
-	chrome9_submit_unlock(engine);
+	if (engine->max_inflight == 1) {
+		chrome9_submit_lock(engine);
+		chrome9_submit_unlock(engine);
+		return;
+	}
+	/* Poll without holding submit_lock, so submitters append meanwhile. */
+	for (;;) {
+		mutex_lock(&engine->submit_lock);
+		pending = chrome9_engine_retire_completed_locked(engine);
+		delay = pending ? chrome9_retire_delay_us(engine) : 0;
+		chrome9_submit_unlock(engine);
+		if (!pending)
+			break;
+		usleep_range(delay, delay + delay / 4);
+	}
+}
+
+/* Streaming syncs of bounced pages copy data: not while the GPU owns them. */
+static bool chrome9_sgt_needs_sync(struct device *dev, struct sg_table *sgt)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+
+	for_each_sgtable_dma_sg(sgt, sg, i)
+		if (dma_need_sync(dev, sg_dma_address(sg)))
+			return true;
+	return false;
+}
+
+/*
+ * Dependency wait of a queueing submitter.  With max_inflight > 1 the
+ * engine's own fences are skipped: the ring executes jobs in order, every
+ * segment starts with a 006c 3D wait and every draw clears the texture
+ * cache (FE A00 bit 0) before sampling.
+ */
+static long chrome9_resv_wait_deps(struct chrome9_engine *engine,
+				   struct dma_resv *resv,
+				   enum dma_resv_usage usage)
+{
+	struct dma_resv_iter cursor;
+	struct dma_fence *fence;
+	long timeout = CHROME9_DEP_TIMEOUT;
+
+	if (engine->max_inflight == 1)
+		return dma_resv_wait_timeout(resv, usage, true, timeout);
+	dma_resv_for_each_fence(&cursor, resv, usage, fence) {
+		if (fence->context == engine->fence_context)
+			continue;
+		timeout = dma_fence_wait_timeout(fence, true, timeout);
+		if (timeout <= 0)
+			return timeout;
+	}
+	return timeout;
 }
 
 /*
@@ -7499,7 +7965,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		}
 		sub->object_low[i] = U64_MAX;
 	}
-	if (mapped_size > SZ_64M - CHROME9_RING_SIZE) {
+	if (mapped_size > SZ_64M - engine->ring_size) {
 		ret = -E2BIG;
 		goto out_put_objects;
 	}
@@ -7521,6 +7987,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		goto out_put_objects;
 	}
 	INIT_LIST_HEAD(&job->quarantine_link);
+	INIT_LIST_HEAD(&job->queue_link);
 	for (i = 0; i < object_count; i++) {
 		job->fragment_objects[i] = to_drm_gem_shmem_obj(objects[i]);
 		job->fragment_sgts[i] =
@@ -7531,10 +7998,6 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		}
 	}
 	job->destination = job->fragment_objects[0];
-	spin_lock_init(&job->fence.lock);
-	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
-			 &job->fence.lock, engine->fence_context,
-			 atomic64_inc_return(&engine->fence_seqno));
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT |
 		      DRM_EXEC_IGNORE_DUPLICATES, object_count);
 	exec_initialized = true;
@@ -7549,8 +8012,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	for (i = 0; i < object_count; i++) {
 		bool write = i == 0 || i == depth_index;
 
-		wait = dma_resv_wait_timeout(objects[i]->resv,
-			dma_resv_usage_rw(write), true, CHROME9_DEP_TIMEOUT);
+		wait = chrome9_resv_wait_deps(engine, objects[i]->resv,
+					      dma_resv_usage_rw(write));
 		if (wait <= 0) {
 			ret = wait < 0 ? wait : -ETIMEDOUT;
 			goto out_exec;
@@ -7585,15 +8048,21 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			CHROME9_QUERY_RE_PRODUCTION;
 	job->query_re |= (READ_ONCE(chrome9_occlusion_ppc_type) & 0x1f) << 8;
 
-	ret = chrome9_submit_lock_interruptible(engine);
+	ret = chrome9_submit_lock_queue_interruptible(engine);
 	if (ret)
 		goto out_unmap;
+	chrome9_job_fence_init_locked(engine, job);
 	if (engine->stopping || engine->wedged || !engine->ready) {
 		ret = -EIO;
 		goto out_unlock_submit;
 	}
 	job->kind = request->kind;
 	job->flags = request->flags;
+	/* Queued jobs hold their snapshot slots until they retire. */
+	if (job->queries && engine->query_slots &&
+	    bitmap_weight(engine->query_slots, engine->query_slot_count) >
+	    engine->query_slot_count - count)
+		chrome9_engine_drain_locked(engine, CHROME9_DRAIN_QUERY);
 	ret = chrome9_job_query_prepare_locked(engine, job, requests, count);
 	if (ret)
 		goto out_prepublication;
@@ -7602,6 +8071,29 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				job->fragment_sgts[i], &sub->bases[i]);
 		if (ret)
 			goto out_prepublication;
+	}
+	/*
+	 * Guard rewrites, cache flushes and bounce syncs below must not race a
+	 * queued job that writes the same object; such a job is retired first.
+	 */
+	for (i = 0; i < object_count && !list_empty(&engine->queue); i++) {
+		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
+
+		if (sub->kind[i] != CHROME9_OBJECT_VERTEX &&
+		    bo->explicit_access && !bo->cpu_dirty &&
+		    bo->guard_object_size == object_sizes[i] &&
+		    bo->guard_mapping_size == mapping_sizes[i] &&
+		    !chrome9_sgt_needs_sync(&cdev->pdev->dev,
+					    job->fragment_sgts[i]))
+			continue;
+		if (!dma_resv_test_signaled(objects[i]->resv,
+					    DMA_RESV_USAGE_WRITE))
+			chrome9_engine_drain_locked(engine,
+						    CHROME9_DRAIN_PREPARE);
+	}
+	if (engine->wedged) {
+		ret = -EIO;
+		goto out_prepublication;
 	}
 	chrome9_prof_mark(CHROME9_PROF_GART);
 	for (i = 0; i < object_count; i++) {
@@ -7733,8 +8225,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			if (ret)
 				goto out_prepublication;
 		}
-		job->cookie = engine->last_cookie == 0x00010001 ?
-			      0x00020002 : 0x00010001;
+		job->cookie = chrome9_next_cookie_locked(engine);
 		job->fence_id = 0;
 		job->retirement_proven = false;
 		ret = chrome9_fragment_segment_end(engine, job, p, &pause);
@@ -7749,6 +8240,14 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		}
 		chrome9_prof_mark(CHROME9_PROF_BUILD);
 		chrome9_job_query_attach(job, first, next);
+		/* Segments retired inline need the queue empty behind them. */
+		if (!(async && next == count)) {
+			chrome9_engine_drain_locked(engine, CHROME9_DRAIN_SYNC);
+			if (engine->wedged) {
+				ret = -EIO;
+				goto out_prepublication;
+			}
+		}
 		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
 			CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
 		chrome9_prof_mark(CHROME9_PROF_APPEND);
@@ -7779,16 +8278,23 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	job->fsub_count = object_count;
 	job->fsub_depth = depth_index;
 	if (async) {
-		/* The retire worker or the next submit_lock holder finishes the
-		 * job; its persistent kernel mappings stay valid meanwhile. */
-		engine->inflight = job;
-		chrome9_submit_unlock(engine);
+		/*
+		 * The retire worker or a later submit_lock holder finishes the
+		 * job; its persistent kernel mappings stay valid meanwhile.  The
+		 * job may retire and be freed as soon as submit_lock drops, so
+		 * the temporary mappings go first.
+		 */
 		for (i = object_count; i-- > 0; )
 			if (job->fragment_mapped[i]) {
 				drm_gem_shmem_vunmap_locked(job->fragment_objects[i],
 							    &job->fragment_maps[i]);
 				job->fragment_mapped[i] = false;
 			}
+		list_add_tail(&job->queue_link, &engine->queue);
+		if (!engine->queued)
+			engine->head_since = ktime_get();
+		WRITE_ONCE(engine->queued, engine->queued + 1);
+		chrome9_submit_unlock(engine);
 		drm_exec_fini(&exec);
 		queue_work(system_highpri_wq, &engine->retire_work);
 		drm_dev_exit(dev_idx);
@@ -7800,6 +8306,11 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	goto out_unlock_submit;
 
 out_prepublication:
+	/*
+	 * Same-context fences replace each other in a reservation: an error
+	 * fence must not signal ahead of the queued jobs it may replace.
+	 */
+	chrome9_engine_drain_locked(engine, CHROME9_DRAIN_ERROR);
 	dma_fence_set_error(&job->fence.base, ret ?: -EIO);
 	chrome9_job_query_drop_locked(engine, job);
 	chrome9_job_release_mappings_locked(engine, job);
@@ -7843,7 +8354,7 @@ out_exec:
 		drm_gem_object_put(objects[i]);
 	}
 	chrome9_job_query_free(job);
-	dma_fence_put(&job->fence.base);
+	chrome9_job_put(job);
 	goto out_dev_exit;
 
 out_free_job:
@@ -11541,7 +12052,10 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		return;
 	}
 	mutex_lock(&engine->vm_lock);
-	ret = chrome9_gart_set(engine, 0, invalid, ARRAY_SIZE(invalid));
+	for (i = 0; i < engine->ring_pages && !ret; i += ARRAY_SIZE(invalid))
+		ret = chrome9_gart_set(engine, i, invalid,
+				       min_t(u32, ARRAY_SIZE(invalid),
+					     engine->ring_pages - i));
 	mutex_unlock(&engine->vm_lock);
 	if (ret) {
 		engine->wedged = true;
@@ -11585,7 +12099,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (engine->fence_cpu)
 		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->fence_cpu,
 				  engine->fence_dma);
-	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
+	dma_free_coherent(&cdev->pdev->dev, engine->ring_size,
 			  engine->ring_cpu, engine->ring_dma);
 	kvfree(engine->gart_saved);
 	kvfree(engine->timeout_segment);
