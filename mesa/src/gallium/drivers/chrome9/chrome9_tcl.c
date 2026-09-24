@@ -140,6 +140,20 @@ tcl_lower_halfz(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* GL rounds the size of aliased points to the nearest integer; the
+ * hardware rounding of fractional sizes is unmeasured. */
+static bool
+tcl_round_point_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_PSIZ)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0],
+                   nir_ffloor(b, nir_fadd_imm(b, intr->src[0].ssa, 0.5)));
+   return true;
+}
+
 static bool
 tcl_single_block(nir_shader *nir, nir_block **block)
 {
@@ -1786,6 +1800,9 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_lower_halfz,
                nir_metadata_control_flow, NULL);
    }
+   if (point_size)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_round_point_size,
+               nir_metadata_control_flow, NULL);
    /* Fold the current control uniforms so their branches disappear. */
    if (key_count)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_inline_key,
@@ -2176,9 +2193,10 @@ tcl_raster_lines(const struct pipe_rasterizer_state *rs)
 
 /*
  * Aliased points of a state size (rounded unless sprites are on, where
- * only whole sizes are accepted) or of the VS size, and sprite coordinates
- * for the logical varyings sprite_coord_enable names (TEXn is generic n,
- * VARn generic 9 + n) with the upper-left origin of the hardware.
+ * only whole sizes are accepted) or of the rounded VS size, and sprite
+ * coordinates for the logical varyings sprite_coord_enable names (TEXn is
+ * generic n, VARn generic 9 + n) with the upper-left origin of the
+ * hardware.
  */
 static const char *
 tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
@@ -2192,7 +2210,9 @@ tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
    if (rs->point_smooth || rs->point_line_tri_clip || !rs->half_pixel_center)
       return "smooth or clipped points";
    if (rs->point_size_per_vertex) {
+      /* The VS size is rounded, which sprites must not be. */
       if (polygon || !ctx->tcl_point_size ||
+          rs->point_quad_rasterization ||
           !(ctx->vs->tcl->nir->info.outputs_written & VARYING_BIT_PSIZ))
          return "per-vertex point size";
       r->flags |= DRM_CHROME9_RASTER_POINT_SIZE_VERTEX;

@@ -7394,8 +7394,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       chrome9_screen_has_capability2(screen,
                                      DRM_CHROME9_CAP2_VERTEX_TOPOLOGY) &&
       debug_get_bool_option("CHROME9_TCL_TOPOLOGY", true);
-   /* Lines passed rungs L1-L3 and the GL smoke; points (size rounding,
-    * edge clipping, sprites) and polygon mode on strips/fans do not yet. */
+   /* Lines passed rungs L1-L3 and the GL smoke; point sizes and edge
+    * clipping match GL, sprites and wireframe wait for rungs sprite, wire. */
    ctx->tcl_points = ctx->tcl_enabled &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_NATIVE_POINTS) &&
       debug_get_bool_option("CHROME9_TCL_POINTS", false);
