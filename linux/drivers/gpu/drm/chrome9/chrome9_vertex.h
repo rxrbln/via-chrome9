@@ -24,9 +24,14 @@ struct chrome9_vertex_program {
 	u32 a60;
 	u32 a61;
 	u32 a62;
-	u32 records[DRM_CHROME9_VERTEX_MAX_RECORDS][4];
+	u32 records[][4];
 };
 
+/* Bytes of a program holding n records; compile output needs the maximum. */
+#define CHROME9_VERTEX_PROGRAM_BYTES(n) \
+	(sizeof(struct chrome9_vertex_program) + (n) * 4 * sizeof(u32))
+
+/* program holds CHROME9_VERTEX_PROGRAM_BYTES(DRM_CHROME9_VERTEX_MAX_RECORDS). */
 int chrome9_vertex_compile(
 	const struct drm_chrome9_vertex_instruction *instructions,
 	u32 instruction_count, const struct chrome9_fragment_program *fragment,

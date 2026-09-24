@@ -14,6 +14,7 @@
 #include <drm/drm_file.h>
 #include <drm/chrome9_drm.h>
 
+#include "chrome9_progcache.h"
 #include "chrome9_query.h"
 
 /* Query objects one DRM file may own. */
@@ -39,7 +40,15 @@ struct chrome9_query {
 
 struct chrome9_file {
 	struct xarray queries;
+	struct chrome9_progcache *programs;
 };
+
+struct chrome9_progcache *chrome9_file_programs(struct drm_file *file)
+{
+	struct chrome9_file *cfile = file->driver_priv;
+
+	return cfile ? cfile->programs : NULL;
+}
 
 unsigned int chrome9_occlusion_query_mode(void)
 {
@@ -137,6 +146,11 @@ int chrome9_query_open(struct drm_device *drm, struct drm_file *file)
 
 	if (!cfile)
 		return -ENOMEM;
+	cfile->programs = chrome9_progcache_create();
+	if (!cfile->programs) {
+		kfree(cfile);
+		return -ENOMEM;
+	}
 	xa_init_flags(&cfile->queries, XA_FLAGS_ALLOC1);
 	file->driver_priv = cfile;
 	return 0;
@@ -154,6 +168,7 @@ void chrome9_query_postclose(struct drm_device *drm, struct drm_file *file)
 	xa_for_each(&cfile->queries, id, query)
 		chrome9_query_put(query);
 	xa_destroy(&cfile->queries);
+	chrome9_progcache_destroy(cfile->programs);
 	kfree(cfile);
 	file->driver_priv = NULL;
 }

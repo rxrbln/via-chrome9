@@ -5,6 +5,7 @@
 
 #include <linux/types.h>
 
+struct chrome9_progcache;
 struct chrome9_query;
 struct dma_fence;
 struct drm_device;
@@ -13,6 +14,7 @@ struct drm_file;
 unsigned int chrome9_occlusion_query_mode(void);
 int chrome9_query_open(struct drm_device *drm, struct drm_file *file);
 void chrome9_query_postclose(struct drm_device *drm, struct drm_file *file);
+struct chrome9_progcache *chrome9_file_programs(struct drm_file *file);
 int chrome9_query_ioctl(struct drm_device *drm, void *data,
 			struct drm_file *file);
 struct chrome9_query *chrome9_query_get_active(struct drm_file *file, u32 id,

@@ -21,9 +21,11 @@ struct chrome9_fragment_program {
 	u32 controls[12];
 	u32 alu[DRM_CHROME9_FRAGMENT_MAX_ALU][4];
 	u32 tau[DRM_CHROME9_FRAGMENT_MAX_TAU];
-	u32 constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
 };
 
+bool chrome9_fragment_constants_valid(const u32 *constants, u32 constant_count);
+
+/* Constants are validated, not copied: the draw emits the caller's copy. */
 int chrome9_fragment_compile(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,

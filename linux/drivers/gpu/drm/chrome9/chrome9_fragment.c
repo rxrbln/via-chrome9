@@ -1352,6 +1352,16 @@ rewrite:
 	return 0;
 }
 
+bool chrome9_fragment_constants_valid(const u32 *constants, u32 constant_count)
+{
+	u32 i;
+
+	for (i = 0; i < constant_count * 4; i++)
+		if (!chrome9_fragment_float_finite(constants[i]))
+			return false;
+	return true;
+}
+
 int chrome9_fragment_compile_targets(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,
@@ -1379,9 +1389,8 @@ int chrome9_fragment_compile_targets(
 	if (ret)
 		goto out;
 	ret = -EINVAL;
-	for (i = 0; i < constant_count * 4; i++)
-		if (!chrome9_fragment_float_finite(constants[i]))
-			goto out;
+	if (!chrome9_fragment_constants_valid(constants, constant_count))
+		goto out;
 	ret = chrome9_fragment_allocate(&state, instruction_count);
 	if (ret)
 		goto out;
@@ -1397,9 +1406,6 @@ int chrome9_fragment_compile_targets(
 		program->varying_alu_width[packed] = state.alu_varying_width[i];
 		program->varying_count++;
 	}
-	if (constant_count)
-		memcpy(program->constants, constants,
-		       constant_count * 4 * sizeof(*constants));
 	ret = chrome9_fragment_encode(&state, program, instruction_count);
 out:
 	kfree(split);

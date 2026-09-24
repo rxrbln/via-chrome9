@@ -30,6 +30,7 @@
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
 #include "chrome9_fragment.h"
+#include "chrome9_progcache.h"
 #include "chrome9_query.h"
 #include "chrome9_vertex.h"
 
@@ -299,6 +300,8 @@ static u64 chrome9_prof_draws;
 static u64 chrome9_prof_segments;
 /* State cache: draws, dwords emitted and dwords omitted. */
 static u64 chrome9_prof_state[3];
+/* Program cache: fragment hits, misses, vertex hits, misses. */
+static u64 chrome9_prof_programs[4];
 static ktime_t chrome9_prof_last;
 
 static void chrome9_prof_start(void)
@@ -367,6 +370,10 @@ static void chrome9_prof_job(struct drm_device *drm)
 		 div64_u64(chrome9_prof_state[1], n),
 		 div64_u64(chrome9_prof_state[2], n));
 	memset(chrome9_prof_state, 0, sizeof(chrome9_prof_state));
+	dev_info(drm->dev, "profile programs: fragment hit %llu miss %llu, vertex hit %llu miss %llu\n",
+		 chrome9_prof_programs[0], chrome9_prof_programs[1],
+		 chrome9_prof_programs[2], chrome9_prof_programs[3]);
+	memset(chrome9_prof_programs, 0, sizeof(chrome9_prof_programs));
 	chrome9_prof_engine(drm);
 	chrome9_prof_draws = 0;
 	chrome9_prof_segments = 0;
@@ -500,7 +507,9 @@ enum chrome9_draw_kind {
  * (stage A) or GEM vertex buffers fetched through rebased indices (stage B).
  */
 struct chrome9_tcl_draw {
-	struct chrome9_vertex_program program;
+	const struct chrome9_vertex_program *program;
+	/* Program A61 with this draw's bool constants. */
+	u32 a61;
 	const struct drm_chrome9_vertex_instruction *instructions;
 	u32 instruction_count;
 	const u32 *constants;
@@ -602,6 +611,7 @@ struct chrome9_draw_request {
 	const struct drm_chrome9_fragment_vertex *fragment_vertices;
 	const struct drm_chrome9_fragment_texture_state *fragment_textures;
 	const struct chrome9_fragment_program *fragment_program;
+	const u32 *fragment_constants;
 	const struct chrome9_tcl_draw *tcl;
 	u64 fragment_texture_size[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_texture_count;
@@ -2973,9 +2983,9 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	/* Superset of the input and output masks; the vendor quad uses 1f. */
 	raster[i++] = 0x12000000 |
 		      GENMASK(max(outputs, tcl->element_count) - 1, 0);
-	raster[i++] = tcl->program.a61 &
+	raster[i++] = tcl->a61 &
 		      ~(tcl->re & CHROME9_TCL_RE_NO_A61_BFC ? BIT(19) : 0);
-	raster[i++] = tcl->program.a62;
+	raster[i++] = tcl->program->a62;
 	/* A20[0] index mode, A20[1] 32-bit indices. */
 	raster[i++] = (addresses ? 0x20000001 | (tcl->index32 ? 2 : 0) :
 		       0x20000000) | tcl->topology;
@@ -3179,6 +3189,7 @@ static int chrome9_tcl_raster_selftest(void)
 	static const u32 stage_b_address[] = {
 		0x00100000, 0x00200000, 0x00300010,
 	};
+	static const struct chrome9_vertex_program vp = { .a62 = 0x62208002 };
 	struct chrome9_fragment_program *fp;
 	struct chrome9_tcl_draw *tcl;
 	u32 raster[CHROME9_TCL_RASTER_WORDS];
@@ -3198,8 +3209,8 @@ static int chrome9_tcl_raster_selftest(void)
 	tcl->element_format[2] = 0xd1;
 	tcl->element_offset[1] = 4;
 	tcl->element_offset[2] = 5;
-	tcl->program.a61 = 0x61800000;
-	tcl->program.a62 = 0x62208002;
+	tcl->program = &vp;
+	tcl->a61 = 0x61800000;
 	memcpy(tcl->rows, rows, sizeof(rows));
 	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
 		ARRAY_SIZE(expected) ||
@@ -3810,7 +3821,7 @@ static u32 chrome9_fragment_state_bound(const struct chrome9_draw_request *reque
 	       (request->query ? CHROME9_QUERY_STATE_DWORDS : 0) +
 	       4 * program->constant_count + 4 * program->alu_count +
 	       program->tau_count +
-	       (tcl ? 4 * tcl->constant_count + 4 * tcl->program.record_count +
+	       (tcl ? 4 * tcl->constant_count + 4 * tcl->program->record_count +
 		      DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS :
 		      4 * (4 + program->varying_count));
 }
@@ -3905,18 +3916,22 @@ static bool chrome9_link_equal(const struct chrome9_state_cache *cache,
 	if (!old || !cache->tcl || !tcl ||
 	    raster_count != cache->raster_count ||
 	    memcmp(config, cache->config, sizeof(cache->config)) ||
-	    !chrome9_raster_equal(raster, cache->raster, raster_count) ||
-	    fp->alu_count != old->alu_count || fp->tau_count != old->tau_count ||
-	    memcmp(fp->controls, old->controls, sizeof(fp->controls)) ||
-	    memcmp(fp->alu, old->alu, fp->alu_count * sizeof(fp->alu[0])) ||
-	    memcmp(fp->tau, old->tau, fp->tau_count * sizeof(fp->tau[0])))
+	    !chrome9_raster_equal(raster, cache->raster, raster_count))
 		return false;
-	vp = &tcl->program;
-	ovp = &cache->tcl->program;
+	/* Cached programs are immutable: one pointer is one program. */
+	if (fp != old &&
+	    (fp->alu_count != old->alu_count || fp->tau_count != old->tau_count ||
+	     memcmp(fp->controls, old->controls, sizeof(fp->controls)) ||
+	     memcmp(fp->alu, old->alu, fp->alu_count * sizeof(fp->alu[0])) ||
+	     memcmp(fp->tau, old->tau, fp->tau_count * sizeof(fp->tau[0]))))
+		return false;
+	vp = tcl->program;
+	ovp = cache->tcl->program;
 	/* Bool constants live in A61 (raster words); int constants here. */
-	return vp->record_count == ovp->record_count && vp->a60 == ovp->a60 &&
-	       !memcmp(vp->records, ovp->records,
-		       vp->record_count * sizeof(vp->records[0])) &&
+	return (vp == ovp ||
+		(vp->record_count == ovp->record_count && vp->a60 == ovp->a60 &&
+		 !memcmp(vp->records, ovp->records,
+			 vp->record_count * sizeof(vp->records[0])))) &&
 	       tcl->int_upload == cache->tcl->int_upload &&
 	       (!tcl->int_upload ||
 		!memcmp(tcl->int_constants, cache->tcl->int_constants,
@@ -4162,11 +4177,11 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	if (program->constant_count) {
 		u32 first = min(program->constant_count, 16U);
 
-		chrome9_emit_header3(&p, 0x22030000, &program->constants[0][0],
-				     first * 4);
+		chrome9_emit_header3(&p, 0x22030000,
+				     request->fragment_constants, first * 4);
 		if (program->constant_count > 16)
 			chrome9_emit_header3(&p, 0x22030080,
-					     &program->constants[16][0],
+					     request->fragment_constants + 16 * 4,
 					     (program->constant_count - 16) * 4);
 	}
 	chrome9_group_end(cache, CHROME9_GROUP_PS_CONSTANTS, group, &p);
@@ -4202,10 +4217,10 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		goto draw;
 	if (tcl) {
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
-				     &tcl->program.records[0][0],
-				     4 * tcl->program.record_count);
+				     &tcl->program->records[0][0],
+				     4 * tcl->program->record_count);
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
-				     &tcl->program.a60, 1);
+				     &tcl->program->a60, 1);
 	} else {
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
 				     vs_program, 4 * (4 + program->varying_count));
@@ -7337,13 +7352,13 @@ struct chrome9_fragment_submit {
 	/* Byte range the fetcher reads per vertex object; only it is flushed. */
 	u64 object_low[CHROME9_FRAGMENT_MAX_OBJECTS];
 	u64 object_high[CHROME9_FRAGMENT_MAX_OBJECTS];
-	u8 texture_object[DRM_CHROME9_VERTEX_MAX_BATCH]
-			[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
-	u32 buffer_object[DRM_CHROME9_VERTEX_MAX_BATCH]
-			 [DRM_CHROME9_VERTEX_MAX_INPUTS];
-	u64 element_start[DRM_CHROME9_VERTEX_MAX_BATCH]
-			 [DRM_CHROME9_VERTEX_MAX_INPUTS];
 	struct chrome9_state_cache cache;
+	/* Object indices and element starts of each draw. */
+	struct {
+		u8 texture_object[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+		u32 buffer_object[DRM_CHROME9_VERTEX_MAX_INPUTS];
+		u64 element_start[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	} draw[];
 };
 
 /* Object index of handle among kind, appended when new; U32_MAX if full. */
@@ -7925,7 +7940,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 
 	if (!count || count > DRM_CHROME9_VERTEX_MAX_BATCH)
 		return -EINVAL;
-	sub = kvzalloc(sizeof(*sub), GFP_KERNEL);
+	/* Every field is written before it is read. */
+	sub = kvmalloc(struct_size(sub, draw, count), GFP_KERNEL);
 	if (!sub)
 		return -ENOMEM;
 	objects = sub->objects;
@@ -7941,11 +7957,13 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		goto out_dev_exit;
 	}
 	sub->kind[0] = CHROME9_OBJECT_DESTINATION;
+	sub->handle[0] = request->destination_handle;
 	objects[0] = drm_gem_object_lookup(file, request->destination_handle);
 	object_sizes[0] = request->object_size;
 	if (request->flags & DRM_CHROME9_FRAGMENT_DEPTH) {
 		depth_index = object_count++;
 		sub->kind[depth_index] = CHROME9_OBJECT_DEPTH;
+		sub->handle[depth_index] = request->depth_handle;
 		objects[depth_index] = drm_gem_object_lookup(file,
 							      request->depth_handle);
 		object_sizes[depth_index] = request->depth_object_size;
@@ -7977,7 +7995,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				ret = -EINVAL;
 				goto out_put_objects;
 			}
-			sub->texture_object[r][t] = i;
+			sub->draw[r].texture_object[t] = i;
 		}
 		/* Stage B vertex buffers are plain, unguarded read-only
 		 * objects; bindings of one handle share its object. */
@@ -7989,7 +8007,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				ret = -E2BIG;
 				goto out_put_objects;
 			}
-			sub->buffer_object[r][t] = i;
+			sub->draw[r].buffer_object[t] = i;
 		}
 	}
 	for (i = 0; i < object_count; i++) {
@@ -8024,6 +8042,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			goto out_put_objects;
 		}
 		sub->object_low[i] = U64_MAX;
+		sub->object_high[i] = 0;
 	}
 	if (mapped_size > SZ_64M - engine->ring_size) {
 		ret = -E2BIG;
@@ -8035,7 +8054,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		if (!tcl || !tcl->buffer_count)
 			continue;
 		ret = chrome9_tcl_buffer_bounds(tcl, objects,
-				sub->buffer_object[r], sub->element_start[r],
+				sub->draw[r].buffer_object, sub->draw[r].element_start,
 				sub->object_low, sub->object_high);
 		if (ret)
 			goto out_put_objects;
@@ -8094,7 +8113,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 
 		if (tcl && tcl->buffer_count &&
 		    !chrome9_tcl_buffers_finite(tcl, job->fragment_maps,
-				sub->buffer_object[r], sub->element_start[r])) {
+				sub->draw[r].buffer_object, sub->draw[r].element_start)) {
 			ret = -EINVAL;
 			goto out_unmap;
 		}
@@ -8264,13 +8283,13 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 
 			for (t = 0; t < req->fragment_texture_count; t++)
 				texture_bases[t] =
-					sub->bases[sub->texture_object[next][t]];
+					sub->bases[sub->draw[next].texture_object[t]];
 			for (t = 0; tcl && tcl->buffer_count &&
 				    t < tcl->element_count; t++)
 				element_address[t] = sub->bases[
-					sub->buffer_object[next]
+					sub->draw[next].buffer_object
 						[tcl->element_buffer[t]]] +
-					sub->element_start[next][t];
+					sub->draw[next].element_start[t];
 			ret = chrome9_emit_fragment_draw(req,
 				sub->bases[0] + PAGE_SIZE,
 				depth_index == U32_MAX ? 0 :
@@ -11164,39 +11183,215 @@ static int chrome9_fragment_texture_selftest(void)
 	return ret ?: chrome9_fragment_texture_3d_selftest();
 }
 
-/* Everything one fragment draw owns between validation and submission. */
+/*
+ * References one fragment draw holds between validation and submission;
+ * its copies and compile scratch live in the ioctl's arena.
+ */
 struct chrome9_fragment_draw {
 	struct chrome9_draw_request request;
-	struct drm_chrome9_fragment_instruction *instructions;
-	struct drm_chrome9_fragment_texture_state *textures;
-	struct drm_chrome9_fragment_vertex *vertices;
-	struct chrome9_fragment_program *program;
-	u32 *constants;
+	struct chrome9_program_entry *fragment_entry;
+	struct chrome9_program_entry *vertex_entry;
 };
 
 static void chrome9_fragment_draw_fini(struct chrome9_fragment_draw *d)
 {
 	chrome9_query_put(d->request.query);
-	kvfree(d->program);
-	kvfree(d->vertices);
-	kfree(d->textures);
-	kfree(d->constants);
-	kfree(d->instructions);
-	memset(d, 0, sizeof(*d));
+	chrome9_program_entry_put(d->vertex_entry);
+	chrome9_program_entry_put(d->fragment_entry);
+}
+
+enum chrome9_program_kind {
+	CHROME9_PROGRAM_FRAGMENT = 1,
+	CHROME9_PROGRAM_VERTEX,
+};
+
+/* Every input of chrome9_fragment_compile_targets() but constant values. */
+struct chrome9_fragment_key {
+	u32 kind;
+	u32 instruction_count;
+	u32 constant_count;
+	u32 texture_count;
+	u32 descriptor_mask;
+	u32 sparse_textures;
+	u32 str_mask;
+	u32 varying_count;
+};
+
+/* Every input of chrome9_vertex_compile() and of the RE record fixups. */
+struct chrome9_vertex_key {
+	u32 kind;
+	u32 instruction_count;
+	u32 input_count;
+	u32 constant_first;
+	u32 constant_count;
+	u32 clip_mask;
+	u32 sprite_mask;
+	u32 max_depth;
+	u32 re;
+	u32 varying_count;
+	u8 two_side;
+	u8 point_size;
+	u8 dynamic;
+	u8 primary_used;
+	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u8 varying_logical[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+};
+
+static_assert(sizeof(struct chrome9_vertex_key) == 76);
+
+/*
+ * The compiled program of these inputs: a cached copy, else compiled into
+ * the arena and offered to the cache.  A hit still validates the constants.
+ */
+static const struct chrome9_fragment_program *
+chrome9_fragment_program_get(struct chrome9_progcache *cache,
+		struct chrome9_arena *arena,
+		const struct drm_chrome9_fragment_instruction *instructions,
+		const u32 *constants, const struct chrome9_fragment_key *params,
+		struct chrome9_program_entry **entry)
+{
+	const struct chrome9_program_key key = {
+		.params = params,
+		.params_size = sizeof(*params),
+		.code = instructions,
+		.code_size = params->instruction_count * sizeof(*instructions),
+	};
+	struct chrome9_fragment_program *program;
+	const void *cached;
+	int ret;
+
+	cached = chrome9_progcache_get(cache, &key, entry);
+	if (cached) {
+		chrome9_prof_programs[0]++;
+		if (!chrome9_fragment_constants_valid(constants,
+						      params->constant_count))
+			return ERR_PTR(-EINVAL);
+		return cached;
+	}
+	chrome9_prof_programs[1]++;
+	program = chrome9_arena_alloc(arena, sizeof(*program));
+	if (!program)
+		return ERR_PTR(-ENOMEM);
+	ret = chrome9_fragment_compile_targets(instructions,
+		params->instruction_count, constants, params->constant_count,
+		params->texture_count, params->descriptor_mask,
+		params->sparse_textures, params->str_mask,
+		params->varying_count, program);
+	if (ret)
+		return ERR_PTR(ret);
+	cached = chrome9_progcache_add(cache, &key, program, sizeof(*program),
+				       entry);
+	return cached ?: program;
+}
+
+static void chrome9_tcl_program_fixup(u32 re,
+				      struct chrome9_vertex_program *vp)
+{
+	unsigned int i;
+
+	if (re & CHROME9_TCL_RE_NO_SECONDARY) {
+		u32 last_input = vp->a62 & 0x1ff, kept = 0, r;
+
+		for (r = 0; r < vp->record_count; r++) {
+			u32 dest = vp->records[r][3] >> 4 & 0xff;
+
+			if (dest == 0x23 || dest == 0x25) {
+				if (r < last_input)
+					vp->a62--;
+				continue;
+			}
+			memmove(vp->records[kept++], vp->records[r],
+				sizeof(vp->records[r]));
+		}
+		vp->active_count -= vp->record_count - kept;
+		vp->record_count = kept;
+		vp->a60 = 0x60800000 | (vp->active_count - 1);
+	}
+	if (re & CHROME9_TCL_RE_NO_BFD_SAT)
+		for (i = 0; i < vp->record_count; i++)
+			if ((vp->records[i][3] >> 4 & 0xff) == 0x24)
+				vp->records[i][3] &= ~BIT(14);
+}
+
+/* tcl->program for fragment program fp, cached like the fragment one. */
+static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
+		struct chrome9_arena *arena, struct chrome9_tcl_draw *tcl,
+		const struct chrome9_fragment_program *fp,
+		struct chrome9_program_entry **entry)
+{
+	struct chrome9_vertex_key params;
+	const struct chrome9_program_key key = {
+		.params = &params,
+		.params_size = sizeof(params),
+		.code = tcl->instructions,
+		.code_size = tcl->instruction_count * sizeof(*tcl->instructions),
+	};
+	struct chrome9_vertex_program *vp;
+	const void *cached;
+	int ret;
+
+	memset(&params, 0, sizeof(params));
+	params.kind = CHROME9_PROGRAM_VERTEX;
+	params.instruction_count = tcl->instruction_count;
+	params.input_count = tcl->element_count;
+	params.constant_first = tcl->constant_first;
+	params.constant_count = tcl->constant_count;
+	params.clip_mask = tcl->clip_mask;
+	params.sprite_mask = tcl->sprite_mask;
+	params.max_depth = tcl->flow.max_depth;
+	params.re = tcl->re & (CHROME9_TCL_RE_NO_SECONDARY |
+			       CHROME9_TCL_RE_NO_BFD_SAT);
+	params.varying_count = fp->varying_count;
+	params.two_side = !!(tcl->cull & (DRM_CHROME9_VERTEX_BFC_CW |
+					  DRM_CHROME9_VERTEX_BFC_CCW));
+	params.point_size = tcl->point_size_vertex;
+	params.dynamic = tcl->flow.dynamic;
+	params.primary_used = fp->primary_used;
+	memcpy(params.input_lanes, tcl->input_lanes, tcl->element_count);
+	memcpy(params.varying_logical, fp->varying_logical, fp->varying_count);
+	memcpy(params.varying_width, fp->varying_width, fp->varying_count);
+	cached = chrome9_progcache_get(cache, &key, entry);
+	if (cached) {
+		chrome9_prof_programs[2]++;
+		tcl->program = cached;
+		return 0;
+	}
+	chrome9_prof_programs[3]++;
+	vp = chrome9_arena_alloc(arena, CHROME9_VERTEX_PROGRAM_BYTES(
+		DRM_CHROME9_VERTEX_MAX_RECORDS));
+	if (!vp)
+		return -ENOMEM;
+	ret = chrome9_vertex_compile(tcl->instructions, tcl->instruction_count,
+		fp, tcl->element_count, tcl->input_lanes, tcl->constant_first,
+		tcl->constant_count, params.two_side, tcl->clip_mask,
+		tcl->point_size_vertex, tcl->sprite_mask, &tcl->flow, vp);
+	if (ret)
+		return ret;
+	chrome9_tcl_program_fixup(params.re, vp);
+	cached = chrome9_progcache_add(cache, &key, vp,
+		CHROME9_VERTEX_PROGRAM_BYTES(vp->record_count), entry);
+	tcl->program = cached ?: vp;
+	return 0;
 }
 
 /* Validate, copy and compile one fragment draw into d->request. */
 static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		struct drm_file *file,
 		struct drm_chrome9_draw_fragment_program *args,
-		struct chrome9_tcl_draw *tcl, struct chrome9_fragment_draw *d)
+		struct chrome9_tcl_draw *tcl, struct chrome9_arena *arena,
+		struct chrome9_fragment_draw *d)
 {
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(args->destination_format);
-	struct drm_chrome9_fragment_instruction *instructions = NULL;
+	struct chrome9_progcache *cache = chrome9_file_programs(file);
+	struct drm_chrome9_fragment_instruction *instructions;
 	struct drm_chrome9_fragment_texture_state *textures = NULL;
 	struct drm_chrome9_fragment_vertex *vertices = NULL;
-	struct chrome9_fragment_program *program = NULL;
+	const struct chrome9_fragment_program *program;
+	struct chrome9_program_entry *fragment_entry = NULL;
+	struct chrome9_program_entry *vertex_entry = NULL;
+	struct chrome9_fragment_key key;
 	u32 *constants = NULL;
 	struct chrome9_draw_request request = {
 		.kind = CHROME9_DRAW_FRAGMENT_PROGRAM,
@@ -11307,42 +11502,34 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	}
 	if (check_mul_overflow(args->triangle_count, 3U, &vertex_count))
 		return -E2BIG;
-	instructions = memdup_array_user(u64_to_user_ptr(args->instructions_ptr),
+	instructions = chrome9_arena_copy_user(arena, args->instructions_ptr,
 		args->instruction_count, sizeof(*instructions));
 	if (IS_ERR(instructions))
 		return PTR_ERR(instructions);
 	if (args->constant_count) {
-		constants = memdup_array_user(u64_to_user_ptr(args->constants_ptr),
+		constants = chrome9_arena_copy_user(arena, args->constants_ptr,
 			args->constant_count, 4 * sizeof(*constants));
-		if (IS_ERR(constants)) {
-			ret = PTR_ERR(constants);
-			constants = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(constants))
+			return PTR_ERR(constants);
 	}
 	if (args->texture_count) {
-		textures = memdup_array_user(u64_to_user_ptr(args->textures_ptr),
+		textures = chrome9_arena_copy_user(arena, args->textures_ptr,
 			args->texture_count, sizeof(*textures));
-		if (IS_ERR(textures)) {
-			ret = PTR_ERR(textures);
-			textures = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(textures))
+			return PTR_ERR(textures);
 		for (i = 0; i < args->texture_count; i++) {
 			u32 unit = sparse_textures ? textures[i].reserved0 : i;
 			u32 flags;
 
 			if (unit >= DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
 			    (sparse_textures && i &&
-			     unit <= request.fragment_texture_units[i - 1])) {
-				ret = -EINVAL;
-				goto out_free;
-			}
+			     unit <= request.fragment_texture_units[i - 1]))
+				return -EINVAL;
 			ret = chrome9_validate_fragment_texture(&textures[i],
 				&request.fragment_texture_size[i], sparse_textures,
 				caps2, &flags);
 			if (ret)
-				goto out_free;
+				return ret;
 			request.fragment_texture_units[i] = unit;
 			request.fragment_texture_flags[i] = flags;
 			if (textures[i].target == DRM_CHROME9_FRAGMENT_TARGET_CUBE ||
@@ -11350,108 +11537,69 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 				str_mask |= BIT(unit);
 			descriptor_mask |= BIT(unit);
 			if (check_add_overflow(total_size,
-				request.fragment_texture_size[i], &total_size)) {
-				ret = -E2BIG;
-				goto out_free;
-			}
+				request.fragment_texture_size[i], &total_size))
+				return -E2BIG;
 		}
 	}
-	if (total_size > SZ_64M - CHROME9_RING_SIZE) {
-		ret = -E2BIG;
-		goto out_free;
-	}
+	if (total_size > SZ_64M - CHROME9_RING_SIZE)
+		return -E2BIG;
 	if (!tcl) {
-		vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+		vertices = chrome9_arena_copy_user(arena, args->vertices_ptr,
 			vertex_count, sizeof(*vertices));
-		if (IS_ERR(vertices)) {
-			ret = PTR_ERR(vertices);
-			vertices = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(vertices))
+			return PTR_ERR(vertices);
 		for (i = 0; i < vertex_count; i++) {
 			unsigned int varying;
 
 			if (!chrome9_coordinate_valid(vertices[i].x_16_16, args->width) ||
 			    !chrome9_coordinate_valid(vertices[i].y_16_16, args->height) ||
 			    vertices[i].z_16_16 < 0 || vertices[i].z_16_16 > 0x10000 ||
-			    !chrome9_rhw_valid(vertices[i].rhw_float)) {
-				ret = -EINVAL;
-				goto out_free;
-			}
+			    !chrome9_rhw_valid(vertices[i].rhw_float))
+				return -EINVAL;
 			for (varying = 0; varying < args->varying_count; varying++) {
 				unsigned int component;
 
 				for (component = 0; component < 4; component++)
 					if (!chrome9_float_finite(
-						vertices[i].varying[varying][component])) {
-						ret = -EINVAL;
-						goto out_free;
-					}
+						vertices[i].varying[varying][component]))
+						return -EINVAL;
 			}
 			for (; varying < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; varying++)
 				if (memchr_inv(vertices[i].varying[varying], 0,
-					       sizeof(vertices[i].varying[varying]))) {
-					ret = -EINVAL;
-					goto out_free;
-				}
+					       sizeof(vertices[i].varying[varying])))
+					return -EINVAL;
 		}
 		for (i = 0; i < vertex_count; i += 3)
 			if (!chrome9_triangle_nondegenerate(
 				vertices[i].x_16_16, vertices[i].y_16_16,
 				vertices[i + 1].x_16_16, vertices[i + 1].y_16_16,
-				vertices[i + 2].x_16_16, vertices[i + 2].y_16_16)) {
-				ret = -EINVAL;
-				goto out_free;
-			}
+				vertices[i + 2].x_16_16, vertices[i + 2].y_16_16))
+				return -EINVAL;
 	}
 	chrome9_prof_mark(CHROME9_PROF_ENTRY);
-	program = kvzalloc(sizeof(*program), GFP_KERNEL);
-	if (!program) {
-		ret = -ENOMEM;
-		goto out_free;
+	key = (struct chrome9_fragment_key) {
+		.kind = CHROME9_PROGRAM_FRAGMENT,
+		.instruction_count = args->instruction_count,
+		.constant_count = args->constant_count,
+		.texture_count = args->texture_count,
+		.descriptor_mask = sparse_textures ? descriptor_mask : 0,
+		.sparse_textures = sparse_textures,
+		.str_mask = str_mask,
+		.varying_count = args->varying_count,
+	};
+	program = chrome9_fragment_program_get(cache, arena, instructions,
+		constants, &key, &fragment_entry);
+	if (IS_ERR(program)) {
+		ret = PTR_ERR(program);
+		goto out_put;
 	}
-	ret = chrome9_fragment_compile_targets(instructions,
-		args->instruction_count, constants, args->constant_count,
-		args->texture_count, sparse_textures ? descriptor_mask : 0,
-		sparse_textures, str_mask, args->varying_count, program);
-	if (ret)
-		goto out_free;
 	if (tcl) {
-		ret = chrome9_vertex_compile(tcl->instructions,
-			tcl->instruction_count, program, tcl->element_count,
-			tcl->input_lanes, tcl->constant_first,
-			tcl->constant_count,
-			tcl->cull & (DRM_CHROME9_VERTEX_BFC_CW |
-				     DRM_CHROME9_VERTEX_BFC_CCW),
-			tcl->clip_mask, tcl->point_size_vertex,
-			tcl->sprite_mask, &tcl->flow, &tcl->program);
+		ret = chrome9_tcl_program_get(cache, arena, tcl, program,
+					      &vertex_entry);
 		if (ret)
-			goto out_free;
+			goto out_put;
 		/* b0..b15 are A61[15:0] (stmUpdateIntBoolConst_inv). */
-		tcl->program.a61 |= tcl->bool_constants;
-		if (tcl->re & CHROME9_TCL_RE_NO_SECONDARY) {
-			struct chrome9_vertex_program *vp = &tcl->program;
-			u32 last_input = vp->a62 & 0x1ff, kept = 0, r;
-
-			for (r = 0; r < vp->record_count; r++) {
-				u32 dest = vp->records[r][3] >> 4 & 0xff;
-
-				if (dest == 0x23 || dest == 0x25) {
-					if (r < last_input)
-						vp->a62--;
-					continue;
-				}
-				memmove(vp->records[kept++], vp->records[r],
-					sizeof(vp->records[r]));
-			}
-			vp->active_count -= vp->record_count - kept;
-			vp->record_count = kept;
-			vp->a60 = 0x60800000 | (vp->active_count - 1);
-		}
-		if (tcl->re & CHROME9_TCL_RE_NO_BFD_SAT)
-			for (i = 0; i < tcl->program.record_count; i++)
-				if ((tcl->program.records[i][3] >> 4 & 0xff) == 0x24)
-					tcl->program.records[i][3] &= ~BIT(14);
+		tcl->a61 = tcl->program->a61 | tcl->bool_constants;
 		request.triangle_count = tcl->primitive_count;
 		request.tcl = tcl;
 	}
@@ -11460,37 +11608,32 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 							 &request.query_generation);
 		if (IS_ERR(request.query)) {
 			ret = PTR_ERR(request.query);
-			request.query = NULL;
-			goto out_free;
+			goto out_put;
 		}
 	}
 	request.fragment_vertices = vertices;
 	request.fragment_textures = textures;
 	request.fragment_program = program;
+	request.fragment_constants = constants;
 	chrome9_prof_mark(CHROME9_PROF_COMPILE);
 	d->request = request;
-	d->instructions = instructions;
-	d->textures = textures;
-	d->vertices = vertices;
-	d->program = program;
-	d->constants = constants;
+	d->fragment_entry = fragment_entry;
+	d->vertex_entry = vertex_entry;
 	return 0;
 
-out_free:
-	kvfree(program);
-	kvfree(vertices);
-	kfree(textures);
-	kfree(constants);
-	kfree(instructions);
+out_put:
+	chrome9_program_entry_put(vertex_entry);
+	chrome9_program_entry_put(fragment_entry);
 	return ret;
 }
 
 static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 				 struct drm_chrome9_draw_fragment_program *args,
-				 struct chrome9_tcl_draw *tcl)
+				 struct chrome9_tcl_draw *tcl,
+				 struct chrome9_arena *arena)
 {
-	struct chrome9_fragment_draw d = { };
-	int ret = chrome9_fragment_draw_prepare(drm, file, args, tcl, &d);
+	struct chrome9_fragment_draw d;
+	int ret = chrome9_fragment_draw_prepare(drm, file, args, tcl, arena, &d);
 
 	if (ret)
 		return ret;
@@ -11504,8 +11647,14 @@ static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 int chrome9_draw_fragment_program_ioctl(struct drm_device *drm, void *data,
 					struct drm_file *file)
 {
+	struct chrome9_arena arena;
+	int ret;
+
 	chrome9_prof_start();
-	return chrome9_draw_fragment(drm, file, data, NULL);
+	chrome9_arena_init(&arena, chrome9_file_programs(file));
+	ret = chrome9_draw_fragment(drm, file, data, NULL, &arena);
+	chrome9_arena_fini(&arena);
+	return ret;
 }
 
 bool chrome9_hw_tcl_enabled(void)
@@ -11684,7 +11833,8 @@ static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
  * range allows.  An odd 16-bit count leaves the upper lane zero.
  */
 static u32 *chrome9_tcl_indices(struct chrome9_tcl_draw *tcl,
-		const void *indices, u32 index_size)
+		const void *indices, u32 index_size,
+		struct chrome9_arena *arena)
 {
 	u32 min = U32_MAX, max = 0, value;
 	unsigned int i;
@@ -11701,9 +11851,11 @@ static u32 *chrome9_tcl_indices(struct chrome9_tcl_draw *tcl,
 	tcl->index32 = tcl->index_range > 0xffff;
 	tcl->index_dwords = tcl->index32 ? tcl->index_count :
 		DIV_ROUND_UP(tcl->index_count, 2);
-	packed = kvcalloc(tcl->index_dwords, sizeof(*packed), GFP_KERNEL);
+	packed = chrome9_arena_alloc(arena, tcl->index_dwords * sizeof(*packed));
 	if (!packed)
 		return NULL;
+	if (!tcl->index32)
+		memset(packed, 0, tcl->index_dwords * sizeof(*packed));
 	for (i = 0; i < tcl->index_count; i++) {
 		value = (index_size == 2 ? ((const u16 *)indices)[i] :
 			 ((const u32 *)indices)[i]) - min;
@@ -11738,36 +11890,18 @@ static bool chrome9_tcl_vertices_finite(const struct chrome9_tcl_draw *tcl)
 	return true;
 }
 
-/* The allocations a validated TCL draw keeps until it is submitted. */
-struct chrome9_tcl_owned {
-	struct chrome9_tcl_draw *tcl;
-	struct drm_chrome9_vertex_instruction *instructions;
-	u32 *constants;
-	u32 *vertices;
-};
-
-static void chrome9_tcl_fini(struct chrome9_tcl_owned *o)
-{
-	if (o->tcl)
-		kvfree(o->tcl->indices);
-	kvfree(o->vertices);
-	kfree(o->constants);
-	kfree(o->instructions);
-	kvfree(o->tcl);
-	memset(o, 0, sizeof(*o));
-}
-
 /* Validate and copy one DRAW_VERTEX_PROGRAM draw's vertex half. */
 static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
-			       struct chrome9_tcl_owned *o)
+			       struct chrome9_arena *arena,
+			       struct chrome9_tcl_draw **tclp)
 {
-	struct drm_chrome9_vertex_instruction *instructions = NULL;
-	struct drm_chrome9_vertex_element *elements = NULL;
-	struct drm_chrome9_vertex_buffer *buffers = NULL;
-	struct chrome9_tcl_draw *tcl = NULL;
-	void *indices = NULL;
-	u32 *constants = NULL;
-	u32 *vertices = NULL;
+	struct drm_chrome9_vertex_instruction *instructions;
+	struct drm_chrome9_vertex_element *elements;
+	struct drm_chrome9_vertex_buffer *buffers;
+	struct chrome9_tcl_draw *tcl;
+	void *indices;
+	u32 *constants;
+	u32 *vertices;
 	bool stage_b = args->buffer_count;
 	u32 count = stage_b ? args->index_count : args->vertex_count;
 	unsigned int i;
@@ -11821,14 +11955,15 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 	    !args->instructions_ptr || !args->elements_ptr ||
 	    !chrome9_tcl_viewport_valid(args->viewport))
 		return -EINVAL;
-	tcl = kvzalloc(sizeof(*tcl), GFP_KERNEL);
+	tcl = chrome9_arena_alloc(arena, sizeof(*tcl));
 	if (!tcl)
 		return -ENOMEM;
+	memset(tcl, 0, sizeof(*tcl));
 	tcl->instruction_count = args->instruction_count;
 	tcl->cull = args->flags;
 	ret = chrome9_tcl_topology(args, count, tcl);
 	if (ret)
-		goto out_free;
+		return ret;
 	tcl->clip_mask = args->clip_distance_mask;
 	tcl->re = READ_ONCE(chrome9_tcl_re);
 	if (READ_ONCE(chrome9_vs_flow)) {
@@ -11841,10 +11976,8 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		u8 ints[DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS][4];
 
 		if (copy_from_user(ints, u64_to_user_ptr(args->int_constants_ptr),
-				   sizeof(ints))) {
-			ret = -EFAULT;
-			goto out_free;
-		}
+				   sizeof(ints)))
+			return -EFAULT;
 		/* Vendor packing: X, Y, Z, W low bytes, little endian. */
 		for (i = 0; i < ARRAY_SIZE(ints); i++)
 			tcl->int_constants[i] = ints[i][0] | ints[i][1] << 8 |
@@ -11873,124 +12006,82 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		tcl->buffer_count = args->buffer_count;
 		tcl->index_count = args->index_count;
 		tcl->base_vertex = args->base_vertex;
-		buffers = memdup_array_user(u64_to_user_ptr(args->buffers_ptr),
+		buffers = chrome9_arena_copy_user(arena, args->buffers_ptr,
 			args->buffer_count, sizeof(*buffers));
-		if (IS_ERR(buffers)) {
-			ret = PTR_ERR(buffers);
-			buffers = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(buffers))
+			return PTR_ERR(buffers);
 		/* Stride 0 repeats one element (constant attribute). */
 		for (i = 0; i < args->buffer_count; i++) {
 			if (!buffers[i].handle ||
 			    !IS_ALIGNED(buffers[i].stride, 4) ||
 			    buffers[i].stride > 2044 ||
-			    !IS_ALIGNED(buffers[i].offset, 4)) {
-				ret = -EINVAL;
-				goto out_free;
-			}
+			    !IS_ALIGNED(buffers[i].offset, 4))
+				return -EINVAL;
 			tcl->buffers[i] = buffers[i];
 		}
-		indices = vmemdup_array_user(u64_to_user_ptr(args->indices_ptr),
+		indices = chrome9_arena_copy_user(arena, args->indices_ptr,
 			args->index_count, args->index_size);
-		if (IS_ERR(indices)) {
-			ret = PTR_ERR(indices);
-			indices = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(indices))
+			return PTR_ERR(indices);
 		tcl->indices = chrome9_tcl_indices(tcl, indices,
-						   args->index_size);
-		if (!tcl->indices) {
-			ret = -ENOMEM;
-			goto out_free;
-		}
+						   args->index_size, arena);
+		if (!tcl->indices)
+			return -ENOMEM;
 		tcl->vertex_count = args->index_count;
 	}
 
-	elements = memdup_array_user(u64_to_user_ptr(args->elements_ptr),
+	elements = chrome9_arena_copy_user(arena, args->elements_ptr,
 		args->element_count, sizeof(*elements));
-	if (IS_ERR(elements)) {
-		ret = PTR_ERR(elements);
-		elements = NULL;
-		goto out_free;
-	}
+	if (IS_ERR(elements))
+		return PTR_ERR(elements);
 	ret = chrome9_tcl_elements(tcl, elements, args->vertex_stride);
 	if (ret)
-		goto out_free;
-	instructions = memdup_array_user(u64_to_user_ptr(args->instructions_ptr),
+		return ret;
+	instructions = chrome9_arena_copy_user(arena, args->instructions_ptr,
 		args->instruction_count, sizeof(*instructions));
-	if (IS_ERR(instructions)) {
-		ret = PTR_ERR(instructions);
-		instructions = NULL;
-		goto out_free;
-	}
+	if (IS_ERR(instructions))
+		return PTR_ERR(instructions);
 	tcl->instructions = instructions;
 	if (args->constant_count) {
-		constants = memdup_array_user(u64_to_user_ptr(args->constants_ptr),
+		constants = chrome9_arena_copy_user(arena, args->constants_ptr,
 			args->constant_count, 4 * sizeof(*constants));
-		if (IS_ERR(constants)) {
-			ret = PTR_ERR(constants);
-			constants = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(constants))
+			return PTR_ERR(constants);
 		for (i = 0; i < 4 * args->constant_count; i++)
-			if (!chrome9_float_finite(constants[i])) {
-				ret = -EINVAL;
-				goto out_free;
-			}
+			if (!chrome9_float_finite(constants[i]))
+				return -EINVAL;
 		tcl->constants = constants;
 	}
 	if (!stage_b) {
-		vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+		vertices = chrome9_arena_copy_user(arena, args->vertices_ptr,
 			args->vertex_count, args->vertex_stride);
-		if (IS_ERR(vertices)) {
-			ret = PTR_ERR(vertices);
-			vertices = NULL;
-			goto out_free;
-		}
+		if (IS_ERR(vertices))
+			return PTR_ERR(vertices);
 		tcl->vertices = vertices;
-		if (!chrome9_tcl_vertices_finite(tcl)) {
-			ret = -EINVAL;
-			goto out_free;
-		}
+		if (!chrome9_tcl_vertices_finite(tcl))
+			return -EINVAL;
 	}
-	o->tcl = tcl;
-	o->instructions = instructions;
-	o->constants = constants;
-	o->vertices = vertices;
-	kvfree(indices);
-	kfree(buffers);
-	kfree(elements);
+	*tclp = tcl;
 	return 0;
-
-out_free:
-	if (tcl)
-		kvfree(tcl->indices);
-	kvfree(indices);
-	kfree(buffers);
-	kvfree(vertices);
-	kfree(constants);
-	kfree(instructions);
-	kfree(elements);
-	kvfree(tcl);
-	return ret;
 }
 
 int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 				      struct drm_file *file)
 {
 	struct drm_chrome9_draw_vertex_program *args = data;
-	struct chrome9_tcl_owned o = { };
+	struct chrome9_tcl_draw *tcl;
+	struct chrome9_arena arena;
 	int ret;
 
 	if (!chrome9_hw_tcl_enabled())
 		return -EOPNOTSUPP;
 	chrome9_prof_start();
-	ret = chrome9_tcl_prepare(args, &o);
-	if (ret)
-		return ret;
-	ret = chrome9_draw_fragment(drm, file, &args->fragment, o.tcl);
-	chrome9_tcl_fini(&o);
+	chrome9_arena_init(&arena, chrome9_file_programs(file));
+	ret = chrome9_tcl_prepare(args, &arena, &tcl);
+	if (!ret)
+		ret = chrome9_draw_fragment(drm, file, &args->fragment, tcl,
+					    &arena);
+	chrome9_arena_fini(&arena);
 	return ret;
 }
 
@@ -12004,9 +12095,10 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 {
 	struct drm_chrome9_draw_vertex_programs *args = data;
 	struct drm_chrome9_draw_vertex_program *draws;
-	const struct chrome9_draw_request **requests = NULL;
-	struct chrome9_fragment_draw *fragments = NULL;
-	struct chrome9_tcl_owned *owned = NULL;
+	const struct chrome9_draw_request **requests;
+	struct chrome9_fragment_draw *fragments;
+	struct chrome9_tcl_draw *tcl;
+	struct chrome9_arena arena;
 	u32 r, prepared = 0;
 	int ret;
 
@@ -12016,27 +12108,29 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 	    args->flags || memchr_inv(args->reserved, 0, sizeof(args->reserved)))
 		return -EINVAL;
 	chrome9_prof_start();
-	draws = vmemdup_array_user(u64_to_user_ptr(args->draws_ptr), args->count,
-				   sizeof(*draws));
-	if (IS_ERR(draws))
-		return PTR_ERR(draws);
-	requests = kvcalloc(args->count, sizeof(*requests), GFP_KERNEL);
-	fragments = kvcalloc(args->count, sizeof(*fragments), GFP_KERNEL);
-	owned = kvcalloc(args->count, sizeof(*owned), GFP_KERNEL);
-	if (!requests || !fragments || !owned) {
+	/* One arena holds every copy and compile scratch of the batch. */
+	chrome9_arena_init(&arena, chrome9_file_programs(file));
+	draws = chrome9_arena_copy_user(&arena, args->draws_ptr, args->count,
+					sizeof(*draws));
+	if (IS_ERR(draws)) {
+		ret = PTR_ERR(draws);
+		goto out;
+	}
+	requests = chrome9_arena_alloc(&arena, args->count * sizeof(*requests));
+	fragments = chrome9_arena_alloc(&arena,
+					args->count * sizeof(*fragments));
+	if (!requests || !fragments) {
 		ret = -ENOMEM;
 		goto out;
 	}
 	for (r = 0; r < args->count; r++, prepared++) {
-		ret = chrome9_tcl_prepare(&draws[r], &owned[r]);
+		ret = chrome9_tcl_prepare(&draws[r], &arena, &tcl);
 		if (ret)
 			goto out;
 		ret = chrome9_fragment_draw_prepare(drm, file, &draws[r].fragment,
-						    owned[r].tcl, &fragments[r]);
-		if (ret) {
-			chrome9_tcl_fini(&owned[r]);
+						    tcl, &arena, &fragments[r]);
+		if (ret)
 			goto out;
-		}
 		requests[r] = &fragments[r].request;
 	}
 	ret = chrome9_submit_fragment_programs(drm, file, requests,
@@ -12044,14 +12138,9 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 	chrome9_prof_mark(CHROME9_PROF_RETIRE);
 	chrome9_prof_job(drm);
 out:
-	for (r = 0; r < prepared; r++) {
+	for (r = 0; r < prepared; r++)
 		chrome9_fragment_draw_fini(&fragments[r]);
-		chrome9_tcl_fini(&owned[r]);
-	}
-	kvfree(owned);
-	kvfree(fragments);
-	kvfree(requests);
-	kvfree(draws);
+	chrome9_arena_fini(&arena);
 	return ret;
 }
 

@@ -10,6 +10,7 @@ config DRM_CHROME9
 	select DRM_KMS_HELPER
 	select I2C
 	select I2C_ALGOBIT
+	select XXHASH
 	help
 	  Clean-room DRM render and native IGA1 modesetting driver for the VIA
 	  VX900 Chrome9 HD graphics function (PCI ID 1106:7122).

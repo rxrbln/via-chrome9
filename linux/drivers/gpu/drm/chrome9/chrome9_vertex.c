@@ -1745,7 +1745,8 @@ int chrome9_vertex_selftest(void)
 	int ret = 0;
 
 	fragment = kzalloc(sizeof(*fragment), GFP_KERNEL);
-	program = kzalloc(sizeof(*program), GFP_KERNEL);
+	program = kzalloc(CHROME9_VERTEX_PROGRAM_BYTES(
+		DRM_CHROME9_VERTEX_MAX_RECORDS), GFP_KERNEL);
 	if (!fragment || !program) {
 		ret = -ENOMEM;
 		goto out;
