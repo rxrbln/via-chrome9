@@ -867,6 +867,87 @@ check_equal_zero_select_compilation(struct chrome9_context *context,
 }
 
 static bool
+check_nonnegative_select_compilation(struct chrome9_context *context)
+{
+   for (unsigned test = 0; test < 5; test++) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "chrome9-nonnegative-select");
+      struct chrome9_shader shader = { 0 };
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *a = nir_load_ubo_vec4(&b, 4, 32, zero, zero);
+      nir_def *c = nir_load_ubo_vec4(&b, 4, 32, zero, nir_imm_int(&b, 1));
+      nir_def *length2 = nir_fdot3(&b, a, a);
+      nir_def *scale = nir_fmul(&b, nir_imm_float(&b, 2.0f),
+                                nir_frsq(&b, length2));
+      nir_def *lighting = nir_fmax(&b, nir_fdot3(&b, a, c),
+                                   nir_imm_float(&b, 0.0f));
+      nir_def *bounded = nir_fmul(&b, scale, lighting);
+      nir_def *value = test == 1 ? nir_channel(&b, a, 0) : bounded;
+      nir_def *predicate;
+      nir_def *selected;
+      unsigned sub = 0, cmp = 0;
+      bool found = false;
+      bool expected = test == 0;
+      bool valid;
+
+      if (test == 3)
+         nir_instr_as_alu(nir_def_instr(bounded))->fp_math_ctrl =
+            nir_fp_preserve_nan;
+      predicate = nir_fge(&b, value, nir_imm_float(&b,
+         test == 2 ? 0.0f : test == 4 ? -0.1f : 0.1f));
+      nir_instr_as_alu(nir_def_instr(predicate))->fp_math_ctrl =
+         nir_fp_preserve_inf;
+      selected = nir_bcsel(
+         &b, predicate,
+         nir_imm_vec3(&b, 0.125f, 0.25f, 0.375f),
+         nir_imm_vec3(&b, 0.5f, 0.625f, 0.75f));
+      nir_store_output(&b, nir_vec4(&b,
+         nir_channel(&b, selected, 0), nir_channel(&b, selected, 1),
+         nir_channel(&b, selected, 2), nir_imm_float(&b, 1.0f)),
+         zero, .write_mask = 0xf,
+         .io_semantics.location = FRAG_RESULT_COLOR);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      nir_recompute_io_bases(b.shader,
+                             nir_var_shader_in | nir_var_shader_out);
+      chrome9_compile_fs_nir(context, &shader, b.shader);
+      for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+         const struct chrome9_ps_instruction *instruction =
+            &shader.semantic_fs_ir.instruction[i];
+
+         sub += instruction->op == CHROME9_PS_OPCODE_SUB;
+         cmp += instruction->op == CHROME9_PS_OPCODE_CMP;
+         if (instruction->op != CHROME9_PS_OPCODE_CMP)
+            continue;
+         found = instruction->destination.writemask == 0x7;
+         for (unsigned lane = 0; lane < 4; lane++) {
+            found &= instruction->source[0].swizzle[lane] ==
+               (lane < 3 ? CHROME9_PS_SWIZZLE_X :
+                           CHROME9_PS_SWIZZLE_ZERO);
+            if (lane == 3)
+               found &= instruction->source[1].swizzle[lane] ==
+                           CHROME9_PS_SWIZZLE_ZERO &&
+                        instruction->source[2].swizzle[lane] ==
+                           CHROME9_PS_SWIZZLE_ZERO;
+         }
+      }
+      valid = expected ?
+         shader.supported && shader.semantic_fs_valid &&
+         shader.native_fs_valid && sub == 1 && cmp == 1 && found :
+         !shader.supported && !shader.semantic_fs_valid;
+      if (!valid)
+         fprintf(stderr, "nonnegative select case %u failed: expected=%u "
+                 "supported=%u semantic=%u native=%u sub=%u cmp=%u "
+                 "found=%u ir=%u\n", test, expected, shader.supported,
+                 shader.semantic_fs_valid, shader.native_fs_valid,
+                 sub, cmp, found, shader.semantic_fs_ir.count);
+      ralloc_free(b.shader);
+      if (!valid)
+         return false;
+   }
+   return true;
+}
+
+static bool
 check_canonical_uniform_select_context(void)
 {
    struct pipe_screen screen = { .get_screen_fd = test_screen_fd };
@@ -1985,6 +2066,7 @@ main(void)
        !check_vector_conditional_compilation(&context, 3, false) ||
        !check_vector_conditional_compilation(&context, 4, false) ||
        !check_vector_conditional_compilation(&context, 1, true) ||
+       !check_nonnegative_select_compilation(&context) ||
        !check_equal_zero_select_compilation(&context, 0.0f, true) ||
        !check_equal_zero_select_compilation(&context, 1.0f, false) ||
        !check_canonical_uniform_select_context() ||

@@ -3097,6 +3097,212 @@ chrome9_ps_unit_interval(nir_scalar scalar, unsigned *budget)
    return true;
 }
 
+/* Generic draws reject non-finite constants, positions and varying lanes;
+ * supported texture formats decode finite normalized values.  Prove that a
+ * scalar DAG cannot introduce a *defined* exceptional value.  Arithmetic
+ * without a local exceptional-value preservation request may still overflow
+ * or hit an undefined domain, but that result is not observably constrained
+ * by NIR and therefore does not invalidate a later default-mode comparison. */
+static bool
+chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
+                                     unsigned components, unsigned *budget);
+
+static bool
+chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
+{
+   nir_instr *instr;
+   nir_alu_instr *alu;
+   unsigned sources = 0;
+
+   if (!*budget)
+      return false;
+   (*budget)--;
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   if (scalar.def->bit_size != 32 || scalar.comp >= scalar.def->num_components)
+      return false;
+   instr = nir_def_instr(scalar.def);
+   if (instr->type == nir_instr_type_load_const) {
+      nir_load_const_instr *load = nir_instr_as_load_const(instr);
+      float value = load->value[scalar.comp].f32;
+
+      return isfinite(value);
+   }
+   /* The normal semantic-leaf validation remains authoritative.  These are
+    * merely the leaf classes whose values the draw path proves finite. */
+   if (instr->type == nir_instr_type_intrinsic ||
+       instr->type == nir_instr_type_tex)
+      return true;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   alu = nir_instr_as_alu(instr);
+   if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan)
+      return false;
+   switch (alu->op) {
+   case nir_op_mov:
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_fsat:
+   case nir_op_frcp:
+   case nir_op_frsq:
+   case nir_op_fsqrt:
+   case nir_op_ffract:
+      sources = 1;
+      break;
+   case nir_op_fadd:
+   case nir_op_fsub:
+   case nir_op_fmul:
+   case nir_op_fmin:
+   case nir_op_fmax:
+      sources = 2;
+      break;
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4: {
+      unsigned components = alu->op == nir_op_fdot2 ? 2 :
+                            alu->op == nir_op_fdot3 ? 3 : 4;
+
+      for (unsigned s = 0; s < 2; s++)
+         if (!chrome9_ps_default_finite_alu_source(alu, s, components,
+                                                    budget))
+            return false;
+      return true;
+   }
+   default:
+      return false;
+   }
+   for (unsigned s = 0; s < sources; s++) {
+      if (!alu->src[s].src.ssa ||
+          alu->src[s].swizzle[scalar.comp] >=
+             alu->src[s].src.ssa->num_components ||
+          !chrome9_ps_default_finite(
+             (nir_scalar) { alu->src[s].src.ssa,
+                            alu->src[s].swizzle[scalar.comp] }, budget))
+         return false;
+   }
+   return true;
+}
+
+static bool
+chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
+                                     unsigned components, unsigned *budget)
+{
+   if (!alu->src[source].src.ssa ||
+       alu->src[source].src.ssa->bit_size != 32)
+      return false;
+   for (unsigned c = 0; c < components; c++) {
+      unsigned component = alu->src[source].swizzle[c];
+
+      if (component >= alu->src[source].src.ssa->num_components ||
+          !chrome9_ps_default_finite(
+             (nir_scalar) { alu->src[source].src.ssa, component }, budget))
+         return false;
+   }
+   return true;
+}
+
+/* Prove a nonnegative result for the lighting DAG shapes emitted by generic
+ * NIR.  This is a mathematical property, not an application/shader match. */
+static bool
+chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
+{
+   nir_instr *instr;
+   nir_alu_instr *alu;
+
+   if (!*budget)
+      return false;
+   (*budget)--;
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   if (scalar.def->bit_size != 32 || scalar.comp >= scalar.def->num_components)
+      return false;
+   instr = nir_def_instr(scalar.def);
+   if (instr->type == nir_instr_type_load_const) {
+      float value = nir_instr_as_load_const(instr)->value[scalar.comp].f32;
+
+      return isfinite(value) && value >= 0.0f;
+   }
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   alu = nir_instr_as_alu(instr);
+   if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan)
+      return false;
+   switch (alu->op) {
+   case nir_op_mov:
+      if (!alu->src[0].src.ssa ||
+          alu->src[0].swizzle[scalar.comp] >=
+             alu->src[0].src.ssa->num_components)
+         return false;
+      return chrome9_ps_default_nonnegative(
+         (nir_scalar) { alu->src[0].src.ssa,
+                        alu->src[0].swizzle[scalar.comp] }, budget);
+   case nir_op_fabs:
+   case nir_op_fsat:
+      if (!alu->src[0].src.ssa ||
+          alu->src[0].swizzle[scalar.comp] >=
+             alu->src[0].src.ssa->num_components)
+         return false;
+      return chrome9_ps_default_finite(
+         (nir_scalar) { alu->src[0].src.ssa,
+                        alu->src[0].swizzle[scalar.comp] }, budget);
+   case nir_op_fsqrt:
+   case nir_op_frsq:
+      if (!alu->src[0].src.ssa ||
+          alu->src[0].swizzle[scalar.comp] >=
+             alu->src[0].src.ssa->num_components)
+         return false;
+      return chrome9_ps_default_nonnegative(
+         (nir_scalar) { alu->src[0].src.ssa,
+                        alu->src[0].swizzle[scalar.comp] }, budget);
+   case nir_op_fmul:
+      if (!alu->src[0].src.ssa || !alu->src[1].src.ssa ||
+          alu->src[0].swizzle[scalar.comp] >=
+             alu->src[0].src.ssa->num_components ||
+          alu->src[1].swizzle[scalar.comp] >=
+             alu->src[1].src.ssa->num_components)
+         return false;
+      return chrome9_ps_default_nonnegative(
+                (nir_scalar) { alu->src[0].src.ssa,
+                               alu->src[0].swizzle[scalar.comp] }, budget) &&
+             chrome9_ps_default_nonnegative(
+                (nir_scalar) { alu->src[1].src.ssa,
+                               alu->src[1].swizzle[scalar.comp] }, budget);
+   case nir_op_fmax: {
+      if (!alu->src[0].src.ssa || !alu->src[1].src.ssa ||
+          alu->src[0].swizzle[scalar.comp] >=
+             alu->src[0].src.ssa->num_components ||
+          alu->src[1].swizzle[scalar.comp] >=
+             alu->src[1].src.ssa->num_components)
+         return false;
+      nir_scalar a = { alu->src[0].src.ssa,
+                       alu->src[0].swizzle[scalar.comp] };
+      nir_scalar b = { alu->src[1].src.ssa,
+                       alu->src[1].swizzle[scalar.comp] };
+      bool a_nonnegative = chrome9_ps_default_nonnegative(a, budget);
+      bool b_nonnegative = chrome9_ps_default_nonnegative(b, budget);
+
+      if (!chrome9_ps_default_finite(a, budget) ||
+          !chrome9_ps_default_finite(b, budget))
+         return false;
+      return a_nonnegative || b_nonnegative;
+   }
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4: {
+      unsigned components = alu->op == nir_op_fdot2 ? 2 :
+                            alu->op == nir_op_fdot3 ? 3 : 4;
+
+      for (unsigned c = 0; c < components; c++)
+         if (alu->src[0].swizzle[c] != alu->src[1].swizzle[c])
+            return false;
+      if (alu->src[0].src.ssa != alu->src[1].src.ssa)
+         return false;
+      return chrome9_ps_default_finite_alu_source(alu, 0, components,
+                                                   budget);
+   }
+   default:
+      return false;
+   }
+}
+
 static bool
 chrome9_ps_emit_scalar_select(struct chrome9_ps_nir_builder *builder,
                               nir_alu_instr *select, nir_def *def,
@@ -3144,10 +3350,11 @@ chrome9_ps_emit_scalar_select(struct chrome9_ps_nir_builder *builder,
 }
 
 /* CMP selects its C operand when A >= 0.  A subtraction can implement an
- * ordered floating comparison only when its sign is preserved.  For a
- * proven [0, 1] value and a normal threshold in [0.25, 0.75], the difference
- * cannot overflow or underflow to a false zero.  Other comparisons need a
- * native SGE/SLT path with qualified exceptional-value behavior. */
+ * ordered floating comparison only when its sign is preserved.  Admit a
+ * proven [0, 1] value around a central normal threshold, or a nonnegative
+ * defined-finite DAG against a positive normal constant.  The latter cannot
+ * overflow and default-mode FTZ is qualified consistently for producer and
+ * SUB/CMP paths.  Other comparisons remain closed. */
 static bool
 chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
                                        nir_alu_instr *select, nir_def *def,
@@ -3160,6 +3367,7 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
    uint8_t condition_temp;
    unsigned components = def->num_components;
    unsigned range_budget = CHROME9_PS_MAX_INSTRUCTIONS;
+   unsigned sign_budget = CHROME9_PS_MAX_INSTRUCTIONS;
    float boundary;
 
    if (select->op != nir_op_bcsel || !components || components > 4 ||
@@ -3194,11 +3402,13 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
                             compare->src[0].swizzle[0] };
    threshold = nir_scalar_resolved(compare->src[1].src.ssa,
                                    compare->src[1].swizzle[0]);
-   if (!nir_scalar_is_const(threshold) ||
-       !chrome9_ps_unit_interval(bounded, &range_budget))
+   if (!nir_scalar_is_const(threshold))
       return false;
    boundary = nir_scalar_as_float(threshold);
-   if (!(boundary >= 0.25f && boundary <= 0.75f))
+   if (!((boundary >= 0.25f && boundary <= 0.75f &&
+          chrome9_ps_unit_interval(bounded, &range_budget)) ||
+         (boundary > 0.0f && isnormal(boundary) &&
+          chrome9_ps_default_nonnegative(bounded, &sign_budget))))
       return false;
    if (!chrome9_ps_lower_alu_source(builder, &compare->src[0], 1, &lhs) ||
        !chrome9_ps_lower_alu_source(builder, &compare->src[1], 1, &rhs) ||
