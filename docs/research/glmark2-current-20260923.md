@@ -115,3 +115,19 @@ staging directory.
 
 The complete glmark2 scene set and larger function variants remain unverified;
 this result closes only the exact five-step medium function regression.
+
+## 2026-09-24 pulsar and Phong validation
+
+With the same staged Mesa/kernel build and Xorg PID 995, the source-audited
+one-frame default `pulsar` scene reported `Validation: Success` at 800x600.
+The exact one-light `shading:shading=phong:model=cat:num-lights=1:nframes=1`
+scene also reported `Validation: Success` at 800x600. This exercises its
+accepted 37-ALU fragment program on the real VX900 rather than only proving
+offline compiler/resource fit. A texture-nearest validation succeeded after
+Phong; Xorg remained alive and the bounded dmesg check found no Chrome9
+timeout, quarantine, engine error, fault, or draw rejection. The three logs
+are `pulsar-default-validate.log`, `shading-phong-cat-validate.log`, and
+`texture-after-phong.log` in the same staging directory.
+
+This does not yet validate multiple lights, cel shading, or the remaining
+glmark2 scenes.
