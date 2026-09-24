@@ -1798,13 +1798,18 @@ static int chrome9_fragment_raster_selftest(void)
 }
 
 static int chrome9_fragment_fe_config(u32 active_texture_count,
-	u8 stage0_coordinate, u32 varying_count, u8 tau_coordinate_mask,
-	const u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS], u32 config[8])
+	u32 texture_count, u32 varying_count,
+	const u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS], u32 config[10])
 {
+	/* These are self-addressed register words.  Write A02/A03 on every
+	 * draw so a smaller next program cannot inherit stale high FE fields.
+	 * Keep the qualified one-/two-input A01 tail as the empty baseline.
+	 */
 	static const u32 default_config[] = {
 		0x00000001, 0x01002521, 0x08010100,
 		0x04000000, 0x05000000, 0x0d810000,
 		0x09000000, 0x0a000000,
+		0x02000000, 0x03000000,
 	};
 	unsigned int i;
 
@@ -1818,12 +1823,23 @@ static int chrome9_fragment_fe_config(u32 active_texture_count,
 	config[2] |= varying_count;
 	for (i = 0; i < varying_count; i++) {
 		u32 producer_width = varying_width[i];
+		/* An ALU-only float4 consumer is live-qualified at width four.
+		 * A programmable draw with descriptors takes the vendor's
+		 * three-component ComputeTexDim cap for every compact FE field.
+		 */
+		u32 consumer_width = min_t(u32, producer_width,
+					   texture_count ? 3 : 4);
+		u32 consumer_word = i < 3 ? 1 : i < 6 ? 8 : 9;
+		u32 consumer_shift = (i < 3 ? i : i < 6 ? i - 3 : i - 6) * 8;
 		u32 word, shift;
 
-		/* A mixed high slot needs a distinct producer/consumer oracle. */
-		if (i >= 2 && tau_coordinate_mask & BIT(i) &&
-		    producer_width != 2)
-			return -EOPNOTSUPP;
+		/* Direct ALU and TAU reads share the compact T-input order.  The
+		 * programmable FE caps producer width by physical consumer ordinal,
+		 * independently of the sampler selected by each TAU instruction.
+		 */
+		config[consumer_word] &= ~(0xffU << consumer_shift);
+		config[consumer_word] |=
+			(0x20 | i << 2 | (consumer_width - 1)) << consumer_shift;
 		if (i < 2) {
 			word = 2;
 			shift = 8 * (i + 1);
@@ -1837,15 +1853,6 @@ static int chrome9_fragment_fe_config(u32 active_texture_count,
 		config[word] &= ~(0xffU << shift);
 		config[word] |= (producer_width - 1) << shift;
 	}
-	/* The programmable triangle-list writer caps stage 0's mapped VS
-	 * coordinate width at three, independently of the sampler's nominal 2-D
-	 * lookup. With no stage 0, ALU-only T0 uses its full producer width.
-	 */
-	if (stage0_coordinate < varying_count)
-		config[1] = (config[1] & ~0x3U) |
-			(min_t(u32, varying_width[stage0_coordinate], 3) - 1);
-	else if (stage0_coordinate == 0xff && varying_count)
-		config[1] = (config[1] & ~0x3U) | (varying_width[0] - 1);
 	return 0;
 }
 
@@ -1854,76 +1861,106 @@ static int chrome9_fragment_fe_config_selftest(void)
 	static const struct {
 		u8 count;
 		u8 width[8];
-		u32 a01, a08, a09, a0a;
+		u32 a01, a02, a03, a08, a09, a0a;
 	} cases[] = {
-		{ 1, { 1 }, 0x01002520, 0x08010001, 0x09000000,
+		{ 1, { 1 }, 0x01002520, 0x02000000, 0x03000000,
+		  0x08010001, 0x09000000,
 		  0x0a000000 },
-		{ 1, { 2 }, 0x01002521, 0x08010101, 0x09000000,
+		{ 1, { 2 }, 0x01002521, 0x02000000, 0x03000000,
+		  0x08010101, 0x09000000,
 		  0x0a000000 },
-		{ 1, { 3 }, 0x01002522, 0x08010201, 0x09000000,
+		{ 1, { 3 }, 0x01002522, 0x02000000, 0x03000000,
+		  0x08010201, 0x09000000,
 		  0x0a000000 },
-		{ 1, { 4 }, 0x01002523, 0x08010301, 0x09000000,
+		{ 1, { 4 }, 0x01002523, 0x02000000, 0x03000000,
+		  0x08010301, 0x09000000,
 		  0x0a000000 },
-		{ 3, { 4, 2, 3 }, 0x01002523, 0x08010303,
+		{ 3, { 4, 2, 3 }, 0x012a2523, 0x02000000, 0x03000000,
+		  0x08010303,
 		  0x09000002, 0x0a000000 },
-		{ 5, { 1, 4, 2, 3, 1 }, 0x01002520, 0x08030005, 0x09000201,
+		{ 5, { 1, 4, 2, 3, 1 }, 0x01292720, 0x0200302e,
+		  0x03000000, 0x08030005, 0x09000201,
 		  0x0a000000 },
-		{ 8, { 4, 1, 2, 3, 4, 1, 2, 3 }, 0x01002523, 0x08000308,
+		{ 8, { 4, 1, 2, 3, 4, 1, 2, 3 }, 0x01292423, 0x0234332e,
+		  0x03003e39, 0x08000308,
 		  0x09030201, 0x0a020100 },
 	};
 	static const u8 empty_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	static const u8 packed3_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 3 };
 	static const u8 packed4_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 4 };
 	static const u8 mixed_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 4, 2 };
-	u32 config[8];
+	static const u8 terrain_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = {
+		4, 4, 4, 2,
+	};
+	static const u8 five_float2[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = {
+		2, 2, 2, 2, 2,
+	};
+	u32 config[10];
 	unsigned int i;
 
-	if (chrome9_fragment_fe_config(0, 0xff, 0, 0, empty_width, config))
+	if (chrome9_fragment_fe_config(0, 0, 0, empty_width, config))
 		return -EINVAL;
 	if (config[0] != 0x00000001 || config[1] != 0x01002521 ||
 	    config[2] != 0x08010100 ||
-	    config[6] != 0x09000000 || config[7] != 0x0a000000)
+	    config[6] != 0x09000000 || config[7] != 0x0a000000 ||
+	    config[8] != 0x02000000 || config[9] != 0x03000000)
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
-		if (chrome9_fragment_fe_config(cases[i].count, 0xff, cases[i].count,
-					       0, cases[i].width, config))
+		if (chrome9_fragment_fe_config(cases[i].count, 0,
+					       cases[i].count, cases[i].width,
+					       config))
 			return -EINVAL;
 		if (config[0] != (cases[i].count << 4 | 1) ||
 		    config[1] != cases[i].a01 ||
 		    config[2] != cases[i].a08 || config[6] != cases[i].a09 ||
-		    config[7] != cases[i].a0a)
+		    config[7] != cases[i].a0a || config[8] != cases[i].a02 ||
+		    config[9] != cases[i].a03)
 			return -EINVAL;
 	}
 	/* A sparse sampler or an ALU-produced TAU coordinate does not add a
 	 * vertex-shader output to A08.
 	 */
-	if (chrome9_fragment_fe_config(1, 0, 0, BIT(0), empty_width, config) ||
+	if (chrome9_fragment_fe_config(1, 1, 0, empty_width, config) ||
 	    config[0] != 0x00000011 || config[1] != 0x01002521 ||
 	    config[2] != 0x08010100 || config[6] != 0x09000000 ||
-	    config[7] != 0x0a000000)
+	    config[7] != 0x0a000000 || config[8] != 0x02000000 ||
+	    config[9] != 0x03000000)
 		return -EINVAL;
-	/* Stage zero maps to the produced float3/float4 T0, capped at the
-	 * programmable pipeline's three-component consumer dimension.
+	/* A textured float3/float4 T0 is capped at three components.
 	 */
-	if (chrome9_fragment_fe_config(1, 0, 1, BIT(0), packed3_width, config) ||
+	if (chrome9_fragment_fe_config(1, 1, 1, packed3_width, config) ||
 	    config[1] != 0x01002522 || config[2] != 0x08010201 ||
-	    chrome9_fragment_fe_config(1, 0, 1, BIT(0), packed4_width, config) ||
+	    chrome9_fragment_fe_config(1, 1, 1, packed4_width, config) ||
 	    config[1] != 0x01002522 || config[2] != 0x08010301)
 		return -EINVAL;
-	/* Stage 0 retains its 2-D consumer dimension when it samples T1 while
-	 * ALU independently reads a four-component T0 producer.
+	/* ALU T0 precedes sampled T1, with the cap applied to each FE field.
 	 */
-	if (chrome9_fragment_fe_config(2, 1, 2, BIT(1), mixed_width, config) ||
-	    config[1] != 0x01002521 ||
+	if (chrome9_fragment_fe_config(2, 1, 2, mixed_width, config) ||
+	    config[1] != 0x01002522 ||
 	    config[2] != 0x08010302)
 		return -EINVAL;
 	/* One MAD can read three T slots while using one active resource. */
-	if (chrome9_fragment_fe_config(1, 0xff, cases[4].count, 0,
+	if (chrome9_fragment_fe_config(1, 0, cases[4].count,
 				       cases[4].width, config) ||
 	    config[0] != 0x00000011 || config[2] != cases[4].a08)
 		return -EINVAL;
-	if (chrome9_fragment_fe_config(4, 0, cases[5].count, BIT(3),
-				       cases[5].width, config) != -EOPNOTSUPP)
+	/* Five direct float2 inputs use A01 then A02; a later one-input draw
+	 * resets both A02 and A03 instead of inheriting the prior map.
+	 */
+	if (chrome9_fragment_fe_config(5, 5, 5, five_float2, config) ||
+	    config[1] != 0x01292521 || config[8] != 0x0200312d ||
+	    config[9] != 0x03000000 ||
+	    chrome9_fragment_fe_config(1, 1, 1, five_float2, config) ||
+	    config[1] != 0x01002521 || config[8] != 0x02000000 ||
+	    config[9] != 0x03000000)
+		return -EINVAL;
+	/* The terrain-sized mixed-width map is capped per physical input, not
+	 * by the dimensions of the five logical sampler descriptors.
+	 */
+	if (chrome9_fragment_fe_config(5, 5, 4, terrain_width, config) ||
+	    config[1] != 0x012a2622 || config[8] != 0x0200002d ||
+	    config[9] != 0x03000000 || config[2] != 0x08030304 ||
+	    config[6] != 0x09000103)
 		return -EINVAL;
 	return 0;
 }
@@ -2028,7 +2065,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	struct chrome9_blend_words blend_words;
 	u32 cookie[] = { CHROME9_2D_REG_DST_POS, job->cookie };
 	u32 destination_state[16];
-	u32 config[8];
+	u32 config[10];
 	u32 common[32] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
 		0x01ce1540, 0x88001ed0, 0x89000800,
@@ -2057,8 +2094,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	if (!base || !program || !request->fragment_vertices || !rt_format)
 		return -EINVAL;
 	ret = chrome9_fragment_fe_config(program->active_texture_count,
-		program->stage0_coordinate, program->varying_count,
-		program->tau_coordinate_mask,
+		program->texture_count, program->varying_count,
 		program->varying_width, config);
 	if (ret)
 		return ret;

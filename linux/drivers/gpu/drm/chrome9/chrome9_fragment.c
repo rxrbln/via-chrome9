@@ -968,22 +968,6 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 				(u32)coordinate->swizzle[2] << 6 |
 				(u32)coordinate->swizzle[3] << 4;
 
-			/* A01 needs one direct stage-zero varying.  Each computed TEX
-			 * carries its own coordinate slot in TAU; keep the first computed
-			 * slot only to suppress the ALU-only T0 fallback in FE setup. */
-			if (!instruction->sampler) {
-				if (computed) {
-					if (program->stage0_coordinate == 0xff)
-						program->stage0_coordinate = coordinate_id;
-				} else {
-					if (program->stage0_coordinate <
-					    program->varying_count &&
-					    program->stage0_coordinate != coordinate_id)
-						return -EOPNOTSUPP;
-					program->stage0_coordinate = coordinate_id;
-				}
-			}
-
 			if (computed) {
 				enum chrome9_fragment_slot slots[3] = { 0 };
 				u32 *bridge;
@@ -1176,7 +1160,6 @@ static int chrome9_fragment_compile_internal(
 	int ret;
 
 	memset(program, 0, sizeof(*program));
-	program->stage0_coordinate = 0xff;
 	ret = chrome9_fragment_validate(&state, instruction_count,
 		constant_count, texture_count, descriptor_mask,
 		sparse_textures, varying_count);
@@ -1657,7 +1640,6 @@ static int chrome9_fragment_position_selftest(struct chrome9_fragment_program *p
 	if (ret || program->alu_count != ARRAY_SIZE(expected_texture_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301101b0 ||
 	    program->varying_count || program->active_texture_count ||
-	    program->stage0_coordinate != 0 ||
 	    memcmp(program->alu, expected_texture_alu,
 		   sizeof(expected_texture_alu)) ||
 	    memcmp(program->controls, expected_texture_controls,
@@ -1842,7 +1824,6 @@ static int chrome9_fragment_vec3_cmp_selftest(
 	    program->tau_count || program->constant_count != 3 ||
 	    program->texture_count || program->varying_count ||
 	    program->active_texture_count || program->tau_coordinate_mask ||
-	    program->stage0_coordinate ||
 	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
 	    memcmp(program->controls, expected_controls,
 		   sizeof(expected_controls)))
@@ -2522,6 +2503,8 @@ int chrome9_fragment_selftest(void)
 	static const u32 constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4];
 	struct drm_chrome9_fragment_instruction sparse_sampler[
 		ARRAY_SIZE(swizzled_texture)];
+	struct drm_chrome9_fragment_instruction crossed_sampler[
+		ARRAY_SIZE(conflicting_direct)];
 	struct chrome9_fragment_program *program;
 	int ret;
 
@@ -2551,7 +2534,6 @@ int chrome9_fragment_selftest(void)
 	ret = chrome9_fragment_compile(repeated_computed,
 		ARRAY_SIZE(repeated_computed), constants, 3, 1, 0, program);
 	if (ret || program->tau_count != 2 || program->alu_count != 5 ||
-	    program->stage0_coordinate != 0 ||
 	    (program->tau[0] >> 12 & 7) != 0 ||
 	    (program->tau[1] >> 12 & 7) != 1 ||
 	    program->tau_coordinate_mask != (BIT(0) | BIT(1)) ||
@@ -2560,9 +2542,31 @@ int chrome9_fragment_selftest(void)
 		ret = -EINVAL;
 		goto out;
 	}
-	if (chrome9_fragment_compile(conflicting_direct,
-		ARRAY_SIZE(conflicting_direct), constants, 0, 1, 2,
-		program) != -EOPNOTSUPP) {
+	ret = chrome9_fragment_compile(conflicting_direct,
+		ARRAY_SIZE(conflicting_direct), constants, 0, 1, 2, program);
+	if (ret || program->varying_count != 2 ||
+	    program->varying_logical[0] != 0 ||
+	    program->varying_logical[1] != 1 ||
+	    program->tau_coordinate_mask != (BIT(0) | BIT(1))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* Sampler order is independent of direct T-input order: s0 reads
+	 * compact coordinate one while s5 reads compact coordinate zero.
+	 */
+	memcpy(crossed_sampler, conflicting_direct, sizeof(crossed_sampler));
+	crossed_sampler[0].src[0].index = 1;
+	crossed_sampler[1].src[0].index = 0;
+	crossed_sampler[1].sampler = 5;
+	ret = chrome9_fragment_compile_sparse(crossed_sampler,
+		ARRAY_SIZE(crossed_sampler), constants, 0, 2,
+		BIT(0) | BIT(5), 2, program);
+	if (ret || program->varying_count != 2 ||
+	    program->varying_logical[0] != 0 ||
+	    program->varying_logical[1] != 1 ||
+	    (program->tau[0] >> 12 & 7) != 1 ||
+	    (program->tau[1] >> 12 & 7) != 0 ||
+	    program->tau_coordinate_mask != (BIT(0) | BIT(1))) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -2619,7 +2623,6 @@ int chrome9_fragment_selftest(void)
 		ARRAY_SIZE(sparse_varyings), constants, 0, 1, 6, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301011b0 ||
-	    program->stage0_coordinate != 1 ||
 	    program->tau_coordinate_mask != BIT(1) ||
 	    program->varying_count != 2 || program->varying_logical[0] != 0 ||
 	    program->varying_width[0] != 4 ||
@@ -2637,7 +2640,6 @@ int chrome9_fragment_selftest(void)
 	    program->varying_logical[1] != 1 ||
 	    program->varying_width[0] != 4 ||
 	    program->varying_width[1] != 2 ||
-	    program->stage0_coordinate != 1 ||
 	    program->tau_coordinate_mask != BIT(1) ||
 	    program->active_texture_count != 2) {
 		ret = -EINVAL;
@@ -2647,7 +2649,6 @@ int chrome9_fragment_selftest(void)
 		ARRAY_SIZE(packed_varying), constants, 0, 1, 1, program);
 	if (ret || program->alu_count != 1 || program->tau_count != 1 ||
 	    program->tau[0] != 0x301006f0 || program->varying_count != 1 ||
-	    program->stage0_coordinate != 0 ||
 	    program->tau_coordinate_mask != BIT(0) ||
 	    program->varying_logical[0] || program->varying_width[0] != 3 ||
 	    program->alu[0][1] != 0x302c0000 ||
@@ -2665,7 +2666,6 @@ int chrome9_fragment_selftest(void)
 	    program->alu_count != ARRAY_SIZE(expected_packed_gray_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301006f0 ||
 	    program->active_texture_count != 1 ||
-	    program->stage0_coordinate != 0 ||
 	    program->tau_coordinate_mask != BIT(0) ||
 	    program->varying_count != 1 || program->varying_width[0] != 3 ||
 	    memcmp(program->alu, expected_packed_gray_alu,
@@ -2681,7 +2681,6 @@ int chrome9_fragment_selftest(void)
 	    program->alu_count != ARRAY_SIZE(expected_packed_gray_partial_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301006f0 ||
 	    program->active_texture_count != 1 ||
-	    program->stage0_coordinate != 0 ||
 	    program->tau_coordinate_mask != BIT(0) ||
 	    program->varying_count != 1 || program->varying_width[0] != 3 ||
 	    memcmp(program->alu, expected_packed_gray_partial_alu,
