@@ -113,6 +113,17 @@ module_param_named(hw_tcl, chrome9_hw_tcl, bool, 0400);
 MODULE_PARM_DESC(hw_tcl,
 	"Enable the pre-promotion hardware vertex program ioctl (default: false)");
 
+/* RE knob for the two-side/UCP ladder: 1 clear A61[19], 2 no saturate on
+ * oBFD0, 4 UCP perspective (A05[6]/[14]), 8 UCP bits in A28/A29. */
+#define CHROME9_TCL_RE_NO_A61_BFC	BIT(0)
+#define CHROME9_TCL_RE_NO_BFD_SAT	BIT(1)
+#define CHROME9_TCL_RE_UCP_PERSPECTIVE	BIT(2)
+#define CHROME9_TCL_RE_UCP_CONSUMER	BIT(3)
+static uint chrome9_tcl_re;
+module_param_named(tcl_re, chrome9_tcl_re, uint, 0600);
+MODULE_PARM_DESC(tcl_re,
+	"Debug: two-side/UCP oracle variants for hardware TCL (default: 0)");
+
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
@@ -219,6 +230,10 @@ struct chrome9_tcl_draw {
 	u32 stride_dw;
 	u32 element_count;
 	u32 cull;
+	/* Enabled user clip planes (DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE). */
+	u32 clip_mask;
+	/* chrome9_tcl_re sampled once per ioctl. */
+	u32 re;
 	u8 element_format[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 element_type[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 element_offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
@@ -2180,9 +2195,12 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		const struct chrome9_tcl_draw *tcl, const u32 *addresses,
 		u32 raster[CHROME9_TCL_RASTER_WORDS])
 {
-	u32 outputs = fp->varying_count ? 3 + fp->varying_count : 5;
+	u32 planes = hweight32(tcl->clip_mask);
+	u32 groups = DIV_ROUND_UP(planes, 3);
+	u32 outputs = fp->varying_count || groups ?
+		      3 + fp->varying_count + groups : 5;
 	u32 link[4];
-	unsigned int e, i = 0;
+	unsigned int e, g, i = 0;
 
 	/* Stage B: SF memory type (A00[16:15] = 01); element bits 19:12 hold
 	 * address bits 9:2 inside the slot's 1-KiB window. */
@@ -2196,7 +2214,8 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	/* Superset of the input and output masks; the vendor quad uses 1f. */
 	raster[i++] = 0x12000000 |
 		      GENMASK(max(outputs, tcl->element_count) - 1, 0);
-	raster[i++] = tcl->program.a61;
+	raster[i++] = tcl->program.a61 &
+		      ~(tcl->re & CHROME9_TCL_RE_NO_A61_BFC ? BIT(19) : 0);
 	raster[i++] = tcl->program.a62;
 	/* A20[0] index mode, A20[1] 32-bit indices. */
 	raster[i++] = addresses ? 0x20000001 | (tcl->index32 ? 2 : 0) :
@@ -2205,13 +2224,28 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	 * 14:12 select Gouraud (4) or flat from the third vertex C (3). */
 	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ?
 			0x23004e02 : 0x23004f02) & ~GENMASK(14, 12)) |
-		      (tcl->cull & DRM_CHROME9_VERTEX_FLAT ? 0x3000 : 0x4000);
+		      (tcl->cull & DRM_CHROME9_VERTEX_FLAT ? 0x3000 : 0x4000) |
+		      /* A23[7]: set = CCW triangles take oBFD (vendor front CW). */
+		      (tcl->cull & DRM_CHROME9_VERTEX_BFC_CCW ? BIT(7) : 0);
 	raster[i++] = 0x24000000 |
 		      (addresses ? tcl->index_count : tcl->vertex_count);
-	if (fp->varying_count) {
+	if (fp->varying_count || groups) {
 		chrome9_fragment_link_words(fp->varying_count, fp->varying_width,
 					    fp->texture_count,
 					    fp->varying_alu_width, link);
+		/* UCP coordinates are VS outputs only (stmUpdateFVFOut_H5i). */
+		for (g = 0; g < groups; g++) {
+			u32 coordinate = fp->varying_count + g;
+			u32 lanes = min(planes - 3 * g, 3U);
+
+			link[coordinate < 4 ? 0 : 1] |=
+				chrome9_fragment_varying_link(lanes) <<
+				(12 - 4 * (coordinate & 3));
+			if (tcl->re & CHROME9_TCL_RE_UCP_CONSUMER)
+				link[coordinate < 4 ? 2 : 3] |=
+					chrome9_fragment_varying_link(lanes) <<
+					(12 - 4 * (coordinate & 3));
+		}
 		memcpy(raster + i, link, sizeof(link));
 		i += ARRAY_SIZE(link);
 	} else {
@@ -2295,6 +2329,18 @@ static int chrome9_tcl_raster_selftest(void)
 	    chrome9_tcl_stream_slot(stage_b_address[1], 8) != 0x00200002 ||
 	    chrome9_tcl_stream_slot(stage_b_address[2], 4) != 0x00300001 ||
 	    chrome9_tcl_stream_slot(0x00100404, 2044) != 0x001005ff)
+		goto out;
+	/* BFC for CCW, two planes behind one ST varying: oT1.xy, A25 cc. */
+	tcl->cull = DRM_CHROME9_VERTEX_BFC_CCW;
+	tcl->clip_mask = 0x3;
+	fp->varying_count = 1;
+	fp->varying_width[0] = 2;
+	fp->varying_logical[0] = 0;
+	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
+		ARRAY_SIZE(expected) + 2 ||
+	    raster[4] != 0x1200001f || raster[8] != 0x23004f82 ||
+	    raster[10] != 0x25f6cc00 || raster[11] != 0x26000000 ||
+	    raster[12] != 0x28ffc000 || raster[13] != 0x29000000)
 		goto out;
 	ret = 0;
 out:
@@ -2581,6 +2627,40 @@ static int chrome9_fragment_fe_config(u32 active_texture_count,
 	return 0;
 }
 
+/*
+ * Hardware user clip planes (FE A05): plane rank k is lane k % 3 of VS
+ * coordinate base + k / 3; A08 counts the extra coordinates and their
+ * dimensions follow the producer-width layout of the varyings.
+ */
+static void chrome9_fragment_fe_ucp(u32 base, u32 planes, u32 config[10])
+{
+	u32 groups = DIV_ROUND_UP(planes, 3);
+	u32 a05 = 0x05000000;
+	unsigned int g;
+
+	for (g = 0; g < groups; g++) {
+		u32 coordinate = base + g;
+		u32 dim = min(planes - 3 * g, 3U) - 1;
+		u32 word, shift;
+
+		a05 |= (BIT(7) | coordinate << 2 | dim) << (8 * g);
+		if (coordinate < 2) {
+			word = 2;
+			shift = 8 * (coordinate + 1);
+		} else if (coordinate < 5) {
+			word = 6;
+			shift = 8 * (coordinate - 2);
+		} else {
+			word = 7;
+			shift = 8 * (coordinate - 5);
+		}
+		config[word] &= ~(0xffU << shift);
+		config[word] |= dim << shift;
+	}
+	config[2] = (config[2] & ~GENMASK(4, 0)) | (base + groups);
+	config[4] = a05;
+}
+
 static int chrome9_fragment_fe_config_selftest(void)
 {
 	static const struct {
@@ -2687,6 +2767,17 @@ static int chrome9_fragment_fe_config_selftest(void)
 	/* The terrain-sized mixed-width map is capped per physical input, not
 	 * by the dimensions of the five logical sampler descriptors.
 	 */
+	/* UCP: 2 planes after one ST varying, then 4 planes (vendor table). */
+	if (chrome9_fragment_fe_config(1, 1, 1, packed3_width, NULL, config))
+		return -EINVAL;
+	chrome9_fragment_fe_ucp(1, 2, config);
+	if (config[4] != 0x05000085 || (config[2] & 0x1f) != 2 ||
+	    (config[2] >> 16 & 0xff) != 1)
+		return -EINVAL;
+	chrome9_fragment_fe_ucp(1, 4, config);
+	if (config[4] != 0x05008886 || (config[2] & 0x1f) != 3 ||
+	    (config[2] >> 16 & 0xff) != 2 || (config[6] & 0xff) != 0)
+		return -EINVAL;
 	if (chrome9_fragment_fe_config(5, 5, 4, terrain_width, NULL, config) ||
 	    config[1] != 0x012a2622 || config[8] != 0x0200002d ||
 	    config[9] != 0x03000000 || config[2] != 0x08030304 ||
@@ -2827,6 +2918,13 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		program->varying_width, program->varying_alu_width, config);
 	if (ret)
 		return ret;
+	if (tcl && tcl->clip_mask) {
+		chrome9_fragment_fe_ucp(program->varying_count,
+					hweight32(tcl->clip_mask), config);
+		if (tcl->re & CHROME9_TCL_RE_UCP_PERSPECTIVE)
+			config[4] |= BIT(6) |
+				(hweight32(tcl->clip_mask) > 3 ? BIT(14) : 0);
+	}
 	vs_control[0] = 0x60800000 | (3 + program->varying_count);
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
@@ -8636,9 +8734,16 @@ static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 		ret = chrome9_vertex_compile(tcl->instructions,
 			tcl->instruction_count, program, tcl->element_count,
 			tcl->input_lanes, tcl->constant_first,
-			tcl->constant_count, &tcl->program);
+			tcl->constant_count,
+			tcl->cull & (DRM_CHROME9_VERTEX_BFC_CW |
+				     DRM_CHROME9_VERTEX_BFC_CCW),
+			tcl->clip_mask, &tcl->program);
 		if (ret)
 			goto out_free;
+		if (tcl->re & CHROME9_TCL_RE_NO_BFD_SAT)
+			for (i = 0; i < tcl->program.record_count; i++)
+				if ((tcl->program.records[i][3] >> 4 & 0xff) == 0x24)
+					tcl->program.records[i][3] &= ~BIT(14);
 		request.triangle_count = tcl->vertex_count / 3;
 		request.tcl = tcl;
 	}
@@ -8828,9 +8933,16 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	if (args->abi_version != DRM_CHROME9_VERTEX_ABI_VERSION ||
 	    (args->flags & ~(DRM_CHROME9_VERTEX_CULL_CW |
 			     DRM_CHROME9_VERTEX_CULL_CCW |
-			     DRM_CHROME9_VERTEX_FLAT)) ||
+			     DRM_CHROME9_VERTEX_FLAT |
+			     DRM_CHROME9_VERTEX_BFC_CW |
+			     DRM_CHROME9_VERTEX_BFC_CCW)) ||
 	    hweight32(args->flags & (DRM_CHROME9_VERTEX_CULL_CW |
 				     DRM_CHROME9_VERTEX_CULL_CCW)) > 1 ||
+	    hweight32(args->flags & (DRM_CHROME9_VERTEX_BFC_CW |
+				     DRM_CHROME9_VERTEX_BFC_CCW)) > 1 ||
+	    (args->clip_distance_mask &
+	     ~GENMASK(DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES - 1, 0)) ||
+	    args->pad0 ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->instruction_count ||
 	    args->instruction_count > DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS ||
@@ -8848,6 +8960,8 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 		return -ENOMEM;
 	tcl->instruction_count = args->instruction_count;
 	tcl->cull = args->flags;
+	tcl->clip_mask = args->clip_distance_mask;
+	tcl->re = READ_ONCE(chrome9_tcl_re);
 	tcl->element_count = args->element_count;
 	tcl->constant_first = args->constant_first;
 	tcl->constant_count = args->constant_count;

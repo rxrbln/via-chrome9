@@ -25,6 +25,9 @@
 #define CHROME9_VS_DEST_TEMP		0x10U
 #define CHROME9_VS_DEST_D0		0x22U
 #define CHROME9_VS_DEST_D1		0x23U
+/* Back-face colors oBFD0/oBFD1 (vendor oD2/oD3, unified outputs 36/37). */
+#define CHROME9_VS_DEST_BFD0		0x24U
+#define CHROME9_VS_DEST_BFD1		0x25U
 #define CHROME9_VS_DEST_T		0x28U
 #define CHROME9_VS_DEST_POSITION	0xa0U
 #define CHROME9_VS_LITERAL_ONE		0x00206490U
@@ -106,6 +109,12 @@ struct chrome9_vertex_state {
 	u32 physical_high_water;
 	u8 position_mask;
 	u8 primary_mask;
+	u8 back_mask;
+	bool two_side;
+	/* Enabled planes, written planes and the first UCP coordinate. */
+	u32 clip_mask;
+	u32 clip_written;
+	u32 clip_base;
 	u8 varying_mask[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 varying_packed[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u32 position_writes;
@@ -235,6 +244,13 @@ static int chrome9_vertex_packed_varying(const struct chrome9_fragment_program *
 	return -EINVAL;
 }
 
+/* Enabled plane k lands in UCP coordinate rank / 3, lane rank % 3. */
+static u32 chrome9_vertex_clip_rank(const struct chrome9_vertex_state *state,
+				    u32 plane)
+{
+	return hweight32(state->clip_mask & (BIT(plane) - 1));
+}
+
 static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	const struct chrome9_fragment_program *fragment,
 	const struct drm_chrome9_vertex_instruction *insn, u32 instruction)
@@ -280,6 +296,27 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 		state->varying_packed[dst->index] = packed;
 		defined = &state->varying_mask[packed];
 		break;
+	case DRM_CHROME9_VERTEX_DEST_BACK_PRIMARY:
+		if (dst->index || !state->two_side)
+			return -EINVAL;
+		if (!fragment->primary_used)
+			mask = 0;
+		defined = &state->back_mask;
+		break;
+	case DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE:
+		if (dst->index >= DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES ||
+		    mask != 1)
+			return -EINVAL;
+		if (!(state->clip_mask & BIT(dst->index))) {
+			state->writemask[instruction] = 0;
+			return 0;
+		}
+		if (state->clip_written & BIT(dst->index))
+			return -EINVAL;
+		state->clip_written |= BIT(dst->index);
+		state->writemask[instruction] =
+			BIT(chrome9_vertex_clip_rank(state, dst->index) % 3);
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -323,7 +360,10 @@ static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 			return ret;
 	}
 	if (state->position_mask != 0xf ||
-	    (fragment->primary_used && state->primary_mask != 0xf))
+	    (fragment->primary_used && state->primary_mask != 0xf) ||
+	    (state->two_side && fragment->primary_used &&
+	     state->back_mask != 0xf) ||
+	    state->clip_written != state->clip_mask)
 		return -EINVAL;
 	for (i = 0; i < fragment->varying_count; i++)
 		if (state->varying_mask[i] !=
@@ -396,12 +436,14 @@ static int chrome9_vertex_emit(struct chrome9_vertex_state *state,
 }
 
 static int chrome9_vertex_encode(struct chrome9_vertex_state *state,
-	const struct drm_chrome9_vertex_instruction *insn, u32 instruction,
+	const struct drm_chrome9_vertex_instruction *user, u32 instruction,
 	struct chrome9_vertex_program *program)
 {
+	const struct drm_chrome9_vertex_instruction *insn = user;
+	struct drm_chrome9_vertex_instruction moved;
 	u32 count = chrome9_vertex_source_count[insn->op];
 	bool sat = insn->dst.modifier & DRM_CHROME9_FRAGMENT_DEST_SAT;
-	u32 temp = U32_MAX, dest, record[4] = { 0 };
+	u32 temp = U32_MAX, dest, rank, record[4] = { 0 };
 	unsigned int s;
 	int ret;
 
@@ -443,6 +485,26 @@ static int chrome9_vertex_encode(struct chrome9_vertex_state *state,
 	case DRM_CHROME9_VERTEX_DEST_PRIMARY:
 		dest = CHROME9_VS_DEST_D0;
 		sat = true;
+		break;
+	case DRM_CHROME9_VERTEX_DEST_BACK_PRIMARY:
+		/* The vendor compiler omits bit 14 here; clamp like oD0. */
+		dest = CHROME9_VS_DEST_BFD0;
+		sat = true;
+		break;
+	case DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE:
+		rank = chrome9_vertex_clip_rank(state, insn->dst.index);
+		dest = CHROME9_VS_DEST_T + state->clip_base + rank / 3;
+		/* Lane-wise ops compute the written lane from its own selectors;
+		 * dot products broadcast. */
+		if (rank % 3 && insn->op != DRM_CHROME9_VERTEX_OP_DP3 &&
+		    insn->op != DRM_CHROME9_VERTEX_OP_DP4 &&
+		    insn->op != DRM_CHROME9_VERTEX_OP_DPH) {
+			moved = *user;
+			for (s = 0; s < count; s++)
+				moved.src[s].swizzle[rank % 3] =
+					user->src[s].swizzle[0];
+			insn = &moved;
+		}
 		break;
 	default:
 		dest = CHROME9_VS_DEST_T + state->varying_packed[insn->dst.index];
@@ -492,12 +554,16 @@ int chrome9_vertex_compile(
 	const struct drm_chrome9_vertex_instruction *instructions,
 	u32 instruction_count, const struct chrome9_fragment_program *fragment,
 	u32 input_count, const u8 *input_lanes, u32 constant_first,
-	u32 constant_count, struct chrome9_vertex_program *program)
+	u32 constant_count, bool two_side, u32 clip_mask,
+	struct chrome9_vertex_program *program)
 {
 	static const u32 fill_d0[4] = { CHROME9_VS_LITERAL_ZERO, 0, 0,
 		CHROME9_VS_NATIVE_MOV << 17 | BIT(14) | CHROME9_VS_DEST_D0 << 4 | 0xf };
 	static const u32 fill_d1[4] = { CHROME9_VS_LITERAL_ZERO, 0, 0,
 		CHROME9_VS_NATIVE_MOV << 17 | BIT(14) | CHROME9_VS_DEST_D1 << 4 | 0xf };
+	static const u32 fill_bfd1[4] = { CHROME9_VS_LITERAL_ZERO, 0, 0,
+		CHROME9_VS_NATIVE_MOV << 17 | BIT(14) | CHROME9_VS_DEST_BFD1 << 4 | 0xf };
+	bool back;
 	struct chrome9_vertex_state *state;
 	u32 i, record[4] = { 0 };
 	int ret;
@@ -506,8 +572,14 @@ int chrome9_vertex_compile(
 	    instruction_count > DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS ||
 	    !input_count || input_count > DRM_CHROME9_VERTEX_MAX_INPUTS ||
 	    constant_first > DRM_CHROME9_VERTEX_MAX_CONSTANTS ||
-	    constant_count > DRM_CHROME9_VERTEX_MAX_CONSTANTS - constant_first)
+	    constant_count > DRM_CHROME9_VERTEX_MAX_CONSTANTS - constant_first ||
+	    clip_mask & ~GENMASK(DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES - 1, 0))
 		return -EINVAL;
+	/* UCP coordinates follow the packed varyings inside A..H. */
+	if (fragment->varying_count + DIV_ROUND_UP(hweight32(clip_mask), 3) >
+	    DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
+		return -E2BIG;
+	back = two_side && fragment->primary_used;
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
 	if (!state)
 		return -ENOMEM;
@@ -518,6 +590,9 @@ int chrome9_vertex_compile(
 	state->constant_first = constant_first;
 	state->constant_end = constant_first + constant_count;
 	state->last_input_record = -1;
+	state->two_side = two_side;
+	state->clip_mask = clip_mask;
+	state->clip_base = fragment->varying_count;
 	memset(state->physical, CHROME9_VERTEX_NO_PHYSICAL,
 	       sizeof(state->physical));
 	memset(program, 0, sizeof(*program));
@@ -544,6 +619,12 @@ int chrome9_vertex_compile(
 	ret = chrome9_vertex_emit(state, program, fill_d1);
 	if (ret)
 		goto out;
+	/* A61[19] selects oBFD0 and oBFD1 together; define the unused one. */
+	if (back) {
+		ret = chrome9_vertex_emit(state, program, fill_bfd1);
+		if (ret)
+			goto out;
+	}
 	if (!state->position_direct) {
 		record[0] = (CHROME9_VS_UNIFIED_TEMP +
 			     state->physical[CHROME9_VERTEX_POSITION_TEMP]) << 14 |
@@ -567,6 +648,9 @@ int chrome9_vertex_compile(
 	program->input_count = input_count;
 	program->a60 = 0x60800000 | (program->active_count - 1);
 	program->a61 = program->physical_temps <= 8 ? 0x61800000 : 0x61000000;
+	/* Vendor: A61[19] = (object +0x0c != 0), set by any oD2/oD3 write. */
+	if (back)
+		program->a61 |= BIT(19);
 	/* A62[8:0] names the last record that reads an input (corpus rule). */
 	program->a62 = 0x62008000 | (input_count - 1) << 20 |
 		       state->last_input_record;
@@ -873,7 +957,7 @@ static int chrome9_vertex_check(const struct chrome9_vertex_case *c,
 		fragment->varying_width[i] = c->width[i];
 	}
 	ret = chrome9_vertex_compile(c->insn, c->count, fragment, c->inputs,
-				     NULL, 0, c->constants, program);
+				     NULL, 0, c->constants, false, 0, program);
 	if (ret != c->result)
 		return -EIO;
 	if (ret)
@@ -936,7 +1020,7 @@ static int chrome9_vertex_live_selftest(u32 live,
 
 	memset(fragment, 0, sizeof(*fragment));
 	if (chrome9_vertex_compile(insn, count, fragment, 1, NULL, 0, live,
-				   program)) {
+				   false, 0, program)) {
 		ret = live > CHROME9_VERTEX_PHYSICAL_TEMPS ? 0 : -EIO;
 		goto out;
 	}
@@ -965,6 +1049,98 @@ out:
 	return ret;
 }
 
+/* back_primary_from_c0 corpus row plus the oD0 source; bit 14 added. */
+static const struct drm_chrome9_vertex_instruction back_primary_insn[] = {
+	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
+	VS_I(MOV, VS_DST(PRIMARY, 0, 0xf, 0), VS_R(INPUT, 1)),
+	VS_I(MOV, VS_DST(BACK_PRIMARY, 0, 0xf, 0), VS_R(CONSTANT, 0)),
+};
+static const u32 back_primary_rec[][4] = {
+	{ 0x0008014c, 0, 0, 0x00080a0f },
+	{ 0x0008414c, 0, 0, 0x0008422f },
+	{ 0x0040014c, 0, 0, 0x0008424f },
+	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008423f },
+	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008425f },
+};
+
+/* Planes 0, 1, 3 enabled (ranks 0..2 in oT1.xyz), plane 2 dropped; the
+ * lane-wise ADD for rank 2 moves its X selectors to Z. */
+static const struct drm_chrome9_vertex_instruction clip_insn[] = {
+	VS_I(MOV, VS_POS, VS_R(INPUT, 0)),
+	VS_I(MOV, VS_DST(VARYING, 0, 3, 0), VS_R(INPUT, 1)),
+	VS_I(DP4, VS_DST(CLIP_DISTANCE, 0, 1, 0), VS_R(INPUT, 0), VS_R(CONSTANT, 0)),
+	VS_I(DP4, VS_DST(CLIP_DISTANCE, 1, 1, 0), VS_R(INPUT, 0), VS_R(CONSTANT, 1)),
+	VS_I(DP4, VS_DST(CLIP_DISTANCE, 2, 1, 0), VS_R(INPUT, 0), VS_R(CONSTANT, 3)),
+	VS_I(ADD, VS_DST(CLIP_DISTANCE, 3, 1, 0), VS_R(INPUT, 1), VS_R(CONSTANT, 2)),
+};
+static const u32 clip_rec[][4] = {
+	{ 0x0008014c, 0, 0, 0x00080a0f },
+	{ 0x0008414c, 0, 0, 0x00080283 },
+	{ 0x0008014c, 0x0040014c, 0, 0x00060291 },
+	{ 0x0008014c, 0x0040414c, 0, 0x00060292 },
+	{ 0x0008410c, CHROME9_VS_LITERAL_ONE, 0x0040810c, 0x00040294 },
+	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008422f },
+	{ CHROME9_VS_LITERAL_ZERO, 0, 0, 0x0008423f },
+};
+
+static int chrome9_vertex_expect(const struct chrome9_vertex_program *program,
+				 const u32 (*expected)[4], u32 count, u32 a61,
+				 u32 a62)
+{
+	if (program->record_count != count + CHROME9_VERTEX_FINALIZER_RECORDS ||
+	    memcmp(program->records, expected, count * sizeof(expected[0])) ||
+	    memcmp(program->records[count], chrome9_vertex_finalizer,
+		   sizeof(chrome9_vertex_finalizer)) ||
+	    program->a61 != a61 || program->a62 != a62)
+		return -EIO;
+	return 0;
+}
+
+static int chrome9_vertex_twoside_clip_selftest(
+	struct chrome9_fragment_program *fragment,
+	struct chrome9_vertex_program *program)
+{
+	memset(fragment, 0, sizeof(*fragment));
+	fragment->primary_used = true;
+	if (chrome9_vertex_compile(back_primary_insn, 3, fragment, 2, NULL, 0, 1,
+				   true, 0, program) ||
+	    chrome9_vertex_expect(program, back_primary_rec,
+				  ARRAY_SIZE(back_primary_rec), 0x61880000,
+				  0x62108001))
+		return -EIO;
+	/* BACK_PRIMARY needs a BFC flag; the flag needs a complete write. */
+	if (chrome9_vertex_compile(back_primary_insn, 3, fragment, 2, NULL, 0, 1,
+				   false, 0, program) != -EINVAL ||
+	    chrome9_vertex_compile(back_primary_insn, 2, fragment, 2, NULL, 0, 1,
+				   true, 0, program) != -EINVAL)
+		return -EIO;
+	/* Without a PRIMARY consumer both colors and A61[19] disappear. */
+	fragment->primary_used = false;
+	if (chrome9_vertex_compile(back_primary_insn, 3, fragment, 2, NULL, 0, 1,
+				   true, 0, program) ||
+	    program->a61 != 0x61800000 || program->record_count != 8)
+		return -EIO;
+
+	fragment->varying_count = 1;
+	fragment->varying_width[0] = 2;
+	if (chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
+				   0xb, program) ||
+	    chrome9_vertex_expect(program, clip_rec, ARRAY_SIZE(clip_rec),
+				  0x61800000, 0x62108004))
+		return -EIO;
+	/* Enabled but unwritten plane, invalid plane, UCP budget. */
+	if (chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
+				   0x1b, program) != -EINVAL ||
+	    chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
+				   0x4b, program) != -EINVAL)
+		return -EIO;
+	fragment->varying_count = 7;
+	if (chrome9_vertex_compile(clip_insn, 6, fragment, 2, NULL, 0, 4, false,
+				   0x0f, program) != -E2BIG)
+		return -EIO;
+	return 0;
+}
+
 int chrome9_vertex_selftest(void)
 {
 	static const u32 live[] = { 12, 16, 17 };
@@ -991,11 +1167,17 @@ int chrome9_vertex_selftest(void)
 	/* A FLOAT2 element must not expose its unfetched Z/W lanes. */
 	memset(fragment, 0, sizeof(*fragment));
 	if (chrome9_vertex_compile(mov_opos_v0_insn, 1, fragment, 1,
-				   (const u8[]){ 0x3 }, 0, 0, program) != -EINVAL ||
+				   (const u8[]){ 0x3 }, 0, 0, false, 0,
+				   program) != -EINVAL ||
 	    chrome9_vertex_compile(mov_opos_v0_insn, 1, fragment, 1,
-				   (const u8[]){ 0xf }, 0, 0, program)) {
+				   (const u8[]){ 0xf }, 0, 0, false, 0, program)) {
 		pr_err("chrome9: vertex self-test input lanes failed\n");
 		ret = -EIO;
+		goto out;
+	}
+	ret = chrome9_vertex_twoside_clip_selftest(fragment, program);
+	if (ret) {
+		pr_err("chrome9: vertex self-test two-side/clip failed\n");
 		goto out;
 	}
 	for (i = 0; i < ARRAY_SIZE(live); i++) {
