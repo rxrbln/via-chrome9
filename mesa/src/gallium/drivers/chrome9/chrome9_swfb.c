@@ -20,6 +20,7 @@
 #include "chrome9_public.h"
 #include "chrome9_resource.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "frontend/sw_winsys.h"
 #include "frontend/winsys_handle.h"
 #include "llvmpipe/lp_public.h"
@@ -351,6 +352,49 @@ chrome9_sw_context_destroy(struct chrome9_context *ctx)
    ctx->sw = NULL;
 }
 
+/* Chrome9 fragment shaders read the facing flag as the FACE varying;
+ * llvmpipe provides it as the front-face system value. */
+static bool
+chrome9_sw_lower_face_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   nir_variable *var;
+   nir_def *face, *value;
+
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_in ||
+       var->data.location != VARYING_SLOT_FACE ||
+       intr->def.bit_size != 32)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   face = nir_load_front_face(b, 1);
+   value = glsl_get_base_type(var->type) == GLSL_TYPE_FLOAT ?
+           nir_bcsel(b, face, nir_imm_float(b, 1.0f),
+                     nir_imm_float(b, -1.0f)) :
+           nir_b2b32(b, face);
+   nir_def_replace(&intr->def,
+                   nir_replicate(b, value, intr->def.num_components));
+   return true;
+}
+
+static void
+chrome9_sw_lower_face_input(nir_shader *nir)
+{
+   if (!nir_shader_intrinsics_pass(nir, chrome9_sw_lower_face_instr,
+                                   nir_metadata_control_flow, NULL))
+      return;
+   nir_foreach_shader_in_variable(var, nir)
+      if (var->data.location == VARYING_SLOT_FACE)
+         var->data.mode = nir_var_shader_temp;
+   nir_fixup_deref_modes(nir);
+   nir_opt_dce(nir);
+   nir_remove_dead_variables(nir, nir_var_shader_temp, NULL);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
 static void *
 chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
                   enum chrome9_sw_kind kind, const void *state)
@@ -394,10 +438,13 @@ chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
       /* The chrome9 lowering float-encodes integer uniforms but keeps
        * native 1-bit booleans; gallivm's no_integers path cannot take
        * those, so compile under llvmpipe's own options. */
-      if (shader.ir.nir)
+      if (shader.ir.nir) {
          shader.ir.nir->options =
             sw->screen->nir_options[kind == CHROME9_SW_VS ?
                                     MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT];
+         if (kind == CHROME9_SW_FS)
+            chrome9_sw_lower_face_input(shader.ir.nir);
+      }
       if (shader.ir.nir && debug_get_bool_option("CHROME9_SW_DUMP", false))
          nir_print_shader(shader.ir.nir, stderr);
       if (shader.ir.nir)
