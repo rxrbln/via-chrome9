@@ -203,6 +203,33 @@ bracket the draw with known-good programs.  This is the one new numerical
 gate required by the cel predicate set; it does not enable preserve-denorm
 execution mode, which Chrome9 continues to reject.
 
+Linux 5.75 configuration-two compilation fixes that discriminator to the
+following eight-record object, so a live gate need not guess at instruction
+packing or resource controls:
+
+```text
+01c00530 50080055 00108005 00020020
+0140b6d0 d008116d 00100016 00000060
+0140b6d0 d008116d 00120116 000000a0
+808216d0 00140924 00120000 000000e0
+01c00530 d01c0053 00120216 000d0120
+0082a6d0 d0082a2d 002203a2 00090120
+01c00530 301c0053 00c082b5 000d0120
+01c00530 301c0053 00f20405 000d0820
+
+active=(0,5,0,0)
+A90=90048000 A91=91000000 A92=92000008
+```
+
+`tools/re/chrome9_cmp_guard_smoke.c --dp3-ftz-consistency` now expresses
+that exact semantic program using only normal uploaded constants.  It accepts
+only a uniform `(0,0)` default-FTZ or `(1,1)` preserve result, while rejecting
+both mixed outcomes, and retains the existing D16, exterior and BO-guard
+checks.  This is an offline-prepared test: it has not been submitted to a
+GPU.  `tools/re/chrome9_vec3_cmp_production_check.py` separately locks the
+five-record vec3 CMP corpus, inactive lanes, active-resource tuple, and full
+A90--A9a tail.
+
 Before enabling the whole shader, use three guarded stages:
 
 1. vec3 `fge` select with a varying positive-normal predicate around `.1`,
