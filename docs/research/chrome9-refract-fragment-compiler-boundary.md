@@ -1,5 +1,100 @@
 # Chrome9 full refract fragment-compiler boundary
 
+## Current-tree recheck after standard square-root lowering
+
+Mesa Chrome9 commit `5be93e7` enables the standard
+`fsqrt -> frcp(frsq(x))` lowering after the separate scalar hardware
+qualification.  A source-exact standalone link of the default glmark2
+2023.01 refract shader, followed by the current Chrome9 NIR options, uniform
+and sampler lowering, `gl_nir_opts`, vector shrinking, and DCE, narrows the
+remaining compiler boundary further than the historical analysis below.
+
+The final fragment NIR has source BLAKE3 words:
+
+```text
+217a676f dd6e1609 596c4dc1 d63b1447
+59629813 13364492 a4d8e477 bccdbec2
+```
+
+It has three linked smooth inputs with widths `{4,4,3}`, sampler/TEX mask
+`0x07`, three computed-coordinate 2-D texture operations, no `fsqrt`, no
+`nir_if`, and no phi.  The first `refract` remains this exact straight-line
+subgraph:
+
+```text
+k         = 1 - 1.44 * (1 - dot(N,I)^2)
+negative  = flt(k, 0.0)                  // preserve:inf
+root      = frcp(frsq(k))
+candidate = 1.2 * I - (1.2 * dot(N,I) + root) * N
+front     = bcsel(negative.xxx, 0.xxx, candidate)
+```
+
+The second `refract`, with reciprocal index `0.833333`, is optimized to a
+branchless two-component candidate in this linked consumer; there is only one
+remaining `bcsel`.  The arithmetic inventory before semantic selection is 68
+ALU nodes including the `flt` and `bcsel`, plus three TEX nodes.  Replacing
+that comparison/select pair with one native CMP and expanding POW100 to the
+existing seven-MUL chain projects 73 semantic ALUs and three TEX operations;
+the kernel then needs three computed-coordinate bridge records.  The resulting
+76-ALU/3-TAU upper bound fits the independently advertised 96-ALU/32-TEX
+stores.  Sampler slots are a separate limit: current extended linkage exposes
+eight slots, while ABI-v1 fallback remains three.
+
+The current compiler returns `supported=0`, `semantic_fs_valid=0`, and an
+empty semantic stream.  The first deterministic rejection is not control
+flow or `fsqrt`: `chrome9_ps_lower_unit_interval_select()` receives the vec3
+`bcsel` above and rejects its `flt(k,0)` predicate because that helper admits
+only `fge` against a normal threshold on a value proven in `[0,1]` by an FRC
+DAG.  The generic implementation boundary is now exactly a zero-sign vector
+select, not broad Boolean lowering and not a sampler/resource-cap change.
+
+For this exact producer, direct native CMP is materially narrower than the
+general ordered-comparison problem.  The condition is a TEMP value and the
+hardware operation is simply `CMP(k,candidate,zero)`: finite nonnegative
+including either signed zero selects the candidate, while finite negative
+selects zero.  No SUB comparison surrogate is involved.  In every
+source-defined execution the two normalized vectors are finite and nonzero,
+so their dot product and the subsequent squared/product chain are finite.
+The last two operations are separate binary32 records:
+
+```text
+p = round_f32((1 - round_f32(d*d)) * 0x1.70a3d8p+0)
+k = round_f32(1.0 - p)
+```
+
+The hexadecimal literal is binary32 `1.44` (`0x3fb851ec`).  Although the real
+function crosses zero, the rounded `p` is itself a binary32 value.  The next
+representable value above one is `1 + 2^-23` and the next below is
+`1 - 2^-24`; therefore a nonzero emitted `k` near the crossing has magnitude
+at least `2^-24`, many orders above the subnormal range.  Zero-length
+normalization and exceptional interpolants are outside the defined GLSL
+`normalize`/unqualified-RSQ domain.  Thus prior live finite-normal TEMP-CMP
+and signed-zero behavior is enough for the comparison semantics of this exact
+shader.  This producer-domain proof, not the older SUB/RCP probes, discharges
+the `flt` `preserve:inf` requirement; it must not be generalized to arbitrary
+`flt` operands.
+
+The smallest offline regression should construct a scalar float32 predicate
+broadcast over result widths one through four and accept only:
+
+```text
+bcsel(flt(k, +0.0), zero, candidate) -> CMP(k, candidate, zero)
+```
+
+It must resolve only bit-exact aliases, require identical result widths,
+preserve lane swizzles and masks, reject per-lane predicates, nonzero
+thresholds, integer conditions, nonzero true arms, and any requested NaN
+preservation.  The exact refract link must then produce sampler mask `0x07`,
+three TEMP coordinates, no Boolean records, no more than 96 semantic ALUs,
+and a kernel-mirror allocation with no more than twelve physical temporaries.
+The exact scene therefore needs an offline selector/allocation proof followed
+by one bounded negative-`k` run to ensure speculative RSQ/RCP of the discarded
+candidate retires safely; the comparison result itself is already within the
+qualified finite-normal/signed-zero domain.  An on-chip-generated NaN
+discriminator remains mandatory before promoting the selector beyond a
+compiler-proved non-NaN producer domain.  This test shape is generic and
+contains no scene name, shader hash, or application-specific branch.
+
 ## Result
 
 The full `glmark2` `light-refract.frag` consumer is not blocked by texture
