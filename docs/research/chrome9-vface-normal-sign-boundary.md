@@ -1,11 +1,30 @@
 # Chrome9 vFace and normal-sign boundary
 
-Status: production Linux compiler differential, offline only, 2026-09-24.
-The compiler accepts the D3D9 `vFace` spelling, but the recovered object and
-draw state do not preserve enough information to implement GLSL
-`gl_FrontFacing`.  The generic Mesa backend must continue to reject FACE until
-a distinct rasterizer-to-pixel-shader face-orientation source is found and
-silicon-tested.
+Status: production Linux compiler differential, D3D profile audit, offline
+only, 2026-09-24.  The compiler accepts an out-of-profile `vFace` token, but
+the recovered object and draw state do not preserve enough information to
+implement GLSL `gl_FrontFacing`.  The generic Mesa backend must continue to
+reject FACE until a distinct rasterizer-to-pixel-shader face-orientation
+source is found and silicon-tested.
+
+## Profile qualification: this is not a valid vFace program
+
+Microsoft's D3D9 register contract makes `vFace` new in pixel shader 3.0.  It
+requires a declaration and, in that profile, can only be used as the
+condition source for `setp`, `if_comp`, or `break_comp`; it is not a valid
+source to ordinary `CMP`.  The recovered vendor pixel frontend recognizes
+PS 1.0 through 1.4 and PS 2.0, and no declaration-capable PS 3.0 path has been
+recovered.  The existing PS 3.0 framing control accepts a bare MOV, but both
+ordinary and centroid `dcl` candidates are rejected by the Windows and Linux
+frontends with no native stream.
+
+Consequently the byte differential below is deliberately an invalid-profile
+parser/backend discriminator.  It proves that the vendor builder notices the
+generic MISC register class, then loses the vPos/vFace index.  It does not
+prove that valid D3D exposes a face source, that native CMP may consume one,
+or that any raster state produces it.  The fact that the analogous
+out-of-profile vPos route later passed on silicon cannot be generalized to
+vFace: the two tokens become the same native source id before draw time.
 
 ## Smallest exact compiler differential
 
@@ -17,7 +36,7 @@ back face:  +normal.xyz
 ```
 
 Using the D3D convention in which `vFace` is positive on the front face, the
-smallest equivalent PS 2.0 object is:
+smallest intentionally out-of-profile PS 2.0 discriminator is:
 
 ```text
 CMP oC0.xyz,vFace.xxxx,-T0,T0
@@ -114,8 +133,8 @@ silently treating all sampler dereferences as unit zero.
 ## Implementation and proof ladder
 
 1. Keep FACE rejected in the semantic compiler; never alias it to POSITION.
-2. Add an offline negative test asserting that vPos-index-zero and
-   vFace-index-one CMP objects remain byte-identical.
+2. Add an offline negative test asserting that the invalid-profile
+   vPos-index-zero and vFace-index-one CMP objects remain byte-identical.
 3. Recover a distinct face-orientation route or state bit and prove it with
    adjacent front/back triangles whose normals produce asymmetric colors.
 4. Require the same draw to exercise nonzero viewport origin and both A8A Y
@@ -139,3 +158,7 @@ silently treating all sampler dereferences as unit zero.
   `chrome9-vpos-cmp-frc-contract.md`.
 - Exact default-lightall source and NIR inventory:
   `ioquake3-gl2-eight-unit-linkage.md`.
+- Microsoft D3D9 PS 3.0 register contract:
+  <https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx9-graphics-reference-asm-ps-registers-ps-3-0>.
+- The vendor PS 3.0 declaration-negative corpus:
+  `chrome9-ps30-dcl-negative-boundary.tsv`.

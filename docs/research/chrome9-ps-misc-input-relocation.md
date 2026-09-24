@@ -10,9 +10,13 @@ predicate.
 
 Instance `+0x80` is a sticky flag set when a parsed instruction references a
 source whose D3D register type is `D3DSPR_MISCTYPE` (17).  In PS 2.0 the two
-defined register numbers are vPos/misc0 and vFace/misc1.  The flag means that
-the program needs a relocated miscellaneous raster input; it is neither A91
-nor a sampler mask.
+token numbers zero and one are accepted by the vendor as vPos/misc0 and
+vFace/misc1, but this is not a valid D3D profile contract: Microsoft defines
+vPos and vFace as PS 3.0 registers, with declarations required.  The flag
+therefore proves only that the vendor accepts and relocates an out-of-profile
+MISC-class token.  It means that the compiled object needs a relocated
+miscellaneous raster input; it is neither A91 nor a sampler mask, and it does
+not distinguish face from position.
 
 The shared instruction builder reconstructs the split D3D register type from
 each of four possible source token words.  The Windows test is exactly:
@@ -53,9 +57,9 @@ are the producer, initialization, and consumer sites.  Unrelated driver
 structures also have members at offset `+0x80` and are not part of this
 lifecycle.
 
-## Smallest production trigger
+## Smallest vendor trigger
 
-The smallest accepted PS 2.0 trigger is:
+The smallest vendor-accepted, out-of-profile PS 2.0 trigger is:
 
 ```text
 ffff0200                       ps_2_0
@@ -249,13 +253,14 @@ meaning of A91.bit23 is not inferred here.
 
 ## Backend boundary
 
-A clean backend must model vPos/vFace as a special raster input, reserve the
-resource id chosen by the A90 bucket, rewrite every native A/B/C occurrence,
-and include it in terminal-use analysis.  It must not allocate physical id
+A clean backend may model the silicon-proven vPos route as a special raster
+input, reserve the resource id chosen by the A90 bucket, rewrite every native
+A/B/C occurrence, and include it in terminal-use analysis.  It must not
+allocate physical id
 `0xcf`, upload a raw sentinel, confuse aux80 with A91, or choose the bucket
 from the final sampler mask.  Because vPos and vFace compile byte-identically
-and the required raster linkage is not proved, the initial Mesa compiler must
-reject both even though their offline compiler path is now closed.
+and no valid-profile vFace producer is recovered, FACE must remain rejected;
+the byte-identical invalid-profile token is not a second runtime input.
 
 Evidence uses `tools/re/chrome9_pps_probe.c`, SHA-256
 `f73e238a22ec86ab342c1b27ce339cd2dcc1796ba5c7e09681d8cab601f103f3`.
