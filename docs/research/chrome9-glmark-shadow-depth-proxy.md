@@ -696,12 +696,43 @@ remained available and the immediate kernel log had no new fault.  Thus the
 RCP/MUL/ADD arithmetic and this physical-register reuse work without TEX;
 the failure starts in the computed-texture transition or associated FE state.
 
-The current source has a separately reviewed but **not yet loaded** A28/A29
-correction: for a program with texture descriptors, the pixel-stage consumer
-width is capped at three while A25/A26 retain the four-component vertex
+The separately reviewed A28/A29 correction caps the pixel-stage consumer
+width at three for a program with texture descriptors, while A25/A26 retain the four-component vertex
 producer.  That matches the shortened vendor shadow tuple `A25=f, A28=e`;
-the currently loaded kernel emits `A25=f, A28=f`.  It is the strongest
-source-backed next silicon differential.  A successful module build and
-selftest source inspection do not yet prove this change fixes the pixels.
-Do not bundle the XY01/XYXY bridge change or a resource-bucket change into
-that test.
+the previous kernel emitted `A25=f, A28=f`.  It was the strongest
+source-backed next silicon differential before the live A/B test.
+The XY01/XYXY bridge and resource bucket were deliberately left unchanged
+in that test.
+
+The shortened proprietary object's external-resource count is one (public
+`+34=1`, also A00 bits 7:4).  `stmUpdatePS_inv:0x17fa1b..0x17fab5` uses that
+count for its A28 width-mask loop.  Direct T0 contributes nibble `e` after
+`stmUpdateTCI` caps float4 to three components; the internally computed TEX
+coordinate in slot one raises the active coordinate high-water to two but
+does **not** create a second external A28 nibble.  The exact mask is therefore
+`A28=28ffe000`, `A29=29000000`, not the speculative `28ffec00`.  The kernel's
+one-varying textured raster construction is complete for this particular
+external/internal coordinate shape.
+
+### Live A28 A/B result and lock hygiene
+
+Kernel commit `3926dbc` built as module SHA-256
+`07b1c6856c122daee7faf82070a0865332a80e235f1c0fce89c3f4f03a32b703`
+(Build ID `5a605b25f17a6187da7abfcf5e7d69ab9e0e4001`).  A hash-gated,
+non-forced `engine_quiesce` handoff replaced the previous module without a
+reboot; Xorg restarted with glamor and the sparse-five guarded texture oracle
+passed on the new module.  The reviewed five-instruction
+`--inspect-threshold-sample` oracle then returned the **same** wrong pixels as
+before: `00ffcc00`, `00ffcc00`, `00003300` in the three rectangles, instead
+of `008c3300`, `008ccc00`, `008c3300`.  Its D16 samples remained `8000`;
+Xorg, the render node, and the kernel log remained healthy.  Correcting the
+external A28 width alone is therefore insufficient to fix this shader.
+
+The initial post-handoff baseline command did not reach the GPU: the Xorg
+child inherited the `flock` descriptor from the handoff invocation and held
+the shared GPU lock.  Read-only `lslocks` showed Xorg as owner and the
+baseline process waiting.  The waiting process was stopped, then the exact
+Xorg process was restarted once under `flock --close`; its replacement had no
+lock descriptor.  The baseline and shadow discriminator above ran after that
+recovery.  Future handoffs must use `flock -x -o`, and the handoff script now
+rejects an inherited lock descriptor at preflight.
