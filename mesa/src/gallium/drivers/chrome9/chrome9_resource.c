@@ -372,12 +372,12 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
-   /* Private surfaces opt in to deferred cache maintenance; buffers are
-    * never written by the device and shared surfaces have foreign CPU
-    * users. */
+   /* Surfaces opt in to deferred cache maintenance; buffers are never
+    * written by the device.  Shared surfaces stay in the protocol because
+    * every importer on this device is this driver; the kernel reverts an
+    * object that becomes a KMS framebuffer. */
    if (templ->target != PIPE_BUFFER &&
-       !(templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT |
-                        PIPE_BIND_DISPLAY_TARGET)) &&
+       !(templ->bind & PIPE_BIND_DISPLAY_TARGET) &&
        chrome9_screen_has_capability(screen,
                                      DRM_CHROME9_CAP_GEM_CPU_ACCESS) &&
        debug_get_bool_option("CHROME9_EXPLICIT_ACCESS", true))
@@ -428,6 +428,9 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
+   /* The exporter may have opted the object in: bracket CPU accesses (a
+    * no-op for implicit objects). */
+   resource->explicit_access = true;
    /* A native Chrome9 DRI3 export retains the complete canonical guarded
     * allocation.  Preserve that fact after same-device PRIME import so the
     * consumer can submit the BO directly and share its reservation object;
@@ -479,13 +482,6 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
 
    (void)context;
    (void)usage;
-   /* An exported object gets CPU users that do not bracket accesses. */
-   if (resource->explicit_access &&
-       chrome9_bo_cpu_access(screen->get_screen_fd(screen), &resource->bo,
-                             DRM_CHROME9_GEM_CPU_IMPLICIT))
-      resource->explicit_access = false;
-   if (resource->explicit_access)
-      return false;
    kms = whandle && whandle->type == WINSYS_HANDLE_TYPE_KMS;
    if (!whandle || pres->target == PIPE_BUFFER ||
        pres->last_level ||
