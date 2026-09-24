@@ -697,8 +697,9 @@ RCP/MUL/ADD arithmetic and this physical-register reuse work without TEX;
 the failure starts in the computed-texture transition or associated FE state.
 
 The separately reviewed A28/A29 correction caps the pixel-stage consumer
-width at three for a program with texture descriptors, while A25/A26 retain the four-component vertex
-producer.  That matches the shortened vendor shadow tuple `A25=f, A28=e`;
+width at three for a program with texture descriptors, while A25/A26 retain
+the four-component vertex producer.  That matches the shortened vendor
+shadow tuple `A25=f, A28=e`;
 the previous kernel emitted `A25=f, A28=f`.  It was the strongest
 source-backed next silicon differential before the live A/B test.
 The XY01/XYXY bridge and resource bucket were deliberately left unchanged
@@ -736,3 +737,23 @@ Xorg process was restarted once under `flock --close`; its replacement had no
 lock descriptor.  The baseline and shadow discriminator above ran after that
 recovery.  Future handoffs must use `flock -x -o`, and the handoff script now
 rejects an inherited lock descriptor at preflight.
+
+### Vendor computed-coordinate bridge A/B
+
+With the A28-corrected module, the five-instruction raw inspection program
+still differed from Linux 5.75's shortened object at the computed TEX bridge:
+the raw `XY01` source emitted `01c00530 c01c0053 00f20106 000d0460`, while
+the vendor's `XYXY` emitted `01c00530 101c0053 00f20104 000d0460`.
+The TAU `301211b0`, PS controls, first three ALUs, and recovered FE tuple
+already matched; no other semantic state was changed in the new
+`--inspect-vendor-bridge` oracle (tools commit `a806006`, binary SHA-256
+`becce225bf4219183bf57524cc88a140403b21525a9a5603a8835c112adcabe4`).
+It retained the same five-instruction full-color terminal write, texture,
+geometry, D16, source snapshot, and BO/exterior guards.
+
+The single locked VX900 run again retired with `z=8000` at all samples and
+the unchanged wrong colors `00ffcc00`, `00ffcc00`, `00003300`.  Xorg and
+`renderD128` remained healthy; the immediate kernel log had no new fault.
+Thus XY01 versus vendor XYXY alone is not sufficient to explain the failure.
+Further work should compare texture descriptors/sample return routing and
+the complete packet image, rather than modifying another state bit by guess.
