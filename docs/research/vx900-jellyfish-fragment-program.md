@@ -343,3 +343,62 @@ float3 meaning.  This isolates a width/component-routing differential below
 the CPU arithmetic reference.  It does not yet distinguish FE producer
 width/link state from A90/resource routing or the native source selector, so
 none of those layers should be changed from this result alone.
+
+### Minimal float3-versus-float4 T2 route discriminator
+
+A fresh manual, Linux VS-compiler, and Linux PS-compiler cross-check finds no
+static mismatch in the float3 T2 image submitted above.  For dense full-width
+T0/T1 followed by float3 T2, the complete width-sensitive producer state is:
+
+```text
+# post-transform H6 input: D3=float4 T0, D4=float4 T1, D5=float3 T2
+FVF A00=00000511 A04=040063c2 A05=0500a4c2 A06=0600e582
+A12=1200003f A25=25f6ffe0 A26=26000000
+A28=28ffffe0 A29=29000000 A62=625081ff
+
+# three outputs; T2 writes XYZ
+FE A08=08030303 A09=09000002 A0a=0a000000
+VS T2=0009414c 00000000 00000000 000802a7
+VS A60=60800006
+```
+
+The `82`, `e`, `2`, and `7` fields independently mean float3/XYZ in the H6
+declaration, FVF mask, FE dimension, and native VS destination.  The VX900
+manual places T2's dimension in A09 bits 1:0 and T2's S/T/R/Q masks in A25
+and A28 bits 7:4.  Thus moving the `2` to another A09 byte or changing only
+one mask is not source-backed.
+
+The smallest compiler-exact consumer which keeps physical T0, T1, and T2 is:
+
+```text
+MAD oC0, T0, T1, T2.xyzx
+
+02c20500 302c1053 00f2c005 00000820
+A90=90058007 A91=91000000 A92=92000001
+active-resource-counts=(1,0,1,0)
+```
+
+Set T0 and T1 to zero and T2 to `(.2,.3,.4)`.  The expected color is then
+`(.2,.3,.4,.2)`, approximately host BGRA word `33334d66`.  This removes both
+textures, every temporary, the computed-coordinate bridge, and all but one
+ALU while retaining all three physical coordinate slots and direct A90 bits
+0--2.  In particular, type-FE A00 must be `00000011`: it is the compiler's
+one active texture-temporary resource, not three varyings.
+
+Run one otherwise identical float4 companion with T2.w=`.8`.  Its only
+width-closure changes are:
+
+```text
+FVF A00=00000512 A06=0600e5c2
+FE A09=09000003
+A25=25f6fff0 A28=28fffff0
+VS T2 destination=000802af
+PS ALU=02c20530 302c1053 00f2c005 00000820
+expected host BGRA=cc334d66
+```
+
+If float4 restores Y/Z while float3 does not, the remaining fault is in the
+float3 width/link closure.  If both retain only T2.x, the failure is below the
+width encoding and instead implicates physical slot-two routing/A90 or the
+native class-3 source path.  This is a proposed guarded cold-boot pair, not a
+silicon result; no GPU submission was made during this audit.
