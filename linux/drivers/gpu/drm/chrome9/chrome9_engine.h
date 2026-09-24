@@ -22,6 +22,7 @@ bool chrome9_textured_triangle_mip_enabled(void);
 bool chrome9_rhw_chain_enabled(void);
 bool chrome9_ps_add_enabled(void);
 bool chrome9_fragment_sparse_textures_enabled(void);
+u64 chrome9_engine_capabilities2(void);
 bool chrome9_hw_tcl_enabled(void);
 int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 		   struct chrome9_sf_mapping **mapping);

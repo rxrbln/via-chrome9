@@ -2648,6 +2648,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = DRM_CHROME9_CAP2_GUARDED_SHARED;
 		if (chrome9_engine_ready(cdev) && chrome9_hw_tcl_enabled())
 			args->value |= DRM_CHROME9_CAP2_VERTEX_TOPOLOGY;
+		if (chrome9_engine_ready(cdev))
+			args->value |= chrome9_engine_capabilities2();
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:

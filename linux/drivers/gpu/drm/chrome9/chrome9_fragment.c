@@ -188,7 +188,8 @@ static u8 chrome9_fragment_alu_component_mask(
 
 static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	u32 instruction_count, u32 constant_count, u32 texture_count,
-	u32 descriptor_mask, bool sparse_textures, u32 varying_count)
+	u32 descriptor_mask, bool sparse_textures, u32 cube_mask,
+	u32 varying_count)
 {
 	u8 output_mask = 0;
 	u32 alu_count = 0;
@@ -343,17 +344,21 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			    coordinate->modifier)
 				return -EINVAL;
 			if (coordinate->file == DRM_CHROME9_FRAGMENT_FILE_VARYING) {
+				/* A cube lookup reads S, T and R. */
+				bool cube = cube_mask & BIT(instruction->sampler);
+				u8 width = state->tex_varying_width[coordinate->index];
+
 				for (source = 0;
 				     source < ARRAY_SIZE(coordinate->swizzle); source++)
 					if (coordinate->swizzle[source] >
 					    DRM_CHROME9_FRAGMENT_SWIZZLE_W)
 						return -EINVAL;
-				chrome9_fragment_note_varying(state, coordinate, 0x3,
-						      false);
-				state->tex_varying_width[coordinate->index] =
-					max3(state->tex_varying_width[coordinate->index],
-					     coordinate->swizzle[0] + 1,
-					     coordinate->swizzle[1] + 1);
+				chrome9_fragment_note_varying(state, coordinate,
+						      cube ? 0x7 : 0x3, false);
+				for (source = 0; source < (cube ? 3 : 2); source++)
+					width = max_t(u8, width,
+						      coordinate->swizzle[source] + 1);
+				state->tex_varying_width[coordinate->index] = width;
 			} else {
 				bridge_count++;
 			}
@@ -1347,11 +1352,11 @@ rewrite:
 	return 0;
 }
 
-static int chrome9_fragment_compile_internal(
+int chrome9_fragment_compile_targets(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,
 	u32 texture_count, u32 descriptor_mask, bool sparse_textures,
-	u32 varying_count,
+	u32 cube_mask, u32 varying_count,
 	struct chrome9_fragment_program *program)
 {
 	struct chrome9_fragment_state state = {
@@ -1370,7 +1375,7 @@ static int chrome9_fragment_compile_internal(
 		state.instructions = split;
 	ret = chrome9_fragment_validate(&state, instruction_count,
 		constant_count, texture_count, descriptor_mask,
-		sparse_textures, varying_count);
+		sparse_textures, cube_mask, varying_count);
 	if (ret)
 		goto out;
 	ret = -EINVAL;
@@ -1407,8 +1412,8 @@ int chrome9_fragment_compile(
 	u32 texture_count, u32 varying_count,
 	struct chrome9_fragment_program *program)
 {
-	return chrome9_fragment_compile_internal(instructions, instruction_count,
-		constants, constant_count, texture_count, 0, false,
+	return chrome9_fragment_compile_targets(instructions, instruction_count,
+		constants, constant_count, texture_count, 0, false, 0,
 		varying_count, program);
 }
 
@@ -1418,8 +1423,8 @@ int chrome9_fragment_compile_sparse(
 	u32 texture_count, u32 descriptor_mask, u32 varying_count,
 	struct chrome9_fragment_program *program)
 {
-	return chrome9_fragment_compile_internal(instructions, instruction_count,
-		constants, constant_count, texture_count, descriptor_mask, true,
+	return chrome9_fragment_compile_targets(instructions, instruction_count,
+		constants, constant_count, texture_count, descriptor_mask, true, 0,
 		varying_count, program);
 }
 
@@ -2046,6 +2051,40 @@ static int chrome9_fragment_shadow_prefix_selftest(
 	    memcmp(program->controls, expected_controls,
 		   sizeof(expected_controls)))
 		return -EINVAL;
+	return 0;
+}
+
+/* A cube sampler widens a direct T coordinate to STR (vendor texld of a
+ * dcl_cube sampler: TAU 301001b0, FE A01/A08 three lanes). */
+static int chrome9_fragment_cube_selftest(
+	struct chrome9_fragment_program *program)
+{
+	static const struct drm_chrome9_fragment_instruction instructions[] = {
+		{
+			.op = DRM_CHROME9_FRAGMENT_OP_TEX,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_VARYING, 0,
+				  { 0, 1, 2, 3 }, 0, 0 }},
+		}, {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {{ DRM_CHROME9_FRAGMENT_FILE_TEMP, 0,
+				  { 0, 1, 2, 3 }, 0, 0 }},
+		},
+	};
+	unsigned int cube;
+	int ret;
+
+	for (cube = 0; cube < 2; cube++) {
+		ret = chrome9_fragment_compile_targets(instructions,
+			ARRAY_SIZE(instructions), NULL, 0, 1, 0, false, cube, 1,
+			program);
+		if (ret || program->tau_count != 1 ||
+		    program->tau[0] != 0x301001b0 ||
+		    program->varying_count != 1 ||
+		    program->varying_width[0] != 2 + cube)
+			return -EINVAL;
+	}
 	return 0;
 }
 
@@ -3149,6 +3188,8 @@ int chrome9_fragment_selftest(void)
 		ret = chrome9_fragment_shadow_prefix_selftest(program);
 	if (!ret)
 		ret = chrome9_fragment_vec3_cmp_selftest(program);
+	if (!ret)
+		ret = chrome9_fragment_cube_selftest(program);
 out:
 	kfree(program);
 	return ret;
