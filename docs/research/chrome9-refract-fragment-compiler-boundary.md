@@ -95,6 +95,15 @@ discriminator remains mandatory before promoting the selector beyond a
 compiler-proved non-NaN producer domain.  This test shape is generic and
 contains no scene name, shader hash, or application-specific branch.
 
+`tools/re/chrome9_normalize_guard_smoke.c --refract-negative` implements the
+bounded negative-domain run without enabling the production selector.  It
+uses `k=(-.25,+0,.25,.5625)`, eagerly evaluates four scalar RSQ/RCP chains,
+then applies `CMP(k,candidate,c0.x=0)`.  The mathematical RGBA result is
+`(0,0,.5,.75)`, ideal host BGRA8888 `0xbf000080`; the checker retains exact
+zero red/green, bounded UNORM tolerance for blue/alpha, D16, exterior, and BO
+guard checks.  It emits an explicit cold-boot/bracket/quarantine warning and
+has only been host-built and dry-started, not submitted to a GPU.
+
 ## Result
 
 The full `glmark2` `light-refract.frag` consumer is not blocked by texture
