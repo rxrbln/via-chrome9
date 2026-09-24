@@ -303,6 +303,16 @@ This gate contains the terrain-critical MAX-to-POW dependency without five
 textures, VTF, mipmaps, FBO transitions or the full long shader, so a failure
 identifies arithmetic rather than resource plumbing.
 
+The checked-in oracle is
+`tools/re/chrome9_terrain_pow_zero_guard_smoke.c`.  Tools commit `b0933fe`
+normalizes every inactive selector lane to ZERO: scalar sources are X000 (or
+Y000 for the literal one), the ZW color write is 00ZW, and the separate X/Y
+color writes are X000/0X00.  This is required because the kernel packs all
+four source selectors even for a partial destination writemask.  A strict
+host build succeeds; binary SHA-256 is
+`01412cd46a4e40178826dd746c60c34fcf10d33afef3d9145de9d054343b70fb`.
+It has not been submitted to hardware.
+
 Only after this gate and the four-slot varying linkage pass should the full
 main fragment object be captured to establish exact final ALU/TAU counts and
 physical-temp high-water.  Fragment closure still does not enable the scene:
