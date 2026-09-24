@@ -98,6 +98,46 @@ places every canonical 32-bit tail level after L8 in consecutive 0x100-byte
 slots.  The hardware use of that sequence remains a static inference until
 the bounded fetch tests pass.
 
+### Executed 1600x1200 allocator cross-check
+
+The same isolated Linux 5.75 helper was executed with the exact refract
+dimensions rather than extrapolating from the earlier 2048-wide cases.  The
+binary remains `via_chrome9_dri.so`, SHA-256
+`fddb4dea85319c76cac3354e43aa9bcb12a8b7f178cee0f70f6c7efe14a69af4`, and
+the called entry remains `sfmCalcMipOffset_inv:0xec2e0`.  It returned offsets
+relative to L0:
+
+```text
+1600x1200 L0=00000000 L1=00753000 L2=00927c00 L3=0099e800
+          L4=009bc300 L5=009c4500 L6=009c6800 L7=009c7400
+          L8=009c7800 L9=009c7900 L10=009c7a00 L11=009c7b00
+```
+
+This result also prevents an overly broad claim that Mesa must reproduce the
+vendor allocator byte-for-byte.  The proprietary allocator charges each
+level `pitch * max(8, ALIGN(height, 8))`; Mesa instead charges the logical
+rows and 256-byte-aligns the next level, with an additional page guard after
+L0.  Their L1--L8 offsets therefore differ for this NPOT chain.  That is
+legal in the recovered state model: Linux writes each supplied relative
+subresource address at `0x1b2688..0x1b26ba` or
+`0x1b2b15..0x1b2b66`, and Windows obtains and writes each L1--L8 subresource
+at `0x101d8134..0x101d81b9`.  H3 carries those eight explicit addresses; it
+does not derive them from the vendor allocation policy.
+
+The decisive agreement begins after the explicitly programmed L8 base:
+
+```text
+vendor:       L8=009c7800 L9=009c7900 L10=009c7a00 L11=009c7b00
+current Mesa: L8=009c5b00 L9=009c5c00 L10=009c5d00
+```
+
+Both satisfy `offset(Lm) = offset(L8) + (m - 8) * 0x100`.  Therefore the
+guarded oracle must program Mesa's current H3 addresses, not substitute the
+vendor's absolute L1--L8 offsets, while using the vendor execution only as
+evidence for the implicit post-L8 stride.  Windows independently emits no
+ninth address word and leaves L9--L11 selection to A30, so it does not
+introduce a competing tail address.
+
 ### Implicit-tail state invariant
 
 There is no separate L9--L11 enable bit.  The manual gives A30[11:6] and
@@ -250,10 +290,12 @@ size `0x01004000`.
 
 Do not begin with the refract shader.  Use one guarded BGRA 1600x1200 L0--L10
 source, one small independent guarded BGRX destination, and the already-known
-single-TEX REPLACE fragment object.  Initialize L7, L8, L9, and L10 to four
-distinct opaque colors and poison every other level, all padding, and both
-guards.  Submit four nearest-image/nearest-mip draws with min=max and exact
-A30 values:
+single-TEX REPLACE fragment object.  Initialize L7 red (`ffff0000`), L8
+green (`ff00ff00`), L9 blue (`ff0000ff`), and L10 white (`ffffffff`); fill
+every other level and every non-guard padding interval with opaque magenta
+(`ffff00ff`).  Preserve unique leading, internal-L0, and final guard
+patterns, and snapshot the complete `0x9c8000` source BO before submission.
+Submit four nearest-image/nearest-mip draws with min=max and exact A30 values:
 
 ```text
 L7 300001c7
@@ -262,11 +304,21 @@ L9 30000249
 L10 3000028a
 ```
 
-Require the four colors in order, engine error zero, exact retirement, both
-guards intact, and byte-for-byte preservation of the complete source BO.
-Then run `L8 -> L9 -> L10 -> L8` without reinstalling unrelated state.  This
-is the smallest test that reaches the refract-specific rectangular implicit
-tail while keeping every candidate fetch inside mapped, recognizable data.
+For each row set semantic `min_lod_s5_5 == max_lod_s5_5 == level * 32`,
+zero bias, nearest image and mip filters, and clamp-to-edge.  The remaining
+sampler words are therefore exactly `31100001 32000049 cccccccc`; the H3
+table and image block remain unchanged between draws.  Keeping the complete
+L0--L10 descriptor installed while changing only A30 makes a wrong result a
+level-selection observation rather than a descriptor-layout transition.
+
+Require red, green, blue, and white in order, engine error zero, exact
+retirement, destination guards/exterior intact, and byte-for-byte
+preservation of the complete source BO.  A green result for forced L9 means
+clamping at the last explicit entry; magenta means another mapped address was
+selected; blue is the only passing L9 result.  Then run
+`L8 -> L9 -> L10 -> L8` without reinstalling unrelated state.  This is the
+smallest test that reaches the refract-specific rectangular implicit tail
+while keeping every candidate fetch inside mapped, recognizable data.
 
 Only after that passes, test an L0/L1 trilinear footprint with
 `A31=31102492`, followed by the real dense three-stage mix
