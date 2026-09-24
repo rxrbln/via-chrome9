@@ -9,6 +9,10 @@ targets.
 
 ## Documents
 
+- [chrome9-modulate-blend-cmd22-hang.md](chrome9-modulate-blend-cmd22-hang.md)
+  traces the GL1 menu cmd22 hang (and the kind-7 timeout) to ioquake3's
+  pulsing glow alpha `0xFE` landing in uncounted H2 type-00 vertex data, where
+  vendor code always uses counted H3, and gives the replay ladder.
 - [chrome9-render-status-20260924.md](chrome9-render-status-20260924.md)
   records FE33 on silicon, the full glmark2 matrix, llvmpipe pixel
   comparisons, ioquake3 GL1/GL2 q3dm1 renders and the fixes they drove.
