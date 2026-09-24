@@ -37,6 +37,7 @@ extern "C" {
 #define DRM_CHROME9_GEM_CPU_ACCESS	0x1f
 #define DRM_CHROME9_DRAW_VERTEX_PROGRAMS	0x20
 #define DRM_CHROME9_GEM_INFO	0x21
+#define DRM_CHROME9_QUERY	0x22
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -125,6 +126,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_GEM_INFO \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GEM_INFO, \
 		 struct drm_chrome9_gem_info)
+#define DRM_IOCTL_CHROME9_QUERY \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_QUERY, \
+		 struct drm_chrome9_query)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -261,6 +265,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_DXT_MIP		(1ULL << 3)
 /* DRAW_VERTEX_PROGRAM topology TRIANGLE_STRIP and TRIANGLE_FAN. */
 #define DRM_CHROME9_CAP2_VERTEX_TOPOLOGY		(1ULL << 5)
+/* DRM_CHROME9_QUERY occlusion queries and DRM_CHROME9_FRAGMENT_QUERY. */
+#define DRM_CHROME9_CAP2_OCCLUSION_QUERY	(1ULL << 6)
+/* Fragment texture target 3D: POT volume, one level, no mip filter. */
+#define DRM_CHROME9_CAP2_TEXTURE_3D		(1ULL << 7)
 /* DRAW_VERTEX_PROGRAM topology POINT_LIST: point_size, POINT_SIZE and
  * RASTER_POINT_SPRITE. */
 #define DRM_CHROME9_CAP2_NATIVE_POINTS		(1ULL << 9)
@@ -319,6 +327,38 @@ struct drm_chrome9_gem_cpu_access {
  * refers to its first row at byte PAGE_SIZE.
  */
 #define DRM_CHROME9_GEM_CREATE_GUARDED_SHARED	(1U << 1)
+
+/*
+ * Occlusion queries.  The kernel keeps a 64-bit sample accumulator per
+ * query and DRM file; draws name an active query with FRAGMENT_QUERY and
+ * the kernel adds their Z/stencil pass counts when they retire.  BEGIN
+ * zeroes the accumulator, draws of earlier BEGIN/END intervals no longer
+ * count.  READ reports available once the query is ended and every
+ * attached draw retired; WAIT blocks for that.  A draw lost to an engine
+ * error makes READ fail with -EIO until the next BEGIN.
+ */
+#define DRM_CHROME9_QUERY_OP_CREATE		0
+#define DRM_CHROME9_QUERY_OP_DESTROY		1
+#define DRM_CHROME9_QUERY_OP_BEGIN		2
+#define DRM_CHROME9_QUERY_OP_END		3
+#define DRM_CHROME9_QUERY_OP_READ		4
+#define DRM_CHROME9_QUERY_READ_WAIT		(1U << 0)
+#define DRM_CHROME9_QUERY_TYPE_OCCLUSION	0
+
+struct drm_chrome9_query {
+	__u32 op;
+	__u32 flags;
+	/* Out for CREATE, in otherwise. */
+	__u32 id;
+	/* CREATE: DRM_CHROME9_QUERY_TYPE_*. */
+	__u32 type;
+	/* READ: accumulated samples. */
+	__u64 result;
+	/* READ: 1 when ended and every attached draw retired. */
+	__u32 available;
+	__u32 pad;
+	__u64 reserved[2];
+};
 
 /* Creation flags and size of an object, e.g. after PRIME import. */
 struct drm_chrome9_gem_info {
@@ -1082,6 +1122,8 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 #define DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED	(1U << 2)
 /* Apply the stencil block; requires DEPTH with the X8Z24 (D24S8) format. */
 #define DRM_CHROME9_FRAGMENT_STENCIL	(1U << 3)
+/* Count the draw's passing samples into the active query named by query. */
+#define DRM_CHROME9_FRAGMENT_QUERY	(1U << 4)
 
 /* Native stencil operations; note INVERT precedes the wrapping forms. */
 #define DRM_CHROME9_STENCIL_OP_KEEP		0
@@ -1161,6 +1203,8 @@ enum drm_chrome9_fragment_file {
 #define DRM_CHROME9_FRAGMENT_TARGET_2D		0
 /* Square POT, faces +X -X +Y -Y +Z -Z, TEX reads three coordinate lanes. */
 #define DRM_CHROME9_FRAGMENT_TARGET_CUBE	1
+/* POT volume, level zero only, slices at face_stride; TEX reads STR. */
+#define DRM_CHROME9_FRAGMENT_TARGET_3D		2
 
 struct drm_chrome9_fragment_source {
 	__u8 file;
@@ -1226,9 +1270,16 @@ struct drm_chrome9_fragment_texture_state {
 	__u32 level_pitch[DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS];
 	/* DRM_CHROME9_FRAGMENT_TARGET_*; levels describe face 0 of a cube. */
 	__u32 target;
-	/* CUBE: byte distance between equal levels of adjacent faces. */
+	/*
+	 * CUBE: byte distance between equal levels of adjacent faces.
+	 * 3D: byte distance between slices, level_pitch[0] * height.
+	 */
 	__u32 face_stride;
-	__u32 reserved[2];
+	/* 3D: number of slices; zero otherwise. */
+	__u16 depth;
+	/* 3D: DRM_CHROME9_TEXTURE_WRAP_* of the R coordinate; zero otherwise. */
+	__u16 wrap_r;
+	__u32 reserved[1];
 };
 
 /* One stencil face; func is a DRM_CHROME9_COMPARE_* value. */
@@ -1282,7 +1333,10 @@ struct drm_chrome9_draw_fragment_program {
 	__u64 constants_ptr;
 	__u64 textures_ptr;
 	struct drm_chrome9_stencil_state stencil;
-	__u64 reserved[2];
+	/* FRAGMENT_QUERY: id of an active DRM_CHROME9_QUERY object. */
+	__u32 query;
+	__u32 reserved1;
+	__u64 reserved[1];
 };
 
 #define DRM_CHROME9_VERTEX_ABI_VERSION		1U
