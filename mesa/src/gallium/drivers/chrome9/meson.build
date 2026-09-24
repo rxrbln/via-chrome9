@@ -33,6 +33,15 @@ chrome9_screen_smoke = executable(
   install : false,
 )
 
+chrome9_mip_target_smoke = executable(
+  'chrome9-mip-target-smoke',
+  'chrome9_mip_target_smoke.c',
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  dependencies : [dep_libdrm, idep_mesautil, idep_nir],
+  link_with : [libchrome9, libgallium],
+  install : false,
+)
+
 chrome9_shader_offline_test = executable(
   'chrome9-shader-offline-test',
   ['chrome9_shader_offline.c', 'chrome9_shader_offline_test.c'],
