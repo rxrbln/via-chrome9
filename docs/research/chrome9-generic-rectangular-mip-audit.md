@@ -78,6 +78,36 @@ places every canonical 32-bit tail level after L8 in consecutive 0x100-byte
 slots.  The hardware use of that sequence remains a static inference until
 the bounded fetch tests pass.
 
+### Implicit-tail state invariant
+
+There is no separate L9--L11 enable bit.  The manual gives A30[11:6] and
+A30[5:0] as the complete maximum/minimum selectors through level B (11),
+defines A31[3:0] only as the D/mipmap filter, and defines exactly eight H3
+subtype-10 addresses per stage for L1--L8 (manual register pages 129, 130,
+and 144--145).  Its A18 location procedure also groups L8, L9, L10, and L11
+under `HTXnL8LOC` (page 123).  Independently, Linux caps the resource count
+to twelve before capping only the H3 address loop to nine total levels, and
+Windows does the same.  Neither builder changes A31 or emits another address
+packet when the count exceeds nine.
+
+For the 1600x1200 L0--L10 chain the complete tail-enabling state is therefore
+only:
+
+```text
+H3 entry 7 = 40009c5b       # explicit L8 base/location
+A30        = 30000280       # unbiased min 0, max 10
+A31        = 31102492       # linear spatial + linear D filtering
+```
+
+Forced L10 instead uses A30=`3000028a` and nearest-D A31 low nibble one.
+A31 selects how LODs are combined; it carries no level count or tail mode.
+The one admissible software invariant is that, after an explicit 256-byte-
+aligned L8, every reachable implicit level has canonical pitch/size, begins
+exactly `0x100` after the preceding tail base, remains non-overlapping, and
+the whole chain through its final guard stays pinned.  Reject `last_level>8`
+if any part of that invariant fails.  Do not invent a ninth H3 word, clamp
+the maximum to eight, or set an undocumented A31 bit.
+
 ## Exact 1600x1200 current-layout vector
 
 Mesa's private resource layout is
