@@ -1089,7 +1089,8 @@ check_saturated_add_rgb_alpha_split(struct chrome9_context *context)
          &shader.semantic_fs_ir.instruction[i];
 
       if (instruction->op == CHROME9_PS_OPCODE_ADD &&
-          !instruction->destination.saturate)
+          instruction->destination.saturate &&
+          (instruction->destination.writemask & 0x7) == 0x7)
          add_count++;
       if (instruction->op == CHROME9_PS_OPCODE_MOV &&
           instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
@@ -1098,7 +1099,7 @@ check_saturated_add_rgb_alpha_split(struct chrome9_context *context)
          sat_count++;
    }
    valid = shader.supported && shader.semantic_fs_valid &&
-      shader.semantic_varying_mask == 3 && add_count == 1 && sat_count == 1;
+      shader.semantic_varying_mask == 3 && add_count == 1 && !sat_count;
    if (!valid)
       fprintf(stderr, "saturated ADD RGB/alpha split failed: "
               "supported=%u semantic=%u varyings=%x add=%u sat=%u\n",
@@ -1727,6 +1728,132 @@ check_product_alpha_unit_interval(void)
    return true;
 }
 
+enum compact_alu_case {
+   COMPACT_FMAD,
+   COMPACT_FNEG,
+   COMPACT_FNEG_C_SLOT,
+   COMPACT_FSAT,
+   COMPACT_FSAT_MULTI_USE,
+   COMPACT_SHARED_FSAT,
+};
+
+static nir_shader *
+make_compact_alu_fragment(enum compact_alu_case test)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-compact-alu");
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *a = nir_load_ubo(&b, 4, 32, zero, nir_imm_int(&b, 0),
+                             .align_mul = 16, .range_base = 0, .range = 48);
+   nir_def *c = nir_load_ubo(&b, 4, 32, zero, nir_imm_int(&b, 16),
+                             .align_mul = 16, .range_base = 0, .range = 48);
+   nir_def *result;
+
+   switch (test) {
+   case COMPACT_FMAD:
+      /* The native ALU exposes only two distinct constant ports per
+       * record; reuse c0 for B so this isolates FMAD opcode lowering. */
+      result = nir_fmad(&b, a, c, a);
+      break;
+   case COMPACT_FNEG:
+      result = nir_fadd(&b, nir_fneg(&b, a), c);
+      break;
+   case COMPACT_FNEG_C_SLOT:
+      result = nir_fmul(&b, a, nir_fneg(&b, c));
+      break;
+   case COMPACT_FSAT:
+      result = nir_fsat(&b, nir_fmul(&b, a, c));
+      break;
+   case COMPACT_FSAT_MULTI_USE: {
+      nir_def *product = nir_fmul(&b, a, c);
+
+      result = nir_fadd(&b, product, nir_fsat(&b, product));
+      break;
+   }
+   case COMPACT_SHARED_FSAT: {
+      nir_def *dot = nir_fdot3(&b, a, c);
+      nir_def *inner = nir_fsat(&b, dot);
+      nir_def *outer = nir_fsat(&b, nir_fmax(&b, dot,
+                                              nir_imm_float(&b, 0.25f)));
+
+      result = nir_vec4(&b, inner, outer, inner, outer);
+      break;
+   }
+   default:
+      abort();
+   }
+   nir_store_output(&b, result, zero, .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static bool
+check_compact_alu_lowering(struct chrome9_context *context)
+{
+   for (enum compact_alu_case test = COMPACT_FMAD;
+        test <= COMPACT_SHARED_FSAT; test++) {
+      struct chrome9_shader shader = { 0 };
+      nir_shader *nir = make_compact_alu_fragment(test);
+      unsigned mad = 0, multiply = 0, add = 0, dp3_sat = 0, max_sat = 0;
+      unsigned saturated_mov = 0, saturated_multiply = 0;
+      unsigned negated = 0;
+
+      chrome9_compile_fs_nir(context, &shader, nir);
+      for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+         const struct chrome9_ps_instruction *instruction =
+            &shader.semantic_fs_ir.instruction[i];
+
+         mad += instruction->op == CHROME9_PS_OPCODE_MAD;
+         multiply += instruction->op == CHROME9_PS_OPCODE_MUL;
+         add += instruction->op == CHROME9_PS_OPCODE_ADD;
+         saturated_mov += instruction->op == CHROME9_PS_OPCODE_MOV &&
+                          instruction->destination.saturate;
+         saturated_multiply += instruction->op == CHROME9_PS_OPCODE_MUL &&
+                               instruction->destination.saturate;
+         dp3_sat += instruction->op == CHROME9_PS_OPCODE_DP3 &&
+                    instruction->destination.saturate;
+         max_sat += instruction->op == CHROME9_PS_OPCODE_MAX &&
+                    instruction->destination.saturate;
+         for (unsigned s = 0; s < 3; s++)
+            negated += !!instruction->source[s].modifier;
+      }
+      bool valid = shader.supported && shader.semantic_fs_valid;
+      if (test == COMPACT_FMAD)
+         valid &= shader.semantic_fs_ir.count == 1 && mad == 1;
+      else if (test == COMPACT_FNEG)
+         valid &= shader.semantic_fs_ir.count == 1 && add == 1 &&
+                  !multiply && negated == 1;
+      else if (test == COMPACT_FNEG_C_SLOT)
+         valid &= shader.semantic_fs_ir.count == 2 && multiply == 2 &&
+                  negated == 0;
+      else if (test == COMPACT_FSAT)
+         valid &= shader.semantic_fs_ir.count == 2 && multiply == 1 &&
+                  shader.semantic_fs_ir.instruction[0].destination.saturate;
+      else if (test == COMPACT_FSAT_MULTI_USE)
+         valid &= shader.semantic_fs_ir.count == 3 && multiply == 1 &&
+                  add == 1 && saturated_mov == 1 && !saturated_multiply;
+      else
+         valid &= dp3_sat == 1 && max_sat == 1;
+      if (!valid) {
+         fprintf(stderr, "compact ALU case %u failed: supported=%u "
+                 "semantic=%u ir=%u mad=%u mul=%u add=%u neg=%u "
+                 "dp3sat=%u maxsat=%u movsat=%u mulsat=%u\n", test,
+                 shader.supported,
+                 shader.semantic_fs_valid, shader.semantic_fs_ir.count,
+                 mad, multiply, add, negated, dp3_sat, max_sat,
+                 saturated_mov, saturated_multiply);
+         nir_print_shader(nir, stderr);
+         ralloc_free(nir);
+         return false;
+      }
+      ralloc_free(nir);
+   }
+   return true;
+}
+
 int
 main(void)
 {
@@ -1824,6 +1951,7 @@ main(void)
        !check_ideas_logo_shadow_compilation(&context) ||
        !check_product_alpha_kill_compilation(&context) ||
        !check_product_alpha_unit_interval() ||
+       !check_compact_alu_lowering(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
    puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur compilation passed");
