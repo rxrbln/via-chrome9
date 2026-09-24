@@ -4686,6 +4686,56 @@ chrome9_ps_sample_alpha(nir_scalar scalar, nir_tex_instr **texture)
    return true;
 }
 
+/*
+ * discard if (a == 0): ABS t0 = |a|; CMP t1 = (-t0 >= 0) ? -1 : +1; KILL t1.
+ * Only +0 and -0 give -|a| >= 0, so no draw-time range proof is needed.
+ */
+static bool
+chrome9_ps_lower_kill_zero(struct chrome9_ps_nir_builder *builder,
+                           const struct chrome9_ps_source *alpha)
+{
+   static const uint32_t signs[4] = { 0xbf800000, 0x3f800000 };
+   struct chrome9_ps_instruction *absolute, *conditional, *kill;
+   struct chrome9_ps_source sign, negative_one, positive_one;
+   uint8_t absolute_temp, condition_temp;
+
+   if (builder->next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS - 2 ||
+       !chrome9_ps_immediate(builder, signs, 2, &sign))
+      return false;
+   negative_one = sign;
+   positive_one = sign;
+   for (unsigned c = 0; c < 4; c++) {
+      negative_one.swizzle[c] = sign.swizzle[0];
+      positive_one.swizzle[c] = sign.swizzle[1];
+   }
+   absolute_temp = builder->next_temp++;
+   condition_temp = builder->next_temp++;
+   absolute = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_ABS);
+   conditional = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_CMP);
+   kill = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_KILL);
+   if (!absolute || !conditional || !kill)
+      return false;
+   absolute->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   absolute->destination.id = absolute_temp;
+   absolute->destination.writemask = 1;
+   absolute->source[0] = *alpha;
+   conditional->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   conditional->destination.id = condition_temp;
+   conditional->destination.writemask = 0xf;
+   conditional->source[0].file = CHROME9_PS_SOURCE_TEMP;
+   conditional->source[0].id = absolute_temp;
+   conditional->source[0].modifier = CHROME9_PS_SOURCE_NEGATE;
+   for (unsigned c = 0; c < 4; c++)
+      conditional->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_X;
+   conditional->source[1] = negative_one;
+   conditional->source[2] = positive_one;
+   kill->source[0].file = CHROME9_PS_SOURCE_TEMP;
+   kill->source[0].id = condition_temp;
+   for (unsigned c = 0; c < 4; c++)
+      kill->source[0].swizzle[c] = c;
+   return true;
+}
+
 static bool
 chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
                                  nir_def *condition)
@@ -4699,6 +4749,7 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
    unsigned sampled_lane, threshold_lane;
    unsigned temp;
    bool product_factor = false;
+   bool equal_zero;
 
    if (!condition || condition->num_components != 1)
       return false;
@@ -4706,7 +4757,8 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
    if (nir_def_instr(predicate.def)->type != nir_instr_type_alu)
       return false;
    compare = nir_instr_as_alu(nir_def_instr(predicate.def));
-   if (predicate.comp || compare->op != nir_op_flt ||
+   equal_zero = compare->op == nir_op_feq;
+   if (predicate.comp || (compare->op != nir_op_flt && !equal_zero) ||
        compare->src[0].src.ssa->bit_size != 32 ||
        compare->src[1].src.ssa->bit_size != 32)
       return false;
@@ -4714,8 +4766,16 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
                                compare->src[0].swizzle[0]);
    reference = nir_scalar_resolved(compare->src[1].src.ssa,
                                    compare->src[1].swizzle[0]);
+   /* feq is commutative: accept the constant zero on either side. */
+   if (equal_zero && nir_scalar_is_const(alpha)) {
+      nir_scalar swap = alpha;
+
+      alpha = reference;
+      reference = swap;
+   }
    if (!nir_scalar_is_const(reference) ||
-       nir_scalar_as_uint(reference) != half[0])
+       (equal_zero ? (nir_scalar_as_uint(reference) & 0x7fffffff) != 0 :
+                     nir_scalar_as_uint(reference) != half[0]))
       return false;
    if (!chrome9_ps_sample_alpha(alpha, &texture)) {
       nir_scalar sample, factor;
@@ -4738,8 +4798,11 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
              varying.file != CHROME9_PS_SOURCE_TEXTURE || varying.id >= 8 ||
              varying.swizzle[factor.comp] > CHROME9_PS_SWIZZLE_W)
             continue;
-         builder->unit_interval_input_mask |=
-            1u << (varying.id * 4 + varying.swizzle[factor.comp]);
+         /* The 0.5 threshold needs the factor proven within [0, 1];
+          * an exact zero test does not. */
+         if (!equal_zero)
+            builder->unit_interval_input_mask |=
+               1u << (varying.id * 4 + varying.swizzle[factor.comp]);
          product_factor = true;
          break;
       }
@@ -4765,6 +4828,8 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
       sampled.swizzle[c] = sampled_lane;
       threshold.swizzle[c] = threshold_lane;
    }
+   if (equal_zero)
+      return chrome9_ps_lower_kill_zero(builder, &sampled);
    temp = builder->next_temp++;
    subtract = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_SUB);
    kill = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_KILL);

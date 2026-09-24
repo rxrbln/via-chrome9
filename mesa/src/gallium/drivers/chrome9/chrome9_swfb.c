@@ -29,6 +29,7 @@
 #include "util/hash_table.h"
 #include "util/os_time.h"
 #include "util/u_debug.h"
+#include "util/u_dynarray.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
@@ -129,8 +130,7 @@ struct chrome9_sw_context {
     * so none outlives its chrome9 BO. */
    struct hash_table *aliases;
    /* chrome9 references held while llvmpipe may still access them. */
-   struct pipe_resource *held[4 * PIPE_MAX_SHADER_SAMPLER_VIEWS];
-   unsigned held_count;
+   struct util_dynarray held;
    bool pending;
    uint64_t draws;
    uint64_t us;
@@ -169,9 +169,9 @@ chrome9_sw_release_held(struct chrome9_sw_context *sw)
       pipe_resource_reference(&alias, NULL);
    }
    _mesa_hash_table_clear(sw->aliases, NULL);
-   for (unsigned i = 0; i < sw->held_count; i++)
-      pipe_resource_reference(&sw->held[i], NULL);
-   sw->held_count = 0;
+   util_dynarray_foreach(&sw->held, struct pipe_resource *, res)
+      pipe_resource_reference(res, NULL);
+   util_dynarray_clear(&sw->held);
 }
 
 void
@@ -194,8 +194,12 @@ chrome9_sw_finish(struct chrome9_context *ctx)
 static void
 chrome9_sw_hold(struct chrome9_sw_context *sw, struct pipe_resource *res)
 {
-   if (res && sw->held_count < ARRAY_SIZE(sw->held))
-      pipe_resource_reference(&sw->held[sw->held_count++], res);
+   struct pipe_resource *ref = NULL;
+
+   if (!res)
+      return;
+   pipe_resource_reference(&ref, res);
+   util_dynarray_append(&sw->held, ref);
 }
 
 static struct chrome9_sw_context *
@@ -211,6 +215,7 @@ chrome9_sw_context(struct chrome9_context *ctx)
    sw->screen = chrome9_screen_sw(ctx->base.screen);
    if (sw->screen)
       sw->lp = sw->screen->context_create(sw->screen, NULL, 0);
+   util_dynarray_init(&sw->held, NULL);
    sw->objects = _mesa_pointer_hash_table_create(NULL);
    sw->aliases = _mesa_pointer_hash_table_create(NULL);
    if (!sw->lp || !sw->objects || !sw->aliases) {
@@ -337,6 +342,7 @@ chrome9_sw_context_destroy(struct chrome9_context *ctx)
       chrome9_sw_delete_object(sw->lp, entry->data);
    _mesa_hash_table_destroy(sw->objects, NULL);
    _mesa_hash_table_destroy(sw->aliases, NULL);
+   util_dynarray_fini(&sw->held);
    if (chrome9_sw_debug())
       fprintf(stderr, "chrome9: sw fallback draws=%" PRIu64 " time=%" PRIu64
                       " us\n", sw->draws, sw->us);
@@ -433,8 +439,12 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
        (uint64_t)res->level_stride[0] * align(resource->height0, 4) >
           align64(res->level_size[0], 4096))
       return NULL;
+   (void)bind;
    templ.last_level = 0;
-   templ.bind = bind | PIPE_BIND_SAMPLER_VIEW;
+   /* One alias serves sampling and rendering within a draw sequence. */
+   templ.bind = PIPE_BIND_SAMPLER_VIEW |
+                (util_format_is_depth_or_stencil(resource->format) ?
+                 PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET);
    templ.next = NULL;
    pipe_reference_init(&templ.reference, 1);
    alias = sw->screen->resource_from_handle(sw->screen, &templ, &handle, 0);
@@ -656,6 +666,11 @@ chrome9_sw_draw_vbo(struct chrome9_context *ctx,
    int64_t start = os_time_get();
 
    if (!chrome9_sw_enabled() || !ctx->vs || !ctx->fs)
+      return false;
+   /* Depth written by the pixel engine and llvmpipe differ in rounding:
+    * an EQUAL test across the two would only partly pass. */
+   if (ctx->dsa && ctx->dsa->depth_enabled &&
+       ctx->dsa->depth_func == PIPE_FUNC_EQUAL)
       return false;
    /* Retire GPU batches that wrote the targets or textures read here. */
    chrome9_draw_flush_gpu_batch(ctx);
