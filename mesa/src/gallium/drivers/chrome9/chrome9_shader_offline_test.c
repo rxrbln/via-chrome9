@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #include "chrome9_shader_offline.h"
 
 /* This is a verifier, including in release builds.  Meson's release profile

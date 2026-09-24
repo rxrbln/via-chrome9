@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: MIT */
-/* Copyright 2026 Chrome9 contributors */
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef CHROME9_CONTEXT_H
 #define CHROME9_CONTEXT_H

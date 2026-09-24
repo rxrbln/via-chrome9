@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 /* Gallium L0 rendering into a guarded BGRA resource with a private mip tail. */
 #include "chrome9_context.h"

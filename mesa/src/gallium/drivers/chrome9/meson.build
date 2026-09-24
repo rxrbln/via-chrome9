@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: MIT
-# Copyright 2026 Chrome9 contributors
 # Copyright 2026 René Rebe <rene@exactco.de>
 
 # llvmpipe renders fragment programs beyond the hardware limits.
