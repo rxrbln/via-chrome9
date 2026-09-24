@@ -714,6 +714,9 @@ cmd22 at the -0.5 pixel-center bias).
 | L6 | the same ops reading an input or a temp holding the constant | exact |
 | L6 | swizzled constant reads (`.yyyy`, `.wwww`) in vector ops | exact |
 | L7 | A01 bit 7, A23 `23004e02` (cull CW) / `23004f02` (cull CCW) | the screen-clockwise triangle disappears with CW only; next uncull draw exact |
+| L11 | chains of 100..246 dependent ADDs plus fills and finalizer, up to 256 records | exact (1 LSB): the store holds at least 256 records |
+| L13 | A23[14:12] = 0 (solid) | one color latched for the whole draw (the third vertex of the first triangle) |
+| L13b | A23[14:12] = 3 (FlatC), two triangles, distinct vertex colors | each triangle fills with its own third vertex color: FlatC = GL provoking-last |
 | A61 | bit 16 set | no visible effect |
 | A61 | bit 18 set | **engine timeout**, needs a cold boot; masked in the RE knob |
 
@@ -723,6 +726,29 @@ constant directly.  Userspace legalizes with a MOV into a temp.  The vendor
 compiler emits `mad r0,v0,c0,c1` and `mad r0,v0,v1,v2` directly, so it
 probably relies on state this driver does not set (open; see
 [chrome9-vs-scalar-precision.md](chrome9-vs-scalar-precision.md) once written).
+
+### Mesa integration (CHROME9_TCL=1)
+
+`gallium/chrome9` commits `1fa63e1`, `b7a4fef` lower the Gallium VS NIR to
+the kernel IR (`chrome9_tcl.c`): CB0 values feeding branches are folded
+into per-draw variants (at most 32 per shader), loads are hoisted and the
+remaining ifs flattened, multiply-adds fused, integers and booleans
+lowered to float, VAR/TEX outputs mapped to fragment varyings n, and the
+read-port rules legalized with temp copies.  Attributes are unpacked to
+FLOAT4 on the CPU and submitted in chunks of up to 128 triangles.  Guarded
+fragment domains are accepted when every guarded lane is proven from
+literals, saturation or default-filled attribute lanes.
+
+| workload | result |
+|---|---|
+| ioquake3 q3dm1 GL1 | 100 % of triangles on hardware TCL, image unchanged |
+| ioquake3 q3dm1 GL2 | 99.5 % on hardware TCL (two guarded draws fall back), image unchanged |
+| glxgears | 100 % on hardware TCL (flat faces via FlatC), 35 fps versus 58 fps post-TNL |
+| glmark2 default set | validation unchanged; conditionals 2 -> 12 fps, jellyfish 2 -> 7, build 2 -> 5 |
+
+The per-draw ioctl, full state rebuild and CPU attribute unpack dominate
+small draws (glxgears); stage B GEM vertex buffers and multi-draw batching
+are the performance follow-ups.
 
 ## Recommended first silicon test
 
