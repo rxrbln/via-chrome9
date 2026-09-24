@@ -252,10 +252,22 @@ offset plus `0x100`, exactly matching this layout.  The final end rounds to
    rejects a multi-level X8Z24 descriptor at
    `chrome9_engine.c:7095..7099`, but still accepts linear min/mag filtering
    for its single level because the generic filter checks at `:7076..7078`
-   allow both codes for every format.  Refract asks for nearest, so its exact
-   state is unaffected.  Until a bounded raw-depth linear-filter oracle
-   exists, the render-node validator should enforce the same nearest-only
-   rule instead of relying on Mesa to do so.
+   allow both codes for every format.  This is not merely a conservative Mesa
+   policy.  Linux `STM_FilterMode_INV` tests private D24X8 format `0x2032` at
+   `via_chrome9_dri.so:0x1b3418..0x1b3448` and enters a format rewrite which
+   clears all four A31 spatial-filter selectors: stage byte `+0x11 &= 0x03`
+   removes A31[15:10], stage word `+0x10 &= 0xfc7f` removes A31[9:7], and
+   stage byte `+0x10 &= 0x8f` removes A31[6:4].  It also applies
+   `+0x16 &= 0xc0` to the associated A32 controls.  Windows independently
+   selects `0x2032` at `VTGUModeDX32A.dll:0x101d9709..0x101d973d`, then
+   applies `state+0xc4 &= 0xffff000f` at `0x101d973d` (preserving only the
+   A31 mip selector below bit 4) and `state+0xc8 &= 0xffc0ffff` at
+   `0x101d9747`.  Both proprietary stacks therefore force point sampling for
+   raw D24X8 instead of forwarding a requested bilinear filter.
+
+   Refract asks for nearest, so its exact state is unaffected.  The
+   render-node validator should enforce nearest minification and magnification
+   for X8Z24 rather than exposing a state the production builders rewrite.
 
 6. **The offline self-test does not cover the dangerous boundary.**
    The existing 64x32 BGRA test stops at L1 and checks only one H3 entry and
