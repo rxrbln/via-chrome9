@@ -1485,14 +1485,14 @@ static int chrome9_scanout_carveout_init(struct chrome9_device *cdev,
 	if (!IS_ALIGNED(offset, PAGE_SIZE) || !IS_ALIGNED(size, PAGE_SIZE))
 		return dev_err_probe(&cdev->pdev->dev, -EINVAL,
 			"scanout carveout must be page aligned\n");
-	if (cdev->vram_size < SZ_64K)
+	if (cdev->vram_size < CHROME9_ENGINE_VRAM_RESERVED)
 		return dev_err_probe(&cdev->pdev->dev, -ENODEV,
 			"BAR2 size is unavailable for scanout validation\n");
 
-	usable = cdev->vram_size - SZ_64K;
+	usable = cdev->vram_size - CHROME9_ENGINE_VRAM_RESERVED;
 	if (offset > usable || size > usable - offset)
 		return dev_err_probe(&cdev->pdev->dev, -ERANGE,
-			"scanout carveout [%#lx,%#lx) overlaps the final 64-KiB GART or exceeds BAR2\n",
+			"scanout carveout [%#lx,%#lx) overlaps the engine VRAM tail or exceeds BAR2\n",
 			offset, offset + size);
 	if (!chrome9_iga1_base_valid(offset) ||
 	    offset + size > CHROME9_IGA1_BASE_MAX)
@@ -1511,7 +1511,7 @@ static int chrome9_scanout_carveout_init(struct chrome9_device *cdev,
 	cdev->scanout_offset = offset;
 	cdev->scanout_size = size;
 	dev_info(&cdev->pdev->dev,
-		 "lab-only BAR2 scanout staging enabled: [%#lx,%#lx), final 64 KiB reserved for GART\n",
+		 "lab-only BAR2 scanout staging enabled: [%#lx,%#lx), GART and query pages reserved\n",
 		 offset, offset + size);
 	return 0;
 }

@@ -6,6 +6,7 @@
 #include <linux/iosys-map.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/sizes.h>
 #include <linux/vgaarb.h>
 
 #include <drm/drm_device.h>
@@ -89,6 +90,9 @@ static inline u32 chrome9_iga2_base_pack(u32 old, u32 byte_address)
 	return (old & CHROME9_IGA2_BASE_KEEP_MASK) |
 	       (byte_address & CHROME9_IGA2_BASE_ADDR_MASK);
 }
+
+/* Final VRAM owned by the engine: occlusion snapshot page, 64-KiB GART. */
+#define CHROME9_ENGINE_VRAM_RESERVED	(SZ_64K + PAGE_SIZE)
 
 #define CHROME9_ENGINE_WAIT_MASK		0x00101ff3
 /* CR bit 4 may remain set while the owned reader is safely at PAUSE. */

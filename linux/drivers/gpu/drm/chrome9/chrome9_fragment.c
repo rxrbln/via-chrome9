@@ -188,7 +188,7 @@ static u8 chrome9_fragment_alu_component_mask(
 
 static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	u32 instruction_count, u32 constant_count, u32 texture_count,
-	u32 descriptor_mask, bool sparse_textures, u32 cube_mask,
+	u32 descriptor_mask, bool sparse_textures, u32 str_mask,
 	u32 varying_count)
 {
 	u8 output_mask = 0;
@@ -344,8 +344,8 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			    coordinate->modifier)
 				return -EINVAL;
 			if (coordinate->file == DRM_CHROME9_FRAGMENT_FILE_VARYING) {
-				/* A cube lookup reads S, T and R. */
-				bool cube = cube_mask & BIT(instruction->sampler);
+				/* A cube or volume lookup reads S, T and R. */
+				bool cube = str_mask & BIT(instruction->sampler);
 				u8 width = state->tex_varying_width[coordinate->index];
 
 				for (source = 0;
@@ -1356,7 +1356,7 @@ int chrome9_fragment_compile_targets(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,
 	u32 texture_count, u32 descriptor_mask, bool sparse_textures,
-	u32 cube_mask, u32 varying_count,
+	u32 str_mask, u32 varying_count,
 	struct chrome9_fragment_program *program)
 {
 	struct chrome9_fragment_state state = {
@@ -1375,7 +1375,7 @@ int chrome9_fragment_compile_targets(
 		state.instructions = split;
 	ret = chrome9_fragment_validate(&state, instruction_count,
 		constant_count, texture_count, descriptor_mask,
-		sparse_textures, cube_mask, varying_count);
+		sparse_textures, str_mask, varying_count);
 	if (ret)
 		goto out;
 	ret = -EINVAL;

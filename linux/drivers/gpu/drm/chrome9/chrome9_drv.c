@@ -31,6 +31,7 @@
 
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
+#include "chrome9_query.h"
 
 #define CHROME9_DRIVER_NAME	"chrome9"
 #define CHROME9_DRIVER_DESC	"VIA Chrome9 HD clean-room render driver"
@@ -2747,6 +2748,8 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_GEM_INFO, chrome9_gem_info_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_QUERY, chrome9_query_ioctl,
+			  DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(chrome9_fops);
@@ -2756,6 +2759,8 @@ static const struct drm_driver chrome9_drm_driver = {
 	.fops = &chrome9_fops,
 	.ioctls = chrome9_ioctls,
 	.num_ioctls = ARRAY_SIZE(chrome9_ioctls),
+	.open = chrome9_query_open,
+	.postclose = chrome9_query_postclose,
 	DRM_GEM_SHMEM_DRIVER_OPS,
 	.gem_create_object = chrome9_gem_create_object,
 	.name = CHROME9_DRIVER_NAME,
@@ -2770,6 +2775,8 @@ static const struct drm_driver chrome9_kms_drm_driver = {
 	.fops = &chrome9_fops,
 	.ioctls = chrome9_ioctls,
 	.num_ioctls = ARRAY_SIZE(chrome9_ioctls),
+	.open = chrome9_query_open,
+	.postclose = chrome9_query_postclose,
 	.gem_prime_import = drm_gem_shmem_prime_import_no_map,
 	.dumb_create = chrome9_gem_dumb_create,
 	.gem_create_object = chrome9_gem_create_object,

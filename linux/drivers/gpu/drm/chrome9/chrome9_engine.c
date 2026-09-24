@@ -30,6 +30,7 @@
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
 #include "chrome9_fragment.h"
+#include "chrome9_query.h"
 #include "chrome9_vertex.h"
 
 #define CHROME9_GART_SIZE		SZ_64K
@@ -60,7 +61,15 @@
 #define CHROME9_FE33_WAIT_3D		0x00200000U
 #define CHROME9_FE33_SLOT_SIZE		16U
 #define CHROME9_FE33_CANARY		0x5afe3300U
+/* Occlusion snapshots: one result dword plus three canaries per slot. */
+#define CHROME9_QUERY_SLOT_SIZE		16U
+#define CHROME9_QUERY_POISON		0xffffffffU
+#define CHROME9_QUERY_CANARY		0x0cc10000U
+/* Reset, snapshot and optional sync, headers and alignment included. */
+#define CHROME9_QUERY_STATE_DWORDS	16U
+#define CHROME9_QUERY_SNAPSHOT_DWORDS	32U
 
+static_assert(CHROME9_ENGINE_VRAM_RESERVED == CHROME9_GART_SIZE + PAGE_SIZE);
 static_assert(IS_ALIGNED(CHROME9_PRIME_PAUSE, 16));
 static_assert(IS_ALIGNED(CHROME9_PRIME_STOP, 16));
 static_assert(IS_ALIGNED(CHROME9_WRAP_APPEND, 128));
@@ -120,6 +129,11 @@ static bool chrome9_dxt = true;
 module_param_named(dxt, chrome9_dxt, bool, 0400);
 MODULE_PARM_DESC(dxt,
 	"DXT1/DXT3/DXT5 fragment texture formats (default: true)");
+
+static bool chrome9_texture_3d;
+module_param_named(texture_3d, chrome9_texture_3d, bool, 0400);
+MODULE_PARM_DESC(texture_3d,
+	"Enable the pre-promotion 3D fragment texture target (default: false)");
 
 /* RE knob for the two-side/UCP ladder: 1 clear A61[19], 2 no saturate on
  * oBFD0, 4 UCP perspective (A05[6]/[14]), 8 UCP bits in A28/A29. */
@@ -294,6 +308,15 @@ struct chrome9_fragment_submit;
 /* Destination, depth, textures and the stage B vertex buffers. */
 #define CHROME9_FRAGMENT_MAX_OBJECTS	64
 
+/* One occlusion snapshot of a job, in draw order. */
+struct chrome9_job_query {
+	struct chrome9_query *query;
+	u32 generation;
+	u32 draw;
+	u32 slot;
+	bool attached;
+};
+
 struct chrome9_job {
 	struct chrome9_fence fence;
 	struct drm_gem_shmem_object *destination;
@@ -336,6 +359,10 @@ struct chrome9_job {
 	bool fence_attached;
 	bool published;
 	bool retirement_proven;
+	struct chrome9_job_query *queries;
+	u32 query_count;
+	/* Snapshots before this index were read or dropped. */
+	u32 query_done;
 };
 
 enum chrome9_draw_kind {
@@ -472,6 +499,9 @@ struct chrome9_draw_request {
 	u8 fragment_texture_units[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u8 fragment_texture_flags[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_depth_format;
+	/* FRAGMENT_QUERY: active query and its interval. */
+	struct chrome9_query *query;
+	u32 query_generation;
 	struct drm_chrome9_stencil_state stencil;
 	u32 ps_program[4];
 	u32 ps_constant_c0[4];
@@ -605,6 +635,10 @@ struct chrome9_engine {
 	bool quarantine_hold;
 	bool module_hold;
 	bool device_hold;
+	/* Occlusion snapshot slots in the VRAM page below the GART. */
+	unsigned long *query_slots;
+	unsigned int query_slot_count;
+	u32 query_offset;
 };
 
 static void chrome9_engine_retire_locked(struct chrome9_engine *engine);
@@ -949,6 +983,53 @@ static int chrome9_emit_3d_tail(struct chrome9_engine *engine,
 	chrome9_emit_header2(cursor, 0x420, 0x0000041c, 0x00300000, NULL, 0);
 	chrome9_emit_header0(cursor, cookie, ARRAY_SIZE(cookie) / 2);
 	return 0;
+}
+
+/* Vendor query begin (hwmUpdateStatus_h5): zero A1C/A1D. */
+static const u32 chrome9_occlusion_reset[] = {
+	0x1c000000, 0x1d000000, 0xcccccccc, 0xcccccccc,
+};
+
+/*
+ * Vendor query end: type-10 read-back of type-01 A1C to the SL byte
+ * address in A21/A22.  Mode 2 first drains the 3D pipeline as the tail does.
+ */
+static void chrome9_emit_occlusion_snapshot(u32 **cursor, u32 address)
+{
+	static const u32 sync[] = { 0x6c, 0x00800000 };
+	static const u32 readback[] = {
+		0x02000000, 0x0300011c, 0xcccccccc, 0xcccccccc,
+	};
+	u32 destination[] = {
+		0x21000000 | (address & 0x00ffffff), 0x22000000 | address >> 24,
+		0xcccccccc, 0xcccccccc,
+	};
+
+	if (chrome9_occlusion_query_mode() == 2)
+		chrome9_emit_header0(cursor, sync, ARRAY_SIZE(sync) / 2);
+	chrome9_emit_header2(cursor, 0x420, 0x0000041c, 0x00100000, readback,
+			     ARRAY_SIZE(readback));
+	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000, destination,
+			     ARRAY_SIZE(destination));
+}
+
+static int chrome9_occlusion_selftest(void)
+{
+	static const u32 golden[] = {
+		0xfe020420, 0x0000041c, 0x00100000, 0xcc000000,
+		0x02000000, 0x0300011c, 0xcccccccc, 0xcccccccc,
+		0xfe020440, 0x0000043c, 0x00010000, 0xcc000000,
+		0x21234560, 0x22000001, 0xcccccccc, 0xcccccccc,
+	};
+	u32 packet[CHROME9_QUERY_SNAPSHOT_DWORDS] __aligned(16);
+	u32 *cursor = packet;
+
+	chrome9_emit_occlusion_snapshot(&cursor, 0x01234560);
+	if (chrome9_occlusion_query_mode() == 2)
+		return cursor == packet + 24 && packet[4] == 0x6c &&
+		       !memcmp(packet + 8, golden, sizeof(golden)) ? 0 : -EINVAL;
+	return cursor == packet + ARRAY_SIZE(golden) &&
+	       !memcmp(packet, golden, sizeof(golden)) ? 0 : -EINVAL;
 }
 
 static int chrome9_finish_ring_sized(u32 *base, u32 *p, size_t capacity,
@@ -2307,7 +2388,11 @@ static void chrome9_fragment_sampler_state(
 	sampler[1] = 0x31100000 | texture->mag_filter << 13 |
 		texture->min_filter << 10 | texture->mag_filter << 7 |
 		texture->min_filter << 4 | texture->mip_filter;
-	sampler[2] = 0x32000040 | texture->wrap_t << 3 | texture->wrap_s;
+	/* A32 [8:6] R wrap, [21:19]/[18:16] R filters; 2D keeps R clamped. */
+	sampler[2] = 0x32000000 | texture->wrap_t << 3 | texture->wrap_s |
+		(texture->target == DRM_CHROME9_FRAGMENT_TARGET_3D ?
+		 texture->mag_filter << 19 | texture->min_filter << 16 |
+		 texture->wrap_r << 6 : 0x40);
 	sampler[3] = 0xcccccccc;
 }
 
@@ -3271,6 +3356,7 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 	u32 texture_base, u32 unit, u32 flags)
 {
 	bool cube = texture->target == DRM_CHROME9_FRAGMENT_TARGET_CUBE;
+	bool volume = texture->target == DRM_CHROME9_FRAGMENT_TARGET_3D;
 	u32 width = texture->width >> texture->first_level;
 	u32 height = texture->height >> texture->first_level;
 	u32 log_size = ilog2(max(height, 1U)) << 4 |
@@ -3288,14 +3374,18 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 		for (face = 1; face < 6; face++)
 			image[count++] = face << 24 | (cube ?
 				(root + face * texture->face_stride) >> 8 : 0);
-	/* Cube: mode 3 with six SF face locations.  Its level table is
-	 * always authoritative, so A22 carries no POT flag. */
-	image[count++] = cube ? 0x18015355 : 0x18001101;
+	/*
+	 * Cube: mode 3 with six SF face locations.  Its level table is
+	 * always authoritative, so A22 carries no POT flag.  3D: mode 2 with
+	 * the R length in A21 and its exponent in A22.
+	 */
+	image[count++] = cube ? 0x18015355 : volume ? 0x18001201 : 0x18001101;
 	image[count++] = 0x20000000 | height << 12 | width;
-	image[count++] = 0x21000001;
+	image[count++] = 0x21000000 | (volume ? texture->depth : 1);
 	image[count++] = 0x22000000 |
 		(!cube && is_power_of_2(width) && is_power_of_2(height) ?
-		 BIT(15) : 0) | log_size;
+		 BIT(15) : 0) |
+		(volume ? ilog2(texture->depth) << 8 : 0) | log_size;
 	image[count++] = 0x30000000 |
 		chrome9_fragment_texture_format(texture->format) << 16 |
 		(texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ?
@@ -3323,6 +3413,7 @@ static u32 chrome9_fragment_state_bound(const struct chrome9_draw_request *reque
 	const struct chrome9_tcl_draw *tcl = request->tcl;
 
 	return 512 + 64 * request->fragment_texture_count +
+	       (request->query ? CHROME9_QUERY_STATE_DWORDS : 0) +
 	       4 * program->constant_count + 4 * program->alu_count +
 	       program->tau_count +
 	       (tcl ? 4 * tcl->constant_count + 4 * tcl->program.record_count :
@@ -3332,12 +3423,15 @@ static u32 chrome9_fragment_state_bound(const struct chrome9_draw_request *reque
 /*
  * Emit one draw's complete state and its vertices (stage A, post-TNL) or
  * stream slots and indices (stage B) at *cursor, never past limit.
- * -E2BIG leaves *cursor unchanged so a batch can start a new segment.
+ * A non-NULL query brackets the draw with a counter reset and a snapshot
+ * to that SL address.  -E2BIG leaves *cursor unchanged so a batch can start
+ * a new segment.
  */
 static noinline_for_stack int
 chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-	const u32 *element_address, u32 **cursor, const u32 *limit)
+	const u32 *element_address, const u32 *query, u32 **cursor,
+	const u32 *limit)
 {
 	static const u32 destination_tail[] = {
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
@@ -3390,6 +3484,7 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 destination_count;
 	u32 common_count = 7;
 	u32 vertex_count = tcl ? tcl->vertex_count : request->triangle_count * 3;
+	u32 snapshot = query ? CHROME9_QUERY_SNAPSHOT_DWORDS : 0;
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 		DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	u32 raster_count;
@@ -3503,6 +3598,10 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			GENMASK(program->varying_width[i] - 1, 0);
 	}
 
+	if (query)
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+				     chrome9_occlusion_reset,
+				     ARRAY_SIZE(chrome9_occlusion_reset));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     destination_state, destination_count);
 	for (i = 0; i < request->fragment_texture_count; i++) {
@@ -3566,7 +3665,7 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		u32 slots[DRM_CHROME9_VERTEX_MAX_INPUTS];
 		u32 draw[4];
 
-		if (p + 0x40 + tcl->index_dwords > limit)
+		if (p + 0x40 + snapshot + tcl->index_dwords > limit)
 			return -E2BIG;
 		for (i = 0; i < tcl->element_count; i++)
 			slots[i] = chrome9_tcl_stream_slot(element_address[i],
@@ -3581,6 +3680,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 				     draw, ARRAY_SIZE(draw));
 		chrome9_emit_header3(&p, 0x00000000, tcl->indices,
 				     tcl->index_dwords);
+		if (query)
+			chrome9_emit_occlusion_snapshot(&p, *query);
 		*cursor = p;
 		return 0;
 	}
@@ -3591,7 +3692,7 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	if (tcl) {
 		u32 dwords = vertex_count * tcl->stride_dw;
 
-		if (p + dwords > limit)
+		if (p + dwords + snapshot > limit)
 			return -E2BIG;
 		memcpy(p, tcl->vertices, dwords * sizeof(*p));
 		p += dwords;
@@ -3601,7 +3702,7 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 
 		for (i = 0; i < program->varying_count; i++)
 			width += program->varying_width[i];
-		if (p + vertex_count * width > limit)
+		if (p + vertex_count * width + snapshot > limit)
 			return -E2BIG;
 	}
 	for (i = 0; !tcl && i < vertex_count; i++) {
@@ -3625,6 +3726,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		}
 	}
 	chrome9_count_vertex_payload(vertex_header, p - vertex_header - 4);
+	if (query)
+		chrome9_emit_occlusion_snapshot(&p, *query);
 	*cursor = p;
 	return 0;
 }
@@ -4306,6 +4409,13 @@ static void chrome9_quarantine_job_locked(struct chrome9_engine *engine,
 					 struct chrome9_job *job)
 {
 	lockdep_assert_held(&engine->submit_lock);
+	/* The engine may still write the slots: they are never reused. */
+	for (; job->query_done < job->query_count; job->query_done++) {
+		struct chrome9_job_query *jq = &job->queries[job->query_done];
+
+		if (jq->attached)
+			chrome9_query_add(jq->query, jq->generation, 0, -EIO);
+	}
 	engine->wedged = true;
 	chrome9_take_quarantine_hold(engine);
 	list_add_tail(&job->quarantine_link, &engine->quarantine);
@@ -5348,6 +5458,10 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_CUBE_MAP;
 	if (READ_ONCE(chrome9_dxt))
 		caps |= DRM_CHROME9_CAP2_DXT | DRM_CHROME9_CAP2_DXT_MIP;
+	if (chrome9_occlusion_query_mode())
+		caps |= DRM_CHROME9_CAP2_OCCLUSION_QUERY;
+	if (READ_ONCE(chrome9_texture_3d))
+		caps |= DRM_CHROME9_CAP2_TEXTURE_3D;
 	return caps;
 }
 
@@ -5410,6 +5524,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 			ret);
 		return ret;
 	}
+	ret = chrome9_occlusion_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"occlusion snapshot self-test failed: %d\n", ret);
+		return ret;
+	}
 	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
 	cdev->mmio = chrome9_iomap_bar_once(cdev->pdev, 1);
 	cdev->vram = chrome9_iomap_bar_once(cdev->pdev, 2);
@@ -5418,7 +5538,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	ret = chrome9_detect_vram(cdev);
 	if (ret)
 		return ret;
-	if (cdev->vram_size < CHROME9_GART_SIZE)
+	if (cdev->vram_size < CHROME9_ENGINE_VRAM_RESERVED)
 		return dev_err_probe(&cdev->pdev->dev, -ERANGE,
 			"detected VRAM is too small for the final 64-KiB GART\n");
 	gart_offset = cdev->vram_size - CHROME9_GART_SIZE;
@@ -5445,6 +5565,17 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	atomic64_set(&engine->fence_seqno, 0);
 	engine->gart_offset = gart_offset;
 	engine->gart = cdev->vram + engine->gart_offset;
+	/* Occlusion snapshots go to the SL page below the GART. */
+	if (chrome9_occlusion_query_mode()) {
+		engine->query_offset = gart_offset - PAGE_SIZE;
+		engine->query_slot_count = PAGE_SIZE / CHROME9_QUERY_SLOT_SIZE;
+		engine->query_slots = bitmap_zalloc(engine->query_slot_count,
+						    GFP_KERNEL);
+		if (!engine->query_slots) {
+			ret = -ENOMEM;
+			goto err_free_engine;
+		}
+	}
 	engine->gart_saved = kvzalloc(CHROME9_GART_SIZE, GFP_KERNEL);
 	if (!engine->gart_saved) {
 		ret = -ENOMEM;
@@ -5592,6 +5723,7 @@ err_free_ring:
 err_free_saved:
 	kvfree(engine->gart_saved);
 err_free_engine:
+	bitmap_free(engine->query_slots);
 	kfree(engine);
 	return ret;
 }
@@ -6544,6 +6676,138 @@ static u32 chrome9_fragment_submit_object(struct drm_file *file,
 	return i;
 }
 
+static void __iomem *chrome9_query_slot(struct chrome9_engine *engine,
+					u32 slot)
+{
+	return engine->cdev->vram + engine->query_offset +
+	       slot * CHROME9_QUERY_SLOT_SIZE;
+}
+
+/* Snapshot entries of the query draws, allocated outside submit_lock. */
+static int chrome9_job_query_alloc(struct chrome9_job *job,
+		const struct chrome9_draw_request *const *requests, u32 count)
+{
+	u32 r, n = 0;
+
+	for (r = 0; r < count; r++)
+		n += !!requests[r]->query;
+	if (!n)
+		return 0;
+	job->queries = kvcalloc(n, sizeof(*job->queries), GFP_KERNEL);
+	return job->queries ? 0 : -ENOMEM;
+}
+
+/* Reserve and poison one VRAM snapshot slot per query draw (submit_lock). */
+static int chrome9_job_query_prepare_locked(struct chrome9_engine *engine,
+		struct chrome9_job *job,
+		const struct chrome9_draw_request *const *requests, u32 count)
+{
+	void __iomem *slot = NULL;
+	unsigned int i;
+	u32 r;
+
+	if (!job->queries)
+		return 0;
+	if (!engine->query_slots)
+		return -EOPNOTSUPP;
+	for (r = 0; r < count; r++) {
+		struct chrome9_job_query *jq;
+		unsigned long bit;
+
+		if (!requests[r]->query)
+			continue;
+		bit = find_first_zero_bit(engine->query_slots,
+					  engine->query_slot_count);
+		if (bit >= engine->query_slot_count)
+			return -ENOSPC;
+		__set_bit(bit, engine->query_slots);
+		jq = &job->queries[job->query_count++];
+		jq->query = chrome9_query_get(requests[r]->query);
+		jq->generation = requests[r]->query_generation;
+		jq->draw = r;
+		jq->slot = bit;
+		slot = chrome9_query_slot(engine, bit);
+		writel(CHROME9_QUERY_POISON, slot);
+		for (i = 1; i < CHROME9_QUERY_SLOT_SIZE / 4; i++)
+			writel(CHROME9_QUERY_CANARY + i, slot + 4 * i);
+	}
+	/* The poison is in VRAM before any snapshot can execute. */
+	readl(slot);
+	return 0;
+}
+
+/* Draws [first, end) are about to be published in the job's fence. */
+static void chrome9_job_query_attach(struct chrome9_job *job, u32 first,
+				     u32 end)
+{
+	unsigned int i;
+
+	for (i = job->query_done; i < job->query_count; i++)
+		if (job->queries[i].draw >= first &&
+		    job->queries[i].draw < end)
+			job->queries[i].attached = chrome9_query_attach(
+				job->queries[i].query,
+				job->queries[i].generation, &job->fence.base);
+}
+
+/* Add the snapshots of the retired draws below end (submit_lock held). */
+static void chrome9_job_query_retire_locked(struct chrome9_engine *engine,
+					    struct chrome9_job *job, u32 end)
+{
+	for (; job->query_done < job->query_count &&
+	       job->queries[job->query_done].draw < end; job->query_done++) {
+		struct chrome9_job_query *jq = &job->queries[job->query_done];
+		void __iomem *slot = chrome9_query_slot(engine, jq->slot);
+		u32 samples = readl(slot);
+		int error = 0;
+		unsigned int i;
+
+		for (i = 1; i < CHROME9_QUERY_SLOT_SIZE / 4; i++)
+			if (readl(slot + 4 * i) != CHROME9_QUERY_CANARY + i)
+				error = -EIO;
+		if (samples == CHROME9_QUERY_POISON)
+			error = -EIO;
+		if (error) {
+			dev_warn_ratelimited(&engine->cdev->pdev->dev,
+				"occlusion snapshot slot %u: %08x %08x %08x %08x\n",
+				jq->slot, samples, readl(slot + 4),
+				readl(slot + 8), readl(slot + 12));
+			samples = 0;
+		}
+		if (jq->attached)
+			chrome9_query_add(jq->query, jq->generation, samples,
+					  error);
+		__clear_bit(jq->slot, engine->query_slots);
+	}
+}
+
+/*
+ * Snapshots that never executed return their slots (submit_lock held); an
+ * attached query lost draws of its interval.
+ */
+static void chrome9_job_query_drop_locked(struct chrome9_engine *engine,
+					  struct chrome9_job *job)
+{
+	for (; job->query_done < job->query_count; job->query_done++) {
+		struct chrome9_job_query *jq = &job->queries[job->query_done];
+
+		if (jq->attached)
+			chrome9_query_add(jq->query, jq->generation, 0, -EIO);
+		__clear_bit(jq->slot, engine->query_slots);
+	}
+}
+
+static void chrome9_job_query_free(struct chrome9_job *job)
+{
+	unsigned int i;
+
+	for (i = 0; i < job->query_count; i++)
+		chrome9_query_put(job->queries[i].query);
+	kvfree(job->queries);
+	job->queries = NULL;
+	job->query_count = 0;
+}
+
 /*
  * Post-job work of a retired fragment submission (submit_lock held): hand
  * written objects back to the CPU, verify their guards and release the SF
@@ -6606,6 +6870,7 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 		}
 		chrome9_sf_resync_object_locked(engine, objects[i]);
 	}
+	chrome9_job_query_retire_locked(engine, job, U32_MAX);
 	chrome9_job_release_mappings_locked(engine, job);
 	chrome9_prof_mark(CHROME9_PROF_VERIFY);
 	return ret;
@@ -6646,6 +6911,7 @@ static void chrome9_engine_reap(struct list_head *list)
 		}
 		kvfree(job->fsub);
 		job->fsub = NULL;
+		chrome9_job_query_free(job);
 		dma_fence_put(&job->fence.base);
 	}
 }
@@ -6682,7 +6948,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	u64 mapped_size = 0;
 	u32 object_count = 1;
 	u32 depth_index = U32_MAX;
-	u32 pause, r, next;
+	u32 pause, r, next, q;
 	long wait;
 	bool exec_initialized = false;
 	bool device_owned = false;
@@ -6874,6 +7140,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		}
 	}
 	chrome9_prof_mark(CHROME9_PROF_MAP);
+	ret = chrome9_job_query_alloc(job, requests, count);
+	if (ret)
+		goto out_unmap;
 
 	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
@@ -6884,6 +7153,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	}
 	job->kind = request->kind;
 	job->flags = request->flags;
+	ret = chrome9_job_query_prepare_locked(engine, job, requests, count);
+	if (ret)
+		goto out_prepublication;
 	for (i = 0; i < object_count; i++) {
 		ret = chrome9_job_acquire_mapping_locked(engine, job, objects[i],
 				job->fragment_sgts[i], &sub->bases[i]);
@@ -6973,7 +7245,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	async = READ_ONCE(chrome9_async_retire);
 	for (i = 0; i < object_count; i++)
 		async &= !iosys_map_is_null(&to_chrome9_bo(objects[i])->kmap);
-	for (next = 0; next < count; ) {
+	for (next = 0, q = 0; next < count; ) {
 		const u32 *limit = chrome9_fragment_segment_limit(engine);
 		u32 *p = chrome9_fragment_segment_begin(engine);
 		u32 first = next;
@@ -6981,6 +7253,14 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		for (; next < count; next++) {
 			const struct chrome9_draw_request *req = requests[next];
 			const struct chrome9_tcl_draw *tcl = req->tcl;
+			u32 query_address = 0;
+
+			while (q < job->query_count && job->queries[q].draw < next)
+				q++;
+			if (q < job->query_count && job->queries[q].draw == next)
+				query_address = engine->query_offset +
+					job->queries[q].slot *
+					CHROME9_QUERY_SLOT_SIZE;
 
 			for (t = 0; t < req->fragment_texture_count; t++)
 				texture_bases[t] =
@@ -6997,7 +7277,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				sub->bases[depth_index] + PAGE_SIZE,
 				texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
-				&p, limit);
+				req->query ? &query_address : NULL, &p, limit);
 			/* A full segment is retired before the next draw. */
 			if (ret == -E2BIG && next > first)
 				break;
@@ -7014,6 +7294,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		chrome9_prof_draws += next - first;
 		chrome9_prof_segments++;
 		chrome9_prof_mark(CHROME9_PROF_BUILD);
+		chrome9_job_query_attach(job, first, next);
 		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
 			CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
 		chrome9_prof_mark(CHROME9_PROF_APPEND);
@@ -7038,6 +7319,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		chrome9_prof_mark(CHROME9_PROF_GPU);
 		job->retirement_proven = true;
 		engine->last_cookie = job->cookie;
+		chrome9_job_query_retire_locked(engine, job, next);
 	}
 	job->fsub = sub;
 	job->fsub_count = object_count;
@@ -7065,6 +7347,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 
 out_prepublication:
 	dma_fence_set_error(&job->fence.base, ret ?: -EIO);
+	chrome9_job_query_drop_locked(engine, job);
 	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 out_unlock_submit:
@@ -7105,6 +7388,7 @@ out_exec:
 		job->fragment_objects[i] = NULL;
 		drm_gem_object_put(objects[i]);
 	}
+	chrome9_job_query_free(job);
 	dma_fence_put(&job->fence.base);
 	goto out_dev_exit;
 
@@ -9252,6 +9536,7 @@ static int chrome9_validate_fragment_texture(
 	u64 *object_size, bool sparse_textures, u64 caps2, u32 *flags)
 {
 	bool cube = texture->target == DRM_CHROME9_FRAGMENT_TARGET_CUBE;
+	bool volume = texture->target == DRM_CHROME9_FRAGMENT_TARGET_3D;
 	u32 block_bytes = chrome9_fragment_texture_block_bytes(texture->format);
 	u64 base_offset;
 	u64 end = 0;
@@ -9335,8 +9620,20 @@ static int chrome9_validate_fragment_texture(
 		   texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE ||
 		   !texture->face_stride ||
 		   !IS_ALIGNED(texture->face_stride, 256) :
+	    /* 3D: POT volume, one uncompressed level (no volume mips). */
+	    volume ? !(caps2 & DRM_CHROME9_CAP2_TEXTURE_3D) || block_bytes ||
+		     texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ||
+		     !is_power_of_2(texture->width) ||
+		     !is_power_of_2(texture->height) ||
+		     !is_power_of_2(texture->depth) || texture->depth > 2048 ||
+		     texture->last_level ||
+		     (texture->wrap_r != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
+		      texture->wrap_r != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
+		      texture->wrap_r != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) :
 		   texture->target != DRM_CHROME9_FRAGMENT_TARGET_2D ||
 		   texture->face_stride)
+		return -EINVAL;
+	if (!volume && (texture->depth || texture->wrap_r))
 		return -EINVAL;
 	base_offset = texture->level_offset[texture->first_level];
 	if (base_offset != PAGE_SIZE)
@@ -9384,6 +9681,12 @@ static int chrome9_validate_fragment_texture(
 		if (texture->face_stride < ALIGN(end - base_offset, 256))
 			return -EINVAL;
 		end = base_offset + 6ULL * texture->face_stride;
+	}
+	/* The sampler steps slices by the level-zero image size. */
+	if (volume) {
+		if (texture->face_stride != end - base_offset)
+			return -EINVAL;
+		end = base_offset + (u64)texture->depth * texture->face_stride;
 	}
 	if (check_add_overflow(ALIGN(end, PAGE_SIZE), (u64)PAGE_SIZE,
 			       object_size))
@@ -9611,6 +9914,98 @@ static int chrome9_fragment_texture_feature_selftest(void)
 	return 0;
 }
 
+/* 4x4x4 BGRA volume (docs/research/chrome9-queries-msaa-3d-flow-re.md 4.1). */
+static int chrome9_fragment_texture_3d_selftest(void)
+{
+	static const u32 expected[] = {
+		0xfe020440, 0x0000043c, 0x00020000, 0xcc000000,
+		0x00000050, 0x18001201, 0x20004004, 0x21000004,
+		0x22008222, 0x30990000, 0xcc000000, 0xcc000000,
+		0xfe020440, 0x0000043c, 0x20020000, 0xcc000000,
+		0x30000000, 0x31102490, 0x32090089, 0xcccccccc,
+	};
+	const u64 caps = DRM_CHROME9_CAP2_TEXTURE_3D;
+	struct drm_chrome9_fragment_texture_state texture = {
+		.handle = 1,
+		.format = DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888,
+		.width = 4,
+		.height = 4,
+		.min_filter = DRM_CHROME9_TEXTURE_FILTER_LINEAR,
+		.mag_filter = DRM_CHROME9_TEXTURE_FILTER_LINEAR,
+		.wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE,
+		.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE,
+		.level_offset = { PAGE_SIZE },
+		.level_pitch = { 32 },
+		.target = DRM_CHROME9_FRAGMENT_TARGET_3D,
+		.face_stride = 128,
+		.depth = 4,
+		.wrap_r = DRM_CHROME9_TEXTURE_WRAP_REPEAT,
+	};
+	struct drm_chrome9_fragment_texture_state bad;
+	u32 packet[32] __aligned(16);
+	u32 *cursor = packet;
+	u64 object_size;
+	u32 flags;
+	unsigned int i;
+
+	if (chrome9_validate_fragment_texture(&texture, &object_size, false, 0,
+					      &flags) != -EINVAL ||
+	    chrome9_validate_fragment_texture(&texture, &object_size, false,
+					      caps, &flags) ||
+	    object_size != 3 * PAGE_SIZE || flags)
+		return -EINVAL;
+	chrome9_emit_fragment_texture(&cursor, &texture, 0x4000, 0, flags);
+	if (cursor != packet + ARRAY_SIZE(expected) ||
+	    memcmp(packet, expected, sizeof(expected)))
+		return -EINVAL;
+	/* With cube maps enabled the unit also clears A01..A05. */
+	if (chrome9_validate_fragment_texture(&texture, &object_size, false,
+			caps | DRM_CHROME9_CAP2_CUBE_MAP, &flags) ||
+	    flags != CHROME9_TEXTURE_FACE_CLOSURE)
+		return -EINVAL;
+	cursor = packet;
+	chrome9_emit_fragment_texture(&cursor, &texture, 0x4000, 0, flags);
+	if (cursor != packet + 24 || packet[4] != 0x50 ||
+	    packet[5] != 0x01000000 || packet[9] != 0x05000000 ||
+	    memcmp(packet + 10, expected + 5, 5 * sizeof(u32)) ||
+	    memcmp(packet + 16, expected + 12, 8 * sizeof(u32)))
+		return -EINVAL;
+	for (i = 0; i < 7; i++) {
+		bad = texture;
+		switch (i) {
+		case 0:
+			bad.depth = 3;
+			break;
+		case 1:
+			bad.face_stride = 256;
+			break;
+		case 2:
+			bad.wrap_r = 0;
+			break;
+		case 3:
+			bad.width = 6;
+			bad.level_pitch[0] = 32;
+			break;
+		case 4:
+			bad.depth = 4096;
+			break;
+		case 5:
+			bad.target = DRM_CHROME9_FRAGMENT_TARGET_2D;
+			bad.face_stride = 0;
+			break;
+		default:
+			bad.target = DRM_CHROME9_FRAGMENT_TARGET_2D;
+			bad.face_stride = 0;
+			bad.depth = 0;
+			break;
+		}
+		if (chrome9_validate_fragment_texture(&bad, &object_size, false,
+						      caps, &flags) != -EINVAL)
+			return -EINVAL;
+	}
+	return 0;
+}
+
 static int chrome9_fragment_texture_selftest(void)
 {
 	static const struct {
@@ -9740,7 +10135,8 @@ static int chrome9_fragment_texture_selftest(void)
 		    -EINVAL)
 			return -EINVAL;
 	}
-	return chrome9_fragment_texture_feature_selftest();
+	ret = chrome9_fragment_texture_feature_selftest();
+	return ret ?: chrome9_fragment_texture_3d_selftest();
 }
 
 /* Everything one fragment draw owns between validation and submission. */
@@ -9755,6 +10151,7 @@ struct chrome9_fragment_draw {
 
 static void chrome9_fragment_draw_fini(struct chrome9_fragment_draw *d)
 {
+	chrome9_query_put(d->request.query);
 	kvfree(d->program);
 	kvfree(d->vertices);
 	kfree(d->textures);
@@ -9765,6 +10162,7 @@ static void chrome9_fragment_draw_fini(struct chrome9_fragment_draw *d)
 
 /* Validate, copy and compile one fragment draw into d->request. */
 static int chrome9_fragment_draw_prepare(struct drm_device *drm,
+		struct drm_file *file,
 		struct drm_chrome9_draw_fragment_program *args,
 		struct chrome9_tcl_draw *tcl, struct chrome9_fragment_draw *d)
 {
@@ -9806,15 +10204,19 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	bool sparse_textures = args->abi_version ==
 		DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES;
 	u64 caps2 = chrome9_engine_capabilities2();
-	u32 cube_mask = 0;
+	u32 str_mask = 0;
 	unsigned int i;
 	int ret;
+
+	if (caps2 & DRM_CHROME9_CAP2_OCCLUSION_QUERY)
+		allowed_flags |= DRM_CHROME9_FRAGMENT_QUERY;
 
 	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
 	     !sparse_textures) ||
 	    (sparse_textures && !chrome9_fragment_sparse_textures_enabled()) ||
-	    args->reserved0 || args->pad ||
+	    args->reserved0 || args->pad || args->reserved1 ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
+	    (!(args->flags & DRM_CHROME9_FRAGMENT_QUERY) && args->query) ||
 	    chrome9_validate_depth_flags(args->flags, allowed_flags) ||
 	    (!depth && (args->flags & (DRM_CHROME9_DEPTH_FUNC_MASK |
 				       DRM_CHROME9_DEPTH_READ_ONLY))) ||
@@ -9918,8 +10320,9 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 				goto out_free;
 			request.fragment_texture_units[i] = unit;
 			request.fragment_texture_flags[i] = flags;
-			if (textures[i].target == DRM_CHROME9_FRAGMENT_TARGET_CUBE)
-				cube_mask |= BIT(unit);
+			if (textures[i].target == DRM_CHROME9_FRAGMENT_TARGET_CUBE ||
+			    textures[i].target == DRM_CHROME9_FRAGMENT_TARGET_3D)
+				str_mask |= BIT(unit);
 			descriptor_mask |= BIT(unit);
 			if (check_add_overflow(total_size,
 				request.fragment_texture_size[i], &total_size)) {
@@ -9985,7 +10388,7 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	ret = chrome9_fragment_compile_targets(instructions,
 		args->instruction_count, constants, args->constant_count,
 		args->texture_count, sparse_textures ? descriptor_mask : 0,
-		sparse_textures, cube_mask, args->varying_count, program);
+		sparse_textures, str_mask, args->varying_count, program);
 	if (ret)
 		goto out_free;
 	if (tcl) {
@@ -10025,6 +10428,15 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		request.triangle_count = tcl->primitive_count;
 		request.tcl = tcl;
 	}
+	if (args->flags & DRM_CHROME9_FRAGMENT_QUERY) {
+		request.query = chrome9_query_get_active(file, args->query,
+							 &request.query_generation);
+		if (IS_ERR(request.query)) {
+			ret = PTR_ERR(request.query);
+			request.query = NULL;
+			goto out_free;
+		}
+	}
 	request.fragment_vertices = vertices;
 	request.fragment_textures = textures;
 	request.fragment_program = program;
@@ -10051,7 +10463,7 @@ static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 				 struct chrome9_tcl_draw *tcl)
 {
 	struct chrome9_fragment_draw d = { };
-	int ret = chrome9_fragment_draw_prepare(drm, args, tcl, &d);
+	int ret = chrome9_fragment_draw_prepare(drm, file, args, tcl, &d);
 
 	if (ret)
 		return ret;
@@ -10568,7 +10980,7 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 		ret = chrome9_tcl_prepare(&draws[r], &owned[r]);
 		if (ret)
 			goto out;
-		ret = chrome9_fragment_draw_prepare(drm, &draws[r].fragment,
+		ret = chrome9_fragment_draw_prepare(drm, file, &draws[r].fragment,
 						    owned[r].tcl, &fragments[r]);
 		if (ret) {
 			chrome9_tcl_fini(&owned[r]);
@@ -10695,6 +11107,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 			  engine->ring_cpu, engine->ring_dma);
 	kvfree(engine->gart_saved);
 	kvfree(engine->timeout_segment);
+	bitmap_free(engine->query_slots);
 	if (engine->module_hold)
 		module_put(THIS_MODULE);
 	kfree(engine);

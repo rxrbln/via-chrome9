@@ -29,12 +29,12 @@ int chrome9_fragment_compile(
 	u32 instruction_count, const u32 *constants, u32 constant_count,
 	u32 texture_count, u32 varying_count,
 	struct chrome9_fragment_program *program);
-/* cube_mask: samplers of TARGET_CUBE textures, whose TEX reads STR. */
+/* str_mask: samplers of TARGET_CUBE and TARGET_3D textures (TEX reads STR). */
 int chrome9_fragment_compile_targets(
 	const struct drm_chrome9_fragment_instruction *instructions,
 	u32 instruction_count, const u32 *constants, u32 constant_count,
 	u32 texture_count, u32 descriptor_mask, bool sparse_textures,
-	u32 cube_mask, u32 varying_count,
+	u32 str_mask, u32 varying_count,
 	struct chrome9_fragment_program *program);
 int chrome9_fragment_compile_sparse(
 	const struct drm_chrome9_fragment_instruction *instructions,
