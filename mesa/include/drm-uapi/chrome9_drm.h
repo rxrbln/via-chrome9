@@ -34,6 +34,7 @@ extern "C" {
 #define DRM_CHROME9_COPY_RECT	0x1b
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_CHAIN	0x1c
 #define DRM_CHROME9_DRAW_FRAGMENT_PROGRAM	0x1d
+#define DRM_CHROME9_DRAW_VERTEX_PROGRAM	0x1e
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -110,6 +111,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_FRAGMENT_PROGRAM \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_FRAGMENT_PROGRAM, \
 		struct drm_chrome9_draw_fragment_program)
+#define DRM_IOCTL_CHROME9_DRAW_VERTEX_PROGRAM \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_VERTEX_PROGRAM, \
+		struct drm_chrome9_draw_vertex_program)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -221,6 +225,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_FRAGMENT_EXTENDED_LINKAGE	(1ULL << 56)
 /* Fragment draws accept resolved per-winding stencil state with X8Z24. */
 #define DRM_CHROME9_CAP_FRAGMENT_STENCIL	(1ULL << 57)
+/* DRAW_VERTEX_PROGRAM with immediate vertices (stage A). */
+#define DRM_CHROME9_CAP_VERTEX_PROGRAM		(1ULL << 58)
+/* DRAW_VERTEX_PROGRAM with GEM vertex buffers and indices (stage B). */
+#define DRM_CHROME9_CAP_VERTEX_BUFFERS		(1ULL << 59)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1181,6 +1189,140 @@ struct drm_chrome9_draw_fragment_program {
 	__u64 textures_ptr;
 	struct drm_chrome9_stencil_state stencil;
 	__u64 reserved[2];
+};
+
+#define DRM_CHROME9_VERTEX_ABI_VERSION		1U
+#define DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS	256U
+/* Native records including fills, position move and finalizer. */
+#define DRM_CHROME9_VERTEX_MAX_RECORDS		256U
+#define DRM_CHROME9_VERTEX_MAX_TEMPS		255U
+#define DRM_CHROME9_VERTEX_MAX_CONSTANTS	256U
+#define DRM_CHROME9_VERTEX_MAX_INPUTS		16U
+#define DRM_CHROME9_VERTEX_MAX_VERTICES		384U
+#define DRM_CHROME9_VERTEX_MAX_INDICES		12288U
+
+enum drm_chrome9_vertex_op {
+	DRM_CHROME9_VERTEX_OP_MOV = 0,
+	DRM_CHROME9_VERTEX_OP_ADD = 1,
+	DRM_CHROME9_VERTEX_OP_SUB = 2,
+	DRM_CHROME9_VERTEX_OP_MUL = 3,
+	DRM_CHROME9_VERTEX_OP_MAD = 4,
+	DRM_CHROME9_VERTEX_OP_DP3 = 5,
+	DRM_CHROME9_VERTEX_OP_DP4 = 6,
+	DRM_CHROME9_VERTEX_OP_DPH = 7,
+	DRM_CHROME9_VERTEX_OP_MIN = 8,
+	DRM_CHROME9_VERTEX_OP_MAX = 9,
+	DRM_CHROME9_VERTEX_OP_ABS = 10,
+	DRM_CHROME9_VERTEX_OP_SGE = 11,
+	DRM_CHROME9_VERTEX_OP_SLT = 12,
+	DRM_CHROME9_VERTEX_OP_SGN = 13,
+	DRM_CHROME9_VERTEX_OP_FRC = 14,
+	DRM_CHROME9_VERTEX_OP_FLR = 15,
+	/* Scalar ops: all four source selectors must be equal. */
+	DRM_CHROME9_VERTEX_OP_RCP = 16,
+	DRM_CHROME9_VERTEX_OP_RSQ = 17,
+	DRM_CHROME9_VERTEX_OP_EXP2 = 18,
+	DRM_CHROME9_VERTEX_OP_LOG2 = 19,
+	DRM_CHROME9_VERTEX_OP_COUNT
+};
+
+enum drm_chrome9_vertex_file {
+	/* Virtual SSA temporaries, defined component-wise before any read. */
+	DRM_CHROME9_VERTEX_FILE_TEMP = 0,
+	/* Dense inputs: index n reads vertex element n. */
+	DRM_CHROME9_VERTEX_FILE_INPUT = 1,
+	DRM_CHROME9_VERTEX_FILE_CONSTANT = 2,
+};
+
+enum drm_chrome9_vertex_dest {
+	DRM_CHROME9_VERTEX_DEST_TEMP = 0,
+	/* Clip-space position, index zero, every lane written once. */
+	DRM_CHROME9_VERTEX_DEST_POSITION = 1,
+	/* Saturated primary color; dropped when the fragment ignores it. */
+	DRM_CHROME9_VERTEX_DEST_PRIMARY = 2,
+	/* Logical fragment varying; every consumed lane must be written,
+	 * unconsumed varyings and lanes are dropped. */
+	DRM_CHROME9_VERTEX_DEST_VARYING = 3,
+};
+
+/* Swizzles, NEG and SAT use the DRM_CHROME9_FRAGMENT_* values. */
+struct drm_chrome9_vertex_source {
+	__u8 file;
+	__u8 index;
+	__u8 swizzle[4];
+	__u8 modifier;
+	__u8 reserved;
+};
+
+struct drm_chrome9_vertex_destination {
+	__u8 file;
+	__u8 index;
+	__u8 writemask;
+	__u8 modifier;
+};
+
+/* Fixed-width 32-byte semantic record; unused sources are all zero. */
+struct drm_chrome9_vertex_instruction {
+	__u8 op;
+	__u8 reserved0;
+	__u16 reserved1;
+	struct drm_chrome9_vertex_destination dst;
+	struct drm_chrome9_vertex_source src[3];
+};
+
+#define DRM_CHROME9_VERTEX_FORMAT_FLOAT1	0
+#define DRM_CHROME9_VERTEX_FORMAT_FLOAT2	1
+#define DRM_CHROME9_VERTEX_FORMAT_FLOAT3	2
+#define DRM_CHROME9_VERTEX_FORMAT_FLOAT4	3
+#define DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM	4
+
+struct drm_chrome9_vertex_element {
+	__u8 format;
+	__u8 buffer;
+	__u16 reserved;
+	__u32 offset;
+};
+
+struct drm_chrome9_vertex_buffer {
+	__u32 handle;
+	__u32 stride;
+	__u64 offset;
+};
+
+/* Culling uses screen-space winding. */
+#define DRM_CHROME9_VERTEX_CULL_CW	(1U << 0)
+#define DRM_CHROME9_VERTEX_CULL_CCW	(1U << 1)
+#define DRM_CHROME9_VERTEX_FLAT		(1U << 2)
+
+/*
+ * fragment carries the complete pixel state with vertices_ptr and
+ * triangle_count zero.  viewport holds the final float bits
+ * sx sy sz ox oy oz 0 0, where ox/oy include the 786432 snap bias.
+ * Stage A sends vertex_count raw vertices (triangle list) packed by
+ * elements with offsets relative to one vertex; stage B is reserved.
+ */
+struct drm_chrome9_draw_vertex_program {
+	struct drm_chrome9_draw_fragment_program fragment;
+	__u32 abi_version;
+	__u32 flags;
+	__u32 instruction_count;
+	__u32 element_count;
+	__u32 constant_first;
+	__u32 constant_count;
+	__u32 vertex_count;
+	__u32 vertex_stride;
+	__u32 index_count;
+	__u32 index_size;
+	__u32 buffer_count;
+	__s32 base_vertex;
+	__u32 viewport[8];
+	__u64 instructions_ptr;
+	__u64 constants_ptr;
+	__u64 elements_ptr;
+	__u64 vertices_ptr;
+	__u64 indices_ptr;
+	__u64 buffers_ptr;
+	__u64 reserved[4];
 };
 
 #if defined(__cplusplus)
