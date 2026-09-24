@@ -1384,9 +1384,9 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
       uint32_t handle = 0;
       unsigned b;
 
+      /* Stride 0 repeats one element (silicon rung B12). */
       if ((!array && !vb->buffer.resource) || !streams[k].dwords ||
-          stride < 4 || stride > 2044 || stride % 4 || offset % 4 ||
-          offset > UINT32_MAX)
+          stride > 2044 || stride % 4 || offset % 4 || offset > UINT32_MAX)
          return false;
       if (!array)
          handle = chrome9_resource(vb->buffer.resource)->bo.handle;
