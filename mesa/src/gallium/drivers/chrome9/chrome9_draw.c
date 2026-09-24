@@ -876,8 +876,11 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    *reason = "color-surface";
    if ((!depth_only &&
         (!surface || !surface->texture ||
-         surface->format != resource->format || surface->level ||
-         surface->first_layer || surface->last_layer)) ||
+         surface->format != resource->format ||
+         /* Other levels and layers render through a level-0 shadow. */
+         (resource == surface->texture &&
+          (surface->level || surface->first_layer)) ||
+         surface->first_layer != surface->last_layer)) ||
        (depth_only && ctx->render_target !=
                       ctx->depth_only_scratch) ||
        (resource->target != PIPE_TEXTURE_2D &&
@@ -1106,7 +1109,9 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              (!chrome9_use_generic_fragment_program(ctx) ?
                 (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
                  source->format != PIPE_FORMAT_B8G8R8A8_UNORM) : !format) ||
-             view->u.tex.first_level ||
+             (view->u.tex.first_level &&
+              !chrome9_use_generic_fragment_program(ctx)) ||
+             view->u.tex.first_level > view->u.tex.last_level ||
              view->u.tex.last_level > original->last_level ||
              !textures[unit]->guarded ||
              !textures[unit]->bo.handle ||
@@ -1476,25 +1481,31 @@ chrome9_generic_fragment_state(
       const struct pipe_sampler_view *view =
          crender->ctx->sampler_views[logical];
       unsigned last_level;
+      unsigned view_first_level;
       unsigned view_last_level;
       int max_lod;
 
-      if (!view || !format || view->u.tex.first_level)
+      if (!view || !format)
          return false;
       if (crender->ctx->fs->semantic_unit_interval_input_mask &&
           logical == 0 &&
           !chrome9_fragment_unit_interval_texture(resource->format))
          return false;
+      view_first_level = view->u.tex.first_level;
       view_last_level = view->u.tex.last_level;
       last_level = resource->last_level;
-      /* The kernel validates the descriptor against the full guarded BO.
-       * A base-only view may still use that physical mip layout when mip
-       * sampling is disabled; clamp its logical LOD to level zero.  Other
-       * partial views need separate validation before they can be exposed. */
+      /*
+       * The descriptor always carries the whole chain; a partial view
+       * clamps the hardware LOD, which counts from level 0, to its levels.
+       * Above its base level the hardware never takes the magnification
+       * filter, so that must equal the minification filter.  Without mip
+       * sampling the hardware LOD is 0, so only a level-0 base works.
+       */
       if (last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
-          (view_last_level != last_level &&
-           (view_last_level || samplers[unit]->mip_filter !=
-              DRM_CHROME9_TEXTURE_MIP_FILTER_NONE)))
+          (view_first_level &&
+           (samplers[unit]->mip_filter ==
+               DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+            samplers[unit]->mag_filter != samplers[unit]->min_filter)))
          return false;
       max_lod = view_last_level * 32;
       texture_state[unit].handle = textures[unit]->bo.handle;
@@ -1518,10 +1529,12 @@ chrome9_generic_fragment_state(
       }
       texture_state[unit].lod_bias_s5_5 = CLAMP(
          lroundf(samplers[unit]->base.lod_bias * 32.0f), -512, 511);
+      /* Sampler LOD limits count from the view's base level. */
       texture_state[unit].min_lod_s5_5 = CLAMP(
-         lroundf(samplers[unit]->base.min_lod * 32.0f), 0, max_lod);
+         lroundf((samplers[unit]->base.min_lod + view_first_level) * 32.0f),
+         (int)view_first_level * 32, max_lod);
       texture_state[unit].max_lod_s5_5 = CLAMP(
-         lroundf(samplers[unit]->base.max_lod * 32.0f),
+         lroundf((samplers[unit]->base.max_lod + view_first_level) * 32.0f),
          texture_state[unit].min_lod_s5_5, max_lod);
       for (unsigned level = 0; level <= last_level; level++) {
          if (textures[unit]->level_offset[level] > UINT32_MAX)

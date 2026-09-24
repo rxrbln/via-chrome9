@@ -35,27 +35,73 @@
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 
+/* Guarded stand-in for one level and layer of a render target that the
+ * hardware cannot address directly; one list per resource. */
 struct chrome9_shadow {
+   struct chrome9_shadow *next;
    struct pipe_resource *shadow;
+   unsigned level;
+   unsigned layer;
    /* Drawable write generation both surfaces last agreed on. */
    uint32_t synced_generation;
    bool synced;
 };
 
+/* Level, layer and row layout of one image of a resource. */
+struct chrome9_subimage {
+   struct chrome9_resource *resource;
+   uint64_t offset;
+   uint32_t stride;
+   unsigned width;
+   unsigned height;
+};
+
+static void
+chrome9_subimage(struct pipe_resource *resource, unsigned level,
+                 unsigned layer, struct chrome9_subimage *image)
+{
+   struct chrome9_resource *res = chrome9_resource(resource);
+
+   image->resource = res;
+   image->offset = res->level_offset[level] + layer * res->layer_stride;
+   image->stride = res->level_stride[level];
+   image->width = u_minify(resource->width0, level);
+   image->height = u_minify(resource->height0, level);
+}
+
 static struct chrome9_shadow *
-chrome9_shadow_entry(struct chrome9_context *ctx, struct pipe_resource *color)
+chrome9_shadow_entry(struct chrome9_context *ctx, struct pipe_resource *color,
+                     unsigned level, unsigned layer)
 {
    struct hash_entry *entry = ctx->shadows ?
       _mesa_hash_table_search(ctx->shadows, color) : NULL;
 
-   return entry ? entry->data : NULL;
+   for (struct chrome9_shadow *shadow = entry ? entry->data : NULL; shadow;
+        shadow = shadow->next)
+      if (shadow->level == level && shadow->layer == layer)
+         return shadow;
+   return NULL;
+}
+
+/* The bound colour image when it renders through a shadow. */
+static const struct pipe_surface *
+chrome9_external_surface(struct chrome9_context *ctx)
+{
+   const struct pipe_surface *surface = ctx->framebuffer.nr_cbufs ?
+                                        &ctx->framebuffer.cbufs[0] : NULL;
+
+   return surface && surface->texture && ctx->render_target &&
+          surface->texture != ctx->render_target ? surface : NULL;
 }
 
 /* Record that the shadow and the drawable hold the same pixels. */
 static void
-chrome9_shadow_synced(struct chrome9_context *ctx, struct pipe_resource *color)
+chrome9_shadow_synced(struct chrome9_context *ctx,
+                      const struct pipe_surface *surface)
 {
-   struct chrome9_shadow *shadow = chrome9_shadow_entry(ctx, color);
+   struct pipe_resource *color = surface->texture;
+   struct chrome9_shadow *shadow =
+      chrome9_shadow_entry(ctx, color, surface->level, surface->first_layer);
 
    if (shadow) {
       shadow->synced_generation =
@@ -64,32 +110,43 @@ chrome9_shadow_synced(struct chrome9_context *ctx, struct pipe_resource *color)
    }
 }
 
-/* CPU copy of the pixel rectangle rect between equal-format surfaces. */
+/* CPU copy of the pixel rectangle rect between equal-format images. */
 static void
-chrome9_copy_surface_rect(struct pipe_resource *destination,
-                          struct pipe_resource *source,
-                          const struct pipe_scissor_state *rect)
+chrome9_copy_image_rect(const struct chrome9_subimage *dst,
+                        const struct chrome9_subimage *src,
+                        const struct pipe_scissor_state *rect)
 {
-   struct chrome9_resource *dst = chrome9_resource(destination);
-   struct chrome9_resource *src = chrome9_resource(source);
-   unsigned cpp = util_format_get_blocksize(source->format);
-   unsigned maxx = MIN3(rect->maxx, destination->width0, source->width0);
-   unsigned maxy = MIN3(rect->maxy, destination->height0, source->height0);
-   uint8_t *dst_map = (uint8_t *)dst->bo.map + dst->data_offset;
-   const uint8_t *src_map = (const uint8_t *)src->bo.map + src->data_offset;
+   unsigned cpp = util_format_get_blocksize(src->resource->base.format);
+   unsigned maxx = MIN3(rect->maxx, dst->width, src->width);
+   unsigned maxy = MIN3(rect->maxy, dst->height, src->height);
+   uint8_t *dst_map = (uint8_t *)dst->resource->bo.map + dst->offset;
+   const uint8_t *src_map =
+      (const uint8_t *)src->resource->bo.map + src->offset;
 
    if (rect->minx >= maxx || rect->miny >= maxy)
       return;
-   chrome9_resource_cpu_access_range(src, false,
-      src->data_offset + (uint64_t)rect->miny * src->stride,
+   chrome9_resource_cpu_access_range(src->resource, false,
+      src->offset + (uint64_t)rect->miny * src->stride,
       (uint64_t)(maxy - rect->miny) * src->stride);
-   chrome9_resource_cpu_access_range(dst, true,
-      dst->data_offset + (uint64_t)rect->miny * dst->stride,
+   chrome9_resource_cpu_access_range(dst->resource, true,
+      dst->offset + (uint64_t)rect->miny * dst->stride,
       (uint64_t)(maxy - rect->miny) * dst->stride);
    for (unsigned y = rect->miny; y < maxy; y++)
       memcpy(dst_map + (size_t)y * dst->stride + rect->minx * cpp,
              src_map + (size_t)y * src->stride + rect->minx * cpp,
              (maxx - rect->minx) * cpp);
+}
+
+static void
+chrome9_copy_surface_rect(struct pipe_resource *destination,
+                          struct pipe_resource *source,
+                          const struct pipe_scissor_state *rect)
+{
+   struct chrome9_subimage dst, src;
+
+   chrome9_subimage(destination, 0, 0, &dst);
+   chrome9_subimage(source, 0, 0, &src);
+   chrome9_copy_image_rect(&dst, &src, rect);
 }
 
 static void
@@ -147,20 +204,26 @@ chrome9_copy_surface_gpu(struct chrome9_context *ctx,
 static void
 chrome9_flush_render_target(struct chrome9_context *ctx)
 {
-   struct pipe_resource *external;
+   const struct pipe_surface *surface = chrome9_external_surface(ctx);
 
-   if (!ctx->render_target_dirty || !ctx->render_target ||
-       !ctx->framebuffer.nr_cbufs ||
-       !(external = ctx->framebuffer.cbufs[0].texture))
+   if (!ctx->render_target_dirty)
       return;
-   if (external != ctx->render_target) {
-      if (chrome9_copy_surface_gpu(ctx, external, ctx->render_target))
+   if (surface) {
+      struct pipe_resource *external = surface->texture;
+
+      if (!surface->level && !surface->first_layer &&
+          chrome9_copy_surface_gpu(ctx, external, ctx->render_target)) {
          /* A device write: the drawable changed, but not by the CPU. */
          chrome9_resource(external)->cpu_write_generation++;
-      else
-         chrome9_copy_surface_rect(external, ctx->render_target,
-                                   &ctx->render_dirty);
-      chrome9_shadow_synced(ctx, external);
+      } else {
+         struct chrome9_subimage dst, src;
+
+         chrome9_subimage(external, surface->level, surface->first_layer,
+                          &dst);
+         chrome9_subimage(ctx->render_target, 0, 0, &src);
+         chrome9_copy_image_rect(&dst, &src, &ctx->render_dirty);
+      }
+      chrome9_shadow_synced(ctx, surface);
    }
    ctx->render_target_dirty = false;
 }
@@ -238,15 +301,21 @@ chrome9_context_render_target_direct_written(struct chrome9_context *ctx)
 void
 chrome9_context_prepare_render_target(struct chrome9_context *ctx)
 {
-   struct pipe_resource *external;
+   const struct pipe_surface *surface = chrome9_external_surface(ctx);
 
-   if (!ctx->render_target_stale || !ctx->render_target ||
-       !ctx->framebuffer.nr_cbufs ||
-       !(external = ctx->framebuffer.cbufs[0].texture))
+   if (!ctx->render_target_stale)
       return;
-   if (external != ctx->render_target) {
-      chrome9_copy_surface(ctx->render_target, external);
-      chrome9_shadow_synced(ctx, external);
+   if (surface) {
+      struct chrome9_subimage dst, src;
+      struct pipe_scissor_state all = { 0, 0, 0, 0 };
+
+      chrome9_subimage(ctx->render_target, 0, 0, &dst);
+      chrome9_subimage(surface->texture, surface->level,
+                       surface->first_layer, &src);
+      all.maxx = MIN2(dst.width, src.width);
+      all.maxy = MIN2(dst.height, src.height);
+      chrome9_copy_image_rect(&dst, &src, &all);
+      chrome9_shadow_synced(ctx, surface);
    }
    ctx->render_target_stale = false;
 }
@@ -6211,7 +6280,9 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                       templ->target == PIPE_TEXTURE_2D) || cube) &&
                     templ->format == texture->format &&
                     chrome9_texture_format_info(templ->format) &&
-                    !templ->u.tex.first_level &&
+                    templ->u.tex.first_level <= templ->u.tex.last_level &&
+                    (!templ->u.tex.first_level ||
+                     chrome9_resource(texture)->guarded) &&
                     templ->u.tex.last_level <= texture->last_level &&
                     !templ->u.tex.first_layer &&
                     templ->u.tex.last_layer ==
@@ -6354,12 +6425,26 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
    }
 }
 
+static void
+chrome9_shadow_list_free(struct chrome9_shadow *shadow)
+{
+   while (shadow) {
+      struct chrome9_shadow *next = shadow->next;
+
+      pipe_resource_reference(&shadow->shadow, NULL);
+      FREE(shadow);
+      shadow = next;
+   }
+}
+
 /*
- * One guarded shadow per unguarded drawable, reused across binds.  Entries
- * whose drawable only this cache still references are dropped first.
+ * One guarded shadow per image (level and layer) of a render target the
+ * hardware cannot address, reused across binds.  Entries whose resource
+ * only this cache still references are dropped first.
  */
 static struct chrome9_shadow *
-chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
+chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color,
+                      unsigned level, unsigned layer)
 {
    struct pipe_screen *screen = ctx->base.screen;
    struct pipe_resource templ = *color;
@@ -6372,18 +6457,22 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
       return NULL;
    hash_table_foreach(ctx->shadows, stale) {
       struct pipe_resource *key = (struct pipe_resource *)stale->key;
-      struct chrome9_shadow *old = stale->data;
 
       if (p_atomic_read(&key->reference.count) > 1)
          continue;
+      chrome9_shadow_list_free(stale->data);
       _mesa_hash_table_remove(ctx->shadows, stale);
-      pipe_resource_reference(&old->shadow, NULL);
-      FREE(old);
       pipe_resource_reference(&key, NULL);
    }
-   entry = _mesa_hash_table_search(ctx->shadows, color);
-   if (entry)
-      return entry->data;
+   record = chrome9_shadow_entry(ctx, color, level, layer);
+   if (record)
+      return record;
+   templ.target = PIPE_TEXTURE_2D;
+   templ.width0 = u_minify(color->width0, level);
+   templ.height0 = u_minify(color->height0, level);
+   templ.depth0 = 1;
+   templ.array_size = 1;
+   templ.last_level = 0;
    templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_LINEAR;
    templ.flags = 0;
    templ.next = NULL;
@@ -6396,8 +6485,16 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color)
       return NULL;
    }
    record->shadow = shadow;
-   pipe_reference(NULL, &color->reference);
-   _mesa_hash_table_insert(ctx->shadows, color, record);
+   record->level = level;
+   record->layer = layer;
+   entry = _mesa_hash_table_search(ctx->shadows, color);
+   if (entry) {
+      record->next = entry->data;
+      entry->data = record;
+   } else {
+      pipe_reference(NULL, &color->reference);
+      _mesa_hash_table_insert(ctx->shadows, color, record);
+   }
    return record;
 }
 
@@ -6417,15 +6514,18 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
    ctx->render_target_stale = false;
    pipe_resource_reference(&ctx->render_target, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, framebuffer);
-   if (color && color->target != PIPE_TEXTURE_CUBE &&
-       surface->format == color->format && !surface->level &&
-       !surface->first_layer && !surface->last_layer) {
+   if (color && surface->format == color->format &&
+       surface->first_layer == surface->last_layer) {
       struct chrome9_resource *resource = chrome9_resource(color);
 
-      if (resource->guarded) {
+      /* Other levels and cube faces render through a shadow. */
+      if (resource->guarded && color->target != PIPE_TEXTURE_CUBE &&
+          !surface->level && !surface->first_layer) {
          pipe_resource_reference(&ctx->render_target, color);
       } else {
-         struct chrome9_shadow *shadow = chrome9_render_shadow(ctx, color);
+         struct chrome9_shadow *shadow =
+            chrome9_render_shadow(ctx, color, surface->level,
+                                  surface->first_layer);
 
          shadow_attempted = true;
          pipe_resource_reference(&ctx->render_target,
@@ -7180,10 +7280,8 @@ chrome9_context_destroy(struct pipe_context *pipe)
    if (ctx->shadows) {
       hash_table_foreach(ctx->shadows, entry) {
          struct pipe_resource *key = (struct pipe_resource *)entry->key;
-         struct chrome9_shadow *shadow = entry->data;
 
-         pipe_resource_reference(&shadow->shadow, NULL);
-         FREE(shadow);
+         chrome9_shadow_list_free(entry->data);
          pipe_resource_reference(&key, NULL);
       }
       _mesa_hash_table_destroy(ctx->shadows, NULL);
