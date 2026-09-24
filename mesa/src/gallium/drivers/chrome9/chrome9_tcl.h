@@ -44,6 +44,14 @@ struct chrome9_tcl_program {
    bool back_primary;
 };
 
+/* Primary colour routing: front only, hardware back-colour selection, or
+ * the back colour as primary (the back-face pass of a culled split). */
+enum chrome9_tcl_colour {
+   CHROME9_TCL_COLOUR_FRONT,
+   CHROME9_TCL_COLOUR_SELECT,
+   CHROME9_TCL_COLOUR_BACK,
+};
+
 #define CHROME9_TCL_MAX_KEY 16
 #define CHROME9_TCL_MAX_VARIANTS 32
 
@@ -52,7 +60,7 @@ struct chrome9_tcl_program {
 struct chrome9_tcl_variant {
    struct chrome9_tcl_variant *next;
    bool clip_halfz;
-   bool twoside;
+   enum chrome9_tcl_colour colour;
    uint8_t clip_enable;
    uint32_t key[CHROME9_TCL_MAX_KEY];
    struct chrome9_tcl_program program;
@@ -70,7 +78,8 @@ struct chrome9_tcl_shader {
 struct chrome9_tcl_shader *chrome9_tcl_shader_create(const struct nir_shader *nir);
 void chrome9_tcl_shader_destroy(struct chrome9_tcl_shader *shader);
 bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
-                         bool twoside, unsigned clip_enable,
+                         enum chrome9_tcl_colour colour,
+                         unsigned clip_enable,
                          unsigned key_count, const uint16_t *key_dword,
                          const uint32_t *key_value,
                          struct chrome9_tcl_program *program);

@@ -60,7 +60,9 @@ struct tcl_builder {
    struct tcl_value *values;
    unsigned next_temp;
    bool failed;
-   bool twoside;
+   enum chrome9_tcl_colour colour;
+   /* The shader writes BFC0 (for CHROME9_TCL_COLOUR_BACK). */
+   bool writes_back;
    unsigned clip_enable;
    bool unit_temp[DRM_CHROME9_VERTEX_MAX_TEMPS];
    /* Whole-register copies used to legalize read ports. */
@@ -759,7 +761,7 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
       .op = DRM_CHROME9_VERTEX_OP_MOV,
    };
    uint8_t swizzle[4] = { 0 };
-   unsigned index;
+   unsigned index = 0;
 
    if (!nir_src_is_const(store->src[1]) || nir_src_as_uint(store->src[1]) ||
        mask > 0xf || b->failed) {
@@ -769,12 +771,17 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
    if (io.location == VARYING_SLOT_POS) {
       mov.dst.file = DRM_CHROME9_VERTEX_DEST_POSITION;
    } else if (io.location == VARYING_SLOT_COL0) {
+      /* The back-face pass takes its primary colour from BFC0. */
+      if (b->colour == CHROME9_TCL_COLOUR_BACK && b->writes_back)
+         return;
       mov.dst.file = DRM_CHROME9_VERTEX_DEST_PRIMARY;
    } else if (io.location == VARYING_SLOT_BFC0) {
       /* Without light_twoside only front colors are visible. */
-      if (!b->twoside)
+      if (b->colour == CHROME9_TCL_COLOUR_FRONT)
          return;
-      mov.dst.file = DRM_CHROME9_VERTEX_DEST_BACK_PRIMARY;
+      mov.dst.file = b->colour == CHROME9_TCL_COLOUR_BACK ?
+                     DRM_CHROME9_VERTEX_DEST_PRIMARY :
+                     DRM_CHROME9_VERTEX_DEST_BACK_PRIMARY;
       b->p->back_primary = true;
    } else if (io.location == VARYING_SLOT_CLIP_DIST0 ||
               io.location == VARYING_SLOT_CLIP_DIST1) {
@@ -992,12 +999,13 @@ tcl_find_key(struct chrome9_tcl_shader *shader)
 
 bool
 chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
-                    bool twoside, unsigned clip_enable,
+                    enum chrome9_tcl_colour colour, unsigned clip_enable,
                     unsigned key_count, const uint16_t *key_dword,
                     const uint32_t *key_value, struct chrome9_tcl_program *p)
 {
    struct tcl_builder b = {
-      .p = p, .twoside = twoside, .clip_enable = clip_enable,
+      .p = p, .colour = colour, .clip_enable = clip_enable,
+      .writes_back = !!(source->info.outputs_written & VARYING_BIT_BFC0),
    };
    struct tcl_key key = { key_count, key_dword, key_value };
    nir_shader *nir = nir_shader_clone(NULL, source);
@@ -1614,8 +1622,8 @@ tcl_cull(const struct pipe_rasterizer_state *rs)
 }
 
 static const struct chrome9_tcl_program *
-tcl_program(struct chrome9_context *ctx, bool clip_halfz, bool twoside,
-            uint8_t clip_enable)
+tcl_program(struct chrome9_context *ctx, bool clip_halfz,
+            enum chrome9_tcl_colour colour, uint8_t clip_enable)
 {
    struct chrome9_tcl_shader *shader = ctx->vs->tcl;
    const struct pipe_constant_buffer *cb = &ctx->vs_constants[0];
@@ -1638,7 +1646,7 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz, bool twoside,
    /* Most recently used first; the tail is reused when the list is full. */
    for (link = &shader->variants; (variant = *link); link = &variant->next) {
       if (variant->clip_halfz == clip_halfz &&
-          variant->twoside == twoside &&
+          variant->colour == colour &&
           variant->clip_enable == clip_enable &&
           !memcmp(variant->key, key, sizeof(key))) {
          *link = variant->next;
@@ -1658,10 +1666,10 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz, bool twoside,
    if (!variant)
       return NULL;
    variant->clip_halfz = clip_halfz;
-   variant->twoside = twoside;
+   variant->colour = colour;
    variant->clip_enable = clip_enable;
    memcpy(variant->key, key, sizeof(key));
-   chrome9_tcl_compile(shader->nir, clip_halfz, twoside, clip_enable,
+   chrome9_tcl_compile(shader->nir, clip_halfz, colour, clip_enable,
                        shader->key_count, shader->key_dword, key,
                        &variant->program);
    variant->next = shader->variants;
@@ -1799,94 +1807,32 @@ tcl_fallback(struct chrome9_context *ctx, const char *reason)
    return false;
 }
 
-bool
-chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
-                 const struct pipe_draw_start_count_bias *range)
+/* One culled pass of a TCL draw; false only when nothing was submitted. */
+static bool
+tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
+              const struct pipe_draw_start_count_bias *range,
+              const uint8_t *indices, unsigned triangles,
+              struct chrome9_tcl_state *state,
+              const struct chrome9_tcl_program *p,
+              const struct tcl_stream *bound, uint32_t flags,
+              uint8_t clip_enable)
 {
    const struct pipe_rasterizer_state *rs = ctx->rasterizer;
-   const struct chrome9_tcl_program *p;
-   struct chrome9_tcl_state *state;
    struct drm_chrome9_vertex_element elements[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct tcl_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct drm_chrome9_draw_vertex_program draw = { 0 };
    struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS];
-   const uint8_t *indices = NULL;
-   const char *why;
-   bool flat, twoside;
-   uint8_t clip_enable;
-   unsigned triangles, stride, per_chunk, buffer_count, done = 0;
+   unsigned stride, per_chunk, buffer_count, done = 0;
    uint32_t index_min, index_max;
 
-   if (!ctx->tcl_enabled)
-      return false;
-   if (!ctx->vs || !ctx->vs->tcl || !rs || !ctx->fs)
-      return tcl_fallback(ctx, "no NIR vertex shader");
-   if (info->primitive_restart || info->instance_count != 1 ||
-       info->start_instance)
-      return tcl_fallback(ctx, "restart or instancing");
-   if (rs->fill_front != PIPE_POLYGON_MODE_FILL ||
-       rs->fill_back != PIPE_POLYGON_MODE_FILL || !rs->depth_clip_near ||
-       !rs->depth_clip_far || rs->rasterizer_discard)
-      return tcl_fallback(ctx, "rasterizer state");
-   /* Back faces are invisible when culled (st also clears the flag). */
-   twoside = rs->light_twoside && rs->cull_face != PIPE_FACE_BACK;
-   if (twoside && !ctx->tcl_twoside)
-      return tcl_fallback(ctx, "two-sided color");
-   clip_enable = rs->clip_plane_enable;
-   if (clip_enable && (!ctx->tcl_clip_distance ||
-                       clip_enable >> DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES))
-      return tcl_fallback(ctx, "user clip planes");
-   if (!tcl_fs_flat(ctx->fs, &flat))
-      return tcl_fallback(ctx, "flat generic varying");
-   flat |= rs->flatshade;
-   triangles = tcl_triangle_count(info->mode, range->count);
-   if (!triangles && !tcl_triangle(info->mode, 0, false, (unsigned[3]){ 0 }))
-      return tcl_fallback(ctx, "primitive type");
-   if (!triangles)
-      return true;
-   if (rs->cull_face == PIPE_FACE_FRONT_AND_BACK)
-      return true;
-   p = tcl_program(ctx, rs->clip_halfz, twoside, clip_enable);
-   if (!p)
-      return tcl_fallback(ctx, "vertex shader not expressible");
-   /* An enabled plane the VS never writes stays with the draw module. */
-   if (p->clip_written != clip_enable)
-      return tcl_fallback(ctx, "unwritten clip distance");
-   if (!tcl_bind_inputs(ctx, p->input_count, streams))
-      return tcl_fallback(ctx, "vertex element format or buffer");
-   if (!tcl_guarded_domain(ctx, p))
-      return tcl_fallback(ctx, "guarded fragment domain");
-   if (info->index_size) {
-      indices = info->has_user_indices ? info->index.user :
-                info->index.resource ?
-                chrome9_resource(info->index.resource)->bo.map : NULL;
-      if (!indices || (info->index_size != 1 && info->index_size != 2 &&
-                       info->index_size != 4) ||
-          (!info->has_user_indices &&
-           ((uint64_t)range->start + range->count) * info->index_size >
-              info->index.resource->width0))
-         return false;
-   }
-   state = ctx->tcl_state;
-   if (!state) {
-      state = ctx->tcl_state = CALLOC_STRUCT(chrome9_tcl_state);
-      if (!state)
-         return false;
-   }
+   memcpy(streams, bound, p->input_count * sizeof(*streams));
    if (!tcl_viewport(ctx, draw.viewport))
       return tcl_fallback(ctx, "viewport");
    if (!tcl_constants(ctx, p, state->constants))
       return tcl_fallback(ctx, "constants");
-   if (!chrome9_draw_tcl_fragment(ctx, &state->fragment, &why))
-      return tcl_fallback(ctx, why);
 
    draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
-   draw.flags = tcl_cull(rs) | (flat ? DRM_CHROME9_VERTEX_FLAT : 0);
-   /* Back colors go to the back-face winding, the one culled by
-    * PIPE_FACE_BACK (tcl_cull). */
-   if (twoside && p->back_primary)
-      draw.flags |= rs->front_ccw ? DRM_CHROME9_VERTEX_BFC_CW :
-                                    DRM_CHROME9_VERTEX_BFC_CCW;
+   draw.flags = flags;
    draw.clip_distance_mask = clip_enable;
    draw.instruction_count = p->instruction_count;
    draw.instructions_ptr = (uintptr_t)p->instructions;
@@ -1983,5 +1929,154 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       done += count;
    }
    ctx->tcl_triangles += triangles;
+   return true;
+}
+
+/*
+ * Without hardware back-colour selection, two-sided colour draws the front
+ * faces with COL0 and the back faces with BFC0 as two culled passes.  That
+ * reorders the faces, so it is used only while the order cannot be seen: no
+ * blending or logic op, no stencil writes, and a writing depth test that
+ * keeps the nearer fragment.
+ */
+static bool
+tcl_face_order_invisible(const struct chrome9_context *ctx)
+{
+   const struct pipe_depth_stencil_alpha_state *dsa = ctx->dsa;
+   const struct pipe_blend_state *blend = ctx->blend;
+
+   if (!dsa || !blend || blend->logicop_enable || !dsa->depth_enabled ||
+       !dsa->depth_writemask ||
+       (dsa->depth_func != PIPE_FUNC_LESS &&
+        dsa->depth_func != PIPE_FUNC_LEQUAL &&
+        dsa->depth_func != PIPE_FUNC_GREATER &&
+        dsa->depth_func != PIPE_FUNC_GEQUAL))
+      return false;
+   for (unsigned i = 0; i < 2; i++)
+      if (dsa->stencil[i].enabled && dsa->stencil[i].writemask)
+         return false;
+   for (unsigned i = 0; i < ctx->framebuffer.nr_cbufs; i++) {
+      const struct pipe_rt_blend_state *rt =
+         &blend->rt[blend->independent_blend_enable ? i : 0];
+
+      if (rt->blend_enable && rt->colormask)
+         return false;
+   }
+   return true;
+}
+
+bool
+chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
+                 const struct pipe_draw_start_count_bias *range)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   const uint32_t cull_front = rs && rs->front_ccw ?
+      DRM_CHROME9_VERTEX_CULL_CCW : DRM_CHROME9_VERTEX_CULL_CW;
+   const uint32_t cull_back = rs && rs->front_ccw ?
+      DRM_CHROME9_VERTEX_CULL_CW : DRM_CHROME9_VERTEX_CULL_CCW;
+   const struct chrome9_tcl_program *programs[2];
+   enum chrome9_tcl_colour colours[2];
+   uint32_t flags[2];
+   struct tcl_stream streams[2][DRM_CHROME9_VERTEX_MAX_INPUTS];
+   struct chrome9_tcl_state *state;
+   const uint8_t *indices = NULL;
+   const char *why;
+   bool flat, twoside;
+   uint8_t clip_enable;
+   unsigned triangles, passes = 1;
+
+   if (!ctx->tcl_enabled)
+      return false;
+   if (!ctx->vs || !ctx->vs->tcl || !rs || !ctx->fs)
+      return tcl_fallback(ctx, "no NIR vertex shader");
+   if (info->primitive_restart || info->instance_count != 1 ||
+       info->start_instance)
+      return tcl_fallback(ctx, "restart or instancing");
+   if (rs->fill_front != PIPE_POLYGON_MODE_FILL ||
+       rs->fill_back != PIPE_POLYGON_MODE_FILL || !rs->depth_clip_near ||
+       !rs->depth_clip_far || rs->rasterizer_discard)
+      return tcl_fallback(ctx, "rasterizer state");
+   clip_enable = rs->clip_plane_enable;
+   if (clip_enable && (!ctx->tcl_clip_distance ||
+                       clip_enable >> DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES))
+      return tcl_fallback(ctx, "user clip planes");
+   if (!tcl_fs_flat(ctx->fs, &flat))
+      return tcl_fallback(ctx, "flat generic varying");
+   flat |= rs->flatshade;
+   triangles = tcl_triangle_count(info->mode, range->count);
+   if (!triangles && !tcl_triangle(info->mode, 0, false, (unsigned[3]){ 0 }))
+      return tcl_fallback(ctx, "primitive type");
+   if (!triangles)
+      return true;
+   if (rs->cull_face == PIPE_FACE_FRONT_AND_BACK)
+      return true;
+
+   /* Back faces are invisible when culled (st also clears the flag); a
+    * shader without BFC0 colours both faces with COL0. */
+   twoside = rs->light_twoside && rs->cull_face != PIPE_FACE_BACK &&
+             (ctx->vs->tcl->nir->info.outputs_written & VARYING_BIT_BFC0);
+   colours[0] = CHROME9_TCL_COLOUR_FRONT;
+   flags[0] = tcl_cull(rs);
+   if (twoside && ctx->tcl_twoside) {
+      /* Back colours go to the back-face winding. */
+      colours[0] = CHROME9_TCL_COLOUR_SELECT;
+      flags[0] |= rs->front_ccw ? DRM_CHROME9_VERTEX_BFC_CW :
+                                  DRM_CHROME9_VERTEX_BFC_CCW;
+   } else if (twoside) {
+      if (!tcl_face_order_invisible(ctx))
+         return tcl_fallback(ctx, "two-sided color with visible face order");
+      if (rs->cull_face == PIPE_FACE_FRONT) {
+         colours[0] = CHROME9_TCL_COLOUR_BACK;
+      } else {
+         flags[0] = cull_back;
+         colours[1] = CHROME9_TCL_COLOUR_BACK;
+         flags[1] = cull_front;
+         passes = 2;
+      }
+   }
+   for (unsigned i = 0; i < passes; i++) {
+      const struct chrome9_tcl_program *p =
+         tcl_program(ctx, rs->clip_halfz, colours[i], clip_enable);
+
+      if (!p)
+         return tcl_fallback(ctx, "vertex shader not expressible");
+      /* An enabled plane the VS never writes stays with the draw module. */
+      if (p->clip_written != clip_enable)
+         return tcl_fallback(ctx, "unwritten clip distance");
+      if (!tcl_bind_inputs(ctx, p->input_count, streams[i]))
+         return tcl_fallback(ctx, "vertex element format or buffer");
+      if (!tcl_guarded_domain(ctx, p))
+         return tcl_fallback(ctx, "guarded fragment domain");
+      programs[i] = p;
+      flags[i] |= flat ? DRM_CHROME9_VERTEX_FLAT : 0;
+   }
+   if (info->index_size) {
+      indices = info->has_user_indices ? info->index.user :
+                info->index.resource ?
+                chrome9_resource(info->index.resource)->bo.map : NULL;
+      if (!indices || (info->index_size != 1 && info->index_size != 2 &&
+                       info->index_size != 4) ||
+          (!info->has_user_indices &&
+           ((uint64_t)range->start + range->count) * info->index_size >
+              info->index.resource->width0))
+         return false;
+   }
+   state = ctx->tcl_state;
+   if (!state) {
+      state = ctx->tcl_state = CALLOC_STRUCT(chrome9_tcl_state);
+      if (!state)
+         return false;
+   }
+   if (!chrome9_draw_tcl_fragment(ctx, &state->fragment, &why))
+      return tcl_fallback(ctx, why);
+   for (unsigned i = 0; i < passes; i++) {
+      if (tcl_draw_pass(ctx, info, range, indices, triangles, state,
+                        programs[i], streams[i], flags[i], clip_enable))
+         continue;
+      if (!i)
+         return false;
+      /* The front faces are already drawn. */
+      CHROME9_REJECT(ctx, triangles);
+   }
    return true;
 }

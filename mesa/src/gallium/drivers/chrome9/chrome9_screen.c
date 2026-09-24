@@ -449,7 +449,8 @@ chrome9_restrict_generic_caps(struct pipe_caps *caps)
    caps->buffer_map_persistent_coherent = false;
    caps->dest_surface_srgb_control = false;
    caps->packed_stream_output = false;
-   caps->two_sided_color = false;
+   /* Draw and the TCL path select BFC0 for back faces. */
+   caps->two_sided_color = true;
    caps->flatshade = false;
    caps->clip_planes = 0;
    caps->dithering = false;

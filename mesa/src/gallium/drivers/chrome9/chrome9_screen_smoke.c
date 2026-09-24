@@ -7539,7 +7539,7 @@ main(int argc, char **argv)
           screen->caps.buffer_map_persistent_coherent ||
           screen->caps.dest_surface_srgb_control ||
           screen->caps.packed_stream_output ||
-          screen->caps.two_sided_color || screen->caps.clip_planes ||
+          !screen->caps.two_sided_color || screen->caps.clip_planes ||
           screen->caps.dithering ||
           screen->caps.mixed_colorbuffer_formats ||
           !screen->caps.generate_mipmap ||
