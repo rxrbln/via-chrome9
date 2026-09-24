@@ -126,10 +126,18 @@ The proprietary Linux compiler has `TryAllocChn_invi`,
 `RenameSrcChannel_invi` and `stmPPS_ShrinkSrcChn_invi` passes for broader
 packing.  Promotion requires a final object with at most 96 ALU, exactly
 five TEX, correct port classes, no undefined lanes, and physical high-water
-at most twelve.  This scheduler is not yet called by the production compiler,
-and the FACE/alpha helpers still require draw-time variant integration.
-Default lightall must remain rejected until the complete integrated object
-and a guarded distinct-color pixel oracle both pass.
+at most twelve.  An end-to-end offline replay now runs the scheduled semantic
+object through the current Mesa native builder and current kernel compiler:
+95 ALU, five TAU, physical `p0` through `p8`, and one final-use marker for
+every physical TEMP (`0x1ff`).  Its resource controls include
+`A92=9205005f` and `A93=9300001f`, matching six varying fields and five
+samplers.  No allocator, port, or upload-capacity blocker remains in that
+replay.  The shared Mesa worktree invokes the scheduler only after the
+original order exceeds twelve live TEMP vectors; that integration is not yet
+committed or target-qualified.  The FACE/alpha helpers still require
+draw-time variant integration.  Default lightall must remain rejected until
+the complete integrated object and a guarded distinct-color pixel oracle both
+pass.
 
 ## Evidence
 
@@ -144,6 +152,10 @@ and a guarded distinct-color pixel oracle both pass.
 - Exact scheduler corpus and result:
   `chrome9_ps_schedule_test.c`, 100 records, peak nine; cross Meson test
   `chrome9-ps-schedule` passes.  This is host evidence, not a GPU result.
+- Native/kernel replay: `/tmp/chrome9-kernel-replay/replay.c`, SHA-256
+  `16da371648c6146c20a74ddab9d99611d32c8e2c478a639e827da2be9c098df6`;
+  replay binary SHA-256
+  `afb966a9e3ee57c8e0e4d0f75e09d6113eda20626cf3da93dadd2512a7569a79`.
 - Generic specialization tests: Mesa commits `04a35c3` and `e5617b5`;
   `chrome9-specialise-test` passes under the matching T2 sysroot loader.
 - Draw ordering and two-sided marker proof:
