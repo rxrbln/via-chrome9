@@ -157,7 +157,7 @@ main(void)
    build_lightall(&input);
    if (input.count != 100 ||
        !chrome9_schedule_ps_ir(&input, &scheduled, &peak) ||
-       peak > 12 || scheduled.count != input.count ||
+       peak != 9 || scheduled.count != input.count ||
        scheduled.instruction[scheduled.count - 1].destination.file !=
           CHROME9_PS_DESTINATION_COLOR ||
        !same_multiset(&input, &scheduled)) {
