@@ -3838,6 +3838,8 @@ tcl_batch_append(struct chrome9_context *ctx,
       draw->buffer_count * sizeof(struct drm_chrome9_vertex_buffer),
       (size_t)draw->index_count * draw->index_size,
       (size_t)draw->vertex_count * draw->vertex_stride,
+      draw->int_constants_ptr ?
+         DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS * 4 * sizeof(uint8_t) : 0,
    };
    const struct drm_chrome9_fragment_texture_state *textures =
       (const void *)(uintptr_t)f->textures_ptr;
@@ -3890,6 +3892,9 @@ tcl_batch_append(struct chrome9_context *ctx,
    copy->vertices_ptr = draw->vertex_count ?
       (uintptr_t)tcl_batch_copy(&cursor,
          (const void *)(uintptr_t)draw->vertices_ptr, sizes[8]) : 0;
+   copy->int_constants_ptr = draw->int_constants_ptr ?
+      (uintptr_t)tcl_batch_copy(&cursor,
+         (const void *)(uintptr_t)draw->int_constants_ptr, sizes[9]) : 0;
    for (unsigned t = 0; t < f->texture_count; t++)
       if (!tcl_batch_has(b->texture_handles, b->texture_handle_count,
                          textures[t].handle))

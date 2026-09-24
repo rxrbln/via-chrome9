@@ -10,6 +10,7 @@
 #include "util/u_dynarray.h"
 
 #include "chrome9_shader_offline.h"
+#include "chrome9_tcl.h"
 #include "chrome9_vs_texture.h"
 
 struct chrome9_query;
@@ -298,6 +299,8 @@ struct chrome9_context {
    bool tcl_point_size;
    bool tcl_lines;
    bool tcl_polygon_mode;
+   /* REP/IF lowering (CAP2_VERTEX_STATIC_FLOW); max_depth 0 without. */
+   struct chrome9_tcl_flow tcl_flow;
    struct chrome9_tcl_state *tcl_state;
    /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */
    struct chrome9_sw_context *sw;

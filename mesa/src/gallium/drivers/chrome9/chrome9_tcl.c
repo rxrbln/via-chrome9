@@ -37,6 +37,12 @@
 #define TCL_SEL_ZERO DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO
 #define TCL_MAX_VERTEX_BYTES (40U * 1024)
 #define TCL_MAX_TRIANGLES (DRM_CHROME9_VERTEX_MAX_VERTICES / 3)
+/* Kernel structural limit (D3D9 static flow depth); the cap grants one. */
+#define TCL_MAX_FLOW_DEPTH 4
+/* instr->pass_flags of code a REP makes redundant (its counter). */
+#define TCL_SKIP 1
+#define TCL_EXPR_LITERAL 0xffff
+#define TCL_EXPR_DWORD 0xfffe
 
 /* How to read the components of one NIR value. */
 struct tcl_value {
@@ -45,6 +51,8 @@ struct tcl_value {
    uint8_t index;
    uint8_t sel[4];
    bool neg;
+   /* Flow region a temp was defined in; zero is the top level. */
+   uint16_t scope;
 };
 
 struct chrome9_tcl_state {
@@ -53,6 +61,7 @@ struct chrome9_tcl_state {
    uint32_t vertices[TCL_MAX_VERTEX_BYTES / sizeof(uint32_t)];
    /* One stage B chunk; the kernel bounds index_count per draw. */
    uint32_t indices[DRM_CHROME9_VERTEX_MAX_INDICES];
+   uint8_t ints[DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS][4];
    /* Draw-relative vertex positions of the current chunk. */
    unsigned positions[MAX2(DRM_CHROME9_VERTEX_MAX_INDICES,
                            DRM_CHROME9_VERTEX_MAX_VERTICES)];
@@ -72,6 +81,15 @@ struct tcl_builder {
    /* Whole-register copies used to legalize read ports. */
    int16_t constant_temp[DRM_CHROME9_VERTEX_MAX_CONSTANTS];
    int16_t input_temp[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   const struct chrome9_tcl_flow *flow;
+   nir_function_impl *impl;
+   unsigned depth;
+   unsigned scope_serial;
+   uint16_t scope[TCL_MAX_FLOW_DEPTH + 1];
+   /* NIR scalar of each program expression node. */
+   struct util_dynarray expr_keys;
+   /* Ifs lowered to IF b#: their condition is evaluated on the CPU. */
+   struct util_dynarray uniform_ifs;
 };
 
 static unsigned
@@ -228,6 +246,15 @@ tcl_source_reads(const struct drm_chrome9_vertex_source *src)
    return false;
 }
 
+static bool
+tcl_scope_active(const struct tcl_builder *b, uint16_t scope)
+{
+   for (unsigned d = 0; d <= b->depth; d++)
+      if (b->scope[d] == scope)
+         return true;
+   return false;
+}
+
 static void
 tcl_append(struct tcl_builder *b, const struct drm_chrome9_vertex_instruction *insn)
 {
@@ -270,7 +297,8 @@ static void
 tcl_emit(struct tcl_builder *b, struct drm_chrome9_vertex_instruction *insn,
          unsigned count)
 {
-   const bool scalar = insn->op >= DRM_CHROME9_VERTEX_OP_RCP;
+   const bool scalar = insn->op >= DRM_CHROME9_VERTEX_OP_RCP &&
+                       insn->op <= DRM_CHROME9_VERTEX_OP_LOG2;
 
    for (unsigned file = DRM_CHROME9_VERTEX_FILE_INPUT;
         file <= DRM_CHROME9_VERTEX_FILE_CONSTANT; file++) {
@@ -314,10 +342,13 @@ tcl_value(struct tcl_builder *b, const nir_def *def)
 {
    const struct tcl_value *v = &b->values[def->index];
 
-   if (!v->valid || def->bit_size != 32) {
+   /* A temp written inside a flow region is undefined after it. */
+   if (!v->valid || def->bit_size != 32 ||
+       (v->file == DRM_CHROME9_VERTEX_FILE_TEMP && !tcl_scope_active(b, v->scope))) {
       if (!b->failed && debug_get_bool_option("CHROME9_DEBUG_TCL", false)) {
          fprintf(stderr, "chrome9: TCL operand %s from: ",
-                 v->valid ? "not 32-bit" : "undefined");
+                 !v->valid ? "undefined" :
+                 def->bit_size != 32 ? "not 32-bit" : "outside its flow region");
          nir_print_instr(nir_def_instr((nir_def *)def), stderr);
          fprintf(stderr, "\n");
       }
@@ -342,6 +373,7 @@ tcl_set_temp(struct tcl_builder *b, const nir_def *def, unsigned temp)
    v->valid = true;
    v->file = DRM_CHROME9_VERTEX_FILE_TEMP;
    v->index = temp;
+   v->scope = b->scope[b->depth];
    /* Lanes past the written width replicate x so they stay defined. */
    for (unsigned i = 0; i < 4; i++)
       v->sel[i] = i < def->num_components ? i : 0;
@@ -428,6 +460,7 @@ tcl_alias(struct tcl_builder *b, nir_alu_instr *alu)
    }
    alias.file = first ? first->file : DRM_CHROME9_VERTEX_FILE_TEMP;
    alias.index = first ? first->index : 0;
+   alias.scope = first ? first->scope : 0;
    alias.neg = first ? first->neg != neg : one_sign > 0;
    if (one_sign >= 0 && one_sign != alias.neg)
       return false;
@@ -767,8 +800,9 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
    uint8_t swizzle[4] = { 0 };
    unsigned index = 0;
 
+   /* The kernel takes outputs only outside flow regions. */
    if (!nir_src_is_const(store->src[1]) || nir_src_as_uint(store->src[1]) ||
-       mask > 0xf || b->failed) {
+       mask > 0xf || b->failed || b->depth) {
       b->failed = true;
       return;
    }
@@ -848,6 +882,28 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
    tcl_emit(b, &mov, 1);
 }
 
+/* Whether a use of def is emitted inside a flow region (phi moves are). */
+static bool
+tcl_used_in_flow(const struct tcl_builder *b, nir_def *def)
+{
+   nir_foreach_use_including_if(src, def) {
+      const nir_cf_node *parent;
+
+      if (nir_src_is_if(src)) {
+         parent = nir_src_use_if(src)->cf_node.parent;
+      } else {
+         nir_instr *instr = nir_src_use_instr(src);
+
+         if (instr->type == nir_instr_type_phi)
+            return true;
+         parent = instr->block->cf_node.parent;
+      }
+      if (parent != &b->impl->cf_node)
+         return true;
+   }
+   return false;
+}
+
 static void
 tcl_intrinsic(struct tcl_builder *b, nir_intrinsic_instr *intr)
 {
@@ -871,6 +927,16 @@ tcl_intrinsic(struct tcl_builder *b, nir_intrinsic_instr *intr)
          out->sel[c] = nir_intrinsic_component(intr) +
                        (c < intr->def.num_components ? c : 0);
       b->p->input_count = MAX2(b->p->input_count, out->index + 1u);
+      /* The kernel reads inputs only outside flow regions. */
+      if (b->flow && tcl_used_in_flow(b, &intr->def)) {
+         if (b->depth) {
+            b->failed = true;
+            return;
+         }
+         out->index = tcl_register_temp(b, DRM_CHROME9_VERTEX_FILE_INPUT,
+                                        out->index);
+         out->file = DRM_CHROME9_VERTEX_FILE_TEMP;
+      }
       return;
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ubo_vec4:
@@ -892,6 +958,671 @@ tcl_intrinsic(struct tcl_builder *b, nir_intrinsic_instr *intr)
       b->failed = true;
       return;
    }
+}
+
+
+static void
+tcl_flow_fail(struct tcl_builder *b, const char *reason)
+{
+   if (!b->failed && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL flow: %s\n", reason);
+   b->failed = true;
+}
+
+struct tcl_expr_key {
+   nir_def *def;
+   unsigned comp;
+};
+
+static bool
+tcl_expr_alu(nir_op op)
+{
+   switch (op) {
+   case nir_op_mov: case nir_op_fneg: case nir_op_fabs: case nir_op_fadd:
+   case nir_op_fsub: case nir_op_fmul: case nir_op_ffma: case nir_op_ffma_weak:
+   case nir_op_fmin: case nir_op_fmax: case nir_op_slt: case nir_op_sge:
+   case nir_op_seq: case nir_op_sne: case nir_op_ffloor: case nir_op_fceil:
+   case nir_op_ftrunc: case nir_op_ffract: case nir_op_fsat: case nir_op_fsign:
+   case nir_op_frcp: case nir_op_frsq: case nir_op_fsqrt: case nir_op_fcsel:
+   case nir_op_fcsel_gt: case nir_op_fcsel_ge:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Node of a scalar computed only from CB0 dwords and literals, or -1. */
+static int
+tcl_expr(struct tcl_builder *b, nir_scalar s)
+{
+   struct chrome9_tcl_program *p = b->p;
+   const struct tcl_expr_key *keys = b->expr_keys.data;
+   struct chrome9_tcl_expr node = { 0 };
+   struct tcl_expr_key key;
+   unsigned row, lane;
+
+   s = nir_scalar_chase_movs(s);
+   if (s.def->bit_size != 32)
+      return -1;
+   for (unsigned i = 0; i < p->expr_count; i++)
+      if (keys[i].def == s.def && keys[i].comp == s.comp)
+         return i;
+   if (nir_scalar_is_const(s)) {
+      node.op = TCL_EXPR_LITERAL;
+      node.value = nir_scalar_as_uint(s);
+   } else if (nir_scalar_is_intrinsic(s) &&
+              tcl_ubo_row(nir_def_as_intrinsic(s.def), &row, &lane)) {
+      node.op = TCL_EXPR_DWORD;
+      node.value = row * 4 + lane + s.comp;
+   } else if (nir_scalar_is_alu(s) && tcl_expr_alu(nir_scalar_alu_op(s))) {
+      const nir_op op = nir_scalar_alu_op(s);
+
+      node.op = op;
+      for (unsigned k = 0; k < nir_op_infos[op].num_inputs; k++) {
+         const int src = tcl_expr(b, nir_scalar_chase_alu_src(s, k));
+
+         if (src < 0)
+            return -1;
+         node.src[k] = src;
+      }
+   } else {
+      return -1;
+   }
+   /* bool_expr and rep bounds hold node indices in a byte. */
+   if (p->expr_count > UINT8_MAX)
+      return -1;
+   if (!(p->expr_count & (p->expr_count - 1))) {
+      struct chrome9_tcl_expr *grown =
+         REALLOC(p->expr, p->expr_count * sizeof(*grown),
+                 MAX2(2 * p->expr_count, 8) * sizeof(*grown));
+
+      if (!grown)
+         return -1;
+      p->expr = grown;
+   }
+   key.def = s.def;
+   key.comp = s.comp;
+   util_dynarray_append(&b->expr_keys, key);
+   p->expr[p->expr_count] = node;
+   return p->expr_count++;
+}
+
+static bool
+tcl_list_empty(struct exec_list *list)
+{
+   nir_cf_node *node = exec_node_data(nir_cf_node, exec_list_get_head(list),
+                                      node);
+
+   return exec_list_is_singular(list) && node->type == nir_cf_node_block &&
+          exec_list_is_empty(&nir_cf_node_as_block(node)->instr_list);
+}
+
+static bool
+tcl_break_arm(struct exec_list *list)
+{
+   nir_cf_node *node = exec_node_data(nir_cf_node, exec_list_get_head(list),
+                                      node);
+   nir_block *block;
+
+   if (!exec_list_is_singular(list) || node->type != nir_cf_node_block)
+      return false;
+   block = nir_cf_node_as_block(node);
+   return exec_list_is_singular(&block->instr_list) &&
+          nir_block_ends_in_break(block);
+}
+
+/* No jump but the terminator's break leaves or restarts this loop. */
+static bool
+tcl_loop_jumps_ok(struct exec_list *list, const nir_if *terminator)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         nir_foreach_instr(instr, nir_cf_node_as_block(node))
+            if (instr->type == nir_instr_type_jump)
+               return false;
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+
+         if (nif != terminator &&
+             (!tcl_loop_jumps_ok(&nif->then_list, terminator) ||
+              !tcl_loop_jumps_ok(&nif->else_list, terminator)))
+            return false;
+         break;
+      }
+      default:
+         /* Nested loops own their breaks. */
+         break;
+      }
+   }
+   return true;
+}
+
+/* Every use of def is one of the given instructions or the if. */
+static bool
+tcl_only_used_by(nir_def *def, const nir_instr *a, const nir_instr *c,
+                 const nir_if *nif)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src) ? nir_src_use_if(src) != nif :
+          nir_src_use_instr(src) != a && nir_src_use_instr(src) != c)
+         return false;
+   }
+   return true;
+}
+
+/* next = fadd(counter, constant step) with counter a header phi whose back
+ * edge value is next. */
+static bool
+tcl_counter_step(nir_scalar next, nir_block *header, nir_block *latch,
+                 nir_phi_instr **counter, float *step)
+{
+   if (!nir_scalar_is_alu(next) || nir_scalar_alu_op(next) != nir_op_fadd ||
+       next.def->num_components != 1)
+      return false;
+   for (unsigned k = 0; k < 2; k++) {
+      nir_scalar own = nir_scalar_chase_movs(nir_scalar_chase_alu_src(next, k));
+      nir_scalar add = nir_scalar_chase_movs(nir_scalar_chase_alu_src(next, !k));
+      nir_instr *instr = nir_def_instr(own.def);
+
+      if (instr->type != nir_instr_type_phi || instr->block != header ||
+          !nir_scalar_is_const(add) ||
+          nir_phi_get_src_from_block(nir_instr_as_phi(instr),
+                                     latch)->src.ssa != next.def)
+         continue;
+      *counter = nir_instr_as_phi(instr);
+      *step = nir_scalar_as_float(add);
+      return true;
+   }
+   return false;
+}
+
+/*
+ * A REP-countable loop: the header block, then "if (c) break;" (or the
+ * mirrored else-break), no other jump, one latch.  c compares a counter
+ * (header phi, constant init and nonzero step) with a CB0 or literal
+ * expression, either directly or rotated by NIR into a condition phi fed
+ * by the compare of the next counter value.  The counter code is skipped
+ * when nothing else reads it.
+ */
+static bool
+tcl_match_rep(struct tcl_builder *b, nir_loop *loop,
+              struct chrome9_tcl_rep *rep, nir_if **terminator)
+{
+   nir_cf_node *first = exec_node_data(nir_cf_node,
+                                       exec_list_get_head(&loop->body), node);
+   nir_block *header, *latch, *preheader;
+   nir_phi_instr *counter = NULL, *cond_phi = NULL;
+   nir_scalar cond, init, next = { 0 };
+   nir_cf_node *second;
+   nir_if *nif;
+   int bound = -1;
+
+   if (nir_loop_has_continue_construct(loop) ||
+       first->type != nir_cf_node_block)
+      return false;
+   header = nir_cf_node_as_block(first);
+   second = nir_cf_node_next(first);
+   latch = nir_loop_last_block(loop);
+   preheader = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
+   if (!second || second->type != nir_cf_node_if ||
+       nir_block_num_preds(header) != 2)
+      return false;
+   nif = nir_cf_node_as_if(second);
+   if (tcl_break_arm(&nif->then_list) && tcl_list_empty(&nif->else_list))
+      rep->break_on_true = true;
+   else if (tcl_break_arm(&nif->else_list) && tcl_list_empty(&nif->then_list))
+      rep->break_on_true = false;
+   else
+      return false;
+   if (!tcl_loop_jumps_ok(&loop->body, nif))
+      return false;
+   cond = nir_scalar_chase_movs(nir_get_scalar(nif->condition.ssa, 0));
+   /* Rotated: the break flag of iteration k + 1 is computed in k. */
+   if (nir_def_instr(cond.def)->type == nir_instr_type_phi &&
+       nir_def_instr(cond.def)->block == header &&
+       cond.def->num_components == 1) {
+      cond_phi = nir_def_as_phi(cond.def);
+      cond = nir_scalar_chase_movs(nir_get_scalar(
+         nir_phi_get_src_from_block(cond_phi, latch)->src.ssa, 0));
+   }
+   if (!nir_scalar_is_alu(cond))
+      return false;
+   rep->compare = nir_scalar_alu_op(cond);
+   if (rep->compare != nir_op_slt && rep->compare != nir_op_sge &&
+       rep->compare != nir_op_seq && rep->compare != nir_op_sne)
+      return false;
+   for (unsigned k = 0; k < 2; k++) {
+      nir_scalar side = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, k));
+      nir_instr *instr = nir_def_instr(side.def);
+      nir_scalar candidate = side;
+
+      if (!cond_phi && instr->type == nir_instr_type_phi &&
+          instr->block == header)
+         candidate = nir_scalar_chase_movs(nir_get_scalar(
+            nir_phi_get_src_from_block(nir_instr_as_phi(instr),
+                                       latch)->src.ssa, 0));
+      if (!counter &&
+          (cond_phi || instr->type == nir_instr_type_phi) &&
+          tcl_counter_step(candidate, header, latch, &counter, &rep->step) &&
+          (cond_phi || &counter->instr == instr)) {
+         next = candidate;
+         rep->counter_first = !k;
+      } else {
+         bound = tcl_expr(b, side);
+      }
+   }
+   if (!counter || bound < 0)
+      return false;
+   rep->bound = bound;
+   init = nir_scalar_chase_movs(nir_get_scalar(
+      nir_phi_get_src_from_block(counter, preheader)->src.ssa, 0));
+   if (!nir_scalar_is_const(init))
+      return false;
+   rep->init = nir_scalar_as_float(init);
+   if (rep->step == 0.0f || !isfinite(rep->step) || !isfinite(rep->init))
+      return false;
+   if (cond_phi ?
+       nif->condition.ssa == &cond_phi->def &&
+       nir_phi_get_src_from_block(cond_phi, latch)->src.ssa == cond.def &&
+       tcl_only_used_by(&counter->def, nir_def_instr(next.def), NULL, NULL) &&
+       tcl_only_used_by(next.def, &counter->instr, nir_def_instr(cond.def),
+                        NULL) &&
+       tcl_only_used_by(cond.def, &cond_phi->instr, NULL, NULL) &&
+       tcl_only_used_by(&cond_phi->def, NULL, NULL, nif) :
+       nif->condition.ssa == cond.def &&
+       tcl_only_used_by(&counter->def, nir_def_instr(cond.def),
+                        nir_def_instr(next.def), NULL) &&
+       tcl_only_used_by(next.def, &counter->instr, NULL, NULL) &&
+       tcl_only_used_by(cond.def, NULL, NULL, nif)) {
+      counter->instr.pass_flags = TCL_SKIP;
+      nir_def_instr(next.def)->pass_flags = TCL_SKIP;
+      nir_def_instr(cond.def)->pass_flags = TCL_SKIP;
+      if (cond_phi)
+         cond_phi->instr.pass_flags = TCL_SKIP;
+   }
+   *terminator = nif;
+   return true;
+}
+
+/* Match every REP and find the b# ifs before emission, so counter and
+ * uniform condition code is never emitted; tcl_skip_dead removes it. */
+static void
+tcl_mark_reps(struct tcl_builder *b, struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+
+         if (tcl_expr(b, nir_get_scalar(nif->condition.ssa, 0)) >= 0)
+            util_dynarray_append(&b->uniform_ifs, nif);
+         tcl_mark_reps(b, &nif->then_list);
+         tcl_mark_reps(b, &nif->else_list);
+      } else if (node->type == nir_cf_node_loop) {
+         struct chrome9_tcl_rep rep;
+         nir_if *terminator;
+
+         tcl_match_rep(b, nir_cf_node_as_loop(node), &rep, &terminator);
+         tcl_mark_reps(b, &nir_cf_node_as_loop(node)->body);
+      }
+   }
+}
+
+static bool
+tcl_uniform_if(const struct tcl_builder *b, const nir_if *nif)
+{
+   util_dynarray_foreach(&b->uniform_ifs, nir_if *, entry)
+      if (*entry == nif)
+         return true;
+   return false;
+}
+
+static void
+tcl_skip_dead(struct tcl_builder *b, nir_function_impl *impl)
+{
+   bool progress;
+
+   do {
+      progress = false;
+      nir_foreach_block_reverse(block, impl) {
+         nir_foreach_instr_reverse(instr, block) {
+            bool dead = instr->type == nir_instr_type_alu &&
+                        instr->pass_flags != TCL_SKIP;
+
+            if (!dead)
+               continue;
+            nir_foreach_use_including_if(src, &nir_instr_as_alu(instr)->def)
+               dead &= nir_src_is_if(src) ?
+                       tcl_uniform_if(b, nir_src_use_if(src)) :
+                       nir_src_use_instr(src)->pass_flags == TCL_SKIP;
+            if (dead) {
+               instr->pass_flags = TCL_SKIP;
+               progress = true;
+            }
+         }
+      }
+   } while (progress);
+}
+
+static void tcl_emit_list(struct tcl_builder *b, struct exec_list *list);
+static void tcl_emit_loop(struct tcl_builder *b, nir_loop *loop);
+
+static void
+tcl_flow_op(struct tcl_builder *b, uint8_t op,
+            const struct drm_chrome9_vertex_source *src)
+{
+   struct drm_chrome9_vertex_instruction insn = { .op = op };
+
+   if (src)
+      insn.src[0] = *src;
+   tcl_append(b, &insn);
+}
+
+static void
+tcl_flow_source(struct drm_chrome9_vertex_source *src, uint8_t file,
+                uint8_t index)
+{
+   memset(src, 0, sizeof(*src));
+   src->file = file;
+   src->index = index;
+   for (unsigned i = 0; i < 4; i++)
+      src->swizzle[i] = i;
+}
+
+/* Region caches: register copies made inside do not exist outside. */
+struct tcl_region {
+   int16_t constant_temp[DRM_CHROME9_VERTEX_MAX_CONSTANTS];
+   int16_t input_temp[DRM_CHROME9_VERTEX_MAX_INPUTS];
+};
+
+static void
+tcl_enter(struct tcl_builder *b, struct tcl_region *r)
+{
+   memcpy(r->constant_temp, b->constant_temp, sizeof(r->constant_temp));
+   memcpy(r->input_temp, b->input_temp, sizeof(r->input_temp));
+   b->scope[++b->depth] = ++b->scope_serial;
+}
+
+static void
+tcl_leave(struct tcl_builder *b, const struct tcl_region *r)
+{
+   memcpy(b->constant_temp, r->constant_temp, sizeof(r->constant_temp));
+   memcpy(b->input_temp, r->input_temp, sizeof(r->input_temp));
+   b->depth--;
+}
+
+static void
+tcl_move(struct tcl_builder *b, unsigned temp, const struct tcl_value *v,
+         unsigned lanes)
+{
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+   struct drm_chrome9_vertex_source src = tcl_source(v, identity, lanes,
+                                                     false);
+
+   tcl_op(b, DRM_CHROME9_VERTEX_OP_MOV, BITFIELD_MASK(lanes), temp, &src, 1);
+}
+
+/* Phis after an if: each arm writes the phi's temp from its source. */
+static void
+tcl_phi_moves(struct tcl_builder *b, nir_block *after, nir_block *pred)
+{
+   nir_foreach_phi(phi, after) {
+      nir_phi_src *src = nir_phi_get_src_from_block(phi, pred);
+      const struct tcl_value *v;
+
+      if (!src) {
+         tcl_flow_fail(b, "phi without an arm source");
+         return;
+      }
+      v = tcl_value(b, src->src.ssa);
+      if (b->failed)
+         return;
+      tcl_move(b, b->values[phi->def.index].index, v, phi->def.num_components);
+   }
+}
+
+static void
+tcl_emit_if(struct tcl_builder *b, nir_if *nif)
+{
+   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
+   struct drm_chrome9_vertex_source cond;
+   struct tcl_region region;
+   bool phis = false;
+   unsigned at;
+   int expr;
+
+   if (b->depth >= b->flow->max_depth) {
+      tcl_flow_fail(b, "nesting depth");
+      return;
+   }
+   expr = tcl_expr(b, nir_get_scalar(nif->condition.ssa, 0));
+   if (expr >= 0) {
+      if (b->p->bool_count >= DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS) {
+         tcl_flow_fail(b, "out of b# constants");
+         return;
+      }
+      b->p->bool_expr[b->p->bool_count] = expr;
+      tcl_flow_source(&cond, DRM_CHROME9_VERTEX_FILE_BOOL,
+                      b->p->bool_count++);
+   } else if (b->flow->dynamic) {
+      const struct tcl_value *v = tcl_value(b, nif->condition.ssa);
+      unsigned temp;
+
+      if (b->failed)
+         return;
+      temp = v->index;
+      if (v->file != DRM_CHROME9_VERTEX_FILE_TEMP || v->sel[0] > 3 || v->neg) {
+         temp = tcl_new_temp(b);
+         tcl_move(b, temp, v, 1);
+      }
+      tcl_flow_source(&cond, DRM_CHROME9_VERTEX_FILE_TEMP, temp);
+      memset(cond.swizzle, v->file == DRM_CHROME9_VERTEX_FILE_TEMP &&
+             v->sel[0] <= 3 && !v->neg ? v->sel[0] : 0, sizeof(cond.swizzle));
+   } else {
+      tcl_flow_fail(b, "data-dependent branch");
+      return;
+   }
+   nir_foreach_phi(phi, after) {
+      tcl_set_temp(b, &phi->def, tcl_new_temp(b));
+      phis = true;
+   }
+   at = b->p->instruction_count;
+   tcl_flow_op(b, DRM_CHROME9_VERTEX_OP_IF, &cond);
+   tcl_enter(b, &region);
+   tcl_emit_list(b, &nif->then_list);
+   tcl_phi_moves(b, after, nir_if_last_then_block(nif));
+   tcl_leave(b, &region);
+   if (phis || !tcl_list_empty(&nif->else_list)) {
+      tcl_flow_op(b, DRM_CHROME9_VERTEX_OP_ELSE, NULL);
+      tcl_enter(b, &region);
+      tcl_emit_list(b, &nif->else_list);
+      tcl_phi_moves(b, after, nir_if_last_else_block(nif));
+      tcl_leave(b, &region);
+   } else if (b->p->instruction_count == at + 1) {
+      b->p->instruction_count--;
+      return;
+   }
+   tcl_flow_op(b, DRM_CHROME9_VERTEX_OP_ENDIF, NULL);
+}
+
+static void
+tcl_emit_instr(struct tcl_builder *b, nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu:
+      tcl_alu(b, nir_instr_as_alu(instr));
+      break;
+   case nir_instr_type_load_const:
+      tcl_load_const(b, nir_instr_as_load_const(instr));
+      break;
+   case nir_instr_type_undef: {
+      nir_undef_instr *undef = nir_instr_as_undef(instr);
+      struct tcl_value *v = &b->values[undef->def.index];
+
+      memset(v, 0, sizeof(*v));
+      v->valid = true;
+      memset(v->sel, TCL_SEL_ZERO, sizeof(v->sel));
+      break;
+   }
+   case nir_instr_type_intrinsic:
+      tcl_intrinsic(b, nir_instr_as_intrinsic(instr));
+      break;
+   case nir_instr_type_phi:
+      /* Set up by the enclosing if or loop. */
+      if (!b->values[nir_instr_as_phi(instr)->def.index].valid)
+         b->failed = true;
+      break;
+   default:
+      b->failed = true;
+      break;
+   }
+   if (b->failed && debug_get_bool_option("CHROME9_DEBUG_TCL", false)) {
+      fprintf(stderr, "chrome9: TCL cannot express: ");
+      nir_print_instr(instr, stderr);
+      fprintf(stderr, "\n");
+   }
+}
+
+static void
+tcl_emit_node(struct tcl_builder *b, nir_cf_node *node)
+{
+   switch (node->type) {
+   case nir_cf_node_block:
+      nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+         if (b->failed)
+            return;
+         if (instr->pass_flags != TCL_SKIP)
+            tcl_emit_instr(b, instr);
+      }
+      break;
+   case nir_cf_node_if:
+      tcl_emit_if(b, nir_cf_node_as_if(node));
+      break;
+   case nir_cf_node_loop:
+      tcl_emit_loop(b, nir_cf_node_as_loop(node));
+      break;
+   default:
+      b->failed = true;
+      break;
+   }
+}
+
+static void
+tcl_emit_list(struct tcl_builder *b, struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list)
+      if (!b->failed)
+         tcl_emit_node(b, node);
+}
+
+struct tcl_back_move {
+   unsigned temp;
+   unsigned lanes;
+   struct tcl_value value;
+};
+
+/* Back edge as a parallel copy: a source reading another carried temp is
+ * staged first, so no carried temp is read after it was rewritten. */
+static void
+tcl_back_moves(struct tcl_builder *b, nir_block *header, nir_block *latch,
+               const BITSET_WORD *carried)
+{
+   struct util_dynarray moves;
+
+   util_dynarray_init(&moves, NULL);
+   nir_foreach_phi(phi, header) {
+      struct tcl_back_move move;
+
+      if (phi->instr.pass_flags == TCL_SKIP)
+         continue;
+      move.temp = b->values[phi->def.index].index;
+      move.lanes = phi->def.num_components;
+      move.value = *tcl_value(b, nir_phi_get_src_from_block(phi, latch)->src.ssa);
+      if (b->failed)
+         break;
+      if (move.value.file == DRM_CHROME9_VERTEX_FILE_TEMP &&
+          move.value.index != move.temp &&
+          BITSET_TEST(carried, move.value.index)) {
+         const unsigned staged = tcl_new_temp(b);
+
+         tcl_move(b, staged, &move.value, move.lanes);
+         move.value.index = staged;
+         move.value.neg = false;
+         for (unsigned i = 0; i < 4; i++)
+            move.value.sel[i] = i < move.lanes ? i : 0;
+         move.value.scope = b->scope[b->depth];
+      }
+      util_dynarray_append(&moves, move);
+   }
+   util_dynarray_foreach(&moves, struct tcl_back_move, move) {
+      bool self = move->value.file == DRM_CHROME9_VERTEX_FILE_TEMP &&
+                  move->value.index == move->temp && !move->value.neg;
+
+      for (unsigned i = 0; i < move->lanes; i++)
+         self &= move->value.sel[i] == i;
+      if (!self && !b->failed)
+         tcl_move(b, move->temp, &move->value, move->lanes);
+   }
+   util_dynarray_fini(&moves);
+}
+
+static void
+tcl_emit_loop(struct tcl_builder *b, nir_loop *loop)
+{
+   nir_block *header = nir_loop_first_block(loop);
+   nir_block *preheader =
+      nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
+   BITSET_DECLARE(carried, DRM_CHROME9_VERTEX_MAX_TEMPS) = { 0 };
+   struct drm_chrome9_vertex_source count;
+   struct chrome9_tcl_rep rep = { 0 };
+   struct tcl_region region;
+   nir_if *terminator;
+   unsigned at;
+
+   if (b->depth >= b->flow->max_depth) {
+      tcl_flow_fail(b, "nesting depth");
+      return;
+   }
+   if (!tcl_match_rep(b, loop, &rep, &terminator)) {
+      tcl_flow_fail(b, "loop without a CB0 or literal trip count");
+      return;
+   }
+   if (b->p->rep_count >= DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS) {
+      tcl_flow_fail(b, "out of i# constants");
+      return;
+   }
+   /* Loop-carried values live in one temp each, set before the loop. */
+   nir_foreach_phi(phi, header) {
+      const struct tcl_value *v;
+      unsigned temp;
+
+      if (phi->instr.pass_flags == TCL_SKIP)
+         continue;
+      v = tcl_value(b, nir_phi_get_src_from_block(phi, preheader)->src.ssa);
+      temp = tcl_new_temp(b);
+      if (b->failed)
+         return;
+      tcl_move(b, temp, v, phi->def.num_components);
+      tcl_set_temp(b, &phi->def, temp);
+      BITSET_SET(carried, temp);
+   }
+   b->p->reps[b->p->rep_count] = rep;
+   tcl_flow_source(&count, DRM_CHROME9_VERTEX_FILE_INT, b->p->rep_count++);
+   at = b->p->instruction_count;
+   tcl_flow_op(b, DRM_CHROME9_VERTEX_OP_REP, &count);
+   tcl_enter(b, &region);
+   foreach_list_typed(nir_cf_node, node, node, &loop->body)
+      if (node != &terminator->cf_node && !b->failed)
+         tcl_emit_node(b, node);
+   if (!b->failed)
+      tcl_back_moves(b, header, nir_loop_last_block(loop), carried);
+   tcl_leave(b, &region);
+   if (b->p->instruction_count == at + 1) {
+      b->p->instruction_count--;
+      return;
+   }
+   tcl_flow_op(b, DRM_CHROME9_VERTEX_OP_ENDREP, NULL);
 }
 
 /* CB0 dword range of a constant-offset UBO load, or false. */
@@ -1016,12 +1747,14 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
                     enum chrome9_tcl_colour colour, unsigned clip_enable,
                     bool point_size, unsigned key_count,
                     const uint16_t *key_dword, const uint32_t *key_value,
+                    const struct chrome9_tcl_flow *flow,
                     struct chrome9_tcl_program *p)
 {
    struct tcl_builder b = {
       .p = p, .colour = colour, .clip_enable = clip_enable,
       .point_size = point_size,
       .writes_back = !!(source->info.outputs_written & VARYING_BIT_BFC0),
+      .flow = flow && flow->max_depth ? flow : NULL,
    };
    struct tcl_key key = { key_count, key_dword, key_value };
    nir_shader *nir = nir_shader_clone(NULL, source);
@@ -1063,9 +1796,9 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
    chrome9_nir_lower_integers(nir);
    NIR_PASS(_, nir, nir_lower_bool_to_float, true);
    tcl_optimize(nir);
-   if (!tcl_single_block(nir, &block)) {
-      if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
-{
+   b.impl = nir_shader_get_entrypoint(nir);
+   if (!b.flow && !tcl_single_block(nir, &block)) {
+      if (debug_get_bool_option("CHROME9_DEBUG_TCL", false)) {
          fprintf(stderr, "chrome9: TCL cannot express control flow\n");
          if (debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0))
             nir_print_shader(nir, stderr);
@@ -1073,59 +1806,146 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       goto out;
    }
    /* CB0 rows come first so immediates can follow them. */
-   nir_foreach_instr(instr, block) {
-      unsigned row, lane;
+   nir_foreach_block(blk, b.impl) {
+      nir_foreach_instr(instr, blk) {
+         unsigned row, lane;
 
-      if (instr->type == nir_instr_type_intrinsic &&
-          tcl_ubo_row(nir_instr_as_intrinsic(instr), &row, &lane))
-         p->uniform_rows = MAX2(p->uniform_rows, row + 1);
+         instr->pass_flags = 0;
+         if (instr->type == nir_instr_type_intrinsic &&
+             tcl_ubo_row(nir_instr_as_intrinsic(instr), &row, &lane))
+            p->uniform_rows = MAX2(p->uniform_rows, row + 1);
+      }
    }
-   b.values = CALLOC(nir_shader_get_entrypoint(nir)->ssa_alloc,
-                     sizeof(*b.values));
+   b.values = CALLOC(b.impl->ssa_alloc, sizeof(*b.values));
    if (!b.values)
       goto out;
    memset(b.constant_temp, 0xff, sizeof(b.constant_temp));
    memset(b.input_temp, 0xff, sizeof(b.input_temp));
-   nir_foreach_instr(instr, block) {
-      switch (instr->type) {
-      case nir_instr_type_alu:
-         tcl_alu(&b, nir_instr_as_alu(instr));
-         break;
-      case nir_instr_type_load_const:
-         tcl_load_const(&b, nir_instr_as_load_const(instr));
-         break;
-      case nir_instr_type_undef: {
-         nir_undef_instr *undef = nir_instr_as_undef(instr);
-         struct tcl_value *v = &b.values[undef->def.index];
-
-         memset(v, 0, sizeof(*v));
-         v->valid = true;
-         memset(v->sel, TCL_SEL_ZERO, sizeof(v->sel));
-         break;
-      }
-      case nir_instr_type_intrinsic:
-         tcl_intrinsic(&b, nir_instr_as_intrinsic(instr));
-         break;
-      default:
-         b.failed = true;
-         break;
-      }
-      if (b.failed) {
-         if (debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0))
-            nir_print_shader(nir, stderr);
-         if (debug_get_bool_option("CHROME9_DEBUG_TCL", false)) {
-            fprintf(stderr, "chrome9: TCL cannot express: ");
-            nir_print_instr(instr, stderr);
-            fprintf(stderr, "\n");
-         }
-         break;
-      }
+   util_dynarray_init(&b.expr_keys, NULL);
+   util_dynarray_init(&b.uniform_ifs, NULL);
+   if (b.flow) {
+      tcl_mark_reps(&b, &b.impl->body);
+      tcl_skip_dead(&b, b.impl);
    }
+   tcl_emit_list(&b, &b.impl->body);
+   util_dynarray_fini(&b.uniform_ifs);
+   util_dynarray_fini(&b.expr_keys);
+   if (b.failed && debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0))
+      nir_print_shader(nir, stderr);
    p->supported = !b.failed && p->instruction_count && p->input_count;
    FREE(b.values);
 out:
    ralloc_free(nir);
    return p->supported;
+}
+
+void
+chrome9_tcl_program_fini(struct chrome9_tcl_program *p)
+{
+   FREE(p->expr);
+   p->expr = NULL;
+   p->expr_count = 0;
+}
+
+static bool
+tcl_compare(uint16_t op, float a, float c)
+{
+   switch (op) {
+   case nir_op_slt:
+      return a < c;
+   case nir_op_sge:
+      return a >= c;
+   case nir_op_seq:
+      return a == c;
+   default:
+      return a != c;
+   }
+}
+
+/* The NIR ALU ops tcl_expr accepts, on floats (integers are lowered). */
+static float
+tcl_expr_alu_eval(uint16_t op, const float *s)
+{
+   switch (op) {
+   case nir_op_mov: return s[0];
+   case nir_op_fneg: return -s[0];
+   case nir_op_fabs: return fabsf(s[0]);
+   case nir_op_fadd: return s[0] + s[1];
+   case nir_op_fsub: return s[0] - s[1];
+   case nir_op_fmul: return s[0] * s[1];
+   case nir_op_ffma:
+   case nir_op_ffma_weak: return s[0] * s[1] + s[2];
+   case nir_op_fmin: return fminf(s[0], s[1]);
+   case nir_op_fmax: return fmaxf(s[0], s[1]);
+   case nir_op_slt:
+   case nir_op_sge:
+   case nir_op_seq:
+   case nir_op_sne: return tcl_compare(op, s[0], s[1]) ? 1.0f : 0.0f;
+   case nir_op_ffloor: return floorf(s[0]);
+   case nir_op_fceil: return ceilf(s[0]);
+   case nir_op_ftrunc: return truncf(s[0]);
+   case nir_op_ffract: return s[0] - floorf(s[0]);
+   case nir_op_fsat: return fminf(fmaxf(s[0], 0.0f), 1.0f);
+   case nir_op_fsign: return s[0] > 0.0f ? 1.0f : s[0] < 0.0f ? -1.0f : 0.0f;
+   case nir_op_frcp: return 1.0f / s[0];
+   case nir_op_frsq: return 1.0f / sqrtf(s[0]);
+   case nir_op_fsqrt: return sqrtf(s[0]);
+   case nir_op_fcsel: return s[0] != 0.0f ? s[1] : s[2];
+   case nir_op_fcsel_gt: return s[0] > 0.0f ? s[1] : s[2];
+   default: return s[0] >= 0.0f ? s[1] : s[2];
+   }
+}
+
+/*
+ * Per-draw b# mask and i# counts ({trip, 0, 1, 0}, the vs_2_0 defi form)
+ * from the current CB0; false when a trip count exceeds 255.
+ */
+bool
+chrome9_tcl_flow_constants(const struct chrome9_tcl_program *p,
+                           const uint8_t *cb0, size_t size, uint32_t *bools,
+                           uint8_t (*ints)[4])
+{
+   float v[UINT8_MAX + 1];
+
+   *bools = 0;
+   memset(ints, 0, DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS * sizeof(*ints));
+   for (unsigned i = 0; i < p->expr_count; i++) {
+      const struct chrome9_tcl_expr *e = &p->expr[i];
+      float src[3];
+
+      if (e->op == TCL_EXPR_LITERAL) {
+         memcpy(&v[i], &e->value, sizeof(v[i]));
+         continue;
+      }
+      if (e->op == TCL_EXPR_DWORD) {
+         if (!cb0 || (e->value + 1ull) * 4 > size)
+            return false;
+         memcpy(&v[i], cb0 + e->value * 4, sizeof(v[i]));
+         continue;
+      }
+      for (unsigned k = 0; k < 3; k++)
+         src[k] = v[e->src[k]];
+      v[i] = tcl_expr_alu_eval(e->op, src);
+   }
+   for (unsigned i = 0; i < p->bool_count; i++)
+      if (v[p->bool_expr[i]] != 0.0f)
+         *bools |= 1u << i;
+   for (unsigned i = 0; i < p->rep_count; i++) {
+      const struct chrome9_tcl_rep *r = &p->reps[i];
+      float counter = r->init;
+      unsigned k;
+
+      for (k = 0; k <= UINT8_MAX; k++, counter += r->step)
+         if (tcl_compare(r->compare, r->counter_first ? counter : v[r->bound],
+                         r->counter_first ? v[r->bound] : counter) ==
+             r->break_on_true)
+            break;
+      if (k > UINT8_MAX)
+         return false;
+      ints[i][0] = k;
+      ints[i][2] = 1;
+   }
+   return true;
 }
 
 struct chrome9_tcl_shader *
@@ -1152,6 +1972,7 @@ chrome9_tcl_shader_destroy(struct chrome9_tcl_shader *shader)
    while (shader->variants) {
       struct chrome9_tcl_variant *next = shader->variants->next;
 
+      chrome9_tcl_program_fini(&shader->variants->program);
       FREE(shader->variants);
       shader->variants = next;
    }
@@ -1885,45 +2706,46 @@ tcl_cull(const struct pipe_rasterizer_state *rs)
           rs->cull_face == PIPE_FACE_FRONT ? front : 0;
 }
 
-static const struct chrome9_tcl_program *
-tcl_program(struct chrome9_context *ctx, bool clip_halfz,
-            enum chrome9_tcl_colour colour, uint8_t clip_enable)
+/* CB0 as the VS reads it, or NULL. */
+static const uint8_t *
+tcl_cb0(const struct chrome9_context *ctx, size_t *size)
+{
+   const struct pipe_constant_buffer *cb = &ctx->vs_constants[0];
+   const uint8_t *map = cb->user_buffer;
+
+   if (!map && cb->buffer)
+      map = chrome9_resource(cb->buffer)->bo.map;
+   *size = map ? cb->buffer_size : 0;
+   return map ? map + cb->buffer_offset : NULL;
+}
+
+static struct chrome9_tcl_variant *
+tcl_variant(struct chrome9_context *ctx, bool clip_halfz,
+            enum chrome9_tcl_colour colour, uint8_t clip_enable, bool unkeyed,
+            const uint32_t *key)
 {
    const bool point_size = ctx->tcl_point_size;
    struct chrome9_tcl_shader *shader = ctx->vs->tcl;
-   const struct pipe_constant_buffer *cb = &ctx->vs_constants[0];
-   const uint8_t *map = cb->user_buffer;
    struct chrome9_tcl_variant **link, *variant;
-   uint32_t key[CHROME9_TCL_MAX_KEY] = { 0 };
 
-   if (shader->key_count) {
-      if (!map && cb->buffer)
-         map = chrome9_resource(cb->buffer)->bo.map;
-      if (!map)
-         return NULL;
-      map += cb->buffer_offset;
-      for (unsigned k = 0; k < shader->key_count; k++) {
-         if ((shader->key_dword[k] + 1u) * 4 > cb->buffer_size)
-            return NULL;
-         memcpy(&key[k], map + shader->key_dword[k] * 4, sizeof(key[k]));
-      }
-   }
    /* Most recently used first; the tail is reused when the list is full. */
    for (link = &shader->variants; (variant = *link); link = &variant->next) {
       if (variant->clip_halfz == clip_halfz &&
           variant->colour == colour &&
           variant->clip_enable == clip_enable &&
           variant->point_size == point_size &&
-          !memcmp(variant->key, key, sizeof(key))) {
+          variant->unkeyed == unkeyed &&
+          !memcmp(variant->key, key, sizeof(variant->key))) {
          *link = variant->next;
          variant->next = shader->variants;
          shader->variants = variant;
-         return variant->program.supported ? &variant->program : NULL;
+         return variant;
       }
       if (!variant->next &&
           shader->variant_count >= CHROME9_TCL_MAX_VARIANTS) {
          *link = NULL;
          shader->variant_count--;
+         chrome9_tcl_program_fini(&variant->program);
          break;
       }
    }
@@ -1935,14 +2757,51 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
    variant->colour = colour;
    variant->clip_enable = clip_enable;
    variant->point_size = point_size;
-   memcpy(variant->key, key, sizeof(key));
+   variant->unkeyed = unkeyed;
+   memcpy(variant->key, key, sizeof(variant->key));
    chrome9_tcl_compile(shader->nir, clip_halfz, colour, clip_enable,
-                       point_size, shader->key_count, shader->key_dword, key,
+                       point_size, unkeyed ? 0 : shader->key_count,
+                       shader->key_dword, key, &ctx->tcl_flow,
                        &variant->program);
+   shader->keyed_compiles += shader->key_count && !unkeyed;
    variant->next = shader->variants;
    shader->variants = variant;
    shader->variant_count++;
-   return variant->program.supported ? &variant->program : NULL;
+   return variant;
+}
+
+static const struct chrome9_tcl_program *
+tcl_program(struct chrome9_context *ctx, bool clip_halfz,
+            enum chrome9_tcl_colour colour, uint8_t clip_enable)
+{
+   struct chrome9_tcl_shader *shader = ctx->vs->tcl;
+   const uint32_t unkeyed_key[CHROME9_TCL_MAX_KEY] = { 0 };
+   uint32_t key[CHROME9_TCL_MAX_KEY] = { 0 };
+   struct chrome9_tcl_variant *variant;
+   const uint8_t *map;
+   size_t size;
+
+   /* Control uniforms that change every few draws: read them at draw
+    * time with hardware flow control instead of compiling per value. */
+   if (shader->key_count && ctx->tcl_flow.max_depth &&
+       shader->keyed_compiles > CHROME9_TCL_KEY_CHURN) {
+      variant = tcl_variant(ctx, clip_halfz, colour, clip_enable, true,
+                            unkeyed_key);
+      if (variant && variant->program.supported)
+         return &variant->program;
+   }
+   if (shader->key_count) {
+      map = tcl_cb0(ctx, &size);
+      if (!map)
+         return NULL;
+      for (unsigned k = 0; k < shader->key_count; k++) {
+         if ((shader->key_dword[k] + 1u) * 4 > size)
+            return NULL;
+         memcpy(&key[k], map + shader->key_dword[k] * 4, sizeof(key[k]));
+      }
+   }
+   variant = tcl_variant(ctx, clip_halfz, colour, clip_enable, false, key);
+   return variant && variant->program.supported ? &variant->program : NULL;
 }
 
 /* Value class of one varying lane for all vertices of a draw; sprite
@@ -2114,6 +2973,15 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       return tcl_fallback(ctx, "viewport");
    if (!tcl_constants(ctx, p, state->constants))
       return tcl_fallback(ctx, "constants");
+   if (p->bool_count || p->rep_count) {
+      size_t size;
+      const uint8_t *cb0 = tcl_cb0(ctx, &size);
+
+      if (!chrome9_tcl_flow_constants(p, cb0, size, &draw.bool_constants,
+                                      state->ints))
+         return tcl_fallback(ctx, "flow control constants");
+      draw.int_constants_ptr = p->rep_count ? (uintptr_t)state->ints : 0;
+   }
 
    draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
    draw.flags = flags;

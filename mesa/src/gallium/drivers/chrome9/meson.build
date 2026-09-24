@@ -110,6 +110,16 @@ chrome9_shader_nir_test = executable(
 )
 test('chrome9-shader-nir', chrome9_shader_nir_test, suite : ['chrome9'])
 
+chrome9_tcl_flow_test = executable(
+  'chrome9-tcl-flow-test',
+  'chrome9_tcl_flow_test.c',
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  dependencies : [dep_libdrm, idep_nir, idep_mesautil],
+  link_with : [libchrome9, libgallium],
+  install : false,
+)
+test('chrome9-tcl-flow', chrome9_tcl_flow_test, suite : ['chrome9'])
+
 chrome9_fragment_test = executable(
   'chrome9-fragment-test',
   ['chrome9_fragment.c', 'chrome9_fragment_test.c'],
