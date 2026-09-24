@@ -70,11 +70,13 @@ one semantic face is culled, every published fragment has the opposite FACE
 value even for clipped triangles.  `front_ccw` changes which physical winding
 belongs to the semantic class, but not the table above.
 
-Mesa commit `e5617b5` implements the target-independent NIR part.  Its helper
-replaces both `load_front_face` and `load_front_face_fsign`, then runs the same
-stable specialization fold used for uniform variants.  Its standalone test
-proves both representations become `+1.0` for a surviving front face and
-`-1.0` for a surviving back face.
+Mesa commits `e5617b5` and `954a7ce` implement the target-independent NIR
+part.  The helper replaces `load_front_face`, `load_front_face_fsign`, and the
+boolean FACE input in either deref or IO-lowered `load_input` form, then runs
+the same stable specialization fold used for uniform variants.  The
+IO-lowered form matters for the exact linked lightall NIR.  Its standalone
+test proves all four representations become `+1.0` for a surviving front
+face and `-1.0` for a surviving back face.
 
 Draw integration must still clone the private fragment variant, key/cache it
 by the three-state semantic face mode, and call the helper only for FRONT or
@@ -156,7 +158,8 @@ pass.
   `16da371648c6146c20a74ddab9d99611d32c8e2c478a639e827da2be9c098df6`;
   replay binary SHA-256
   `afb966a9e3ee57c8e0e4d0f75e09d6113eda20626cf3da93dadd2512a7569a79`.
-- Generic specialization tests: Mesa commits `04a35c3` and `e5617b5`;
+- Generic specialization tests: Mesa commits `04a35c3`, `e5617b5`, and
+  `954a7ce`;
   `chrome9-specialise-test` passes under the matching T2 sysroot loader.
 - Draw ordering and two-sided marker proof:
   `chrome9-draw-twoside-face-sign.md`.
