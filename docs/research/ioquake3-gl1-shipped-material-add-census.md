@@ -1,8 +1,8 @@
 # Shipped ioquake3 GL1 material census: ADD versus additive blend
 
-Status: source and original game-data audit plus a bounded cmd22 saturation
-oracle on VX900, 2026-09-24.  This is not a live q3dm17 shader capture or
-full material qualification.  The latest coherent q3dm1
+Status: source and installed game-data audit, a bounded cmd22 saturation
+oracle, and a live q3dm17 shader capture on VX900, 2026-09-24.  This is not
+yet a framebuffer-pixel qualification of the whole material.  The latest coherent q3dm1
 gameplay trace reached the deliberate 32,768-triangle cap with no shader or
 draw rejection; no missing q3dm1 fragment class is established by that run.
 
@@ -65,22 +65,25 @@ Do not substitute a four-lane ADD: it would incorrectly add alpha.  Also do
 not infer that a 32-bit TGA is opaque from its header; ioquake scans pixel
 alpha when selecting GL_RGB8 or GL_RGBA8.
 
-Mesa 26.2.2 `main/ff_fragment_shader.c:650..713` emits a stage-local
-`nir_fsat` around the RGB `fadd`, then assembles alpha separately.  Chrome9's
-generic NIR lowering in `chrome9_context.c:3496..3554` accepts `fadd`, but
-does not currently lower `nir_op_fsat`.  The fragment IR and cmd22 encoder
-already carry destination saturation (`chrome9_shader_offline.c:62..71`,
-`chrome9_fragment.c:328..329`).  The Linux and Windows compiler-exact ADD
-records are archived in
+Mesa 26.2.2 `main/ff_fragment_shader.c:650..713` constructs a stage-local
+`nir_fsat` around the RGB `fadd`, then assembles alpha separately.  The live
+linked NIR, however, lowers that saturation to `fmax(sum, 0)` followed by
+`fmin(..., 1)`.  Chrome9's generic compiler accepts these exact scalar/vector
+operations and produces a supported native program.  The separately added
+`nir_op_fsat` lowering remains useful for NIR that retains the intrinsic,
+but was **not** the route exercised by this q3dm17 capture.  The fragment IR
+and cmd22 encoder carry destination saturation
+(`chrome9_shader_offline.c:62..71`, `chrome9_fragment.c:328..329`).  The Linux
+and Windows compiler-exact ADD records are archived in
 [`ioquake-texture-environment-combine.md`](ioquake-texture-environment-combine.md),
 but this full fixed-function key has not been captured or executed.
 
-The minimal safe lowering is a separate native `MOV` with destination SAT
-for an `fsat` node, retaining a new virtual result rather than changing a
+The minimal safe lowering for an unlowered `fsat` is a separate native `MOV`
+with destination SAT, retaining a new virtual result rather than changing a
 shared producer.  It must preserve the node's vector width and feed only the
-RGB lanes where Mesa emitted saturation.  After a real q3dm17 linked NIR
-capture, folding SAT into the producer's destination can be considered only
-when dominance/use analysis proves the producer has no unsaturated consumer.
+RGB lanes where Mesa emitted saturation.  Folding SAT into a producer's
+destination can be considered only when dominance/use analysis proves the
+producer has no unsaturated consumer.
 An isolated oracle should use normalized inputs
 `primary=(.5,.75,.25,.5)`, `T0=(.5,.5,.5,1)`,
 `T1=(.875,.25,.5,.25)`: RGB must become `(1,.625,.625)`, and the RGB second
@@ -99,7 +102,40 @@ interior pixels matched BGRA `0x80bf40a0` within two channel LSBs; exterior
 pixels stayed zero, both texture BO snapshots and all guard pages were
 unchanged, and the immediate kernel log showed no GPU fault/timeout.  This
 qualifies the saturation *instruction* and the BGRA/XRGB alpha contract, not
-yet the entire q3dm17 shader's NIR lowering or runtime sampler/depth state.
+the complete q3dm17 material's framebuffer, sampler, or depth behavior.
+
+## Bounded q3dm17 runtime capture
+
+The distinct-saturation Mesa build (library SHA-256
+`580e8f0aeaa6710d8f78892285c0c73650d79d884f1928a0a98459503a5de3e7`)
+was staged at `/root/tmp/chrome9-live/ioquake-addsat-20260924/` and run with
+`CHROME9_DRAW_LIMIT=32768`, `CHROME9_DEBUG_SHADERS=1`, and
+`CHROME9_DUMP_NIR=1` under the shared GPU lock.  The retained trace is
+`gl1-q3dm17-addsat-limit32768.log`, SHA-256
+`0189284efa9f7efc447a6d7a7b2fbbe6cb844a2fbd45b78e9247fa45e26b284f`.
+The game entered q3dm17 and hit exactly the deliberate triangle limit; there
+were no draw rejections, timeouts, quarantine records, or new kernel faults.
+
+The live fixed-function fragment NIR was:
+
+```text
+T0 = projected_tex(0, TEX0.xy, TEX0.w)
+T1 = projected_tex(1, TEX1.xy, TEX1.w)
+P  = T0 * COL0
+S  = T1 + P
+U  = max(S, 0)
+V  = min(U, 1)
+out = vec4(V.rgb, P.a)
+```
+
+It compiled as `program=28 supported=1 semantic=1 native=1 nir=1`, with
+9 semantic instructions, two TAUs and seven ALUs; the game bound that shader
+218 times during the bounded run.  This is strong compiler and live draw-state
+admission evidence for the ADD material, but not a per-pixel proof of its
+visible surface.  A screenshot or isolated material-position capture is the
+next correctness check.  The runtime also warned that installed `pak0.pk3`
+has a noncanonical checksum; this audit describes the *installed* archive,
+not a claim that it is byte-identical to a retail CD.
 
 `tools/re/ioquake_gl1_material_census.py` is a read-only source-candidate
 filter with self-tests for the identity-lighting trap and independent RGB/A
@@ -113,9 +149,10 @@ ssh root@192.168.2.60 "unzip -p /root/.q3a/baseq3/pak0.pk3 'scripts/*.shader'" |
 ```
 
 This filter handles stage generation/blend state only; it is intentionally
-not a renderer trace.  Before code admission, run a bounded `+devmap q3dm17`
-capture under the shared GPU lock, record the linked NIR, verify an actual
-ADD bind and post-TNL projector guards, and compare framebuffer/depth/guard
-pixels against the reference.  If the stage is outside the viewport at the
-spawn point, a script-specific forced camera or isolated Gallium test is
-needed; a BSP reference alone does not prove a visible fragment.
+not a renderer trace.  The bounded live trace now proves the linked NIR and
+an actual ADD-program bind.  Remaining work is to compare framebuffer pixels
+at a known visible material surface, verify post-TNL projector guards for
+that draw, and test later source-over/filter passes.  If the stage is outside
+the viewport at the spawn point, a script-specific forced camera or isolated
+Gallium test is needed; a BSP reference or shader bind alone does not prove a
+visible fragment.
