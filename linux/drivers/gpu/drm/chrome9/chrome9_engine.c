@@ -72,10 +72,13 @@
 #define CHROME9_QUERY_SF_INDEX		(CHROME9_GART_ENTRIES - 1)
 
 /*
- * RE knob for the snapshot rung ladder, sampled once per submission:
- * 1 destination before the read-back, 2 3D drain first, 4 A21/A22 in
- * dwords, 8 destination in the SF page (GART), 16 PPC type 17h write-back
- * instead of the read-back, 32 log stray writes (scratch page, VRAM).
+ * Snapshot variants, sampled once per submission.  Production (knob 0):
+ * 6c drain, then the PPC type 17h write-back to the SL slot's byte
+ * address, which stores the count and a zero dword (silicon, 2026-09-25).
+ * Debug knob: 1 destination before the read-back, 2 3D drain first, 4
+ * addresses in dwords, 8 destination in the SF page (GART), 16 PPC
+ * write-back instead of the type-10 read-back, 32 log stray writes, 64 CR
+ * idle group first.
  */
 #define CHROME9_QUERY_RE_ORDER		BIT(0)
 #define CHROME9_QUERY_RE_DRAIN		BIT(1)
@@ -97,10 +100,13 @@ module_param_named(occlusion_ppc_type, chrome9_occlusion_ppc_type, uint,
 MODULE_PARM_DESC(occlusion_ppc_type,
 	"Debug: PPC counter written back with occlusion_re bit 16 (default: 0x17 HZOcclusionCNT)");
 
+#define CHROME9_QUERY_RE_PRODUCTION	(CHROME9_QUERY_RE_PPC | \
+					 CHROME9_QUERY_RE_DRAIN)
+
 static uint chrome9_occlusion_re;
 module_param_named(occlusion_re, chrome9_occlusion_re, uint, 0600);
 MODULE_PARM_DESC(occlusion_re,
-	"Debug: occlusion snapshot variants, see CHROME9_QUERY_RE_* (default: 0)");
+	"Debug: occlusion snapshot variant instead of PPC 17h after a drain, see CHROME9_QUERY_RE_* (default: 0)");
 
 static_assert(CHROME9_ENGINE_VRAM_RESERVED == CHROME9_GART_SIZE + PAGE_SIZE);
 static_assert(IS_ALIGNED(CHROME9_PRIME_PAUSE, 16));
@@ -1052,8 +1058,8 @@ static const u32 chrome9_occlusion_reset[] = {
 
 /*
  * Vendor query end: type-10 read-back of type-01 A1C to the byte address
- * in A21/A22.  RE_DRAIN (also occlusion_query=2) first drains the 3D
- * pipeline as the tail does, RE_IDLE adds the CR engine-idle group.
+ * in A21/A22 (never observed to write on VX900).  RE_DRAIN first drains
+ * the 3D pipeline as the tail does, RE_IDLE adds the CR engine-idle group.
  * RE_PPC instead fires a PPC write-back (type 17h HZOcclusionCNT unless
  * occlusion_ppc_type says otherwise) to the SL or SF byte address; RE_DWORDS
  * gives both address forms in the manual's dword units.
@@ -1109,9 +1115,21 @@ static int chrome9_occlusion_selftest(void)
 		0xfe020440, 0x0000043c, 0x00080000, 0xcc000000,
 		0x01000017, 0x02234560, 0x03400101, 0xcccccccc,
 	};
+	static const u32 production[] = {
+		0xfe000000, 0x00000001, 0x00000000, 0xcc000000,
+		0x0000006c, 0x00800000, 0xcc000000, 0xcc000000,
+		0xfe020440, 0x0000043c, 0x00080000, 0xcc000000,
+		0x01000017, 0x02234560, 0x03000101, 0xcccccccc,
+	};
 	u32 packet[CHROME9_QUERY_SNAPSHOT_DWORDS] __aligned(16);
 	u32 *cursor = packet;
 
+	chrome9_emit_occlusion_snapshot(&cursor, 0x01234560,
+					CHROME9_QUERY_RE_PRODUCTION | 0x17 << 8);
+	if (cursor != packet + ARRAY_SIZE(production) ||
+	    memcmp(packet, production, sizeof(production)))
+		return -EINVAL;
+	cursor = packet;
 	chrome9_emit_occlusion_snapshot(&cursor, 0x01234560, 0);
 	if (cursor != packet + ARRAY_SIZE(golden) ||
 	    memcmp(packet, golden, sizeof(golden)))
@@ -6913,9 +6931,14 @@ static int chrome9_job_query_prepare_locked(struct chrome9_engine *engine,
 		jq->generation = requests[r]->query_generation;
 		jq->draw = r;
 		jq->slot = bit;
+		/* The PPC write-back stores two dwords: count and zero. */
 		chrome9_query_slot_write(engine, job->query_re, bit, 0,
 					 CHROME9_QUERY_POISON);
-		for (i = 1; i < CHROME9_QUERY_SLOT_SIZE / 4; i++)
+		if (job->query_re & CHROME9_QUERY_RE_PPC)
+			chrome9_query_slot_write(engine, job->query_re, bit, 1,
+						 CHROME9_QUERY_POISON);
+		for (i = job->query_re & CHROME9_QUERY_RE_PPC ? 2 : 1;
+		     i < CHROME9_QUERY_SLOT_SIZE / 4; i++)
 			chrome9_query_slot_write(engine, job->query_re, bit, i,
 						 CHROME9_QUERY_CANARY + i);
 		if (job->query_re & CHROME9_QUERY_RE_WATCH)
@@ -6959,10 +6982,12 @@ static void chrome9_job_query_retire_locked(struct chrome9_engine *engine,
 		for (i = 0; i < ARRAY_SIZE(words); i++)
 			words[i] = chrome9_query_slot_read(engine, re, jq->slot, i);
 		samples = words[0];
-		for (i = 1; i < ARRAY_SIZE(words); i++)
+		for (i = re & CHROME9_QUERY_RE_PPC ? 2 : 1;
+		     i < ARRAY_SIZE(words); i++)
 			if (words[i] != CHROME9_QUERY_CANARY + i)
 				error = -EIO;
-		if (samples == CHROME9_QUERY_POISON)
+		if (samples == CHROME9_QUERY_POISON ||
+		    (re & CHROME9_QUERY_RE_PPC && words[1]))
 			error = -EIO;
 		if (re & CHROME9_QUERY_RE_WATCH) {
 			chrome9_query_watch(engine, re, jq->slot, watch);
@@ -7356,10 +7381,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	if (ret)
 		goto out_unmap;
 	job->query_re = (READ_ONCE(chrome9_occlusion_re) &
-			 CHROME9_QUERY_RE_MASK) |
-			(READ_ONCE(chrome9_occlusion_ppc_type) & 0x1f) << 8 |
-			(chrome9_occlusion_query_mode() == 2 ?
-			 CHROME9_QUERY_RE_DRAIN : 0);
+			 CHROME9_QUERY_RE_MASK) ?:
+			CHROME9_QUERY_RE_PRODUCTION;
+	job->query_re |= (READ_ONCE(chrome9_occlusion_ppc_type) & 0x1f) << 8;
 
 	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)

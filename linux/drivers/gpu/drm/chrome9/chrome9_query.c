@@ -20,10 +20,10 @@
 #define CHROME9_QUERY_MAX_PER_FILE	16384U
 #define CHROME9_QUERY_WAIT_TIMEOUT	msecs_to_jiffies(5000)
 
-static uint chrome9_occlusion_query;
+static uint chrome9_occlusion_query = 1;
 module_param_named(occlusion_query, chrome9_occlusion_query, uint, 0600);
 MODULE_PARM_DESC(occlusion_query,
-	"Pre-promotion occlusion queries: 0 off, 1 vendor counter snapshot, 2 snapshot after a 3D sync (default: 0)");
+	"Occlusion queries: 0 off, 1 on (default: 1)");
 
 struct chrome9_query {
 	struct kref ref;
@@ -43,7 +43,7 @@ struct chrome9_file {
 
 unsigned int chrome9_occlusion_query_mode(void)
 {
-	return min(READ_ONCE(chrome9_occlusion_query), 2U);
+	return !!READ_ONCE(chrome9_occlusion_query);
 }
 
 static void chrome9_query_release(struct kref *ref)
