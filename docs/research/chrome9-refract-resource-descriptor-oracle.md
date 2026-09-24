@@ -340,20 +340,20 @@ return `-EINVAL` before any GPU submission.  This is the minimal proof that
 full-object acceptance did not turn the private mip tail into an unguarded
 renderable range.
 
-Mesa also still rejects the eventual consumer before submission:
-`chrome9_draw.c:696..744` restricts mip sampling to square POT BGRX resources
-no larger than 512, while refract's stage 1 is 1600x1200 BGRA and extends to
-L10.  That gate must be generalized from the proven layout/format contract,
-not bypassed for the scene.
+The square-POT BGRX limit at `chrome9_draw.c:696..744` belongs only to the
+legacy `DRAW_TEXTURED_TRIANGLE_MIP` path.  The generic fragment-program path
+at `:1179..1220` already serializes the complete physical resource chain, and
+the kernel generic validator accepts rectangular BGRA through L11.  Refract's
+1600x1200 BGRA L0--L10 consumer is therefore not blocked by that legacy gate;
+its remaining qualification is the combined descriptor/filter/shader draw.
 
-Finally, the CPU mipmap callback is not independently synchronized against a
-retained BGRA producer.  `chrome9_resource.c:524..529` flushes a pending draw
-from `transfer_map` only for X8Z24, whereas `:745..805` maps and reads BGRA
-directly during mip generation.  Refract itself avoids this race because its
-FBO unbind reaches `chrome9_set_framebuffer_state`, which flushes the retained
-batch and render target at `chrome9_context.c:4340..4349`, before
-`glGenerateMipmap`.  The callback still needs a self-contained producer flush
-for callers which generate mipmaps without that framebuffer transition.
+The CPU mipmap callback now independently flushes a retained producer before
+its first map at `chrome9_resource.c:775`; its host fixture embeds a complete
+`chrome9_context`, so that synchronization call is memory-safe under the unit
+test as well.  Refract additionally unbinds its FBO first, reaching the batch
+flush in `chrome9_set_framebuffer_state`.  The remaining mip-generation gate
+is live end-to-end producer/CPU/consumer qualification, not a missing software
+ownership transition.
 
 ## Bounded guarded oracle
 
@@ -390,16 +390,27 @@ three dense descriptor slots, mixed raw-depth/color sampling, and old/new/old
 state closure.  It deliberately does not depend on `normalize`, `refract`,
 `pow`, or the production shader schedule.
 
+The first kernel-side producer gate is now live-qualified on VX900.  The raw
+64x32 oracle first submitted the 0x6000-byte destination without the extended
+flag: it returned `-EINVAL` and both color and depth BOs remained byte-exact.
+The flagged BGRA+D24 draw then produced the expected L0 color and depth, kept
+color guard pages 0/3/5 and depth guard pages 0/3 intact, and preserved the L1
+payload plus padding poison.  The engine logged no new fault.  This proves the
+opt-in full-object mapping, dual color guards and level-zero write bound; it
+does not yet qualify the Gallium flag path, CPU mip generation, or the full
+three-resource refract consumer.
+
 ## Remaining risks
 
 * The current 1600x1200 refract chain reaches L10.  Only L1--L8 have explicit
   H3 addresses.  The proprietary allocator proves consecutive 256-byte
   L9--L11 storage after L8, but silicon selection of that implicit tail still
   needs the existing POT and asymmetric NPOT oracle.
-* The three-nearest-sampler smoke source exists, but no retained live result
-  was found in the documentation.  Three texture descriptors must therefore
-  remain a live qualification item even though the compiler/packet namespace
-  is statically exact.
+* The guarded three-nearest-sampler oracle is live-qualified: all three slots
+  returned their distinct expected channels with guards and sources intact.
+  The unvalidated step is the refract combination of raw D24 stage 0,
+  trilinear BGRA L0--L10 stage 1, plain BGRA stage 2, and its production
+  fragment program.
 * The synchronous D24 writer/reader transition is live, including an
   unrelated active Z16 destination.  It has not yet been qualified in the
   same draw as two additional color samplers and a stage-1 mip table.
