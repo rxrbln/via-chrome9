@@ -387,9 +387,43 @@ pixels, and both color/depth guards.  A strict C11 `-Wall -Wextra -Werror`
 host build and the kernel object build pass.  Neither mode was submitted by
 this audit.
 
-This prefix omits only the already-qualified fragment-coordinate arithmetic
-and the output-vector assembly from the 36-ALU scene program.  The five-step
-positive gate should run first; the zero gate uses the identical packet shape
-and differs only in the scalar varying value and expected color.  Do not set
-`.lower_fsqrt` until these repeated scalar gates retire and a generated
-function-medium shader passes the bounded compiler/resource checks.
+### Corrected five-step silicon result
+
+The complete source-shaped recurrence was subsequently run on a fresh VX900
+boot with the debug-free kernel commit `5656982` and module SHA-256
+`f7e0c4023d813182842b7142e1943c2e01e384003abe6230b0c788e2bf83fcfb`.
+This build contains the corrected proprietary `000X` scalar-source packing;
+it is not the older `XXXX` stream qualified above.
+
+After a known-good CMP baseline, `--sqrt-x-positive` again produced `.5`.
+`--sqrt-chain5-positive` then produced exact `.75`, and
+`--sqrt-chain5-zero` replaced the color sentinel with exact zero.  Both
+five-step runs passed their D16, interior/exterior, and BO-guard checks.  A
+known-good baseline passed after each candidate; no timeout or engine fault
+was reported.
+
+This closes the byte-exact 31-record Linux production stream, repeated
+positive and zero RSQ/RCP endpoints, lifetime reuse, release bits, A90--A92,
+and retirement on this silicon.  It does not by itself execute the complete
+36-record scene program: the latter additionally contains fragment-position
+arithmetic and output assembly.
+
+The remaining production compiler change is generic rather than
+scene-specific.  Set Mesa's standard `.lower_fsqrt = true` in the Chrome9 NIR
+compiler options, so the state tracker lowers FSQRT to FRSQ followed by FRCP
+before the semantic backend.  Convert the existing function-medium test from
+a test-local preview into a production-options assertion: five FSQRT nodes
+must become five FRSQ and five FRCP nodes; the resulting shader must remain a
+36-record structured cmd22 program with the documented
+`MUL/FRC/RSQ/RCP/MOV = 12/11/5/5/3` histogram and no sampler/varying input.
+Continue rejecting non-default explicit float-control modes.  Before claiming
+the scene, retain the UAPI translation check, capture the full native
+POSITION/MISC resource tuple, and run one bounded validation bracketed by
+known-good draws.
+
+The raw prefix omits only the already-qualified fragment-coordinate
+arithmetic and the output-vector assembly from the 36-ALU scene program.  Its
+positive and zero gates have now retired in the required order.  Production
+`.lower_fsqrt` may advance through the offline compiler/resource assertions
+above; the generated complete shader and scene validation remain separate
+bounded gates.
