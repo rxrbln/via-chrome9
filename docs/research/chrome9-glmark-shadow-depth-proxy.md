@@ -297,6 +297,46 @@ possibilities without another matrix:
 The five-record test retains the existing BGRA+D16 guard/exterior checks and
 builds with strict warnings. It has not been submitted to the GPU.
 
+### Shadow-domain refinement
+
+The native frontend is a D3D9 PS 2.x compiler. Microsoft's instruction
+contract says that RCP of zero yields infinity and that the scalar result is
+replicated, but it does not promise that `-0` produces negative infinity:
+[`rcp - ps`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/rcp---ps).
+The all-true live result is therefore compatible with the native D3D
+contract even though it is insufficient for an unrestricted NIR
+`preserve:inf` lowering.
+
+The exact glmark2 shadow graph is narrower. The inner projected comparison is
+observed only when the outer predicate proves `ShadowCoord.w > 0`; zero,
+negative zero, and every negative W select the outer false arm. The installed
+2023.01 scene builds `LightMatrix` as bias * perspective * lookAt from eye
+`(0,3,2)` to the origin, with near/far `2/50`, and feeds ground vertices
+`(x,y,0,1)` for x,y in [-1,1]. Therefore at all four vertices:
+
+```text
+d = ShadowCoord.w = (13 - 3*y) / sqrt(13)
+  in [10/sqrt(13), 16/sqrt(13)] = [2.7735, 4.4376]
+
+ShadowCoord.z / w = 25/24 - (25/12)/d
+                  in [0.2905, 0.5722]
+```
+
+Both are strictly positive normal values, and perspective-correct
+interpolation over the quad preserves that bounded interval. Thus the
+default scene itself never exercises signed-zero RCP or an infinite
+projection. This is useful validation scope, not permission for a scene-name
+special case: a generic backend still needs a source-backed finite range
+proof or a gate for arbitrary finite positive W and signed Z before accepting
+all shaders with the same NIR flags.
+
+The smallest remaining general shadow-domain arithmetic gate uses only the
+already-observed positive reciprocal-zero path: broadcast `RCP(+0)`, multiply
+it by `(+1,-1,+1,-1)`, subtract those values from finite sampled-depth-like
+`.5`, and feed native CMP. Expected true/false lanes alternate. That isolates
+whether positive reciprocal overflow retains the multiplier's sign through
+MUL and SUB; it does not depend on unsupported negative-zero RCP semantics.
+
 ### Runnable subnormal gate
 
 `tools/re/chrome9_cmp_guard_smoke.c` now implements the two finite
