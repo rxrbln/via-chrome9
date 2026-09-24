@@ -411,9 +411,8 @@ eight-ALU/one-TAU production schedule.  Three guarded rectangles distinguish
 sampled depth below the threshold, sampled depth above it, and the outer
 `W <= 0` arm.  Expected gray values are `.15`, `.30`, and `.30`; the test also
 requires D16 near `8000`, untouched exterior pixels, intact color/depth/source
-guards, and a byte-identical X8Z24 source.  It builds under strict warnings
-but has not been submitted to a GPU. Run it once between known-good baselines;
-the failed generic infinity-sign characterization is not a prerequisite.
+guards, and a byte-identical X8Z24 source.  It builds under strict warnings.
+The failed generic infinity-sign characterization is not a prerequisite.
 
 ### Independent packet and guard review
 
@@ -439,3 +438,24 @@ review binary SHA-256 is
 This review qualifies only the finite/default-mode scene domain described
 above.  It deliberately does not reinterpret the negative subnormal or
 infinity-sign results as passing general comparison coverage.
+
+### First full-program silicon result
+
+The reviewed oracle was submitted once on VX900 between passing known-good
+texture baselines.  It retired without a kernel fault, preserved the complete
+X8Z24 source and every checked guard, and wrote D16 `8000` at the samples.
+The high-depth rectangle and the outer `W <= 0` rectangle both produced their
+expected unshadowed host word `ff4d4d4d`.  The low-depth rectangle alone was
+wrong: it also produced `ff4d4d4d` instead of the expected shadowed
+`ff262626`.  The post-run texture baseline passed.  Tools commit `6049abd`
+prints all three rectangle results for subsequent discriminators.
+
+This is a finite correctness failure, not a timeout or proof that the whole
+packet class is unsafe.  The observation only says that the inner condition
+was not negative for the low-depth sample; the first run does not distinguish
+projected-Z transport, computed-coordinate sampling, SUB orientation, or CMP
+selection.  Keep each cause open until one source-backed draw exposes the
+intermediate values.  The most compact discriminator retains the same
+projective prefix and FE route, then writes projected Z, sampled X, and their
+biased threshold into separate color lanes.  For the low-depth rectangle the
+expected tuple is approximately `(.4,.2,.5505,1)`.
