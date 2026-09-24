@@ -97,6 +97,59 @@ The rewrite is valid only because both arms are side-effect free; it must not
 be applied across TEXKILL, memory operations, or a texture operation whose
 execution semantics need short-circuiting.
 
+### Exact vec3 CMP record and inactive-lane rule
+
+Linux 5.75 production configuration-two compilation now fixes the smallest
+defined TEMP/TEMP/TEMP vec3 object.  It first moves a scalar condition and
+two vec3 arms, then executes `CMP r3.xyz,r0.xxx,r1.xyz,r2.xyz` and consumes
+that result:
+
+```text
+01c00530 d01c0053 00108016 000d0020
+01c00530 501c0053 00708105 000d0060
+01c00530 501c0053 00708205 000d00a0
+02020550 50201055 00720000 000900e0  # vec3 CMP
+01c00530 501c0053 00720305 000d0820
+
+active=(0,4,0,0)
+A90=90050000 A91=91000000 A92=92000005
+```
+
+The exact tokens and full control tail are retained in
+`chrome9-vec3-cmp-production-corpus.tsv`.  The Windows private compiler emits
+the same `XYZ` destination mask and normalizes the same inactive source lane,
+but its research identity-register callbacks do not reproduce Linux
+configuration-two lifetime bits; Linux remains the executable byte oracle.
+
+The fourth lane is not don't-care.  Production normalizes every source to an
+inactive-W selector of ZERO:
+
+```text
+condition = (X,X,X,ZERO)
+true arm  = (X,Y,Z,ZERO)
+false arm = (X,Y,Z,ZERO)
+```
+
+That normalization explains the CMP record's `...0550`, `...1055`, and
+high `5...` fields.  A generic vector-select helper must therefore:
+
+1. emit scalar `SUB` to a one-lane TEMP;
+2. manually broadcast that TEMP X selector over only the destination's live
+   XYZ lanes, padding W with ZERO;
+3. lower each vec3 arm with `components=3`, which already pads W with ZERO;
+4. emit CMP with destination writemask `0x7`.
+
+Calling the existing scalar helper unchanged would use an X000 predicate and
+select only the first lane correctly.  Conversely XXXX would violate the
+vendor inactive-lane image.  This is a byte-level compiler requirement, not
+a cosmetic canonicalization.
+
+The three source constants in the corpus are deliberately materialized into
+TEMP registers before CMP.  The live VX900 limit is three *distinct constant
+registers in one MAD/CMP record*, not three operands.  A real select may use
+up to two distinct constant arm registers beside a TEMP condition, but the
+existing generic constant-port legalization should remain authoritative.
+
 The proprietary SGE/SLT objects and the existing semantic CMP path both
 form their predicate by subtracting the operands.  Live evidence shows the
 hardware's default mode flushes a subnormal difference, and the exceptional
@@ -131,6 +184,18 @@ varying bits, and byte-exact Linux production records before one bounded
 scene draw.  Do not infer that fit merely from the source node count: vector
 assembly and legalized three-source constant ports add records, while the
 physical allocator must keep peak live values within r0--r11.
+
+The focused offline Mesa/kernel regression should construct a scalar
+predicate TEMP plus two independently sourced vec3 arms, then compare every
+native word above.  It should assert that Mesa never emits XXXX in the
+inactive lane for this vec3 shape and that the kernel reconstruction retains
+XYZ0 plus destination mask XYZ.  The UAPI need not reject every alternative
+inactive selector globally; byte-exact compiler output is the narrower
+contract here.  Negative cases must reject an actually undefined *live* arm
+lane and a direct CMP naming three distinct constants.  A second vector must
+swap the arms without changing A/C/B placement.  These tests close compiler
+packing; the guarded silicon stage is still required for lane-wise numerical
+select.
 
 ## Ranked implementation consequence
 
