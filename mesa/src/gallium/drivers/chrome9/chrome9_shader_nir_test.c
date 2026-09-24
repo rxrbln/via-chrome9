@@ -890,6 +890,8 @@ check_nonnegative_select_compilation(struct chrome9_context *context)
       bool expected = test == 0;
       bool valid;
 
+      nir_instr_as_alu(nir_def_instr(lighting))->fp_math_ctrl =
+         nir_fp_preserve_inf | nir_fp_preserve_nan;
       if (test == 3)
          nir_instr_as_alu(nir_def_instr(bounded))->fp_math_ctrl =
             nir_fp_preserve_nan;

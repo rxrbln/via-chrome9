@@ -3135,7 +3135,10 @@ chrome9_ps_default_finite(nir_scalar scalar, unsigned *budget)
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
-   if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan)
+   /* FMAX is handled below only after both inputs prove that no defined
+    * exceptional value reaches it, making its preserve request vacuous. */
+   if ((alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan) &&
+       alu->op != nir_op_fmax)
       return false;
    switch (alu->op) {
    case nir_op_mov:
@@ -3223,7 +3226,8 @@ chrome9_ps_default_nonnegative(nir_scalar scalar, unsigned *budget)
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
-   if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan)
+   if ((alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan) &&
+       alu->op != nir_op_fmax)
       return false;
    switch (alu->op) {
    case nir_op_mov:
