@@ -695,6 +695,35 @@ vertex fetch are qualified; see
 [chrome9-near-plane-clipping-re.md](chrome9-near-plane-clipping-re.md).  The
 implementation plan is [chrome9-hw-tcl-implementation-plan.md](chrome9-hw-tcl-implementation-plan.md).
 
+### Kernel-compiled programs through DRAW_VERTEX_PROGRAM
+
+Kernel commits `4e7e5e0` (compiler), `4e69730` (stage A ioctl), `5fcfcd9`
+(port rules, cull); runner `tools/re/chrome9_tcl_oracle.c` (64x64 target,
+one triangle, compared pixel for pixel with the same triangle through
+cmd22 at the -0.5 pixel-center bias).
+
+| rung | program | result |
+|---|---|---|
+| L3 | `MOV oPos,v0; MOV oD0,v1` (BGRA8 `d1`), oD1 literal fill | pass, 1128 px, 0 mismatches |
+| L4/L5 | `MOV oT0,v1` (FLOAT4), oD0 and oD1 literal fills | pass |
+| matrix | four DP4 lanes into r0 with c0..c3 at `32030000`, pixel-space input | pass |
+| L6 | MOV ADD SUB MUL MAD DP3 DP4 DPH MIN MAX ABS SGE SLT SGN FRC FLR into oT0 | exact (at most 1 LSB) |
+| L6 | MAD v1,c0,c1 and MAD c0,v1,c1 | **wrong**: both constant slots read c1 (`v*c1+c1`); c0 twice is exact |
+| L6 | MAD v1,v2,c1 | **wrong**: `v2*v2+c1`; two distinct temps (MAD t1,t2,c / MAD t1,t2,v) are exact |
+| L6 | RCP/RSQ/EXP2/LOG2 of a constant, to an output or a temp | **wrong**: RCP(x) for x in (1,2) is 1/1.5, EXP2 similar, LOG2 always 0 |
+| L6 | the same ops reading an input or a temp holding the constant | exact |
+| L6 | swizzled constant reads (`.yyyy`, `.wwww`) in vector ops | exact |
+| L7 | A01 bit 7, A23 `23004e02` (cull CW) / `23004f02` (cull CCW) | the screen-clockwise triangle disappears with CW only; next uncull draw exact |
+| A61 | bit 16 set | no visible effect |
+| A61 | bit 18 set | **engine timeout**, needs a cold boot; masked in the RE knob |
+
+Consequences, enforced by `chrome9_vertex_validate()`: at most one distinct
+constant row and one distinct input per record, and scalar ops never read a
+constant directly.  Userspace legalizes with a MOV into a temp.  The vendor
+compiler emits `mad r0,v0,c0,c1` and `mad r0,v0,v1,v2` directly, so it
+probably relies on state this driver does not set (open; see
+[chrome9-vs-scalar-precision.md](chrome9-vs-scalar-precision.md) once written).
+
 ## Recommended first silicon test
 
 Goal: execute the first compiler-generated VS on VX900 with the smallest
