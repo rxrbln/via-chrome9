@@ -61,3 +61,23 @@ proofs. The previously validated effect2d Laplacian kernel
 `0,1,0;1,-4,1;0,1,0;` still reported `Validation: Success` with the new
 library. Logs remain on the target under
 `/root/tmp/chrome9-live/literal-pack/`.
+
+## 2026-09-24 vertex-uniform capability correction
+
+The next isolated client library, SHA-256
+`1bfe606d2447974fb36229e1c2c32ee5a8ba82e96ec1c1f9f6d4819ce9d4a895`,
+fixes a Mesa vertex-stage integer-capability mismatch which previously made
+the default uniform-controlled `loop` vertex shader execute an effectively
+unbounded number of iterations. The detailed diagnosis, six-case 0/1/2
+uniform-versus-literal controls, and correction are recorded in
+`chrome9-glmark-loop-vs-uniform-stall.md`.
+
+With this library on the unchanged X/KMS session, glmark2 reported
+`Validation: Success` for all three five-step loop fragment forms:
+text-expanded, literal-bound, and uniform-bound. The earlier validated
+`texture:texture-filter=nearest`, `shading:shading=gouraud`, and
+`buffer:update-fraction=10:update-method=map` scenes also still reported
+`Validation: Success`. The two-pass blur/FBO CPU-reference oracle again
+passed both passes with a maximum RGB delta of one 8-bit level. Xorg remained
+alive and the bounded kernel fault check found no new Chrome9 error. Logs
+are retained under `/root/tmp/chrome9-live/vs-uniform-float/`.
