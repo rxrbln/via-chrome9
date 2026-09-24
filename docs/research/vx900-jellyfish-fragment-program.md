@@ -315,5 +315,11 @@ is `9b27261d`; the checker allows two bytes of output-conversion tolerance
 per lane. The tool also requires D16 near `8000`, untouched
 triangle exterior, intact leading/trailing guards on color, depth, and both
 sources, and byte-identical source BOs. It builds with strict host warnings.
-It has not been submitted to a GPU; run it once only after a known-good
-baseline, stop on timeout/quarantine, and require a known-good draw after it.
+The corrected `XYWW` packet was accepted and retired on VX900.  Its first
+checked interior pixel was `726d3d08`, however, rather than the CPU reference
+`9b27261d`; D16 was `8000`, no kernel fault was logged, and known-good draws
+passed both before and after.  This closes packet safety and the direct-source
+validator issue, but it does **not** validate the shader numerically.  Until
+the source of the color differential is isolated, the test remains an
+unresolved ALU/varying/computed-coordinate linkage oracle rather than evidence
+that jellyfish rendering is correct.
