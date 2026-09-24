@@ -2628,7 +2628,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_PRIMARY;
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_STENCIL;
 			if (chrome9_hw_tcl_enabled())
-				args->value |= DRM_CHROME9_CAP_VERTEX_PROGRAM;
+				args->value |= DRM_CHROME9_CAP_VERTEX_PROGRAM |
+					DRM_CHROME9_CAP_VERTEX_BUFFERS;
 			if (chrome9_fragment_sparse_textures_enabled())
 				args->value |=
 					DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES;

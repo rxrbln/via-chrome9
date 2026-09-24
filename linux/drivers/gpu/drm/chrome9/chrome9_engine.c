@@ -134,6 +134,10 @@ struct chrome9_fence {
 
 struct chrome9_sf_mapping;
 
+/* Destination, depth, textures and the stage B vertex buffers. */
+#define CHROME9_FRAGMENT_MAX_OBJECTS \
+	(2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES + DRM_CHROME9_VERTEX_MAX_INPUTS)
+
 struct chrome9_job {
 	struct chrome9_fence fence;
 	struct drm_gem_shmem_object *destination;
@@ -148,12 +152,12 @@ struct chrome9_job {
 	struct iosys_map depth_map;
 	struct iosys_map texture2_map;
 	struct iosys_map texture3_map;
-	struct chrome9_sf_mapping *sf_mappings[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+	struct chrome9_sf_mapping *sf_mappings[CHROME9_FRAGMENT_MAX_OBJECTS];
 	struct drm_gem_shmem_object *fragment_objects[
-		2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
-	struct sg_table *fragment_sgts[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
-	struct iosys_map fragment_maps[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
-	bool fragment_mapped[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+		CHROME9_FRAGMENT_MAX_OBJECTS];
+	struct sg_table *fragment_sgts[CHROME9_FRAGMENT_MAX_OBJECTS];
+	struct iosys_map fragment_maps[CHROME9_FRAGMENT_MAX_OBJECTS];
+	bool fragment_mapped[CHROME9_FRAGMENT_MAX_OBJECTS];
 	struct list_head quarantine_link;
 	unsigned int sf_mapping_count;
 	u32 cookie;
@@ -199,7 +203,10 @@ enum chrome9_draw_kind {
 	CHROME9_DRAW_FRAGMENT_PROGRAM,
 };
 
-/* Stage A hardware TCL: compiled VS, raw vertices and viewport rows. */
+/*
+ * Hardware TCL: compiled VS, viewport rows and either raw inline vertices
+ * (stage A) or GEM vertex buffers fetched through rebased indices (stage B).
+ */
 struct chrome9_tcl_draw {
 	struct chrome9_vertex_program program;
 	const struct drm_chrome9_vertex_instruction *instructions;
@@ -218,6 +225,18 @@ struct chrome9_tcl_draw {
 	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	/* Rows 256..258: viewport scale, offset and the snap bias. */
 	u32 rows[12];
+	/* Stage B: indices are rebased to index_min and packed per dword. */
+	const u32 *indices;
+	u32 index_count;
+	u32 index_dwords;
+	u32 index_min;
+	u32 index_range;
+	bool index32;
+	s32 base_vertex;
+	u32 buffer_count;
+	struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u8 element_buffer[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u32 element_byte_offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
 };
 
 struct chrome9_draw_request {
@@ -2146,35 +2165,49 @@ static u32 chrome9_fragment_raster_state(
 
 #define CHROME9_TCL_RASTER_WORDS	48
 
+/* Stream slot (3003 n): 1-KiB base in [31:10], pitch in dwords in [8:0]. */
+static u32 chrome9_tcl_stream_slot(u32 address, u32 stride)
+{
+	return (address & ~0x3ffU) | (stride >> 2 & 0x1ff);
+}
+
 /*
  * Stage A TCL raster/FVF block: raw application elements feed v0..vN-1,
  * the output linkage stays byte-identical to the post-TNL path and
  * A40..A48 carry the clip engine's copy of rows 256/257.
  */
 static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
-		const struct chrome9_tcl_draw *tcl,
+		const struct chrome9_tcl_draw *tcl, const u32 *addresses,
 		u32 raster[CHROME9_TCL_RASTER_WORDS])
 {
 	u32 outputs = fp->varying_count ? 3 + fp->varying_count : 5;
 	u32 link[4];
 	unsigned int e, i = 0;
 
-	raster[i++] = (tcl->element_count - 1) << 8 | tcl->stride_dw;
+	/* Stage B: SF memory type (A00[16:15] = 01); element bits 19:12 hold
+	 * address bits 9:2 inside the slot's 1-KiB window. */
+	raster[i++] = (tcl->element_count - 1) << 8 | tcl->stride_dw |
+		      (addresses ? BIT(15) : 0);
 	for (e = 0; e < tcl->element_count; e++)
-		raster[i++] = (1 + e) << 24 | tcl->element_offset[e] << 12 |
+		raster[i++] = (1 + e) << 24 |
+			      (addresses ? (addresses[e] >> 2) & 0xff :
+					   tcl->element_offset[e]) << 12 |
 			      e << 8 | tcl->element_format[e];
 	/* Superset of the input and output masks; the vendor quad uses 1f. */
 	raster[i++] = 0x12000000 |
 		      GENMASK(max(outputs, tcl->element_count) - 1, 0);
 	raster[i++] = tcl->program.a61;
 	raster[i++] = tcl->program.a62;
-	raster[i++] = 0x20000000;
+	/* A20[0] index mode, A20[1] 32-bit indices. */
+	raster[i++] = addresses ? 0x20000001 | (tcl->index32 ? 2 : 0) :
+		      0x20000000;
 	/* A23 bit 8 selects the culled physical winding (set = CCW); bits
 	 * 14:12 select Gouraud (4) or flat from the third vertex C (3). */
 	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ?
 			0x23004e02 : 0x23004f02) & ~GENMASK(14, 12)) |
 		      (tcl->cull & DRM_CHROME9_VERTEX_FLAT ? 0x3000 : 0x4000);
-	raster[i++] = 0x24000000 | tcl->vertex_count;
+	raster[i++] = 0x24000000 |
+		      (addresses ? tcl->index_count : tcl->vertex_count);
 	if (fp->varying_count) {
 		chrome9_fragment_link_words(fp->varying_count, fp->varying_width,
 					    fp->texture_count,
@@ -2218,6 +2251,9 @@ static int chrome9_tcl_raster_selftest(void)
 		0x494000f8, 0x494000f8, 0x00000000, 0x00000000,
 		0x49400000, 0x49400000, 0x00000000, 0x00000000,
 	};
+	static const u32 stage_b_address[] = {
+		0x00100000, 0x00200000, 0x00300010,
+	};
 	struct chrome9_fragment_program *fp;
 	struct chrome9_tcl_draw *tcl;
 	u32 raster[CHROME9_TCL_RASTER_WORDS];
@@ -2240,13 +2276,136 @@ static int chrome9_tcl_raster_selftest(void)
 	tcl->program.a61 = 0x61800000;
 	tcl->program.a62 = 0x62208002;
 	memcpy(tcl->rows, rows, sizeof(rows));
-	if (chrome9_tcl_raster_state(fp, tcl, raster) == ARRAY_SIZE(expected) &&
-	    !memcmp(raster, expected, sizeof(expected)))
-		ret = 0;
+	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
+		ARRAY_SIZE(expected) ||
+	    memcmp(raster, expected, sizeof(expected)))
+		goto out;
+	/* Stage B, vendor stream probe: 00100000/12, 00200000/8, 00300010/4. */
+	tcl->element_format[0] = 0x82;
+	tcl->element_format[1] = 0x42;
+	tcl->element_format[2] = 0xc7;
+	tcl->index_count = 6;
+	tcl->index32 = true;
+	if (chrome9_tcl_raster_state(fp, tcl, stage_b_address, raster) !=
+		ARRAY_SIZE(expected) ||
+	    raster[0] != 0x00008206 || raster[1] != 0x01000082 ||
+	    raster[2] != 0x02000142 || raster[3] != 0x030042c7 ||
+	    raster[7] != 0x20000003 || raster[9] != 0x24000006 ||
+	    chrome9_tcl_stream_slot(stage_b_address[0], 12) != 0x00100003 ||
+	    chrome9_tcl_stream_slot(stage_b_address[1], 8) != 0x00200002 ||
+	    chrome9_tcl_stream_slot(stage_b_address[2], 4) != 0x00300001 ||
+	    chrome9_tcl_stream_slot(0x00100404, 2044) != 0x001005ff)
+		goto out;
+	ret = 0;
 out:
 	kfree(tcl);
 	kfree(fp);
 	return ret;
+}
+
+static bool chrome9_float_finite(u32 value);
+
+/*
+ * Vertex element formats: native A(1+i) low byte (components-1 << 6 |
+ * type << 1 | normalize, VX900 manual), fetch dwords and which dwords hold
+ * float32 or float16 data for the stage A finite check.
+ */
+static const struct {
+	u8 native;
+	u8 dwords;
+	u8 float32;
+	u8 float16;
+} chrome9_tcl_formats[] = {
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT1] = { 0x02, 1, 1, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT2] = { 0x42, 2, 2, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT3] = { 0x82, 3, 3, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT4] = { 0xc2, 4, 4, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM] = { 0xd1, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM] = { 0xc7, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED] = { 0xc6, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM] = { 0x49, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM] = { 0xc9, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM] = { 0x4b, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM] = { 0xcb, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED] = { 0x4a, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED] = { 0xca, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT] = { 0x44, 1, 0, 1 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT] = { 0xc4, 2, 0, 2 },
+};
+
+static bool chrome9_tcl_half_finite(u32 value)
+{
+	return (value & 0x7c00) != 0x7c00 && (value & 0x7c000000) != 0x7c000000;
+}
+
+/*
+ * Stage B element byte offsets of the first fetched vertex; every vertex in
+ * [index_min, index_min + index_range] (+ base_vertex) must lie inside its
+ * object.
+ */
+static int chrome9_tcl_buffer_bounds(const struct chrome9_tcl_draw *tcl,
+		struct drm_gem_object *const *objects, const u32 *buffer_object,
+		u64 *element_start, u64 *object_low, u64 *object_high)
+{
+	s64 first = (s64)tcl->index_min + tcl->base_vertex;
+	unsigned int e;
+
+	if (first < 0)
+		return -EINVAL;
+	for (e = 0; e < tcl->element_count; e++) {
+		u8 b = tcl->element_buffer[e];
+		const struct drm_chrome9_vertex_buffer *buffer = &tcl->buffers[b];
+		u64 start, span, end;
+
+		if (check_mul_overflow((u64)first, (u64)buffer->stride, &start) ||
+		    check_add_overflow(start, buffer->offset, &start) ||
+		    check_add_overflow(start, (u64)tcl->element_byte_offset[e],
+				       &start) ||
+		    check_mul_overflow((u64)tcl->index_range,
+				       (u64)buffer->stride, &span) ||
+		    check_add_overflow(start, span, &end) ||
+		    check_add_overflow(end,
+			4ULL * chrome9_tcl_formats[tcl->element_type[e]].dwords,
+			&end) ||
+		    end > objects[buffer_object[b]]->size)
+			return -EINVAL;
+		element_start[e] = start;
+		object_low[buffer_object[b]] = min(object_low[buffer_object[b]],
+						   start);
+		object_high[buffer_object[b]] = max(object_high[buffer_object[b]],
+						    end);
+	}
+	return 0;
+}
+
+static bool chrome9_tcl_buffers_finite(const struct chrome9_tcl_draw *tcl,
+		const struct iosys_map *maps, const u32 *buffer_object,
+		const u64 *element_start)
+{
+	unsigned int v, e, c;
+
+	for (e = 0; e < tcl->element_count; e++) {
+		u8 type = tcl->element_type[e];
+		u8 b = tcl->element_buffer[e];
+		const u8 *data = (const u8 *)maps[buffer_object[b]].vaddr +
+				 element_start[e];
+
+		if (!chrome9_tcl_formats[type].float32 &&
+		    !chrome9_tcl_formats[type].float16)
+			continue;
+		for (v = 0; v <= tcl->index_range; v++) {
+			const u32 *vertex = (const u32 *)(data +
+				(size_t)v * tcl->buffers[b].stride);
+
+			for (c = 0; c < chrome9_tcl_formats[type].float32; c++)
+				if (!chrome9_float_finite(READ_ONCE(vertex[c])))
+					return false;
+			for (c = 0; c < chrome9_tcl_formats[type].float16; c++)
+				if (!chrome9_tcl_half_finite(READ_ONCE(vertex[c])))
+					return false;
+		}
+	}
+	return true;
 }
 
 static int chrome9_fragment_raster_selftest(void)
@@ -2597,7 +2756,7 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	const struct chrome9_draw_request *request, struct chrome9_job *job,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-	u32 *pause)
+	const u32 *element_address, u32 *pause)
 {
 	static const u32 destination_tail[] = {
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
@@ -2732,7 +2891,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 					   DRM_CHROME9_VERTEX_CULL_CCW) ? BIT(7) : 0);
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	if (tcl)
-		raster_count = chrome9_tcl_raster_state(program, tcl, raster);
+		raster_count = chrome9_tcl_raster_state(program, tcl,
+			element_address, raster);
 	else
 		raster_count = chrome9_fragment_raster_state(
 			program->varying_count, program->varying_width,
@@ -2807,6 +2967,33 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	if (program->tau_count)
 		chrome9_emit_header3(&p, 0x21030000, program->tau,
 				     program->tau_count);
+	if (element_address) {
+		u32 slots[DRM_CHROME9_VERTEX_MAX_INPUTS];
+		u32 draw[4];
+
+		/* Keep room for the tail, PAUSE/STOP and the read-ahead. */
+		if (p + 0x40 + tcl->index_dwords + CHROME9_CR_READ_AHEAD / 4 +
+		    0x100 > base + CHROME9_RUN_STAGING_SIZE / 4)
+			return -E2BIG;
+		for (i = 0; i < tcl->element_count; i++)
+			slots[i] = chrome9_tcl_stream_slot(element_address[i],
+				tcl->buffers[tcl->element_buffer[i]].stride);
+		chrome9_emit_header3(&p, 0x30030000, slots, tcl->element_count);
+		/* Inclusive index bounds; indices were rebased to zero. */
+		draw[0] = 0x2c000000 | (tcl->index_range & 0x00ffffff);
+		draw[1] = 0x2d000000;
+		draw[2] = 0x2e000000 | (tcl->index_range >> 24) << 8;
+		draw[3] = 0x24000000 | tcl->index_count;
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
+				     draw, ARRAY_SIZE(draw));
+		chrome9_emit_header3(&p, 0x00000000, tcl->indices,
+				     tcl->index_dwords);
+		ret = chrome9_emit_3d_tail(engine, job, &p);
+		if (ret)
+			return ret;
+		return chrome9_finish_ring_sized(base, p,
+			CHROME9_RUN_STAGING_SIZE, pause, &job->segment_stop);
+	}
 	while (!IS_ALIGNED((unsigned long)p, 16))
 		*p++ = 0xcc000000;
 	vertex_header = p;
@@ -5553,11 +5740,19 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		struct drm_file *file, const struct chrome9_draw_request *request)
 {
 	struct chrome9_device *cdev = to_chrome9(drm);
-	struct drm_gem_object *objects[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
-	u64 object_sizes[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
-	u64 mapping_sizes[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
-	u32 bases[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	const struct chrome9_tcl_draw *tcl = request->tcl;
+	struct drm_gem_object *objects[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
+	u64 object_sizes[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
+	u64 mapping_sizes[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
+	u32 bases[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
 	u32 texture_bases[DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { };
+	u64 element_start[DRM_CHROME9_VERTEX_MAX_INPUTS] = { };
+	u32 element_address[DRM_CHROME9_VERTEX_MAX_INPUTS] = { };
+	u32 buffer_object[DRM_CHROME9_VERTEX_MAX_INPUTS] = { };
+	/* Byte range the fetcher reads per vertex object; only it is flushed. */
+	u64 object_low[CHROME9_FRAGMENT_MAX_OBJECTS];
+	u64 object_high[CHROME9_FRAGMENT_MAX_OBJECTS] = { };
+	u32 buffer_first;
 	struct chrome9_engine *engine;
 	struct chrome9_job *job = NULL;
 	struct drm_exec exec;
@@ -5596,6 +5791,26 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		object_sizes[object_count] = request->fragment_texture_size[i];
 		object_count++;
 	}
+	/* Stage B vertex buffers are plain, unguarded read-only objects;
+	 * bindings of one handle share its object. */
+	buffer_first = object_count;
+	for (i = 0; tcl && i < tcl->buffer_count; i++) {
+		unsigned int j;
+
+		for (j = 0; j < i; j++)
+			if (tcl->buffers[j].handle == tcl->buffers[i].handle)
+				break;
+		if (j < i) {
+			buffer_object[i] = buffer_object[j];
+			continue;
+		}
+		buffer_object[i] = object_count;
+		objects[object_count] = drm_gem_object_lookup(file,
+			tcl->buffers[i].handle);
+		if (objects[object_count])
+			object_sizes[object_count] = objects[object_count]->size;
+		object_count++;
+	}
 	for (i = 0; i < object_count; i++) {
 		unsigned int j;
 
@@ -5631,6 +5846,14 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	if (mapped_size > SZ_64M - CHROME9_RING_SIZE) {
 		ret = -E2BIG;
 		goto out_put_objects;
+	}
+	if (tcl && tcl->buffer_count) {
+		for (i = 0; i < ARRAY_SIZE(object_low); i++)
+			object_low[i] = U64_MAX;
+		ret = chrome9_tcl_buffer_bounds(tcl, objects, buffer_object,
+				element_start, object_low, object_high);
+		if (ret)
+			goto out_put_objects;
 	}
 
 	job = kzalloc_obj(*job);
@@ -5683,6 +5906,12 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			goto out_unmap;
 		}
 	}
+	if (tcl && tcl->buffer_count &&
+	    !chrome9_tcl_buffers_finite(tcl, job->fragment_maps, buffer_object,
+					element_start)) {
+		ret = -EINVAL;
+		goto out_unmap;
+	}
 
 	ret = mutex_lock_interruptible(&engine->submit_lock);
 	if (ret)
@@ -5700,6 +5929,14 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			goto out_prepublication;
 	}
 	for (i = 0; i < object_count; i++) {
+		if (i >= buffer_first) {
+			chrome9_cache_flush((u8 *)job->fragment_maps[i].vaddr +
+					    object_low[i],
+					    object_high[i] - object_low[i]);
+			dma_sync_sgtable_for_device(&cdev->pdev->dev,
+				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+			continue;
+		}
 		chrome9_prepare_map_guards(&job->fragment_maps[i], object_sizes[i]);
 		if (mapping_sizes[i] != object_sizes[i])
 			chrome9_prepare_map_guards(&job->fragment_maps[i],
@@ -5715,8 +5952,11 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 							  DMA_RESV_USAGE_READ);
 	job->fence_attached = true;
 	for (i = 0; i < request->fragment_texture_count; i++)
-		texture_bases[i] = bases[object_count -
+		texture_bases[i] = bases[buffer_first -
 			request->fragment_texture_count + i];
+	for (i = 0; tcl && tcl->buffer_count && i < tcl->element_count; i++)
+		element_address[i] = bases[buffer_object[
+			tcl->element_buffer[i]]] + element_start[i];
 	job->cookie = engine->last_cookie == 0x00010001 ?
 		      0x00020002 : 0x00010001;
 	job->fence_id = 0;
@@ -5724,7 +5964,8 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	ret = chrome9_build_fragment_program(engine, request, job,
 		bases[0] + PAGE_SIZE,
 		depth_index == U32_MAX ? 0 : bases[depth_index] + PAGE_SIZE,
-		texture_bases, &pause);
+		texture_bases, tcl && tcl->buffer_count ? element_address : NULL,
+		&pause);
 	if (ret)
 		goto out_prepublication;
 	ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
@@ -5750,11 +5991,18 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 	for (i = 0; i < object_count; i++) {
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
-		chrome9_cache_flush(job->fragment_maps[i].vaddr, mapping_sizes[i]);
+		/* The engine never writes vertex buffers. */
+		if (i < buffer_first)
+			chrome9_cache_flush(job->fragment_maps[i].vaddr,
+					    mapping_sizes[i]);
 	}
 	dma_rmb();
 	device_owned = false;
 	for (i = 0; i < object_count; i++) {
+		if (i >= buffer_first) {
+			chrome9_sf_resync_object_locked(engine, objects[i]);
+			continue;
+		}
 		if (!chrome9_verify_map_guards(&job->fragment_maps[i],
 					       object_sizes[i]) ||
 		    (mapping_sizes[i] != object_sizes[i] &&
@@ -6176,7 +6424,6 @@ int chrome9_draw_triangle_d16_blend_ioctl(struct drm_device *drm, void *data,
 	return chrome9_submit_depth_triangle(drm, file, &request);
 }
 
-static bool chrome9_float_finite(u32 value);
 static bool chrome9_rhw_valid(u32 value);
 
 static bool
@@ -8442,33 +8689,6 @@ static bool chrome9_tcl_viewport_valid(const u32 viewport[8])
 	       !viewport[6] && !viewport[7];
 }
 
-/*
- * Vertex element formats: native A(1+i) low byte (components-1 << 6 |
- * type << 1 | normalize, VX900 manual), fetch dwords and which dwords hold
- * float32 or float16 data for the stage A finite check.
- */
-static const struct {
-	u8 native;
-	u8 dwords;
-	u8 float32;
-	u8 float16;
-} chrome9_tcl_formats[] = {
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT1] = { 0x02, 1, 1, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT2] = { 0x42, 2, 2, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT3] = { 0x82, 3, 3, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT4] = { 0xc2, 4, 4, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM] = { 0xd1, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM] = { 0xc7, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED] = { 0xc6, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM] = { 0x49, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM] = { 0xc9, 2, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM] = { 0x4b, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM] = { 0xcb, 2, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED] = { 0x4a, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED] = { 0xca, 2, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT] = { 0x44, 1, 0, 1 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT] = { 0xc4, 2, 0, 2 },
-};
 
 static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
 		const struct drm_chrome9_vertex_element *elements, u32 stride)
@@ -8480,27 +8700,70 @@ static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
 		const struct drm_chrome9_vertex_element *element = &elements[e];
 
 		if (element->format >= ARRAY_SIZE(chrome9_tcl_formats) ||
-		    element->buffer || element->reserved ||
-		    !IS_ALIGNED(element->offset, 4) ||
-		    element->offset >
-			stride - 4 * chrome9_tcl_formats[element->format].dwords)
+		    element->reserved || !IS_ALIGNED(element->offset, 4) ||
+		    (tcl->buffer_count ?
+		     element->buffer >= tcl->buffer_count :
+		     element->buffer || element->offset >
+			stride - 4 * chrome9_tcl_formats[element->format].dwords))
 			return -EINVAL;
 		tcl->element_format[e] = chrome9_tcl_formats[element->format].native;
 		tcl->element_type[e] = element->format;
-		tcl->element_offset[e] = element->offset / 4;
+		if (tcl->buffer_count) {
+			tcl->element_buffer[e] = element->buffer;
+			tcl->element_byte_offset[e] = element->offset;
+		} else {
+			tcl->element_offset[e] = element->offset / 4;
+		}
 		/* The fetcher fills lanes a format lacks with (0, 0, 0, 1). */
 		tcl->input_lanes[e] = 0xf;
 		fetched += chrome9_tcl_formats[element->format].dwords;
+	}
+	if (tcl->buffer_count) {
+		tcl->stride_dw = fetched;
+		return 0;
 	}
 	/* Inline vertices are parsed as the sum of element fetch dwords
 	 * (A00[6:0]); padding misaligns the stream and stops the engine. */
 	return fetched * 4 == stride ? 0 : -EINVAL;
 }
 
-static bool chrome9_tcl_half_finite(u32 value)
+/*
+ * Stage B indices: find the inclusive range, rebase to zero (the range
+ * start folds into the element addresses) and pack 16-bit pairs when the
+ * range allows.  An odd 16-bit count leaves the upper lane zero.
+ */
+static u32 *chrome9_tcl_indices(struct chrome9_tcl_draw *tcl,
+		const void *indices, u32 index_size)
 {
-	return (value & 0x7c00) != 0x7c00 && (value & 0x7c000000) != 0x7c000000;
+	u32 min = U32_MAX, max = 0, value;
+	unsigned int i;
+	u32 *packed;
+
+	for (i = 0; i < tcl->index_count; i++) {
+		value = index_size == 2 ? ((const u16 *)indices)[i] :
+			((const u32 *)indices)[i];
+		min = min(min, value);
+		max = max(max, value);
+	}
+	tcl->index_min = min;
+	tcl->index_range = max - min;
+	tcl->index32 = tcl->index_range > 0xffff;
+	tcl->index_dwords = tcl->index32 ? tcl->index_count :
+		DIV_ROUND_UP(tcl->index_count, 2);
+	packed = kvcalloc(tcl->index_dwords, sizeof(*packed), GFP_KERNEL);
+	if (!packed)
+		return NULL;
+	for (i = 0; i < tcl->index_count; i++) {
+		value = (index_size == 2 ? ((const u16 *)indices)[i] :
+			 ((const u32 *)indices)[i]) - min;
+		if (tcl->index32)
+			packed[i] = value;
+		else
+			packed[i / 2] |= value << (i & 1 ? 16 : 0);
+	}
+	return packed;
 }
+
 
 static bool chrome9_tcl_vertices_finite(const struct chrome9_tcl_draw *tcl)
 {
@@ -8530,23 +8793,44 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	struct drm_chrome9_draw_vertex_program *args = data;
 	struct drm_chrome9_vertex_instruction *instructions = NULL;
 	struct drm_chrome9_vertex_element *elements = NULL;
+	struct drm_chrome9_vertex_buffer *buffers = NULL;
 	struct chrome9_tcl_draw *tcl = NULL;
+	void *indices = NULL;
 	u32 *constants = NULL;
 	u32 *vertices = NULL;
+	bool stage_b = args->buffer_count;
 	unsigned int i;
 	int ret;
 
 	if (!chrome9_hw_tcl_enabled())
 		return -EOPNOTSUPP;
+	if (stage_b) {
+		if (args->vertex_count || args->vertex_stride ||
+		    args->vertices_ptr ||
+		    args->buffer_count > args->element_count ||
+		    args->buffer_count > DRM_CHROME9_VERTEX_MAX_INPUTS ||
+		    !args->index_count || args->index_count % 3 ||
+		    args->index_count > DRM_CHROME9_VERTEX_MAX_INDICES ||
+		    (args->index_size != 2 && args->index_size != 4) ||
+		    !args->indices_ptr || !args->buffers_ptr)
+			return -EINVAL;
+	} else if (args->index_count || args->index_size ||
+		   args->base_vertex || args->indices_ptr || args->buffers_ptr ||
+		   !args->vertex_count || args->vertex_count % 3 ||
+		   args->vertex_count > DRM_CHROME9_VERTEX_MAX_VERTICES ||
+		   !IS_ALIGNED(args->vertex_stride, 4) ||
+		   args->vertex_stride < 4 || args->vertex_stride > 4 * 127 ||
+		   args->vertex_count * args->vertex_stride >
+			CHROME9_TCL_MAX_VERTEX_BYTES ||
+		   !args->vertices_ptr) {
+		return -EINVAL;
+	}
 	if (args->abi_version != DRM_CHROME9_VERTEX_ABI_VERSION ||
 	    (args->flags & ~(DRM_CHROME9_VERTEX_CULL_CW |
 			     DRM_CHROME9_VERTEX_CULL_CCW |
 			     DRM_CHROME9_VERTEX_FLAT)) ||
 	    hweight32(args->flags & (DRM_CHROME9_VERTEX_CULL_CW |
 				     DRM_CHROME9_VERTEX_CULL_CCW)) > 1 ||
-	    args->index_count || args->index_size ||
-	    args->buffer_count || args->base_vertex || args->indices_ptr ||
-	    args->buffers_ptr ||
 	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
 	    !args->instruction_count ||
 	    args->instruction_count > DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS ||
@@ -8556,14 +8840,7 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	    args->constant_count >
 		DRM_CHROME9_VERTEX_MAX_CONSTANTS - args->constant_first ||
 	    !!args->constants_ptr != !!args->constant_count ||
-	    !args->vertex_count || args->vertex_count % 3 ||
-	    args->vertex_count > DRM_CHROME9_VERTEX_MAX_VERTICES ||
-	    !IS_ALIGNED(args->vertex_stride, 4) || args->vertex_stride < 4 ||
-	    args->vertex_stride > 4 * 127 ||
-	    args->vertex_count * args->vertex_stride >
-		CHROME9_TCL_MAX_VERTEX_BYTES ||
 	    !args->instructions_ptr || !args->elements_ptr ||
-	    !args->vertices_ptr ||
 	    !chrome9_tcl_viewport_valid(args->viewport))
 		return -EINVAL;
 	tcl = kvzalloc(sizeof(*tcl), GFP_KERNEL);
@@ -8582,6 +8859,43 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 	}
 	tcl->rows[8] = 0x49400000;
 	tcl->rows[9] = 0x49400000;
+	if (stage_b) {
+		tcl->buffer_count = args->buffer_count;
+		tcl->index_count = args->index_count;
+		tcl->base_vertex = args->base_vertex;
+		buffers = memdup_array_user(u64_to_user_ptr(args->buffers_ptr),
+			args->buffer_count, sizeof(*buffers));
+		if (IS_ERR(buffers)) {
+			ret = PTR_ERR(buffers);
+			buffers = NULL;
+			goto out_free;
+		}
+		/* Stride 0 (constant attributes) is not proven on silicon. */
+		for (i = 0; i < args->buffer_count; i++) {
+			if (!buffers[i].handle ||
+			    !IS_ALIGNED(buffers[i].stride, 4) ||
+			    buffers[i].stride < 4 || buffers[i].stride > 2044 ||
+			    !IS_ALIGNED(buffers[i].offset, 4)) {
+				ret = -EINVAL;
+				goto out_free;
+			}
+			tcl->buffers[i] = buffers[i];
+		}
+		indices = vmemdup_array_user(u64_to_user_ptr(args->indices_ptr),
+			args->index_count, args->index_size);
+		if (IS_ERR(indices)) {
+			ret = PTR_ERR(indices);
+			indices = NULL;
+			goto out_free;
+		}
+		tcl->indices = chrome9_tcl_indices(tcl, indices,
+						   args->index_size);
+		if (!tcl->indices) {
+			ret = -ENOMEM;
+			goto out_free;
+		}
+		tcl->vertex_count = args->index_count;
+	}
 
 	elements = memdup_array_user(u64_to_user_ptr(args->elements_ptr),
 		args->element_count, sizeof(*elements));
@@ -8616,21 +8930,27 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 			}
 		tcl->constants = constants;
 	}
-	vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
-		args->vertex_count, args->vertex_stride);
-	if (IS_ERR(vertices)) {
-		ret = PTR_ERR(vertices);
-		vertices = NULL;
-		goto out_free;
-	}
-	tcl->vertices = vertices;
-	if (!chrome9_tcl_vertices_finite(tcl)) {
-		ret = -EINVAL;
-		goto out_free;
+	if (!stage_b) {
+		vertices = vmemdup_array_user(u64_to_user_ptr(args->vertices_ptr),
+			args->vertex_count, args->vertex_stride);
+		if (IS_ERR(vertices)) {
+			ret = PTR_ERR(vertices);
+			vertices = NULL;
+			goto out_free;
+		}
+		tcl->vertices = vertices;
+		if (!chrome9_tcl_vertices_finite(tcl)) {
+			ret = -EINVAL;
+			goto out_free;
+		}
 	}
 	ret = chrome9_draw_fragment(drm, file, &args->fragment, tcl);
 
 out_free:
+	if (tcl)
+		kvfree(tcl->indices);
+	kvfree(indices);
+	kfree(buffers);
 	kvfree(vertices);
 	kfree(constants);
 	kfree(instructions);
