@@ -154,6 +154,41 @@ tcl_round_point_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/*
+ * GL 2.1 2.12 discards a point whose vertex lies outside the clip volume;
+ * the clip engine draws the visible part instead (rung pedge).  Move such
+ * a point behind the near plane, z = 0 after the half-z lowering.
+ */
+static bool
+tcl_clip_point(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned *stores = data;
+   nir_def *pos, *outside, *z;
+
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_POS)
+      return false;
+   (*stores)++;
+   if (nir_intrinsic_component(intr) || nir_intrinsic_write_mask(intr) != 0xf ||
+       intr->src[0].ssa->num_components != 4) {
+      (*stores)++;
+      return false;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   pos = intr->src[0].ssa;
+   outside = nir_b2f32(b, nir_flt(b, nir_channel(b, pos, 3),
+                                  nir_fmax(b, nir_fabs(b, nir_channel(b, pos, 0)),
+                                           nir_fabs(b, nir_channel(b, pos, 1)))));
+   z = nir_ffma(b, outside,
+                nir_fadd_imm(b, nir_fmul_imm(b, nir_fabs(b, nir_channel(b, pos, 3)),
+                                             -2.0), -1.0),
+                nir_channel(b, pos, 2));
+   nir_src_rewrite(&intr->src[0],
+                   nir_vec4(b, nir_channel(b, pos, 0), nir_channel(b, pos, 1),
+                            z, nir_channel(b, pos, 3)));
+   return true;
+}
+
 static bool
 tcl_single_block(nir_shader *nir, nir_block **block)
 {
@@ -1759,14 +1794,14 @@ tcl_find_key(struct chrome9_tcl_shader *shader)
 bool
 chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
                     enum chrome9_tcl_colour colour, unsigned clip_enable,
-                    bool point_size, unsigned key_count,
+                    unsigned point, unsigned key_count,
                     const uint16_t *key_dword, const uint32_t *key_value,
                     const struct chrome9_tcl_flow *flow,
                     struct chrome9_tcl_program *p)
 {
    struct tcl_builder b = {
       .p = p, .colour = colour, .clip_enable = clip_enable,
-      .point_size = point_size,
+      .point_size = point & CHROME9_TCL_POINT_SIZE,
       .writes_back = !!(source->info.outputs_written & VARYING_BIT_BFC0),
       .flow = flow && flow->max_depth ? flow : NULL,
    };
@@ -1800,9 +1835,17 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_lower_halfz,
                nir_metadata_control_flow, NULL);
    }
-   if (point_size)
+   if (point & CHROME9_TCL_POINT_SIZE)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_round_point_size,
                nir_metadata_control_flow, NULL);
+   if (point & CHROME9_TCL_POINT_CLIP) {
+      unsigned stores = 0;
+
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_clip_point,
+               nir_metadata_control_flow, &stores);
+      if (stores != 1)
+         goto out;
+   }
    /* Fold the current control uniforms so their branches disappear. */
    if (key_count)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_inline_key,
@@ -2205,7 +2248,7 @@ tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
    const struct pipe_rasterizer_state *rs = ctx->rasterizer;
    const nir_shader *fs = ctx->fs->nir;
    float size = rs->point_size;
-   unsigned sprite = 0;
+   unsigned sprite = 0, read = 0;
 
    if (rs->point_smooth || rs->point_line_tri_clip || !rs->half_pixel_center)
       return "smooth or clipped points";
@@ -2231,6 +2274,8 @@ tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
          const bool tex = fs->info.inputs_read & VARYING_BIT_TEX(n);
          const bool var = fs->info.inputs_read & VARYING_BIT_VAR(n);
 
+         if (tex || var)
+            read |= BITFIELD_BIT(n);
          if (!(tex && rs->sprite_coord_enable & BITFIELD_BIT(n)) &&
              !(var && rs->sprite_coord_enable & BITFIELD_BIT(9 + n)))
             continue;
@@ -2243,6 +2288,10 @@ tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
    if (sprite) {
       if (polygon || rs->sprite_coord_mode != PIPE_SPRITE_COORD_UPPER_LEFT)
          return "point sprite origin";
+      /* A01[21] replaces every coordinate, A2F[9:0] selects none (rung
+       * sprite P3b); user clip distances ride on coordinates too. */
+      if (sprite != read || rs->clip_plane_enable)
+         return "point sprite on a subset of coordinates";
       r->flags |= DRM_CHROME9_RASTER_POINT_SPRITE |
                   DRM_CHROME9_RASTER_SPRITE_MASK(sprite);
    }
@@ -2328,11 +2377,10 @@ tcl_raster(const struct chrome9_context *ctx, const struct pipe_draw_info *info,
       if (why)
          return why;
    }
-   if (front == PIPE_POLYGON_MODE_POINT) {
-      why = tcl_raster_points(ctx, true, r);
-      if (why)
-         return why;
-   }
+   /* GL draws the vertices of the clipped polygon, the hardware those of
+    * the unclipped triangle. */
+   if (front == PIPE_POLYGON_MODE_POINT)
+      return "polygon point mode";
    r->flags |= DRM_CHROME9_RASTER_POLYGON_CW(
                   tcl_polygon_mode(rs->front_ccw ? back : front)) |
                DRM_CHROME9_RASTER_POLYGON_CCW(
@@ -2742,9 +2790,11 @@ tcl_cb0(const struct chrome9_context *ctx, size_t *size)
 static struct chrome9_tcl_variant *
 tcl_variant(struct chrome9_context *ctx, bool clip_halfz,
             enum chrome9_tcl_colour colour, uint8_t clip_enable, bool unkeyed,
-            const uint32_t *key)
+            bool point_clip, const uint32_t *key)
 {
-   const bool point_size = ctx->tcl_point_size;
+   const uint8_t point_size =
+      (ctx->tcl_point_size ? CHROME9_TCL_POINT_SIZE : 0) |
+      (point_clip ? CHROME9_TCL_POINT_CLIP : 0);
    struct chrome9_tcl_shader *shader = ctx->vs->tcl;
    struct chrome9_tcl_variant **link, *variant;
 
@@ -2792,7 +2842,8 @@ tcl_variant(struct chrome9_context *ctx, bool clip_halfz,
 
 static const struct chrome9_tcl_program *
 tcl_program(struct chrome9_context *ctx, bool clip_halfz,
-            enum chrome9_tcl_colour colour, uint8_t clip_enable)
+            enum chrome9_tcl_colour colour, uint8_t clip_enable,
+            bool point_clip)
 {
    struct chrome9_tcl_shader *shader = ctx->vs->tcl;
    const uint32_t unkeyed_key[CHROME9_TCL_MAX_KEY] = { 0 };
@@ -2806,7 +2857,7 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
    if (shader->key_count && ctx->tcl_flow.max_depth &&
        shader->keyed_compiles > CHROME9_TCL_KEY_CHURN) {
       variant = tcl_variant(ctx, clip_halfz, colour, clip_enable, true,
-                            unkeyed_key);
+                            point_clip, unkeyed_key);
       if (variant && variant->program.supported)
          return &variant->program;
    }
@@ -2820,7 +2871,8 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
          memcpy(&key[k], map + shader->key_dword[k] * 4, sizeof(key[k]));
       }
    }
-   variant = tcl_variant(ctx, clip_halfz, colour, clip_enable, false, key);
+   variant = tcl_variant(ctx, clip_halfz, colour, clip_enable, false,
+                         point_clip, key);
    return variant && variant->program.supported ? &variant->program : NULL;
 }
 
@@ -3205,7 +3257,9 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    }
    for (unsigned i = 0; i < passes; i++) {
       const struct chrome9_tcl_program *p =
-         tcl_program(ctx, rs->clip_halfz, colours[i], clip_enable);
+         tcl_program(ctx, rs->clip_halfz, colours[i], clip_enable,
+                     !raster.triangles && raster.topology ==
+                        DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST);
 
       if (!p)
          return tcl_fallback(ctx, "vertex shader not expressible");

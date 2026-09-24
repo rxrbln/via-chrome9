@@ -102,7 +102,8 @@ struct chrome9_tcl_variant {
    bool clip_halfz;
    enum chrome9_tcl_colour colour;
    uint8_t clip_enable;
-   bool point_size;
+   /* CHROME9_TCL_POINT_* */
+   uint8_t point_size;
    bool unkeyed;
    uint32_t key[CHROME9_TCL_MAX_KEY];
    struct chrome9_tcl_program program;
@@ -122,11 +123,14 @@ struct chrome9_tcl_shader *chrome9_tcl_shader_create(const struct nir_shader *ni
 void chrome9_tcl_shader_destroy(struct chrome9_tcl_shader *shader);
 bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
                          enum chrome9_tcl_colour colour,
-                         unsigned clip_enable, bool point_size,
+                         unsigned clip_enable, unsigned point,
                          unsigned key_count, const uint16_t *key_dword,
                          const uint32_t *key_value,
                          const struct chrome9_tcl_flow *flow,
                          struct chrome9_tcl_program *program);
+/* chrome9_tcl_compile() point forms: rounded PSIZ output, centre clip. */
+#define CHROME9_TCL_POINT_SIZE 1u
+#define CHROME9_TCL_POINT_CLIP 2u
 void chrome9_tcl_program_fini(struct chrome9_tcl_program *program);
 bool chrome9_tcl_flow_constants(const struct chrome9_tcl_program *program,
                                 const uint8_t *cb0, size_t size,

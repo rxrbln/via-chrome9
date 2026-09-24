@@ -419,8 +419,11 @@ chrome9_bind_rasterizer_state(struct pipe_context *pipe, void *state)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
-   ctx->rasterizer = state;
+   /* The flush in draw_set_rasterizer_state() lets the wide point and line
+    * stages rebind the previous state through this hook; take the new one
+    * last or the hardware paths keep drawing with the old one. */
    draw_set_rasterizer_state(ctx->draw, state, state);
+   ctx->rasterizer = state;
 }
 
 static void *
@@ -7552,6 +7555,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    draw_wide_point_threshold(ctx->draw, 0.0f);
    draw_wide_line_threshold(ctx->draw, 0.0f);
    draw_enable_point_sprites(ctx->draw, true);
+   draw_wide_point_gl(ctx->draw, true);
    draw_enable_line_stipple(ctx->draw, true);
    stage = chrome9_draw_vbuf_stage(ctx);
    if (!stage)

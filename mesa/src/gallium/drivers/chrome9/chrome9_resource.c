@@ -763,7 +763,24 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    else if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
       /* Queued draws may still read the buffer. */
       chrome9_tcl_batch_flush_resource(chrome9_context(pipe), resource);
-   chrome9_resource_cpu_access(cresource, usage & PIPE_MAP_WRITE);
+   /* An unsynchronized buffer write touches no bytes a queued job reads:
+    * record the range without waiting for the device. */
+   if (resource->target == PIPE_BUFFER &&
+       (usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_READ | PIPE_MAP_WRITE)) ==
+          (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_WRITE) &&
+       chrome9_screen_has_capability2(resource->screen,
+                                      DRM_CHROME9_CAP2_GEM_CPU_NOWAIT)) {
+      cresource->cpu_write_generation++;
+      if (!chrome9_bo_cpu_access_range(
+             resource->screen->get_screen_fd(resource->screen),
+             &cresource->bo,
+             DRM_CHROME9_GEM_CPU_PREPARE_WRITE | DRM_CHROME9_GEM_CPU_NOWAIT,
+             box->x, box->width))
+         fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n",
+                 strerror(errno));
+   } else {
+      chrome9_resource_cpu_access(cresource, usage & PIPE_MAP_WRITE);
+   }
 
    transfer = CALLOC_STRUCT(pipe_transfer);
    if (!transfer)
