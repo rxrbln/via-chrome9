@@ -8870,11 +8870,11 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 			buffers = NULL;
 			goto out_free;
 		}
-		/* Stride 0 (constant attributes) is not proven on silicon. */
+		/* Stride 0 repeats one element (constant attribute). */
 		for (i = 0; i < args->buffer_count; i++) {
 			if (!buffers[i].handle ||
 			    !IS_ALIGNED(buffers[i].stride, 4) ||
-			    buffers[i].stride < 4 || buffers[i].stride > 2044 ||
+			    buffers[i].stride > 2044 ||
 			    !IS_ALIGNED(buffers[i].offset, 4)) {
 				ret = -EINVAL;
 				goto out_free;
