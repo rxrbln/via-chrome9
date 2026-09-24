@@ -6302,6 +6302,11 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			chrome9_prof_full_kind[(bo->explicit_access ? 3 : 0) +
 				(i == 0 ? 0 : i == depth_index ? 1 : 2)]++;
 		}
+		/* The job never writes a sampled object's pages. */
+		if (bo->explicit_access && i != 0 && i != depth_index) {
+			bo->guard_object_size = object_sizes[i];
+			bo->guard_mapping_size = mapping_sizes[i];
+		}
 		dma_sync_sgtable_for_device(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 		chrome9_prof_sub_ns[2] += ktime_to_ns(ktime_sub(ktime_get(), t1));
@@ -6358,8 +6363,8 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
 
-		/* The engine never writes vertex buffers. */
-		if (i >= buffer_first)
+		/* The job writes only its color and depth destinations. */
+		if (i != 0 && i != depth_index)
 			continue;
 		if (!bo->explicit_access) {
 			chrome9_cache_flush(job->fragment_maps[i].vaddr,
@@ -6372,13 +6377,13 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		if (mapping_sizes[i] != object_sizes[i])
 			chrome9_flush_map_guards(&job->fragment_maps[i],
 						 mapping_sizes[i]);
-		if (i == 0 || i == depth_index)
-			bo->device_written = true;
+		bo->device_written = true;
 	}
 	dma_rmb();
 	device_owned = false;
 	for (i = 0; i < object_count; i++) {
-		if (i >= buffer_first) {
+		/* Sampled textures and vertex buffers are only read. */
+		if (i != 0 && i != depth_index) {
 			chrome9_sf_resync_object_locked(engine, objects[i]);
 			continue;
 		}
