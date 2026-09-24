@@ -9,6 +9,26 @@ no larger than 512 and at most L9.  It is called only for the non-generic
 one-texture path at `:1011..1018`.  Broadening that helper would not enable
 the real three-sampler refract consumer.
 
+The distinction now also matters to the default glmark2 `texture:mipmap`
+scene.  Its linked fragment shader samples the crate texture and multiplies
+the result by the smooth vertex color.  Current Chrome9 accepts that shader
+as one TEX plus one MUL with semantic varying mask `0x0003` and sampler mask
+`0x01`, so `chrome9_use_generic_fragment_program()` is true.  The draw does
+not use `DRAW_TEXTURED_TRIANGLE_MIP`, even though an older build qualified
+that ioctl with `Validation: Success`.  Current Mesa serializes the complete
+512-square BGRX L0--L9 resource into the structured cmd22 descriptor at
+`chrome9_draw.c:1217..1259`; the old square/POT predicate and its module
+parameter are not the current scene gate.
+
+This makes one application check especially valuable after the generic mip
+path is built on the target: run the exact default `texture:texture-filter=mipmap`
+validation and require both glmark2's reference success and cmd22 submission.
+That single run covers derivative-selected trilinear sampling through the
+new descriptor, whereas repeating the legacy ioctl proof does not.  A
+failure should first be classified as draw rejection, retired wrong image,
+or timeout; it is not a reason to route a semantic program back through the
+closed REPLACE/MODULATE object.
+
 The generic path already has the right descriptor model for a rectangular
 1600x1200 BGRA L0--L10 chain:
 
