@@ -152,6 +152,50 @@ and writable LEQUAL depth for masked surfaces; then read-only EQUAL depth plus
 ONE/ONE, DST_COLOR/ONE and source-over blends for dynamic-light and fog
 passes.  These are generic GL states, not ioquake scene keys.
 
+## Projected-MODULATE plus blend qualification
+
+The projector lowering makes the retained first draw representable, but it
+does not itself qualify the complete draw on silicon.  There is no retained
+pixel oracle for generic command 22 combining TEX times primary color with
+ioquake's same-factor `SRC_ALPHA,INV_SRC_ALPHA` blend.  Existing Gallium
+source-over results either use REPLACE or the canonical separate-alpha
+equation, while the older fixed MODULATE list has one completion-timeout
+incident.  Vendor state builders do strongly support the packet shape:
+A34--A37 and the RT A00 blend gate are built independently of the pixel
+shader and TEX count, and the generic request carries the same normalized
+blend block beside the semantic program.
+
+The smallest safe discriminator is one no-depth triangle, not an application
+run:
+
+- guarded 32x32 BGRX target cleared green;
+- guarded 2x2 BGRA texture, nearest/clamp L0, texel `80ff0000`;
+- white primary, direct T0.xy, and Q raw bits exactly `3f800000`;
+- the exact projected full-RGBA texture-times-primary program; and
+- `SRC_ALPHA,INV_SRC_ALPHA` for both RGB and alpha.
+
+The covered BGRX pixel must be approximately `00807f00` in RGB, with one LSB
+tolerance.  Require one generic program batch, exact retirement, unchanged
+texture/exterior/guards, and a generic no-blend TEX baseline before and after.
+Stop on the first timeout.  If this closes, repeat only once with a BGRA
+target cleared to transparent green.  The exact ioquake same-factor equation
+stores approximately `40807f00`: alpha is `As*As = 0.25`.  The canonical
+separate-alpha source-over result `80807f00` is a negative discriminator.
+This second draw also proves A52 format 99 rather than merely RGB agreement on
+an XRGB target.
+
+After that gate, source and current capability review find no deterministic
+generic-state rejection for the next q3dm1 material classes.  The first
+representative two-pass material is protobanner: projected BGRA times primary
+with GE128 and LEQUAL/write, followed by projected XRGB lightmap times white
+with `DST_COLOR,ZERO` and EQUAL/read-only.  Dynamic light uses XRGB times
+primary, clamp/linear L0, `ONE,ONE` or `DST_COLOR,ONE`, EQUAL/read-only.  Fog
+uses BGRA times primary, clamp/linear L0, same-factor source-over, and
+LEQUAL/read-only or EQUAL/read-only.  A bounded current application run is
+therefore the correct next discovery step once the single-triangle gate
+passes; no later shader should be called the current first failure before
+that run.
+
 ## GL2 startup after the old uniform error
 
 The historical GL2 startup error reported too few default fragment-uniform
