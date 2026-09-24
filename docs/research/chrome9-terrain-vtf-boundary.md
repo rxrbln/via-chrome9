@@ -96,8 +96,9 @@ The linked main fragment shader has these source-exact resources:
 | resource | requirement |
 |---|---:|
 | active TEX instructions | 5 |
-| active FS sampler ids | 0, 1, 2, 4, 5 |
-| sampler/view high-water | 6 |
+| application texture units | 0, 1, 2, 4, 5 |
+| linked/Gallium FS sampler slots | 0, 1, 2, 3, 4 |
+| sampler/view slot count | 5 |
 | logical smooth varyings | 5 |
 | packed physical FS inputs | 4, widths `4,4,4,2` |
 | varying components | 14 (`3+3+3+2+3`) |
@@ -116,17 +117,27 @@ Those interface resources fit the recovered UAPI maxima of eight textures,
 eight varyings, 32 TAU records, and 32 constant vec4s.  They do not fit the
 current production Gallium claims: three FS samplers and three FS inputs.
 The structured stores now advertise 96 ALU/total and 32 TEX instructions, so
-instruction caps are not the first link gate.  Sampler mask `0x37` is
-also sparse, and the draw path explicitly rejects it as
-`sparse-sampler-abi` (`chrome9_draw.c:951-959`).  Raising only the cap cannot
-make terrain submit.
+instruction caps are not the first link gate.
+
+The application-unit holes do **not** become holes in the Gallium shader
+slots.  `gl_nir_lower_samplers_as_deref()` assigns the five linked opaque
+uniforms dense per-stage indices 0 through 4 from
+`UniformStorage[location].opaque[stage].index`
+(`gl_nir_lower_samplers_as_deref.c:176-178,388`).  At draw time
+`st_atom_texture.c:101-152` and `st_atom_sampler.c:222-243` walk those dense
+`prog->SamplersUsed` slots, map each through `prog->SamplerUnits[slot]` to
+application units 0,1,2,4,5, and install the selected state back into pipe
+slots 0 through 4.  The exact linked Chrome9 fragment probe consequently
+reports `sampler_mask=0x1f`, not sparse `0x37`.  Terrain therefore needs five
+FS sampler/view slots, but it does not require the optional sparse-descriptor
+ABI.
 
 The fragment ALU count and physical-temp pressure are intentionally not
 claimed closed by this audit.  The literal one-iteration light loop can
 unroll, and glmark uploads `pointLightDistance[0] = 0`, allowing the distance
 branch to specialize away, but a captured linked Chrome9 NIR object is still
 required to prove `ALU + computed-coordinate bridges <= 96` and at most 12
-simultaneously live physical temps.  The five-TEX, five-varying, six-slot and
+simultaneously live physical temps.  The five-TEX, five-varying, five-slot and
 16-constant figures above are exact independently of that later compiler
 proof.
 
