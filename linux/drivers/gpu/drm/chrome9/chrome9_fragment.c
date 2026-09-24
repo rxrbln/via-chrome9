@@ -1792,6 +1792,157 @@ static int chrome9_fragment_primary_selftest(
 	return 0;
 }
 
+static struct drm_chrome9_fragment_source
+chrome9_fragment_scalar_source(u8 file, u8 index)
+{
+	return (struct drm_chrome9_fragment_source) {
+		file, index,
+		{ DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+		  DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+		  DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO,
+		  DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO }, 0, 0,
+	};
+}
+
+static int chrome9_fragment_sqrt_chain_selftest(
+	struct chrome9_fragment_program *program)
+{
+	static const u32 expected_alu[][4] = {
+		{ 0x0140b6d0, 0xd008016d, 0x0012c016, 0x00000020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd000116d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0x801c0053, 0x001000b6, 0x00070060 },
+		{ 0x01c00530, 0x801c0053, 0x001001b6, 0x00060020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd008016d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd000116d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0x801c0053, 0x001000b6, 0x00070060 },
+		{ 0x01c00530, 0x801c0053, 0x001001b6, 0x00060020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd008016d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd000116d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0x801c0053, 0x001000b6, 0x00070060 },
+		{ 0x01c00530, 0x801c0053, 0x001001b6, 0x00060020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd008016d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd000116d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0x801c0053, 0x001000b6, 0x00070060 },
+		{ 0x01c00530, 0x801c0053, 0x001001b6, 0x00060020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd008016d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0xd01c0053, 0x00100016, 0x000e0060 },
+		{ 0x0140b6d0, 0xd000116d, 0x00100116, 0x00000020 },
+		{ 0x01c00530, 0x801c0053, 0x001000b6, 0x00070060 },
+		{ 0x01c00530, 0x801c0053, 0x001001b6, 0x00060020 },
+		{ 0x01c00530, 0xd01c0053, 0x00120016, 0x000e0060 },
+		{ 0x01c00530, 0x001c0053, 0x00f20100, 0x000d0820 },
+	};
+	static const u32 constants[] = { 0x40400000, 0, 0, 0 };
+	struct drm_chrome9_fragment_instruction instructions[31] = { 0 };
+	struct drm_chrome9_fragment_source scalar =
+		chrome9_fragment_scalar_source(DRM_CHROME9_FRAGMENT_FILE_VARYING,
+					       0);
+	const struct drm_chrome9_fragment_source constant =
+		chrome9_fragment_scalar_source(DRM_CHROME9_FRAGMENT_FILE_CONSTANT,
+					       0);
+	const struct drm_chrome9_fragment_source zero = { 0 };
+	unsigned int instruction = 0;
+	u8 temporary = 0;
+	unsigned int step;
+	int ret;
+
+	/* Match the source-shaped five-step function-medium chain.  All scalar
+	 * sources use X000, as in the production object; only the terminal MOV
+	 * deliberately replicates X to the four color lanes.
+	 */
+	for (step = 0; step < 5; step++) {
+		struct drm_chrome9_fragment_source result;
+
+		instructions[instruction++] =
+			(struct drm_chrome9_fragment_instruction) {
+				.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+				.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP,
+					 temporary, 0x1, 0 },
+				.src = { scalar, constant, zero },
+			};
+		result = chrome9_fragment_scalar_source(
+			DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary++);
+		instructions[instruction++] =
+			(struct drm_chrome9_fragment_instruction) {
+				.op = DRM_CHROME9_FRAGMENT_OP_FRC,
+				.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP,
+					 temporary, 0x1, 0 },
+				.src = { result, zero, zero },
+			};
+		scalar = chrome9_fragment_scalar_source(
+			DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary++);
+		instructions[instruction++] =
+			(struct drm_chrome9_fragment_instruction) {
+				.op = DRM_CHROME9_FRAGMENT_OP_MUL,
+				.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP,
+					 temporary, 0x1, 0 },
+				.src = { scalar, scalar, zero },
+			};
+		result = chrome9_fragment_scalar_source(
+			DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary++);
+		instructions[instruction++] =
+			(struct drm_chrome9_fragment_instruction) {
+				.op = DRM_CHROME9_FRAGMENT_OP_RSQ,
+				.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP,
+					 temporary, 0x1, 0 },
+				.src = { result, zero, zero },
+			};
+		result = chrome9_fragment_scalar_source(
+			DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary++);
+		instructions[instruction++] =
+			(struct drm_chrome9_fragment_instruction) {
+				.op = DRM_CHROME9_FRAGMENT_OP_RCP,
+				.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP,
+					 temporary, 0x1, 0 },
+				.src = { result, zero, zero },
+			};
+		result = chrome9_fragment_scalar_source(
+			DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary++);
+		instructions[instruction++] =
+			(struct drm_chrome9_fragment_instruction) {
+				.op = DRM_CHROME9_FRAGMENT_OP_FRC,
+				.dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP,
+					 temporary, 0x1, 0 },
+				.src = { result, zero, zero },
+			};
+		scalar = chrome9_fragment_scalar_source(
+			DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary++);
+	}
+	instructions[instruction++] =
+		(struct drm_chrome9_fragment_instruction) {
+			.op = DRM_CHROME9_FRAGMENT_OP_MOV,
+			.dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+			.src = {{
+				DRM_CHROME9_FRAGMENT_FILE_TEMP, temporary - 1,
+				{ DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				  DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				  DRM_CHROME9_FRAGMENT_SWIZZLE_X,
+				  DRM_CHROME9_FRAGMENT_SWIZZLE_X }, 0, 0,
+			}},
+		};
+	if (instruction != ARRAY_SIZE(instructions) || temporary != 30)
+		return -EINVAL;
+	ret = chrome9_fragment_compile(instructions, ARRAY_SIZE(instructions),
+		constants, 1, 0, 1, program);
+	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
+	    program->tau_count || program->active_texture_count != 1 ||
+	    program->varying_count != 1 || program->varying_width[0] != 1 ||
+	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
+	    program->controls[0] != 0x90058001 ||
+	    program->controls[1] != 0x91000000 ||
+	    program->controls[2] != 0x9200001f)
+		return -EINVAL;
+	return 0;
+}
+
 int chrome9_fragment_selftest(void)
 {
 	static const struct drm_chrome9_fragment_instruction computed[] = {
@@ -2260,6 +2411,9 @@ int chrome9_fragment_selftest(void)
 	if (ret)
 		goto out;
 	ret = chrome9_fragment_primary_selftest(program);
+	if (ret)
+		goto out;
+	ret = chrome9_fragment_sqrt_chain_selftest(program);
 	if (ret)
 		goto out;
 	ret = chrome9_fragment_compile(computed, ARRAY_SIZE(computed), constants,
