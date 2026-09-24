@@ -101,6 +101,85 @@ lamp record count, physical high-water, A90--A92 controls, the shared condition
 being emitted once, and rejection when any triangle vertex violates the
 recorded input-domain requirement.
 
+### Exact bounded replay and first resource gate
+
+That replay is now complete against the 141-line current capture.  The copied
+capture has SHA-256
+`eccffdeee025eeeda4d6e6f9115c706c5012f089a524f74d96569931d8d13880`;
+it is Mesa root `a854407` with Chrome9 nested commit `3ecbc20`.  Its post-inline
+arithmetic and dependency order were rebuilt with the three uniforms retaining
+distinct UBO bases 0, 1, and 2.  An offline-only `ffract`/`fge` surrogate made
+the existing compiler emit the same one-scalar-to-three-vec3-select graph.  The
+complete surrogate compiler transcript has SHA-256
+`96dc3b56687a071e24cb649fa2161fb208fcc6f494080616338fe166062acc76`.
+The surrogate is only a scheduling instrument: it is not an FEQ semantic
+claim and is not production code.
+
+Replacing its one FRC, three per-select SUB conditions, and three CMP records
+with the reviewed shared condition gives the exact bounded stream:
+
+```text
+ABS  qabs, T1.zzzz
+SUB  qneg, c31.zzzz, qabs.xxxx
+CMP  light0.xyz, qneg.xxxx, light0_minus_position.xyz, light0.xyz
+CMP  light1.xyz, qneg.xxxx, light1_minus_position.xyz, light1.xyz
+CMP  light2.xyz, qneg.xxxx, light2_minus_position.xyz, light2.xyz
+```
+
+Here c31.z is exact zero; `T1.z` is the captured packed
+`vertex_position.w`.  The remaining stream is unchanged, including three
+five-MUL POW20 chains and the current source-fneg-to-MUL treatment.  Its exact
+semantic census is:
+
+| operation | records |
+|---|---:|
+| MOV | 2 |
+| MUL | 38 |
+| ADD | 12 |
+| SUB | 1 |
+| MAX | 6 |
+| DP3 | 13 |
+| RSQ | 4 |
+| ABS | 1 |
+| CMP | 3 |
+| **total** | **80** |
+
+There are zero TEX records.  The three direct varyings have widths 4, 4, and
+2 and mask `0x07`.  UBO constants c0--c2 plus immediates c29--c31 give
+constant mask `0xe0000007` and constant high-water 32.  Every record remains
+inside the constant-port rule.  Thus neither the 96-ALU limit, the 32-constant
+limit, varying linkage, nor texture capacity is the first failure.
+
+The allocate-before-releasing-last-use replay reaches ten simultaneously live
+whole-register temporaries and physical high-water ten (p0--p9), still inside
+the recovered twelve-register physical file.  The current kernel nevertheless
+fails sooner.  At zero-based bounded record 29, the second light's
+`RSQ t38, t39.x` allocates the ninth live temporary to p8.  At allocation time
+the live set is:
+
+```text
+t10:p1  shared equality condition       t12:p0  shared -position
+t8:p2   first-light direction            t20:p4  normalized normal
+t23:p3  packed eye vector                t28:p6  first POW/accumulator value
+t37:p7  second-light selected vector     t39:p5  its DP3 length
+t38:p8  new second-light RSQ result
+```
+
+`chrome9_fragment_resource_note_destination()` indexes an eight-entry
+resource array and returns `-E2BIG` for destination id p8.  This is the first
+deterministic capacity blocker; the encoder never reaches the later ten-live
+peak or finalizes controls.  A different physical choice cannot help this
+record under the current whole-register allocator because nine values are live
+under its allocate-before-release rule.
+
+If a generic resource representation and schedule first admit p8/p9, the
+projected no-bucket controls are `A90=90040007`, `A91=91000000`, and
+`A92=92000050`.  They are a projection, not current kernel output: the present
+encoder returns before writing the final controls.  The next implementation
+gate is therefore generic scheduling/recomputation or a proven extension of
+the resource analyzer, followed by this complete 80-record replay.  Raising an
+advertised ALU cap or adding a lamp/shader identity would not fix the failure.
+
 ## Exact captured NIR contract
 
 The post-option lamp NIR is `/tmp/ideas-lamp-post.nir`, SHA-256
