@@ -275,6 +275,7 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		chrome9_fb_destroy(&chrome9_fb->base);
 		return ERR_PTR(-EINVAL);
 	}
+	chrome9_bo_force_implicit(obj);
 
 	return &chrome9_fb->base;
 }

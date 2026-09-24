@@ -130,6 +130,12 @@ MODULE_PARM_DESC(hw_tcl,
  * Debug: fragment/TCL job phase profile.  With profile=N every N jobs log
  * the average microseconds per phase.  Single-client measurement only.
  */
+/* Debug: non-zero VRAM offset receives fragment job color writes instead of
+ * the SF destination (local frame buffer fill-rate measurement). */
+static ulong chrome9_vram_target_test;
+module_param_named(vram_target_test, chrome9_vram_target_test, ulong, 0600);
+MODULE_PARM_DESC(vram_target_test, "Debug: VRAM offset for fragment color writes");
+
 static uint chrome9_profile;
 module_param_named(profile, chrome9_profile, uint, 0600);
 MODULE_PARM_DESC(profile, "Debug: log fragment job phase times every N jobs");
@@ -3031,6 +3037,11 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 	vs_control[0] = 0x60800000 | (3 + program->varying_count);
 	destination_state[0] = 0x50000000 | (target >> 8);
 	destination_state[1] = 0x51100000;
+	if (READ_ONCE(chrome9_vram_target_test)) {
+		destination_state[0] = 0x50000000 |
+			(READ_ONCE(chrome9_vram_target_test) >> 8);
+		destination_state[1] = 0x51000000;
+	}
 	destination_state[2] = 0x52000000 |
 		(rt_format->a52_format << 16) | (request->pitch >> 5);
 	if (blend) {
@@ -4505,6 +4516,39 @@ static void chrome9_flush_map_guards(struct iosys_map *map, u64 size)
 	chrome9_cache_flush((u8 *)map->vaddr + size - PAGE_SIZE, PAGE_SIZE);
 }
 
+/*
+ * Invalidate lines older than the device's writes (caller holds the resv
+ * lock) and optionally leave the explicit protocol.
+ */
+static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo)
+{
+	struct iosys_map map;
+	int ret;
+
+	if (!bo->device_written)
+		return 0;
+	ret = drm_gem_shmem_vmap_locked(&bo->base, &map);
+	if (ret)
+		return ret;
+	if (!map.is_iomem)
+		chrome9_cache_flush(map.vaddr, bo->base.base.size);
+	drm_gem_shmem_vunmap_locked(&bo->base, &map);
+	bo->device_written = false;
+	return 0;
+}
+
+/* KMS scanout reads the pages without announcing CPU or device access. */
+void chrome9_bo_force_implicit(struct drm_gem_object *obj)
+{
+	struct chrome9_bo *bo = to_chrome9_bo(obj);
+
+	dma_resv_lock(obj->resv, NULL);
+	chrome9_bo_cpu_sync_locked(bo);
+	bo->explicit_access = false;
+	bo->cpu_dirty = true;
+	dma_resv_unlock(obj->resv);
+}
+
 int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {
@@ -4513,7 +4557,6 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 			    DRM_CHROME9_GEM_CPU_PREPARE_WRITE;
 	struct drm_gem_object *obj;
 	struct chrome9_bo *bo;
-	struct iosys_map map;
 	long wait;
 	int ret;
 
@@ -4541,15 +4584,10 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 		goto out_unlock;
 	}
 	/* Invalidate lines that may predate the device's writes. */
-	if (bo->device_written &&
-	    args->flags & (prepare | DRM_CHROME9_GEM_CPU_IMPLICIT)) {
-		ret = drm_gem_shmem_vmap_locked(&bo->base, &map);
+	if (args->flags & (prepare | DRM_CHROME9_GEM_CPU_IMPLICIT)) {
+		ret = chrome9_bo_cpu_sync_locked(bo);
 		if (ret)
 			goto out_unlock;
-		if (!map.is_iomem)
-			chrome9_cache_flush(map.vaddr, obj->size);
-		drm_gem_shmem_vunmap_locked(&bo->base, &map);
-		bo->device_written = false;
 	}
 	if (args->flags & (DRM_CHROME9_GEM_CPU_PREPARE_WRITE |
 			   DRM_CHROME9_GEM_CPU_EXPLICIT))
