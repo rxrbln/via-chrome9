@@ -52,6 +52,10 @@ _Static_assert(sizeof(struct drm_chrome9_fragment_texture_state) == 176,
                "Chrome9 fragment texture ABI size");
 _Static_assert(sizeof(struct drm_chrome9_draw_fragment_program) == 184,
                "Chrome9 fragment draw ABI size");
+_Static_assert(sizeof(struct drm_chrome9_vertex_instruction) == 32,
+               "Chrome9 vertex instruction ABI size");
+_Static_assert(sizeof(struct drm_chrome9_draw_vertex_program) == 344,
+               "Chrome9 vertex draw ABI size");
 
 bool
 chrome9_get_param(int fd, uint32_t param, uint64_t *value)
@@ -247,6 +251,13 @@ chrome9_draw_fragment_program(
       return true;
    chrome9_dump_failed_fragment_program(draw, errno);
    return false;
+}
+
+bool
+chrome9_draw_vertex_program(
+   int fd, const struct drm_chrome9_draw_vertex_program *draw)
+{
+   return draw && ioctl(fd, DRM_IOCTL_CHROME9_DRAW_VERTEX_PROGRAM, draw) == 0;
 }
 
 bool

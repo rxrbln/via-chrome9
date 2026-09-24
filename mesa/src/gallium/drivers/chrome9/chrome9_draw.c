@@ -799,6 +799,39 @@ chrome9_stencil_active(const struct chrome9_context *ctx)
    return ctx->dsa && ctx->dsa->stencil[0].enabled;
 }
 
+static uint32_t
+chrome9_draw_depth_flags(const struct chrome9_context *ctx, bool depth_active)
+{
+   uint32_t depth_flags = 0;
+
+   if (depth_active && !ctx->dsa->depth_enabled) {
+      depth_flags = DRM_CHROME9_DEPTH_FUNC(DRM_CHROME9_COMPARE_ALWAYS) |
+                    DRM_CHROME9_DEPTH_READ_ONLY;
+   } else if (depth_active) {
+      if (ctx->depth_func_supported || ctx->depth_equal_supported ||
+          ctx->depth_always_supported)
+         depth_flags = DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
+      if (!ctx->dsa->depth_writemask)
+         depth_flags |= DRM_CHROME9_DEPTH_READ_ONLY;
+   }
+   return depth_flags;
+}
+
+static void
+chrome9_draw_scissor(const struct chrome9_context *ctx,
+                     const struct chrome9_resource *target,
+                     struct drm_chrome9_scissor_state *scissor)
+{
+   memset(scissor, 0, sizeof(*scissor));
+   if (ctx->rasterizer && ctx->rasterizer->scissor) {
+      scissor->flags = DRM_CHROME9_SCISSOR_ENABLE;
+      scissor->min_x = MIN2(ctx->scissor.minx, target->base.width0);
+      scissor->max_x = MIN2(ctx->scissor.maxx, target->base.width0);
+      scissor->min_y = MIN2(ctx->scissor.miny, target->base.height0);
+      scissor->max_y = MIN2(ctx->scissor.maxy, target->base.height0);
+   }
+}
+
 static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
@@ -1341,50 +1374,33 @@ chrome9_triangle_stencil(const struct chrome9_context *ctx,
    state->ccw = native;
 }
 
+/* Everything of a generic cmd22 request except its vertices and stencil
+ * faces; shared by the post-TNL batches and the hardware TCL path. */
 static bool
-chrome9_queue_generic_triangle(
-   struct chrome9_vbuf_render *crender, const unsigned indices[3],
-   struct chrome9_resource *target, struct chrome9_resource *depth,
+chrome9_generic_fragment_state(
+   struct chrome9_vbuf_render *crender, struct chrome9_resource *target,
+   struct chrome9_resource *depth,
    struct chrome9_resource *textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
    struct chrome9_sampler_state *samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
    bool depth_active, bool blend_active,
    const struct drm_chrome9_blend_state *blend,
    const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
-   bool *queued)
-{
+   struct drm_chrome9_draw_fragment_program *draw,
    struct drm_chrome9_fragment_instruction
-      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS],
+   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4],
    struct drm_chrome9_fragment_texture_state
-      texture_state[DRM_CHROME9_FRAGMENT_MAX_TEXTURES] = { 0 };
-   struct drm_chrome9_fragment_vertex vertices[3] = { 0 };
-   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+      texture_state[DRM_CHROME9_FRAGMENT_MAX_TEXTURES])
+{
    uint8_t depth_swizzle[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
    uint8_t depth_sampler_mask = 0;
-   struct drm_chrome9_draw_fragment_program draw = { 0 };
    const unsigned constant_count = crender->ctx->fs->semantic_constant_mask ?
       32 - __builtin_clz(crender->ctx->fs->semantic_constant_mask) : 0;
    unsigned instruction_count;
-   const float pixel_center_bias = crender->ctx->rasterizer &&
-      crender->ctx->rasterizer->half_pixel_center ? 0.5f : 0.0f;
-   const bool primary = crender->ctx->fs->semantic_input_mask == 1;
 
-   *queued = false;
-   /* The laboratory draw limit applies to cmd22 as well as the older
-    * immediate paths.  Include deferred batches: none has been submitted
-    * yet, but each already consumes one slot in this draw's limit. */
-   if (crender->ctx->draw_limit &&
-       crender->ctx->submitted_triangles + crender->deferred_triangles +
-          crender->batch_count >= crender->ctx->draw_limit) {
-      if (!crender->ctx->draw_limit_reported) {
-         fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
-                         " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
-                 crender->ctx->submitted_triangles +
-                    crender->deferred_triangles + crender->batch_count,
-                 crender->ctx->draw_limit);
-         crender->ctx->draw_limit_reported = true;
-      }
-      return true;
-   }
+   memset(draw, 0, sizeof(*draw));
+   memset(texture_state, 0,
+          DRM_CHROME9_FRAGMENT_MAX_TEXTURES * sizeof(*texture_state));
    if (!chrome9_fragment_build_instructions(
           &crender->ctx->fs->semantic_fs_ir,
           crender->ctx->fs->semantic_sampler_mask, instructions,
@@ -1476,6 +1492,95 @@ chrome9_queue_generic_triangle(
             textures[unit]->level_stride[level];
       }
    }
+   draw->destination_handle = target->bo.handle;
+   draw->depth_handle = depth_active ? depth->bo.handle : 0;
+   draw->flags = (depth_active ? DRM_CHROME9_FRAGMENT_DEPTH | depth_flags : 0) |
+                (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
+   if (depth_active && chrome9_stencil_active(crender->ctx))
+      draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+   if (target->base.last_level) {
+      if (!target->guarded ||
+          !chrome9_screen_has_capability(
+             crender->ctx->base.screen,
+             DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))
+         return false;
+      draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
+   }
+   /* The count and user pointers are filled only when the batch is flushed.
+    * Keeping them zero makes the rest of this structure a comparable state
+    * key, including target, depth, blend and scissor state. */
+   draw->width = target->base.width0;
+   draw->height = target->base.height0;
+   draw->destination_pitch = target->stride;
+   draw->depth_pitch = depth_active ? depth->stride : 0;
+   draw->destination_format =
+      target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+      DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+      DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+   draw->depth_format = depth_active ?
+      (chrome9_format_is_d24(depth->base.format) ?
+       DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 : DRM_CHROME9_FRAGMENT_DEPTH_D16) :
+      0;
+   draw->instruction_count = instruction_count;
+   draw->constant_count = constant_count;
+   draw->texture_count = crender->texture_count;
+   draw->varying_count = crender->varying_count;
+   draw->abi_version = chrome9_fragment_uses_sparse_abi(crender->ctx) ?
+      DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES :
+      DRM_CHROME9_FRAGMENT_ABI_VERSION;
+   if (blend_active)
+      draw->blend = *blend;
+   draw->scissor = *scissor;
+   return true;
+}
+
+static bool
+chrome9_queue_generic_triangle(
+   struct chrome9_vbuf_render *crender, const unsigned indices[3],
+   struct chrome9_resource *target, struct chrome9_resource *depth,
+   struct chrome9_resource *textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+   struct chrome9_sampler_state *samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+   bool depth_active, bool blend_active,
+   const struct drm_chrome9_blend_state *blend,
+   const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
+   bool *queued)
+{
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   struct drm_chrome9_fragment_texture_state
+      texture_state[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   struct drm_chrome9_fragment_vertex vertices[3] = { 0 };
+   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+   struct drm_chrome9_draw_fragment_program draw;
+   unsigned constant_count;
+   unsigned instruction_count;
+   const float pixel_center_bias = crender->ctx->rasterizer &&
+      crender->ctx->rasterizer->half_pixel_center ? 0.5f : 0.0f;
+   const bool primary = crender->ctx->fs->semantic_input_mask == 1;
+
+   *queued = false;
+   /* The laboratory draw limit applies to cmd22 as well as the older
+    * immediate paths.  Include deferred batches: none has been submitted
+    * yet, but each already consumes one slot in this draw's limit. */
+   if (crender->ctx->draw_limit &&
+       crender->ctx->submitted_triangles + crender->deferred_triangles +
+          crender->batch_count >= crender->ctx->draw_limit) {
+      if (!crender->ctx->draw_limit_reported) {
+         fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
+                         " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
+                 crender->ctx->submitted_triangles +
+                    crender->deferred_triangles + crender->batch_count,
+                 crender->ctx->draw_limit);
+         crender->ctx->draw_limit_reported = true;
+      }
+      return true;
+   }
+   if (!chrome9_generic_fragment_state(crender, target, depth, textures,
+          samplers, depth_active, blend_active, blend, scissor, depth_flags,
+          &draw, instructions, constants, texture_state))
+      return false;
+   instruction_count = draw.instruction_count;
+   constant_count = draw.constant_count;
    for (unsigned i = 0; i < 3; i++) {
       const float *source;
 
@@ -1547,47 +1652,8 @@ chrome9_queue_generic_triangle(
       if (!chrome9_triangle_nondegenerate(x, y))
          return true;
    }
-   draw.destination_handle = target->bo.handle;
-   draw.depth_handle = depth_active ? depth->bo.handle : 0;
-   draw.flags = (depth_active ? DRM_CHROME9_FRAGMENT_DEPTH | depth_flags : 0) |
-                (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
-   if (depth_active && chrome9_stencil_active(crender->ctx)) {
-      draw.flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+   if (depth_active && chrome9_stencil_active(crender->ctx))
       chrome9_triangle_stencil(crender->ctx, vertices, &draw.stencil);
-   }
-   if (target->base.last_level) {
-      if (!target->guarded ||
-          !chrome9_screen_has_capability(
-             crender->ctx->base.screen,
-             DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))
-         return false;
-      draw.flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
-   }
-   /* The count and user pointers are filled only when the batch is flushed.
-    * Keeping them zero makes the rest of this structure a comparable state
-    * key, including target, depth, blend and scissor state. */
-   draw.width = target->base.width0;
-   draw.height = target->base.height0;
-   draw.destination_pitch = target->stride;
-   draw.depth_pitch = depth_active ? depth->stride : 0;
-   draw.destination_format =
-      target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
-      DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
-      DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
-   draw.depth_format = depth_active ?
-      (chrome9_format_is_d24(depth->base.format) ?
-       DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 : DRM_CHROME9_FRAGMENT_DEPTH_D16) :
-      0;
-   draw.instruction_count = instruction_count;
-   draw.constant_count = constant_count;
-   draw.texture_count = crender->texture_count;
-   draw.varying_count = crender->varying_count;
-   draw.abi_version = chrome9_fragment_uses_sparse_abi(crender->ctx) ?
-      DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES :
-      DRM_CHROME9_FRAGMENT_ABI_VERSION;
-   if (blend_active)
-      draw.blend = *blend;
-   draw.scissor = *scissor;
    if (crender->batch_count &&
        (!crender->batch_generic_program ||
         memcmp(&crender->batch_fragment, &draw, sizeof(draw)) ||
@@ -2156,16 +2222,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       (ctx->draw_triangle_d16_rhw_batch ||
        ctx->draw_triangle_d16_rhw_run ||
        ctx->draw_triangle_d16_rhw_chain);
-   if (depth_active && !ctx->dsa->depth_enabled) {
-      depth_flags = DRM_CHROME9_DEPTH_FUNC(DRM_CHROME9_COMPARE_ALWAYS) |
-                    DRM_CHROME9_DEPTH_READ_ONLY;
-   } else if (depth_active) {
-      if (ctx->depth_func_supported || ctx->depth_equal_supported ||
-          ctx->depth_always_supported)
-         depth_flags = DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
-      if (!ctx->dsa->depth_writemask)
-         depth_flags |= DRM_CHROME9_DEPTH_READ_ONLY;
-   }
+   depth_flags = chrome9_draw_depth_flags(ctx, depth_active);
    if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program) &&
        !chrome9_fragment_constant_color(ctx, &constant_color)) {
       CHROME9_REJECT(ctx, 1);
@@ -2191,13 +2248,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       CHROME9_REJECT(ctx, 1);
       return;
    }
-   if (ctx->rasterizer && ctx->rasterizer->scissor) {
-      scissor.flags = DRM_CHROME9_SCISSOR_ENABLE;
-      scissor.min_x = MIN2(ctx->scissor.minx, target->base.width0);
-      scissor.max_x = MIN2(ctx->scissor.maxx, target->base.width0);
-      scissor.min_y = MIN2(ctx->scissor.miny, target->base.height0);
-      scissor.max_y = MIN2(ctx->scissor.maxy, target->base.height0);
-   }
+   chrome9_draw_scissor(ctx, target, &scissor);
    if (crender->generic_program) {
       bool queued;
 
@@ -3414,4 +3465,131 @@ chrome9_draw_end_guarded_domain(struct chrome9_context *ctx)
       FREE(batch);
       batch = next;
    }
+}
+
+static void
+chrome9_tcl_stencil_face(const struct chrome9_context *ctx, unsigned face,
+                         struct drm_chrome9_stencil_face *native)
+{
+   static const uint8_t native_op[8] = {
+      [PIPE_STENCIL_OP_KEEP] = DRM_CHROME9_STENCIL_OP_KEEP,
+      [PIPE_STENCIL_OP_ZERO] = DRM_CHROME9_STENCIL_OP_ZERO,
+      [PIPE_STENCIL_OP_REPLACE] = DRM_CHROME9_STENCIL_OP_REPLACE,
+      [PIPE_STENCIL_OP_INCR] = DRM_CHROME9_STENCIL_OP_INCR_SAT,
+      [PIPE_STENCIL_OP_DECR] = DRM_CHROME9_STENCIL_OP_DECR_SAT,
+      [PIPE_STENCIL_OP_INCR_WRAP] = DRM_CHROME9_STENCIL_OP_INCR_WRAP,
+      [PIPE_STENCIL_OP_DECR_WRAP] = DRM_CHROME9_STENCIL_OP_DECR_WRAP,
+      [PIPE_STENCIL_OP_INVERT] = DRM_CHROME9_STENCIL_OP_INVERT,
+   };
+   const struct pipe_stencil_state *s = &ctx->dsa->stencil[face];
+
+   native->func = s->func;
+   native->fail_op = native_op[s->fail_op & 7];
+   native->zfail_op = native_op[s->zfail_op & 7];
+   native->zpass_op = native_op[s->zpass_op & 7];
+   native->ref = ctx->stencil_ref.ref_value[face];
+   native->value_mask = s->valuemask;
+   native->write_mask = s->writemask;
+}
+
+/*
+ * Resolve the complete pixel state of a hardware TCL draw.  Screen
+ * winding follows chrome9_triangle_stencil(): front faces are CCW in
+ * window coordinates when front_ccw is set.
+ */
+bool
+chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
+                          struct chrome9_tcl_fragment *fragment,
+                          const char **why)
+{
+   struct chrome9_vbuf_render *crender = ctx->vbuf_render;
+   bool saved_generic;
+   uint8_t saved_varyings, saved_textures;
+   struct chrome9_resource *target = NULL, *depth = NULL;
+   struct chrome9_resource *textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   struct chrome9_sampler_state *samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   struct drm_chrome9_blend_state blend = { 0 };
+   struct drm_chrome9_scissor_state scissor;
+   const char *reason = NULL;
+   bool depth_active = false, blend_successor = false, ok = false;
+
+   *why = "no generic fragment program";
+   if (!crender || !chrome9_use_generic_fragment_program(ctx))
+      return false;
+   chrome9_flush_triangle_batch(crender);
+   *why = "failed batch";
+   if (crender->batch_failed)
+      return false;
+   /* Borrow the vbuf layout fields the shared state builder reads. */
+   saved_generic = crender->generic_program;
+   saved_varyings = crender->varying_count;
+   saved_textures = crender->texture_count;
+   crender->generic_program = true;
+   crender->varying_count = ctx->fs->semantic_varying_mask ?
+      32 - __builtin_clz(ctx->fs->semantic_varying_mask) : 0;
+   crender->texture_count = ctx->fragment_sparse_textures ?
+      __builtin_popcount(ctx->fs->semantic_sampler_mask) :
+      chrome9_fragment_sampler_high_water(ctx->fs->semantic_sampler_mask);
+   if (!chrome9_draw_state_supported(ctx, &target, &depth, textures,
+                                     samplers, crender->texture_count,
+                                     &depth_active, &blend,
+                                     &blend_successor, &reason)) {
+      *why = reason ? reason : "draw state";
+      goto out;
+   }
+   *why = "fragment program state";
+   chrome9_draw_scissor(ctx, target, &scissor);
+   if (!chrome9_generic_fragment_state(crender, target, depth, textures,
+          samplers, depth_active, blend_successor, &blend, &scissor,
+          chrome9_draw_depth_flags(ctx, depth_active), &fragment->draw,
+          fragment->instructions, fragment->constants, fragment->textures))
+      goto out;
+   if (fragment->draw.flags & DRM_CHROME9_FRAGMENT_STENCIL) {
+      const bool front_ccw = ctx->rasterizer && ctx->rasterizer->front_ccw;
+      const unsigned back = ctx->dsa->stencil[1].enabled ? 1 : 0;
+
+      chrome9_tcl_stencil_face(ctx, 0, front_ccw ? &fragment->draw.stencil.ccw :
+                                                   &fragment->draw.stencil.cw);
+      chrome9_tcl_stencil_face(ctx, back, front_ccw ?
+                               &fragment->draw.stencil.cw :
+                               &fragment->draw.stencil.ccw);
+   }
+   ok = true;
+out:
+   crender->generic_program = saved_generic;
+   crender->varying_count = saved_varyings;
+   crender->texture_count = saved_textures;
+   return ok;
+}
+
+bool
+chrome9_draw_tcl_submit(struct chrome9_context *ctx,
+                        const struct chrome9_tcl_fragment *fragment,
+                        struct drm_chrome9_draw_vertex_program *draw,
+                        unsigned triangles)
+{
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+
+   draw->fragment = fragment->draw;
+   draw->fragment.instructions_ptr = (uintptr_t)fragment->instructions;
+   draw->fragment.constants_ptr = fragment->draw.constant_count ?
+      (uintptr_t)fragment->constants : 0;
+   draw->fragment.textures_ptr = fragment->draw.texture_count ?
+      (uintptr_t)fragment->textures : 0;
+   chrome9_context_prepare_render_target(ctx);
+   if (!chrome9_draw_vertex_program(fd, draw)) {
+      /* The caller falls back or accounts the rejected triangles. */
+      if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
+         fprintf(stderr, "chrome9: DRAW_VERTEX_PROGRAM failed after=%" PRIu64
+                         " count=%u: %s\n", ctx->submitted_triangles,
+                 triangles, strerror(errno));
+         ctx->warnings |= CHROME9_WARN_SUBMIT;
+      }
+      return false;
+   }
+   ctx->submitted_triangles += triangles;
+   ctx->submitted_batches++;
+   ctx->submitted_program_batches++;
+   chrome9_context_render_target_written(ctx);
+   return true;
 }

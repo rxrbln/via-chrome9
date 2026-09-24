@@ -14,6 +14,7 @@ libchrome9 = static_library(
     'chrome9_ps_schedule.c',
     'chrome9_shader_offline.c',
     'chrome9_specialise.c',
+    'chrome9_tcl.c',
     'chrome9_vs_texture.c',
   ),
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],

@@ -42,6 +42,8 @@ bool chrome9_draw_triangle_d16_rhw_chain(
 bool chrome9_draw_program_triangle_d16_rhw_batch(
    int fd,
    const struct drm_chrome9_draw_program_triangle_d16_rhw_batch *draw);
+bool chrome9_draw_vertex_program(
+   int fd, const struct drm_chrome9_draw_vertex_program *draw);
 bool chrome9_draw_fragment_program(
    int fd, const struct drm_chrome9_draw_fragment_program *draw);
 bool chrome9_draw_textured_triangle(

@@ -5,6 +5,7 @@
 #include "chrome9_context.h"
 
 #include "chrome9_draw.h"
+#include "chrome9_tcl.h"
 #include "chrome9_drm.h"
 #include "chrome9_format.h"
 #include "chrome9_fragment.h"
@@ -379,9 +380,13 @@ chrome9_create_vs_state(struct pipe_context *pipe,
 
    if (!shader)
       return NULL;
+   /* Clone before draw takes the NIR; TCL compiles it lazily. */
+   if (ctx->tcl_enabled && state->type == PIPE_SHADER_IR_NIR && state->ir.nir)
+      shader->tcl = chrome9_tcl_shader_create(state->ir.nir);
    shader->draw = draw_create_vertex_shader(ctx->draw, state);
    shader->supported = shader->draw != NULL;
    if (!shader->draw) {
+      chrome9_tcl_shader_destroy(shader->tcl);
       FREE(shader);
       return NULL;
    }
@@ -411,6 +416,7 @@ chrome9_delete_vs_state(struct pipe_context *pipe, void *state)
       draw_bind_vertex_shader(ctx->draw, NULL);
    }
    draw_delete_vertex_shader(ctx->draw, shader->draw);
+   chrome9_tcl_shader_destroy(shader->tcl);
    FREE(shader);
 }
 
@@ -6056,6 +6062,8 @@ chrome9_set_viewport_states(struct pipe_context *pipe, unsigned start,
                             unsigned count,
                             const struct pipe_viewport_state *viewports)
 {
+   if (!start && count)
+      chrome9_context(pipe)->viewport = viewports[0];
    draw_set_viewport_states(chrome9_context(pipe)->draw, start, count,
                             viewports);
 }
@@ -6384,6 +6392,8 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
 
    chrome9_refresh_vs_textures(ctx);
+   if (chrome9_tcl_draw(ctx, info, &draws[0]))
+      return;
 
    for (unsigned i = 0; i < ctx->num_vertex_buffers; i++) {
       const struct pipe_vertex_buffer *vb = &ctx->vertex_buffers[i];
@@ -6449,6 +6459,12 @@ chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
    chrome9_report_rejects(ctx);
+   if (ctx->tcl_enabled && !(++ctx->tcl_flushes % 16) &&
+       debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " fallback draws=%"
+                      PRIu64 " all triangles=%" PRIu64 "\n",
+              ctx->tcl_triangles, ctx->tcl_fallback_draws,
+              ctx->submitted_triangles);
    (void)flags;
    /* DRAW_TRIANGLE completes synchronously. */
    if (fence)
@@ -6506,6 +6522,11 @@ chrome9_context_destroy(struct pipe_context *pipe)
    chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
    chrome9_report_rejects(ctx);
+   if (ctx->tcl_enabled && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " fallback draws=%"
+                      PRIu64 " all triangles=%" PRIu64 "\n",
+              ctx->tcl_triangles, ctx->tcl_fallback_draws,
+              ctx->submitted_triangles);
    if (ctx->reject_sites)
       _mesa_hash_table_destroy(ctx->reject_sites, NULL);
    ctx->reject_sites = NULL;
@@ -6527,6 +6548,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
    for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
       pipe_sampler_view_reference(&ctx->vs_sampler_views[i], NULL);
    chrome9_vs_texture_sampler_destroy(ctx->vs_tgsi_sampler);
+   FREE(ctx->tcl_state);
    FREE(ctx);
 }
 
@@ -6572,6 +6594,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
    ctx->fragment_sparse_textures =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES);
+   ctx->tcl_enabled = (capabilities & DRM_CHROME9_CAP_VERTEX_PROGRAM) &&
+      debug_get_bool_option("CHROME9_TCL", false);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =

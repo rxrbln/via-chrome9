@@ -88,9 +88,14 @@ struct chrome9_fs_variant {
    bool supported;
 };
 
+struct chrome9_tcl_shader;
+struct chrome9_tcl_state;
+
 struct chrome9_shader {
    void *draw;
    void *nir;
+   /* Hardware TCL form of a vertex shader, compiled on first use. */
+   struct chrome9_tcl_shader *tcl;
    struct chrome9_fs_variant *variants;
    unsigned variant_count;
    enum chrome9_fragment_program fragment_program;
@@ -230,6 +235,13 @@ struct chrome9_context {
    struct chrome9_vertex_elements *vertex_elements;
    struct pipe_scissor_state scissor;
    bool scissor_valid;
+   struct pipe_viewport_state viewport;
+   /* CHROME9_TCL=1 with DRM_CHROME9_CAP_VERTEX_PROGRAM. */
+   bool tcl_enabled;
+   struct chrome9_tcl_state *tcl_state;
+   uint64_t tcl_triangles;
+   uint64_t tcl_fallback_draws;
+   uint64_t tcl_flushes;
 
    uint64_t submitted_triangles;
    uint64_t submitted_batches;
