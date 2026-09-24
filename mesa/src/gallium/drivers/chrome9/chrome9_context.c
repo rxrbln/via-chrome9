@@ -2536,6 +2536,7 @@ struct chrome9_ps_nir_builder {
    uint32_t immediate[32][4];
    uint32_t immediate_mask;
    uint32_t uniform_mask;
+   uint8_t immediate_lane_mask[32];
    uint8_t value_count;
    uint8_t next_temp;
    uint8_t alu_count;
@@ -2644,38 +2645,62 @@ chrome9_ps_immediate(struct chrome9_ps_nir_builder *builder,
                      const uint32_t value[4], unsigned components,
                      struct chrome9_ps_source *source)
 {
+   uint32_t best_values[4] = { 0 };
+   uint8_t best_swizzle[4] = { 0 };
+   uint8_t best_mask = 0;
+   unsigned best_new_lanes = 5;
    unsigned id = 32;
 
    if (!components || components > 4)
       return false;
-   for (unsigned candidate = 16; candidate < 32; candidate++) {
-      if (!(builder->immediate_mask & (1u << candidate)))
+   for (unsigned candidate = 32; candidate-- > 16;) {
+      uint32_t packed[4];
+      uint8_t swizzle[4] = { 0 };
+      uint8_t mask = builder->immediate_lane_mask[candidate];
+      unsigned new_lanes = 0;
+      unsigned c;
+
+      /* Uniform ownership was collected before lowering any literals. */
+      if (builder->uniform_mask & (1u << candidate))
          continue;
-      if (!memcmp(builder->immediate[candidate], value,
-                  sizeof(builder->immediate[candidate]))) {
-         id = candidate;
-         break;
-      }
-   }
-   if (id == 32) {
-      for (unsigned candidate = 32; candidate-- > 16;) {
-         if (!((builder->immediate_mask | builder->uniform_mask) &
-               (1u << candidate))) {
-            id = candidate;
-            break;
+      memcpy(packed, builder->immediate[candidate], sizeof(packed));
+      for (c = 0; c < components; c++) {
+         unsigned lane;
+
+         for (lane = 0; lane < 4; lane++)
+            if ((mask & (1u << lane)) && packed[lane] == value[c])
+               break;
+         if (lane == 4) {
+            for (lane = 0; lane < 4; lane++)
+               if (!(mask & (1u << lane)))
+                  break;
+            if (lane == 4)
+               break;
+            packed[lane] = value[c];
+            mask |= 1u << lane;
+            new_lanes++;
          }
+         swizzle[c] = lane;
       }
-      if (id == 32)
-         return false;
-      memcpy(builder->immediate[id], value,
-             sizeof(builder->immediate[id]));
-      builder->immediate_mask |= 1u << id;
+      if (c == components && new_lanes < best_new_lanes) {
+         id = candidate;
+         best_new_lanes = new_lanes;
+         best_mask = mask;
+         memcpy(best_values, packed, sizeof(best_values));
+         memcpy(best_swizzle, swizzle, sizeof(best_swizzle));
+      }
    }
+   if (id == 32)
+      return false;
+   memcpy(builder->immediate[id], best_values, sizeof(best_values));
+   builder->immediate_lane_mask[id] = best_mask;
+   builder->immediate_mask |= 1u << id;
    memset(source, 0, sizeof(*source));
    source->file = CHROME9_PS_SOURCE_CONSTANT;
    source->id = id;
    for (unsigned c = 0; c < 4; c++)
-      source->swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
+      source->swizzle[c] = c < components ? best_swizzle[c] :
+                           CHROME9_PS_SWIZZLE_ZERO;
    return true;
 }
 
@@ -3371,6 +3396,7 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
    nir_tex_instr *texture;
    struct chrome9_ps_source sampled, threshold;
    struct chrome9_ps_instruction *subtract, *kill;
+   unsigned threshold_lane;
    unsigned temp;
 
    if (!condition || condition->num_components != 1)
@@ -3402,9 +3428,10 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
        !chrome9_ps_lower_def(builder, alpha.def, &sampled) ||
        !chrome9_ps_immediate(builder, half, 1, &threshold))
       return false;
+   threshold_lane = threshold.swizzle[0];
    for (unsigned c = 0; c < 4; c++) {
       sampled.swizzle[c] = CHROME9_PS_SWIZZLE_W;
-      threshold.swizzle[c] = CHROME9_PS_SWIZZLE_X;
+      threshold.swizzle[c] = threshold_lane;
    }
    temp = builder->next_temp++;
    subtract = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_SUB);
