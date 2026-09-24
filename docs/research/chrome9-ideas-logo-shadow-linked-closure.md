@@ -120,6 +120,39 @@ and terminal color MOV; it is not a Boolean ALU or fixed alpha-test alias.
 Equality survives because SUB produces zero and finite TEXKILL rejects only
 negative lanes.
 
+## Exact texture and draw-state qualification
+
+The installed scene source removes two possible ambiguities.  `logo.cc`
+creates a 32x32 unsized `GL_ALPHA` image with `GL_UNSIGNED_BYTE`, selects
+NEAREST minification/magnification, and sets both axes to REPEAT.  The current
+state tracker chooses `PIPE_FORMAT_A8_UNORM`; its canonical sampler view is
+identity and specifically has `swizzle_a=PIPE_SWIZZLE_W`.  Chrome9 native A8
+format `A30=301b0000` already decodes as `(0,0,0,A)`, so the semantic TEX
+result remains XYZW and the alpha predicate reads W.  Applying an additional
+alpha replication at the view boundary would be wrong.  For this single-level
+NEAREST/REPEAT object the sampler image is:
+
+```text
+A30=30000000 A31=31100000 A32=32000052
+```
+
+Here A32 contains repeat value two in both S and T.  The image-format A30 and
+sampler A30 live in different HParaType selector spaces.
+
+`scene-ideas.cpp` enables culling but explicitly disables depth testing before
+the `LOGO_SHADOW` draw, then re-enables depth only for the later lamp and
+normal-logo draws.  Consequently the exact shadow submission has no depth
+handle, no `DRM_CHROME9_FRAGMENT_DEPTH` flag, and no fragment-depth output.
+The recovered KILL schedule is still TEX, replicated-alpha SUB, KILL bridge,
+TEXKILL, then terminal color MOV.  The guarded A8 KILL test with D16 proves
+the stronger color-plus-depth suppression contract, but KILL/depth-write
+interaction is not an additional prerequisite for this installed draw.
+
+The exact A8 decoder, repeat sampler bits, POSITION/MISC linkage, KILL
+transition maps, and color-only destination packet are all qualified fields.
+The only unqualified item is their complete linked execution on silicon; no
+unknown register or packet field has been isolated inside that composition.
+
 ## Current implementation boundary
 
 The current clean-room tree already contains every semantic piece:
