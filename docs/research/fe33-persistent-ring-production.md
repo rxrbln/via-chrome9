@@ -12,6 +12,31 @@ The old Linux `via_chrome9_dma.c` has SHA-256
 The Windows 7 KMD `VTGKModeDX32A.sys` has SHA-256
 `618129602e2f63153987ea24e4584b961a64fe1a9013cd355449fb39876c0a56`.
 
+## Implementation status (2026-09-24)
+
+Kernel Chrome9 commit `665a532` implements the first tranche behind
+`fe33_fence=1` (default off).  Every 3D builder ends through
+`chrome9_emit_3d_tail()`: `CC000000` padding, `FE330004` with wait
+`00200000`, then the unchanged H0 sync, A1C/A1D reset, dummy and cookie.
+The 2D copy-rectangle path emits no FE33.  The slot is a dedicated
+`dma_alloc_coherent()` page (16-byte aligned, below 4 GiB, never an SF/GART
+page); IDs are nonzero, monotonic and never wrap (`-ENOSPC` at `U32_MAX`).
+`chrome9_emit_fe33()` poisons `slot[0]=~id`, writes canaries
+`5afe3301..3` and issues `dma_wmb()` before the segment is copied.
+`chrome9_wait_job()` polls the exact ID first, then cookie, PAUSE and idle.
+A timeout logs the slot, `0494` and `040c` and uses the existing quarantine;
+a canary change is only logged and counted.  The init self-test checks the
+golden vector below, the `ffffffff`/`fffffff0` extremes and all rejections.
+Engine init logs `fe33=on|off`; the first completion logs its ID and job
+kind; teardown logs `fe33=<completions>/<last id>` and canary faults.
+
+Layout check: for the largest page-staged builders (34-triangle batch with
+blend, 24-triangle textured run, D16 batch) the extra 16 bytes stay inside
+existing slack, so PAUSE/STOP do not move.  The 544-triangle D16 RHW run
+keeps its `9c70`/`9cf0` golden.
+
+Not silicon-tested.  Gates 2--6 below remain open.
+
 ## Bounded first result
 
 The first production-capable record is system-write-only `FE330004` with the

@@ -114,6 +114,19 @@ bounded scene comparison.  This covers roadmap G3's `b2f32(flt)`.
   `monotonic-command-ring.md`, `persistent-batched-submit-performance-plan.md`
   and `vendor-state-reuse-performance-audit.md`.
 
+## FE33 3D completion fence — committed, not silicon-tested
+
+Kernel `665a532` adds opt-in `fe33_fence=1`; details and remaining gates in
+[`fe33-persistent-ring-production.md`](fe33-persistent-ring-production.md).
+Built W=1 clean, checkpatch clean: SHA-256
+`d763d55710b62922c0df33edcd77708d4596f9e71f69afb3abc59c96f658a283`,
+Build ID `65becbf9f36c5499d16cc07a67e40ebb314a54de` (includes stencil
+`d76968e`).  With the parameter off the command bytes are unchanged.
+First silicon step: hand off this module with `fe33_fence=1`, run the fixed
+quad, stencil guard and sparse five-texture oracles, and require the
+`FE33 first 3D completion` line with no canary warning.  Then run the
+kind-7 discrimination ladder in `ioquake-gl1-kind7-cookie-timeout.md`.
+
 ## Next steps, in order
 
 1. Run `chrome9_gl_stencil_smoke` on the target with the matching Mesa build;
@@ -147,12 +160,12 @@ timeout; inspect and cold-boot instead.
 
 ## Repository state
 
-Committed: kernel `3926dbc`, `561cc56`; tools `a806006`, `2673e13`, `47695b0`;
+Committed: kernel `3926dbc`, `561cc56`, `d76968e` (stencil), `665a532` (FE33); tools `a806006`, `2673e13`, `47695b0`;
 Mesa Chrome9 `722d91b`, `d56f61f`; docs `469ebf9`.
 
 Uncommitted, this lane:
-- Kernel Chrome9: `chrome9_drv.c`, `chrome9_engine.c` (stencil); UAPI
-  `include/uapi/drm/chrome9_drm.h` in the untracked kernel tree.
+- Kernel UAPI `include/uapi/drm/chrome9_drm.h` (stencil) in the untracked
+  kernel tree.
 - Mesa: `include/drm-uapi/chrome9_drm.h`; Chrome9 `chrome9_context.[ch]`,
   `chrome9_draw.c`, `chrome9_format.[ch]`, `chrome9_resource.c`,
   `chrome9_shader_nir_test.c`.
