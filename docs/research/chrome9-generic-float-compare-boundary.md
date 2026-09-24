@@ -164,6 +164,33 @@ TEMP/TEMP SLT.  The emitter asks the manager to allocate a scratch register,
 so r12 in the isolated rows is an observed allocation, not a guaranteed
 register for a populated program.
 
+The defined TEMP/TEMP case is now recovered without that synthetic-manager
+setup.  Supply the valid public PS 2.0 chain
+`MOV r0,c0; MOV r1,c1; SGE r2,r0,r1; MOV oC0,r2` to the Linux compiler with
+`CHROME9_INTERNAL_SLT_FROM_SGE=1`.  Its ordinary parser and validator establish
+the producers, consumer, and register lifetimes.  An offline-only process
+callback replaces exactly one validated normalized SGE opcode with internal
+SLT opcode 107 just before vendor dispatch; no native record is hand-written.
+After configuration-two finalization, the object is:
+
+```text
+MOV r0,c0      01c00530 301c0053 00f08005 000d0020
+MOV r1,c1      01c00530 301c0053 00f08105 000d0060
+SLT r2,r0,r1   02010538 30000924 00f20005 000000e0
+               01409240 30140b6d 00f20305 000900a0
+MOV oC0,r2    01c00530 301c0053 00f20205 000d0820
+active=(0,4,0,0), A90=90050000 A91=91000000 A92=92000005
+```
+
+The vendor register trace maps logical r0/r1/r2 to physical 0/1/2,
+allocates comparison scratch **r3** with `special-ok=1`, and releases r3
+after the second SLT record.  The corresponding public SGE chain uses the
+same first compare record and r3, but its second record is
+`0140b6d0 30140924 00f20305 000900a0`.  Therefore scratch selection is
+dynamic, while the strict SLT second-record operand placement remains
+independent of SGE.  This is a compiler/dependency/resource oracle only;
+exceptional-value and subnormal semantics still need guarded silicon tests.
+
 The first isolated record computes `src0 + -src1` into scratch r12.  Decoding
 the second gives A=r12/release, C=native ZERO, B=native ONE, subop 9, so the
 symbolic operation is exactly `difference >= 0 ? 0 : 1`.  This independently
@@ -172,10 +199,9 @@ Special-r12 allocation explains the active temporary high-water 13 and the
 `90040000` resource bucket, matching the established FLR/POW/NRM special
 scratch family.
 
-The constant, one-varying, and corrected two-varying rows provide compiler-
-shape oracles, but they remain silicon-unqualified and use r12, which the
-current generic allocator does not expose.  The malformed historical row
-provides no execution oracle.
+The constant, one-varying, corrected two-varying, and defined TEMP/TEMP rows
+provide compiler-shape oracles, but they remain silicon-unqualified.  The
+malformed historical row provides no execution oracle.
 Do not invent a one-record SLT or silently substitute SUB+CMP.  A future
 semantic SLT opcode must own this two-record expansion, scratch lifetime and
 resource accounting, and dependency finalization in the kernel.
