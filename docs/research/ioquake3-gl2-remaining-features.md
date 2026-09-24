@@ -86,6 +86,19 @@ play, or the main menu under `cl_renderer opengl2`.
 
 ### 2.1 Sky
 
+**Update 2026-09-24 (evening): resolved as a configuration artifact.**  The
+target's `/root/.q3a/baseq3/q3config.cfg` had `seta r_fastsky "1"`, so
+`RB_StageIteratorSky()` returned before `glDepthRange(1, 1)` and neither
+sky stage was drawn; the dark sky was stale framebuffer content.  A driver
+debug print of every `set_viewport_states` z confirmed that depth range
+[1,1] never occurred, and a draw trace showed `killsky_1`/`killsky_2`
+(identified by their level-0 averages) only in load-time draws.  With
+`r_fastsky 0` the hardware sky (TCL and post-TNL) matches llvmpipe within
+the cloud-scroll phase (upper-sky mean R 42 versus 52, G below 1 on both);
+artifact `artifacts/2026-09-24/tcl/q3dm1-gl2-sky-tcl-vs-llvmpipe.png`.
+Capture scripts must set `r_fastsky 0` explicitly.  The analysis below is
+kept for its method.
+
 **Program path (source).**  `textures/skies/tim_hell` has two stages:
 `killsky_1` with `tcMod scroll 0.05 .1; tcMod scale 2 2; depthWrite`, and
 `killsky_2` with `blendfunc GL_ONE GL_ONE; tcMod scroll 0.05 0.06; tcMod scale 3 2`.
