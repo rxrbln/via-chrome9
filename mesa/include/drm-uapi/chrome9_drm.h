@@ -272,6 +272,8 @@ struct drm_chrome9_gem_create {
 #define DRM_CHROME9_GEM_CPU_IMPLICIT		(1U << 1)
 #define DRM_CHROME9_GEM_CPU_PREPARE_READ	(1U << 2)
 #define DRM_CHROME9_GEM_CPU_PREPARE_WRITE	(1U << 3)
+/* Only wait until the device no longer uses the object. */
+#define DRM_CHROME9_GEM_CPU_WAIT		(1U << 4)
 
 struct drm_chrome9_gem_cpu_access {
 	__u32 handle;
