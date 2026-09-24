@@ -555,3 +555,36 @@ For the first rectangle its expected logical RGBA is approximately
 bytes still require a focused compiler self-test and an independent packet
 review before any fresh-boot submission; they are a safe offline next gate,
 not authorization to run it now.
+
+### Narrower production-prefix differential
+
+There is a smaller source-backed discriminator than exporting the prefix.
+The raw oracle currently writes only XYZ in its projective multiply:
+
+```text
+MUL t1.xyz, T0.xyzw, rcpW.xxxx
+```
+
+Its current native destination mask is therefore `7` in
+`0140b6d0 30000000 0070c005 00000060`. The exact proprietary shadow object
+above instead writes full XYZW in the same operation:
+
+```text
+0140b6d0 30000000 00f0c005 00000060
+```
+
+That is the only production-prefix difference which directly explains the
+observed branch while preserving the known-correct sample coordinate. X and Y
+must have reached the sampler closely enough to fetch `.2`; if the partial
+vector result loses only Z, the threshold becomes bias `.1505`, so `.2` is
+unoccluded and the oracle emits the observed `.30`. This is a hypothesis tied
+to the exact failed pixel, not proof that partial TEMP masks generally lose Z.
+
+The next cold-boot shadow discriminator should therefore change only the
+projective MUL destination from mask `7` to `f`, leaving the original nested
+comparison graph, sampler, vertices, constants, and single full terminal
+COLOR write unchanged. For finite nonzero W its newly written W is exactly
+one and is otherwise dead. This one-word change aligns the prefix with the
+Linux production object and avoids every partial-COLOR hazard. It still needs
+independent packet review and the usual stop-on-timeout discipline before a
+single hardware run.
