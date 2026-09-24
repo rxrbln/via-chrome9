@@ -272,6 +272,7 @@ static const struct nir_shader_compiler_options chrome9_nir_options = {
    .lower_flrp32 = true,
    .lower_fmod = true,
    .lower_fsat = true,
+   .lower_fsqrt = true,
    .lower_sincos = true,
    .lower_uniforms_to_ubo = true,
    /* For a top-tested i < N loop, NIR reports the last body trip as N - 1.

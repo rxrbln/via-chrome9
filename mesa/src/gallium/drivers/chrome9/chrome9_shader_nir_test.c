@@ -3,14 +3,17 @@
 
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
+#include "chrome9_public.h"
 #include "chrome9_specialise.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -20,6 +23,7 @@
  * or GPU submissions are permitted by this deliberately narrow ioctl stub. */
 #define CHROME9_TEST_FD 1909
 static unsigned unexpected_ioctls;
+static bool creating_test_screen;
 
 int
 ioctl(int fd, unsigned long request, ...)
@@ -30,11 +34,22 @@ ioctl(int fd, unsigned long request, ...)
    va_start(arguments, request);
    payload = va_arg(arguments, void *);
    va_end(arguments);
-   if (fd == CHROME9_TEST_FD && request == DRM_IOCTL_CHROME9_GET_PARAM) {
+   if ((fd == CHROME9_TEST_FD || creating_test_screen) &&
+       request == DRM_IOCTL_CHROME9_GET_PARAM) {
       struct drm_chrome9_get_param *param = payload;
 
+      if (param && param->param == DRM_CHROME9_PARAM_DEVICE_ID) {
+         param->value = 0x7122;
+         return 0;
+      }
+      if (param && param->param == DRM_CHROME9_PARAM_REVISION) {
+         param->value = 0;
+         return 0;
+      }
       if (param && param->param == DRM_CHROME9_PARAM_CAPABILITIES) {
-         param->value = DRM_CHROME9_CAP_DRAW_TRIANGLE |
+         param->value = DRM_CHROME9_CAP_GEM |
+                        DRM_CHROME9_CAP_GEM_SHMEM_CACHED |
+                        DRM_CHROME9_CAP_DRAW_TRIANGLE |
                         DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM;
          return 0;
       }
@@ -850,29 +865,41 @@ count_alu_op(nir_shader *nir, nir_op op)
 static bool
 check_function_medium_sqrt_boundary(struct chrome9_context *context)
 {
-   /* This is a compiler-only preview.  The repeated RSQ/RCP hardware gate
-    * must pass before the production options may enable lower_fsqrt. */
-   static const nir_shader_compiler_options sqrt_options = {
-      .lower_uniforms_to_ubo = true,
-      .lower_fsqrt = true,
-   };
    struct chrome9_shader current = { 0 }, lowered = { 0 };
    nir_shader *nir = make_function_medium_fragment(&options);
-   nir_shader *preview = make_function_medium_fragment(&sqrt_options);
+   nir_shader *lowered_nir = NULL;
+   struct pipe_screen *screen = NULL;
+   int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
    unsigned sqrt_before = count_alu_op(nir, nir_op_fsqrt);
    unsigned sqrt_after, rsq_after, rcp_after;
    unsigned mul = 0, frc = 0, rsq = 0, rcp = 0, mov = 0;
    bool valid;
 
+   if (fd >= 0) {
+      creating_test_screen = true;
+      screen = chrome9_screen_create(fd, NULL);
+      creating_test_screen = false;
+      close(fd);
+   }
+   if (!screen || !screen->nir_options[MESA_SHADER_FRAGMENT] ||
+       !screen->nir_options[MESA_SHADER_FRAGMENT]->lower_fsqrt) {
+      fprintf(stderr, "Chrome9 screen does not enable fsqrt lowering\n");
+      if (screen)
+         screen->destroy(screen);
+      ralloc_free(nir);
+      return false;
+   }
+   lowered_nir = make_function_medium_fragment(
+      screen->nir_options[MESA_SHADER_FRAGMENT]);
    chrome9_compile_fs_nir(context, &current, nir);
    /* Use Mesa's standard algebraic fsqrt lowering, not a Chrome9 test-only
     * opcode substitution.  Remove dead pre-lowering nodes before compiling. */
-   nir_opt_algebraic(preview);
-   nir_opt_dce(preview);
-   sqrt_after = count_alu_op(preview, nir_op_fsqrt);
-   rsq_after = count_alu_op(preview, nir_op_frsq);
-   rcp_after = count_alu_op(preview, nir_op_frcp);
-   chrome9_compile_fs_nir(context, &lowered, preview);
+   nir_opt_algebraic(lowered_nir);
+   nir_opt_dce(lowered_nir);
+   sqrt_after = count_alu_op(lowered_nir, nir_op_fsqrt);
+   rsq_after = count_alu_op(lowered_nir, nir_op_frsq);
+   rcp_after = count_alu_op(lowered_nir, nir_op_frcp);
+   chrome9_compile_fs_nir(context, &lowered, lowered_nir);
    for (unsigned i = 0; i < lowered.semantic_fs_ir.count; i++) {
       switch (lowered.semantic_fs_ir.instruction[i].op) {
       case CHROME9_PS_OPCODE_MUL: mul++; break;
@@ -896,14 +923,15 @@ check_function_medium_sqrt_boundary(struct chrome9_context *context)
    if (!valid)
       fprintf(stderr, "function-medium sqrt boundary failed: "
               "sqrt=%u->%u rsq=%u rcp=%u current=%u/%u "
-              "preview=%u/%u/%u ir=%u histogram=%u/%u/%u/%u/%u\n",
+              "lowered=%u/%u/%u ir=%u histogram=%u/%u/%u/%u/%u\n",
               sqrt_before, sqrt_after, rsq_after, rcp_after,
               current.supported, current.semantic_fs_valid,
               lowered.supported, lowered.semantic_fs_valid,
               lowered.fragment_program, lowered.semantic_fs_ir.count,
               mul, frc, rsq, rcp, mov);
-   ralloc_free(preview);
+   ralloc_free(lowered_nir);
    ralloc_free(nir);
+   screen->destroy(screen);
    return valid;
 }
 
