@@ -7019,6 +7019,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
               ctx->tcl_triangles, ctx->tcl_buffer_triangles,
               ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
+   chrome9_tcl_batch_destroy(ctx);
    chrome9_sw_context_destroy(ctx);
    if (ctx->reject_sites)
       _mesa_hash_table_destroy(ctx->reject_sites, NULL);
@@ -7100,6 +7101,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES);
    ctx->tcl_enabled = (capabilities & DRM_CHROME9_CAP_VERTEX_PROGRAM) &&
       debug_get_bool_option("CHROME9_TCL", false);
+   ctx->tcl_batching = ctx->tcl_enabled &&
+      (capabilities & DRM_CHROME9_CAP_VERTEX_BATCH) &&
+      debug_get_bool_option("CHROME9_TCL_BATCH", true);
    ctx->tcl_buffers = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_BUFFERS) &&
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);

@@ -26,6 +26,9 @@ bool chrome9_bo_create(int fd, uint64_t size, uint32_t flags,
 bool chrome9_bo_export_fd(int fd, const struct chrome9_bo *bo, int *prime_fd);
 void chrome9_bo_destroy(int fd, struct chrome9_bo *bo);
 bool chrome9_bo_cpu_access(int fd, const struct chrome9_bo *bo, uint32_t flags);
+bool chrome9_draw_vertex_programs(
+   int fd, const struct drm_chrome9_draw_vertex_program *draws,
+   unsigned count);
 bool chrome9_draw_triangle(int fd,
                            const struct drm_chrome9_draw_triangle *draw);
 bool chrome9_draw_triangle_d16(

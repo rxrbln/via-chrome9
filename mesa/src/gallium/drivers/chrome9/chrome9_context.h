@@ -250,6 +250,9 @@ struct chrome9_context {
    bool tcl_enabled;
    /* Stage B: hardware vertex fetch from GEM buffers. */
    bool tcl_buffers;
+   /* TCL draws queued for one DRAW_VERTEX_PROGRAMS submission. */
+   bool tcl_batching;
+   struct chrome9_tcl_batch *tcl_batch;
    /* Native back-face color (oBFD0) and user clip planes (FE A05). */
    bool tcl_twoside;
    bool tcl_clip_distance;

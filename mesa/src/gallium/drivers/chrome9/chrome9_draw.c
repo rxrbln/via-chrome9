@@ -3,6 +3,8 @@
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_draw.h"
+#include "util/u_dynarray.h"
+#include "util/u_inlines.h"
 
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
@@ -1904,6 +1906,8 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
 
    if (!count)
       return;
+   /* Queued TCL draws precede these triangles. */
+   chrome9_tcl_batch_flush(ctx);
    if (crender->defer_guarded_domain && crender->batch_generic_program) {
       struct chrome9_deferred_fragment_batch *batch = NULL;
 
@@ -3409,6 +3413,8 @@ chrome9_draw_flush_batch(struct chrome9_context *ctx)
 void
 chrome9_draw_flush_gpu_batch(struct chrome9_context *ctx)
 {
+   if (ctx)
+      chrome9_tcl_batch_flush(ctx);
    if (ctx && ctx->vbuf_render) {
       struct chrome9_vbuf_render *render = ctx->vbuf_render;
 
@@ -3557,6 +3563,12 @@ chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
       goto out;
    }
    *why = "fragment program state";
+   fragment->resource_count = 0;
+   fragment->resources[fragment->resource_count++] = &target->base;
+   if (depth_active)
+      fragment->resources[fragment->resource_count++] = &depth->base;
+   for (unsigned unit = 0; unit < crender->texture_count; unit++)
+      fragment->resources[fragment->resource_count++] = &textures[unit]->base;
    chrome9_draw_scissor(ctx, target, &scissor);
    if (!chrome9_generic_fragment_state(crender, target, depth, textures,
           samplers, depth_active, blend_successor, &blend, &scissor,
@@ -3581,11 +3593,213 @@ out:
    return ok;
 }
 
+/*
+ * Queued DRAW_VERTEX_PROGRAMS work: every draw owns one block with copies
+ * of the arrays its pointers name, and the batch holds references on the
+ * resources behind its GEM handles until it is submitted.
+ */
+struct chrome9_tcl_batch {
+   unsigned count;
+   struct drm_chrome9_draw_vertex_program draws[DRM_CHROME9_VERTEX_MAX_BATCH];
+   void *blocks[DRM_CHROME9_VERTEX_MAX_BATCH];
+   unsigned triangles[DRM_CHROME9_VERTEX_MAX_BATCH];
+   struct util_dynarray resources;
+   /* Distinct kernel objects: destination, depth, textures, buffers. */
+   uint32_t texture_handles[DRM_CHROME9_VERTEX_MAX_BATCH];
+   uint32_t buffer_handles[DRM_CHROME9_VERTEX_MAX_BATCH];
+   unsigned texture_handle_count, buffer_handle_count;
+};
+
+#define CHROME9_TCL_BATCH_MAX_OBJECTS 64
+
+static bool
+tcl_batch_has(const uint32_t *handles, unsigned count, uint32_t handle)
+{
+   for (unsigned i = 0; i < count; i++)
+      if (handles[i] == handle)
+         return true;
+   return false;
+}
+
+/* Objects draw would add to the batch's distinct kernel objects. */
+static unsigned
+tcl_batch_new_objects(const struct chrome9_tcl_batch *b,
+                      const struct drm_chrome9_draw_vertex_program *draw,
+                      const struct drm_chrome9_fragment_texture_state *textures,
+                      const struct drm_chrome9_vertex_buffer *buffers)
+{
+   unsigned added = 0;
+
+   for (unsigned t = 0; t < draw->fragment.texture_count; t++)
+      added += !tcl_batch_has(b->texture_handles, b->texture_handle_count,
+                              textures[t].handle);
+   for (unsigned v = 0; v < draw->buffer_count; v++)
+      added += !tcl_batch_has(b->buffer_handles, b->buffer_handle_count,
+                              buffers[v].handle);
+   return added;
+}
+
+static void
+tcl_batch_release(struct chrome9_tcl_batch *b)
+{
+   util_dynarray_foreach(&b->resources, struct pipe_resource *, resource)
+      pipe_resource_reference(resource, NULL);
+   util_dynarray_clear(&b->resources);
+   for (unsigned i = 0; i < b->count; i++)
+      FREE(b->blocks[i]);
+   b->count = 0;
+   b->texture_handle_count = 0;
+   b->buffer_handle_count = 0;
+}
+
+void
+chrome9_tcl_batch_flush(struct chrome9_context *ctx)
+{
+   struct chrome9_tcl_batch *b = ctx->tcl_batch;
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+
+   if (!b || !b->count)
+      return;
+   if (b->count == 1 ? !chrome9_draw_vertex_program(fd, &b->draws[0]) :
+       !chrome9_draw_vertex_programs(fd, b->draws, b->count)) {
+      /* Retry singly so one rejected draw loses only its triangles. */
+      if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
+         fprintf(stderr, "chrome9: DRAW_VERTEX_PROGRAMS of %u failed: %s\n",
+                 b->count, strerror(errno));
+         ctx->warnings |= CHROME9_WARN_SUBMIT;
+      }
+      for (unsigned i = 0; b->count > 1 && i < b->count; i++)
+         if (!chrome9_draw_vertex_program(fd, &b->draws[i]))
+            CHROME9_REJECT(ctx, b->triangles[i]);
+      if (b->count == 1)
+         CHROME9_REJECT(ctx, b->triangles[0]);
+   }
+   ctx->submitted_batches++;
+   tcl_batch_release(b);
+}
+
+void
+chrome9_tcl_batch_destroy(struct chrome9_context *ctx)
+{
+   if (!ctx->tcl_batch)
+      return;
+   chrome9_tcl_batch_flush(ctx);
+   util_dynarray_fini(&ctx->tcl_batch->resources);
+   FREE(ctx->tcl_batch);
+   ctx->tcl_batch = NULL;
+}
+
+static void *
+tcl_batch_copy(uint8_t **cursor, const void *source, size_t bytes)
+{
+   void *copy = *cursor;
+
+   if (bytes)
+      memcpy(copy, source, bytes);
+   *cursor += align(bytes, 16);
+   return copy;
+}
+
+/* Queue a copy of draw; false when it cannot be queued. */
+static bool
+tcl_batch_append(struct chrome9_context *ctx,
+                 const struct drm_chrome9_draw_vertex_program *draw,
+                 unsigned triangles, struct pipe_resource *const *resources,
+                 unsigned resource_count)
+{
+   struct chrome9_tcl_batch *b = ctx->tcl_batch;
+   const struct drm_chrome9_draw_fragment_program *f = &draw->fragment;
+   const size_t sizes[] = {
+      f->instruction_count * sizeof(struct drm_chrome9_fragment_instruction),
+      f->constant_count * 4 * sizeof(uint32_t),
+      f->texture_count * sizeof(struct drm_chrome9_fragment_texture_state),
+      draw->instruction_count * sizeof(struct drm_chrome9_vertex_instruction),
+      draw->constant_count * 4 * sizeof(uint32_t),
+      draw->element_count * sizeof(struct drm_chrome9_vertex_element),
+      draw->buffer_count * sizeof(struct drm_chrome9_vertex_buffer),
+      (size_t)draw->index_count * draw->index_size,
+      (size_t)draw->vertex_count * draw->vertex_stride,
+   };
+   const struct drm_chrome9_fragment_texture_state *textures =
+      (const void *)(uintptr_t)f->textures_ptr;
+   const struct drm_chrome9_vertex_buffer *buffers =
+      (const void *)(uintptr_t)draw->buffers_ptr;
+   struct drm_chrome9_draw_vertex_program *copy;
+   size_t total = 0;
+   uint8_t *block, *cursor;
+
+   if (!b) {
+      b = ctx->tcl_batch = CALLOC_STRUCT(chrome9_tcl_batch);
+      if (!b)
+         return false;
+      util_dynarray_init(&b->resources, NULL);
+   }
+   if (b->count &&
+       (b->count == DRM_CHROME9_VERTEX_MAX_BATCH ||
+        b->draws[0].fragment.destination_handle != f->destination_handle ||
+        b->draws[0].fragment.depth_handle != f->depth_handle ||
+        2 + b->texture_handle_count + b->buffer_handle_count +
+           tcl_batch_new_objects(b, draw, textures, buffers) >
+           CHROME9_TCL_BATCH_MAX_OBJECTS))
+      chrome9_tcl_batch_flush(ctx);
+   for (unsigned i = 0; i < ARRAY_SIZE(sizes); i++)
+      total += align(sizes[i], 16);
+   block = cursor = MALLOC(MAX2(total, 16));
+   if (!block)
+      return false;
+   copy = &b->draws[b->count];
+   *copy = *draw;
+   copy->fragment.instructions_ptr = (uintptr_t)tcl_batch_copy(&cursor,
+      (const void *)(uintptr_t)f->instructions_ptr, sizes[0]);
+   copy->fragment.constants_ptr = f->constant_count ?
+      (uintptr_t)tcl_batch_copy(&cursor,
+         (const void *)(uintptr_t)f->constants_ptr, sizes[1]) : 0;
+   copy->fragment.textures_ptr = f->texture_count ?
+      (uintptr_t)tcl_batch_copy(&cursor, textures, sizes[2]) : 0;
+   copy->instructions_ptr = (uintptr_t)tcl_batch_copy(&cursor,
+      (const void *)(uintptr_t)draw->instructions_ptr, sizes[3]);
+   copy->constants_ptr = draw->constant_count ?
+      (uintptr_t)tcl_batch_copy(&cursor,
+         (const void *)(uintptr_t)draw->constants_ptr, sizes[4]) : 0;
+   copy->elements_ptr = (uintptr_t)tcl_batch_copy(&cursor,
+      (const void *)(uintptr_t)draw->elements_ptr, sizes[5]);
+   copy->buffers_ptr = draw->buffer_count ?
+      (uintptr_t)tcl_batch_copy(&cursor, buffers, sizes[6]) : 0;
+   copy->indices_ptr = draw->index_count ?
+      (uintptr_t)tcl_batch_copy(&cursor,
+         (const void *)(uintptr_t)draw->indices_ptr, sizes[7]) : 0;
+   copy->vertices_ptr = draw->vertex_count ?
+      (uintptr_t)tcl_batch_copy(&cursor,
+         (const void *)(uintptr_t)draw->vertices_ptr, sizes[8]) : 0;
+   for (unsigned t = 0; t < f->texture_count; t++)
+      if (!tcl_batch_has(b->texture_handles, b->texture_handle_count,
+                         textures[t].handle))
+         b->texture_handles[b->texture_handle_count++] = textures[t].handle;
+   for (unsigned v = 0; v < draw->buffer_count; v++)
+      if (!tcl_batch_has(b->buffer_handles, b->buffer_handle_count,
+                         buffers[v].handle))
+         b->buffer_handles[b->buffer_handle_count++] = buffers[v].handle;
+   for (unsigned i = 0; i < resource_count; i++) {
+      struct pipe_resource *held = NULL;
+
+      if (!resources[i])
+         continue;
+      pipe_resource_reference(&held, resources[i]);
+      util_dynarray_append(&b->resources, held);
+   }
+   b->blocks[b->count] = block;
+   b->triangles[b->count] = triangles;
+   b->count++;
+   return true;
+}
+
 bool
 chrome9_draw_tcl_submit(struct chrome9_context *ctx,
                         const struct chrome9_tcl_fragment *fragment,
                         struct drm_chrome9_draw_vertex_program *draw,
-                        unsigned triangles)
+                        unsigned triangles,
+                        struct pipe_resource *const *buffers,
+                        unsigned buffer_count)
 {
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
 
@@ -3596,6 +3810,22 @@ chrome9_draw_tcl_submit(struct chrome9_context *ctx,
    draw->fragment.textures_ptr = fragment->draw.texture_count ?
       (uintptr_t)fragment->textures : 0;
    chrome9_context_prepare_render_target(ctx);
+   if (ctx->tcl_batching) {
+      struct pipe_resource *resources[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES +
+                                      DRM_CHROME9_VERTEX_MAX_INPUTS];
+      unsigned count = fragment->resource_count;
+
+      memcpy(resources, fragment->resources, count * sizeof(resources[0]));
+      for (unsigned i = 0; i < buffer_count; i++)
+         resources[count++] = buffers[i];
+      if (tcl_batch_append(ctx, draw, triangles, resources, count)) {
+         ctx->submitted_triangles += triangles;
+         ctx->submitted_program_batches++;
+         chrome9_context_render_target_written(ctx);
+         return true;
+      }
+   }
+   chrome9_tcl_batch_flush(ctx);
    if (!chrome9_draw_vertex_program(fd, draw)) {
       /* The caller falls back or accounts the rejected triangles. */
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {

@@ -1408,7 +1408,8 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
                  const struct tcl_stream *streams, uint32_t min, uint32_t max,
                  struct drm_chrome9_vertex_element *elements,
                  struct drm_chrome9_vertex_buffer *buffers,
-                 unsigned *buffer_count, struct pipe_resource **uploads)
+                 unsigned *buffer_count, struct pipe_resource **uploads,
+                 struct pipe_resource **resources)
 {
    const void *user[DRM_CHROME9_VERTEX_MAX_INPUTS];
    uint64_t low[DRM_CHROME9_VERTEX_MAX_INPUTS];
@@ -1440,6 +1441,7 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
          buffers[n].stride = stride;
          buffers[n].offset = (uint64_t)min * stride;
          user[n] = array;
+         resources[n] = array ? NULL : vb->buffer.resource;
          low[n] = UINT64_MAX;
          high[n] = 0;
          n++;
@@ -1466,6 +1468,7 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
                         &out_offset, &uploads[b]);
       if (!uploads[b])
          return false;
+      resources[b] = uploads[b];
       buffers[b].handle = chrome9_resource(uploads[b])->bo.handle;
       /* Vertex 0 of the rebased range now starts at out_offset. */
       buffers[b].offset = out_offset;
@@ -1488,7 +1491,8 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *range,
                  const uint8_t *indices, unsigned triangles, uint32_t min,
                  struct chrome9_tcl_state *state,
-                 struct drm_chrome9_draw_vertex_program *draw)
+                 struct drm_chrome9_draw_vertex_program *draw,
+                 struct pipe_resource *const *resources)
 {
    const unsigned per_chunk = DRM_CHROME9_VERTEX_MAX_INDICES / 3;
    const int64_t bias = (int64_t)(info->index_size ? range->index_bias : 0) -
@@ -1520,7 +1524,8 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          }
       }
       draw->index_count = n;
-      if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, count)) {
+      if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, count,
+                                   resources, draw->buffer_count)) {
          ctx->tcl_buffer_rejects++;
          if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
             fprintf(stderr, "chrome9: TCL buffers rejected (%s): buffers=%u "
@@ -1892,15 +1897,16 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (ctx->tcl_buffers &&
        tcl_index_range(info, range, indices, &index_min, &index_max)) {
       struct pipe_resource *uploads[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
+      struct pipe_resource *resources[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
       bool drawn = tcl_bind_buffers(ctx, p->input_count, streams, index_min,
                                     index_max, elements, buffers,
-                                    &buffer_count, uploads);
+                                    &buffer_count, uploads, resources);
 
       if (drawn) {
          draw.buffer_count = buffer_count;
          draw.buffers_ptr = (uintptr_t)buffers;
          drawn = tcl_draw_buffers(ctx, info, range, indices, triangles,
-                                  index_min, state, &draw);
+                                  index_min, state, &draw, resources);
       }
       for (unsigned b = 0; b < ARRAY_SIZE(uploads); b++)
          pipe_resource_reference(&uploads[b], NULL);
@@ -1963,7 +1969,8 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          }
       }
       draw.vertex_count = 3 * count;
-      if (!chrome9_draw_tcl_submit(ctx, &state->fragment, &draw, count)) {
+      if (!chrome9_draw_tcl_submit(ctx, &state->fragment, &draw, count,
+                                   NULL, 0)) {
          /* A first-chunk rejection falls back to the draw module. */
          if (!done) {
             if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))

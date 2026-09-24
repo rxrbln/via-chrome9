@@ -26,14 +26,21 @@ struct chrome9_tcl_fragment {
    uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
    struct drm_chrome9_fragment_texture_state
       textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   /* Target, depth and texture resources behind the handles above. */
+   struct pipe_resource *resources[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   unsigned resource_count;
 };
 
 bool chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
                                struct chrome9_tcl_fragment *fragment,
                                const char **why);
+void chrome9_tcl_batch_flush(struct chrome9_context *ctx);
+void chrome9_tcl_batch_destroy(struct chrome9_context *ctx);
 bool chrome9_draw_tcl_submit(struct chrome9_context *ctx,
                              const struct chrome9_tcl_fragment *fragment,
                              struct drm_chrome9_draw_vertex_program *draw,
-                             unsigned triangles);
+                             unsigned triangles,
+                             struct pipe_resource *const *buffers,
+                             unsigned buffer_count);
 
 #endif

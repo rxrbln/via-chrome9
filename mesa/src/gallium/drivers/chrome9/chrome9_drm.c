@@ -272,6 +272,20 @@ chrome9_draw_vertex_program(
 }
 
 bool
+chrome9_draw_vertex_programs(
+   int fd, const struct drm_chrome9_draw_vertex_program *draws,
+   unsigned count)
+{
+   struct drm_chrome9_draw_vertex_programs args = {
+      .count = count,
+      .draws_ptr = (uintptr_t)draws,
+   };
+
+   return draws && count &&
+          ioctl(fd, DRM_IOCTL_CHROME9_DRAW_VERTEX_PROGRAMS, &args) == 0;
+}
+
+bool
 chrome9_draw_textured_triangle(
    int fd, const struct drm_chrome9_draw_textured_triangle *draw)
 {
