@@ -111,6 +111,61 @@ This directly proves that sparse logical sampler IDs remain sparse in the TAU
 sampler nibbles while sparse logical coordinate IDs are compacted separately.
 Neither `+40` nor A91 may be substituted for the logical sampler set.
 
+### Sparse sampler five still occupies FE consumer zero
+
+The Windows programmable draw writer closes the remaining front-end mapping
+ambiguity.  `VTGUModeDX32A.dll:0x101574a0..0x10157b13` reads the draw-state
+stage-enable mask at its second argument `+0x30`, visits logical stages zero
+through seven in order, and compacts only the enabled stages into a local
+coordinate-selector array.  This is not the PS compiler instance `+0x30`
+color-output-count field.  The bit-five case at
+`0x10157584..0x10157595` copies the logical-stage-five selector from context
+`+0x2d54`.  With one active stage, the count-one jump-table entry at
+`0x1015769b..0x101576ad` enters the FE-stage-zero writer at
+`0x10157a8a`.  That writer updates A01 at hardware-image `+0x04`; it does not
+write stage five's field in A02.
+
+The stage-zero writer takes the selected coordinate's producer width from
+context `+0x2d60[selector]`, caps it with `ComputeTexDim(ctx, 0)`, and packs
+the coordinate selector in A01 bits 4:2, perspective mode in bit 5, and
+dimension-minus-one in bits 1:0.  Thus the first active sampler occupies FE
+consumer position zero independently of its logical sampler nibble.  Later
+active samplers occupy the subsequent A01/A02/A03 fields in ascending logical
+sampler order.
+
+The Linux 5.75 compiler probe makes the single-stage value byte-exact.  For
+`TEX(s5,T5); MOV oC0,r0`, the production H5 texture-register manager reports
+`remap logical=5 -> 0` and emits:
+
+```text
+TAU                  351001b5
+active tuple         (1,1,1,6)
+instance +34/+38     1 / 6
+object +40/+70       20 / 1
+A90--A93             90018000 91000001 92010001 93000001
+```
+
+Changing only the coordinate to logical T0 produces the same native TAU,
+controls, and physical coordinate zero; only logical-use metadata `+0x40`
+changes from `0x20` to `1`.  Therefore a lone float2 `s5,T5` or `s5,T0`
+program has physical `stage0_coordinate=0` and the ordinary mapped-A
+consumer word A01=`01002521`.  Logical unit five remains present in the TAU
+sampler nibbles and in the image/sampler state selectors.  A01=`01002535`
+would instead select un-compacted coordinate F and is not the production
+object for this one-resource program.
+
+The current semantic compiler records `stage0_coordinate` only while
+encoding logical sampler zero.  Under sparse ABI v2 a first or lone TEX on
+logical sampler five therefore leaves it at `0xff`; the FE builder may then
+fall back to varying zero.  That happens to produce the same A01 for the
+minimal one-varying float2 case, but it is not the vendor contract and becomes
+wrong when an earlier ALU-only varying has a different width or the sampled
+coordinate compacts to a later physical slot.  The source-backed invariant is
+to record the compact physical coordinate of the first active TEX in ascending
+logical sampler order, while preserving the logical sampler id in TAU and
+descriptor state.  Keep sparse hardware qualification default-off until this
+mapping is explicit and selftested.
+
 ## Per-stage state namespace
 
 The shader sampler number and all state selectors must agree.  For validated
