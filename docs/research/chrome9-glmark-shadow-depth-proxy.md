@@ -127,11 +127,96 @@ narrow domain:
 * a NaN from projection or bias is outside the local contract because neither
   comparison requests `preserve:nan`.
 
-The remaining silicon question is thus finite-versus-infinity sign handling,
-not general IEEE NaN behavior.  Do not broaden this scene-specific proof into
-generic `flt`/`fge`: arbitrary operands can still form `Inf-Inf`, and a
-finite near-equality may expose subtraction/denormal behavior not established
-by the current corpus.
+The remaining silicon questions are finite-versus-infinity sign handling and
+whether a nonzero **subnormal difference retains its sign**.  They are not a
+general IEEE NaN requirement for this shader.  The first predicate can receive
+a finite subnormal W directly from the validated varying stream, so `0-W`
+alone can be exactly `-minsubnormal`.  If SUB flushes that value to `-0`,
+native CMP treats the condition as nonnegative and changes a strict-true
+result to false.  The sampled-depth predicate may admit a stronger spacing
+proof after its exact conversion and projection ranges are analyzed, but that
+does not discharge the W predicate.  Do not broadly lower `flt`/`fge`:
+arbitrary operands can additionally form `Inf-Inf`, and comparisons which
+request NaN preservation have a stronger contract.
+
+### Exact proprietary SLT mapping
+
+The separately recovered internal proprietary SLT emitter confirms the
+materialized strict-less-than shape.  For the defined TEMP chain
+`SLT r2,r0,r1`, the two finalized records are:
+
+```text
+02010538 30000924 00f20005 000000e0
+01409240 30140b6d 00f20305 000900a0
+```
+
+The first record computes `r0 - r1` into dynamically allocated scratch r3.
+The second is native subop-9 CMP with A=`r3` plus release, C=native ZERO,
+B=native ONE, and destination r2.  It therefore implements:
+
+```text
+d = x - y
+result = d >= 0 ? 0 : 1
+```
+
+Scratch r3 is an observed allocation for this populated chain, not a fixed
+architectural register.  The kernel allocator must reserve any free physical
+temporary across both records and release it only in the second.  Isolated
+constant/varying probes which happened to allocate r12 are not executable
+register-allocation contracts.  The complete encoding and provenance are in
+`chrome9-generic-float-compare-boundary.md`.
+
+This two-record object fixes opcode, operand order, literal source class,
+scratch lifetime, and strict equality orientation.  Static bytes cannot prove
+subnormal, infinity, or NaN arithmetic.  In particular:
+
+* `+0 < -0` and `-0 < +0` both require zero.  Existing CMP tests show either
+  signed zero condition selects the nonnegative arm, so this passes if SUB
+  produces either zero sign.
+* `0 < minsubnormal`, `-minsubnormal < -0`, and
+  `largest-subnormal < min-normal` all require one.  Every corresponding
+  difference is exactly `-minsubnormal`; these are the shortest flush-to-zero
+  discriminators.
+* finite versus `+Inf`/`-Inf` requires the mathematical sign of the infinite
+  difference.  This is the infinity shape used by shadow.
+* equal infinities form NaN in the first record.  A general comparison with
+  `preserve:inf` must still handle those inputs, but shadow's finite left
+  operand and finite uploaded W exclude them.
+* a comparison which requests `preserve:nan` must return the NIR operation's
+  ordered/unordered result for a NaN in either source.  Shadow does not request
+  that contract, so it must not be used to promote the general case.
+
+### Minimal subnormal oracle
+
+Before accepting the shadow nested select, add one two-ALU guarded semantic
+oracle using the already-defined SUB and CMP operations.  Upload:
+
+```text
+x = (+0, +minsubnormal, -minsubnormal, largest-subnormal)
+y = (+minsubnormal, +0, -0, min-normal)
+d = x - y
+oC0 = CMP(d, false=.25, true=.75)
+```
+
+The exact FP32 input bits are:
+
+```text
+x = (00000000, 00000001, 80000001, 007fffff)
+y = (00000001, 00000000, 80000000, 00800000)
+```
+
+All constants pass the kernel's finite-value check.  The strict results are
+`(true,false,true,true)`, so identical `.25/.75` arm vectors produce host
+BGRA8888 `bfbf40bf`.  Reverse x and y in a second draw; the results are
+`(false,true,false,false)` and the expected host word is `4040bf40`.
+Use the same constant register for both CMP arms through scalar swizzles, so
+the gate cannot trip the unrelated three-distinct-constant port hazard.
+
+This semantic SUB+CMP gate exercises the same arithmetic and native subop-9
+condition as proprietary SLT but not its native file-5 ZERO/ONE literals.  A
+future semantic SLT opcode still needs an offline byte-exact kernel test for
+both records and scratch lifetime.  The numeric gate can run first because
+the condition path is independent of which finite values occupy the arms.
 
 Two checked-in offline cases define a minimal guarded follow-up without
 uploading nonfinite constants, which the kernel correctly rejects:
