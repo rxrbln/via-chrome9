@@ -523,4 +523,31 @@ T1=`(.45,.55,.65,.3)`, a T2-to-T0 alias instead gives
 A00=`00000031`, A01=`01002523`, A08=`08030303`,
 A09=`09000003`, FVF A25/A28=`...fff0`, the three float4 VS copies, and
 A60=`60800006`.  This discriminator is source-backed and host-only; it has
-not been submitted to the GPU by this audit.
+now been submitted once to the GPU, with the result below.
+
+### Split-X three-varying timeout
+
+The corrected four-MOV `--split-x` test (tools source `76f4e7d`, binary
+SHA-256 `67388a18ce8b29b0e7f8e3f58b98d3967f36985652e29aea445718be60916026`)
+was run once after a known-good two-texture draw passed on the same boot.
+The test's first draw returned `ETIMEDOUT`; no color or depth result was
+read and no further GPU command was submitted on that boot.  The driver
+reported:
+
+```text
+phase=cookie seq=6 kind=22 flags=0x101 epoch=0
+current=0x3000 pause=0x2ff0 stop=0x3070
+cr=80000000 engine=00001711
+```
+
+The full log is preserved at
+`/root/tmp/chrome9-live/t2-route/dmesg-after-split-x-timeout.log`, SHA-256
+`90e9294b95453cc99c060a37b18a10bd85c6b404bf61ab61fb521702bf792d62`.
+Kernel compiler selftest `82fec38` independently asserts the four exact
+Linux native records, all three varying widths, resource count, and
+A90--A92.  Thus neither a simultaneous three-source MAD nor mismatched
+fragment ALU words is required for this timeout.  The remaining unknown is
+the full three-varying producer/FE/upload envelope or another shared setup
+path; the timeout does not identify one specific register.  Do not submit
+another three-varying probe or change A00/A01/A08/A09 without a full
+packet-level differential and a new bounded test rationale.
