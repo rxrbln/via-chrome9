@@ -288,6 +288,36 @@ chain, and the SUB/CMP plus split-COLOR tail.  Function-medium's optimized NIR
 is scalar, so Y/Z/W partial destinations and the CMP discriminator are not
 requirements for this scene and should be deferred.
 
+### Selector-image qualification found by the 31-record startup test
+
+The two silicon results above qualify the arithmetic and retirement behavior,
+but not the byte-exact Linux production source image.  Module `83a0d6` still
+contained a semantic-compiler packing bug: for EXP2/LOG2/RCP/RSQ it copied the
+selected component into native W, then filled native XYZ with selector value
+zero (`X`) instead of `DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO` (value 5).  Thus an
+input written semantically as `(X,ZERO,ZERO,ZERO)` reached those live draws as
+native `XXXX`.  The expected Linux/Windows record below is native `000X`:
+
+```text
+old live compiler source A:  word1=001c0053 word2=...0000  # XXXX
+production source A:         word1=801c0053 word2=...00b6  # 000X
+```
+
+The difference first became observable when
+`chrome9_fragment_sqrt_chain_selftest()` compared all native words at module
+startup.  It is a real source-selector mismatch, not an equivalent temporary
+allocation: source id and destination mask are unchanged, while the three
+inactive selector fields differ.  The generic correction applies equally to
+EXP2, LOG2, RCP, and RSQ.
+
+Consequently the earlier positive and zero passes remain useful numerical and
+wedge-safety evidence for the scalar unit, but they do not qualify the
+vendor-canonical `000X` packet.  Likewise, the old 12-record timeout used
+`XXXX` and must not be attributed to the corrected `000X` chain.  The first
+five-step run after the startup correction is the first complete live gate for
+the production selector image; bracket it with known-good draws and stop on a
+timeout as already required below.
+
 ## Source-shaped five-step scalar gate
 
 The next relevant discriminator repeats the exact scalar body used by the
