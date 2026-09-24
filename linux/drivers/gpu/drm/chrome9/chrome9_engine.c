@@ -2150,9 +2150,11 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	raster[i++] = tcl->program.a61;
 	raster[i++] = tcl->program.a62;
 	raster[i++] = 0x20000000;
-	/* A23 bit 8 selects the culled physical winding: set = CCW. */
-	raster[i++] = tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ?
-		      0x23004e02 : 0x23004f02;
+	/* A23 bit 8 selects the culled physical winding (set = CCW); bits
+	 * 14:12 select Gouraud (4) or flat from the third vertex C (3). */
+	raster[i++] = ((tcl->cull & DRM_CHROME9_VERTEX_CULL_CW ?
+			0x23004e02 : 0x23004f02) & ~GENMASK(14, 12)) |
+		      (tcl->cull & DRM_CHROME9_VERTEX_FLAT ? 0x3000 : 0x4000);
 	raster[i++] = 0x24000000 | tcl->vertex_count;
 	if (fp->varying_count) {
 		chrome9_fragment_link_words(fp->varying_count, fp->varying_width,
@@ -2706,7 +2708,9 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	/* Vendor hardware TCL: type-01 A01 clip engine (bit 11) plus bit 20. */
 	if (tcl)
-		common[4] |= 0x00100800 | (tcl->cull ? BIT(7) : 0);
+		common[4] |= 0x00100800 |
+			     (tcl->cull & (DRM_CHROME9_VERTEX_CULL_CW |
+					   DRM_CHROME9_VERTEX_CULL_CCW) ? BIT(7) : 0);
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	if (tcl)
 		raster_count = chrome9_tcl_raster_state(program, tcl, raster);
@@ -8411,8 +8415,10 @@ int chrome9_draw_vertex_program_ioctl(struct drm_device *drm, void *data,
 		return -EOPNOTSUPP;
 	if (args->abi_version != DRM_CHROME9_VERTEX_ABI_VERSION ||
 	    (args->flags & ~(DRM_CHROME9_VERTEX_CULL_CW |
-			     DRM_CHROME9_VERTEX_CULL_CCW)) ||
-	    hweight32(args->flags) > 1 ||
+			     DRM_CHROME9_VERTEX_CULL_CCW |
+			     DRM_CHROME9_VERTEX_FLAT)) ||
+	    hweight32(args->flags & (DRM_CHROME9_VERTEX_CULL_CW |
+				     DRM_CHROME9_VERTEX_CULL_CCW)) > 1 ||
 	    args->index_count || args->index_size ||
 	    args->buffer_count || args->base_vertex || args->indices_ptr ||
 	    args->buffers_ptr ||
