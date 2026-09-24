@@ -663,13 +663,45 @@ the production shader.
 The red lane saturating to `ff` for W=+1 and to zero for W=-1 is consistent
 with the old `RCP(W)` temporary being read in place of the biased projected
 depth.  The green lane is also consistent with sampling at `1/W` rather than
-at the projected S coordinate, but S=.25 lies on a two-texel nearest-filter
-boundary; that lane alone is weaker evidence.  These are **inferences from
-pixels**, not a proven allocator or FE fault.  The five-instruction diagnostic
+at the projected S coordinate.  For a normalized two-texel texture, S=.25 is
+the center of texel zero, not a nearest-filter selection boundary.  These are
+**inferences from pixels**, not a proven allocator or FE fault.  The five-instruction diagnostic
 has a smaller physical-register high-water and shorter TEMP lifetime than
 the eight-instruction proprietary full-shadow object, so its A90 bucket and
 bridge release bit cannot be compared to that full object as if the programs
-were otherwise identical.  A source-equivalent five-instruction Linux
-configuration-two replay, with per-instruction physical IDs and release
-bits, is the next offline gate.  Do not change A28, the computed bridge, or
-the resource bucket based on these pixels alone.
+were otherwise identical.
+
+### Shortened vendor replay and ALU-only silicon discriminator
+
+A source-equivalent five-instruction Linux 5.75 configuration-two replay
+retained RCP, full projective MUL, biased scalar ADD, computed TEX, and a
+terminal full-color ADD.  It emitted five ALUs and one TAU with active tuple
+`(2,3,1,1)` and controls `A90=90058001`, `A91=91000002`,
+`A92=92010005`, `A93=93000001`, `A95=95000008`.  The proprietary computed
+coordinate bridge uses XYXY, whereas the current raw/Mesa form uses XY01.
+The shortened proprietary bridge releases TEMP1 at its last use; the full
+eight-instruction shader keeps it live longer.  More importantly, the MUL
+releases direct varying T0 in its A slot, **not** C-slot TEMP r0.  The existing
+kernel's physical-register lifetime suppression is correct for that record;
+the proposed per-virtual release change was reverted without loading it.
+
+The next bounded raw oracle removed TEX and the ALU/TAU phase transition,
+retaining exactly `RCP -> MUL -> scalar ADD -> full-color MOV`.  The
+`--inspect-threshold-only` binary SHA-256 was
+`f43081c55c48c49691e8c6b3f253cc5ed024c38e13ac6fc8d79d8ba78bc74e43`.
+On the current VX900 module it passed all three rectangles at expected
+`0x8c8c8c8c` (one-byte tolerance), D16, source preservation, full BO guards,
+and exterior checks.  The command retired normally; Xorg and `renderD128`
+remained available and the immediate kernel log had no new fault.  Thus the
+RCP/MUL/ADD arithmetic and this physical-register reuse work without TEX;
+the failure starts in the computed-texture transition or associated FE state.
+
+The current source has a separately reviewed but **not yet loaded** A28/A29
+correction: for a program with texture descriptors, the pixel-stage consumer
+width is capped at three while A25/A26 retain the four-component vertex
+producer.  That matches the shortened vendor shadow tuple `A25=f, A28=e`;
+the currently loaded kernel emits `A25=f, A28=f`.  It is the strongest
+source-backed next silicon differential.  A successful module build and
+selftest source inspection do not yet prove this change fixes the pixels.
+Do not bundle the XY01/XYXY bridge change or a resource-bucket change into
+that test.
