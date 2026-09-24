@@ -214,6 +214,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_FRAGMENT_PRIMARY		(1ULL << 54)
 /* Generic fragment descriptors may name sparse logical texture units. */
 #define DRM_CHROME9_CAP_FRAGMENT_SPARSE_TEXTURES	(1ULL << 55)
+/* The programmable FE writes all eight compact T inputs in A01--A03;
+ * structured draws accept eight descriptor slots independently of TEX count.
+ */
+#define DRM_CHROME9_CAP_FRAGMENT_EXTENDED_LINKAGE	(1ULL << 56)
 
 struct drm_chrome9_get_param {
 	__u32 param;
