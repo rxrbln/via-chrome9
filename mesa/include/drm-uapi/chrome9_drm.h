@@ -276,6 +276,9 @@ struct drm_chrome9_gem_create {
 struct drm_chrome9_gem_cpu_access {
 	__u32 handle;
 	__u32 flags;
+	/* Byte range PREPARE_* covers; size 0 is the whole object. */
+	__u64 offset;
+	__u64 size;
 };
 
 /*
