@@ -219,3 +219,24 @@ bounded gate after a cold recovery, is:
 
 Until those gates separate the failure, `.lower_fsqrt` must remain disabled
 and function-medium remains fail-closed.
+
+`tools/re/chrome9_normalize_guard_smoke.c --sqrt-x-positive` implements the
+first gate without the zero endpoint, CMP, or Y/Z/W partial writes.  It sends
+one finite full-float T0.x value, `.25`, through X-mask `RSQ`, X-mask `RCP`,
+then replicates the scalar X result to the full color output.  The Linux 5.75
+configuration-two compiler gives the exact production precedent:
+
+```text
+01c00530 801c0053 0012c0b6 00070020
+01c00530 801c0053 001200b6 00060060
+01c00530 001c0053 00f20100 000d0820
+
+active=(1,2,1,0) A90=90058001 A91=91000000 A92=92000003
+```
+
+The expected mathematical result is `.5`, so every BGRA8 lane must be within
+two codes of `0x80`.  The tool also requires D16 near `0x8000`, an untouched
+triangle exterior, and intact color/depth guard pages.  It passes a strict
+host build; it has not been submitted to the GPU by this audit.  Passing this
+gate would qualify only the finite-positive X-lane chain and scalar forward,
+not zero, signed values, exceptional values, or partial Y/Z/W destinations.
