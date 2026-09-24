@@ -93,6 +93,29 @@ test_linear_mips(void)
    for (unsigned lane = 1; lane < 4; lane++)
       for (unsigned c = 0; c < 4; c++)
          sample_ok &= rgba[c][lane] == 0.0f;
+   {
+      struct pipe_sampler_state state = {0};
+      const float s[4] = {0.375f, 0.375f, 0.375f, 0.375f};
+      const float t[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+      const float lod[4] = {0};
+      float derivs[3][2][4] = {{{0}}};
+
+      state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+      state.min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST;
+      state.wrap_s = state.wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+      state.max_lod = 1.0f;
+      ctx.vs_sampler_states[0] = &state;
+      for (unsigned lane = 0; lane < 4; lane++)
+         derivs[0][0][lane] = 0.25f;
+      /* The gradient spans one texel of view level zero (absolute L1).
+       * Scaling against the resource's L0 would incorrectly choose L2. */
+      sampler->get_samples(sampler, 0, 0, s, t, lod, lod, lod, derivs,
+                           (const int8_t[3]){0},
+                           TGSI_SAMPLER_DERIVS_EXPLICIT, rgba);
+      sample_ok &= fabsf(rgba[0][0] - 1.0f) < 0.0001f &&
+                   fabsf(rgba[1][0]) < 0.0001f &&
+                   fabsf(rgba[2][0]) < 0.0001f;
+   }
    chrome9_vs_texture_sampler_destroy(sampler);
    if (!sample_ok)
       return false;
@@ -183,6 +206,10 @@ test_sampler(void)
              fabsf(rgba[0][2] - 0.5f) < 0.0001f &&
              fabsf(rgba[1][2] - 0.5f) < 0.0001f &&
              fabsf(rgba[2][2] - 0.5f) < 0.0001f;
+   if (!success)
+      fprintf(stderr, "initial sampler rgba0=%g,%g,%g,%g center=%g,%g,%g,%g\n",
+              rgba[0][0], rgba[1][0], rgba[2][0], rgba[3][0],
+              rgba[0][2], rgba[1][2], rgba[2][2], rgba[3][2]);
    sampler->get_samples(sampler, 5, 5, s, t, zero, zero, zero,
                         derivs, offsets, TGSI_SAMPLER_LOD_EXPLICIT, rgba);
    success &= fabsf(rgba[0][0] - 0.2f) < 0.0001f &&
@@ -205,6 +232,209 @@ test_sampler(void)
    sampler->get_samples(sampler, 5, 5, s, t, zero, zero, zero,
                         derivs, offsets, TGSI_SAMPLER_LOD_EXPLICIT, rgba);
    success &= rgba[0][0] == 0.0f && rgba[1][0] == 0.0f;
+   chrome9_vs_texture_sampler_destroy(sampler);
+   return success;
+}
+
+static bool
+check_sample(struct tgsi_sampler *sampler, const char *name, float s0,
+             float t0, float lod0, enum tgsi_sampler_control control,
+             const float expected[4])
+{
+   const float s[4] = {s0, s0, s0, s0};
+   const float t[4] = {t0, t0, t0, t0};
+   const float lod[4] = {lod0, lod0, lod0, lod0};
+   const float zero[4] = {0};
+   const int8_t offset[3] = {0};
+   float derivs[3][2][4] = {{{0}}};
+   float rgba[4][4];
+
+   sampler->get_samples(sampler, 0, 0, s, t, zero, zero, lod,
+                        derivs, offset, control, rgba);
+   for (unsigned lane = 0; lane < 4; lane++) {
+      for (unsigned c = 0; c < 4; c++) {
+         if (fabsf(rgba[c][lane] - expected[c]) > 0.0001f) {
+            fprintf(stderr, "%s: lane %u channel %u got %g expected %g\n",
+                    name, lane, c, rgba[c][lane], expected[c]);
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+test_sampler_states(void)
+{
+   uint8_t image[256] = {0};
+   struct chrome9_resource resource = {0};
+   struct pipe_sampler_view view = {0};
+   struct pipe_sampler_state state = {0};
+   struct chrome9_context ctx = {0};
+   struct tgsi_sampler *sampler;
+   bool success = true;
+
+   resource.base.target = PIPE_TEXTURE_2D;
+   resource.base.format = PIPE_FORMAT_B8G8R8X8_UNORM;
+   resource.base.width0 = resource.base.height0 = 2;
+   resource.base.depth0 = resource.base.array_size = 1;
+   resource.base.last_level = 1;
+   resource.bo.map = image;
+   resource.bo.size = sizeof(image);
+   resource.level_offset[0] = 64;
+   resource.level_stride[0] = 32;
+   resource.level_size[0] = 64;
+   resource.level_offset[1] = 128;
+   resource.level_stride[1] = 32;
+   resource.level_size[1] = 32;
+   /* Base 2x2 is red, green, blue, white; mip 1 is blue.  Deliberately
+    * non-one X bytes distinguish BGRX alpha semantics from raw BGRA. */
+   memcpy(image + 64, (const uint8_t[]){0, 0, 255, 64,
+                                        0, 255, 0, 128}, 8);
+   memcpy(image + 96, (const uint8_t[]){255, 0, 0, 192,
+                                        255, 255, 255, 0}, 8);
+   memcpy(image + 128, (const uint8_t[]){255, 0, 0, 255}, 4);
+   view.texture = &resource.base;
+   view.target = PIPE_TEXTURE_2D;
+   view.format = resource.base.format;
+   view.u.tex.last_level = 1;
+   set_identity_swizzle(&view);
+   ctx.vs_sampler_views[0] = &view;
+   ctx.vs_sampler_states[0] = &state;
+   if (!chrome9_vs_texture_mapping(&view, &ctx.vs_texture_mappings[0]))
+      return false;
+   sampler = chrome9_vs_texture_sampler_create(&ctx);
+   if (!sampler)
+      return false;
+
+   state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+   state.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+   state.wrap_s = state.wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+   state.max_lod = 1.0f;
+   success &= check_sample(sampler, "BGRX alpha one", 0.25f, 0.25f,
+                           0.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){1, 0, 0, 1});
+   view.swizzle_a = PIPE_SWIZZLE_1;
+   success &= check_sample(sampler, "BGRX alpha-one view swizzle",
+                           0.25f, 0.25f, 0.0f,
+                           TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){1, 0, 0, 1});
+   view.swizzle_a = PIPE_SWIZZLE_W;
+   resource.base.format = view.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+
+   success &= check_sample(sampler, "nearest clamp", -0.25f, 0.25f,
+                           0.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){1, 0, 0, 64.0f / 255.0f});
+   state.wrap_s = PIPE_TEX_WRAP_REPEAT;
+   success &= check_sample(sampler, "nearest repeat", -0.25f, 0.25f,
+                           0.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){0, 1, 0, 128.0f / 255.0f});
+   state.wrap_s = PIPE_TEX_WRAP_MIRROR_REPEAT;
+   success &= check_sample(sampler, "nearest mirror repeat", -0.25f,
+                           0.25f, 0.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){1, 0, 0, 64.0f / 255.0f});
+   state.wrap_s = PIPE_TEX_WRAP_REPEAT;
+   state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_LINEAR;
+   success &= check_sample(sampler, "linear repeat seam", 0.0f, 0.25f,
+                           0.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){0.5f, 0.5f, 0,
+                                           96.0f / 255.0f});
+   state.wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+   state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+   state.min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST;
+   success &= check_sample(sampler, "nearest mip level one", 0.25f,
+                           0.25f, 1.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){0, 0, 1, 1});
+   success &= check_sample(sampler, "nearest mip half rounds up", 0.25f,
+                           0.25f, 0.5f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){0, 0, 1, 1});
+   state.min_mip_filter = PIPE_TEX_MIPFILTER_LINEAR;
+   success &= check_sample(sampler, "linear mip quarter", 0.25f, 0.25f,
+                           0.25f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){0.75f, 0, 0.25f,
+                                           (0.75f * 64.0f + 0.25f * 255.0f) /
+                                           255.0f});
+   state.lod_bias = 0.25f;
+   success &= check_sample(sampler, "linear mip LOD bias", 0.25f, 0.25f,
+                           0.0f, TGSI_SAMPLER_LOD_ZERO,
+                           (const float[]){0.75f, 0, 0.25f,
+                                           (0.75f * 64.0f + 0.25f * 255.0f) /
+                                           255.0f});
+   state.lod_bias = 0.0f;
+   state.max_lod = 0.25f;
+   success &= check_sample(sampler, "linear mip max LOD", 0.25f, 0.25f,
+                           1.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){0.75f, 0, 0.25f,
+                                           (0.75f * 64.0f + 0.25f * 255.0f) /
+                                           255.0f});
+   chrome9_vs_texture_sampler_destroy(sampler);
+   return success;
+}
+
+static bool
+test_sampler_formats(void)
+{
+   static const struct {
+      enum pipe_format format;
+      uint8_t pixel[4];
+      float expected[4];
+   } cases[] = {
+      {PIPE_FORMAT_A8_UNORM, {128}, {0, 0, 0, 128.0f / 255.0f}},
+      {PIPE_FORMAT_L8_UNORM, {128},
+       {128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f, 1}},
+      {PIPE_FORMAT_L8A8_UNORM, {128, 64},
+       {128.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f,
+        64.0f / 255.0f}},
+      {PIPE_FORMAT_B5G6R5_UNORM, {0, 248}, {1, 0, 0, 1}},
+      {PIPE_FORMAT_X8Z24_UNORM, {0, 0, 0, 128},
+       {8388608.0f / 16777215.0f, 0, 0, 1}},
+   };
+   uint8_t image[96] = {0};
+   struct chrome9_resource resource = {0};
+   struct pipe_sampler_view view = {0};
+   struct pipe_sampler_state state = {0};
+   struct chrome9_context ctx = {0};
+   struct tgsi_sampler *sampler;
+   bool success = true;
+
+   resource.base.target = PIPE_TEXTURE_2D;
+   resource.base.width0 = resource.base.height0 = 1;
+   resource.base.depth0 = resource.base.array_size = 1;
+   resource.bo.map = image;
+   resource.bo.size = sizeof(image);
+   resource.level_offset[0] = 32;
+   resource.level_stride[0] = 32;
+   resource.level_size[0] = 32;
+   view.texture = &resource.base;
+   view.target = PIPE_TEXTURE_2D;
+   set_identity_swizzle(&view);
+   state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+   state.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+   state.wrap_s = state.wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+   ctx.vs_sampler_views[0] = &view;
+   ctx.vs_sampler_states[0] = &state;
+   sampler = chrome9_vs_texture_sampler_create(&ctx);
+   if (!sampler)
+      return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+      resource.base.format = view.format = cases[i].format;
+      memcpy(image + 32, cases[i].pixel, sizeof(cases[i].pixel));
+      if (!chrome9_vs_texture_mapping(&view, &ctx.vs_texture_mappings[0])) {
+         success = false;
+         break;
+      }
+      success &= check_sample(sampler, util_format_name(cases[i].format),
+                              0.5f, 0.5f, 0.0f,
+                              TGSI_SAMPLER_LOD_EXPLICIT, cases[i].expected);
+   }
+   view.swizzle_r = PIPE_SWIZZLE_1;
+   view.swizzle_g = PIPE_SWIZZLE_X;
+   view.swizzle_b = PIPE_SWIZZLE_0;
+   view.swizzle_a = PIPE_SWIZZLE_Y;
+   success &= check_sample(sampler, "depth view swizzle", 0.5f, 0.5f,
+                           0.0f, TGSI_SAMPLER_LOD_EXPLICIT,
+                           (const float[]){1, 8388608.0f / 16777215.0f,
+                                           0, 0});
    chrome9_vs_texture_sampler_destroy(sampler);
    return success;
 }
@@ -415,6 +645,14 @@ main(void)
    }
    if (!test_sampler()) {
       fputs("vertex texture callback failed\n", stderr);
+      return 1;
+   }
+   if (!test_sampler_states()) {
+      fputs("vertex texture state callback failed\n", stderr);
+      return 1;
+   }
+   if (!test_sampler_formats()) {
+      fputs("vertex texture format callback failed\n", stderr);
       return 1;
    }
    /* Raw NIR can name high slots; linked GL uses dense shader slots even

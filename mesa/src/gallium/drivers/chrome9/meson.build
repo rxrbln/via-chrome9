@@ -55,7 +55,7 @@ test('chrome9-shader-offline', chrome9_shader_offline_test,
 
 chrome9_vs_texture_test = executable(
   'chrome9-vs-texture-test',
-  ['chrome9_vs_texture.c', 'chrome9_vs_texture_test.c'],
+  ['chrome9_format.c', 'chrome9_vs_texture.c', 'chrome9_vs_texture_test.c'],
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [idep_nir, idep_mesautil],
   link_with : [libgallium],

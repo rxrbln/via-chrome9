@@ -4,6 +4,7 @@
 #include "chrome9_vs_texture.h"
 
 #include "chrome9_context.h"
+#include "chrome9_format.h"
 #include "chrome9_resource.h"
 
 #include <limits.h>
@@ -81,22 +82,174 @@ chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
 }
 
 static void
-chrome9_vs_fetch_bgra(const struct chrome9_vs_texture_mapping *mapping,
-                      unsigned level, unsigned x, unsigned y, float rgba[4])
+chrome9_vs_fetch_texel(const struct pipe_sampler_view *view,
+                       const struct chrome9_vs_texture_mapping *mapping,
+                       unsigned level, unsigned x, unsigned y, float rgba[4])
 {
+   unsigned cpp = util_format_get_blocksize(view->format);
    const uint8_t *pixel = (const uint8_t *)mapping->base +
       mapping->mip_offset[level] + (size_t)y * mapping->row_stride[level] +
-      (size_t)x * 4;
+      (size_t)x * cpp;
+   float decoded[4];
+   const unsigned swizzle[4] = {
+      view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a,
+   };
 
-   rgba[0] = pixel[2] * (1.0f / 255.0f);
-   rgba[1] = pixel[1] * (1.0f / 255.0f);
-   rgba[2] = pixel[0] * (1.0f / 255.0f);
-   rgba[3] = pixel[3] * (1.0f / 255.0f);
+   if (view->format == PIPE_FORMAT_X8Z24_UNORM) {
+      util_format_unpack_z_float(view->format, &decoded[0], pixel, 1);
+      decoded[1] = decoded[2] = 0.0f;
+      decoded[3] = 1.0f;
+   } else {
+      util_format_unpack_rgba(view->format, decoded, pixel, 1);
+   }
+   for (unsigned c = 0; c < 4; c++) {
+      switch (swizzle[c]) {
+      case PIPE_SWIZZLE_X:
+      case PIPE_SWIZZLE_Y:
+      case PIPE_SWIZZLE_Z:
+      case PIPE_SWIZZLE_W:
+         rgba[c] = decoded[swizzle[c]];
+         break;
+      case PIPE_SWIZZLE_0:
+         rgba[c] = 0.0f;
+         break;
+      case PIPE_SWIZZLE_1:
+         rgba[c] = 1.0f;
+         break;
+      default:
+         rgba[c] = 0.0f;
+         break;
+      }
+   }
 }
 
-/* A bounded first software sampler contract: terrain's normalized 2D BGRA,
- * explicit LOD zero, linear/clamp-to-edge state.  Other states return zero;
- * public VS texture caps remain zero until their envelope is implemented. */
+static float
+chrome9_vs_wrap_coordinate(float coordinate, unsigned wrap)
+{
+   if (wrap == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
+      return CLAMP(coordinate, 0.0f, 1.0f);
+   if (wrap == PIPE_TEX_WRAP_REPEAT) {
+      float fraction = fmodf(coordinate, 1.0f);
+
+      return fraction < 0.0f ? fraction + 1.0f : fraction;
+   }
+   if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
+      float mirrored = fmodf(coordinate, 2.0f);
+
+      if (mirrored < 0.0f)
+         mirrored += 2.0f;
+      return mirrored > 1.0f ? 2.0f - mirrored : mirrored;
+   }
+   return 0.0f;
+}
+
+static unsigned
+chrome9_vs_wrap_texel(int index, unsigned size, unsigned wrap)
+{
+   if (wrap == PIPE_TEX_WRAP_REPEAT) {
+      int wrapped = index % (int)size;
+
+      return wrapped < 0 ? wrapped + size : wrapped;
+   }
+   if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
+      int period = 2 * (int)size;
+      int wrapped = index % period;
+
+      if (wrapped < 0)
+         wrapped += period;
+      return wrapped >= (int)size ? period - 1 - wrapped : wrapped;
+   }
+   return CLAMP(index, 0, (int)size - 1);
+}
+
+static void
+chrome9_vs_sample_level(const struct pipe_sampler_view *view,
+                        const struct chrome9_vs_texture_mapping *mapping,
+                        const struct pipe_sampler_state *state,
+                        unsigned level, float s, float t,
+                        const int8_t offset[3], unsigned filter,
+                        float rgba[4])
+{
+   unsigned width = u_minify(mapping->width, level);
+   unsigned height = u_minify(mapping->height, level);
+   float x = chrome9_vs_wrap_coordinate(s, state->wrap_s) * width;
+   float y = chrome9_vs_wrap_coordinate(t, state->wrap_t) * height;
+
+   if (filter == PIPE_TEX_FILTER_NEAREST) {
+      unsigned ix = chrome9_vs_wrap_texel((int)floorf(x) + offset[0],
+                                          width, state->wrap_s);
+      unsigned iy = chrome9_vs_wrap_texel((int)floorf(y) + offset[1],
+                                          height, state->wrap_t);
+
+      chrome9_vs_fetch_texel(view, mapping, level, ix, iy, rgba);
+      return;
+   }
+
+   x -= 0.5f;
+   y -= 0.5f;
+   int x0 = floorf(x), y0 = floorf(y);
+   float fx = x - x0, fy = y - y0;
+   float texels[2][2][4];
+
+   for (unsigned j = 0; j < 2; j++) {
+      unsigned iy = chrome9_vs_wrap_texel(y0 + j + offset[1], height,
+                                          state->wrap_t);
+
+      for (unsigned i = 0; i < 2; i++) {
+         unsigned ix = chrome9_vs_wrap_texel(x0 + i + offset[0], width,
+                                             state->wrap_s);
+
+         chrome9_vs_fetch_texel(view, mapping, level, ix, iy, texels[j][i]);
+      }
+   }
+   for (unsigned c = 0; c < 4; c++) {
+      float top = texels[0][0][c] * (1.0f - fx) + texels[0][1][c] * fx;
+      float bottom = texels[1][0][c] * (1.0f - fx) + texels[1][1][c] * fx;
+
+      rgba[c] = top * (1.0f - fy) + bottom * fy;
+   }
+}
+
+static float
+chrome9_vs_sample_lod(const struct chrome9_vs_texture_mapping *mapping,
+                      const struct pipe_sampler_state *state,
+                      const float lod[TGSI_QUAD_SIZE],
+                      float derivs[3][2][TGSI_QUAD_SIZE],
+                      enum tgsi_sampler_control control, unsigned lane)
+{
+   float value = state->lod_bias;
+
+   switch (control) {
+   case TGSI_SAMPLER_LOD_BIAS:
+   case TGSI_SAMPLER_LOD_EXPLICIT:
+      value += lod[lane];
+      break;
+   case TGSI_SAMPLER_DERIVS_EXPLICIT: {
+      unsigned width = u_minify(mapping->width, mapping->first_level);
+      unsigned height = u_minify(mapping->height, mapping->first_level);
+      float sx = derivs[0][0][lane] * width;
+      float tx = derivs[1][0][lane] * height;
+      float sy = derivs[0][1][lane] * width;
+      float ty = derivs[1][1][lane] * height;
+      float rho = MAX2(hypotf(sx, tx), hypotf(sy, ty));
+
+      value = rho > 0.0f ? log2f(rho) : -INFINITY;
+      break;
+   }
+   case TGSI_SAMPLER_LOD_NONE:
+   case TGSI_SAMPLER_LOD_ZERO:
+      break;
+   default:
+      return NAN;
+   }
+   if (isnan(value))
+      return NAN;
+   return CLAMP(value, state->min_lod, state->max_lod);
+}
+
+/* Vertex programs execute in the draw module.  Sample from the same linear
+ * guarded mip layout used by fragment resources, with Gallium's normalized
+ * 2D filter, wrap, LOD, and view-swizzle semantics. */
 static void
 chrome9_vs_get_samples(struct tgsi_sampler *sampler,
                        unsigned sview_index, unsigned sampler_index,
@@ -119,52 +272,59 @@ chrome9_vs_get_samples(struct tgsi_sampler *sampler,
    const struct chrome9_vs_texture_mapping *mapping =
       view ? &ctx->vs_texture_mappings[sview_index] : NULL;
    bool valid = view && state && mapping->base &&
-      view->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
-      mapping->first_level == 0 &&
-      state->min_img_filter == PIPE_TEX_FILTER_LINEAR &&
-      state->mag_img_filter == PIPE_TEX_FILTER_LINEAR &&
-      state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE &&
-      state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
-      state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
+      chrome9_texture_format_info(view->format) &&
+      (state->min_img_filter == PIPE_TEX_FILTER_NEAREST ||
+       state->min_img_filter == PIPE_TEX_FILTER_LINEAR) &&
+      (state->mag_img_filter == PIPE_TEX_FILTER_NEAREST ||
+       state->mag_img_filter == PIPE_TEX_FILTER_LINEAR) &&
+      (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ||
+       state->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST ||
+       state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR) &&
+      (state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
+       state->wrap_s == PIPE_TEX_WRAP_REPEAT ||
+       state->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT) &&
+      (state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
+       state->wrap_t == PIPE_TEX_WRAP_REPEAT ||
+       state->wrap_t == PIPE_TEX_WRAP_MIRROR_REPEAT) &&
       state->compare_mode == PIPE_TEX_COMPARE_NONE &&
       !state->unnormalized_coords &&
-      (control == TGSI_SAMPLER_LOD_EXPLICIT ||
-       control == TGSI_SAMPLER_LOD_ZERO) &&
-      !offset[0] && !offset[1] && !offset[2];
+      !offset[2];
 
    (void)r;
    (void)c0;
-   (void)derivs;
    for (unsigned lane = 0; lane < TGSI_QUAD_SIZE; lane++) {
       float result[4] = {0};
 
-      if (valid && isfinite(s[lane]) && isfinite(t[lane]) &&
-          (control == TGSI_SAMPLER_LOD_ZERO ||
-           (isfinite(lod[lane]) && lod[lane] == 0.0f))) {
-         const unsigned width = mapping->width, height = mapping->height;
-         float x = CLAMP(s[lane], 0.0f, 1.0f) * width - 0.5f;
-         float y = CLAMP(t[lane], 0.0f, 1.0f) * height - 0.5f;
-         int x0 = floorf(x), y0 = floorf(y);
-         float fx = x - x0, fy = y - y0;
-         unsigned xs[2] = {CLAMP(x0, 0, (int)width - 1),
-                           CLAMP(x0 + 1, 0, (int)width - 1)};
-         unsigned ys[2] = {CLAMP(y0, 0, (int)height - 1),
-                           CLAMP(y0 + 1, 0, (int)height - 1)};
-         float texels[2][2][4];
+      if (valid && isfinite(s[lane]) && isfinite(t[lane])) {
+         float lambda = chrome9_vs_sample_lod(mapping, state, lod, derivs,
+                                               control, lane);
 
-         for (unsigned j = 0; j < 2; j++)
-            for (unsigned i = 0; i < 2; i++)
-               chrome9_vs_fetch_bgra(mapping, 0, xs[i], ys[j],
-                                     texels[j][i]);
-         for (unsigned c = 0; c < 4; c++) {
-            float top = texels[0][0][c] * (1.0f - fx) +
-                        texels[0][1][c] * fx;
-            float bottom = texels[1][0][c] * (1.0f - fx) +
-                           texels[1][1][c] * fx;
-            result[c] = top * (1.0f - fy) + bottom * fy;
+         if (isfinite(lambda)) {
+            unsigned max_level = mapping->last_level - mapping->first_level;
+            unsigned filter = lambda <= 0.0f ? state->mag_img_filter :
+                                                   state->min_img_filter;
+            float level = CLAMP(lambda, 0.0f, (float)max_level);
+            unsigned first = mapping->first_level;
+
+            if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST)
+               first += (unsigned)floorf(level + 0.5f);
+            else if (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
+               first += (unsigned)floorf(level);
+            chrome9_vs_sample_level(view, mapping, state, first,
+                                    s[lane], t[lane], offset, filter, result);
+            if (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR &&
+                first < mapping->last_level && level > 0.0f) {
+               float next[4];
+               float fraction = level - floorf(level);
+
+               chrome9_vs_sample_level(view, mapping, state, first + 1,
+                                       s[lane], t[lane], offset,
+                                       state->min_img_filter, next);
+               for (unsigned c = 0; c < 4; c++)
+                  result[c] = result[c] * (1.0f - fraction) +
+                              next[c] * fraction;
+            }
          }
-         if (view->swizzle_a == PIPE_SWIZZLE_1)
-            result[3] = 1.0f;
       }
       for (unsigned c = 0; c < 4; c++)
          rgba[c][lane] = result[c];
@@ -216,7 +376,7 @@ chrome9_vs_get_texel(struct tgsi_sampler *sampler,
          (int64_t)mapping->first_level + lod[lane] : -1;
 
       if (view && mapping->base &&
-          view->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
+          chrome9_texture_format_info(view->format) &&
           lod[lane] >= 0 && level_index <= mapping->last_level &&
           !k[lane] && !offset[2]) {
          unsigned level = level_index;
@@ -227,8 +387,8 @@ chrome9_vs_get_texel(struct tgsi_sampler *sampler,
 
          if (x >= 0 && (uint64_t)x < width &&
              y >= 0 && (uint64_t)y < height)
-            chrome9_vs_fetch_bgra(mapping, level, (unsigned)x,
-                                  (unsigned)y, result);
+            chrome9_vs_fetch_texel(view, mapping, level, (unsigned)x,
+                                   (unsigned)y, result);
       }
       for (unsigned c = 0; c < 4; c++)
          rgba[c][lane] = result[c];

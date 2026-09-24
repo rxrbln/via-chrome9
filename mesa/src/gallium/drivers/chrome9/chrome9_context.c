@@ -16,6 +16,7 @@
 #include "draw/draw_context.h"
 #include "nir.h"
 #include "tgsi/tgsi_parse.h"
+#include "util/format/u_format.h"
 #include "util/u_draw.h"
 #include "util/u_debug.h"
 #include "util/u_debug_cb.h"
@@ -33,7 +34,8 @@ chrome9_copy_surface(struct pipe_resource *destination,
 {
    struct chrome9_resource *dst = chrome9_resource(destination);
    struct chrome9_resource *src = chrome9_resource(source);
-   unsigned width = MIN2(destination->width0, source->width0) * 4;
+   unsigned cpp = util_format_get_blocksize(source->format);
+   unsigned width = MIN2(destination->width0, source->width0) * cpp;
    unsigned height = MIN2(destination->height0, source->height0);
    uint8_t *dst_map = (uint8_t *)dst->bo.map + dst->data_offset;
    const uint8_t *src_map = (const uint8_t *)src->bo.map + src->data_offset;
@@ -4343,12 +4345,17 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
    if (supported && !chrome9_resource(texture)->guarded) {
       struct pipe_resource shadow_templ = *texture;
 
-      shadow_templ.last_level = 0;
-      shadow_templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR;
-      shadow_templ.flags = 0;
-      cview->shadow = pipe->screen->resource_create(pipe->screen,
-                                                     &shadow_templ);
-      supported = cview->shadow != NULL;
+      /* Imported images expose only their level-zero plane layout. */
+      if (templ->u.tex.last_level) {
+         supported = false;
+      } else {
+         shadow_templ.last_level = 0;
+         shadow_templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR;
+         shadow_templ.flags = 0;
+         cview->shadow = pipe->screen->resource_create(pipe->screen,
+                                                        &shadow_templ);
+         supported = cview->shadow != NULL;
+      }
    }
 
    if (!supported) {
@@ -4790,8 +4797,7 @@ chrome9_refresh_vs_textures(struct chrome9_context *ctx)
 
       if (view && view->texture == external)
          chrome9_flush_render_target(ctx);
-      if (view && view->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
-          chrome9_sampler_view(view)->shadow) {
+      if (view && chrome9_sampler_view(view)->shadow) {
          chrome9_copy_surface(chrome9_sampler_view(view)->shadow,
                               view->texture);
          effective = *view;
@@ -5128,7 +5134,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.resource_release = u_default_resource_release;
    chrome9_init_context_resource_functions(&ctx->base);
 
-   ctx->draw = draw_create(&ctx->base);
+   /* The vertex sampler is a TGSI-exec callback.  LLVM draw shaders use
+    * their own sampler ABI and cannot safely share that callback. */
+   ctx->draw = draw_create_no_llvm(&ctx->base);
    if (!ctx->draw)
       goto fail;
    ctx->vs_tgsi_sampler = chrome9_vs_texture_sampler_create(ctx);

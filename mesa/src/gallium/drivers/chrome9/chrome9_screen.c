@@ -13,12 +13,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "draw/draw_context.h"
 #include "drm-uapi/chrome9_drm.h"
 #include "xf86drm.h"
 #include "nir.h"
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
+#include "tgsi/tgsi_exec.h"
 #include "util/u_debug.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
@@ -307,19 +307,28 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
    unsigned fs_samplers;
    int debug_fs_samplers;
 
-   draw_init_shader_caps(vs);
+   /* Chrome9 uses the interpreter path so its vertex texture callback is
+    * active even in Mesa builds that also contain LLVM draw support. */
+   tgsi_exec_init_shader_caps(vs);
    vs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    /* GLSL 1.20 uses float-encoded integer uniforms unless both shader
     * stages expose native integers.  Keep the draw module's vertex lowering
     * in that same representation while the fragment backend lacks them. */
    vs->integers = false;
-   /* Vertex texture callbacks are staged but not yet a public feature:
-    * preserve the zero cap until executable sampler and draw-module proofs
-    * cover the advertised operation and state envelope. */
-   vs->max_tex_instructions = 0;
-   vs->max_tex_indirections = 0;
-   vs->max_texture_samplers = 0;
-   vs->max_sampler_views = 0;
+   /* Two dense vertex sampler slots cover the tested draw-module path,
+    * including the two independent fetches needed by terrain.  The same
+    * kernel capability gates sampler-view resource allocation. */
+   if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE) {
+      vs->max_tex_instructions = 32;
+      vs->max_tex_indirections = 1;
+      vs->max_texture_samplers = 2;
+      vs->max_sampler_views = 2;
+   } else {
+      vs->max_tex_instructions = 0;
+      vs->max_tex_indirections = 0;
+      vs->max_texture_samplers = 0;
+      vs->max_sampler_views = 0;
+   }
    /* cso_unbind_context() calls these interfaces whenever the limits are
     * nonzero; Chrome9 does not wire images or shader buffers. */
    vs->max_shader_buffers = 0;
