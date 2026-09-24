@@ -91,13 +91,18 @@ not a model for modern error handling.
 Windows `VTGKModeDX32A.sys` reads SR6F through the indexed helper at analysis
 `0x1ad10`, ORs bit 7 into the saved byte, updates the PTE/residency arrays, and
 writes SR6F through `0x1adc0`.  The map path is
-`0x2ddf0..0x2e0ca`; unmap is `0x2db10..0x2ddd7`.  Depending on a device flag,
-it writes the same flush byte once or repeats it nine times.  No SR6F-clear
-poll appears in those map/unmap paths.  The read helper retries indexed reads
-up to three times until the returned index byte matches the request
-(`0x1ad10..0x1adaa`), which also shows that indexed access was treated as a
-fallible transaction.  Neither vendor family proves that Linux should remove
-its bounded post-wait.
+`0x2ddf0..0x2e0ca`; unmap is `0x2db10..0x2ddd7`.  When adapter flag
+`+0x9cc.bit2` is set, map writes the flush byte once and calls the completion
+helper at `0x2f6e0`; that helper first reads SR6F up to five times and then
+enters a timed wait/recovery loop while bit 7 remains set.  When the flag is
+clear, map writes the same byte ten times total (one common write plus nine
+fallback writes).  Unmap writes it once with the flag set, or twelve times
+total with the flag clear (one plus eleven fallback writes), and does not call
+the completion helper.  The read helper retries indexed reads up to three
+times until the returned index byte matches the request (`0x1ad10..0x1adaa`),
+which also shows that indexed access was treated as a fallible transaction.
+The flag-enabled map therefore independently supports a post-request
+completion check, although it does not manipulate SR6C in this path.
 
 The current driver is deliberately stricter:
 
@@ -153,10 +158,11 @@ immediately select SR6C and restore bit 7
 ```
 
 This is explicit at `via_chrome9_dma.c:432-454`; initialization uses the same
-ordering at lines 259-299.  Windows does not contradict it: its map/unmap
-paths pulse SR6F once or nine times and do not poll for the newly requested
-bit to clear.  Neither vendor path requires a CR PAUSE or an engine-idle wait
-around a live allocation map.
+ordering at lines 259-299.  Windows does not contradict it: its flag-enabled
+map pulses SR6F once and calls `0x2f6e0`, which polls the newly requested bit
+and then enters timed wait/recovery; its fallback map repeats the write ten
+times without polling.  Neither vendor path requires a CR PAUSE or an
+engine-idle wait around a live allocation map.
 
 The current engine instead waits for the request to complete inside
 `chrome9_gart_flush()` while `SR6C.bit7` is still clear, and restores SR6C
