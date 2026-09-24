@@ -7435,6 +7435,18 @@ main(int argc, char **argv)
       screen->destroy(screen);
       return 1;
    }
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_FRAGMENT_EXTENDED_LINKAGE) &&
+       (screen->shader_caps[MESA_SHADER_FRAGMENT].max_inputs !=
+           DRM_CHROME9_FRAGMENT_MAX_VARYINGS ||
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers !=
+           DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views !=
+           DRM_CHROME9_FRAGMENT_MAX_TEXTURES)) {
+      fputs("extended fragment linkage caps missing\n", stderr);
+      screen->destroy(screen);
+      return 1;
+   }
    {
       const struct pipe_shader_caps *vs =
          &screen->shader_caps[MESA_SHADER_VERTEX];

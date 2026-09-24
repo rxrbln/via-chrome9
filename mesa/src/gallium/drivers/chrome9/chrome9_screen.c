@@ -336,6 +336,8 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) ? 96 : 32;
    fs->max_alu_instructions = fs->max_instructions;
    fs->max_inputs =
+      (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_EXTENDED_LINKAGE) ?
+      DRM_CHROME9_FRAGMENT_MAX_VARYINGS :
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
       3 : 2;
    fs->max_outputs = 1;
@@ -346,10 +348,11 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32) ?
       32 * 4 * sizeof(float) : 4 * sizeof(float);
    fs->max_const_buffers = 1;
-   /* The structured fragment-program path has independently qualified
-    * three distinct nearest/clamp descriptors in one draw.  The older
-    * immediate-triangle path retains its own two-texture limit. */
+   /* The extended structured FE maps eight ordered inputs and descriptor
+    * slots.  Keep older kernels' three-slot and legacy two-slot limits. */
    fs_samplers =
+      (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_EXTENDED_LINKAGE) ?
+      DRM_CHROME9_FRAGMENT_MAX_TEXTURES :
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) ? 3 :
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
       2 : 1;
