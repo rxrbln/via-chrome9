@@ -785,3 +785,42 @@ passing result would isolate the previous mismatch to the inspection-only
 terminal lane packing; a failure would leave a genuine computed-TEX/phase or
 sample-return issue even with the vendor's terminal record.  No GPU test is
 authorized by this note while the project is paused.
+
+### Root cause: textured consumer cap dropped the ALU-read W lane
+
+On 2026-09-24 the `--inspect-vendor-terminal` oracle (binary SHA-256
+`4f617495f56e66a44066db304a563429283e2f7c99a6d90b4524acb0f3083d97`) ran once
+on the A28 module.  The kernel selftest `chrome9_fragment_shadow_prefix_selftest`
+already proves that this five-instruction program is byte-identical to the
+Linux 5.75 shortened object, so the submitted ALU/TAU words and A90-A9b were
+no longer a variable.  The result was `ffffffff`, `ffffffff`, `00000000`
+instead of `bfbfbfbf`, `ffffffff`, `bfbfbfbf`; D16 `8000`, guards intact, no
+kernel fault.
+
+Every observed pixel from the threshold/sample and vendor-terminal runs fits
+one model: the PS reads `T0.w` as +0.  `RCP(+0)` is +Inf on VX900 (see the
+infinity-sign gate), so the projective MUL yields `sign(T0)*Inf`: W=+1 gives
+a saturated threshold and S=+Inf clamped to texel one (`cc`), W=-1 gives a
+negative threshold and S=-Inf clamped to texel zero (`33`).  The ALU-only
+threshold test passed because it had no texture state and so used a
+four-component consumer.
+
+The kernel applied the vendor `ComputeTexDim` three-component cap to every
+FE consumer field (A01/A02/A03) and to A28/A29 whenever texture state was
+present, including a varying whose W lane the ALU reads directly.  The fix
+keeps that cap but raises it to the ALU-read width of each varying
+(`chrome9_fragment_consumer_width`; compiler tracks `varying_alu_width`).
+For this shader A01 becomes `01002523` and A28 `28fff000`.
+
+Module SHA-256 `76934b91623d4c22240dffc33285182f4308047039e1146ccf819fa08a7cc50f`
+(Build ID `aec88bb5cd29c7afa5d44ec107ef1716193c5099`) was deployed through
+the generic hash-gated `tools/chrome9_module_handoff.sh`.  On it the
+vendor-terminal, threshold/sample and **complete eight-instruction projected
+X8Z24 shadow compare** oracles all passed (occluded, unoccluded and W<=0
+rectangles, D16/guards/source intact).  Regression baselines passed: three
+sampler, sparse five-sampler (RGB `50/44/30`) and CMP TEMP-true; no kernel
+fault.  Logs: target `/root/tmp/chrome9-live/alu-w-width-20260924/`.
+
+glmark2 `shadow:nframes=1` with the deployed Mesa still reports
+`draw rejected: unsupported bounded fragment program`: the Mesa nested-CMP
+lowering of the `flt`/`iand`/`bcsel` graph is the remaining scene blocker.
