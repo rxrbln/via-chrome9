@@ -189,6 +189,53 @@ advertises three fragment inputs and three sampler slots.  The discriminator
 only proves that, after those route and descriptor paths are generalized,
 raising the ALU cap is not the required fix.
 
+### Scheduling and channel-allocation discriminator
+
+Mesa's generic `nir_schedule()` is not a fix at the point where the driver
+currently calls the semantic compiler.  Normal and fallback scheduling at
+pressure thresholds 4, 6, 8, 12 and 32 all reproduce the same 100-record
+semantic order, allocator failure and peak.  `chrome9_compile_ps_nir()` walks
+the output DAG recursively and emits its own postorder, so it discards the
+NIR block order.  Scheduling must happen while emitting that DAG or over the
+completed semantic IR.
+
+The first failure does have a zero-cost local improvement.  Records 23..29
+form the roughness denominator chain; their first late consumers are records
+66, 75 and 80.  Sinking the chain immediately before record 66 reduces the
+live set at record 34 from 13 vectors to 11 without adding or deleting an
+operation.  It does not lower the later peak because `t29` and `t35` then
+remain live across those three consumers.
+
+A dependency-checked, deliberately offline schedule gives a stronger upper
+bound.  It sinks the independent lightmap/normalization and reflectance
+subtrees, moves the diffuse fetch to its first consumer, and duplicates one
+ADD so the early `t12` lifetime need not cross the late normalization.  The
+result is 101 semantic records, exactly 96 ALU plus five TEX, with a peak of
+ten virtual vectors and 21 written channels.  It has no undefined temporary.
+This exhausts the ALU store but demonstrates that spilling is not the first
+required mechanism.
+
+Twenty-one live channels fit within the raw 24-channel capacity of six vec4
+registers, but that count is not yet a successful hardware coloring.  One
+vector destination's written channels must remain co-resident in one physical
+register, and every A/C/B source-port rule must still hold.  The proprietary
+Linux compiler provides direct guidance rather than a reason to guess:
+
+```text
+001c1f00 T TryAllocChn_invi
+001c2090 T RenameSrcChannel_invi
+00161a40 T stmPPS_ShrinkSrcChn_invi
+```
+
+`TryAllocChn_invi` selects one candidate slot for a requested channel group
+while checking the named channel lifetimes independently.  Its disassembly
+has 16 candidate slots for classes zero and one and four for class eight.
+`RenameSrcChannel_invi` separately rewrites source channels.  The generic
+next step is therefore a grouped per-channel interval allocator plus semantic
+source-swizzle rewriting, validated against port rules.  Only that allocator
+can decide whether the 21-channel schedule really colors into the six-temp
+resource bucket; the current whole-vector allocator cannot.
+
 The generic implementation ladder is:
 
 1. retain alpha mode in the draw-time variant key and prove mode zero removes
