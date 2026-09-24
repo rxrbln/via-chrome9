@@ -11,6 +11,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "draw/draw_context.h"
+#include "draw/draw_vs.h"
+#include "nir_builder.h"
+#include "pipe/p_screen.h"
 #include "tgsi/tgsi_exec.h"
 
 static bool
@@ -193,10 +197,208 @@ test_sampler(void)
    return success;
 }
 
+static nir_shader *
+make_two_sample_vertex_shader(bool explicit_lod)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &options, "chrome9-two-vertex-textures");
+   nir_def *coord = nir_load_input(
+      &b, 2, 32, nir_imm_int(&b, 0),
+      .io_semantics.location = VERT_ATTRIB_TEX0);
+   nir_def *sample[2];
+   const unsigned slots[2] = {3, 5};
+
+   b.shader->info.io_lowered = true;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader,
+                                                explicit_lod ? 2 : 1);
+      nir_variable *uniform = nir_variable_create(
+         b.shader, nir_var_uniform,
+         glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false,
+                           GLSL_TYPE_FLOAT), "vertex_texture");
+
+      uniform->data.binding = slots[i];
+
+      tex->op = explicit_lod ? nir_texop_txl : nir_texop_tex;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->coord_components = 2;
+      tex->dest_type = nir_type_float32;
+      tex->texture_index = slots[i];
+      tex->sampler_index = slots[i];
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+      if (explicit_lod)
+         tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod,
+                                           nir_imm_float(&b, 0.0f));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      sample[i] = &tex->def;
+   }
+   nir_store_output(&b,
+      nir_vec4(&b, nir_channel(&b, sample[0], 0),
+               nir_imm_float(&b, 0.0f), nir_imm_float(&b, 0.0f),
+               nir_imm_float(&b, 1.0f)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = VARYING_SLOT_POS);
+   nir_store_output(&b,
+      nir_vec4(&b, nir_imm_float(&b, 0.0f),
+               nir_channel(&b, sample[1], 1), nir_imm_float(&b, 0.0f),
+               nir_imm_float(&b, 1.0f)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static bool
+test_draw_vertex_samples(bool explicit_lod)
+{
+   uint8_t image3[160] = {0}, image5[160] = {0};
+   struct chrome9_resource resource3 = {0}, resource5 = {0};
+   struct pipe_sampler_view view3 = {0}, view5 = {0};
+   struct pipe_sampler_state state = {0};
+   struct pipe_rasterizer_state rasterizer = {0};
+   struct pipe_screen screen = {0};
+   struct chrome9_context ctx = {0};
+   struct draw_vertex_shader *shader = NULL;
+   nir_shader *nir = NULL;
+   const float input[4][1][4] = {
+      {{0.25f, 0.25f, 0.0f, 1.0f}},
+      {{0.75f, 0.25f, 0.0f, 1.0f}},
+      {{0.50f, 0.50f, 0.0f, 1.0f}},
+      {{0.25f, 0.75f, 0.0f, 1.0f}},
+   };
+   const float expected_position_x[4] = {1.0f, 0.0f, 0.5f, 0.0f};
+   const float expected_varying_y[4] = {0.2f, 0.4f, 0.5f, 0.6f};
+   struct draw_buffer_info constants[PIPE_MAX_CONSTANT_BUFFERS] = {0};
+   float output[4][2][4] = {{{0}}};
+   int position_slot = -1, varying_slot = -1;
+   bool success = false;
+
+   resource3.base.target = resource5.base.target = PIPE_TEXTURE_2D;
+   resource3.base.format = resource5.base.format =
+      PIPE_FORMAT_B8G8R8A8_UNORM;
+   resource3.base.width0 = resource5.base.width0 = 2;
+   resource3.base.height0 = resource5.base.height0 = 2;
+   resource3.base.depth0 = resource5.base.depth0 = 1;
+   resource3.base.array_size = resource5.base.array_size = 1;
+   resource3.bo.map = image3;
+   resource5.bo.map = image5;
+   resource3.bo.size = sizeof(image3);
+   resource5.bo.size = sizeof(image5);
+   resource3.level_offset[0] = resource5.level_offset[0] = 64;
+   resource3.level_stride[0] = resource5.level_stride[0] = 32;
+   resource3.level_size[0] = resource5.level_size[0] = 64;
+   memcpy(image3 + 64, (const uint8_t[]){0, 0, 255, 255,
+                                         0, 255, 0, 255}, 8);
+   memcpy(image3 + 96, (const uint8_t[]){255, 0, 0, 255,
+                                         255, 255, 255, 255}, 8);
+   memcpy(image5 + 64, (const uint8_t[]){0, 51, 0, 255,
+                                         0, 102, 0, 255}, 8);
+   memcpy(image5 + 96, (const uint8_t[]){0, 153, 0, 255,
+                                         0, 204, 0, 255}, 8);
+   view3.texture = &resource3.base;
+   view5.texture = &resource5.base;
+   view3.target = view5.target = PIPE_TEXTURE_2D;
+   view3.format = view5.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+   ctx.vs_sampler_views[3] = &view3;
+   ctx.vs_sampler_views[5] = &view5;
+   if (!chrome9_vs_texture_mapping(&view3, &ctx.vs_texture_mappings[3]) ||
+       !chrome9_vs_texture_mapping(&view5, &ctx.vs_texture_mappings[5])) {
+      fputs("draw vertex texture mapping failed\n", stderr);
+      return false;
+   }
+   state.min_img_filter = state.mag_img_filter = PIPE_TEX_FILTER_LINEAR;
+   state.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+   state.wrap_s = state.wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+   ctx.vs_sampler_states[3] = ctx.vs_sampler_states[5] = &state;
+   ctx.base.screen = &screen;
+   ctx.draw = draw_create_no_llvm(&ctx.base);
+   if (!ctx.draw) {
+      fputs("draw context creation failed\n", stderr);
+      return false;
+   }
+   ctx.vs_tgsi_sampler = chrome9_vs_texture_sampler_create(&ctx);
+   if (!ctx.vs_tgsi_sampler) {
+      fputs("draw sampler creation failed\n", stderr);
+      goto out;
+   }
+   draw_texture_sampler(ctx.draw, MESA_SHADER_VERTEX, ctx.vs_tgsi_sampler);
+   draw_set_rasterizer_state(ctx.draw, &rasterizer, &rasterizer);
+   nir = make_two_sample_vertex_shader(explicit_lod);
+   if (!nir)
+      goto out;
+   struct pipe_shader_state shader_state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = nir,
+   };
+
+   shader = draw_create_vertex_shader(ctx.draw, &shader_state);
+   /* nir_to_tgsi() consumes the NIR shader even when compilation fails. */
+   nir = NULL;
+   if (!shader || shader->info.num_inputs != 1 ||
+       shader->info.num_outputs != 2) {
+      fprintf(stderr, "vertex shader setup failed: explicit=%u shader=%p "
+              "inputs=%u outputs=%u\n", explicit_lod, (void *)shader,
+              shader ? shader->info.num_inputs : 0,
+              shader ? shader->info.num_outputs : 0);
+      goto out;
+   }
+   for (unsigned slot = 0; slot < shader->info.num_outputs; slot++) {
+      if (shader->info.output_semantic_name[slot] == TGSI_SEMANTIC_POSITION)
+         position_slot = slot;
+      if (shader->info.output_semantic_name[slot] == TGSI_SEMANTIC_GENERIC)
+         varying_slot = slot;
+   }
+   if (position_slot < 0 || varying_slot < 0) {
+      fprintf(stderr, "vertex semantics missing: position=%d varying=%d\n",
+              position_slot, varying_slot);
+      goto out;
+   }
+   shader->prepare(shader, ctx.draw);
+   shader->run_linear(ctx.draw, shader, input[0], output[0], constants, 4,
+                      sizeof(input[0]), sizeof(output[0]), NULL);
+   success = true;
+   for (unsigned vertex = 0; vertex < 4; vertex++) {
+      const float *position = output[vertex][position_slot];
+      const float *varying = output[vertex][varying_slot];
+
+      success &= fabsf(position[0] - expected_position_x[vertex]) < 0.0001f &&
+                 position[1] == 0.0f && position[2] == 0.0f &&
+                 position[3] == 1.0f && varying[0] == 0.0f &&
+                 fabsf(varying[1] - expected_varying_y[vertex]) < 0.0001f &&
+                 varying[2] == 0.0f && varying[3] == 1.0f;
+      if (!success)
+         fprintf(stderr, "vertex %u explicit=%u output pos=(%g,%g,%g,%g) "
+                 "varying=(%g,%g,%g,%g)\n", vertex, explicit_lod,
+                 position[0], position[1], position[2], position[3],
+                 varying[0], varying[1], varying[2], varying[3]);
+   }
+out:
+   if (shader)
+      draw_delete_vertex_shader(ctx.draw, shader);
+   if (nir)
+      ralloc_free(nir);
+   draw_destroy(ctx.draw);
+   chrome9_vs_texture_sampler_destroy(ctx.vs_tgsi_sampler);
+   return success;
+}
+
 int
 main(void)
 {
-   if (!test_linear_mips() || !test_sampler()) {
+   if (!test_linear_mips()) {
+      fputs("vertex texture mip mapping failed\n", stderr);
+      return 1;
+   }
+   if (!test_sampler()) {
+      fputs("vertex texture callback failed\n", stderr);
+      return 1;
+   }
+   if (!test_draw_vertex_samples(false) ||
+       !test_draw_vertex_samples(true)) {
       fputs("chrome9 vertex texture mapping failed\n", stderr);
       return 1;
    }

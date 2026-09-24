@@ -57,7 +57,8 @@ chrome9_vs_texture_test = executable(
   'chrome9-vs-texture-test',
   ['chrome9_vs_texture.c', 'chrome9_vs_texture_test.c'],
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
-  dependencies : [idep_mesautil],
+  dependencies : [idep_nir, idep_mesautil],
+  link_with : [libgallium],
   install : false,
 )
 test('chrome9-vs-texture', chrome9_vs_texture_test, suite : ['chrome9'])
