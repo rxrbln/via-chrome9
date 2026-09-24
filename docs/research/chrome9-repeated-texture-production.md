@@ -397,20 +397,29 @@ separate from this stage namespace and from the currently promoted three
 sampler slots.  Terrain's five fragment samplers therefore remain a future
 capability gate even after the ABI representation is correct.
 
-On 2026-09-24 the guarded three-texture test gained a `--s5` mode
-(`tools/re/chrome9_three_texture_guard_smoke.c`, tools commit `9451cd9`).  It
-submits ABI v2 with one compact BGRA descriptor labelled logical unit 5 and
-one `TEX s5` followed by a color MOV.  It requires an exact red pixel, an
-untouched triangle exterior, both destination guards, and byte-identical
-source and source guards.  The strict T2 cross-build passed.  The currently
-loaded cursor-enabled module has `fragment_sparse_textures=N`, so the staged
-binary returned its intentional skip code 77 before GEM allocation or GPU
-submission; dmesg gained zero lines and the render node remained present.
-This is a fail-closed preflight, **not** an s5 silicon pass.  The staged
-binary and skip log are under
-`/root/tmp/chrome9-live/sparse-s5-20260924/` on the target.  Run the s5 draw
-only after a hash-gated opt-in module handoff with exact rollback, then
-continue the sparse-pair and five-stage ladder above.
+On 2026-09-24 the guarded three-texture test gained `--s5` and `--s0-s5`
+modes (`tools/re/chrome9_three_texture_guard_smoke.c`, tools commits
+`9451cd9`, `ed47142`, and `5eda1e5`).  The first submits ABI v2 with one
+compact BGRA descriptor labelled logical unit 5 and one `TEX s5`; the second
+submits descriptors `[0,5]` with both TEX records and a bounded ADD.  The
+oracles check expected interior pixels, every four-pixel exterior margin,
+both destination guards, and byte-identical source BOs including their
+guards.  Uniform source texels intentionally isolate descriptor routing:
+these probes do **not** distinguish nearest from linear or clamp from repeat.
+
+The strict T2 cross-build passed.  With `fragment_sparse_textures=N`, the
+staged s5 binary returned its intentional skip code 77 before GEM allocation
+or GPU submission, with zero new dmesg lines.  A hash-gated same-binary
+handoff then enabled `cursor_sf=1 fragment_sparse_textures=1`, retained X
+glamor and the render node, and logged no new GPU fault.  Under the GPU lock,
+the dense three-texture baseline, logical s5, a dense post-baseline, logical
+s0+s5, and another dense post-baseline all passed on VX900 with exact expected
+colors and intact guards/sources.  The s5 result was repeated with the pair
+binary before the pair was submitted.  Logs are under
+`/root/tmp/chrome9-live/sparse-s5-20260924/`; the handoff log is also in
+`artifacts/2026-09-24/cursor-sf/`.  This proves the first two high-slot
+rungs and the return to a dense draw, not the five-stage terrain envelope or
+independent high-slot coordinate/filter/mip behavior.
 
 ## Multi-source resource-state tables
 
