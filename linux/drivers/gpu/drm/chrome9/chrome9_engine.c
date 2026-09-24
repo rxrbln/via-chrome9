@@ -669,7 +669,8 @@ static int chrome9_build_prime(struct chrome9_engine *engine,
 				    DRM_CHROME9_FIXED_QUAD_VS_HALF | \
 				    DRM_CHROME9_FIXED_QUAD_VS_M4X4 | \
 				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE | \
-				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR)
+				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR | \
+				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL)
 
 /*
  * Byte-exact vendor compiler records (hw-TCL corpus out_d0_d1 and
@@ -732,13 +733,13 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 		0x40800000, 0xc0800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
 		0xc0800000, 0xc0800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
 	};
-	/* (-.5,-.5,.5,1), (.5,-.5,.5,1), (0,.5,-.125,-.25): z = w/2. */
+	/* (-.5,-.5,.9,1), (.5,-.5,.9,1), (0,.5,-.35,-.25): z = w - 0.1. */
 	static const u32 clip_near[] = {
-		0xbf000000, 0xbf000000, 0x3f000000, 0x3f800000,
+		0xbf000000, 0xbf000000, 0x3f666666, 0x3f800000,
 		0xffff0000, 0xffff0000,
-		0x3f000000, 0xbf000000, 0x3f000000, 0x3f800000,
+		0x3f000000, 0xbf000000, 0x3f666666, 0x3f800000,
 		0xffff0000, 0xffff0000,
-		0x00000000, 0x3f000000, 0xbe000000, 0xbe800000,
+		0x00000000, 0x3f000000, 0xbeb33333, 0xbe800000,
 		0xffff0000, 0xffff0000,
 	};
 	static const u32 pixel[] = {
@@ -764,13 +765,19 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 	vs->vertices = matrix ? pixel :
 		       flags == DRM_CHROME9_FIXED_QUAD_VS_W2 ? clip_w2 :
 		       flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ? clip_wide :
-		       flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR ? clip_near :
-		       clip_w1;
-	vs->a24 = flags == DRM_CHROME9_FIXED_QUAD_VS_HALF ||
-		  flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR ? 0x24000003 :
-								0x24000004;
-	vs->clip = flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ||
-		   flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR;
+		       flags & (DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
+				DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL) ?
+		       clip_near : clip_w1;
+	vs->a24 = flags & (DRM_CHROME9_FIXED_QUAD_VS_HALF |
+			   DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
+			   DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL) ?
+		  0x24000003 : 0x24000004;
+	vs->clip = flags & (DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE |
+			    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
+			    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL);
+	/* Also execute the first MOV clip-position(32) <- scratch tail. */
+	if (flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL)
+		vs->a60++;
 	vs->vertex_dwords = (vs->a24 & 0xff) * 6;
 }
 
@@ -3748,8 +3755,9 @@ static bool chrome9_verify_target(struct chrome9_job *job, u32 flags)
 		if (target[i] != CHROME9_TARGET_SENTINEL)
 			changed++;
 	}
-	if (flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ||
-	    flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR)
+	if (flags & (DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE |
+		     DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR |
+		     DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL))
 		return true;
 	if (flags == DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE ||
 	    flags == DRM_CHROME9_FIXED_QUAD_VS_HALF)
