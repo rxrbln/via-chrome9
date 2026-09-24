@@ -246,6 +246,21 @@ struct drm_chrome9_gem_create {
 #define DRM_CHROME9_FIXED_QUAD_CONSTANT_RED	(1U << 1)
 #define DRM_CHROME9_FIXED_QUAD_DEPTH_ORACLE	(1U << 2)
 #define DRM_CHROME9_FIXED_QUAD_BLEND_ORACLE	(1U << 3)
+/* Hardware-VS oracles: compiled VS, viewport rows 256..258, clip-space
+ * vertices (W=1 or W=2), one triangle, or pixel vertices through M4x4. */
+#define DRM_CHROME9_FIXED_QUAD_VS_ORACLE	(1U << 4)
+#define DRM_CHROME9_FIXED_QUAD_VS_W2		(1U << 5)
+#define DRM_CHROME9_FIXED_QUAD_VS_HALF		(1U << 6)
+#define DRM_CHROME9_FIXED_QUAD_VS_M4X4		(1U << 7)
+/* Clip engine (A01 bit 11) with the A40..A48 viewport: a +-4 clip-space
+ * quad, or a triangle with one vertex behind the eye.  Only the guards are
+ * verified in the kernel; userspace compares the coverage. */
+#define DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE	(1U << 8)
+#define DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR	(1U << 9)
+#define DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR_TAIL	(1U << 10)
+/* The W=1 quad fetched from a fourth page of a 4-page object through
+ * per-element stream slots and inline 16-bit indices. */
+#define DRM_CHROME9_FIXED_QUAD_VS_FETCH		(1U << 11)
 
 /*
  * Diagnostic bounded submission: fill the middle page of an exactly
