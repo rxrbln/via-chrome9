@@ -275,3 +275,32 @@ submission success is consistent with this result.  glmark2 reporting
 `Validation: Unknown` is not itself a pixel failure and should not be treated
 as evidence that this shader object is wrong; a deterministic guarded
 two-texture oracle is still needed for numerical scene validation.
+
+## Guarded numerical gate
+
+`tools/re/chrome9_jellyfish_guard_smoke.c` now supplies that gate without
+matching on a scene or shader name. It submits the exact current 19-record
+semantic order above: 17 ALUs, sampler 1 from a TEMP-computed coordinate,
+sampler 0 from direct T0, disjoint partial definitions, split RGB/alpha, and
+the terminal color move. Constants are compacted to c0--c3, which does not
+alter temporary lifetime or ALU/TAU phase ordering.
+
+Every vertex carries the same three float4 varyings. Direct sampler 0 reads
+T0.xy=(.25,.25). The computed path forms
+T0.zw + 12*(.05,.025)=(.85,.55), so nearest/repeat sampler 1 must select its
+bottom-right texel. Distinct 2x2 BGRA source images make direct/computed
+coordinate or sampler-slot swaps observable. The resulting arithmetic is:
+
+```text
+ambient + diffuse = (.1,.2,.3) + (.1,.2,.3) = (.2,.4,.6)
++ caustic          = (.3,.6,.9)
+* color-map RGB    = (.15,.15,.1125)
+alpha              = .75 - .3 + .4*.4 = .61
+```
+
+Allowing two UNORM conversion steps of tolerance, the expected host BGRA
+word is `9c26261d`. The tool also requires D16 near `8000`, untouched
+triangle exterior, intact leading/trailing guards on color, depth, and both
+sources, and byte-identical source BOs. It builds with strict host warnings.
+It has not been submitted to a GPU; run it once only after a known-good
+baseline, stop on timeout/quarantine, and require a known-good draw after it.
