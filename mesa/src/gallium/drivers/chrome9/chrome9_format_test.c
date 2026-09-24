@@ -51,6 +51,21 @@ main(void)
    CHECK(!chrome9_texture_swizzle_supported(
       PIPE_FORMAT_R8_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y,
       PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W));
+   CHECK(chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_A8_UNORM, PIPE_SWIZZLE_0, PIPE_SWIZZLE_0,
+      PIPE_SWIZZLE_0, PIPE_SWIZZLE_W));
+   CHECK(!chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_A8_UNORM, PIPE_SWIZZLE_W, PIPE_SWIZZLE_W,
+      PIPE_SWIZZLE_W, PIPE_SWIZZLE_W));
+   CHECK(chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_L8_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_X,
+      PIPE_SWIZZLE_X, PIPE_SWIZZLE_1));
+   CHECK(!chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_L8A8_UNORM, PIPE_SWIZZLE_X, PIPE_SWIZZLE_X,
+      PIPE_SWIZZLE_X, PIPE_SWIZZLE_1));
+   CHECK(!chrome9_texture_swizzle_supported(
+      PIPE_FORMAT_B8G8R8A8_UNORM, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_Y,
+      PIPE_SWIZZLE_X, PIPE_SWIZZLE_W));
    CHECK(chrome9_format_storage_cpp(PIPE_FORMAT_Z16_UNORM) == 2);
    CHECK(chrome9_format_storage_cpp(PIPE_FORMAT_X8Z24_UNORM) == 4);
    CHECK(!chrome9_format_storage_cpp(PIPE_FORMAT_Z24X8_UNORM));

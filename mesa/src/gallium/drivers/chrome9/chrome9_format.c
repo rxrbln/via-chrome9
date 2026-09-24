@@ -10,17 +10,28 @@
 #include "pipe/p_state.h"
 #include "util/macros.h"
 
+#define Z CHROME9_LANE_ZERO
+#define O CHROME9_LANE_ONE
+#define D(n) (CHROME9_LANE_DATA + (n))
 static const struct chrome9_texture_format_info texture_formats[] = {
    { PIPE_FORMAT_B8G8R8X8_UNORM,
-     DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888, 4 },
+     DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888, 4, { D(0), D(1), D(2), O } },
    { PIPE_FORMAT_B8G8R8A8_UNORM,
-     DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888, 4 },
-   { PIPE_FORMAT_A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_A8, 1 },
-   { PIPE_FORMAT_L8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8, 1 },
-   { PIPE_FORMAT_L8A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8A8, 2 },
-   { PIPE_FORMAT_B5G6R5_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_RGB565, 2 },
-   { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4 },
+     DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888, 4, { D(0), D(1), D(2), D(3) } },
+   { PIPE_FORMAT_A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_A8, 1,
+     { Z, Z, Z, D(0) } },
+   { PIPE_FORMAT_L8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8, 1,
+     { D(0), D(0), D(0), O } },
+   { PIPE_FORMAT_L8A8_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_L8A8, 2,
+     { D(0), D(0), D(0), D(1) } },
+   { PIPE_FORMAT_B5G6R5_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_RGB565, 2,
+     { D(0), D(1), D(2), O } },
+   { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4,
+     { D(0), Z, Z, O } },
 };
+#undef Z
+#undef O
+#undef D
 
 const struct chrome9_texture_format_info *
 chrome9_texture_format_info(enum pipe_format format)
@@ -111,17 +122,28 @@ chrome9_texture_swizzle_supported(enum pipe_format format,
    if (format == PIPE_FORMAT_X8Z24_UNORM)
       return r <= PIPE_SWIZZLE_1 && g <= PIPE_SWIZZLE_1 &&
              b <= PIPE_SWIZZLE_1 && a <= PIPE_SWIZZLE_1;
-   if (r != PIPE_SWIZZLE_X ||
-       g != PIPE_SWIZZLE_Y || b != PIPE_SWIZZLE_Z)
-      return false;
 
-   /* The native decoders already implement Gallium's A8, luminance,
-    * luminance-alpha, and RGB565 missing-channel semantics.  Their canonical
-    * view is therefore identity.  XRGB may also spell its decoder-supplied
-    * alpha-one explicitly.
-    */
-   return a == PIPE_SWIZZLE_W ||
-          (format == PIPE_FORMAT_B8G8R8X8_UNORM && a == PIPE_SWIZZLE_1);
+   /* The native decoders implement Gallium's missing-channel semantics, so
+    * any view that selects the same decoded value per lane is exact. */
+   const struct chrome9_texture_format_info *info =
+      chrome9_texture_format_info(format);
+   const unsigned view[4] = { r, g, b, a };
+
+   for (unsigned lane = 0; lane < 4; lane++) {
+      unsigned selected;
+
+      if (view[lane] <= PIPE_SWIZZLE_W)
+         selected = info->lanes[view[lane]];
+      else if (view[lane] == PIPE_SWIZZLE_0)
+         selected = CHROME9_LANE_ZERO;
+      else if (view[lane] == PIPE_SWIZZLE_1)
+         selected = CHROME9_LANE_ONE;
+      else
+         return false;
+      if (selected != info->lanes[lane])
+         return false;
+   }
+   return true;
 }
 
 bool

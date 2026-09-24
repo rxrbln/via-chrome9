@@ -13,7 +13,13 @@ struct chrome9_texture_format_info {
    enum pipe_format pipe_format;
    uint32_t drm_format;
    uint8_t bytes_per_pixel;
+   /* Decoded RGBA lanes: CHROME9_LANE_ZERO/ONE or CHROME9_LANE_DATA + n. */
+   uint8_t lanes[4];
 };
+
+#define CHROME9_LANE_ZERO 0
+#define CHROME9_LANE_ONE 1
+#define CHROME9_LANE_DATA 2
 
 const struct chrome9_texture_format_info *
 chrome9_texture_format_info(enum pipe_format format);
