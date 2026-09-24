@@ -1,6 +1,7 @@
 # Chrome9 glmark2 desktop blur compiler boundary
 
-Status: source-exact linked NIR and production compiler object; no GPU claim.
+Status: source-exact compiler test and bounded live GPU run; pixel-exact
+blur correctness remains unproven.
 
 This note closes the static compiler envelope for the default glmark2 desktop
 blur and identifies the first independently implementable generic Mesa gate.
@@ -222,3 +223,24 @@ alpha-1.0 lane reaches the terminal color output.  The semantic UAPI
 translation accepts the resulting program.  This is compiler evidence only;
 it does not yet validate GPU execution, FBO-to-texture coherency, or the
 complete glmark2 desktop scene.
+
+## Bounded live scene result
+
+On the 192.168.2.60 VX900 target, the updated Mesa library completed
+`desktop:windows=1:effect=blur:blur-radius=5:passes=1:separable=true` at
+640x480 with a 22--23 FPS result. A six-second bounded run exited normally;
+the kernel reported no GART, mapping, job, draw, or fragment fault. The
+library loaded by the GL client was verified with `LD_DEBUG=libs` and its
+SHA-256 was
+`34b195977f428bf76e01b61f17c12cd0ede36f02f3458f0279ef5ffe4f152159`.
+The captured target frame is retained at
+`/root/tmp/chrome9-live/literal-pack/desktop-blur-frame.png`.
+
+The frame visibly contains the logo, colored tiles, and moving Tux window
+in the expected 640x480 region. A same-size llvmpipe capture has the same
+scene composition, but the captures were taken at different animation times
+and are not a pixel reference. glmark2 `--validate` reported
+`Validation: Unknown`. Thus this is an execution and qualitative rendering
+milestone, **not** proof of exact eleven-tap filtering, vertical-pass
+correctness, or all desktop-scene variants. The next correctness gate is a
+deterministic nonuniform texture and CPU eleven-tap oracle.
