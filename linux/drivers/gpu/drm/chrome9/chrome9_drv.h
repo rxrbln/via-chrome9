@@ -170,6 +170,10 @@ struct chrome9_bo {
 	bool device_written;
 	/* Kernel mapping kept from the first job until the object is freed. */
 	struct iosys_map kmap;
+	/* Guard pages at these object/mapping sizes were verified intact after
+	 * the last job and have no dirty CPU lines (explicit objects only). */
+	u64 guard_object_size;
+	u64 guard_mapping_size;
 };
 
 void chrome9_bo_hold_kmap(struct chrome9_bo *bo);

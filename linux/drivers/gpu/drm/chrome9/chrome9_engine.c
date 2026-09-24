@@ -884,6 +884,9 @@ static int chrome9_finish_ring_sized(u32 *base, u32 *p, size_t capacity,
 	if (*stop <= *pause || *stop - *pause < 0x20 ||
 	    *stop > capacity - CHROME9_CR_READ_AHEAD)
 		return -E2BIG;
+	/* Only STOP plus the read-ahead window is copied to the ring. */
+	end = min(end, base + (*stop + 16 + CHROME9_CR_READ_AHEAD) /
+			   sizeof(*base));
 	while (p < end) {
 		*p++ = 0xccccccc0;
 		*p++ = 0xddd00000;
@@ -3125,7 +3128,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 			GENMASK(program->varying_width[i] - 1, 0);
 	}
 
-	memset(base, 0xcc, CHROME9_RUN_STAGING_SIZE);
+	/* Every dword up to the read-ahead end is written explicitly. */
 	chrome9_emit_header0(&p, sync, 1);
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 			     destination_state, destination_count);
@@ -6266,6 +6269,17 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
 		ktime_t t0 = ktime_get(), t1;
 
+		/* Verified guards without CPU writes since need no rewrite. */
+		if (bo->explicit_access && !bo->cpu_dirty &&
+		    bo->guard_object_size == object_sizes[i] &&
+		    bo->guard_mapping_size == mapping_sizes[i]) {
+			t1 = ktime_get();
+			chrome9_prof_sub_ns[0] += ktime_to_ns(ktime_sub(t1, t0));
+			dma_sync_sgtable_for_device(&cdev->pdev->dev,
+				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+			continue;
+		}
+		bo->guard_object_size = 0;
 		chrome9_prepare_map_guards(&job->fragment_maps[i], object_sizes[i]);
 		if (mapping_sizes[i] != object_sizes[i])
 			chrome9_prepare_map_guards(&job->fragment_maps[i],
@@ -6375,6 +6389,12 @@ static int chrome9_submit_fragment_program(struct drm_device *drm,
 						mapping_sizes[i]))) {
 			ret = -EIO;
 			dma_fence_set_error(&job->fence.base, ret);
+			to_chrome9_bo(objects[i])->guard_object_size = 0;
+		} else if (to_chrome9_bo(objects[i])->explicit_access) {
+			to_chrome9_bo(objects[i])->guard_object_size =
+				object_sizes[i];
+			to_chrome9_bo(objects[i])->guard_mapping_size =
+				mapping_sizes[i];
 		}
 		chrome9_sf_resync_object_locked(engine, objects[i]);
 	}
