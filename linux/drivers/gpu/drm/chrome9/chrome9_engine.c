@@ -54,7 +54,6 @@
 #define CHROME9_TARGET_DIM		32U
 #define CHROME9_DEP_TIMEOUT		msecs_to_jiffies(5000)
 #define CHROME9_HW_TIMEOUT_US		100000
-#define CHROME9_DRAW_CACHE_MAX_ENTRIES	64U
 #define CHROME9_DRAW_CACHE_MAX_PAGES	(CHROME9_GART_ENTRIES - \
 					 CHROME9_RING_PAGES)
 #define CHROME9_FE33_SYSTEM_WRITE	0xfe330004U
@@ -215,6 +214,8 @@ static void chrome9_prof_mark(enum chrome9_prof_phase phase)
 	chrome9_prof_last = now;
 }
 
+static void chrome9_prof_engine(struct drm_device *drm);
+
 static void chrome9_prof_job(struct drm_device *drm)
 {
 	u32 every = READ_ONCE(chrome9_profile);
@@ -256,6 +257,7 @@ static void chrome9_prof_job(struct drm_device *drm)
 		 div64_u64(chrome9_prof_draws * 100, n) % 100,
 		 div64_u64(chrome9_prof_segments, n),
 		 div64_u64(chrome9_prof_segments * 100, n) % 100);
+	chrome9_prof_engine(drm);
 	chrome9_prof_draws = 0;
 	chrome9_prof_segments = 0;
 	memset(chrome9_prof_sub_ns, 0, sizeof(chrome9_prof_sub_ns));
@@ -636,6 +638,19 @@ static void chrome9_submit_unlock(struct chrome9_engine *engine)
 	list_splice_init(&engine->reaped, &reap);
 	mutex_unlock(&engine->submit_lock);
 	chrome9_engine_reap(&reap);
+}
+
+/* Draw mapping cache totals since load. */
+static void chrome9_prof_engine(struct drm_device *drm)
+{
+	struct chrome9_engine *engine = READ_ONCE(to_chrome9(drm)->engine);
+
+	if (engine)
+		dev_info(drm->dev,
+			 "profile draw cache: hits %llu scanout %llu misses %llu evictions %llu entries %u pages %u\n",
+			 engine->draw_cache_hits, engine->draw_cache_scanout_hits,
+			 engine->draw_cache_misses, engine->draw_cache_evictions,
+			 engine->draw_cache_entries, engine->draw_cache_pages);
 }
 
 struct chrome9_sf_mapping {
@@ -4335,15 +4350,12 @@ static struct chrome9_sf_mapping *
 chrome9_draw_mapping_find_locked(struct chrome9_engine *engine,
 				 struct drm_gem_object *object)
 {
-	struct chrome9_sf_mapping *mapping;
+	struct chrome9_sf_mapping *mapping =
+		to_chrome9_bo(object)->draw_mapping;
 
 	lockdep_assert_held(&engine->submit_lock);
-	list_for_each_entry(mapping, &engine->draw_mappings, link) {
-		if (mapping->object == object && mapping->bound &&
-		    !mapping->quarantined)
-			return mapping;
-	}
-	return NULL;
+	return mapping && mapping->bound && !mapping->quarantined ?
+	       mapping : NULL;
 }
 
 static int
@@ -4374,6 +4386,8 @@ chrome9_draw_mapping_evict_locked(struct chrome9_engine *engine,
 	drm_mm_remove_node(&mapping->node);
 	mapping->node_allocated = false;
 	list_del_init(&mapping->link);
+	if (to_chrome9_bo(mapping->object)->draw_mapping == mapping)
+		to_chrome9_bo(mapping->object)->draw_mapping = NULL;
 	engine->draw_cache_entries--;
 	engine->draw_cache_pages -= mapping->page_count;
 	engine->draw_cache_evictions++;
@@ -4452,8 +4466,8 @@ chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
 	page_count = object->size >> PAGE_SHIFT;
 	if (page_count > CHROME9_DRAW_CACHE_MAX_PAGES)
 		return -E2BIG;
-	while (engine->draw_cache_entries >= CHROME9_DRAW_CACHE_MAX_ENTRIES ||
-	       engine->draw_cache_pages >
+	/* The cache is bounded by its GART pages only. */
+	while (engine->draw_cache_pages >
 	       CHROME9_DRAW_CACHE_MAX_PAGES - page_count) {
 		ret = chrome9_draw_mapping_evict_lru_locked(engine);
 		if (ret)
@@ -4525,6 +4539,7 @@ chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
 		goto err_free;
 	}
 	list_add_tail(&mapping->link, &engine->draw_mappings);
+	to_chrome9_bo(object)->draw_mapping = mapping;
 	engine->draw_cache_entries++;
 	engine->draw_cache_pages += mapping->page_count;
 	mutex_unlock(&engine->vm_lock);

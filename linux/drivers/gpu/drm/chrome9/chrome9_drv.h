@@ -158,6 +158,8 @@ static inline void chrome9_vga_seq_put(struct chrome9_device *cdev)
 int chrome9_detect_vram(struct chrome9_device *cdev);
 bool chrome9_dma32_scanout_supported(struct chrome9_device *cdev);
 
+struct chrome9_sf_mapping;
+
 /* Every chrome9 GEM object: shmem plus CPU cache coherence state, all
  * protected by the object's reservation lock. */
 struct chrome9_bo {
@@ -179,6 +181,8 @@ struct chrome9_bo {
 	u64 guard_mapping_size;
 	/* DRM_CHROME9_GEM_CREATE_* flags of the object. */
 	u32 create_flags;
+	/* Cached draw mapping (engine submit lock). */
+	struct chrome9_sf_mapping *draw_mapping;
 };
 
 void chrome9_bo_hold_kmap(struct chrome9_bo *bo);
