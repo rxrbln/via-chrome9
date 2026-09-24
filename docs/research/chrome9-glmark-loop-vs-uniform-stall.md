@@ -43,12 +43,22 @@ The unmodified same-size, same-option glmark2 run with
 intrinsically unbounded and further narrows the defect to Chrome9's
 draw-module/NIR-to-TGSI path or its constant-buffer integration.
 
+A non-rendering GDB breakpoint at `tgsi_exec_set_constant_buffers` exposed
+CB0's 80-byte payload before vertex execution. Dwords 0--15 contain the
+4x4 transform; dword 16, corresponding to `VertexLoops`, is
+`0x3f800000` (float 1.0) even though glmark2 calls `glUniform1i(...,1)`.
+If the NIR-to-TGSI interpreter consumes that dword as an integer, the loop
+bound is 1,065,353,216 rather than one. This is a direct explanation for
+the prolonged `micro_frc` stack and the zero-bound control passing, but the
+representation contract must be traced before changing Mesa. The breakpoint
+trace is `/root/tmp/chrome9-live/literal-pack/loop-const-gdb.txt`.
+
 Target evidence is retained at
 `/root/tmp/chrome9-live/literal-pack/loop-literal-validate.log`,
 `loop-literal.strace`, `loop-literal-stack.txt`,
 `loop-no-vs-loop.log`, `loop-literal-vs-loop.log`, and
-`loop-zero-vs-uniform.log`, plus `loop-llvmpipe-control.log`. Do not count
-this glmark2 variant as passing.
+`loop-zero-vs-uniform.log`, plus `loop-llvmpipe-control.log` and the GDB
+constant-buffer trace. Do not count this glmark2 variant as passing.
 Next, identify whether the bound changes representation or address between
 the GL uniform upload, Gallium vertex constant buffer, NIR-to-TGSI lowering,
 and `tgsi_exec_machine_run`; then add a focused regression test before any
