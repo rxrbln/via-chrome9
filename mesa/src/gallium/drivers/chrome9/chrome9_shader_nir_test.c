@@ -1107,6 +1107,65 @@ check_saturated_add_rgb_alpha_split(struct chrome9_context *context)
    return valid;
 }
 
+static nir_shader *
+make_position_alias_fragment(unsigned offset)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-position-alias");
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *position = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, offset),
+      .io_semantics.location = VARYING_SLOT_POS);
+
+   b.shader->info.io_lowered = true;
+   /* The measured POSITION source exposes XY only, so test exactly the
+    * gl_FragCoord lanes that the structured fragment ABI can read. */
+   nir_store_output(&b,
+                    nir_vec4(&b, nir_channel(&b, position, 0),
+                              nir_channel(&b, position, 1),
+                              nir_imm_float(&b, 0.0f),
+                              nir_imm_float(&b, 1.0f)),
+                    nir_imm_int(&b, 0),
+                    .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static bool
+check_position_alias_compilation(struct chrome9_context *context)
+{
+   struct chrome9_shader direct = { 0 }, indirect = { 0 };
+   nir_shader *direct_nir = make_position_alias_fragment(0);
+   nir_shader *indirect_nir = make_position_alias_fragment(1);
+   const struct chrome9_ps_instruction *instruction;
+   bool valid;
+
+   chrome9_compile_fs_nir(context, &direct, direct_nir);
+   chrome9_compile_fs_nir(context, &indirect, indirect_nir);
+   instruction = &direct.semantic_fs_ir.instruction[0];
+   valid = direct.supported && direct.semantic_fs_valid &&
+      direct.semantic_fs_ir.count >= 1 &&
+      direct.semantic_input_mask == 0 &&
+      direct.semantic_varying_mask == 0 &&
+      instruction->source[0].file == CHROME9_PS_SOURCE_POSITION &&
+      instruction->source[0].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+      instruction->source[0].swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+      !indirect.semantic_fs_valid;
+   if (!valid)
+      fprintf(stderr, "POSITION alias failed: direct=%u/%u/%u "
+              "src=%u varyings=%x indirect=%u\n",
+              direct.supported, direct.semantic_fs_valid,
+              direct.semantic_fs_ir.count, instruction->source[0].file,
+              direct.semantic_varying_mask, indirect.semantic_fs_valid);
+   ralloc_free(direct_nir);
+   ralloc_free(indirect_nir);
+   return valid;
+}
+
 static bool
 check_per_lane_conditional_rejected(struct chrome9_context *context)
 {
@@ -1612,6 +1671,7 @@ main(void)
        !check_canonical_uniform_select_context() ||
        !check_front_face_variant_context() ||
        !check_saturated_add_rgb_alpha_split(&context) ||
+       !check_position_alias_compilation(&context) ||
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
        !check_function_medium_sqrt_boundary(&context) ||

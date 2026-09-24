@@ -2847,6 +2847,22 @@ chrome9_ps_leaf(struct chrome9_ps_nir_builder *builder, nir_def *def,
          return true;
       }
 
+      /* The state tracker can lower gl_FragCoord to the POSITION input
+       * rather than leave load_frag_coord in the linked fragment shader.
+       * Accept only the same pixel-centered, smooth source; an indirect or
+       * differently interpolated load is not the screen-position register. */
+      if (chrome9_fs_smooth_pixel_load_range(load, VARYING_SLOT_POS) &&
+          def->bit_size == 32 && def->num_components &&
+          nir_intrinsic_component(load) < 4 &&
+          def->num_components <= 4 - nir_intrinsic_component(load)) {
+         memset(source, 0, sizeof(*source));
+         source->file = CHROME9_PS_SOURCE_POSITION;
+         for (unsigned c = 0; c < 4; c++)
+            source->swizzle[c] = c < def->num_components ?
+               nir_intrinsic_component(load) + c : CHROME9_PS_SWIZZLE_ZERO;
+         return true;
+      }
+
       if (load->intrinsic == nir_intrinsic_load_uniform &&
           nir_src_is_const(load->src[0]) && !nir_intrinsic_base(load) &&
           def->bit_size == 32 && def->num_components &&
