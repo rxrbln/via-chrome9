@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef _UAPI_CHROME9_DRM_H_
 #define _UAPI_CHROME9_DRM_H_
 
@@ -218,6 +219,8 @@ enum drm_chrome9_param {
  * structured draws accept eight descriptor slots independently of TEX count.
  */
 #define DRM_CHROME9_CAP_FRAGMENT_EXTENDED_LINKAGE	(1ULL << 56)
+/* Fragment draws accept resolved per-winding stencil state with X8Z24. */
+#define DRM_CHROME9_CAP_FRAGMENT_STENCIL	(1ULL << 57)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -977,6 +980,18 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 #define DRM_CHROME9_FRAGMENT_BLEND	(1U << 1)
 /* Allow a guarded L0 target to contain trailing mip storage. */
 #define DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED	(1U << 2)
+/* Apply the stencil block; requires DEPTH with the X8Z24 (D24S8) format. */
+#define DRM_CHROME9_FRAGMENT_STENCIL	(1U << 3)
+
+/* Native stencil operations; note INVERT precedes the wrapping forms. */
+#define DRM_CHROME9_STENCIL_OP_KEEP		0
+#define DRM_CHROME9_STENCIL_OP_ZERO		1
+#define DRM_CHROME9_STENCIL_OP_REPLACE		2
+#define DRM_CHROME9_STENCIL_OP_INCR_SAT		3
+#define DRM_CHROME9_STENCIL_OP_DECR_SAT		4
+#define DRM_CHROME9_STENCIL_OP_INVERT		5
+#define DRM_CHROME9_STENCIL_OP_INCR_WRAP	6
+#define DRM_CHROME9_STENCIL_OP_DECR_WRAP	7
 
 enum drm_chrome9_fragment_op {
 	DRM_CHROME9_FRAGMENT_OP_MOV = 0,
@@ -1099,6 +1114,27 @@ struct drm_chrome9_fragment_texture_state {
 	__u32 reserved[4];
 };
 
+/* One stencil face; func is a DRM_CHROME9_COMPARE_* value. */
+struct drm_chrome9_stencil_face {
+	__u8 func;
+	__u8 fail_op;
+	__u8 zfail_op;
+	__u8 zpass_op;
+	__u8 ref;
+	__u8 value_mask;
+	__u8 write_mask;
+	__u8 pad;
+};
+
+/*
+ * Faces are resolved to screen-space winding by userspace: cw applies to
+ * clockwise triangles in window coordinates, ccw to counter-clockwise ones.
+ */
+struct drm_chrome9_stencil_state {
+	struct drm_chrome9_stencil_face cw;
+	struct drm_chrome9_stencil_face ccw;
+};
+
 /*
  * All pointers address immutable arrays copied before GEM reservation.  The
  * constants array contains constant_count vec4s; textures contains
@@ -1128,7 +1164,8 @@ struct drm_chrome9_draw_fragment_program {
 	__u64 instructions_ptr;
 	__u64 constants_ptr;
 	__u64 textures_ptr;
-	__u64 reserved[4];
+	struct drm_chrome9_stencil_state stencil;
+	__u64 reserved[2];
 };
 
 #if defined(__cplusplus)
