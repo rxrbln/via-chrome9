@@ -132,6 +132,12 @@ MODULE_PARM_DESC(hw_tcl,
  */
 /* Debug: non-zero VRAM offset receives fragment job color writes instead of
  * the SF destination (local frame buffer fill-rate measurement). */
+/* Draw objects are cache-maintained by the kernel, so their SF pages may
+ * be mapped without the snoop (cached) PTE bit. */
+static bool chrome9_gart_nosnoop;
+module_param_named(gart_nosnoop, chrome9_gart_nosnoop, bool, 0400);
+MODULE_PARM_DESC(gart_nosnoop, "Map draw objects with non-snooped GART PTEs (default: false)");
+
 static ulong chrome9_vram_target_test;
 module_param_named(vram_target_test, chrome9_vram_target_test, ulong, 0600);
 MODULE_PARM_DESC(vram_target_test, "Debug: VRAM offset for fragment color writes");
@@ -3903,7 +3909,7 @@ static void chrome9_quarantine_job_locked(struct chrome9_engine *engine,
 }
 
 static int chrome9_collect_sgt_ptes(struct sg_table *sgt, u32 *ptes,
-				    unsigned int page_count)
+				    unsigned int page_count, bool snoop)
 {
 	struct scatterlist *sg;
 	unsigned int index;
@@ -3922,7 +3928,7 @@ static int chrome9_collect_sgt_ptes(struct sg_table *sgt, u32 *ptes,
 				return -E2BIG;
 			ptes[count++] =
 				(lower_32_bits(address >> PAGE_SHIFT) & 0x3fffffff) |
-				CHROME9_GART_CACHED;
+				(snoop ? CHROME9_GART_CACHED : 0);
 			address += PAGE_SIZE;
 			length -= PAGE_SIZE;
 		}
@@ -4083,7 +4089,7 @@ chrome9_draw_mapping_acquire_locked(struct chrome9_engine *engine,
 	}
 	mapping->sgt = sgt;
 	ret = chrome9_collect_sgt_ptes(mapping->sgt, mapping->ptes,
-				       page_count);
+				       page_count, !chrome9_gart_nosnoop);
 	if (ret)
 		goto err_free;
 
@@ -4240,7 +4246,7 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 		goto err_free;
 	}
 	ret = chrome9_collect_sgt_ptes(mapping->sgt, mapping->ptes,
-				       mapping->page_count);
+				       mapping->page_count, true);
 	if (ret)
 		goto err_free;
 
