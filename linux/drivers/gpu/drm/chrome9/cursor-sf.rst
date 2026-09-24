@@ -43,3 +43,25 @@ proves programming/readback and safe handoff, not
 that the image's RGB/alpha pixels were visibly fetched: the available KVM
 capture does not support this output mode.  Do not enable the opt-in by
 default on register evidence alone.
+
+The opt-in Xorg modesetting/glamor run on the same date showed hardware
+cursor visibility enabled in 02f0 readback.  Movement from pointer
+(160,150) to (300,250) changed only 02f8 by (+140,+100).  Changing the X
+root cursor from
+crosshair to hand2 left the *final* SF base at ``20014000``.  That alone was
+ambiguous: two image commits can toggle the private slots twice.  A second,
+temporary diagnostic build traced the first nine cursor atomic updates,
+framebuffer IDs, upload counts, and CRC32 of the packed source and active
+private image.  Crosshair CRC ``990e6ecc`` changed to ``a6d49d9f`` on the
+first shape commit and to hand2 CRC ``0671ec7f`` on the next.  Each shape
+change uploaded the new image twice, switching slots 1->0->1, with source
+and active-image CRCs equal at every step.  Pure position commits used the
+same framebuffer, uploaded nothing, and retained equal CRCs.  Therefore the
+unchanged final base was valid double-buffer parity, not a stale cursor.
+The diagnostic instrumentation was removed from the product source after
+this test.  The exact trace is archived at
+``artifacts/2026-09-24/cursor-sf/x-cursor-diagnostic-20260924-091438.log``
+in the workspace and at
+``/root/tmp/chrome9-live/cursor-sf-oracle-20260924/run-20260924-091438``
+on the target.  These checks prove the X cursor path updates the private
+pixels, but do not externally prove displayed RGB/alpha at 1024-by-768.
