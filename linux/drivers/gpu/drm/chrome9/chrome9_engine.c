@@ -176,15 +176,15 @@ MODULE_PARM_DESC(dxt,
 	"DXT1/DXT3/DXT5 fragment texture formats (default: true)");
 
 /* Published fragment jobs the ring may hold before a submitter waits. */
-static uint chrome9_max_inflight = 2;
+static uint chrome9_max_inflight = 8;
 module_param_named(max_inflight, chrome9_max_inflight, uint, 0400);
 MODULE_PARM_DESC(max_inflight,
-	"Fragment/vertex program jobs in flight, 1..64 (default: 2)");
+	"Fragment/vertex program jobs in flight, 1..64 (default: 8)");
 
-static uint chrome9_ring_pages = 64;
+static uint chrome9_ring_pages = 256;
 module_param_named(ring_pages, chrome9_ring_pages, uint, 0400);
 MODULE_PARM_DESC(ring_pages,
-	"Command ring pages, 16..256 (default: 64)");
+	"Command ring pages, 16..256 (default: 256)");
 
 static bool chrome9_texture_3d = true;
 module_param_named(texture_3d, chrome9_texture_3d, bool, 0600);
@@ -246,10 +246,10 @@ module_param_named(async_retire, chrome9_async_retire, bool, 0600);
 MODULE_PARM_DESC(async_retire, "Retire fragment jobs asynchronously (default: true)");
 
 /* Omit repeated state groups between draws of one staging segment. */
-static bool chrome9_state_cache_enable;
+static bool chrome9_state_cache_enable = true;
 module_param_named(state_cache, chrome9_state_cache_enable, bool, 0600);
 MODULE_PARM_DESC(state_cache,
-		 "Omit state repeated within one command segment (default: false)");
+		 "Omit state repeated within one command segment (default: true)");
 
 static uint chrome9_profile;
 module_param_named(profile, chrome9_profile, uint, 0600);
@@ -690,6 +690,8 @@ struct chrome9_engine {
 	u32 fence_slots;
 	u32 ring_pages;
 	u32 ring_size;
+	/* Bytes of run_staging_cpu: one fragment segment at most. */
+	u32 run_staging_size;
 	/* Totals since load: drains by cause, live appends, full-queue waits. */
 	u64 queue_drains[CHROME9_DRAIN_COUNT];
 	u64 live_appends;
@@ -719,6 +721,8 @@ struct chrome9_engine {
 	resource_size_t gart_offset;
 	u64 fence_context;
 	atomic64_t fence_seqno;
+	/* Every job up to this sequence number has signalled. */
+	atomic64_t retired_seqno;
 	u32 saved_dst_pos;
 	u8 saved_seq_index;
 	u8 saved_6a;
@@ -1001,6 +1005,24 @@ static void chrome9_job_fence_init_locked(struct chrome9_engine *engine,
 	dma_fence_init64(&job->fence.base, &chrome9_fence_ops,
 			 &job->fence.lock, engine->fence_context,
 			 atomic64_inc_return(&engine->fence_seqno));
+}
+
+/* Signal a job's fence and advance the retired sequence number. */
+static void chrome9_job_signal(struct chrome9_engine *engine,
+			       struct chrome9_job *job)
+{
+	s64 seqno = job->fence.base.seqno;
+	s64 old = atomic64_read(&engine->retired_seqno);
+
+	dma_fence_signal(&job->fence.base);
+	while (old < seqno) {
+		s64 prev = atomic64_cmpxchg(&engine->retired_seqno, old, seqno);
+
+		if (prev == old)
+			break;
+		old = prev;
+	}
+	wake_up_all(&engine->retire_wq);
 }
 
 /* The fence is the first member; a job without one is plain memory. */
@@ -4301,7 +4323,7 @@ static u32 *chrome9_fragment_segment_begin(struct chrome9_engine *engine)
 static const u32 *chrome9_fragment_segment_limit(struct chrome9_engine *engine)
 {
 	return (u32 *)engine->run_staging_cpu +
-	       (CHROME9_RUN_STAGING_SIZE - CHROME9_CR_READ_AHEAD) / 4 - 0x100;
+	       (engine->run_staging_size - CHROME9_CR_READ_AHEAD) / 4 - 0x100;
 }
 
 static int chrome9_fragment_segment_end(struct chrome9_engine *engine,
@@ -4312,7 +4334,7 @@ static int chrome9_fragment_segment_end(struct chrome9_engine *engine,
 	if (ret)
 		return ret;
 	return chrome9_finish_ring_sized(engine->run_staging_cpu, p,
-		CHROME9_RUN_STAGING_SIZE, pause, &job->segment_stop);
+		engine->run_staging_size, pause, &job->segment_stop);
 }
 
 static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
@@ -5651,6 +5673,38 @@ static void chrome9_bo_cpu_dirty(struct chrome9_bo *bo, u64 offset, u64 size)
 	bo->cpu_dirty = true;
 }
 
+int chrome9_fence_ioctl(struct drm_device *drm, void *data,
+			struct drm_file *file)
+{
+	struct drm_chrome9_fence *args = data;
+	struct chrome9_engine *engine = READ_ONCE(to_chrome9(drm)->engine);
+	long ret;
+
+	if (args->flags || args->reserved || !engine)
+		return -EINVAL;
+	switch (args->op) {
+	case DRM_CHROME9_FENCE_OP_LAST:
+		if (args->seqno || args->timeout_ns)
+			return -EINVAL;
+		args->seqno = atomic64_read(&engine->fence_seqno);
+		return 0;
+	case DRM_CHROME9_FENCE_OP_WAIT:
+		if (args->seqno > (u64)atomic64_read(&engine->fence_seqno))
+			return -EINVAL;
+		ret = wait_event_interruptible_timeout(engine->retire_wq,
+			(u64)atomic64_read(&engine->retired_seqno) >= args->seqno ||
+			READ_ONCE(engine->wedged) || READ_ONCE(engine->stopping),
+			nsecs_to_jiffies(args->timeout_ns));
+		if (ret < 0)
+			return ret;
+		if ((u64)atomic64_read(&engine->retired_seqno) >= args->seqno)
+			return 0;
+		return ret ? -EIO : -ETIME;
+	default:
+		return -EINVAL;
+	}
+}
+
 int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {
@@ -6065,7 +6119,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_3D;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
-	return caps | DRM_CHROME9_CAP2_GEM_CPU_NOWAIT;
+	return caps | DRM_CHROME9_CAP2_GEM_CPU_NOWAIT |
+	       DRM_CHROME9_CAP2_FENCE_SEQNO;
 }
 
 static int chrome9_fragment_texture_selftest(void);
@@ -6182,6 +6237,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	INIT_LIST_HEAD(&engine->draw_mappings);
 	engine->fence_context = dma_fence_context_alloc(1);
 	atomic64_set(&engine->fence_seqno, 0);
+	atomic64_set(&engine->retired_seqno, 0);
 	engine->gart_offset = gart_offset;
 	engine->gart = cdev->vram + engine->gart_offset;
 	/* Occlusion snapshots go to the SL page below the GART; the slots
@@ -6263,7 +6319,11 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 		ret = -ENOMEM;
 		goto err_free_ring;
 	}
-	engine->run_staging_cpu = vzalloc(CHROME9_RUN_STAGING_SIZE);
+	/* Half the ring: a large job fits one segment and needs no
+	 * synchronous wait between segments. */
+	engine->run_staging_size = max_t(u32, CHROME9_RUN_STAGING_SIZE,
+					 engine->ring_size / 2);
+	engine->run_staging_cpu = vzalloc(engine->run_staging_size);
 	if (!engine->run_staging_cpu) {
 		ret = -ENOMEM;
 		goto err_free_ring;
@@ -6610,7 +6670,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	job->mapped = false;
 	chrome9_submit_unlock(engine);
 	dma_resv_unlock(resv);
-	dma_fence_signal(&job->fence.base);
+	chrome9_job_signal(engine, job);
 	job->destination = NULL;
 	drm_gem_object_put(obj);
 	chrome9_job_put(job);
@@ -6625,7 +6685,7 @@ out_unlock_submit:
 	if (quarantine) {
 		dma_resv_unlock(resv);
 		if (signal)
-			dma_fence_signal(&job->fence.base);
+			chrome9_job_signal(engine, job);
 		ret = ret ?: -EIO;
 		goto out_dev_exit;
 	}
@@ -6637,7 +6697,7 @@ out_vunmap:
 out_unlock_resv:
 	dma_resv_unlock(resv);
 	if (signal)
-		dma_fence_signal(&job->fence.base);
+		chrome9_job_signal(engine, job);
 out_put_fence:
 	job->destination = NULL;
 	drm_gem_object_put(obj);
@@ -7068,7 +7128,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 			 CHROME9_DRAW_IMMEDIATE_TEXTURED_TRIANGLE_MIP)
 			ret = chrome9_append_segment(engine, job,
 					     engine->run_staging_cpu,
-					     CHROME9_RUN_STAGING_SIZE, pause,
+					     engine->run_staging_size, pause,
 					     &must_quarantine);
 		else
 			ret = chrome9_append_segment(engine, job,
@@ -7164,7 +7224,7 @@ out_unlock_submit:
 	if (quarantine) {
 		drm_exec_fini(&exec);
 		if (signal)
-			dma_fence_signal(&job->fence.base);
+			chrome9_job_signal(engine, job);
 		ret = ret ?: -EIO;
 		goto out_dev_exit;
 	}
@@ -7220,7 +7280,7 @@ out_exec:
 	if (exec_initialized)
 		drm_exec_fini(&exec);
 	if (signal)
-		dma_fence_signal(&job->fence.base);
+		chrome9_job_signal(engine, job);
 	job->destination = NULL;
 	job->depth = NULL;
 	job->texture2 = NULL;
@@ -7633,7 +7693,7 @@ static void chrome9_job_retire_locked(struct chrome9_engine *engine,
 	job->retirement_proven = true;
 	engine->last_cookie = job->cookie;
 	chrome9_fragment_job_finish_locked(engine, job);
-	dma_fence_signal(&job->fence.base);
+	chrome9_job_signal(engine, job);
 	list_add_tail(&job->reap_link, &engine->reaped);
 	wake_up_all(&engine->retire_wq);
 }
@@ -8249,7 +8309,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			}
 		}
 		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
-			CHROME9_RUN_STAGING_SIZE, pause, &must_quarantine);
+			engine->run_staging_size, pause, &must_quarantine);
 		chrome9_prof_mark(CHROME9_PROF_APPEND);
 		if (ret) {
 			if (!must_quarantine)
@@ -8320,7 +8380,7 @@ out_unlock_submit:
 	if (quarantine) {
 		drm_exec_fini(&exec);
 		if (signal)
-			dma_fence_signal(&job->fence.base);
+			chrome9_job_signal(engine, job);
 		ret = ret ?: -EIO;
 		goto out_dev_exit;
 	}
@@ -8347,7 +8407,7 @@ out_exec:
 	if (exec_initialized)
 		drm_exec_fini(&exec);
 	if (signal)
-		dma_fence_signal(&job->fence.base);
+		chrome9_job_signal(engine, job);
 	job->destination = NULL;
 	for (i = 0; i < object_count; i++) {
 		job->fragment_objects[i] = NULL;

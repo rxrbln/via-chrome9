@@ -2750,6 +2750,8 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(CHROME9_QUERY, chrome9_query_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_FENCE, chrome9_fence_ioctl,
+			  DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(chrome9_fops);
