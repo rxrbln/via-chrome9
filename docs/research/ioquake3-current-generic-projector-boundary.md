@@ -35,14 +35,33 @@ ordered later fixed-function programs are retained in
 5. the same two-sample RGB product with texture-zero alpha times primary
    alpha.
 
-The latest archived application run is not current-HEAD compiler evidence.
+An older archived application run is not current-HEAD compiler evidence.
 `ioquake-safe-v2/gl1-q3dm1/stderr.log`, SHA-256
 `15ae81d5b62a7f009fad2e29413a46d4f7edfeea422c156b9c69199483391510`,
 used Mesa `d621583564`; its first reported boundary was the then-intentional
 `textured-modulate-blend-unproven` state gate.  Subsequent closed projected,
 blend, depth and lightmap commits mean that log cannot establish the first
-rejection of current HEAD.  A new bounded application run is required before
-calling any later state or shader the current live first failure.
+rejection of current HEAD.
+
+A newer bounded application run now provides the current application-side
+boundary.  Target artifact
+`/root/tmp/chrome9-live/ioquake-20260924/gl1-default-mip.log`, SHA-256
+`270a6abc8d6fd39c143f286cd9cd666e2efb3d37957a5b88699a329ac77444ba`,
+reports Mesa `git-a854407ab5`, enters `q3dm1`, loads cgame and all map
+surfaces, and then rejects the first unsupported draw as:
+
+```text
+reason=textured-modulate-blend-unproven fs=16 layout=1 tex=1
+views=1 samplers=1 target=281 depth=0 dsa=0/0/0
+blend=1/0/3/19/0/3/19 mask=0xf blend_successor=1
+```
+
+Enum value 16 is `CHROME9_FS_TEXTURE_PROJECTED_MODULATE`.  The same log
+submits two ordinary `textured+d16` triangles immediately before the reject.
+This proves that the current first retained GL1 application stop is the
+closed projected-MODULATE program combined with blend, not mip allocation or
+basic textured depth.  It does not by itself prove the later world-material
+passes; those remain ordered next gates after generic projector lowering.
 
 ## Current generic compiler rejection
 
@@ -152,4 +171,3 @@ executable.  The first source-exact default lightall backend blocker is FACE
 pressure in the five-sampler lighting program.  A fresh startup/gameplay run
 must confirm the new first live rejection after matching kernel/Mesa bits are
 loaded.
-
