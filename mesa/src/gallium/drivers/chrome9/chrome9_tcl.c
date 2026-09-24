@@ -1090,36 +1090,68 @@ chrome9_tcl_shader_destroy(struct chrome9_tcl_shader *shader)
    FREE(shader);
 }
 
-/* Draw-position triangle list for one primitive type. */
+/*
+ * Draw-position triangle t of a primitive, rotated (winding kept) so the
+ * GL provoking vertex (ARB_provoking_vertex) is last, the hardware's flat
+ * source.  first selects the first-vertex convention.
+ */
 static bool
-tcl_triangle(enum mesa_prim mode, unsigned t, unsigned v[3])
+tcl_triangle(enum mesa_prim mode, unsigned t, bool first, unsigned v[3])
 {
+   unsigned provoking, k;
+
    switch (mode) {
    case MESA_PRIM_TRIANGLES:
       v[0] = 3 * t; v[1] = 3 * t + 1; v[2] = 3 * t + 2;
-      return true;
+      provoking = first ? v[0] : v[2];
+      break;
    case MESA_PRIM_TRIANGLE_STRIP:
       /* Odd triangles swap their first two vertices to keep winding. */
       v[0] = t + (t & 1); v[1] = t + 1 - (t & 1); v[2] = t + 2;
-      return true;
+      provoking = first ? t : t + 2;
+      break;
    case MESA_PRIM_TRIANGLE_FAN:
+      v[0] = 0; v[1] = t + 1; v[2] = t + 2;
+      provoking = first ? t + 1 : t + 2;
+      break;
    case MESA_PRIM_POLYGON:
       v[0] = 0; v[1] = t + 1; v[2] = t + 2;
-      return true;
+      provoking = 0;
+      break;
    case MESA_PRIM_QUADS:
-      v[0] = 4 * (t / 2);
-      v[1] = v[0] + 1 + (t & 1);
-      v[2] = v[0] + 2 + (t & 1);
-      return true;
+      /* Both halves share the provoking corner. */
+      k = 4 * (t / 2);
+      if (first) {
+         v[0] = k; v[1] = k + 1 + (t & 1); v[2] = k + 2 + (t & 1);
+         provoking = k;
+      } else {
+         v[0] = k + (t & 1); v[1] = k + 1 + (t & 1); v[2] = k + 3;
+         provoking = k + 3;
+      }
+      break;
    case MESA_PRIM_QUAD_STRIP:
       /* Quad k is 2k, 2k+1, 2k+3, 2k+2. */
-      v[0] = 2 * (t / 2);
-      v[1] = v[0] + (t & 1 ? 3 : 1);
-      v[2] = v[0] + (t & 1 ? 2 : 3);
-      return true;
+      k = 2 * (t / 2);
+      if (!(t & 1)) {
+         v[0] = k; v[1] = k + 1; v[2] = k + 3;
+      } else if (first) {
+         v[0] = k; v[1] = k + 3; v[2] = k + 2;
+      } else {
+         v[0] = k + 2; v[1] = k; v[2] = k + 3;
+      }
+      provoking = first ? k : k + 3;
+      break;
    default:
       return false;
    }
+   while (v[2] != provoking) {
+      const unsigned rotate = v[0];
+
+      v[0] = v[1];
+      v[1] = v[2];
+      v[2] = rotate;
+   }
+   return true;
 }
 
 static unsigned
@@ -1250,8 +1282,8 @@ tcl_constants(struct chrome9_context *ctx, const struct chrome9_tcl_program *p,
          map = chrome9_resource(cb->buffer)->bo.map;
       if (!map || cb->buffer_size < p->uniform_rows * 16)
          return false;
-      memcpy(rows, map + (cb->user_buffer ? 0 : cb->buffer_offset),
-             p->uniform_rows * 16);
+      /* As in chrome9_draw_vbo(): the offset applies to both kinds. */
+      memcpy(rows, map + cb->buffer_offset, p->uniform_rows * 16);
       for (unsigned i = 0; i < p->uniform_rows * 4; i++) {
          float f;
 
@@ -1288,9 +1320,10 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz)
 
    if (shader->key_count) {
       if (!map && cb->buffer)
-         map = chrome9_resource(cb->buffer)->bo.map + cb->buffer_offset;
+         map = chrome9_resource(cb->buffer)->bo.map;
       if (!map)
          return NULL;
+      map += cb->buffer_offset;
       for (unsigned k = 0; k < shader->key_count; k++) {
          if ((shader->key_dword[k] + 1u) * 4 > cb->buffer_size)
             return NULL;
@@ -1418,6 +1451,26 @@ tcl_dump(const struct drm_chrome9_draw_vertex_program *draw,
    }
 }
 
+/* Flat interpolation: the hardware flat mode covers colors only. */
+static bool
+tcl_fs_flat(const struct chrome9_shader *fs, bool *primary)
+{
+   const nir_shader *nir = fs->nir;
+
+   *primary = false;
+   if (!nir)
+      return true;
+   nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.interpolation != INTERP_MODE_FLAT)
+         continue;
+      if (var->data.location == VARYING_SLOT_COL0)
+         *primary = true;
+      else
+         return false;
+   }
+   return true;
+}
+
 /* CHROME9_DEBUG_TCL=1 names each new fallback reason once. */
 static bool
 tcl_fallback(struct chrome9_context *ctx, const char *reason)
@@ -1426,7 +1479,10 @@ tcl_fallback(struct chrome9_context *ctx, const char *reason)
 
    if (reason != last && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
       fprintf(stderr, "chrome9: TCL fallback: %s (tcl triangles so far %" PRIu64
-                      ")\n", reason, ctx->tcl_triangles);
+                      ", fs program=%u semantic=%u inputs=%#x)\n", reason,
+              ctx->tcl_triangles, ctx->fs ? ctx->fs->fragment_program : 0,
+              ctx->fs ? ctx->fs->semantic_fs_valid : 0,
+              ctx->fs ? ctx->fs->semantic_input_mask : 0);
    last = reason;
    ctx->tcl_fallback_draws++;
    return false;
@@ -1444,6 +1500,7 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    struct drm_chrome9_draw_vertex_program draw = { 0 };
    const uint8_t *indices = NULL;
    const char *why;
+   bool flat;
    unsigned triangles, stride, per_chunk, done = 0;
 
    if (!ctx->tcl_enabled)
@@ -1458,10 +1515,11 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
        rs->clip_plane_enable || !rs->depth_clip_near ||
        !rs->depth_clip_far || rs->rasterizer_discard)
       return tcl_fallback(ctx, "rasterizer state");
-   if (rs->flatshade)
-      return tcl_fallback(ctx, "flat shading");
+   if (!tcl_fs_flat(ctx->fs, &flat))
+      return tcl_fallback(ctx, "flat generic varying");
+   flat |= rs->flatshade;
    triangles = tcl_triangle_count(info->mode, range->count);
-   if (!triangles && !tcl_triangle(info->mode, 0, (unsigned[3]){ 0 }))
+   if (!triangles && !tcl_triangle(info->mode, 0, false, (unsigned[3]){ 0 }))
       return tcl_fallback(ctx, "primitive type");
    if (!triangles)
       return true;
@@ -1507,7 +1565,8 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       elements[k].offset = 16 * k;
    }
    draw.abi_version = DRM_CHROME9_VERTEX_ABI_VERSION;
-   draw.flags = tcl_cull(rs);
+   /* The native provoking vertex is the last one, as in GL. */
+   draw.flags = tcl_cull(rs) | (flat ? DRM_CHROME9_VERTEX_FLAT : 0);
    draw.instruction_count = p->instruction_count;
    draw.instructions_ptr = (uintptr_t)p->instructions;
    draw.element_count = p->input_count;
@@ -1524,7 +1583,7 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       for (unsigned t = done; t < done + count; t++) {
          unsigned v[3];
 
-         tcl_triangle(info->mode, t, v);
+         tcl_triangle(info->mode, t, rs->flatshade_first, v);
          for (unsigned i = 0; i < 3; i++) {
             const unsigned position = range->start + v[i];
             unsigned index = position;

@@ -81,6 +81,7 @@ struct chrome9_fs_variant {
     * within [0, 1] before a range-dependent fragment lowering is submitted. */
    uint32_t semantic_unit_interval_input_mask;
    bool semantic_fs_valid;
+   bool semantic_passthrough;
    bool native_fs_valid;
    bool native_fs_from_nir;
    bool flat_primary;
@@ -112,6 +113,9 @@ struct chrome9_shader {
    uint32_t semantic_identity_projector_input_mask;
    uint32_t semantic_unit_interval_input_mask;
    bool semantic_fs_valid;
+   /* Synthesized MOV oC0, primary: used by hardware TCL only, the
+    * post-TNL path keeps its faster fixed-function route. */
+   bool semantic_passthrough;
    bool native_fs_valid;
    bool native_fs_from_nir;
    bool flat_primary;

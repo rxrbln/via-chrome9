@@ -126,12 +126,19 @@ chrome9_fragment_texture_unit(const struct chrome9_context *ctx,
 }
 
 static bool
-chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
+chrome9_generic_fragment_program(const struct chrome9_context *ctx)
 {
    return ctx->draw_fragment_program && ctx->fs &&
           ctx->fs->semantic_fs_valid &&
           (!ctx->fs->semantic_input_mask ||
            (ctx->fragment_primary && ctx->fs->semantic_input_mask == 1));
+}
+
+static bool
+chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
+{
+   return chrome9_generic_fragment_program(ctx) &&
+          !ctx->fs->semantic_passthrough;
 }
 
 static bool
@@ -3514,7 +3521,7 @@ chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
    bool depth_active = false, blend_successor = false, ok = false;
 
    *why = "no generic fragment program";
-   if (!crender || !chrome9_use_generic_fragment_program(ctx))
+   if (!crender || !chrome9_generic_fragment_program(ctx))
       return false;
    chrome9_flush_triangle_batch(crender);
    *why = "failed batch";

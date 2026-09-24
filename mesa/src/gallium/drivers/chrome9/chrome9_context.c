@@ -5364,6 +5364,25 @@ chrome9_tgsi_fs_passthrough(const struct tgsi_token *tokens)
    return valid && input >= 0 && output >= 0 && moves == 1;
 }
 
+/* MOV oC0, primary: passthrough programs the semantic lowering skips. */
+static void
+chrome9_semantic_primary_passthrough(struct chrome9_shader *shader)
+{
+   struct chrome9_ps_instruction *mov = &shader->semantic_fs_ir.instruction[0];
+
+   memset(&shader->semantic_fs_ir, 0, sizeof(shader->semantic_fs_ir));
+   mov->op = CHROME9_PS_OPCODE_MOV;
+   mov->destination.file = CHROME9_PS_DESTINATION_COLOR;
+   mov->destination.writemask = 0xf;
+   mov->source[0].file = CHROME9_PS_SOURCE_INPUT;
+   for (unsigned i = 0; i < 4; i++)
+      mov->source[0].swizzle[i] = i;
+   shader->semantic_fs_ir.count = 1;
+   shader->semantic_input_mask = 1;
+   shader->semantic_fs_valid = true;
+   shader->semantic_passthrough = true;
+}
+
 void
 chrome9_compile_fs_nir(struct chrome9_context *ctx,
                        struct chrome9_shader *shader, nir_shader *nir)
@@ -5380,6 +5399,10 @@ chrome9_compile_fs_nir(struct chrome9_context *ctx,
       CHROME9_FS_PRIMARY_FLAT_SCALAR_RGBX;
    shader->native_fs_valid = straight_line &&
       chrome9_compile_native_fs(ctx, shader, nir);
+   /* Flat colors arrive per vertex already (draw module flat stage or
+    * the hardware flat mode), so the program is a plain primary MOV. */
+   if (!shader->semantic_fs_valid && shader->flat_primary)
+      chrome9_semantic_primary_passthrough(shader);
    if (shader->semantic_fs_valid && ctx->draw_fragment_program &&
        (!shader->semantic_input_mask ||
         (ctx->fragment_primary && shader->semantic_input_mask == 1)) &&
@@ -5413,6 +5436,7 @@ chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
    variant->semantic_unit_interval_input_mask =
       shader->semantic_unit_interval_input_mask;
    variant->semantic_fs_valid = shader->semantic_fs_valid;
+   variant->semantic_passthrough = shader->semantic_passthrough;
    variant->native_fs_valid = shader->native_fs_valid;
    variant->native_fs_from_nir = shader->native_fs_from_nir;
    variant->flat_primary = shader->flat_primary;
@@ -5441,6 +5465,7 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
    shader->semantic_unit_interval_input_mask =
       variant->semantic_unit_interval_input_mask;
    shader->semantic_fs_valid = variant->semantic_fs_valid;
+   shader->semantic_passthrough = variant->semantic_passthrough;
    shader->native_fs_valid = variant->native_fs_valid;
    shader->native_fs_from_nir = variant->native_fs_from_nir;
    shader->flat_primary = variant->flat_primary;
@@ -5679,6 +5704,9 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->supported = chrome9_tgsi_fs_passthrough(state->tokens);
       shader->fragment_program = shader->supported ?
          CHROME9_FS_PRIMARY_COLOR : CHROME9_FS_UNSUPPORTED;
+      /* The same MOV oC0, primary the NIR path lowers, for generic draws. */
+      if (shader->supported)
+         chrome9_semantic_primary_passthrough(shader);
    }
    if (!shader->nir && shader->supported && !shader->native_fs_valid)
       shader->native_fs_valid = chrome9_compile_native_fs(
