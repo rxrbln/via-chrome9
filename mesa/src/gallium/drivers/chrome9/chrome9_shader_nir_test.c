@@ -594,6 +594,88 @@ check_per_lane_conditional_rejected(struct chrome9_context *context)
    return rejected;
 }
 
+static bool
+check_blinn_phong_integer_power(struct chrome9_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-blinn-phong-integer-power");
+   struct chrome9_shader shader = { 0 };
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *normal = nir_load_interpolated_input(
+      &b, 3, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_def *unit = nir_fmul(&b, normal,
+      nir_frsq(&b, nir_fdot3(&b, normal, normal)));
+   nir_def *half = nir_imm_vec3(&b, 0.0f, 0.5f, 0.5f);
+   nir_def *light = nir_imm_vec3(&b, 0.0f, 0.0f, 1.0f);
+   nir_def *spec = nir_fpow(&b,
+      nir_fmax(&b, nir_fdot3(&b, unit, half), nir_imm_float(&b, 0.0f)),
+      nir_imm_float(&b, 100.0f));
+   nir_def *diffuse = nir_fmax(&b, nir_fdot3(&b, unit, light),
+                               nir_imm_float(&b, 0.0f));
+   nir_def *rgb = nir_fadd(&b,
+      nir_fadd(&b, nir_fmul(&b,
+         nir_imm_vec3(&b, 0.8f, 0.8f, 0.8f), spec),
+         nir_imm_vec3(&b, 0.1f, 0.1f, 0.1f)),
+      nir_fmul(&b, nir_imm_vec3(&b, 0.0f, 0.0f, 0.8f), diffuse));
+   unsigned dp3 = 0, rsq = 0, max = 0, mul = 0, add = 0, mov = 0;
+   bool high_virtual_temp = false, terminal_color = false;
+   bool valid;
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b,
+      nir_channel(&b, rgb, 0), nir_channel(&b, rgb, 1),
+      nir_channel(&b, rgb, 2), nir_imm_float(&b, 1.0f)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &shader.semantic_fs_ir.instruction[i];
+
+      dp3 += instruction->op == CHROME9_PS_OPCODE_DP3;
+      rsq += instruction->op == CHROME9_PS_OPCODE_RSQ;
+      max += instruction->op == CHROME9_PS_OPCODE_MAX;
+      mul += instruction->op == CHROME9_PS_OPCODE_MUL;
+      add += instruction->op == CHROME9_PS_OPCODE_ADD;
+      mov += instruction->op == CHROME9_PS_OPCODE_MOV;
+      high_virtual_temp |=
+         instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+         instruction->destination.id >= 12;
+      if (i + 1 == shader.semantic_fs_ir.count)
+         terminal_color =
+            instruction->destination.file == CHROME9_PS_DESTINATION_COLOR &&
+            instruction->destination.writemask == 0xf;
+   }
+   valid = shader.supported && shader.semantic_fs_valid &&
+      shader.fragment_program == CHROME9_FS_COMPILED_ALU &&
+      shader.semantic_fs_ir.count == 22 &&
+      shader.semantic_input_mask == 0 &&
+      shader.semantic_varying_mask == 1 &&
+      !shader.semantic_sampler_mask &&
+      shader.native_fs.immediate_mask == 0xc0000000 &&
+      high_virtual_temp && terminal_color &&
+      dp3 == 3 && rsq == 1 && max == 2 && mul == 11 &&
+      add == 2 && mov == 3;
+   if (!valid)
+      fprintf(stderr, "Blinn-Phong integer-power cmd22 compilation failed: "
+              "supported=%u semantic=%u program=%u ir=%u varying=%x "
+              "sampler=%x immed=%08x native=%u temps=%u "
+              "histogram=%u/%u/%u/%u/%u/%u terminal=%u\n",
+              shader.supported, shader.semantic_fs_valid,
+              shader.fragment_program, shader.semantic_fs_ir.count,
+              shader.semantic_varying_mask, shader.semantic_sampler_mask,
+              shader.native_fs.immediate_mask, shader.native_fs_valid,
+              high_virtual_temp, dp3, rsq, max, mul, add, mov,
+              terminal_color);
+   ralloc_free(b.shader);
+   return valid;
+}
+
 int
 main(void)
 {
@@ -678,8 +760,9 @@ main(void)
        !check_vector_conditional_compilation(&context, 3) ||
        !check_vector_conditional_compilation(&context, 4) ||
        !check_per_lane_conditional_rejected(&context) ||
+       !check_blinn_phong_integer_power(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, and blur compilation passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, vector select, Blinn-Phong shape, and blur compilation passed");
    return 0;
 }
