@@ -224,7 +224,7 @@ build_front_face_pair(void)
    nir_def *input_face = nir_load_input(
       &b, 1, 32, nir_imm_int(&b, 0), .dest_type = nir_type_bool32,
       .io_semantics.location = VARYING_SLOT_FACE);
-   nir_def *from_input = nir_bcsel(&b, input_face,
+   nir_def *from_input = nir_bcsel(&b, nir_b2b1(&b, input_face),
                                    nir_imm_float(&b, 1.0f),
                                    nir_imm_float(&b, -1.0f));
    nir_def *from_deref = nir_bcsel(&b, nir_load_var(&b, in),
