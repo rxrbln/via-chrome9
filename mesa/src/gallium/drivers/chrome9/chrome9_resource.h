@@ -12,6 +12,9 @@
 struct pipe_context;
 struct pipe_screen;
 
+/* Created through a LINEAR modifier: shared yet guarded (BO + PAGE). */
+#define CHROME9_RESOURCE_FLAG_CANONICAL_SHARED PIPE_RESOURCE_FLAG_DRV_PRIV
+
 struct chrome9_resource {
    struct pipe_resource base;
    struct chrome9_bo bo;

@@ -120,7 +120,8 @@ chrome9_resource_layout(const struct pipe_resource *templ,
     * shadows in chrome9_context.c; they must never reach a draw ioctl
     * directly.  Private resources retain the exact BO+PAGE kernel ABI below.
     */
-   if (templ->bind & PIPE_BIND_SHARED) {
+   if ((templ->bind & PIPE_BIND_SHARED) &&
+       !(templ->flags & CHROME9_RESOURCE_FLAG_CANONICAL_SHARED)) {
       if (templ->last_level ||
           !chrome9_u64_align(layout->level_size[0], page_size,
                              &layout->allocation_size) ||
@@ -866,12 +867,74 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
    return true;
 }
 
+/*
+ * LINEAR modifier imports and exports use the multi-plane DRI3 and KMS
+ * paths, which carry the plane offset: such shared surfaces keep the
+ * canonical guarded layout (pixels at BO + PAGE) and need no shadow.
+ */
+static bool
+chrome9_modifier_format(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+          format == PIPE_FORMAT_B8G8R8A8_UNORM;
+}
+
+static void
+chrome9_query_dmabuf_modifiers(struct pipe_screen *screen,
+                               enum pipe_format format, int max,
+                               uint64_t *modifiers,
+                               unsigned int *external_only, int *count)
+{
+   (void)screen;
+   *count = chrome9_modifier_format(format) ? 1 : 0;
+   if (max && *count) {
+      modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+      if (external_only)
+         external_only[0] = false;
+   }
+}
+
+static bool
+chrome9_is_dmabuf_modifier_supported(struct pipe_screen *screen,
+                                     uint64_t modifier,
+                                     enum pipe_format format,
+                                     bool *external_only)
+{
+   (void)screen;
+   if (external_only)
+      *external_only = false;
+   return modifier == DRM_FORMAT_MOD_LINEAR && chrome9_modifier_format(format);
+}
+
+static struct pipe_resource *
+chrome9_resource_create_with_modifiers(struct pipe_screen *screen,
+                                       const struct pipe_resource *templ,
+                                       const uint64_t *modifiers, int count)
+{
+   struct pipe_resource canonical = *templ;
+   bool linear = false;
+
+   for (int i = 0; i < count; i++)
+      linear |= modifiers[i] == DRM_FORMAT_MOD_LINEAR;
+   if (!linear || templ->target != PIPE_TEXTURE_2D || templ->last_level ||
+       !chrome9_modifier_format(templ->format) ||
+       !debug_get_bool_option("CHROME9_GUARDED_SHARED", true))
+      return NULL;
+   canonical.flags |= CHROME9_RESOURCE_FLAG_CANONICAL_SHARED;
+   return chrome9_resource_create(screen, &canonical);
+}
+
 void
 chrome9_init_screen_resource_functions(struct pipe_screen *screen)
 {
    screen->is_format_supported = chrome9_is_format_supported;
    screen->can_create_resource = chrome9_can_create_resource;
    screen->resource_create = chrome9_resource_create;
+   screen->resource_create_with_modifiers =
+      chrome9_resource_create_with_modifiers;
+   screen->query_dmabuf_modifiers = chrome9_query_dmabuf_modifiers;
+   screen->is_dmabuf_modifier_supported =
+      chrome9_is_dmabuf_modifier_supported;
    screen->resource_from_handle = chrome9_resource_from_handle;
    screen->resource_get_handle = chrome9_resource_get_handle;
    screen->resource_destroy = chrome9_resource_destroy;
