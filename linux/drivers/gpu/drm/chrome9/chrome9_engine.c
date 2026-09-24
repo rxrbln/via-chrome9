@@ -2212,6 +2212,10 @@ static void chrome9_fragment_mip_state(
 	unsigned int level;
 
 	memset(mip, 0, 8 * sizeof(*mip));
+	/* POT levels are derived by the sampler; the table is not used. */
+	if (is_power_of_2(max(texture->width >> texture->first_level, 1U)) &&
+	    is_power_of_2(max(texture->height >> texture->first_level, 1U)))
+		return;
 	for (level = 1; level <= min(level_count, 8U); level++)
 		mip[level - 1] = 0x40000000 |
 			((texture->level_offset[texture->first_level + level] -
@@ -8950,6 +8954,7 @@ static int chrome9_validate_fragment_texture(
 	u64 level_size;
 	u32 bytes_per_pixel;
 	u32 level_count;
+	bool pot;
 	unsigned int i;
 
 	switch (texture->format) {
@@ -9003,6 +9008,10 @@ static int chrome9_validate_fragment_texture(
 	base_offset = texture->level_offset[texture->first_level];
 	if (base_offset != PAGE_SIZE)
 		return -EINVAL;
+	/* The sampler derives POT levels itself, packed at their exact size;
+	 * NPOT levels come from the 256-byte granular address table. */
+	pot = is_power_of_2(max(texture->width >> texture->first_level, 1U)) &&
+	      is_power_of_2(max(texture->height >> texture->first_level, 1U));
 	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS; i++) {
 		u32 width;
 		u32 height;
@@ -9017,13 +9026,16 @@ static int chrome9_validate_fragment_texture(
 		height = max(texture->height >> i, 1U);
 		pitch = ALIGN(width * bytes_per_pixel, 32);
 		if (texture->level_pitch[i] != pitch ||
-		    !IS_ALIGNED(texture->level_offset[i], 256) ||
-		    (i > texture->first_level &&
-		     texture->level_offset[i] < ALIGN(previous_end, 256)))
+		    (pot && i > texture->first_level &&
+		     texture->level_offset[i] != previous_end) ||
+		    (!pot &&
+		     (!IS_ALIGNED(texture->level_offset[i], 256) ||
+		      (i > texture->first_level &&
+		       texture->level_offset[i] < ALIGN(previous_end, 256)))))
 			return -EINVAL;
 		relative = texture->level_offset[i] - base_offset;
 		if ((relative >> 8) > 0x00ffffff ||
-		    (i > texture->first_level + 8 &&
+		    (!pot && i > texture->first_level + 8 &&
 		     texture->level_offset[i] !=
 		     texture->level_offset[i - 1] + 0x100))
 			return -EINVAL;
@@ -9100,11 +9112,16 @@ static int chrome9_fragment_texture_selftest(void)
 		return ret;
 	chrome9_fragment_sampler_state(&texture, sampler);
 	chrome9_fragment_mip_state(&texture, mip);
+	/* POT: L1 directly follows L0, no address table words. */
 	if (object_size != 5 * PAGE_SIZE ||
 	    memcmp(sampler, expected_sampler, sizeof(expected_sampler)) ||
-	    mip[0] != 0x40000020 || memchr_inv(mip + 1, 0,
-					       7 * sizeof(*mip)))
+	    memchr_inv(mip, 0, sizeof(mip)))
 		return -EINVAL;
+	texture.level_offset[1] += 32;
+	if (chrome9_validate_fragment_texture(&texture, &object_size, false) !=
+	    -EINVAL)
+		return -EINVAL;
+	texture.level_offset[1] -= 32;
 	/* Both ABIs use compact BO addresses.  Only the packet's image,
 	 * mipmap and sampler selectors change to the logical unit in v2. */
 	cursor = packet;
@@ -9142,12 +9159,15 @@ static int chrome9_fragment_texture_selftest(void)
 		texture.level_offset[0] = PAGE_SIZE;
 		texture.level_pitch[0] =
 			ALIGN(texture.width * formats[i].bytes_per_pixel, 32);
-		texture.level_offset[1] = 3 * PAGE_SIZE;
+		texture.level_offset[1] = PAGE_SIZE +
+			texture.level_pitch[0] * texture.height;
 		texture.level_pitch[1] =
 			ALIGN((texture.width >> 1) * formats[i].bytes_per_pixel, 32);
 		ret = chrome9_validate_fragment_texture(&texture, &object_size,
 			false);
-		if (ret || object_size != 5 * PAGE_SIZE ||
+		if (ret || object_size !=
+		    ALIGN(texture.level_offset[1] + texture.level_pitch[1] *
+			  (texture.height >> 1), PAGE_SIZE) + PAGE_SIZE ||
 		    chrome9_fragment_texture_format(texture.format) !=
 			formats[i].image)
 			return -EINVAL;
