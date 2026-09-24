@@ -113,12 +113,6 @@ module_param_named(hw_tcl, chrome9_hw_tcl, bool, 0400);
 MODULE_PARM_DESC(hw_tcl,
 	"Enable the pre-promotion hardware vertex program ioctl (default: false)");
 
-/* RE knob: OR the open A61 bits 17:16 into TCL programs; bit 18 hangs. */
-static uint chrome9_tcl_a61_or;
-module_param_named(tcl_a61_or, chrome9_tcl_a61_or, uint, 0600);
-MODULE_PARM_DESC(tcl_a61_or,
-	"Debug: OR A61 bits 17:16 into hardware vertex programs (default: 0)");
-
 static unsigned long chrome9_engine_gart_offset = ULONG_MAX;
 module_param_named(engine_gart_offset, chrome9_engine_gart_offset, ulong, 0400);
 MODULE_PARM_DESC(engine_gart_offset,
@@ -2116,8 +2110,7 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	/* Superset of the input and output masks; the vendor quad uses 1f. */
 	raster[i++] = 0x12000000 |
 		      GENMASK(max(outputs, tcl->element_count) - 1, 0);
-	raster[i++] = tcl->program.a61 |
-		      (READ_ONCE(chrome9_tcl_a61_or) & GENMASK(17, 16));
+	raster[i++] = tcl->program.a61;
 	raster[i++] = tcl->program.a62;
 	raster[i++] = 0x20000000;
 	/* A23 bit 8 selects the culled physical winding: set = CCW. */
