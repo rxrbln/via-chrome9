@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: MIT */
-/* Copyright 2026 Chrome9 contributors */
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef _UAPI_CHROME9_DRM_H_
 #define _UAPI_CHROME9_DRM_H_
@@ -37,6 +36,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_VERTEX_PROGRAM	0x1e
 #define DRM_CHROME9_GEM_CPU_ACCESS	0x1f
 #define DRM_CHROME9_DRAW_VERTEX_PROGRAMS	0x20
+#define DRM_CHROME9_GEM_INFO	0x21
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -122,6 +122,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_VERTEX_PROGRAMS \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_VERTEX_PROGRAMS, \
 		struct drm_chrome9_draw_vertex_programs)
+#define DRM_IOCTL_CHROME9_GEM_INFO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GEM_INFO, \
+		 struct drm_chrome9_gem_info)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -130,6 +133,7 @@ enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_BAR0_SIZE = 3,
 	DRM_CHROME9_PARAM_BAR1_SIZE = 4,
 	DRM_CHROME9_PARAM_BAR2_SIZE = 5,
+	DRM_CHROME9_PARAM_CAPABILITIES2 = 6,
 };
 
 /* The kernel can allocate and mmap GEM objects. */
@@ -246,6 +250,10 @@ enum drm_chrome9_param {
 /* DRAW_VERTEX_PROGRAMS: several TCL draws per submission. */
 #define DRM_CHROME9_CAP_VERTEX_BATCH		(1ULL << 63)
 
+/* Second capability word, DRM_CHROME9_PARAM_CAPABILITIES2. */
+/* GEM_CREATE_GUARDED_SHARED and GEM_INFO. */
+#define DRM_CHROME9_CAP2_GUARDED_SHARED		(1ULL << 0)
+
 struct drm_chrome9_get_param {
 	__u32 param;
 	__u32 pad;
@@ -289,6 +297,20 @@ struct drm_chrome9_gem_cpu_access {
  * buffers: ordinary render resources should not consume constrained memory.
  */
 #define DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT	(1U << 0)
+/*
+ * The object keeps the guarded layout of draw targets (guard page, rows from
+ * byte PAGE_SIZE, trailing guard page), but a layout offset of 0 given by a
+ * client that cannot carry plane offsets (DRI3 without modifiers, KMS AddFB)
+ * refers to its first row at byte PAGE_SIZE.
+ */
+#define DRM_CHROME9_GEM_CREATE_GUARDED_SHARED	(1U << 1)
+
+/* Creation flags and size of an object, e.g. after PRIME import. */
+struct drm_chrome9_gem_info {
+	__u32 handle;
+	__u32 flags;
+	__u64 size;
+};
 
 #define DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE	(1U << 0)
 #define DRM_CHROME9_FIXED_QUAD_CONSTANT_RED	(1U << 1)
