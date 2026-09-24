@@ -337,13 +337,16 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32) ?
       32 * 4 * sizeof(float) : 4 * sizeof(float);
    fs->max_const_buffers = 1;
-   /* Mesa's compatibility context requires at least one logical unit. */
+   /* The structured fragment-program path has independently qualified
+    * three distinct nearest/clamp descriptors in one draw.  The older
+    * immediate-triangle path retains its own two-texture limit. */
    fs_samplers =
+      (screen->capabilities & DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) ? 3 :
       (screen->capabilities & DRM_CHROME9_CAP_DRAW_TWO_TEXTURED_TRIANGLE) ?
       2 : 1;
-   /* Diagnostic-only GL2 link probe.  Draw classification remains closed
-    * to live-proven one-/two-unit programs, so this cannot submit an
-    * unvalidated higher-unit packet. */
+   /* Diagnostic link probes can request the remaining structured descriptor
+    * slots, but callers must still qualify new state combinations before
+    * treating them as production-supported. */
    debug_fs_samplers =
       debug_get_num_option("CHROME9_DEBUG_MAX_FS_SAMPLERS", 0);
    if (debug_fs_samplers > (int)fs_samplers && debug_fs_samplers <= 8)

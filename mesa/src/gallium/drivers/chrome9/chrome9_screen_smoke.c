@@ -7426,6 +7426,15 @@ main(int argc, char **argv)
       screen->destroy(screen);
       return 1;
    }
+   if (chrome9_screen_has_capability(
+          screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
+       (screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers < 3 ||
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views < 3 ||
+        screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions < 3)) {
+      fputs("structured fragment three-sampler caps missing\n", stderr);
+      screen->destroy(screen);
+      return 1;
+   }
    {
       const struct pipe_shader_caps *vs =
          &screen->shader_caps[MESA_SHADER_VERTEX];
@@ -7454,6 +7463,14 @@ main(int argc, char **argv)
          screen->destroy(screen);
          return 1;
       }
+   }
+   if (argc > 2 && !strcmp(argv[2], "--caps-only")) {
+      printf("fragment sampler/view/TEX caps: %u/%u/%u\n",
+             screen->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers,
+             screen->shader_caps[MESA_SHADER_FRAGMENT].max_sampler_views,
+             screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions);
+      screen->destroy(screen);
+      return 0;
    }
    {
       struct pipe_fence_handle *fence = NULL;
