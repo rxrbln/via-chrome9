@@ -272,6 +272,199 @@ out:
    return valid;
 }
 
+static bool
+check_separable_blur_compilation(struct chrome9_context *context)
+{
+   /* Exact linked glmark2 desktop horizontal pass at 300x300. */
+   static const uint32_t offset_bits[11] = {
+      0xbc88850a, 0xbc5a6e76, 0xbc23d2d8, 0xbbda6e76, 0xbb5a6e76,
+      0x00000000,
+      0x3b5a6e76, 0x3bda6e76, 0x3c23d2d8, 0x3c5a6e76, 0x3c88850a,
+   };
+   static const uint32_t weight_bits[6] = {
+      0x3e751c19, 0x3e4cbbc3, 0x3dee9dd8,
+      0x3d42070c, 0x3c5c26dd, 0x3b2e429e,
+   };
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-eleven-tap-blur");
+   struct chrome9_shader shader = { 0 };
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *coord = nir_load_interpolated_input(
+      &b, 2, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_def *sum = NULL;
+   unsigned textures = 0, adds = 0, multiplies = 0, moves = 0;
+   unsigned alpha_moves = 0;
+   unsigned alpha_temp = CHROME9_PS_MAX_VIRTUAL_TEMPS;
+   bool coordinates_valid = true;
+   bool weights_valid = true;
+   bool valid = false;
+
+   b.shader->info.io_lowered = true;
+   for (int tap = -5; tap <= 5; tap++) {
+      float offset, weight;
+      nir_def *sample_coord;
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+      nir_def *weighted;
+
+      memcpy(&offset, &offset_bits[tap + 5], sizeof(offset));
+      memcpy(&weight, &weight_bits[tap < 0 ? -tap : tap], sizeof(weight));
+      sample_coord = tap ?
+         nir_fadd(&b, coord, nir_imm_vec2(&b, offset, 0.0f)) : coord;
+      tex->op = nir_texop_tex;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->coord_components = 2;
+      tex->dest_type = nir_type_float32;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, sample_coord);
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      weighted = nir_fmul(&b, &tex->def, nir_imm_float(&b, weight));
+      sum = sum ? nir_fadd(&b, sum, weighted) : weighted;
+   }
+   nir_store_output(&b, nir_vec4(&b,
+      nir_channel(&b, sum, 0), nir_channel(&b, sum, 1),
+      nir_channel(&b, sum, 2), nir_imm_float(&b, 1.0f)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &shader.semantic_fs_ir.instruction[i];
+      const struct chrome9_ps_source *source = &instruction->source[0];
+
+      if (instruction->op == CHROME9_PS_OPCODE_TEX) {
+         const struct chrome9_ps_instruction *multiply =
+            i + 1 < shader.semantic_fs_ir.count ?
+            &shader.semantic_fs_ir.instruction[i + 1] : NULL;
+         const struct chrome9_ps_source *sample = multiply ?
+            &multiply->source[0] : NULL;
+         const struct chrome9_ps_source *weight = multiply ?
+            &multiply->source[1] : NULL;
+         unsigned distance = textures > 5 ? textures - 5 : 5 - textures;
+
+         coordinates_valid &= textures < ARRAY_SIZE(offset_bits);
+         weights_valid &= distance < ARRAY_SIZE(weight_bits);
+         coordinates_valid &= instruction->sampler == 0 &&
+            source->swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+            source->swizzle[1] == CHROME9_PS_SWIZZLE_Y;
+         if (textures == 5) {
+            coordinates_valid &= source->file ==
+               CHROME9_PS_SOURCE_TEXTURE && source->id == 0;
+         } else if (!i || source->file != CHROME9_PS_SOURCE_TEMP) {
+            coordinates_valid = false;
+         } else {
+            const struct chrome9_ps_instruction *coordinate =
+               &shader.semantic_fs_ir.instruction[i - 1];
+            const struct chrome9_ps_source *varying =
+               &coordinate->source[0];
+            const struct chrome9_ps_source *offset =
+               &coordinate->source[1];
+
+            coordinates_valid &= coordinate->op == CHROME9_PS_OPCODE_ADD &&
+               coordinate->destination.file ==
+                  CHROME9_PS_DESTINATION_TEMP &&
+               coordinate->destination.id == source->id &&
+               coordinate->destination.writemask == 3 &&
+               varying->file == CHROME9_PS_SOURCE_TEXTURE &&
+               varying->id == 0 &&
+               varying->swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+               varying->swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+               offset->file == CHROME9_PS_SOURCE_CONSTANT &&
+               offset->id < 32 && offset->swizzle[0] < 4 &&
+               offset->swizzle[1] < 4 &&
+               shader.native_fs.immediate[offset->id]
+                  [offset->swizzle[0]] ==
+                     offset_bits[textures < ARRAY_SIZE(offset_bits) ?
+                                 textures : 0] &&
+               shader.native_fs.immediate[offset->id]
+                  [offset->swizzle[1]] == 0;
+         }
+         weights_valid &= multiply &&
+            multiply->op == CHROME9_PS_OPCODE_MUL &&
+            multiply->destination.writemask == 7 &&
+            sample->file == CHROME9_PS_SOURCE_TEMP &&
+            sample->id == instruction->destination.id &&
+            weight->file == CHROME9_PS_SOURCE_CONSTANT &&
+            weight->id < 32 && weight->swizzle[0] < 4;
+         if (weights_valid && distance < ARRAY_SIZE(weight_bits)) {
+            weights_valid &= shader.native_fs.immediate[weight->id]
+               [weight->swizzle[0]] == weight_bits[distance];
+            for (unsigned lane = 0; lane < 3; lane++)
+               weights_valid &= sample->swizzle[lane] == lane &&
+                  weight->swizzle[lane] == weight->swizzle[0];
+         }
+      }
+      textures += instruction->op == CHROME9_PS_OPCODE_TEX;
+      adds += instruction->op == CHROME9_PS_OPCODE_ADD;
+      multiplies += instruction->op == CHROME9_PS_OPCODE_MUL;
+      moves += instruction->op == CHROME9_PS_OPCODE_MOV;
+      if (instruction->op == CHROME9_PS_OPCODE_MOV &&
+          instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+          instruction->destination.writemask == 8 &&
+          source->file == CHROME9_PS_SOURCE_CONSTANT &&
+          source->id < 32 && source->swizzle[3] < 4 &&
+          shader.native_fs.immediate[source->id][source->swizzle[3]] ==
+             0x3f800000) {
+         alpha_moves++;
+         alpha_temp = instruction->destination.id;
+      }
+   }
+   const struct chrome9_ps_instruction *terminal =
+      shader.semantic_fs_ir.count ?
+      &shader.semantic_fs_ir.instruction[shader.semantic_fs_ir.count - 1] :
+      NULL;
+   valid = shader.supported && shader.semantic_fs_valid &&
+      shader.semantic_fs_ir.count == 45 && textures == 11 &&
+      adds == 20 && multiplies == 11 && moves == 3 && alpha_moves == 1 &&
+      coordinates_valid && weights_valid && terminal &&
+      terminal->op == CHROME9_PS_OPCODE_MOV &&
+      terminal->destination.file == CHROME9_PS_DESTINATION_COLOR &&
+      terminal->source[0].file == CHROME9_PS_SOURCE_TEMP &&
+      terminal->source[0].id == alpha_temp &&
+      terminal->source[0].swizzle[3] == CHROME9_PS_SWIZZLE_W &&
+      shader.semantic_sampler_mask == 1 &&
+      shader.semantic_varying_mask == 1 &&
+      __builtin_popcount(shader.native_fs.immediate_mask) <= 8;
+   for (unsigned i = 0; i < 11; i++) {
+      uint32_t bits = offset_bits[i];
+      bool found = !bits;
+
+      for (unsigned id = 16; id < 32 && !found; id++)
+         if (shader.native_fs.immediate_mask & (1u << id))
+            for (unsigned lane = 0; lane < 4; lane++)
+               found |= shader.native_fs.immediate[id][lane] == bits;
+      valid &= found;
+   }
+   for (unsigned i = 0; i < 7; i++) {
+      uint32_t bits = i == 6 ? 0x3f800000 : weight_bits[i];
+      bool found = false;
+
+      for (unsigned id = 16; id < 32 && !found; id++)
+         if (shader.native_fs.immediate_mask & (1u << id))
+            for (unsigned lane = 0; lane < 4; lane++)
+               found |= shader.native_fs.immediate[id][lane] == bits;
+      valid &= found;
+   }
+   if (!valid)
+      fprintf(stderr, "eleven-tap blur compilation failed: "
+              "supported=%u semantic=%u ir=%u tex=%u add=%u mul=%u "
+              "mov=%u alpha=%u coords=%u weights=%u samplers=%x varyings=%x "
+              "immediates=%08x\n",
+              shader.supported,
+              shader.semantic_fs_valid, shader.semantic_fs_ir.count,
+              textures, adds, multiplies, moves, alpha_moves,
+              coordinates_valid, weights_valid,
+              shader.semantic_sampler_mask,
+              shader.semantic_varying_mask,
+              shader.native_fs.immediate_mask);
+   ralloc_free(b.shader);
+   return valid;
+}
+
 int
 main(void)
 {
@@ -350,8 +543,9 @@ main(void)
        !check_scalar_literal_packing(&context, false, 64, true) ||
        !check_scalar_literal_packing(&context, false, 65, false) ||
        !check_reordered_vector_literals(&context) ||
-       !check_packed_alpha_kill(&context))
+       !check_packed_alpha_kill(&context) ||
+       !check_separable_blur_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, and packed literals passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, and blur compilation passed");
    return 0;
 }
