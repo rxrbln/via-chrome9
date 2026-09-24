@@ -164,6 +164,13 @@ struct chrome9_vertex_elements {
    struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];
 };
 
+/* A pipe fence: completes when resource, the context's last submitted
+ * target, is idle. */
+struct chrome9_fence {
+   struct pipe_reference reference;
+   struct pipe_resource *resource;
+};
+
 struct chrome9_context {
    struct pipe_context base;
    struct draw_context *draw;
@@ -179,6 +186,8 @@ struct chrome9_context {
    /* Guarded render shadows of unguarded drawables, keyed by drawable. */
    struct hash_table *shadows;
    bool render_target_dirty;
+   /* Target of the most recent submission, for fences. */
+   struct pipe_resource *last_target;
    /* Pixels written since the last publish, when render_target_dirty. */
    struct pipe_scissor_state render_dirty;
    bool render_target_stale;

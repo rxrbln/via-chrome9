@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_swfb.h"
 #include "chrome9_public.h"
@@ -21,6 +22,7 @@
 #include "pipe/p_screen.h"
 #include "tgsi/tgsi_exec.h"
 #include "util/u_debug.h"
+#include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/simple_mtx.h"
@@ -263,26 +265,42 @@ chrome9_screen_destroy(struct pipe_screen *screen)
    FREE(cscreen);
 }
 
+/*
+ * Submissions retire in order with at most one in flight, so a fence
+ * completes when the last target the context submitted to is idle.
+ */
 static void
 chrome9_fence_reference(struct pipe_screen *screen,
                         struct pipe_fence_handle **ptr,
                         struct pipe_fence_handle *fence)
 {
+   struct chrome9_fence *old = (struct chrome9_fence *)*ptr;
+
    (void)screen;
-   (void)fence;
-   /* DRAW_TRIANGLE completes synchronously, so the driver never emits a fence. */
-   *ptr = NULL;
+   if (pipe_reference(old ? &old->reference : NULL,
+                      fence ? &((struct chrome9_fence *)fence)->reference :
+                              NULL)) {
+      pipe_resource_reference(&old->resource, NULL);
+      FREE(old);
+   }
+   *ptr = fence;
 }
 
 static bool
 chrome9_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
                      struct pipe_fence_handle *fence, uint64_t timeout)
 {
-   (void)screen;
+   struct chrome9_fence *f = (struct chrome9_fence *)fence;
+
    (void)ctx;
-   (void)fence;
    (void)timeout;
-   return true;
+   if (!f || !f->resource ||
+       !chrome9_screen_has_capability(screen,
+                                      DRM_CHROME9_CAP_GEM_CPU_ACCESS))
+      return true;
+   return chrome9_bo_cpu_access(chrome9_screen(screen)->fd,
+                                &chrome9_resource(f->resource)->bo,
+                                DRM_CHROME9_GEM_CPU_WAIT);
 }
 
 static const struct nir_shader_compiler_options chrome9_nir_options = {

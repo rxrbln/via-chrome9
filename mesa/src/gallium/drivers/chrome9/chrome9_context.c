@@ -189,6 +189,8 @@ chrome9_context_render_target_written(struct chrome9_context *ctx)
 
    if (!ctx->framebuffer.nr_cbufs)
       return;
+   if (ctx->last_target != ctx->render_target)
+      pipe_resource_reference(&ctx->last_target, ctx->render_target);
    if (ctx->rasterizer && ctx->rasterizer->scissor && ctx->scissor_valid) {
       box.minx = MIN2(ctx->scissor.minx, box.maxx);
       box.miny = MIN2(ctx->scissor.miny, box.maxy);
@@ -7010,9 +7012,16 @@ chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
               ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
    (void)flags;
-   /* DRAW_TRIANGLE completes synchronously. */
-   if (fence)
+   if (fence) {
+      struct chrome9_fence *f = CALLOC_STRUCT(chrome9_fence);
+
       *fence = NULL;
+      if (f) {
+         pipe_reference_init(&f->reference, 1);
+         pipe_resource_reference(&f->resource, ctx->last_target);
+         *fence = (struct pipe_fence_handle *)f;
+      }
+   }
 }
 
 static void
@@ -7117,6 +7126,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
    util_unreference_framebuffer_state(&ctx->framebuffer);
    pipe_resource_reference(&ctx->render_target, NULL);
    pipe_resource_reference(&ctx->depth_only_scratch, NULL);
+   pipe_resource_reference(&ctx->last_target, NULL);
    if (ctx->shadows) {
       hash_table_foreach(ctx->shadows, entry) {
          struct pipe_resource *key = (struct pipe_resource *)entry->key;

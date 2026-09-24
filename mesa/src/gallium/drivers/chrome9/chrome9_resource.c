@@ -469,7 +469,8 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
 
    if (write)
       resource->cpu_write_generation++;
-   if (resource->explicit_access &&
+   /* Every access also waits for asynchronously retiring jobs. */
+   if (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_GEM_CPU_ACCESS) &&
        !chrome9_bo_cpu_access_range(screen->get_screen_fd(screen),
                                     &resource->bo,
                                     write ? DRM_CHROME9_GEM_CPU_PREPARE_WRITE :
