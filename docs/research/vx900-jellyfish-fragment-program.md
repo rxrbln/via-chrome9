@@ -344,6 +344,21 @@ the CPU arithmetic reference.  It does not yet distinguish FE producer
 width/link state from A90/resource routing or the native source selector, so
 none of those layers should be changed from this result alone.
 
+The next one-variable run disproves the tentative interpretation that the
+red increase was delivered V2.x.  Keeping the byte-identical vector-probe
+program and changing only all six vertices' V2.x from `.2` to `.6` produced
+exactly the same `00ad3d08` pixel.  D16 remained `8000`, known-good draws
+passed before and after, and no new kernel fault was logged.  Correct T2.x
+delivery would have changed both the final red add and the earlier green
+ambient term: relative to the prior pixel, red should saturate and green
+should rise by approximately `(.6-.2)*(0x40/255)`, giving about `00ff5708`
+even if the already-broken Y/Z lanes remained zero.  The unchanged word
+therefore means the apparent earlier `+0x40` was not sourced from submitted
+V2.x.  The remaining classes are a lower-slot alias, a component remap which
+does not read physical X, or stale/constant input.  This single mutation
+cannot distinguish a T0 alias from a T1 alias because neither lower varying
+changed.
+
 ### Minimal float3-versus-float4 T2 route discriminator
 
 A fresh manual, Linux VS-compiler, and Linux PS-compiler cross-check finds no
@@ -385,6 +400,12 @@ ALU while retaining all three physical coordinate slots and direct A90 bits
 0--2.  In particular, type-FE A00 must be `00000011`: it is the compiler's
 one active texture-temporary resource, not three varyings.
 
+For a stronger alias fingerprint without changing the program or the
+float3/float4 comparison, keep T0 zero but set T1 to a distinct poison such
+as `(.7,.1,.9,.6)`.  The T0*T1 product remains exactly zero.  A correct T2
+route retains `33334d66`; a T0 alias produces zero; and a T1 alias produces
+approximately `b3b31ae6` because the float3 source is `T2.xyzx`.
+
 Run one otherwise identical float4 companion with T2.w=`.8`.  Its only
 width-closure changes are:
 
@@ -396,6 +417,11 @@ VS T2 destination=000802af
 PS ALU=02c20530 302c1053 00f2c005 00000820
 expected host BGRA=cc334d66
 ```
+
+With the same T1 poison, the float4 companion's three route fingerprints are
+`cc334d66` for correct T2, zero for a T0 alias, and `99b31ae6` for a T1
+alias.  These distinct results make the raw MAD pair strictly more diagnostic
+than another one-variable mutation inside the 16-record/two-TEX envelope.
 
 If float4 restores Y/Z while float3 does not, the remaining fault is in the
 float3 width/link closure.  If both retain only T2.x, the failure is below the
