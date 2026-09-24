@@ -1,10 +1,9 @@
 # Chrome9 glmark2 function-medium fragment gate
 
-Status: source-exact and Mesa-26.2.2 offline-NIR audit plus narrowed guarded
-silicon gates, 2026-09-24.  Isolated finite-positive and positive-zero scalar
-square roots pass, but the older combined multi-lane oracle timed out and
-quarantined the engine.  Do not enable the lowering generally until the
-source-shaped repeated scalar gate passes.
+Status: source-exact and Mesa-26.2.2 offline-NIR audit plus guarded silicon
+closure, 2026-09-24.  The corrected byte-exact scalar gates and the complete
+five-step medium scene now pass.  The older combined multi-lane oracle remains
+a separate timed-out packet and does not qualify vector partial writes.
 
 ## Exact scene source
 
@@ -477,3 +476,17 @@ padding, and successful 36-record UAPI translation.  Once those checks pass,
 the next meaningful live gate is one bounded `function` medium-complexity
 glmark2 validation bracketed by known-good draws; another scene-shaped raw
 shader probe would not separate a remaining hardware unknown.
+
+### Complete scene result
+
+Mesa subsequently enabled the standard `lower_fsqrt` option and retained the
+offline 36-record production-options regression described above.  On the
+VX900 target the exact five-step medium-complexity fragment scene completed
+with glmark2 `Validation: Success`.  A known-good textured baseline passed
+afterward and the kernel log gained no GPU timeout or engine fault.
+
+This closes the complete POSITION prefix, five lowered scalar roots, output
+assembly, structured-UAPI translation, and application validator together.
+It does not rehabilitate the old 12-record multi-lane partial-write timeout,
+qualify negative square roots, or broaden explicit floating-point control
+support.  Those remain independent contracts.
