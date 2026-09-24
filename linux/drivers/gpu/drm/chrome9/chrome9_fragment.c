@@ -2577,9 +2577,14 @@ int chrome9_fragment_selftest(void)
 	ret = chrome9_fragment_compile(resource_chain,
 		ARRAY_SIZE(resource_chain), constants, 0, 0, 3, program);
 	if (ret || program->active_texture_count != 3 ||
+	    program->varying_count != 3 || program->varying_width[0] != 4 ||
+	    program->varying_width[1] != 4 || program->varying_width[2] != 4 ||
 	    program->alu_count != ARRAY_SIZE(expected_resource_chain_alu) ||
 	    memcmp(program->alu, expected_resource_chain_alu,
-		   sizeof(expected_resource_chain_alu))) {
+		   sizeof(expected_resource_chain_alu)) ||
+	    program->controls[0] != 0x90058007 ||
+	    program->controls[1] != 0x91000000 ||
+	    program->controls[2] != 0x92000003) {
 		ret = -EINVAL;
 		goto out;
 	}
