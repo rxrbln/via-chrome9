@@ -35,6 +35,7 @@ extern "C" {
 #define DRM_CHROME9_DRAW_TRIANGLE_D16_RHW_CHAIN	0x1c
 #define DRM_CHROME9_DRAW_FRAGMENT_PROGRAM	0x1d
 #define DRM_CHROME9_DRAW_VERTEX_PROGRAM	0x1e
+#define DRM_CHROME9_GEM_CPU_ACCESS	0x1f
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -114,6 +115,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_DRAW_VERTEX_PROGRAM \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_DRAW_VERTEX_PROGRAM, \
 		struct drm_chrome9_draw_vertex_program)
+#define DRM_IOCTL_CHROME9_GEM_CPU_ACCESS \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_CHROME9_GEM_CPU_ACCESS, \
+		struct drm_chrome9_gem_cpu_access)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -233,6 +237,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_VERTEX_TWO_SIDE		(1ULL << 60)
 /* DRAW_VERTEX_PROGRAM CLIP_DISTANCE destination and clip_distance_mask. */
 #define DRM_CHROME9_CAP_VERTEX_CLIP_DISTANCE	(1ULL << 61)
+/* GEM_CPU_ACCESS: explicit CPU access bracketing defers cache flushes. */
+#define DRM_CHROME9_CAP_GEM_CPU_ACCESS		(1ULL << 62)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -245,6 +251,24 @@ struct drm_chrome9_gem_create {
 	__u32 flags;
 	__u32 handle;
 	__u64 mmap_offset;
+};
+
+/*
+ * Explicit CPU access.  After EXPLICIT, the kernel flushes the object's CPU
+ * cache lines before device use only if a PREPARE_WRITE came after the
+ * previous device use, and invalidates them after device writes only at the
+ * next PREPARE_READ/PREPARE_WRITE.  Userspace must call PREPARE_* before
+ * every CPU access through its mapping, and IMPLICIT before sharing the
+ * object with a client that does not follow this protocol.
+ */
+#define DRM_CHROME9_GEM_CPU_EXPLICIT		(1U << 0)
+#define DRM_CHROME9_GEM_CPU_IMPLICIT		(1U << 1)
+#define DRM_CHROME9_GEM_CPU_PREPARE_READ	(1U << 2)
+#define DRM_CHROME9_GEM_CPU_PREPARE_WRITE	(1U << 3)
+
+struct drm_chrome9_gem_cpu_access {
+	__u32 handle;
+	__u32 flags;
 };
 
 /*
