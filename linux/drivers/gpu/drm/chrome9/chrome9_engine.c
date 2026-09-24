@@ -142,6 +142,12 @@ static ulong chrome9_vram_target_test;
 module_param_named(vram_target_test, chrome9_vram_target_test, ulong, 0600);
 MODULE_PARM_DESC(vram_target_test, "Debug: VRAM offset for fragment color writes");
 
+/* Retire the last segment of a fragment submission in a worker, so the
+ * CPU prepares the next submission while the engine runs. */
+static bool chrome9_async_retire = true;
+module_param_named(async_retire, chrome9_async_retire, bool, 0600);
+MODULE_PARM_DESC(async_retire, "Retire fragment jobs asynchronously (default: true)");
+
 static uint chrome9_profile;
 module_param_named(profile, chrome9_profile, uint, 0600);
 MODULE_PARM_DESC(profile, "Debug: log fragment job phase times every N jobs");
@@ -200,20 +206,26 @@ static void chrome9_prof_job(struct drm_device *drm)
 {
 	u32 every = READ_ONCE(chrome9_profile);
 	unsigned int i;
+	u64 n;
 
-	if (!every || ++chrome9_prof_jobs < every)
+	/* Concurrent submitters may reset the counter; divide by a snapshot. */
+	if (!every)
+		return;
+	n = READ_ONCE(chrome9_prof_jobs) + 1;
+	WRITE_ONCE(chrome9_prof_jobs, n);
+	if (n < every)
 		return;
 	for (i = 0; i < CHROME9_PROF_COUNT; i++) {
 		dev_info(drm->dev, "profile %s %llu us\n", chrome9_prof_names[i],
-			 div64_u64(chrome9_prof_ns[i], 1000 * chrome9_prof_jobs));
+			 div64_u64(chrome9_prof_ns[i], 1000 * n));
 		chrome9_prof_ns[i] = 0;
 	}
 	dev_info(drm->dev,
 		 "profile flush: guards %llu us, full %llu us (%llu KiB), dma sync %llu us\n",
-		 div64_u64(chrome9_prof_sub_ns[0], 1000 * chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_sub_ns[1], 1000 * chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_full_bytes, 1024 * chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_sub_ns[2], 1000 * chrome9_prof_jobs));
+		 div64_u64(chrome9_prof_sub_ns[0], 1000 * n),
+		 div64_u64(chrome9_prof_sub_ns[1], 1000 * n),
+		 div64_u64(chrome9_prof_full_bytes, 1024 * n),
+		 div64_u64(chrome9_prof_sub_ns[2], 1000 * n));
 	dev_info(drm->dev,
 		 "profile full flushes: implicit dst %llu depth %llu tex %llu, dirty dst %llu depth %llu tex %llu\n",
 		 chrome9_prof_full_kind[0], chrome9_prof_full_kind[1],
@@ -221,21 +233,21 @@ static void chrome9_prof_job(struct drm_device *drm)
 		 chrome9_prof_full_kind[4], chrome9_prof_full_kind[5]);
 	memset(chrome9_prof_full_kind, 0, sizeof(chrome9_prof_full_kind));
 	dev_info(drm->dev, "profile wait: fence %llu cookie %llu pause %llu work %llu us\n",
-		 div64_u64(chrome9_prof_wait_ns[0], 1000 * chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_wait_ns[1], 1000 * chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_wait_ns[2], 1000 * chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_wait_ns[3], 1000 * chrome9_prof_jobs));
+		 div64_u64(chrome9_prof_wait_ns[0], 1000 * n),
+		 div64_u64(chrome9_prof_wait_ns[1], 1000 * n),
+		 div64_u64(chrome9_prof_wait_ns[2], 1000 * n),
+		 div64_u64(chrome9_prof_wait_ns[3], 1000 * n));
 	memset(chrome9_prof_wait_ns, 0, sizeof(chrome9_prof_wait_ns));
 	dev_info(drm->dev, "profile draws per job %llu.%02llu, segments per job %llu.%02llu\n",
-		 div64_u64(chrome9_prof_draws, chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_draws * 100, chrome9_prof_jobs) % 100,
-		 div64_u64(chrome9_prof_segments, chrome9_prof_jobs),
-		 div64_u64(chrome9_prof_segments * 100, chrome9_prof_jobs) % 100);
+		 div64_u64(chrome9_prof_draws, n),
+		 div64_u64(chrome9_prof_draws * 100, n) % 100,
+		 div64_u64(chrome9_prof_segments, n),
+		 div64_u64(chrome9_prof_segments * 100, n) % 100);
 	chrome9_prof_draws = 0;
 	chrome9_prof_segments = 0;
 	memset(chrome9_prof_sub_ns, 0, sizeof(chrome9_prof_sub_ns));
 	chrome9_prof_full_bytes = 0;
-	chrome9_prof_jobs = 0;
+	WRITE_ONCE(chrome9_prof_jobs, 0);
 }
 static uint chrome9_tcl_re;
 module_param_named(tcl_re, chrome9_tcl_re, uint, 0600);
@@ -262,6 +274,7 @@ struct chrome9_fence {
 };
 
 struct chrome9_sf_mapping;
+struct chrome9_fragment_submit;
 
 /* Destination, depth, textures and the stage B vertex buffers. */
 #define CHROME9_FRAGMENT_MAX_OBJECTS	64
@@ -287,6 +300,11 @@ struct chrome9_job {
 	struct iosys_map fragment_maps[CHROME9_FRAGMENT_MAX_OBJECTS];
 	bool fragment_mapped[CHROME9_FRAGMENT_MAX_OBJECTS];
 	struct list_head quarantine_link;
+	/* Asynchronously retired fragment submission and its objects. */
+	struct list_head reap_link;
+	struct chrome9_fragment_submit *fsub;
+	u32 fsub_count;
+	u32 fsub_depth;
 	unsigned int sf_mapping_count;
 	u32 cookie;
 	u32 fence_id;
@@ -491,6 +509,11 @@ struct chrome9_blend_words {
 struct chrome9_engine {
 	struct chrome9_device *cdev;
 	struct mutex submit_lock;
+	/* Published job whose retirement is pending (submit_lock). */
+	struct chrome9_job *inflight;
+	/* Retired jobs whose object references drop after the unlock. */
+	struct list_head reaped;
+	struct work_struct retire_work;
 	struct mutex vm_lock;
 	struct drm_mm sf_mm;
 	struct list_head quarantine;
@@ -556,6 +579,39 @@ struct chrome9_engine {
 	bool module_hold;
 	bool device_hold;
 };
+
+static void chrome9_engine_retire_locked(struct chrome9_engine *engine);
+static void chrome9_engine_reap(struct list_head *list);
+static void chrome9_retire_work(struct work_struct *work);
+
+/*
+ * Every submit_lock holder first retires a job left in flight, so the ring,
+ * GART and cache invariants of the synchronous paths keep holding.
+ */
+static void chrome9_submit_lock(struct chrome9_engine *engine)
+{
+	mutex_lock(&engine->submit_lock);
+	chrome9_engine_retire_locked(engine);
+}
+
+static int chrome9_submit_lock_interruptible(struct chrome9_engine *engine)
+{
+	int ret = mutex_lock_interruptible(&engine->submit_lock);
+
+	if (!ret)
+		chrome9_engine_retire_locked(engine);
+	return ret;
+}
+
+/* Object references of retired jobs drop outside the lock. */
+static void chrome9_submit_unlock(struct chrome9_engine *engine)
+{
+	LIST_HEAD(reap);
+
+	list_splice_init(&engine->reaped, &reap);
+	mutex_unlock(&engine->submit_lock);
+	chrome9_engine_reap(&reap);
+}
 
 struct chrome9_sf_mapping {
 	struct chrome9_engine *engine;
@@ -4305,7 +4361,7 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 	if (ret)
 		goto err_free;
 
-	ret = mutex_lock_interruptible(&engine->submit_lock);
+	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
 		goto err_free;
 	if (engine->stopping || engine->wedged || !engine->ready) {
@@ -4337,7 +4393,7 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 				 "SF scanout bind cleanup failed bind=%d cleanup=%d; mapping retained for reboot\n",
 				 ret, cleanup_ret);
 			mutex_unlock(&engine->vm_lock);
-			mutex_unlock(&engine->submit_lock);
+			chrome9_submit_unlock(engine);
 			return -EIO;
 		}
 		mapping->bound = false;
@@ -4347,7 +4403,7 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 	}
 	list_add_tail(&mapping->link, &engine->scanout_mappings);
 	mutex_unlock(&engine->vm_lock);
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 
 	dev_dbg(&cdev->pdev->dev,
 		"pinned direct scanout BO size=%zu at SF %#llx (%u PTEs)\n",
@@ -4359,7 +4415,7 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 err_unlock_vm:
 	mutex_unlock(&engine->vm_lock);
 err_unlock_submit:
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 err_free:
 	chrome9_sf_mapping_free(mapping);
 	return ret;
@@ -4375,9 +4431,9 @@ void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping)
 		return;
 	engine = mapping->engine;
 	cdev = engine->cdev;
-	mutex_lock(&engine->submit_lock);
+	chrome9_submit_lock(engine);
 	if (mapping->quarantined) {
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	if (engine->wedged || engine->stopping) {
@@ -4385,7 +4441,7 @@ void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping)
 		chrome9_take_quarantine_hold(engine);
 		dev_crit(&cdev->pdev->dev,
 			 "SF scanout mapping retained after unsafe engine state\n");
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 
@@ -4399,7 +4455,7 @@ void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping)
 		dev_crit(&cdev->pdev->dev,
 			 "SF scanout unbind failed; mapping retained for reboot\n");
 		mutex_unlock(&engine->vm_lock);
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	mapping->bound = false;
@@ -4407,7 +4463,7 @@ void chrome9_sf_unpin(struct chrome9_sf_mapping *mapping)
 	mapping->node_allocated = false;
 	list_del_init(&mapping->link);
 	mutex_unlock(&engine->vm_lock);
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 
 	dev_dbg(&cdev->pdev->dev, "unpinned direct SF scanout mapping\n");
 	chrome9_sf_mapping_free(mapping);
@@ -4450,9 +4506,9 @@ int chrome9_engine_display_begin(struct chrome9_device *cdev)
 	if (!engine)
 		return -ENODEV;
 	/* Atomic enable/disable callbacks cannot propagate an interrupted lock. */
-	mutex_lock(&engine->submit_lock);
+	chrome9_submit_lock(engine);
 	if (engine->stopping || engine->wedged || !engine->ready) {
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return -EIO;
 	}
 
@@ -4470,7 +4526,7 @@ void chrome9_engine_display_end(struct chrome9_device *cdev)
 	struct chrome9_engine *engine = cdev->engine;
 
 	lockdep_assert_held(&engine->submit_lock);
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 }
 
 static bool chrome9_verify_target(struct chrome9_job *job, u32 flags)
@@ -4629,7 +4685,8 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 
 	if (!args->flags ||
 	    args->flags & ~(prepare | DRM_CHROME9_GEM_CPU_EXPLICIT |
-			    DRM_CHROME9_GEM_CPU_IMPLICIT) ||
+			    DRM_CHROME9_GEM_CPU_IMPLICIT |
+			    DRM_CHROME9_GEM_CPU_WAIT) ||
 	    (args->flags & DRM_CHROME9_GEM_CPU_EXPLICIT &&
 	     args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT))
 		return -EINVAL;
@@ -4843,12 +4900,12 @@ ssize_t chrome9_engine_read_timeout_segment(struct chrome9_device *cdev,
 
 	if (!engine)
 		return -ENODEV;
-	mutex_lock(&engine->submit_lock);
+	chrome9_submit_lock(engine);
 	if (off >= 0 && off < engine->timeout_segment_size) {
 		ret = min_t(size_t, count, engine->timeout_segment_size - off);
 		memcpy(buf, (u8 *)engine->timeout_segment + off, ret);
 	}
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 	return ret;
 }
 
@@ -5077,6 +5134,8 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	mutex_init(&engine->submit_lock);
 	mutex_init(&engine->vm_lock);
 	INIT_LIST_HEAD(&engine->quarantine);
+	INIT_LIST_HEAD(&engine->reaped);
+	INIT_WORK(&engine->retire_work, chrome9_retire_work);
 	INIT_LIST_HEAD(&engine->scanout_mappings);
 	INIT_LIST_HEAD(&engine->draw_mappings);
 	engine->fence_context = dma_fence_context_alloc(1);
@@ -5376,7 +5435,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 		ret = -EINVAL;
 		goto out_vunmap;
 	}
-	ret = mutex_lock_interruptible(&engine->submit_lock);
+	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
 		goto out_vunmap;
 	if (engine->stopping || engine->wedged || !engine->ready) {
@@ -5481,7 +5540,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	signal = true;
 	drm_gem_shmem_vunmap_locked(job->destination, &job->map);
 	job->mapped = false;
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 	dma_resv_unlock(resv);
 	dma_fence_signal(&job->fence.base);
 	job->destination = NULL;
@@ -5494,7 +5553,7 @@ out_prepublication:
 	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 out_unlock_submit:
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 	if (quarantine) {
 		dma_resv_unlock(resv);
 		if (signal)
@@ -5780,7 +5839,7 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 		}
 	}
 
-	ret = mutex_lock_interruptible(&engine->submit_lock);
+	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
 		goto out_unmap;
 	if (engine->stopping || engine->wedged || !engine->ready) {
@@ -6036,7 +6095,7 @@ out_prepublication:
 	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 out_unlock_submit:
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 	if (quarantine) {
 		drm_exec_fini(&exec);
 		if (signal)
@@ -6067,14 +6126,14 @@ out_unmap:
 			chrome9_cache_flush(job->texture3_map.vaddr,
 					    texture3_obj->size);
 		/* Preserve device ownership for any object currently scanned out. */
-		mutex_lock(&engine->submit_lock);
+		chrome9_submit_lock(engine);
 		chrome9_sf_resync_object_locked(engine, obj);
 		chrome9_sf_resync_object_locked(engine, depth_obj);
 		if (three_objects)
 			chrome9_sf_resync_object_locked(engine, texture2_obj);
 		if (four_objects)
 			chrome9_sf_resync_object_locked(engine, texture3_obj);
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 	}
 	if (job->texture3_mapped) {
 		drm_gem_shmem_vunmap_locked(job->texture3, &job->texture3_map);
@@ -6183,6 +6242,121 @@ static u32 chrome9_fragment_submit_object(struct drm_file *file,
 }
 
 /*
+ * Post-job work of a retired fragment submission (submit_lock held): hand
+ * written objects back to the CPU, verify their guards and release the SF
+ * mappings.  -EIO when a guard was overwritten.
+ */
+static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
+					      struct chrome9_job *job)
+{
+	struct chrome9_device *cdev = engine->cdev;
+	struct chrome9_fragment_submit *sub = job->fsub;
+	struct drm_gem_object **objects = sub->objects;
+	u64 *object_sizes = sub->object_sizes;
+	u64 *mapping_sizes = sub->mapping_sizes;
+	u32 object_count = job->fsub_count;
+	u32 depth_index = job->fsub_depth;
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < object_count; i++) {
+		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
+
+		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
+			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
+		/* The job writes only its color and depth destinations. */
+		if (i != 0 && i != depth_index)
+			continue;
+		if (!bo->explicit_access) {
+			chrome9_cache_flush(job->fragment_maps[i].vaddr,
+					    mapping_sizes[i]);
+			continue;
+		}
+		/* Defer the invalidate to the next CPU access. */
+		chrome9_flush_map_guards(&job->fragment_maps[i],
+					 object_sizes[i]);
+		if (mapping_sizes[i] != object_sizes[i])
+			chrome9_flush_map_guards(&job->fragment_maps[i],
+						 mapping_sizes[i]);
+		bo->device_written = true;
+	}
+	dma_rmb();
+	for (i = 0; i < object_count; i++) {
+		/* Sampled textures and vertex buffers are only read. */
+		if (i != 0 && i != depth_index) {
+			chrome9_sf_resync_object_locked(engine, objects[i]);
+			continue;
+		}
+		if (!chrome9_verify_map_guards(&job->fragment_maps[i],
+					       object_sizes[i]) ||
+		    (mapping_sizes[i] != object_sizes[i] &&
+		     !chrome9_verify_map_guards(&job->fragment_maps[i],
+						mapping_sizes[i]))) {
+			ret = -EIO;
+			dma_fence_set_error(&job->fence.base, ret);
+			to_chrome9_bo(objects[i])->guard_object_size = 0;
+		} else if (to_chrome9_bo(objects[i])->explicit_access) {
+			to_chrome9_bo(objects[i])->guard_object_size =
+				object_sizes[i];
+			to_chrome9_bo(objects[i])->guard_mapping_size =
+				mapping_sizes[i];
+		}
+		chrome9_sf_resync_object_locked(engine, objects[i]);
+	}
+	chrome9_job_release_mappings_locked(engine, job);
+	chrome9_prof_mark(CHROME9_PROF_VERIFY);
+	return ret;
+}
+
+/* Wait for and finish the in-flight job, if any (submit_lock held). */
+static void chrome9_engine_retire_locked(struct chrome9_engine *engine)
+{
+	struct chrome9_job *job = engine->inflight;
+
+	if (!job)
+		return;
+	engine->inflight = NULL;
+	if (chrome9_wait_job(engine, job)) {
+		/* The quarantined job keeps its objects until teardown. */
+		dma_fence_set_error(&job->fence.base, -ETIME);
+		chrome9_quarantine_job_locked(engine, job);
+		return;
+	}
+	job->retirement_proven = true;
+	engine->last_cookie = job->cookie;
+	chrome9_fragment_job_finish_locked(engine, job);
+	dma_fence_signal(&job->fence.base);
+	list_add_tail(&job->reap_link, &engine->reaped);
+}
+
+static void chrome9_engine_reap(struct list_head *list)
+{
+	struct chrome9_job *job, *next;
+	unsigned int i;
+
+	list_for_each_entry_safe(job, next, list, reap_link) {
+		list_del(&job->reap_link);
+		job->destination = NULL;
+		for (i = 0; i < job->fsub_count; i++) {
+			job->fragment_objects[i] = NULL;
+			drm_gem_object_put(job->fsub->objects[i]);
+		}
+		kvfree(job->fsub);
+		job->fsub = NULL;
+		dma_fence_put(&job->fence.base);
+	}
+}
+
+static void chrome9_retire_work(struct work_struct *work)
+{
+	struct chrome9_engine *engine =
+		container_of(work, struct chrome9_engine, retire_work);
+
+	chrome9_submit_lock(engine);
+	chrome9_submit_unlock(engine);
+}
+
+/*
  * Submit fragment draws that share one destination and depth buffer (and
  * their formats).  Objects are looked up, mapped, cache-maintained and
  * verified once; the draws are packed into as few staging segments as fit,
@@ -6212,6 +6386,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	bool signal = false;
 	bool quarantine = false;
 	bool must_quarantine;
+	bool async;
 	unsigned int i, t;
 	int dev_idx;
 	int ret;
@@ -6397,7 +6572,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	}
 	chrome9_prof_mark(CHROME9_PROF_MAP);
 
-	ret = mutex_lock_interruptible(&engine->submit_lock);
+	ret = chrome9_submit_lock_interruptible(engine);
 	if (ret)
 		goto out_unmap;
 	if (engine->stopping || engine->wedged || !engine->ready) {
@@ -6490,6 +6665,11 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 							  DMA_RESV_USAGE_READ);
 	job->fence_attached = true;
 	chrome9_prof_mark(CHROME9_PROF_FLUSH);
+	/* The last segment retires asynchronously when every object keeps a
+	 * kernel mapping for the post-job work. */
+	async = READ_ONCE(chrome9_async_retire);
+	for (i = 0; i < object_count; i++)
+		async &= !iosys_map_is_null(&to_chrome9_bo(objects[i])->kmap);
 	for (next = 0; next < count; ) {
 		const u32 *limit = chrome9_fragment_segment_limit(engine);
 		u32 *p = chrome9_fragment_segment_begin(engine);
@@ -6543,6 +6723,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			quarantine = true;
 			goto out_unlock_submit;
 		}
+		if (async && next == count)
+			break;
 		ret = chrome9_wait_job(engine, job);
 		if (ret) {
 			dma_fence_set_error(&job->fence.base, -ETIME);
@@ -6554,53 +6736,27 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		job->retirement_proven = true;
 		engine->last_cookie = job->cookie;
 	}
-	for (i = 0; i < object_count; i++) {
-		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
-
-		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
-			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
-		/* The job writes only its color and depth destinations. */
-		if (i != 0 && i != depth_index)
-			continue;
-		if (!bo->explicit_access) {
-			chrome9_cache_flush(job->fragment_maps[i].vaddr,
-					    mapping_sizes[i]);
-			continue;
-		}
-		/* Defer the invalidate to the next CPU access. */
-		chrome9_flush_map_guards(&job->fragment_maps[i],
-					 object_sizes[i]);
-		if (mapping_sizes[i] != object_sizes[i])
-			chrome9_flush_map_guards(&job->fragment_maps[i],
-						 mapping_sizes[i]);
-		bo->device_written = true;
+	job->fsub = sub;
+	job->fsub_count = object_count;
+	job->fsub_depth = depth_index;
+	if (async) {
+		/* The retire worker or the next submit_lock holder finishes the
+		 * job; its persistent kernel mappings stay valid meanwhile. */
+		engine->inflight = job;
+		chrome9_submit_unlock(engine);
+		for (i = object_count; i-- > 0; )
+			if (job->fragment_mapped[i]) {
+				drm_gem_shmem_vunmap_locked(job->fragment_objects[i],
+							    &job->fragment_maps[i]);
+				job->fragment_mapped[i] = false;
+			}
+		drm_exec_fini(&exec);
+		queue_work(system_highpri_wq, &engine->retire_work);
+		drm_dev_exit(dev_idx);
+		return 0;
 	}
-	dma_rmb();
+	ret = chrome9_fragment_job_finish_locked(engine, job);
 	device_owned = false;
-	for (i = 0; i < object_count; i++) {
-		/* Sampled textures and vertex buffers are only read. */
-		if (i != 0 && i != depth_index) {
-			chrome9_sf_resync_object_locked(engine, objects[i]);
-			continue;
-		}
-		if (!chrome9_verify_map_guards(&job->fragment_maps[i],
-					       object_sizes[i]) ||
-		    (mapping_sizes[i] != object_sizes[i] &&
-		     !chrome9_verify_map_guards(&job->fragment_maps[i],
-						mapping_sizes[i]))) {
-			ret = -EIO;
-			dma_fence_set_error(&job->fence.base, ret);
-			to_chrome9_bo(objects[i])->guard_object_size = 0;
-		} else if (to_chrome9_bo(objects[i])->explicit_access) {
-			to_chrome9_bo(objects[i])->guard_object_size =
-				object_sizes[i];
-			to_chrome9_bo(objects[i])->guard_mapping_size =
-				mapping_sizes[i];
-		}
-		chrome9_sf_resync_object_locked(engine, objects[i]);
-	}
-	chrome9_job_release_mappings_locked(engine, job);
-	chrome9_prof_mark(CHROME9_PROF_VERIFY);
 	signal = true;
 	goto out_unlock_submit;
 
@@ -6609,7 +6765,7 @@ out_prepublication:
 	chrome9_job_release_mappings_locked(engine, job);
 	signal = true;
 out_unlock_submit:
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 	if (quarantine) {
 		drm_exec_fini(&exec);
 		if (signal)
@@ -6625,10 +6781,10 @@ out_unmap:
 			chrome9_cache_flush(job->fragment_maps[i].vaddr,
 					    mapping_sizes[i]);
 		}
-		mutex_lock(&engine->submit_lock);
+		chrome9_submit_lock(engine);
 		for (i = 0; i < object_count; i++)
 			chrome9_sf_resync_object_locked(engine, objects[i]);
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 	}
 	for (i = object_count; i-- > 0; )
 		if (job->fragment_mapped[i]) {
@@ -9749,12 +9905,13 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		return;
 	for (i = 0; i < ARRAY_SIZE(invalid); i++)
 		invalid[i] = CHROME9_GART_INVALID;
-	mutex_lock(&engine->submit_lock);
+	cancel_work_sync(&engine->retire_work);
+	chrome9_submit_lock(engine);
 	/* KMS must retire every persistent display pin before engine teardown. */
 	if (!list_empty(&engine->scanout_mappings)) {
 		dev_crit(&cdev->pdev->dev,
 			 "refusing engine teardown with live scanout mappings\n");
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	engine->stopping = true;
@@ -9763,7 +9920,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		chrome9_take_quarantine_hold(engine);
 		dev_crit(&cdev->pdev->dev,
 			 "refusing unsafe engine teardown with live/quarantined mappings; reboot required\n");
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, status,
@@ -9780,7 +9937,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		chrome9_take_quarantine_hold(engine);
 		dev_crit(&cdev->pdev->dev,
 			 "engine did not quiesce; retained for reboot\n");
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	ret = chrome9_draw_cache_purge_locked(engine);
@@ -9789,7 +9946,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		chrome9_take_quarantine_hold(engine);
 		dev_crit(&cdev->pdev->dev,
 			 "draw SF cache did not drain; retained for reboot\n");
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	mutex_lock(&engine->vm_lock);
@@ -9798,14 +9955,14 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (ret) {
 		engine->wedged = true;
 		chrome9_take_quarantine_hold(engine);
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	ret = chrome9_gart_restore(engine);
 	if (ret) {
 		engine->wedged = true;
 		chrome9_take_quarantine_hold(engine);
-		mutex_unlock(&engine->submit_lock);
+		chrome9_submit_unlock(engine);
 		return;
 	}
 	if (engine->mm_initialized)
@@ -9825,7 +9982,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 		 engine->gart_flush_kicks,
 		 engine->fence_count, engine->fence_last_id,
 		 engine->fence_canary_faults);
-	mutex_unlock(&engine->submit_lock);
+	chrome9_submit_unlock(engine);
 	cdev->engine = NULL;
 	vfree(engine->run_staging_cpu);
 	free_page((unsigned long)engine->staging_cpu);
