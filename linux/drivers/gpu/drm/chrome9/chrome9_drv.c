@@ -2627,6 +2627,7 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 				DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED;
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_PRIMARY;
 			args->value |= DRM_CHROME9_CAP_FRAGMENT_STENCIL;
+			args->value |= DRM_CHROME9_CAP_GEM_CPU_ACCESS;
 			if (chrome9_hw_tcl_enabled())
 				args->value |= DRM_CHROME9_CAP_VERTEX_PROGRAM |
 					DRM_CHROME9_CAP_VERTEX_BUFFERS |
@@ -2728,6 +2729,9 @@ static const struct drm_ioctl_desc chrome9_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(CHROME9_DRAW_VERTEX_PROGRAM,
 			  chrome9_draw_vertex_program_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(CHROME9_GEM_CPU_ACCESS,
+			  chrome9_gem_cpu_access_ioctl,
+			  DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(chrome9_fops);
@@ -2738,6 +2742,7 @@ static const struct drm_driver chrome9_drm_driver = {
 	.ioctls = chrome9_ioctls,
 	.num_ioctls = ARRAY_SIZE(chrome9_ioctls),
 	DRM_GEM_SHMEM_DRIVER_OPS,
+	.gem_create_object = chrome9_gem_create_object,
 	.name = CHROME9_DRIVER_NAME,
 	.desc = CHROME9_DRIVER_DESC,
 	.major = 0,
@@ -2752,6 +2757,7 @@ static const struct drm_driver chrome9_kms_drm_driver = {
 	.num_ioctls = ARRAY_SIZE(chrome9_ioctls),
 	.gem_prime_import = drm_gem_shmem_prime_import_no_map,
 	.dumb_create = chrome9_gem_dumb_create,
+	.gem_create_object = chrome9_gem_create_object,
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 	.name = CHROME9_DRIVER_NAME,
 	.desc = CHROME9_DRIVER_DESC,

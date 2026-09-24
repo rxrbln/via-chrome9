@@ -8,6 +8,7 @@
 #include <linux/vgaarb.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_simple_kms_helper.h>
 
@@ -156,6 +157,27 @@ static inline void chrome9_vga_seq_put(struct chrome9_device *cdev)
 int chrome9_detect_vram(struct chrome9_device *cdev);
 bool chrome9_dma32_scanout_supported(struct chrome9_device *cdev);
 
+/* Every chrome9 GEM object: shmem plus CPU cache coherence state, all
+ * protected by the object's reservation lock. */
+struct chrome9_bo {
+	struct drm_gem_shmem_object base;
+	/* Userspace brackets its CPU accesses with GEM_CPU_ACCESS. */
+	bool explicit_access;
+	/* CPU caches may hold dirty lines: flush before device use. */
+	bool cpu_dirty;
+	/* The device wrote since the last CPU invalidate. */
+	bool device_written;
+};
+
+static inline struct chrome9_bo *to_chrome9_bo(struct drm_gem_object *obj)
+{
+	return container_of(obj, struct chrome9_bo, base.base);
+}
+
+struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,
+						 size_t size);
+int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
+				 struct drm_file *file);
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
 int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,

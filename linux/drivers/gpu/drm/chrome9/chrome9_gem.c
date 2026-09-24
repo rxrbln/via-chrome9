@@ -39,6 +39,18 @@ struct chrome9_framebuffer {
 	unsigned int pin_count;
 };
 
+struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,
+						 size_t size)
+{
+	struct chrome9_bo *bo = kzalloc_obj(*bo);
+
+	if (!bo)
+		return ERR_PTR(-ENOMEM);
+	/* Implicit until userspace opts in; nothing is known about caches. */
+	bo->cpu_dirty = true;
+	return &bo->base.base;
+}
+
 static void
 chrome9_gem_set_dma32(struct drm_gem_shmem_object *shmem_obj)
 {
