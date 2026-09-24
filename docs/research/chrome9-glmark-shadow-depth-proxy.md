@@ -610,15 +610,19 @@ This produces logical RGBA `(threshold,sample,0,0)`. The current encoder's
 source-exact terminal record is:
 
 ```text
-0202a2d0 50140924 00f20016 00000820
+0202a2d0 d0140924 00f20016 00000820
 ```
 
 The complete object has five ALUs, one TAU and controls
 `90058001/91000002/92010005/93000001`, with A95=`95000008`. Expected host
 BGRA words for the three guarded rectangles are approximately
-`008c3300`, `008ccc00`, and `00003300`, respectively: threshold `.5505` with
-samples `.2` and `.8`, then clamped-negative threshold with sample `.2` for
-W=-1. D16 still distinguishes a black-alpha diagnostic value from no draw.
+`008c3300`, `008ccc00`, and `008c3300`, respectively.  For W=-1 the submitted
+projective Z is `-.4`; RCP(-1) restores projected Z `+.4`, so the threshold is
+still `.5505` and the sample is still `.2`.  The earlier `00003300` prediction
+incorrectly omitted that reciprocal.  Likewise word1 `50140924` would encode
+the threshold source as `(X,ZERO,ONE,ZERO)` and write blue one; the corrected
+`d0140924` encodes `(X,ZERO,ZERO,ZERO)`.  D16 still distinguishes a black-alpha
+diagnostic value from no draw.
 This is the smallest source-backed separator between projected-Z/threshold
 transport and X8Z24 sample-lane transport; it needs a focused compiler
 self-test and independent packet review before a fresh-boot run.

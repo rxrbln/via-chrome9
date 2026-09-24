@@ -103,6 +103,32 @@ lamp record count, physical high-water, A90--A92 controls, the shared condition
 being emitted once, and rejection when any triangle vertex violates the
 recorded input-domain requirement.
 
+For this exact scene the restriction is not merely expected to pass.  The lamp
+draw issues five 26-index triangle strips under one vertex shader and one
+modelview.  That shader constructs `curVertex.w` from literal `1.0`.  The
+modelview path used for the lamp is composed only from identity, `lookAt`,
+translation, scale and rotation.  LibMatrix constructs each with an exact
+affine bottom row `(0,0,0,1)`, and its explicit four-term matrix multiply
+preserves that row.  Therefore every original lamp vertex writes
+`vertex_position.w` with raw bits `3f800000`.  The captured fragment NIR maps
+that value to `VAR1.z`, hence packed `T1.z`, before the shared FEQ.  Triangle
+strip decomposition does not change it; any clipping-created vertex must still
+be checked at the post-draw boundary rather than assumed from source.
+
+The existing generic queue has the authoritative values in
+`chrome9_queue_generic_triangle()`: after layout packing, component `c` of
+varying `v` is `source[4 + primary + 4 * v + c]`.  A dynamic implementation
+can compare those three raw words before copying the triangle and accept only
+three identical signed-zero or finite-normal values.  The ideas lamp therefore
+passes with three `3f800000` words for every emitted triangle.  One additional
+correctness constraint is whole-draw atomicity: the current bounded triangle
+batch can be submitted before a later triangle is seen, so a later domain
+failure cannot safely fall back after earlier batches rendered.  Production
+must either preflight/defer the whole draw before the first ioctl, or prefer a
+linked-stage proof which specializes the exact affine matrix row and folds the
+vertex output component to constant one.  Neither route may key on the scene or
+shader hash.
+
 ### Exact bounded replay and resource fit
 
 That replay is now complete against the 141-line current capture.  The copied
