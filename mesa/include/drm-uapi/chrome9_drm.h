@@ -208,6 +208,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP_FRAGMENT_KILL			(1ULL << 51)
 /* Fragment ALU may read the native pixel-position MISC source in XY. */
 #define DRM_CHROME9_CAP_FRAGMENT_POSITION		(1ULL << 52)
+/* Fragment L0 may target a guarded BO with additional trailing mip storage. */
+#define DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED	(1ULL << 53)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -964,6 +966,8 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 
 #define DRM_CHROME9_FRAGMENT_DEPTH	(1U << 0)
 #define DRM_CHROME9_FRAGMENT_BLEND	(1U << 1)
+/* Allow a guarded L0 target to contain trailing mip storage. */
+#define DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED	(1U << 2)
 
 enum drm_chrome9_fragment_op {
 	DRM_CHROME9_FRAGMENT_OP_MOV = 0,
