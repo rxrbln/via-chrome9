@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_context.h"
 
@@ -3536,6 +3537,231 @@ chrome9_ps_lower_equal_zero_select(struct chrome9_ps_nir_builder *builder,
 
 static bool
 chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
+                     struct chrome9_ps_source *source);
+
+/* Emit CMP(condition.x, when_nonnegative, when_negative) into a new temp. */
+static bool
+chrome9_ps_emit_cmp(struct chrome9_ps_nir_builder *builder,
+                    uint8_t condition_temp,
+                    const struct chrome9_ps_source *when_nonnegative,
+                    const struct chrome9_ps_source *when_negative,
+                    unsigned components, struct chrome9_ps_source *result)
+{
+   struct chrome9_ps_instruction *conditional;
+   uint8_t temp;
+
+   if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+      return false;
+   temp = builder->next_temp++;
+   conditional = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_CMP);
+   if (!conditional)
+      return false;
+   conditional->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   conditional->destination.id = temp;
+   conditional->destination.writemask = (1u << components) - 1;
+   conditional->source[0].file = CHROME9_PS_SOURCE_TEMP;
+   conditional->source[0].id = condition_temp;
+   for (unsigned c = 0; c < 4; c++)
+      conditional->source[0].swizzle[c] = c < components ?
+         CHROME9_PS_SWIZZLE_X : CHROME9_PS_SWIZZLE_ZERO;
+   conditional->source[1] = *when_nonnegative;
+   conditional->source[2] = *when_negative;
+   memset(result, 0, sizeof(*result));
+   result->file = CHROME9_PS_SOURCE_TEMP;
+   result->id = temp;
+   for (unsigned c = 0; c < 4; c++)
+      result->swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
+   return true;
+}
+
+/* Scalar lhs - rhs into a new temp; its sign orders the two operands. */
+static bool
+chrome9_ps_emit_difference(struct chrome9_ps_nir_builder *builder,
+                           nir_alu_src *lhs, nir_alu_src *rhs,
+                           uint8_t *condition_temp)
+{
+   struct chrome9_ps_source a, b;
+   struct chrome9_ps_instruction *subtract;
+
+   if (!chrome9_ps_lower_alu_source(builder, lhs, 1, &a) ||
+       !chrome9_ps_lower_alu_source(builder, rhs, 1, &b) ||
+       builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+      return false;
+   *condition_temp = builder->next_temp++;
+   subtract = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_SUB);
+   if (!subtract)
+      return false;
+   subtract->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   subtract->destination.id = *condition_temp;
+   subtract->destination.writemask = 1;
+   subtract->source[0] = a;
+   subtract->source[1] = b;
+   return true;
+}
+
+/*
+ * Select between two lowered values under a scalar boolean predicate without
+ * materializing integers: ordered float compares become SUB+CMP, and
+ * iand/ior/inot become nested or exchanged CMP arms.  Compares are admitted
+ * only in the default float mode on operands proven free of defined
+ * exceptional values; NaN preservation is never admitted.
+ */
+static bool
+chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
+                                 nir_scalar predicate,
+                                 const struct chrome9_ps_source *when_true,
+                                 const struct chrome9_ps_source *when_false,
+                                 unsigned components, unsigned depth,
+                                 struct chrome9_ps_source *result)
+{
+   nir_alu_instr *alu;
+   struct chrome9_ps_source inner;
+   uint8_t condition, reverse;
+   unsigned finite_budget = CHROME9_PS_MAX_INSTRUCTIONS;
+
+   if (depth > 8)
+      return false;
+   predicate = nir_scalar_resolved(predicate.def, predicate.comp);
+   if (predicate.def->bit_size != 1)
+      return false;
+   if (nir_scalar_is_const(predicate)) {
+      *result = nir_scalar_as_bool(predicate) ? *when_true : *when_false;
+      return true;
+   }
+   if (nir_def_instr(predicate.def)->type != nir_instr_type_alu)
+      return false;
+   alu = nir_instr_as_alu(nir_def_instr(predicate.def));
+   if (predicate.comp >= alu->def.num_components)
+      return false;
+
+   switch (alu->op) {
+   case nir_op_inot:
+      return chrome9_ps_emit_predicate_select(
+         builder, nir_scalar_chase_alu_src(predicate, 0), when_false,
+         when_true, components, depth + 1, result);
+   case nir_op_iand:
+      return chrome9_ps_emit_predicate_select(
+                builder, nir_scalar_chase_alu_src(predicate, 1), when_true,
+                when_false, components, depth + 1, &inner) &&
+             chrome9_ps_emit_predicate_select(
+                builder, nir_scalar_chase_alu_src(predicate, 0), &inner,
+                when_false, components, depth + 1, result);
+   case nir_op_ior:
+      return chrome9_ps_emit_predicate_select(
+                builder, nir_scalar_chase_alu_src(predicate, 1), when_true,
+                when_false, components, depth + 1, &inner) &&
+             chrome9_ps_emit_predicate_select(
+                builder, nir_scalar_chase_alu_src(predicate, 0), when_true,
+                &inner, components, depth + 1, result);
+   case nir_op_fge:
+   case nir_op_flt:
+   case nir_op_feq:
+   case nir_op_fneu:
+      break;
+   default:
+      return false;
+   }
+   if ((alu->fp_math_ctrl & nir_fp_preserve_nan) ||
+       !alu->src[0].src.ssa || !alu->src[1].src.ssa ||
+       alu->src[0].src.ssa->bit_size != 32 ||
+       alu->src[1].src.ssa->bit_size != 32 ||
+       !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 0),
+                                  &finite_budget) ||
+       !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 1),
+                                  &finite_budget))
+      return false;
+   {
+      /* Lower one component of each operand as a scalar source. */
+      nir_alu_src lhs = alu->src[0], rhs = alu->src[1];
+
+      lhs.swizzle[0] = alu->src[0].swizzle[predicate.comp];
+      rhs.swizzle[0] = alu->src[1].swizzle[predicate.comp];
+      if (!chrome9_ps_emit_difference(builder, &lhs, &rhs, &condition))
+         return false;
+      switch (alu->op) {
+      case nir_op_fge:
+         return chrome9_ps_emit_cmp(builder, condition, when_true,
+                                    when_false, components, result);
+      case nir_op_flt:
+         return chrome9_ps_emit_cmp(builder, condition, when_false,
+                                    when_true, components, result);
+      default:
+         /* Equality holds when both differences are nonnegative. */
+         if (!chrome9_ps_emit_difference(builder, &rhs, &lhs, &reverse))
+            return false;
+         if (alu->op == nir_op_feq)
+            return chrome9_ps_emit_cmp(builder, reverse, when_true,
+                                       when_false, components, &inner) &&
+                   chrome9_ps_emit_cmp(builder, condition, &inner,
+                                       when_false, components, result);
+         return chrome9_ps_emit_cmp(builder, reverse, when_false,
+                                    when_true, components, &inner) &&
+                chrome9_ps_emit_cmp(builder, condition, &inner,
+                                    when_true, components, result);
+      }
+   }
+}
+
+static bool
+chrome9_ps_record_value(struct chrome9_ps_nir_builder *builder, nir_def *def,
+                        const struct chrome9_ps_source *result,
+                        struct chrome9_ps_source *source)
+{
+   unsigned value;
+
+   if (builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
+      return false;
+   value = builder->value_count++;
+   builder->value[value].def = def;
+   builder->value[value].source = *result;
+   builder->value[value].complete = true;
+   *source = *result;
+   return true;
+}
+
+/* General bcsel and b2f32 under one broadcast scalar predicate. */
+static bool
+chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
+                                nir_alu_instr *alu, nir_def *def,
+                                struct chrome9_ps_source *source)
+{
+   static const uint32_t one[4] = {
+      0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+   };
+   static const uint32_t zero[4] = { 0 };
+   const unsigned predicate_src = 0;
+   unsigned components = def->num_components;
+   struct chrome9_ps_source when_true, when_false, result;
+
+   if ((alu->op != nir_op_bcsel && alu->op != nir_op_b2f32) ||
+       !components || components > 4 ||
+       !alu->src[predicate_src].src.ssa ||
+       alu->src[predicate_src].src.ssa->bit_size != 1)
+      return false;
+   for (unsigned c = 1; c < components; c++)
+      if (alu->src[predicate_src].swizzle[c] !=
+          alu->src[predicate_src].swizzle[0])
+         return false;
+   if (alu->op == nir_op_bcsel) {
+      if (!chrome9_ps_lower_alu_source(builder, &alu->src[1], components,
+                                       &when_true) ||
+          !chrome9_ps_lower_alu_source(builder, &alu->src[2], components,
+                                       &when_false))
+         return false;
+   } else if (!chrome9_ps_immediate(builder, one, components, &when_true) ||
+              !chrome9_ps_immediate(builder, zero, components, &when_false)) {
+      return false;
+   }
+   return chrome9_ps_emit_predicate_select(
+             builder,
+             (nir_scalar) { alu->src[predicate_src].src.ssa,
+                            alu->src[predicate_src].swizzle[0] },
+             &when_true, &when_false, components, 0, &result) &&
+          chrome9_ps_record_value(builder, def, &result, source);
+}
+
+static bool
+chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                      struct chrome9_ps_source *source)
 {
    nir_instr *instr;
@@ -3737,7 +3963,10 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    if (alu->op == nir_op_bcsel)
       return chrome9_ps_lower_unit_interval_select(builder, alu, def,
                                                     source) ||
-             chrome9_ps_lower_equal_zero_select(builder, alu, def, source);
+             chrome9_ps_lower_equal_zero_select(builder, alu, def, source) ||
+             chrome9_ps_lower_general_select(builder, alu, def, source);
+   if (alu->op == nir_op_b2f32)
+      return chrome9_ps_lower_general_select(builder, alu, def, source);
    for (unsigned s = 0; s < ARRAY_SIZE(source_components); s++)
       source_components[s] = components;
    if (alu->op == nir_op_fpow) {
@@ -5254,8 +5483,8 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
       }
    }
    if (!framebuffer->nr_cbufs && framebuffer->zsbuf.texture &&
-       framebuffer->zsbuf.format == PIPE_FORMAT_X8Z24_UNORM &&
-       framebuffer->zsbuf.texture->format == PIPE_FORMAT_X8Z24_UNORM &&
+       chrome9_format_is_d24(framebuffer->zsbuf.format) &&
+       framebuffer->zsbuf.texture->format == framebuffer->zsbuf.format &&
        !framebuffer->zsbuf.level && !framebuffer->zsbuf.first_layer &&
        !framebuffer->zsbuf.last_layer && framebuffer->width &&
        framebuffer->height &&
@@ -5372,15 +5601,28 @@ chrome9_clear_target(struct chrome9_resource *target,
 }
 
 static void
-chrome9_clear_depth_target(struct chrome9_resource *target, double depth,
-                           unsigned x, unsigned y, unsigned width,
-                           unsigned height)
+chrome9_clear_zs_target(struct chrome9_resource *target, unsigned buffers,
+                        double depth, unsigned stencil, uint8_t stencil_mask,
+                        unsigned x, unsigned y, unsigned width,
+                        unsigned height)
 {
-   uint32_t value;
+   uint32_t value = 0, keep = 0xffffffff;
 
-   if (!target ||
-       !chrome9_pack_depth_clear(target->base.format, depth, &value) ||
-       x >= target->base.width0 || y >= target->base.height0)
+   if (!target || x >= target->base.width0 || y >= target->base.height0)
+      return;
+   if (buffers & PIPE_CLEAR_DEPTH) {
+      if (!chrome9_pack_depth_clear(target->base.format, depth, &value))
+         return;
+      /* X8Z24 has no stencil: a depth clear defines the whole word. */
+      keep = target->base.format == PIPE_FORMAT_S8_UINT_Z24_UNORM ?
+         0xff : 0;
+   }
+   if ((buffers & PIPE_CLEAR_STENCIL) &&
+       target->base.format == PIPE_FORMAT_S8_UINT_Z24_UNORM) {
+      keep &= ~(uint32_t)stencil_mask;
+      value |= stencil & stencil_mask;
+   }
+   if (keep == 0xffffffff)
       return;
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
@@ -5394,11 +5636,46 @@ chrome9_clear_depth_target(struct chrome9_resource *target, double depth,
          for (unsigned column = 0; column < width; column++)
             z16[column] = (uint16_t)value;
       } else {
-         uint32_t *x8z24 = (uint32_t *)pixels + x;
+         uint32_t *d24 = (uint32_t *)pixels + x;
 
          for (unsigned column = 0; column < width; column++)
-            x8z24[column] = value;
+            d24[column] = (d24[column] & keep) | value;
       }
+   }
+}
+
+/* Per-channel masked clear of a 32-bpp BGRA/BGRX target. */
+static void
+chrome9_clear_target_masked(struct chrome9_resource *target,
+                            const union pipe_color_union *color,
+                            unsigned color_mask, unsigned x, unsigned y,
+                            unsigned width, unsigned height)
+{
+   union util_color packed;
+   uint32_t keep = 0;
+
+   if (!target || x >= target->base.width0 || y >= target->base.height0 ||
+       (target->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+        target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM))
+      return;
+   util_pack_color_union(target->base.format, &packed, color);
+   /* BGRA8888 stores R in bits 23:16, G 15:8, B 7:0 and A 31:24. */
+   if (!(color_mask & PIPE_MASK_R))
+      keep |= 0x00ff0000;
+   if (!(color_mask & PIPE_MASK_G))
+      keep |= 0x0000ff00;
+   if (!(color_mask & PIPE_MASK_B))
+      keep |= 0x000000ff;
+   if (!(color_mask & PIPE_MASK_A))
+      keep |= 0xff000000;
+   width = MIN2(width, target->base.width0 - x);
+   height = MIN2(height, target->base.height0 - y);
+   for (unsigned row = 0; row < height; row++) {
+      uint32_t *pixels = (uint32_t *)((uint8_t *)target->bo.map +
+         target->data_offset + (uint64_t)(y + row) * target->stride) + x;
+
+      for (unsigned column = 0; column < width; column++)
+         pixels[column] = (pixels[column] & keep) | (packed.ui[0] & ~keep);
    }
 }
 
@@ -5413,16 +5690,12 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    struct pipe_resource *resource;
    unsigned x = 0, y = 0, width, height;
 
-   (void)stencil_mask;
-   (void)stencil;
    chrome9_draw_flush_batch(ctx);
-   if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH)))
+   if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)))
       return;
-   if (((buffers & PIPE_CLEAR_COLOR0) && ctx->framebuffer.nr_cbufs &&
-        (color_mask & 0xf) != 0xf) ||
-       (buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH))) {
+   if (buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)) {
       chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
-                        "masked color or stencil clears are not implemented");
+                        "clears of additional color buffers are not implemented");
       return;
    }
    width = ctx->framebuffer.width;
@@ -5436,17 +5709,22 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    if ((buffers & PIPE_CLEAR_COLOR0) && ctx->framebuffer.nr_cbufs &&
        (resource = ctx->render_target)) {
       chrome9_context_prepare_render_target(ctx);
-      chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
-                           height);
+      if ((color_mask & 0xf) == 0xf)
+         chrome9_clear_target(chrome9_resource(resource), color, x, y, width,
+                              height);
+      else
+         chrome9_clear_target_masked(chrome9_resource(resource), color,
+                                     color_mask, x, y, width, height);
       chrome9_context_render_target_written(ctx);
       /* Imported drawable targets render through a guarded shadow.  Clears
        * are synchronous CPU writes, so publish the completed image now even
        * when the state tracker keeps this framebuffer bound. */
       chrome9_flush_render_target(ctx);
    }
-   if (buffers & PIPE_CLEAR_DEPTH)
-      chrome9_clear_depth_target(chrome9_context_depth_target(ctx), depth,
-                                 x, y, width, height);
+   if (buffers & PIPE_CLEAR_DEPTHSTENCIL)
+      chrome9_clear_zs_target(chrome9_context_depth_target(ctx), buffers,
+                              depth, stencil, stencil_mask,
+                              x, y, width, height);
 }
 
 static void
@@ -5459,16 +5737,16 @@ chrome9_clear_depth_stencil(struct pipe_context *pipe,
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
 
-   (void)stencil;
    (void)render_condition;
    chrome9_draw_flush_batch(ctx);
-   if (!surface || !surface->texture || clear_flags != PIPE_CLEAR_DEPTH) {
+   if (!surface || !surface->texture ||
+       !(clear_flags & PIPE_CLEAR_DEPTHSTENCIL)) {
       chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
-                        "stencil clears are not implemented");
+                        "unsupported depth/stencil clear");
       return;
    }
-   chrome9_clear_depth_target(chrome9_resource(surface->texture), depth,
-                              x, y, width, height);
+   chrome9_clear_zs_target(chrome9_resource(surface->texture), clear_flags,
+                           depth, stencil, 0xff, x, y, width, height);
 }
 
 static void
@@ -5689,8 +5967,7 @@ static void
 chrome9_set_stencil_ref(struct pipe_context *pipe,
                         const struct pipe_stencil_ref reference)
 {
-   (void)pipe;
-   (void)reference;
+   chrome9_context(pipe)->stencil_ref = reference;
 }
 
 static void
@@ -5832,6 +6109,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =
       !!(capabilities & DRM_CHROME9_CAP_SCISSOR);
+   ctx->fragment_stencil =
+      !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_STENCIL);
    ctx->draw_limit = MAX2(debug_get_num_option("CHROME9_DRAW_LIMIT", 0), 0);
    ctx->debug_draws = debug_get_bool_option("CHROME9_DEBUG_DRAWS", false);
 

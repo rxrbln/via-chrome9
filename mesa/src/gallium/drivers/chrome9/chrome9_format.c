@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_format.h"
 
@@ -40,7 +41,7 @@ chrome9_format_storage_cpp(enum pipe_format format)
       return info->bytes_per_pixel;
    if (format == PIPE_FORMAT_Z16_UNORM)
       return 2;
-   if (format == PIPE_FORMAT_X8Z24_UNORM)
+   if (chrome9_format_is_d24(format))
       return 4;
    return 0;
 }
@@ -50,7 +51,7 @@ chrome9_pack_depth_clear(enum pipe_format format, double depth,
                          uint32_t *word)
 {
    if (!word || (format != PIPE_FORMAT_Z16_UNORM &&
-                 format != PIPE_FORMAT_X8Z24_UNORM))
+                 !chrome9_format_is_d24(format)))
       return false;
    if (!isfinite(depth))
       depth = 0.0;

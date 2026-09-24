@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef CHROME9_CONTEXT_H
 #define CHROME9_CONTEXT_H
 
@@ -202,6 +203,8 @@ struct chrome9_context {
    bool blend_extended_factors;
    bool alpha_test_supported;
    bool scissor_supported;
+   bool fragment_stencil;
+   struct pipe_stencil_ref stencil_ref;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
    struct pipe_constant_buffer vs_constants[PIPE_MAX_CONSTANT_BUFFERS];

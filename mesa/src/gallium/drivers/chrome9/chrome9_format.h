@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef CHROME9_FORMAT_H
 #define CHROME9_FORMAT_H
 
@@ -16,6 +17,14 @@ struct chrome9_texture_format_info {
 
 const struct chrome9_texture_format_info *
 chrome9_texture_format_info(enum pipe_format format);
+
+/* Both share native D24S8 storage: depth in bits 31:8, stencil in 7:0. */
+static inline bool
+chrome9_format_is_d24(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_X8Z24_UNORM ||
+          format == PIPE_FORMAT_S8_UINT_Z24_UNORM;
+}
 
 /* Storage support is independent of sampling and render capability. */
 unsigned chrome9_format_storage_cpp(enum pipe_format format);

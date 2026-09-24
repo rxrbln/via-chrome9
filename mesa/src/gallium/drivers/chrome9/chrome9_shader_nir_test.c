@@ -887,7 +887,10 @@ check_nonnegative_select_compilation(struct chrome9_context *context)
       nir_def *selected;
       unsigned sub = 0, cmp = 0;
       bool found = false;
-      bool expected = test == 0;
+      /* The general finite-predicate path also admits the unbounded input,
+       * zero threshold and negative threshold.  Only preserve_nan on the
+       * arithmetic producer remains outside the native CMP contract. */
+      bool expected = test != 3;
       bool valid;
 
       nir_instr_as_alu(nir_def_instr(lighting))->fp_math_ctrl =
@@ -942,6 +945,98 @@ check_nonnegative_select_compilation(struct chrome9_context *context)
                  "found=%u ir=%u\n", test, expected, shader.supported,
                  shader.semantic_fs_valid, shader.native_fs_valid,
                  sub, cmp, found, shader.semantic_fs_ir.count);
+      ralloc_free(b.shader);
+      if (!valid)
+         return false;
+   }
+   return true;
+}
+
+static bool
+check_general_predicate_compilation(struct chrome9_context *context)
+{
+   static const char *const names[] = {
+      "b2f32-fge", "flt-and-bcsel", "feq-bcsel", "fneu-bcsel",
+      "ior-bcsel", "inot-bcsel", "preserve-nan-rejected",
+   };
+   static const unsigned min_compares[] = { 1, 2, 2, 2, 2, 1, 0 };
+
+   for (unsigned test = 0; test < ARRAY_SIZE(names); test++) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "%s", names[test]);
+      struct chrome9_shader shader = { 0 };
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *a = nir_load_ubo_vec4(&b, 4, 32, zero, zero);
+      nir_def *c = nir_load_ubo_vec4(&b, 4, 32, zero,
+                                     nir_imm_int(&b, 1));
+      nir_def *ax = nir_channel(&b, a, 0);
+      nir_def *cx = nir_channel(&b, c, 0);
+      nir_def *predicate;
+      nir_def *selected;
+      unsigned subtracts = 0, compares = 0;
+      bool valid;
+
+      switch (test) {
+      case 0:
+         predicate = nir_fge(&b, ax, cx);
+         selected = nir_b2f32(&b, predicate);
+         break;
+      case 1:
+         predicate = nir_iand(&b, nir_flt(&b, ax, cx),
+                              nir_fge(&b, nir_channel(&b, a, 1),
+                                      nir_channel(&b, c, 1)));
+         break;
+      case 2:
+         predicate = nir_feq(&b, ax, cx);
+         break;
+      case 3:
+         predicate = nir_fneu(&b, ax, cx);
+         break;
+      case 4:
+         predicate = nir_ior(&b, nir_flt(&b, ax, cx),
+                             nir_fge(&b, nir_channel(&b, a, 1),
+                                     nir_channel(&b, c, 1)));
+         break;
+      case 5:
+         predicate = nir_inot(&b, nir_flt(&b, ax, cx));
+         break;
+      default:
+         predicate = nir_fge(&b, ax, cx);
+         nir_instr_as_alu(nir_def_instr(predicate))->fp_math_ctrl =
+            nir_fp_preserve_nan;
+         break;
+      }
+      if (test != 0)
+         selected = nir_bcsel(&b, predicate,
+                              nir_imm_float(&b, 0.25f),
+                              nir_imm_float(&b, 0.75f));
+      nir_store_output(&b, nir_vec4(&b, selected, selected, selected,
+                                    nir_imm_float(&b, 1.0f)), zero,
+                       .write_mask = 0xf,
+                       .io_semantics.location = FRAG_RESULT_COLOR);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      nir_recompute_io_bases(b.shader,
+                             nir_var_shader_in | nir_var_shader_out);
+      chrome9_compile_fs_nir(context, &shader, b.shader);
+      for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+         subtracts += shader.semantic_fs_ir.instruction[i].op ==
+                      CHROME9_PS_OPCODE_SUB;
+         compares += shader.semantic_fs_ir.instruction[i].op ==
+                     CHROME9_PS_OPCODE_CMP;
+      }
+      valid = test == 6 ? !shader.supported && !shader.semantic_fs_valid :
+         shader.supported && shader.semantic_fs_valid &&
+         shader.native_fs_valid &&
+         subtracts >= min_compares[test] &&
+         compares >= min_compares[test];
+      if (!valid) {
+         fprintf(stderr, "%s compilation failed: supported=%u semantic=%u "
+                 "native=%u sub=%u cmp=%u ir=%u\n", names[test],
+                 shader.supported, shader.semantic_fs_valid,
+                 shader.native_fs_valid, subtracts, compares,
+                 shader.semantic_fs_ir.count);
+         nir_print_shader(b.shader, stderr);
+      }
       ralloc_free(b.shader);
       if (!valid)
          return false;
@@ -2069,6 +2164,7 @@ main(void)
        !check_vector_conditional_compilation(&context, 4, false) ||
        !check_vector_conditional_compilation(&context, 1, true) ||
        !check_nonnegative_select_compilation(&context) ||
+       !check_general_predicate_compilation(&context) ||
        !check_equal_zero_select_compilation(&context, 0.0f, true) ||
        !check_equal_zero_select_compilation(&context, 1.0f, false) ||
        !check_canonical_uniform_select_context() ||

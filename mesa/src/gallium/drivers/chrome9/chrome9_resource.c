@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_resource.h"
 
@@ -84,7 +85,7 @@ chrome9_resource_layout(const struct pipe_resource *templ,
    cpp = chrome9_format_storage_cpp(templ->format);
    if (!chrome9_is_surface_target(templ->target) ||
        !cpp ||
-       (templ->format == PIPE_FORMAT_X8Z24_UNORM &&
+       (chrome9_format_is_d24(templ->format) &&
         (templ->target != PIPE_TEXTURE_2D || templ->last_level)) ||
        !templ->width0 || templ->width0 > CHROME9_MAX_SURFACE_DIMENSION ||
        !templ->height0 || templ->height0 > CHROME9_MAX_SURFACE_DIMENSION ||
@@ -234,6 +235,13 @@ chrome9_format_supported(struct pipe_screen *screen,
              debug_get_bool_option("CHROME9_EXPERIMENTAL_X8Z24", false) &&
              chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
+             !(bindings & ~depth_bindings);
+   /* Stencil shares the D24 gate until its guarded silicon oracles pass. */
+   if (format == PIPE_FORMAT_S8_UINT_Z24_UNORM)
+      return target == PIPE_TEXTURE_2D &&
+             debug_get_bool_option("CHROME9_EXPERIMENTAL_X8Z24", false) &&
+             chrome9_screen_has_capability(
+                screen, DRM_CHROME9_CAP_FRAGMENT_STENCIL) &&
              !(bindings & ~depth_bindings);
    if ((bindings & PIPE_BIND_SAMPLER_VIEW) &&
        !chrome9_screen_has_capability(
@@ -524,7 +532,7 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    /* A D24 attachment may still be in a retained triangle batch.  The
     * ioctl itself is synchronous, but a direct persistent mapping is not a
     * synchronization point until that batch has been submitted. */
-   if (resource->format == PIPE_FORMAT_X8Z24_UNORM &&
+   if (chrome9_format_is_d24(resource->format) &&
        !(usage & PIPE_MAP_UNSYNCHRONIZED))
       chrome9_draw_flush_batch(chrome9_context(pipe));
 
@@ -539,12 +547,16 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    if (resource->target == PIPE_BUFFER) {
       offset = box->x;
    } else {
-      const struct chrome9_texture_format_info *format =
-         chrome9_texture_format_info(resource->format);
+      const unsigned cpp = chrome9_format_storage_cpp(resource->format);
+
+      if (!cpp) {
+         pipe_resource_reference(&transfer->resource, NULL);
+         FREE(transfer);
+         return NULL;
+      }
 
       transfer->stride = cresource->level_stride[level];
       transfer->layer_stride = cresource->level_size[level];
-      const unsigned cpp = format ? format->bytes_per_pixel : 2;
 
       offset = cresource->level_offset[level] +
                (uint64_t)box->y * cresource->level_stride[level] +

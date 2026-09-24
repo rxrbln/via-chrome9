@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_draw.h"
 
@@ -793,6 +794,12 @@ chrome9_mip_view_supported(const struct chrome9_context *ctx,
 }
 
 static bool
+chrome9_stencil_active(const struct chrome9_context *ctx)
+{
+   return ctx->dsa && ctx->dsa->stencil[0].enabled;
+}
+
+static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
                              struct chrome9_resource **depth,
@@ -808,7 +815,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    struct pipe_resource *resource;
    const bool depth_only = !ctx->framebuffer.nr_cbufs &&
       ctx->framebuffer.zsbuf.texture &&
-      ctx->framebuffer.zsbuf.format == PIPE_FORMAT_X8Z24_UNORM;
+      chrome9_format_is_d24(ctx->framebuffer.zsbuf.format);
 
    *depth = NULL;
    memset(textures, 0,
@@ -897,29 +904,39 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        ctx->fs->fragment_program != CHROME9_FS_TEXTURE_RGBX)
       return false;
    *reason = "stencil/depth-bounds";
-   if (ctx->dsa && (ctx->dsa->stencil[0].enabled ||
-                    ctx->dsa->stencil[1].enabled ||
-                    ctx->dsa->depth_bounds_test))
+   if (ctx->dsa && (ctx->dsa->depth_bounds_test ||
+                    (ctx->dsa->stencil[1].enabled &&
+                     !ctx->dsa->stencil[0].enabled)))
       return false;
-   if (ctx->dsa && ctx->dsa->depth_enabled) {
+   /* Stencil needs the kernel stencil block and a D24S8 surface; without
+    * a depth test it runs as depth ALWAYS with writes disabled. */
+   if (chrome9_stencil_active(ctx) &&
+       (!ctx->fragment_stencil ||
+        !chrome9_use_generic_fragment_program(ctx) ||
+        ctx->framebuffer.zsbuf.format != PIPE_FORMAT_S8_UINT_Z24_UNORM ||
+        (!ctx->dsa->depth_enabled &&
+         (!ctx->depth_always_supported || !ctx->depth_read_only_supported))))
+      return false;
+   if (ctx->dsa && (ctx->dsa->depth_enabled || chrome9_stencil_active(ctx))) {
       const struct pipe_surface *surface = &ctx->framebuffer.zsbuf;
+      const bool d24 = chrome9_format_is_d24(surface->format);
+      const bool depth_test = ctx->dsa->depth_enabled;
 
       *reason = "depth-state";
       *depth = chrome9_context_depth_target(ctx);
-      if ((surface->format == PIPE_FORMAT_X8Z24_UNORM ?
+      if ((d24 ?
            !chrome9_use_generic_fragment_program(ctx) :
            !ctx->draw_triangle_d16) ||
-          (!ctx->dsa->depth_writemask &&
+          (depth_test && !ctx->dsa->depth_writemask &&
            !ctx->depth_read_only_supported) ||
-          (ctx->dsa->depth_func != PIPE_FUNC_LESS &&
+          (depth_test && ctx->dsa->depth_func != PIPE_FUNC_LESS &&
            !(ctx->depth_func_supported &&
              ctx->dsa->depth_func == PIPE_FUNC_LEQUAL) &&
            !(ctx->depth_equal_supported &&
              ctx->dsa->depth_func == PIPE_FUNC_EQUAL) &&
            !(ctx->depth_always_supported &&
              ctx->dsa->depth_func == PIPE_FUNC_ALWAYS)) || !*depth ||
-          (surface->format != PIPE_FORMAT_Z16_UNORM &&
-           surface->format != PIPE_FORMAT_X8Z24_UNORM) ||
+          (surface->format != PIPE_FORMAT_Z16_UNORM && !d24) ||
           surface->level ||
           surface->first_layer || surface->last_layer ||
           ((*depth)->base.target != PIPE_TEXTURE_2D &&
@@ -1283,6 +1300,47 @@ chrome9_guarded_draw_domain(const struct chrome9_vbuf_render *crender,
 
 static void chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender);
 
+/* Resolve the GL face of one post-viewport triangle exactly as Draw's cull
+ * stage does and mirror that face into both native winding blocks, so the
+ * result does not depend on the hardware's A23/A25 orientation. */
+static void
+chrome9_triangle_stencil(const struct chrome9_context *ctx,
+                         const struct drm_chrome9_fragment_vertex v[3],
+                         struct drm_chrome9_stencil_state *state)
+{
+   static const uint8_t native_op[8] = {
+      [PIPE_STENCIL_OP_KEEP] = DRM_CHROME9_STENCIL_OP_KEEP,
+      [PIPE_STENCIL_OP_ZERO] = DRM_CHROME9_STENCIL_OP_ZERO,
+      [PIPE_STENCIL_OP_REPLACE] = DRM_CHROME9_STENCIL_OP_REPLACE,
+      [PIPE_STENCIL_OP_INCR] = DRM_CHROME9_STENCIL_OP_INCR_SAT,
+      [PIPE_STENCIL_OP_DECR] = DRM_CHROME9_STENCIL_OP_DECR_SAT,
+      [PIPE_STENCIL_OP_INCR_WRAP] = DRM_CHROME9_STENCIL_OP_INCR_WRAP,
+      [PIPE_STENCIL_OP_DECR_WRAP] = DRM_CHROME9_STENCIL_OP_DECR_WRAP,
+      [PIPE_STENCIL_OP_INVERT] = DRM_CHROME9_STENCIL_OP_INVERT,
+   };
+   const int64_t ex = (int64_t)v[0].x_16_16 - v[2].x_16_16;
+   const int64_t ey = (int64_t)v[0].y_16_16 - v[2].y_16_16;
+   const int64_t fx = (int64_t)v[1].x_16_16 - v[2].x_16_16;
+   const int64_t fy = (int64_t)v[1].y_16_16 - v[2].y_16_16;
+   const bool ccw = ex * fy - ey * fx < 0;
+   const bool front_ccw = ctx->rasterizer && ctx->rasterizer->front_ccw;
+   const unsigned face = ccw == front_ccw || !ctx->dsa->stencil[1].enabled ?
+      0 : 1;
+   const struct pipe_stencil_state *s = &ctx->dsa->stencil[face];
+   const struct drm_chrome9_stencil_face native = {
+      .func = s->func,
+      .fail_op = native_op[s->fail_op & 7],
+      .zfail_op = native_op[s->zfail_op & 7],
+      .zpass_op = native_op[s->zpass_op & 7],
+      .ref = ctx->stencil_ref.ref_value[face],
+      .value_mask = s->valuemask,
+      .write_mask = s->writemask,
+   };
+
+   state->cw = native;
+   state->ccw = native;
+}
+
 static bool
 chrome9_queue_generic_triangle(
    struct chrome9_vbuf_render *crender, const unsigned indices[3],
@@ -1493,6 +1551,10 @@ chrome9_queue_generic_triangle(
    draw.depth_handle = depth_active ? depth->bo.handle : 0;
    draw.flags = (depth_active ? DRM_CHROME9_FRAGMENT_DEPTH | depth_flags : 0) |
                 (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
+   if (depth_active && chrome9_stencil_active(crender->ctx)) {
+      draw.flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+      chrome9_triangle_stencil(crender->ctx, vertices, &draw.stencil);
+   }
    if (target->base.last_level) {
       if (!target->guarded ||
           !chrome9_screen_has_capability(
@@ -1513,7 +1575,7 @@ chrome9_queue_generic_triangle(
       DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
       DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
    draw.depth_format = depth_active ?
-      (depth->base.format == PIPE_FORMAT_X8Z24_UNORM ?
+      (chrome9_format_is_d24(depth->base.format) ?
        DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 : DRM_CHROME9_FRAGMENT_DEPTH_D16) :
       0;
    draw.instruction_count = instruction_count;
@@ -2090,7 +2152,10 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       (ctx->draw_triangle_d16_rhw_batch ||
        ctx->draw_triangle_d16_rhw_run ||
        ctx->draw_triangle_d16_rhw_chain);
-   if (depth_active) {
+   if (depth_active && !ctx->dsa->depth_enabled) {
+      depth_flags = DRM_CHROME9_DEPTH_FUNC(DRM_CHROME9_COMPARE_ALWAYS) |
+                    DRM_CHROME9_DEPTH_READ_ONLY;
+   } else if (depth_active) {
       if (ctx->depth_func_supported || ctx->depth_equal_supported ||
           ctx->depth_always_supported)
          depth_flags = DRM_CHROME9_DEPTH_FUNC(ctx->dsa->depth_func);
