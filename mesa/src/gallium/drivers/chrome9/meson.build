@@ -11,6 +11,7 @@ libchrome9 = static_library(
     'chrome9_fragment.c',
     'chrome9_resource.c',
     'chrome9_screen.c',
+    'chrome9_ps_schedule.c',
     'chrome9_shader_offline.c',
     'chrome9_specialise.c',
     'chrome9_vs_texture.c',
@@ -52,6 +53,15 @@ chrome9_shader_offline_test = executable(
 )
 test('chrome9-shader-offline', chrome9_shader_offline_test,
      suite : ['chrome9'])
+
+chrome9_ps_schedule_test = executable(
+  'chrome9-ps-schedule-test',
+  ['chrome9_ps_schedule.c', 'chrome9_ps_schedule_test.c'],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  native : true,
+  install : false,
+)
+test('chrome9-ps-schedule', chrome9_ps_schedule_test, suite : ['chrome9'])
 
 chrome9_vs_texture_test = executable(
   'chrome9-vs-texture-test',
