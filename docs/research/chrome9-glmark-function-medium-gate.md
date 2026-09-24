@@ -241,6 +241,18 @@ host build; it has not been submitted to the GPU by this audit.  Passing this
 gate would qualify only the finite-positive X-lane chain and scalar forward,
 not zero, signed values, exceptional values, or partial Y/Z/W destinations.
 
+The adjacent `--sqrt-x-zero` mode is the second, explicitly wedge-risk gate.
+It reuses the exact same three semantic records, target, geometry, and checks;
+the only input change is T0.x `.25 -> +0`, and the required full BGRA word is
+exactly zero.  This is source-backed as an *unguarded* vendor path, not as a
+safety guarantee: the symbolized Linux RSQ/RCP emitters and their Windows
+twins inspect no input value bits and emit the same records for a runtime
+zero as for `.25`.  They do not insert a zero test, clamp, or alternate
+instruction.  The tool prints a cold-boot wedge warning before submission.
+Run it only after the finite-positive X-only gate retires, bracket it with a
+known-good draw, and quarantine the engine immediately on timeout.  It passes
+a strict host build and has not been submitted to the GPU by this audit.
+
 ### Finite-positive silicon result
 
 On a fresh VX900 boot with module build `83a0d6`, the exact three-record
