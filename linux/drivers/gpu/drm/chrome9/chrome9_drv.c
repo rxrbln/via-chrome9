@@ -2911,11 +2911,39 @@ out_unlock:
 }
 static DEVICE_ATTR_WO(engine_quiesce);
 
+static ssize_t engine_timeout_segment_read(struct file *file,
+					   struct kobject *kobj,
+					   const struct bin_attribute *attr,
+					   char *buf, loff_t off, size_t count)
+{
+	struct drm_device *drm = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (!drm)
+		return -ENODEV;
+	return chrome9_engine_read_timeout_segment(to_chrome9(drm), buf, off,
+						   count);
+}
+static BIN_ATTR_ADMIN_RO(engine_timeout_segment, 0);
+
 static struct attribute *chrome9_device_attrs[] = {
 	&dev_attr_engine_quiesce.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(chrome9_device);
+
+static const struct bin_attribute *const chrome9_device_bin_attrs[] = {
+	&bin_attr_engine_timeout_segment,
+	NULL,
+};
+
+static const struct attribute_group chrome9_device_group = {
+	.attrs = chrome9_device_attrs,
+	.bin_attrs = chrome9_device_bin_attrs,
+};
+
+static const struct attribute_group *chrome9_device_groups[] = {
+	&chrome9_device_group,
+	NULL,
+};
 
 static const struct pci_device_id chrome9_pci_table[] = {
 	{ PCI_DEVICE(CHROME9_PCI_VENDOR_ID, CHROME9_PCI_DEVICE_VX900) },

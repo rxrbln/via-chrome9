@@ -323,6 +323,9 @@ struct chrome9_engine {
 	void *run_staging_cpu;
 	u32 *fence_cpu;
 	dma_addr_t fence_dma;
+	/* Header plus ring bytes of the most recent timed-out segment. */
+	u32 *timeout_segment;
+	size_t timeout_segment_size;
 	u32 fence_last_id;
 	u64 fence_count;
 	u64 fence_canary_faults;
@@ -732,10 +735,14 @@ static void chrome9_fixed_vs_oracle(u32 flags, u32 target,
 		0xc0000000, 0xc0000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
 	};
 	static const u32 clip_wide[] = {
-		0xc0800000, 0x40800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
-		0x40800000, 0x40800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
-		0x40800000, 0xc0800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
-		0xc0800000, 0xc0800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0xc0800000, 0x40800000, 0x3f000000, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x40800000, 0x40800000, 0x3f000000, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x40800000, 0xc0800000, 0x3f000000, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0xc0800000, 0xc0800000, 0x3f000000, 0x3f800000,
+		0xffff0000, 0xffff0000,
 	};
 	/* (-.5,-.5,.9,1), (.5,-.5,.9,1), (0,.5,-.35,-.25): z = w - 0.1. */
 	static const u32 clip_near[] = {
@@ -3955,6 +3962,60 @@ static bool chrome9_verify_blend_oracle(struct chrome9_job *job)
 	return covered >= 400 && covered <= 600;
 }
 
+#define CHROME9_TIMEOUT_SEGMENT_MAGIC	0xc9d00001U
+#define CHROME9_TIMEOUT_HEADER_WORDS	8U
+
+/* Keep the whole failing segment (plus read-ahead) for offline replay. */
+static void chrome9_capture_timeout_segment(struct chrome9_engine *engine,
+					    struct chrome9_job *job)
+{
+	u32 start = job->ring_pause - job->segment_pause;
+	u32 end = min_t(u32, job->ring_stop + CHROME9_CR_READ_AHEAD,
+			CHROME9_RING_SIZE);
+	size_t size;
+	u32 *copy;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (job->ring_pause < job->segment_pause || end <= start)
+		return;
+	size = (CHROME9_TIMEOUT_HEADER_WORDS * sizeof(u32)) + (end - start);
+	copy = kvmalloc(size, GFP_KERNEL);
+	if (!copy)
+		return;
+	copy[0] = CHROME9_TIMEOUT_SEGMENT_MAGIC;
+	copy[1] = start;
+	copy[2] = job->segment_pause;
+	copy[3] = job->segment_stop;
+	copy[4] = job->fence_id;
+	copy[5] = job->cookie;
+	copy[6] = job->kind;
+	copy[7] = job->flags;
+	dma_rmb();
+	memcpy(copy + CHROME9_TIMEOUT_HEADER_WORDS,
+	       (u8 *)engine->ring_cpu + start, end - start);
+	kvfree(engine->timeout_segment);
+	engine->timeout_segment = copy;
+	engine->timeout_segment_size = size;
+}
+
+ssize_t chrome9_engine_read_timeout_segment(struct chrome9_device *cdev,
+					    char *buf, loff_t off,
+					    size_t count)
+{
+	struct chrome9_engine *engine = READ_ONCE(cdev->engine);
+	ssize_t ret = 0;
+
+	if (!engine)
+		return -ENODEV;
+	mutex_lock(&engine->submit_lock);
+	if (off >= 0 && off < engine->timeout_segment_size) {
+		ret = min_t(size_t, count, engine->timeout_segment_size - off);
+		memcpy(buf, (u8 *)engine->timeout_segment + off, ret);
+	}
+	mutex_unlock(&engine->submit_lock);
+	return ret;
+}
+
 static int chrome9_wait_job(struct chrome9_engine *engine,
 			    struct chrome9_job *job)
 {
@@ -4030,6 +4091,7 @@ timeout:
 			READ_ONCE(engine->fence_cpu[3]),
 			readl(cdev->mmio + CHROME9_REG_CURRENT_FENCE),
 			readl(cdev->mmio + CHROME9_REG_ENGINE_ERROR));
+	chrome9_capture_timeout_segment(engine, job);
 	if (!(cr_current & 3) && cr_current < CHROME9_RING_SIZE) {
 		u32 first = cr_current >= CHROME9_CR_READ_AHEAD ?
 			    cr_current - CHROME9_CR_READ_AHEAD : 0;
@@ -8087,6 +8149,7 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	dma_free_coherent(&cdev->pdev->dev, CHROME9_RING_SIZE,
 			  engine->ring_cpu, engine->ring_dma);
 	kvfree(engine->gart_saved);
+	kvfree(engine->timeout_segment);
 	if (engine->module_hold)
 		module_put(THIS_MODULE);
 	kfree(engine);

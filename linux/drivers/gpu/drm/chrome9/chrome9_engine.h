@@ -14,6 +14,9 @@ struct drm_gem_object;
 int chrome9_engine_init(struct chrome9_device *cdev);
 void chrome9_engine_fini(struct chrome9_device *cdev);
 bool chrome9_engine_ready(const struct chrome9_device *cdev);
+ssize_t chrome9_engine_read_timeout_segment(struct chrome9_device *cdev,
+					    char *buf, loff_t off,
+					    size_t count);
 bool chrome9_textured_triangle_run_enabled(void);
 bool chrome9_textured_triangle_mip_enabled(void);
 bool chrome9_rhw_chain_enabled(void);
