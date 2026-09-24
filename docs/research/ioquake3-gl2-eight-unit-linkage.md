@@ -129,6 +129,15 @@ reconstruct normal Z.  The current compiler result is therefore exact and
 empty: `supported=0`, `semantic=0`, zero semantic records, zero ALU and zero
 TAU.  No partial native object is evidence of fit.
 
+The exact production-compiler vFace differential and the bounded synthetic
+face-sign resource experiment are documented in
+`chrome9-vface-normal-sign-boundary.md`.  In particular, vFace and vPos
+compile byte-identically even in the actual vec3 CMP shape, so POSITION/MISC
+must not be exposed as FACE.  The synthetic sign form removes FACE and leaves
+95 ALU plus five TEX nodes after SQRT lowering, but a final native count still
+requires the same sampler and uniform lowering that the Mesa state tracker
+performs before driver compilation.
+
 The generic implementation ladder is:
 
 1. retain alpha mode in the draw-time variant key and prove mode zero removes
