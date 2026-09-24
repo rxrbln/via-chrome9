@@ -282,8 +282,13 @@ Mesa Chrome9 commit `722d91b` now implements the first deliberately narrow
 part: a generic defined-finite/nonnegative DAG proof and vector
 `fge(x, positive-normal constant)` lowering, with raw signed inputs,
 zero/negative thresholds, and exceptional-value-preserving producers kept
-closed.  The next useful change is dynamic positive-normal FLT, followed by
-the zero-threshold signed-unit proof and side-effect-free Boolean-AND rewrite.
+closed.  Replaying the exact linked object after that commit identified its
+`fmax(NdotL,0)` carrying `preserve:inf,nan`.  Commit `d56f61f` admits that
+operator only after both fmax inputs prove no defined exceptional value,
+making the preservation request vacuous; the exact first cel predicate is
+now covered by the host shape regression.  The next useful change is dynamic
+positive-normal FLT, followed by the zero-threshold signed-unit proof and
+side-effect-free Boolean-AND rewrite.
 This machinery remains separate from the narrower FRC threshold proof used
 by `conditionals` and from the projected-depth proof used by `shadow`.
 
