@@ -523,6 +523,44 @@ check_vector_conditional_compilation(struct chrome9_context *context)
           shader.native_fs_valid && found;
 }
 
+static bool
+check_per_lane_conditional_rejected(struct chrome9_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-per-lane-conditional");
+   struct chrome9_shader shader = { 0 };
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *color = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_COL0);
+   nir_def *condition = nir_fge(
+      &b, nir_ffract(&b, nir_trim_vector(&b, color, 3)),
+      nir_imm_vec3(&b, 0.5f, 0.5f, 0.5f));
+   nir_def *selected = nir_bcsel(
+      &b, condition,
+      nir_imm_vec3(&b, 0.25f, 0.5f, 0.75f),
+      nir_imm_vec3(&b, 0.75f, 0.25f, 0.5f));
+   bool rejected;
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b,
+      nir_channel(&b, selected, 0), nir_channel(&b, selected, 1),
+      nir_channel(&b, selected, 2), nir_imm_float(&b, 1.0f)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   rejected = !shader.supported;
+   if (!rejected)
+      fputs("per-lane conditional was miscompiled as a scalar broadcast\n",
+            stderr);
+   ralloc_free(b.shader);
+   return rejected;
+}
+
 int
 main(void)
 {
@@ -603,6 +641,7 @@ main(void)
        !check_reordered_vector_literals(&context) ||
        !check_packed_alpha_kill(&context) ||
        !check_vector_conditional_compilation(&context) ||
+       !check_per_lane_conditional_rejected(&context) ||
        !check_separable_blur_compilation(&context))
       return 1;
    puts("chrome9 primary alpha, texture modulation, packed literals, vector select, and blur compilation passed");
