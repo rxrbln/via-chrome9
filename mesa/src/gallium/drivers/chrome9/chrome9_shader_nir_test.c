@@ -3,6 +3,7 @@
 
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
+#include "chrome9_draw.h"
 #include "chrome9_public.h"
 #include "chrome9_specialise.h"
 
@@ -1581,6 +1582,151 @@ check_ideas_logo_shadow_compilation(struct chrome9_context *context)
    return valid;
 }
 
+static nir_shader *
+make_product_alpha_kill_fragment(bool transformed_factor,
+                                 bool wrong_sample_lane,
+                                 bool reverse_predicate)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-product-alpha-kill");
+   nir_variable *var0 = nir_variable_create(
+      b.shader, nir_var_shader_in, glsl_vec4_type(), "var0");
+   nir_variable *var1 = nir_variable_create(
+      b.shader, nir_var_shader_in, glsl_vec2_type(), "var1");
+   nir_variable *output = nir_variable_create(
+      b.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+
+   var0->data.location = VARYING_SLOT_VAR0;
+   var0->data.interpolation = INTERP_MODE_SMOOTH;
+   var1->data.location = VARYING_SLOT_VAR1;
+   var1->data.interpolation = INTERP_MODE_SMOOTH;
+   output->data.location = FRAG_RESULT_COLOR;
+   nir_def *varying0 = nir_load_deref(&b, nir_build_deref_var(&b, var0));
+   nir_def *varying1 = nir_load_deref(&b, nir_build_deref_var(&b, var1));
+   nir_def *coordinate = nir_vec2(&b, nir_channel(&b, varying0, 0),
+                                  nir_channel(&b, varying0, 1));
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coordinate);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_def *factor = nir_channel(&b, varying1, 1);
+
+   if (transformed_factor)
+      factor = nir_fadd(&b, factor, nir_imm_float(&b, 0.0f));
+   nir_def *alpha = nir_fmul(
+      &b, nir_channel(&b, &tex->def, wrong_sample_lane ? 0 : 3), factor);
+   nir_def *predicate = reverse_predicate ?
+      nir_flt(&b, nir_imm_float(&b, 0.5f), alpha) :
+      nir_flt(&b, alpha, nir_imm_float(&b, 0.5f));
+
+   nir_discard_if(&b, predicate);
+   nir_def *lighting = nir_vec3(&b, nir_channel(&b, varying0, 2),
+                                nir_channel(&b, varying0, 3),
+                                nir_channel(&b, varying1, 0));
+   nir_def *rgb = nir_fmul(&b, nir_trim_vector(&b, &tex->def, 3), lighting);
+   nir_store_deref(&b, nir_build_deref_var(&b, output),
+                   nir_vec4(&b, nir_channel(&b, rgb, 0),
+                                 nir_channel(&b, rgb, 1),
+                                 nir_channel(&b, rgb, 2), alpha), 0xf);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   return b.shader;
+}
+
+static bool
+check_product_alpha_kill_compilation(struct chrome9_context *context)
+{
+   struct chrome9_shader shader = { 0 }, transformed = { 0 };
+   struct chrome9_shader wrong_lane = { 0 }, reversed = { 0 };
+   struct chrome9_shader no_kill = { 0 };
+   nir_shader *nir = make_product_alpha_kill_fragment(false, false, false);
+   nir_shader *transformed_nir =
+      make_product_alpha_kill_fragment(true, false, false);
+   nir_shader *wrong_lane_nir =
+      make_product_alpha_kill_fragment(false, true, false);
+   nir_shader *reversed_nir =
+      make_product_alpha_kill_fragment(false, false, true);
+   unsigned texture = 0, multiply = 0, subtract = 0, kill = 0;
+   bool old_fragment_kill = context->fragment_kill;
+   bool valid;
+
+   context->fragment_kill = true;
+   chrome9_compile_fs_nir(context, &shader, nir);
+   chrome9_compile_fs_nir(context, &transformed, transformed_nir);
+   chrome9_compile_fs_nir(context, &wrong_lane, wrong_lane_nir);
+   chrome9_compile_fs_nir(context, &reversed, reversed_nir);
+   context->fragment_kill = false;
+   chrome9_compile_fs_nir(context, &no_kill, nir);
+   context->fragment_kill = old_fragment_kill;
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      switch (shader.semantic_fs_ir.instruction[i].op) {
+      case CHROME9_PS_OPCODE_TEX: texture++; break;
+      case CHROME9_PS_OPCODE_MUL: multiply++; break;
+      case CHROME9_PS_OPCODE_SUB: subtract++; break;
+      case CHROME9_PS_OPCODE_KILL: kill++; break;
+      default: break;
+      }
+   }
+   valid = shader.supported && shader.semantic_fs_valid &&
+      shader.fragment_program == CHROME9_FS_COMPILED_ALU &&
+      shader.semantic_input_mask == 0 &&
+      shader.semantic_varying_mask == 3 &&
+      shader.semantic_sampler_mask == 1 &&
+      shader.semantic_unit_interval_input_mask == (1u << 5) &&
+      texture == 1 && multiply == 2 && subtract == 1 && kill == 1 &&
+      !transformed.supported && !transformed.semantic_fs_valid &&
+      !wrong_lane.supported && !wrong_lane.semantic_fs_valid &&
+      !reversed.supported && !reversed.semantic_fs_valid &&
+      !no_kill.supported && !no_kill.semantic_fs_valid;
+   if (!valid)
+      fprintf(stderr, "product-alpha KILL compilation failed: "
+              "supported=%u semantic=%u ir=%u inputs=%x varyings=%x "
+              "samplers=%x unit=%08x ops=%u/%u/%u/%u "
+              "negative=%u/%u %u/%u %u/%u no-kill=%u/%u\n",
+              shader.supported, shader.semantic_fs_valid,
+              shader.semantic_fs_ir.count, shader.semantic_input_mask,
+              shader.semantic_varying_mask, shader.semantic_sampler_mask,
+              shader.semantic_unit_interval_input_mask,
+              texture, multiply, subtract, kill,
+              transformed.supported, transformed.semantic_fs_valid,
+              wrong_lane.supported, wrong_lane.semantic_fs_valid,
+              reversed.supported, reversed.semantic_fs_valid,
+              no_kill.supported, no_kill.semantic_fs_valid);
+   if (!valid)
+      nir_print_shader(nir, stderr);
+   ralloc_free(reversed_nir);
+   ralloc_free(wrong_lane_nir);
+   ralloc_free(transformed_nir);
+   ralloc_free(nir);
+   return valid;
+}
+
+static bool
+check_product_alpha_unit_interval(void)
+{
+   static const uint32_t accepted[] = {
+      0x00000000, 0x80000000, 0x00000001, 0x3f000000, 0x3f800000,
+   };
+   static const uint32_t rejected[] = {
+      0x80000001, 0xbf800000, 0x3f800001, 0x7f800000, 0xff800000,
+      0x7fc00000,
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(accepted); i++)
+      if (!chrome9_fragment_unit_interval_value(accepted[i]))
+         return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(rejected); i++)
+      if (chrome9_fragment_unit_interval_value(rejected[i]))
+         return false;
+   return true;
+}
+
 int
 main(void)
 {
@@ -1676,6 +1822,8 @@ main(void)
        !check_blinn_phong_integer_power(&context) ||
        !check_function_medium_sqrt_boundary(&context) ||
        !check_ideas_logo_shadow_compilation(&context) ||
+       !check_product_alpha_kill_compilation(&context) ||
+       !check_product_alpha_unit_interval() ||
        !check_separable_blur_compilation(&context))
       return 1;
    puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur compilation passed");

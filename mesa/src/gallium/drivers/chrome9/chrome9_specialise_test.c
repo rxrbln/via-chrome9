@@ -239,7 +239,8 @@ build_front_face_pair(void)
 }
 
 static nir_shader *
-build_ubo_index_shift(unsigned shift, bool dynamic_shift, bool extra_use)
+build_ubo_index_shift(unsigned shift, bool dynamic_shift, bool extra_use,
+                      unsigned row_offset, unsigned chained_row_offset)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
                                                    &options,
@@ -262,6 +263,11 @@ build_ubo_index_shift(unsigned shift, bool dynamic_shift, bool extra_use)
 
    for (unsigned lane = 0; lane < 4; lane++) {
       nir_def *index = nir_channel(&b, indices, lane);
+
+      if (row_offset)
+         index = nir_iadd_imm(&b, index, row_offset);
+      if (chained_row_offset)
+         index = nir_iadd_imm(&b, index, chained_row_offset);
 
       for (unsigned row = 0; row < 4; row++) {
          nir_def *value = nir_load_ubo_vec4(
@@ -290,10 +296,41 @@ alu_op_count(nir_shader *nir, nir_op op)
    return count;
 }
 
+static unsigned
+ubo_load_fadd_imm_count(nir_shader *nir, uint32_t imm)
+{
+   unsigned count = 0;
+
+   nir_foreach_function_impl(impl, nir)
+      nir_foreach_block(block, impl)
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_ubo_vec4)
+               continue;
+            nir_instr *index_instr = nir_def_instr(intr->src[1].ssa);
+            if (index_instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(index_instr);
+            if (alu->op != nir_op_fadd)
+               continue;
+            for (unsigned source = 0; source < 2; source++) {
+               if (nir_src_is_const(alu->src[source].src) &&
+                   nir_src_comp_as_uint(alu->src[source].src,
+                                        alu->src[source].swizzle[0]) == imm) {
+                  count++;
+                  break;
+               }
+            }
+         }
+   return count;
+}
+
 static bool
 check_ubo_index_shift(void)
 {
-   nir_shader *nir = build_ubo_index_shift(2, false, false);
+   nir_shader *nir = build_ubo_index_shift(2, false, false, 0, 0);
    bool valid = chrome9_nir_lower_ubo_index_shifts(nir) &&
                 alu_op_count(nir, nir_op_ishl) == 0 &&
                 alu_op_count(nir, nir_op_imul) == 0 &&
@@ -325,17 +362,42 @@ check_ubo_index_shift(void)
    }
    ralloc_free(nir);
 
-   nir = build_ubo_index_shift(1, false, false);
+   nir = build_ubo_index_shift(2, false, false, 3, 0);
+   valid &= chrome9_nir_lower_ubo_index_shifts(nir) &&
+            alu_op_count(nir, nir_op_ishl) == 0 &&
+            alu_op_count(nir, nir_op_iadd) == 4;
+   nir_opt_algebraic(nir);
+   nir_opt_constant_folding(nir);
+   nir_opt_dce(nir);
+   nir_lower_int_to_float(nir);
+   valid &= alu_op_count(nir, nir_op_ishl) == 0 &&
+            alu_op_count(nir, nir_op_imul) == 0 &&
+            alu_op_count(nir, nir_op_iadd) == 0 &&
+            alu_op_count(nir, nir_op_fmul) == 1 &&
+            ubo_load_fadd_imm_count(nir, 0x40400000) == 16;
+   ralloc_free(nir);
+
+   nir = build_ubo_index_shift(2, false, false, 4, 0);
    valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
             alu_op_count(nir, nir_op_ishl) == 1;
    ralloc_free(nir);
 
-   nir = build_ubo_index_shift(2, true, false);
+   nir = build_ubo_index_shift(2, false, false, 2, 2);
    valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
             alu_op_count(nir, nir_op_ishl) == 1;
    ralloc_free(nir);
 
-   nir = build_ubo_index_shift(2, false, true);
+   nir = build_ubo_index_shift(1, false, false, 0, 0);
+   valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
+            alu_op_count(nir, nir_op_ishl) == 1;
+   ralloc_free(nir);
+
+   nir = build_ubo_index_shift(2, true, false, 0, 0);
+   valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
+            alu_op_count(nir, nir_op_ishl) == 1;
+   ralloc_free(nir);
+
+   nir = build_ubo_index_shift(2, false, true, 0, 0);
    valid &= !chrome9_nir_lower_ubo_index_shifts(nir) &&
             alu_op_count(nir, nir_op_ishl) == 1;
    ralloc_free(nir);

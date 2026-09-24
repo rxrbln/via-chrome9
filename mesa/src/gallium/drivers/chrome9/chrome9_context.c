@@ -2589,6 +2589,7 @@ struct chrome9_ps_nir_builder {
    uint8_t texture_count;
    uint32_t equal_zero_input_mask;
    uint32_t identity_projector_input_mask;
+   uint32_t unit_interval_input_mask;
    struct {
       nir_def *predicate;
       uint8_t temp;
@@ -3625,17 +3626,30 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
 }
 
 static bool
+chrome9_ps_sample_alpha(nir_scalar scalar, nir_tex_instr **texture)
+{
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   if (scalar.comp != 3 || scalar.def->num_components != 4 ||
+       scalar.def->bit_size != 32 ||
+       nir_def_instr(scalar.def)->type != nir_instr_type_tex)
+      return false;
+   *texture = nir_instr_as_tex(nir_def_instr(scalar.def));
+   return true;
+}
+
+static bool
 chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
                                  nir_def *condition)
 {
    static const uint32_t half[4] = { 0x3f000000 };
    nir_scalar predicate, alpha, reference;
-   nir_alu_instr *compare;
+   nir_alu_instr *compare, *multiply = NULL;
    nir_tex_instr *texture;
-   struct chrome9_ps_source sampled, threshold;
+   struct chrome9_ps_source sampled, threshold, varying;
    struct chrome9_ps_instruction *subtract, *kill;
-   unsigned threshold_lane;
+   unsigned sampled_lane, threshold_lane;
    unsigned temp;
+   bool product_factor = false;
 
    if (!condition || condition->num_components != 1)
       return false;
@@ -3651,24 +3665,55 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
                                compare->src[0].swizzle[0]);
    reference = nir_scalar_resolved(compare->src[1].src.ssa,
                                    compare->src[1].swizzle[0]);
-   if (alpha.comp != 3 ||
-       nir_def_instr(alpha.def)->type != nir_instr_type_tex ||
-       !nir_scalar_is_const(reference) ||
+   if (!nir_scalar_is_const(reference) ||
        nir_scalar_as_uint(reference) != half[0])
       return false;
-   texture = nir_instr_as_tex(nir_def_instr(alpha.def));
+   if (!chrome9_ps_sample_alpha(alpha, &texture)) {
+      nir_scalar sample, factor;
+
+      if (nir_def_instr(alpha.def)->type != nir_instr_type_alu)
+         return false;
+      multiply = nir_instr_as_alu(nir_def_instr(alpha.def));
+      if (multiply->op != nir_op_fmul || multiply->fp_math_ctrl ||
+          alpha.comp >= multiply->def.num_components)
+         return false;
+      for (unsigned sampler_source = 0; sampler_source < 2;
+           sampler_source++) {
+         sample = nir_scalar_chase_alu_src(alpha, sampler_source);
+         factor = nir_scalar_chase_alu_src(alpha, 1 - sampler_source);
+         factor = nir_scalar_resolved(factor.def, factor.comp);
+         if (!chrome9_ps_sample_alpha(sample, &texture) ||
+             factor.def->bit_size != 32 ||
+             factor.comp >= factor.def->num_components ||
+             !chrome9_ps_leaf(builder, factor.def, &varying) ||
+             varying.file != CHROME9_PS_SOURCE_TEXTURE || varying.id >= 8 ||
+             varying.swizzle[factor.comp] > CHROME9_PS_SWIZZLE_W)
+            continue;
+         builder->unit_interval_input_mask |=
+            1u << (varying.id * 4 + varying.swizzle[factor.comp]);
+         product_factor = true;
+         break;
+      }
+      if (!product_factor)
+         return false;
+   }
    if (texture->op != nir_texop_tex ||
        texture->sampler_dim != GLSL_SAMPLER_DIM_2D ||
        texture->texture_index != 0 || texture->sampler_index != 0 ||
        texture->is_array || texture->is_shadow ||
-       alpha.def->num_components != 4 || alpha.def->bit_size != 32 ||
+       texture->def.num_components != 4 || texture->def.bit_size != 32 ||
+       alpha.def->bit_size != 32 ||
        builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
        !chrome9_ps_lower_def(builder, alpha.def, &sampled) ||
        !chrome9_ps_immediate(builder, half, 1, &threshold))
       return false;
+   if (alpha.comp >= alpha.def->num_components ||
+       sampled.swizzle[alpha.comp] > CHROME9_PS_SWIZZLE_W)
+      return false;
+   sampled_lane = sampled.swizzle[alpha.comp];
    threshold_lane = threshold.swizzle[0];
    for (unsigned c = 0; c < 4; c++) {
-      sampled.swizzle[c] = CHROME9_PS_SWIZZLE_W;
+      sampled.swizzle[c] = sampled_lane;
       threshold.swizzle[c] = threshold_lane;
    }
    temp = builder->next_temp++;
@@ -3694,6 +3739,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint32_t *uniform_mask,
                        uint32_t *equal_zero_input_mask,
                        uint32_t *identity_projector_input_mask,
+                       uint32_t *unit_interval_input_mask,
                        bool allow_kill,
                        bool *lowered)
 {
@@ -3852,6 +3898,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    *equal_zero_input_mask = builder.equal_zero_input_mask;
    *identity_projector_input_mask =
       builder.identity_projector_input_mask;
+   *unit_interval_input_mask = builder.unit_interval_input_mask;
    *lowered = true;
    bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
 
@@ -3984,6 +4031,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      &shader->semantic_uniform_mask,
                                      &shader->semantic_equal_zero_input_mask,
                                      &shader->semantic_identity_projector_input_mask,
+                                     &shader->semantic_unit_interval_input_mask,
                                      ctx->fragment_kill,
                                      &lowered);
    if (lowered) {
@@ -4218,6 +4266,8 @@ chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
       shader->semantic_equal_zero_input_mask;
    variant->semantic_identity_projector_input_mask =
       shader->semantic_identity_projector_input_mask;
+   variant->semantic_unit_interval_input_mask =
+      shader->semantic_unit_interval_input_mask;
    variant->semantic_fs_valid = shader->semantic_fs_valid;
    variant->native_fs_valid = shader->native_fs_valid;
    variant->native_fs_from_nir = shader->native_fs_from_nir;
@@ -4244,6 +4294,8 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
       variant->semantic_equal_zero_input_mask;
    shader->semantic_identity_projector_input_mask =
       variant->semantic_identity_projector_input_mask;
+   shader->semantic_unit_interval_input_mask =
+      variant->semantic_unit_interval_input_mask;
    shader->semantic_fs_valid = variant->semantic_fs_valid;
    shader->native_fs_valid = variant->native_fs_valid;
    shader->native_fs_from_nir = variant->native_fs_from_nir;
@@ -5120,7 +5172,8 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    const bool guarded_domain =
       ctx->fs->semantic_equal_zero_input_mask != 0 ||
-      ctx->fs->semantic_identity_projector_input_mask != 0;
+      ctx->fs->semantic_identity_projector_input_mask != 0 ||
+      ctx->fs->semantic_unit_interval_input_mask != 0;
 
    if (guarded_domain)
       chrome9_draw_begin_guarded_domain(ctx);

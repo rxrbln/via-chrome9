@@ -1174,9 +1174,39 @@ chrome9_equal_zero_value(uint32_t bits)
    return magnitude == 0 || magnitude == 0x3f800000;
 }
 
+bool
+chrome9_fragment_unit_interval_value(uint32_t bits)
+{
+   float value;
+
+   memcpy(&value, &bits, sizeof(value));
+   return isfinite(value) && value >= 0.0f && value <= 1.0f;
+}
+
+static bool
+chrome9_fragment_unit_interval_texture(enum pipe_format format)
+{
+   /* Keep the range-dependent KILL proof explicit if the generic sampler
+    * table later grows a float or signed-normalized format.  Filtering and
+    * the canonical view swizzles preserve [0, 1] for these UNORM decoders. */
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_A8_UNORM:
+   case PIPE_FORMAT_L8_UNORM:
+   case PIPE_FORMAT_L8A8_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+   case PIPE_FORMAT_X8Z24_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
 /* Preflight the entire post-VS vbuf callback before its first batch can be
  * submitted.  Equality-to-zero lanes must be bit-identical in their proven
- * finite domain; omitted projectors must be exactly one at every vertex.
+ * finite domain, omitted projectors must be exactly one, and unit-interval
+ * lanes must remain finite and within [0, 1] at every vertex.
  * The batches are deferred until the complete Gallium draw ends, so a late
  * callback cannot invalidate an earlier cmd22 submission. */
 static bool
@@ -1188,11 +1218,13 @@ chrome9_guarded_draw_domain(const struct chrome9_vbuf_render *crender,
       crender->ctx->fs->semantic_equal_zero_input_mask : 0;
    const uint32_t projector_mask = crender->ctx->fs ?
       crender->ctx->fs->semantic_identity_projector_input_mask : 0;
+   const uint32_t unit_interval_mask = crender->ctx->fs ?
+      crender->ctx->fs->semantic_unit_interval_input_mask : 0;
    const unsigned primary = crender->ctx->fs &&
       crender->ctx->fs->semantic_input_mask == 1;
    uint32_t reference[32] = { 0 };
 
-   if (!equal_zero_mask && !projector_mask)
+   if (!equal_zero_mask && !projector_mask && !unit_interval_mask)
       return true;
    if (!crender->generic_program || !crender->layout_valid)
       return false;
@@ -1232,6 +1264,17 @@ chrome9_guarded_draw_domain(const struct chrome9_vbuf_render *crender,
             return false;
          memcpy(&bits, vertex + 4 + primary + lane, sizeof(bits));
          if (bits != 0x3f800000)
+            return false;
+      }
+      for (uint32_t remaining = unit_interval_mask; remaining;
+           remaining &= remaining - 1) {
+         unsigned lane = __builtin_ctz(remaining);
+         uint32_t bits;
+
+         if (lane / 4 >= crender->varying_count)
+            return false;
+         memcpy(&bits, vertex + 4 + primary + lane, sizeof(bits));
+         if (!chrome9_fragment_unit_interval_value(bits))
             return false;
       }
    }
@@ -1331,6 +1374,10 @@ chrome9_queue_generic_triangle(
 
       if (!view || !format || view->u.tex.first_level)
          return false;
+      if (crender->ctx->fs->semantic_unit_interval_input_mask &&
+          logical == 0 &&
+          !chrome9_fragment_unit_interval_texture(resource->format))
+         return false;
       view_last_level = view->u.tex.last_level;
       last_level = resource->last_level;
       /* The kernel validates the descriptor against the full guarded BO.
@@ -1416,6 +1463,20 @@ chrome9_queue_generic_triangle(
           vertices[0].varying[lane / 4][lane % 4] != 0x3f800000 ||
           vertices[1].varying[lane / 4][lane % 4] != 0x3f800000 ||
           vertices[2].varying[lane / 4][lane % 4] != 0x3f800000)
+         return false;
+   }
+   for (uint32_t remaining =
+           crender->ctx->fs->semantic_unit_interval_input_mask;
+        remaining; remaining &= remaining - 1) {
+      const unsigned lane = __builtin_ctz(remaining);
+
+      if (lane / 4 >= crender->varying_count ||
+          !chrome9_fragment_unit_interval_value(
+             vertices[0].varying[lane / 4][lane % 4]) ||
+          !chrome9_fragment_unit_interval_value(
+             vertices[1].varying[lane / 4][lane % 4]) ||
+          !chrome9_fragment_unit_interval_value(
+             vertices[2].varying[lane / 4][lane % 4]))
          return false;
    }
    {

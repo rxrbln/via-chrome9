@@ -76,6 +76,9 @@ struct chrome9_fs_variant {
    uint32_t semantic_equal_zero_input_mask;
    /* Projected samples lowered to 2D TEX only when Q is exactly one. */
    uint32_t semantic_identity_projector_input_mask;
+   /* Direct varying lanes whose complete post-VS draw is proven finite and
+    * within [0, 1] before a range-dependent fragment lowering is submitted. */
+   uint32_t semantic_unit_interval_input_mask;
    bool semantic_fs_valid;
    bool native_fs_valid;
    bool native_fs_from_nir;
@@ -101,6 +104,7 @@ struct chrome9_shader {
    uint8_t semantic_sampler_mask;
    uint32_t semantic_equal_zero_input_mask;
    uint32_t semantic_identity_projector_input_mask;
+   uint32_t semantic_unit_interval_input_mask;
    bool semantic_fs_valid;
    bool native_fs_valid;
    bool native_fs_from_nir;

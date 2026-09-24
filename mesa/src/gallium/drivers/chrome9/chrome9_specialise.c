@@ -17,7 +17,7 @@
 #include "nir_builder.h"
 
 static bool
-chrome9_ubo_index_use(const nir_def *def, unsigned depth)
+chrome9_ubo_index_use(const nir_def *def, unsigned depth, bool saw_iadd)
 {
    bool used = false;
 
@@ -40,9 +40,27 @@ chrome9_ubo_index_use(const nir_def *def, unsigned depth)
          return false;
 
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      if (alu->op != nir_op_mov)
+      if (alu->op == nir_op_iadd) {
+         unsigned source = use == &alu->src[0].src ? 0 : 1;
+         unsigned other = 1 - source;
+
+         /* The recovered bone-address DAG has at most one row offset on
+          * each lane.  Reject a chain even when every individual immediate
+          * is small: otherwise +2,+2 would bypass the +3 bound. */
+         if (saw_iadd || use != &alu->src[source].src ||
+             !nir_src_is_const(alu->src[other].src))
+            return false;
+         for (unsigned c = 0; c < alu->def.num_components; c++) {
+            unsigned swizzle = alu->src[other].swizzle[c];
+
+            if (nir_src_comp_as_uint(alu->src[other].src, swizzle) > 3)
+               return false;
+         }
+      } else if (alu->op != nir_op_mov) {
          return false;
-      if (!chrome9_ubo_index_use(&alu->def, depth + 1))
+      }
+      if (!chrome9_ubo_index_use(&alu->def, depth + 1,
+                                 saw_iadd || alu->op == nir_op_iadd))
          return false;
    }
    return used;
@@ -66,7 +84,7 @@ chrome9_lower_ubo_index_shift(nir_builder *b, nir_instr *instr, void *data)
       if (nir_src_comp_as_uint(alu->src[1].src, swizzle) != 2)
          return false;
    }
-   if (!chrome9_ubo_index_use(&alu->def, 0))
+   if (!chrome9_ubo_index_use(&alu->def, 0, false))
       return false;
 
    /* The use walk admitted only defined load_ubo_vec4 addresses.  Their valid
