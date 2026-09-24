@@ -427,3 +427,53 @@ positive and zero gates have now retired in the required order.  Production
 `.lower_fsqrt` may advance through the offline compiler/resource assertions
 above; the generated complete shader and scene validation remain separate
 bounded gates.
+
+### Exact complete-program preflight
+
+The test binary from Mesa commit `f836ff3` was stopped immediately after the
+lowered shader's semantic compile and its complete 36-record IR was inspected.
+The fragment-position prefix is:
+
+```text
+MUL t32.x, POSITION.x000, C31.y000
+MUL t31.x, t32.x000,       POSITION.y000
+FRC t30.x, t31.x000
+```
+
+It is followed by five copies of the canonical six-record scalar block
+`MUL 3,d; FRC; MUL a,a; RSQ; RCP; FRC`.  The output suffix is:
+
+```text
+MOV t33.xyz, t0.xxx0
+MOV t33.w,   C31.000z
+MOV COLOR,   t33.xyzw
+```
+
+Every inactive scalar selector is ZERO; none of these sources accidentally
+uses the earlier unsafe replicated `XXXX` form.  The only literal register is
+C31, with X=`3.0`, Y=`0.0001`, and Z=`1.0`.  There is no sampler, TAU, primary
+input, or T-varying input.
+
+Kernel lifetime allocation alternates two physical temporaries, including the
+output assembly.  With MISC as the sole active external source, the production
+resource calculation is `(active0, physical)=(1,2)`: bucket `0x18000`, MISC
+id three, and controls:
+
+```text
+A90=900d8008 A91=91000000 A92=92000024
+```
+
+`active_texture_count=0`, `varying_count=0`, and `tau_count=0`; consequently
+there is no MISC/direct-T collision and no dependence on the still-unqualified
+three-varying H6 route.  This complete-program result composes already-live
+boundaries: the byte-exact 31-record scalar core passed positive and zero
+inputs, and the POSITION-plus-constant path passed a longer eight-ALU shader.
+The five extra prefix/output records do not introduce a new opcode or resource
+class and remain below the 96-ALU ABI bound.
+
+The production-options regression should additionally assert C31 as the sole
+immediate, no user constant/uniform mask, one POSITION source with X000/Y000
+padding, and successful 36-record UAPI translation.  Once those checks pass,
+the next meaningful live gate is one bounded `function` medium-complexity
+glmark2 validation bracketed by known-good draws; another scene-shaped raw
+shader probe would not separate a remaining hardware unknown.
