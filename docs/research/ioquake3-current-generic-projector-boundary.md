@@ -156,20 +156,25 @@ triangles.  The guarded-domain end publishes a deferred batch only after the
 whole-draw identity-Q proof succeeds.  Thus the second capture is hardware
 submission/retirement evidence for 64 generic command-22 triangles, not only
 shader admission.  The first executed class is program 18, four ALU plus one
-TEX and constant c0.  Before the limit line, programs 19, 16, 17 and 18 all
-report `supported=1`; programs 24, 25 and 9 are created later and also report
-supported, but the cap prevents treating those later bindings as hardware
-execution evidence.  The projected classes have 5/1, 2/1, 2/1, 5/1, 7/2 and
-7/2 total/TEX records as applicable.  There is no unsupported,
+TEX and constant c0.  This class does not consume PRIMARY.  Before the limit
+line, programs 19, 16, 17 and 18 all report `supported=1`; programs 24, 25
+and 9 are created later and also report supported.  Programs 19, 24 and 25
+consume PRIMARY and the build in this artifact had the generic vertex
+allocation mismatch described below, so neither their bindings nor absence
+of a state-rejection line prove that they reached a vbuf draw callback.  The
+projected classes have 5/1, 2/1, 2/1, 5/1, 7/2 and 7/2 total/TEX records as
+applicable.  There is no unsupported,
 bounded-state-reject, ioctl-failure, timeout, quarantine or GPU-fault line in
 the application captures or the contemporaneous kernel log.  The userspace
 trace does not retain a numeric ioctl cookie; command kind 22 follows from
 the source path `batch_generic_program -> chrome9_draw_fragment_program`.
 
-This is not a pixel oracle.  It proves that the exact application-side
-projector classes survive compiler, whole-draw guard, generic state builder,
-kernel validation and GPU retirement for the bounded prefix.  It does not
-prove the RGB/alpha equation, blend result, mip choice or depth result.
+This is not a pixel oracle.  It proves that the executed program-18
+constant-color projector class survives compiler, whole-draw guard, generic
+state builder, kernel validation and GPU retirement for the bounded prefix.
+It proves compiler admission only for the primary-bearing classes.  It does
+not prove their vbuf layout, the RGB/alpha equation, blend result, mip choice
+or depth result.
 
 ## Next GL1 compiler and state rungs
 
@@ -231,8 +236,15 @@ that gate.  Target `texture-only-debug.log`, SHA-256
 `23805d1a9cc17d7807886bc54c6c51b8484378a9a1add90a23fa10233b5554b3`,
 reports program 15 as semantic/native-valid but observes zero submitted and
 zero rejected triangles (`+0/+0`) and four zero samples instead of the red
-pattern.  That is a separate unresolved draw-path/control result, not evidence
-that the q3dm1 command-22 pixels are correct.
+pattern.  Static tracing isolates the silent drop before draw emission: the
+generic vertex-info builder includes one packed PRIMARY word, making the
+PRIMARY+T0 record nine words, while that build's allocator expected only
+position plus varying words, eight in this case.  Allocation therefore
+returns false without incrementing submitted or rejected counters.  The
+source fix is to include the PRIMARY word in the generic allocator's expected
+size; it still requires an allocator-fixed smoke and capped q3dm1 run.  This
+also explains why the old capture cannot qualify primary-bearing projected
+programs 19, 24 or 25.
 
 After a numeric pixel gate, source and current capability review find no
 deterministic generic-state rejection for the next q3dm1 material classes.
