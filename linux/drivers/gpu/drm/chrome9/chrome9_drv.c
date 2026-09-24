@@ -844,7 +844,6 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		0xffff0000, 0xffff0000,
 	};
 	u32 fvf[ARRAY_SIZE(raster_fvf)];
-	u32 clip_config[ARRAY_SIZE(config)];
 	unsigned int i;
 	u32 state[] = {
 		0x50000000 | (target >> 8),
@@ -856,12 +855,14 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		0x01c01540, 0x88001ed0, 0x89000800,
 	};
 
+	/* Vendor hardware TCL: type-01 A01 clip engine (bit 11) plus bit 20. */
+	if (vs && vs->clip)
+		state[15] |= 0x00100800;
 	/* Exact 7122 H6 vendor emission with state+0x178 set to one. */
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
 			     state, ARRAY_SIZE(state));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0xfe020000,
-			     vs && vs->clip ? clip_config : config,
-			     ARRAY_SIZE(config));
+			     config, ARRAY_SIZE(config));
 	memcpy(fvf, raster_fvf, sizeof(fvf));
 	if (vs) {
 		fvf[7] = vs->a62;
@@ -889,8 +890,6 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 					  (offset >> 24) << 8 | scale >> 24;
 		}
 	}
-	memcpy(clip_config, config, sizeof(config));
-	clip_config[1] |= 0x800;
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
 			     fvf, ARRAY_SIZE(fvf));
 	if (constants32) {
