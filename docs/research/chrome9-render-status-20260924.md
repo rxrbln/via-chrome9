@@ -96,8 +96,32 @@ GL1 q3dm1 (800x600) renders like llvmpipe, no rejects, no kernel report.
 GL2 q3dm1 takes the no-FBO path and, after `ad64c2f`, renders close to
 llvmpipe; remaining visible differences are small (sky and floor tint).
 
+## Evening update: hardware TCL, llvmpipe fallback, points/lines
+
+Library `objs-chrome9-llvm` (chrome9 + llvmpipe, shared LLVM 23.1) with
+`CHROME9_TCL=1` on kernel `d6579af` (`hw_tcl=1 fe33_fence=1`).
+
+| workload | state |
+|---|---|
+| ioquake3 q3dm1 GL1 | renders; 100 % of triangles on hardware TCL |
+| ioquake3 q3dm1 GL2 | renders; 99.5 % on hardware TCL; sky matches llvmpipe once `r_fastsky 0` (the saved config had 1) |
+| ioquake3 GL2 dlights | `alpha == 0` discard now lowers natively (ABS/CMP/KILL) |
+| glxgears | renders correctly on hardware TCL (FlatC flat shading); 35 fps TCL, 58 fps post-TNL |
+| glmark2 default set | every scene renders; validation as before except terrain now renders |
+| glmark2 terrain | noise pass and vertex-texture mesh on llvmpipe, rest on hardware; 0.56 s/frame; matches llvmpipe |
+| glmark2 refract | renders on hardware TCL but 27 s/frame: 139k triangles in 128-triangle ioctls, each flushing the 1600x1200 target through the CPU cache |
+| glmark2 desktop blur | still one 8-bit level low at the validation pixel (see `chrome9-dlight-alpha-blur-precision.md`) |
+| points and lines | were silently dropped; now converted to triangles by draw, pixel-identical to llvmpipe |
+
+Kernel GART flush protocol: re-request burst, 600 ms wait and a ring kick
+on idle; no flush timeout since (`chrome9-gart-flush-timeout.md`).
+
 ## Open
 
-* terrain noise pass capacity (hardware limit; needs a fallback design);
-* hardware TCL, remaining GL2 features (two-sided FACE, alpha modes 1/2);
-* throughput, strictly after all hardware features.
+* blur 1-LSB precision (stage-dump experiment prepared);
+* hardware features: stage B GEM vertex buffers and native vertex formats
+  (`chrome9-tcl-vertex-formats-stage-b.md`), two-sided colors and user clip
+  planes on TCL (`chrome9-lines-points-twoside-re.md`); both currently fall
+  back to the draw module;
+* throughput (refract, glxgears TCL, per-ioctl flushes), strictly after the
+  hardware features.
