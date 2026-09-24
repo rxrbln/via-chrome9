@@ -257,6 +257,26 @@ are `bfbf40bf` and `4040bf40`, respectively.
 
 The tool builds under strict host warnings with the current UAPI.  It retains
 the existing BGRA+D16 leading/trailing guard checks, triangle-exterior check,
-and bounded render-node interface.  It has not been submitted to a GPU.  A
-timeout or engine quarantine on the forward case ends the experiment; do not
-run the reverse case afterward.
+and bounded render-node interface.  The forward case was initially held for
+independent review.  A timeout, engine quarantine, or negative numeric result
+ends the experiment; do not run the reverse case afterward.
+
+### Live forward-gate result, 2026-09-24
+
+The strict host build of the reviewed probe (SHA-256
+`1a29e12623d283e36a784343af69e915b35dd437376e7a505b2e8ef041e66166`)
+was staged at `/root/tmp/chrome9-live/cmp-oracle/chrome9-cmp-subnormal` on the
+192.168.2.60 VX900 target.  A known-good `--cmp-temp-true` draw passed before
+and after the new draw.  The single bounded `--subnormal-lt` draw returned
+normally but failed its pixel check: at (12,12) the actual BGRA host word was
+`40404040`, not the strict-FP32 expected `bfbf40bf`; D16 was `8000`.
+Leading/trailing BO guards passed their check before the pixel mismatch was
+reported.  The bounded kernel log check found no new Chrome9 fault.  The
+reverse case was **not** run after this negative forward result.
+
+All four lanes selecting the `.25` false arm is consistent with loss of the
+subnormal difference before CMP, but this probe alone does not distinguish
+input denormal flushing, arithmetic result flushing, or another shader
+numeric behavior.  Therefore the proposed generic strict-`<` lowering is
+**not qualified** for subnormal operands and must remain disabled.  Static
+proprietary SLT bytes do not override the live numeric counterexample.
