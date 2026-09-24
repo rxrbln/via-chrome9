@@ -757,3 +757,31 @@ the unchanged wrong colors `00ffcc00`, `00ffcc00`, `00003300`.  Xorg and
 Thus XY01 versus vendor XYXY alone is not sufficient to explain the failure.
 Further work should compare texture descriptors/sample return routing and
 the complete packet image, rather than modifying another state bit by guess.
+
+### Final pre-pause packet audit and next discriminator
+
+The last read-only Linux 5.75/Windows cross-check found no descriptor or TAU
+byte delta for this guarded 2x1 X8Z24 level-zero nearest/clamp sample.  The
+current kernel's image state is the vendor-backed sequence
+`<base+1000>>8, 18001101, 20001002, 21000001, 22008001, 30fe2000`;
+sampler state is `30000000, 31100000, 32000049, cccccccc`.  `A30=fe2000`
+is the D24X8 Z-mode-4 route and `0x49` is the qualified clamp/clamp sampler
+encoding (not border).  TAU remains `301211b0`; A91/A93/A95 and the FE tuple
+also match the shortened proprietary object after the A28 correction.
+
+The inspection-only **terminal ADD** is the remaining known native-program
+byte difference.  Its X000/0X00 lane packing has no PS2/vendor precedent,
+whereas the proprietary short object ends in `ADD oC0,r0.xxxx,r2.xxxx`, native
+record `02020000 00140924 00f20000 00000820`.  The new
+`--inspect-vendor-terminal` offline diagnostic preserves the five-op prefix,
+XYXY bridge, texture, geometry, D16/source/BO/exterior guards, and substitutes
+that exact terminal.  Expected host BGRA for its three rectangles is
+`bfbfbfbf`, `ffffffff`, `bfbfbfbf` (one-byte tolerance); this is threshold
+about 0.5505 plus sampled depth 0.2, 0.8, 0.2 with color saturation.  It
+builds strictly from tools commit `2673e13` as binary SHA-256
+`4f617495f56e66a44066db304a563429283e2f7c99a6d90b4524acb0f3083d97`,
+but has **not** been staged or executed on the target.  A
+passing result would isolate the previous mismatch to the inspection-only
+terminal lane packing; a failure would leave a genuine computed-TEX/phase or
+sample-return issue even with the vendor's terminal record.  No GPU test is
+authorized by this note while the project is paused.
