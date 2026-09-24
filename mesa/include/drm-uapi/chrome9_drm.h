@@ -253,6 +253,8 @@ enum drm_chrome9_param {
 /* Second capability word, DRM_CHROME9_PARAM_CAPABILITIES2. */
 /* GEM_CREATE_GUARDED_SHARED and GEM_INFO. */
 #define DRM_CHROME9_CAP2_GUARDED_SHARED		(1ULL << 0)
+/* DRAW_VERTEX_PROGRAM topology TRIANGLE_STRIP and TRIANGLE_FAN. */
+#define DRM_CHROME9_CAP2_VERTEX_TOPOLOGY		(1ULL << 5)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1381,16 +1383,23 @@ struct drm_chrome9_vertex_buffer {
 #define DRM_CHROME9_VERTEX_BFC_CW	(1U << 3)
 #define DRM_CHROME9_VERTEX_BFC_CCW	(1U << 4)
 
+/* Primitive assembly of the vertex or index sequence; values 1..3 are
+ * reserved for points and lines. */
+#define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST	0U
+#define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP	4U
+#define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN	5U
+
 /*
  * fragment carries the complete pixel state with vertices_ptr and
  * triangle_count zero.  viewport holds the final float bits
  * sx sy sz ox oy oz 0 0, where ox/oy include the 786432 snap bias.
- * Stage A sends vertex_count raw vertices (triangle list) packed by
+ * Stage A sends vertex_count raw vertices (in topology order) packed by
  * elements with offsets relative to one vertex.  Stage B (buffer_count
  * non-zero, vertex_count/vertex_stride/vertices_ptr zero) fetches every
  * element from buffers[element.buffer] at offset + element.offset +
  * (index + base_vertex) * stride through index_count 16- or 32-bit
- * triangle list indices.  Offsets and strides are dword aligned, strides
+ * indices.  A list takes a multiple of three vertices, a strip or fan at
+ * least three; strips and fans take no BFC_* flag.  Offsets and strides are dword aligned, strides
  * 0..2044 bytes; stride 0 repeats one element for every vertex.
  */
 struct drm_chrome9_draw_vertex_program {
@@ -1416,7 +1425,7 @@ struct drm_chrome9_draw_vertex_program {
 	__u64 buffers_ptr;
 	/* Enabled CLIP_DISTANCE planes, bits below MAX_CLIP_DISTANCES. */
 	__u32 clip_distance_mask;
-	__u32 pad0;
+	__u32 topology;		/* DRM_CHROME9_VERTEX_TOPOLOGY_* */
 	__u64 reserved[3];
 };
 
