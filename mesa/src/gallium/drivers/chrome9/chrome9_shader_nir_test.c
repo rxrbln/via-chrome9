@@ -2,14 +2,54 @@
 /* Copyright 2026 Chrome9 contributors */
 
 #include "chrome9_context.h"
+#include "chrome9_drm.h"
 #include "chrome9_specialise.h"
 
+#include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "pipe/p_screen.h"
+
+/* Exercise the real context callbacks without opening a DRM node.  No BOs
+ * or GPU submissions are permitted by this deliberately narrow ioctl stub. */
+#define CHROME9_TEST_FD 1909
+static unsigned unexpected_ioctls;
+
+int
+ioctl(int fd, unsigned long request, ...)
+{
+   va_list arguments;
+   void *payload;
+
+   va_start(arguments, request);
+   payload = va_arg(arguments, void *);
+   va_end(arguments);
+   if (fd == CHROME9_TEST_FD && request == DRM_IOCTL_CHROME9_GET_PARAM) {
+      struct drm_chrome9_get_param *param = payload;
+
+      if (param && param->param == DRM_CHROME9_PARAM_CAPABILITIES) {
+         param->value = DRM_CHROME9_CAP_DRAW_TRIANGLE |
+                        DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM;
+         return 0;
+      }
+   }
+   unexpected_ioctls++;
+   errno = ENOTTY;
+   return -1;
+}
+
+static int
+test_screen_fd(struct pipe_screen *screen)
+{
+   (void)screen;
+   return CHROME9_TEST_FD;
+}
 
 static const nir_shader_compiler_options options = {
    .lower_uniforms_to_ubo = true,
@@ -568,6 +608,86 @@ check_vector_conditional_compilation(struct chrome9_context *context,
 }
 
 static bool
+check_canonical_uniform_select_context(void)
+{
+   struct pipe_screen screen = { .get_screen_fd = test_screen_fd };
+   struct pipe_context *pipe = chrome9_context_create(&screen, NULL, 0);
+   struct chrome9_context *ctx;
+   struct chrome9_shader *shader;
+   struct pipe_draw_info info = {
+      .mode = MESA_PRIM_TRIANGLES,
+      .index_size = 2,
+      .has_user_indices = true,
+      .instance_count = 1,
+   };
+   struct pipe_draw_start_count_bias draw = { .count = 3 };
+   bool valid = false;
+
+   if (!pipe)
+      return false;
+   ctx = chrome9_context(pipe);
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-canonical-uniform-select");
+   nir_def *uniform = nir_load_ubo_vec4(&b, 4, 32,
+      nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+   nir_def *predicate = nir_fge(&b,
+      nir_ffract(&b, nir_channel(&b, uniform, 0)),
+      nir_imm_float(&b, 0.5f));
+   nir_def *selected = nir_bcsel(&b, predicate,
+      nir_imm_float(&b, 0.25f), nir_imm_float(&b, 0.75f));
+   struct pipe_shader_state state = {
+      .type = PIPE_SHADER_IR_NIR,
+      .ir.nir = b.shader,
+   };
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b, nir_vec4(&b, selected, selected, selected,
+                                 nir_imm_float(&b, 1.0f)),
+                    nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_nir_find_inlinable_uniforms(b.shader);
+   shader = pipe->create_fs_state(pipe, &state);
+   if (!shader) {
+      ralloc_free(b.shader);
+      goto out;
+   }
+   if (!shader->canonical_supported || !shader->supported ||
+       b.shader->info.num_inlinable_uniforms != 1 ||
+       b.shader->info.inlinable_uniform_dw_offsets[0] != 0)
+      goto out_shader;
+
+   pipe->bind_fs_state(pipe, shader);
+   /* A missing index pointer stops the draw immediately after variant
+    * selection, before draw-module execution or a GPU ioctl. */
+   ctx->vs = shader;
+   for (unsigned i = 0; i < 65; i++) {
+      float scalar = (float)i / 71.0f;
+      uint32_t bits;
+
+      memcpy(&bits, &scalar, sizeof(bits));
+      pipe->set_inlinable_constants(pipe, MESA_SHADER_FRAGMENT, 1, &bits);
+      pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+      if (!shader->supported || shader->variant_count || unexpected_ioctls ||
+          (ctx->warnings & CHROME9_WARN_DRAW_STATE))
+         goto out_shader;
+   }
+   valid = true;
+
+out_shader:
+   ctx->vs = NULL;
+   pipe->bind_fs_state(pipe, NULL);
+   pipe->delete_fs_state(pipe, shader);
+out:
+   if (!valid)
+      fprintf(stderr, "canonical uniform select context fallback failed\n");
+   pipe->destroy(pipe);
+   return valid;
+}
+
+static bool
 check_per_lane_conditional_rejected(struct chrome9_context *context)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -771,6 +891,7 @@ main(void)
        !check_vector_conditional_compilation(&context, 3, false) ||
        !check_vector_conditional_compilation(&context, 4, false) ||
        !check_vector_conditional_compilation(&context, 1, true) ||
+       !check_canonical_uniform_select_context() ||
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
        !check_separable_blur_compilation(&context))
