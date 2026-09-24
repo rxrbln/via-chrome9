@@ -1053,6 +1053,61 @@ out:
 }
 
 static bool
+check_saturated_add_rgb_alpha_split(struct chrome9_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-saturated-add-rgb-alpha-split");
+   struct chrome9_shader shader = { 0 };
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   nir_def *first = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR0);
+   nir_def *second = nir_load_interpolated_input(
+      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+      .io_semantics.location = VARYING_SLOT_VAR1);
+   nir_def *sum = nir_fadd(&b, first, second);
+   nir_def *clamped = nir_fsat(&b, sum);
+   unsigned add_count = 0, sat_count = 0;
+   bool valid;
+
+   b.shader->info.io_lowered = true;
+   nir_store_output(&b,
+      nir_vec4(&b, nir_channel(&b, clamped, 0),
+                nir_channel(&b, clamped, 1),
+                nir_channel(&b, clamped, 2),
+                nir_channel(&b, first, 3)),
+      nir_imm_int(&b, 0), .write_mask = 0xf,
+      .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      const struct chrome9_ps_instruction *instruction =
+         &shader.semantic_fs_ir.instruction[i];
+
+      if (instruction->op == CHROME9_PS_OPCODE_ADD &&
+          !instruction->destination.saturate)
+         add_count++;
+      if (instruction->op == CHROME9_PS_OPCODE_MOV &&
+          instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+          instruction->destination.saturate &&
+          (instruction->destination.writemask & 0x7) == 0x7)
+         sat_count++;
+   }
+   valid = shader.supported && shader.semantic_fs_valid &&
+      shader.semantic_varying_mask == 3 && add_count == 1 && sat_count == 1;
+   if (!valid)
+      fprintf(stderr, "saturated ADD RGB/alpha split failed: "
+              "supported=%u semantic=%u varyings=%x add=%u sat=%u\n",
+              shader.supported, shader.semantic_fs_valid,
+              shader.semantic_varying_mask, add_count, sat_count);
+   ralloc_free(b.shader);
+   return valid;
+}
+
+static bool
 check_per_lane_conditional_rejected(struct chrome9_context *context)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -1556,6 +1611,7 @@ main(void)
        !check_equal_zero_select_compilation(&context, 1.0f, false) ||
        !check_canonical_uniform_select_context() ||
        !check_front_face_variant_context() ||
+       !check_saturated_add_rgb_alpha_split(&context) ||
        !check_per_lane_conditional_rejected(&context) ||
        !check_blinn_phong_integer_power(&context) ||
        !check_function_medium_sqrt_boundary(&context) ||

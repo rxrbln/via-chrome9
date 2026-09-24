@@ -3496,6 +3496,12 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    case nir_op_mov:
       return chrome9_ps_lower_alu_source(builder, &alu->src[0], components,
                                          source);
+   case nir_op_fsat:
+      /* Keep saturation on a distinct instruction: the producer may have
+       * other unsaturated users or only some lanes may be clamped. */
+      op = CHROME9_PS_OPCODE_MOV;
+      source_count = 1;
+      break;
    case nir_op_fmul:
       op = CHROME9_PS_OPCODE_MUL;
       source_count = 2;
@@ -3594,6 +3600,7 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
    native->destination.file = CHROME9_PS_DESTINATION_TEMP;
    native->destination.id = temp;
    native->destination.writemask = (1u << components) - 1;
+   native->destination.saturate = alu->op == nir_op_fsat;
    for (unsigned s = 0; s < source_count; s++)
       native->source[s] = operands[s];
    builder->value[value].complete = true;
