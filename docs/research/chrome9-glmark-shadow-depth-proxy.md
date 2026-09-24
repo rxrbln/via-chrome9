@@ -243,3 +243,20 @@ risk is numeric exceptional-value handling rather than a new packet class.
 The reciprocal-zero result itself is not bit-readable through the normalized
 render target, so a passing color result qualifies only the complete
 RCP/SUB/CMP path used by the test.
+
+### Runnable subnormal gate
+
+`tools/re/chrome9_cmp_guard_smoke.c` now implements the two finite
+discriminators above as `--subnormal-lt` and
+`--subnormal-lt-reverse`.  Both modes use exactly two semantic records:
+full-lane `SUB t0,c0,c1`, followed by
+`CMP oC0,t0,c2.xxxx,c2.yyyy`.  Packing false `.25` and true `.75` into one
+constant register avoids the independently recovered three-distinct-register
+limit on a single ALU record.  The forward/reverse expected host BGRA words
+are `bfbf40bf` and `4040bf40`, respectively.
+
+The tool builds under strict host warnings with the current UAPI.  It retains
+the existing BGRA+D16 leading/trailing guard checks, triangle-exterior check,
+and bounded render-node interface.  It has not been submitted to a GPU.  A
+timeout or engine quarantine on the forward case ends the experiment; do not
+run the reverse case afterward.
