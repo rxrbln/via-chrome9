@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include <linux/build_bug.h>
 #include <linux/dma-fence.h>
@@ -1634,9 +1635,22 @@ static u32 chrome9_fragment_varying_link(u32 width)
 	return link[width];
 }
 
+/* Texture state caps PS consumer fields at three, as ComputeTexDim does,
+ * but a direct ALU read of W must keep the fourth produced lane.
+ */
+static u32 chrome9_fragment_consumer_width(u32 producer_width,
+	u32 texture_count, const u8 *alu_width, unsigned int varying)
+{
+	u32 cap = texture_count ? 3 : 4;
+
+	if (alu_width)
+		cap = max_t(u32, cap, alu_width[varying]);
+	return min(producer_width, cap);
+}
+
 static u32 chrome9_fragment_raster_state(
 		u32 varying_count, const u8 *varying_width, u32 texture_count,
-		u32 vertex_count,
+		const u8 *alu_width, u32 vertex_count,
 		u32 raster[40])
 {
 	static const u32 zero_varying[] = {
@@ -1687,12 +1701,10 @@ static u32 chrome9_fragment_raster_state(
 		u32 shift = 12 - 4 * (varying & 3);
 		u32 producer = chrome9_fragment_varying_link(
 			varying_width[varying]);
-		/* A25/A26 describe the VS producer.  A28/A29 describe the
-		 * programmable PS consumer after ComputeTexDim's three-component
-		 * cap when a texture-state object is present.
-		 */
-		u32 consumer = chrome9_fragment_varying_link(min_t(u8,
-			varying_width[varying], texture_count ? 3 : 4));
+		/* A25/A26 describe the VS producer, A28/A29 the PS consumer. */
+		u32 consumer = chrome9_fragment_varying_link(
+			chrome9_fragment_consumer_width(varying_width[varying],
+				texture_count, alu_width, varying));
 
 		if (varying < 4) {
 			a25 |= producer << shift;
@@ -1740,13 +1752,13 @@ static int chrome9_fragment_raster_selftest(void)
 	u32 count;
 	unsigned int varying_count;
 
-	count = chrome9_fragment_raster_state(0, NULL, 0, 3, raster);
+	count = chrome9_fragment_raster_state(0, NULL, 0, NULL, 3, raster);
 	if (count != ARRAY_SIZE(expected_zero_varying) ||
 	    memcmp(raster, expected_zero_varying,
 		   sizeof(expected_zero_varying)))
 		return -EINVAL;
-	count = chrome9_fragment_raster_state(ARRAY_SIZE(width), width, 0, 3,
-		raster);
+	count = chrome9_fragment_raster_state(ARRAY_SIZE(width), width, 0,
+		NULL, 3, raster);
 	if (count != 28 || raster[0] != 0x00000309 ||
 	    raster[4] != 0x04006382 || raster[5] != 0x1200000f ||
 	    raster[7] != 0x623081ff || raster[10] != 0x24000003 ||
@@ -1781,7 +1793,7 @@ static int chrome9_fragment_raster_selftest(void)
 				}
 			}
 			count = chrome9_fragment_raster_state(varying_count, widths,
-				0, 3, raster);
+				0, NULL, 3, raster);
 			if (count != 27 + varying_count ||
 			    raster[0] != ((2 + varying_count) << 8 | stride) ||
 			    raster[6 + varying_count] !=
@@ -1807,21 +1819,25 @@ static int chrome9_fragment_raster_selftest(void)
 		static const u8 mixed_width[] = { 4, 2, 3 };
 		static const u8 fifth_float4[] = { 2, 2, 2, 2, 4 };
 
-		count = chrome9_fragment_raster_state(1, float4_width, 1, 3,
+		count = chrome9_fragment_raster_state(1, float4_width, 1, NULL, 3,
 			raster);
 		if (count != 28 || raster[11] != 0x25f6f000 ||
 		    raster[13] != 0x28ffe000 ||
-		    chrome9_fragment_raster_state(1, float4_width, 0, 3,
+		    chrome9_fragment_raster_state(1, float4_width, 0, NULL, 3,
 						 raster) != 28 ||
 		    raster[11] != 0x25f6f000 ||
 		    raster[13] != 0x28fff000)
 			return -EINVAL;
-		count = chrome9_fragment_raster_state(3, mixed_width, 1, 3,
+		if (chrome9_fragment_raster_state(1, float4_width, 1,
+						 float4_width, 3, raster) != 28 ||
+		    raster[11] != 0x25f6f000 || raster[13] != 0x28fff000)
+			return -EINVAL;
+		count = chrome9_fragment_raster_state(3, mixed_width, 1, NULL, 3,
 			raster);
 		if (count != 30 || raster[13] != 0x25f6fce0 ||
 		    raster[15] != 0x28ffece0)
 			return -EINVAL;
-		count = chrome9_fragment_raster_state(5, fifth_float4, 1, 3,
+		count = chrome9_fragment_raster_state(5, fifth_float4, 1, NULL, 3,
 			raster);
 		if (count != 32 || raster[15] != 0x25f6cccc ||
 		    raster[16] != 0x2600f000 ||
@@ -1834,7 +1850,8 @@ static int chrome9_fragment_raster_selftest(void)
 
 static int chrome9_fragment_fe_config(u32 active_texture_count,
 	u32 texture_count, u32 varying_count,
-	const u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS], u32 config[10])
+	const u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS],
+	const u8 *alu_width, u32 config[10])
 {
 	/* These are self-addressed register words.  Write A02/A03 on every
 	 * draw so a smaller next program cannot inherit stale high FE fields.
@@ -1858,12 +1875,8 @@ static int chrome9_fragment_fe_config(u32 active_texture_count,
 	config[2] |= varying_count;
 	for (i = 0; i < varying_count; i++) {
 		u32 producer_width = varying_width[i];
-		/* An ALU-only float4 consumer is live-qualified at width four.
-		 * A programmable draw with descriptors takes the vendor's
-		 * three-component ComputeTexDim cap for every compact FE field.
-		 */
-		u32 consumer_width = min_t(u32, producer_width,
-					   texture_count ? 3 : 4);
+		u32 consumer_width = chrome9_fragment_consumer_width(
+			producer_width, texture_count, alu_width, i);
 		u32 consumer_word = i < 3 ? 1 : i < 6 ? 8 : 9;
 		u32 consumer_shift = (i < 3 ? i : i < 6 ? i - 3 : i - 6) * 8;
 		u32 word, shift;
@@ -1933,7 +1946,7 @@ static int chrome9_fragment_fe_config_selftest(void)
 	u32 config[10];
 	unsigned int i;
 
-	if (chrome9_fragment_fe_config(0, 0, 0, empty_width, config))
+	if (chrome9_fragment_fe_config(0, 0, 0, empty_width, NULL, config))
 		return -EINVAL;
 	if (config[0] != 0x00000001 || config[1] != 0x01002521 ||
 	    config[2] != 0x08010100 ||
@@ -1943,7 +1956,7 @@ static int chrome9_fragment_fe_config_selftest(void)
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		if (chrome9_fragment_fe_config(cases[i].count, 0,
 					       cases[i].count, cases[i].width,
-					       config))
+					       NULL, config))
 			return -EINVAL;
 		if (config[0] != (cases[i].count << 4 | 1) ||
 		    config[1] != cases[i].a01 ||
@@ -1955,7 +1968,7 @@ static int chrome9_fragment_fe_config_selftest(void)
 	/* A sparse sampler or an ALU-produced TAU coordinate does not add a
 	 * vertex-shader output to A08.
 	 */
-	if (chrome9_fragment_fe_config(1, 1, 0, empty_width, config) ||
+	if (chrome9_fragment_fe_config(1, 1, 0, empty_width, NULL, config) ||
 	    config[0] != 0x00000011 || config[1] != 0x01002521 ||
 	    config[2] != 0x08010100 || config[6] != 0x09000000 ||
 	    config[7] != 0x0a000000 || config[8] != 0x02000000 ||
@@ -1963,36 +1976,41 @@ static int chrome9_fragment_fe_config_selftest(void)
 		return -EINVAL;
 	/* A textured float3/float4 T0 is capped at three components.
 	 */
-	if (chrome9_fragment_fe_config(1, 1, 1, packed3_width, config) ||
+	if (chrome9_fragment_fe_config(1, 1, 1, packed3_width, NULL, config) ||
 	    config[1] != 0x01002522 || config[2] != 0x08010201 ||
-	    chrome9_fragment_fe_config(1, 1, 1, packed4_width, config) ||
+	    chrome9_fragment_fe_config(1, 1, 1, packed4_width, NULL, config) ||
 	    config[1] != 0x01002522 || config[2] != 0x08010301)
+		return -EINVAL;
+	/* A direct ALU W read keeps textured float4 T0 at four components. */
+	if (chrome9_fragment_fe_config(1, 1, 1, packed4_width, packed4_width,
+				       config) ||
+	    config[1] != 0x01002523 || config[2] != 0x08010301)
 		return -EINVAL;
 	/* ALU T0 precedes sampled T1, with the cap applied to each FE field.
 	 */
-	if (chrome9_fragment_fe_config(2, 1, 2, mixed_width, config) ||
+	if (chrome9_fragment_fe_config(2, 1, 2, mixed_width, NULL, config) ||
 	    config[1] != 0x01002522 ||
 	    config[2] != 0x08010302)
 		return -EINVAL;
 	/* One MAD can read three T slots while using one active resource. */
 	if (chrome9_fragment_fe_config(1, 0, cases[4].count,
-				       cases[4].width, config) ||
+				       cases[4].width, NULL, config) ||
 	    config[0] != 0x00000011 || config[2] != cases[4].a08)
 		return -EINVAL;
 	/* Five direct float2 inputs use A01 then A02; a later one-input draw
 	 * resets both A02 and A03 instead of inheriting the prior map.
 	 */
-	if (chrome9_fragment_fe_config(5, 5, 5, five_float2, config) ||
+	if (chrome9_fragment_fe_config(5, 5, 5, five_float2, NULL, config) ||
 	    config[1] != 0x01292521 || config[8] != 0x0200312d ||
 	    config[9] != 0x03000000 ||
-	    chrome9_fragment_fe_config(1, 1, 1, five_float2, config) ||
+	    chrome9_fragment_fe_config(1, 1, 1, five_float2, NULL, config) ||
 	    config[1] != 0x01002521 || config[8] != 0x02000000 ||
 	    config[9] != 0x03000000)
 		return -EINVAL;
 	/* The terrain-sized mixed-width map is capped per physical input, not
 	 * by the dimensions of the five logical sampler descriptors.
 	 */
-	if (chrome9_fragment_fe_config(5, 5, 4, terrain_width, config) ||
+	if (chrome9_fragment_fe_config(5, 5, 4, terrain_width, NULL, config) ||
 	    config[1] != 0x012a2622 || config[8] != 0x0200002d ||
 	    config[9] != 0x03000000 || config[2] != 0x08030304 ||
 	    config[6] != 0x09000103)
@@ -2130,7 +2148,7 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 		return -EINVAL;
 	ret = chrome9_fragment_fe_config(program->active_texture_count,
 		program->texture_count, program->varying_count,
-		program->varying_width, config);
+		program->varying_width, program->varying_alu_width, config);
 	if (ret)
 		return ret;
 	vs_control[0] = 0x60800000 | (3 + program->varying_count);
@@ -2186,8 +2204,8 @@ static int chrome9_build_fragment_program(struct chrome9_engine *engine,
 
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	raster_count = chrome9_fragment_raster_state(program->varying_count,
-		program->varying_width, program->texture_count, vertex_count,
-		raster);
+		program->varying_width, program->texture_count,
+		program->varying_alu_width, vertex_count, raster);
 	memcpy(vs_program, vs_prefix, sizeof(vs_prefix));
 	for (i = 0; i < program->varying_count; i++) {
 		u32 *record = vs_program + 16 + i * 4;

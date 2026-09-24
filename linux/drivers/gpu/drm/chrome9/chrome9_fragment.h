@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef __CHROME9_FRAGMENT_H__
 #define __CHROME9_FRAGMENT_H__
 
@@ -16,6 +17,7 @@ struct chrome9_fragment_program {
 	u8 tau_coordinate_mask;
 	u8 varying_logical[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u8 varying_alu_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u32 controls[12];
 	u32 alu[DRM_CHROME9_FRAGMENT_MAX_ALU][4];
 	u32 tau[DRM_CHROME9_FRAGMENT_MAX_TAU];

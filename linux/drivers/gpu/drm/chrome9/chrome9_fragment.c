@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
@@ -37,6 +38,7 @@ struct chrome9_fragment_state {
 	u8 position_slots[DRM_CHROME9_FRAGMENT_MAX_ALU];
 	bool position_used;
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+	u8 alu_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_varying[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_instruction[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
 	u8 coordinate_last_tau[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
@@ -144,7 +146,8 @@ static int chrome9_fragment_validate_source(
 }
 
 static void chrome9_fragment_note_varying(struct chrome9_fragment_state *state,
-	const struct drm_chrome9_fragment_source *source, u8 component_mask)
+	const struct drm_chrome9_fragment_source *source, u8 component_mask,
+	bool alu)
 {
 	u8 width = 1;
 	unsigned int component;
@@ -158,6 +161,9 @@ static void chrome9_fragment_note_varying(struct chrome9_fragment_state *state,
 	state->varying_mask |= BIT(source->index);
 	state->varying_width[source->index] =
 		max(state->varying_width[source->index], width);
+	if (alu)
+		state->alu_varying_width[source->index] =
+			max(state->alu_varying_width[source->index], width);
 }
 
 static u8 chrome9_fragment_alu_component_mask(
@@ -321,7 +327,8 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			for (source = 0; source < source_count; source++)
 				chrome9_fragment_note_varying(state,
 					&instruction->src[source],
-					chrome9_fragment_alu_component_mask(instruction));
+					chrome9_fragment_alu_component_mask(instruction),
+					true);
 		if (instruction->dst.file == DRM_CHROME9_FRAGMENT_DEST_TEMP)
 			state->defined_mask[instruction->dst.index] |=
 				instruction->dst.writemask;
@@ -339,7 +346,8 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 					if (coordinate->swizzle[source] >
 					    DRM_CHROME9_FRAGMENT_SWIZZLE_W)
 						return -EINVAL;
-				chrome9_fragment_note_varying(state, coordinate, 0x3);
+				chrome9_fragment_note_varying(state, coordinate, 0x3,
+						      false);
 			} else {
 				bridge_count++;
 			}
@@ -1190,6 +1198,7 @@ static int chrome9_fragment_compile_internal(
 			continue;
 		program->varying_logical[packed] = i;
 		program->varying_width[packed] = state.varying_width[i];
+		program->varying_alu_width[packed] = state.alu_varying_width[i];
 		program->varying_count++;
 	}
 	if (constant_count)
@@ -1824,6 +1833,8 @@ static int chrome9_fragment_shadow_prefix_selftest(
 	if (ret || program->alu_count != ARRAY_SIZE(expected_alu) ||
 	    program->tau_count != 1 || program->tau[0] != 0x301211b0 ||
 	    program->active_texture_count != 1 ||
+	    program->varying_width[0] != 4 ||
+	    program->varying_alu_width[0] != 4 ||
 	    memcmp(program->alu, expected_alu, sizeof(expected_alu)) ||
 	    memcmp(program->controls, expected_controls,
 		   sizeof(expected_controls)))
