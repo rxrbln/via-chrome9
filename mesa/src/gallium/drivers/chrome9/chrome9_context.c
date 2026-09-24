@@ -6718,7 +6718,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       debug_get_bool_option("CHROME9_TCL", false);
    ctx->tcl_buffers = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_BUFFERS) &&
-      debug_get_bool_option("CHROME9_TCL_BUFFERS", false);
+      debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =
