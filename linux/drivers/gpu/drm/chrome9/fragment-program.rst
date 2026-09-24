@@ -25,6 +25,16 @@ coordinate is rejected.  Lifetime markers are derived only after physical
 allocation and cover the last read of a physical slot across the whole
 program.
 
+The ``FRAGMENT_EXTENDED_LINKAGE`` capability means that each structured draw
+also writes the ordered direct-input FE fields A01--A03 and accepts up to
+eight descriptor slots.  Direct ALU and TAU reads share the same ascending
+logical-T order; the sampler selected by a TAU does not determine its FE
+field.  Textured draws cap each consumer width at three components, while
+the independently qualified ALU-only path retains a four-component width.
+Every draw writes the inactive A02/A03 baseline to prevent stale high fields
+after a program with fewer inputs.  This capability is absent from older
+kernels whose FE image only programs the first consumer field.
+
 The smallest computed-coordinate production oracle is::
 
   ALU 008106d0 d0140924 00308006 00000020
