@@ -1,7 +1,7 @@
 # Chrome9 glmark2 desktop blur compiler boundary
 
-Status: source-exact compiler test and bounded live GPU run; pixel-exact
-blur correctness remains unproven.
+Status: source-exact compiler test, bounded live scene, and a deterministic
+two-pass GPU-versus-CPU blur pixel oracle; full scene validation remains open.
 
 This note closes the static compiler envelope for the default glmark2 desktop
 blur and identifies the first independently implementable generic Mesa gate.
@@ -236,11 +236,40 @@ SHA-256 was
 The captured target frame is retained at
 `/root/tmp/chrome9-live/literal-pack/desktop-blur-frame.png`.
 
+The default four-window form, using the same blur radius, passes, and
+separable setting with `nframes=2`, also exited normally at 640x480. It
+reported 14 FPS and 75.524 ms frame time, with no new Chrome9 fault in the
+bounded kernel log check. Its target log is
+`/root/tmp/chrome9-live/literal-pack/desktop-blur-four.log`. This is an
+execution check, not a correctness reference or performance result for a
+long-running workload.
+
 The frame visibly contains the logo, colored tiles, and moving Tux window
 in the expected 640x480 region. A same-size llvmpipe capture has the same
 scene composition, but the captures were taken at different animation times
 and are not a pixel reference. glmark2 `--validate` reported
 `Validation: Unknown`. Thus this is an execution and qualitative rendering
 milestone, **not** proof of exact eleven-tap filtering, vertical-pass
-correctness, or all desktop-scene variants. The next correctness gate is a
-deterministic nonuniform texture and CPU eleven-tap oracle.
+correctness, or all desktop-scene variants. The separate deterministic blur
+oracle below closes the first two of those pixel questions.
+
+## Deterministic two-pass pixel oracle
+
+`tools/chrome9_egl_blur_oracle.c` renders a nonuniform RGBA8 source through
+the captured 300x300 horizontal and vertical eleven-tap GLSL blur programs.
+The first pass writes a BGRA/RGBA FBO texture, which is sampled by the second;
+both outputs are read back and checked against a CPU reference at twelve
+interior points. The shader uses the exact captured FP32 tap offsets and
+Gaussian weights. A five-level RGB tolerance accounts for permitted linear
+filter precision and 8-bit intermediate quantization; alpha must match
+exactly. A locally tested llvmpipe run had maximum RGB delta 1/0 for the
+horizontal/vertical passes.
+
+The target-native build ran through EGL on X and reported the actual Chrome9
+GL 2.1 renderer, not llvmpipe. Both passes passed with maximum RGB delta 1,
+and no new kernel fault appeared. The target log and source are retained at
+`/root/tmp/chrome9-live/blur-oracle/`; the tested source SHA-256 is
+`0f3fd9a0c7cc0ae051ef4207cbea25ee57d7456f31e6bee5989bad6ef019b862`.
+This qualifies the tested two-pass shader, linear sampling, and FBO-to-texture
+chain at those points. It does not prove every pixel, arbitrary blur sizes,
+desktop composition/blending, or all glmark2 variants.

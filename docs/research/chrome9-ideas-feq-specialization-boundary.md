@@ -141,10 +141,12 @@ A safe generic extension should walk only boolean predicates that actually
 control a `bcsel` (including a bounded `iand` tree), collect the uniform
 leaves through the existing constant-offset UBO rules, and keep the exact
 draw-time bits in the variant key.  It should not inline every uniform in a
-large arithmetic shader.  With the three light `w` dwords keyed to zero, NIR
-must fold all light FEQs, eager light reciprocals, and their dead general
-arms.  The remaining shared vertex FEQ must stay until linked-stage constant
-provenance exists.
+large arithmetic shader.  In the captured compact lamp layout the three
+loads have vec4 bases 0, 1, and 2, so the exact prospective dword offsets are
+`{3,7,11}`; these are UBO dword offsets, not GLSL uniform locations.  With
+those three dwords keyed to zero, NIR must fold all light FEQs, eager light
+reciprocals, and their dead general arms.  The remaining shared vertex FEQ
+must stay until linked-stage constant provenance exists.
 
 ## Smallest Linux production objects
 
@@ -236,4 +238,3 @@ exact submitted records, guarded color/depth BOs, and known-good draws before
 and after.  Until the linked exact-one fact and its interpolation contract
 are implemented, this remains an offline compiler task and generic FEQ stays
 fail-closed.
-
