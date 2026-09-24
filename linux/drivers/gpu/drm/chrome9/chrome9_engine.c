@@ -667,7 +667,9 @@ static int chrome9_build_prime(struct chrome9_engine *engine,
 #define CHROME9_FIXED_QUAD_VS_MASK (DRM_CHROME9_FIXED_QUAD_VS_ORACLE | \
 				    DRM_CHROME9_FIXED_QUAD_VS_W2 | \
 				    DRM_CHROME9_FIXED_QUAD_VS_HALF | \
-				    DRM_CHROME9_FIXED_QUAD_VS_M4X4)
+				    DRM_CHROME9_FIXED_QUAD_VS_M4X4 | \
+				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE | \
+				    DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR)
 
 /*
  * Byte-exact vendor compiler records (hw-TCL corpus out_d0_d1 and
@@ -724,6 +726,21 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 		0x40000000, 0xc0000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
 		0xc0000000, 0xc0000000, 0, 0x40000000, 0xffff0000, 0xffff0000,
 	};
+	static const u32 clip_wide[] = {
+		0xc0800000, 0x40800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x40800000, 0x40800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0x40800000, 0xc0800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+		0xc0800000, 0xc0800000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
+	};
+	/* (-.5,-.5,.5,1), (.5,-.5,.5,1), (0,.5,-.125,-.25): z = w/2. */
+	static const u32 clip_near[] = {
+		0xbf000000, 0xbf000000, 0x3f000000, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x3f000000, 0xbf000000, 0x3f000000, 0x3f800000,
+		0xffff0000, 0xffff0000,
+		0x00000000, 0x3f000000, 0xbe000000, 0xbe800000,
+		0xffff0000, 0xffff0000,
+	};
 	static const u32 pixel[] = {
 		0x00000000, 0x00000000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
 		0x42000000, 0x00000000, 0, 0x3f800000, 0xffff0000, 0xffff0000,
@@ -745,9 +762,15 @@ static void chrome9_fixed_vs_oracle(u32 flags, struct chrome9_quad_vs *vs)
 		vs->user_dwords = ARRAY_SIZE(pixel_to_clip);
 	}
 	vs->vertices = matrix ? pixel :
-		       flags == DRM_CHROME9_FIXED_QUAD_VS_W2 ? clip_w2 : clip_w1;
-	vs->a24 = flags == DRM_CHROME9_FIXED_QUAD_VS_HALF ? 0x24000003 :
-							     0x24000004;
+		       flags == DRM_CHROME9_FIXED_QUAD_VS_W2 ? clip_w2 :
+		       flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ? clip_wide :
+		       flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR ? clip_near :
+		       clip_w1;
+	vs->a24 = flags == DRM_CHROME9_FIXED_QUAD_VS_HALF ||
+		  flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR ? 0x24000003 :
+								0x24000004;
+	vs->clip = flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ||
+		   flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR;
 	vs->vertex_dwords = (vs->a24 & 0xff) * 6;
 }
 
@@ -3725,6 +3748,9 @@ static bool chrome9_verify_target(struct chrome9_job *job, u32 flags)
 		if (target[i] != CHROME9_TARGET_SENTINEL)
 			changed++;
 	}
+	if (flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_WIDE ||
+	    flags == DRM_CHROME9_FIXED_QUAD_VS_CLIP_NEAR)
+		return true;
 	if (flags == DRM_CHROME9_FIXED_QUAD_GOURAUD_TRIANGLE ||
 	    flags == DRM_CHROME9_FIXED_QUAD_VS_HALF)
 		return changed >= 400 && changed <= 600 &&

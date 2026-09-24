@@ -199,6 +199,7 @@ struct chrome9_quad_vs {
 	const u32 *vertices;
 	unsigned int vertex_dwords;
 	u32 a24;
+	bool clip;
 };
 
 void chrome9_emit_3d_quad_h6_vs(u32 **cursor, unsigned long target,

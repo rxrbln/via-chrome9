@@ -844,6 +844,8 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		0xffff0000, 0xffff0000,
 	};
 	u32 fvf[ARRAY_SIZE(raster_fvf)];
+	u32 clip_config[ARRAY_SIZE(config)];
+	unsigned int i;
 	u32 state[] = {
 		0x50000000 | (target >> 8),
 		0x51000000 | (system_framebuffer ? BIT(20) : 0),
@@ -858,12 +860,32 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
 			     state, ARRAY_SIZE(state));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0xfe020000,
-			     config, ARRAY_SIZE(config));
+			     vs && vs->clip ? clip_config : config,
+			     ARRAY_SIZE(config));
 	memcpy(fvf, raster_fvf, sizeof(fvf));
 	if (vs) {
 		fvf[7] = vs->a62;
 		fvf[10] = vs->a24;
 	}
+	if (vs && vs->clip) {
+		/*
+		 * The clip engine reads its own copy of rows 256/257: low 24
+		 * bits per word, exponent bytes packed into A42/A45/A48.
+		 */
+		for (i = 0; i < 3; i++) {
+			u32 scale = vs->internal[i];
+			u32 offset = vs->internal[4 + i];
+
+			fvf[13 + 3 * i] = (0x40 + 3 * i) << 24 |
+					  (scale & 0x00ffffff);
+			fvf[14 + 3 * i] = (0x41 + 3 * i) << 24 |
+					  (offset & 0x00ffffff);
+			fvf[15 + 3 * i] = (0x42 + 3 * i) << 24 |
+					  (offset >> 24) << 8 | scale >> 24;
+		}
+	}
+	memcpy(clip_config, config, sizeof(config));
+	clip_config[1] |= 0x800;
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00040000,
 			     fvf, ARRAY_SIZE(fvf));
 	if (constants32) {
