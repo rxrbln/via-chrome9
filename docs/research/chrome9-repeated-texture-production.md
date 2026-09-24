@@ -158,49 +158,140 @@ general A00 = ((high_water << 4) & 000000fe) | 1
 general A08 = 08010100 | (high_water & 00fefeff)
 ```
 
-Consequently a sparse stage set ending at s5 must retain high-water six and
-use A00=`00000061`, not popcount-five A00=`00000051`.  Its final A01--A03 and
-A08--A0a coordinate linkage must describe the compiler-allocated physical
-coordinates; the TAU sampler nibble alone does not create that linkage.  This
-six-stage sparse combination is exact static/compiler evidence and still
-requires a distinct-color live state-closure test.
+Consequently the *fixed-function* sparse stage set ending at s5 retains
+high-water six and uses A00=`00000061`, not popcount-five A00=`00000051`.
+Do not carry that inference into the programmable path.  The later compiler
+and Windows-runtime differential proves programmable A00 bits 7:4 come from
+compiled metadata `+0x34`, `stmGetActiveTexTmpNum`'s active
+texture-temporary resource count.  Sparse `TEX(s5,T5)` has `+0x34=1` even
+though its sampler high-water is six.  Programmable coordinate linkage and
+sampler identity remain independently finalized.
 
 ### Sparse-stage ABI audit
 
-The high-water rule applies to the semantic draw ABI as well as to A00/A08.
-`texture_count` cannot mean the population count of active samplers when TAU
-records retain their logical sampler ids.  The production sparse object above
-uses sampler nibbles `0,1,2,4,5`; its required count is therefore six.  A
-five-element compact descriptor array would either make sampler five fail the
-range check or silently bind it to the wrong resource.
+The current ABI-v1 descriptor contract independently uses sampler high-water:
 
-The current clean-room paths expose that mismatch exactly:
+* Mesa's generic vertex-layout setup uses
+  `chrome9_fragment_sampler_high_water(semantic_sampler_mask)`, so mask
+  `0x37` produces `texture_count=6`, not popcount five.
+* Mesa explicitly rejects a generic draw unless
+  `chrome9_fragment_sampler_slots_dense()` is true.  It does not compact a
+  sparse program or submit a fabricated descriptor.
+* The kernel requires each TEX sampler to be below `texture_count`, then
+  requires `texture_count == fls(compiled_sampler_mask)`.  It validates,
+  looks up, maps, and emits every descriptor index below that count.
 
-* Mesa `chrome9_draw.c:241..243` assigns the generic draw's
-  `texture_count = popcount(semantic_sampler_mask)`, and
-  `chrome9_fragment_sampler_unit()` compacts set bits into dense descriptor
-  indices.
-* The kernel `chrome9_fragment.c:197` requires every native sampler id to be
-  below `texture_count`, and `:269` independently requires
-  `texture_count == fls(sampler_mask)`.
-
-The implementation invariant is consequently:
+Thus the exact safe ABI-v1 invariant is:
 
 ```text
 texture_count = sampler_mask ? fls(sampler_mask) : 0
 descriptor index = logical sampler id
+sampler_mask = (1 << texture_count) - 1
 ```
 
-The present UAPI cannot express that rule safely: it has neither an active
-mask nor a logical index in each descriptor, and the kernel validates, maps,
-and emits every element through `texture_count`.  Do not fill holes by
-renumbering active descriptors, and do not invent a hidden dummy BO contract.
-Until the ABI grows either an active-slot mask over a high-water-sized array or
-explicit logical indices, reject sparse programs.  In the successor ABI every
-set bit must have one complete image/sampler state pair and retained BO, while
-holes emit closed state and own no BO.  The TAU sampler nibble must remain the
-logical id.  This rule is required by terrain's fragment units `0,1,2,4,5`; it
-is not a terrain-specific special case.
+The present UAPI cannot represent mask `0x37` without pretending slot 3 is a
+live fragment resource.  Supplying a dummy or merely application-bound slot-3
+BO is not an acceptable contract: fragment liveness must not depend on an
+unreferenced vertex texture, and ABI v1 makes the kernel enable and retain
+every supplied descriptor.
+
+#### Recommended ABI v2: compact states with explicit units
+
+Prefer a compact descriptor array carrying an explicit logical unit over
+either compiler-side TAU renumbering or high-water-sized holes.  Under a new,
+capability-negotiated ABI version, reinterpret
+`drm_chrome9_fragment_texture_state.reserved0` as `unit` and submit terrain as:
+
+```text
+texture_count = 5
+descriptor index       0  1  2  3  4
+descriptor unit        0  1  2  4  5
+compiled TAU sampler   0  1  2  4  5
+descriptor mask        0x37
+```
+
+The descriptor array remains compact for validation, BO lookup, reservation,
+mapping, and `texture_base[i]`.  Only native state selection uses `unit`:
+
+```text
+image H2 selector       = unit << 24 | 00020000
+sampler H2 selector     = unit << 24 | 20020000
+mip H3 selector         = 10030000 | unit << 3
+```
+
+Require units below eight, strictly increasing and unique.  Build a descriptor
+mask from them and require exact equality with the sampler mask collected from
+all semantic TEX records.  A TEX is valid only if its sampler bit is present,
+not merely if its numeric id is below `texture_count`.  Repeated TEX records
+for one unit share its single descriptor.  Every compact entry still carries
+one complete image/sampler pair and one retained read-only BO; no inactive
+entry exists.
+
+This preserves the vendor-observed sparse sampler nibbles and state selectors.
+Renumbering TAU samplers to 0..4 could keep ABI v1 dense, but no recovered
+VX900 object demonstrates that transformation and it would require a second
+logical-to-physical map to pack Gallium views and sampler states in exact
+lockstep with every shader variant.  A high-water array plus active mask is
+larger and additionally needs a proved rule for closing or retaining skipped
+hardware stages.  The explicit-unit compact form avoids both uncertainties.
+
+ABI compatibility must remain explicit.  ABI v1 continues to require
+`texture_state.reserved0=0`, dense units equal to array indices, and the exact
+rules above.  A new capability bit advertises ABI-v2 sparse-unit support; Mesa
+uses v2 only after observing it and otherwise retains the current rejection.
+The kernel accepts both versions rather than silently changing all existing
+draws.  Dense draws may continue using v1 even on a v2 kernel.
+
+Kernel-side v2 validation should derive the descriptor mask before compiling,
+pass that mask into semantic validation, and require the compiler's final
+sampler mask to equal it.  The emitter uses compact index `i` for
+`fragment_textures[i]` and `texture_base[i]`, but the validated unit for all
+three native selectors.  Userspace must similarly gather each descriptor's
+view and sampler state from that logical unit, reject a missing half of the
+pair, and include the ordered unit list in the batch state key.  Depth-texture
+view swizzles remain indexed by logical TEX sampler id: build
+`depth_sampler_mask` and `depth_swizzle[unit]` before compact packing, then
+apply them to instructions whose sampler nibble is that same logical unit.
+
+The following negative cases are required before exposing the capability:
+
+* duplicate, descending, or out-of-range units;
+* a TEX unit missing from the descriptor mask or an unused descriptor unit;
+* a null/invalid view, sampler state, handle, level, or format at any listed
+  unit;
+* a descriptor unit changed without a batch flush, or a shader variant whose
+  sampler mask no longer matches the packed state;
+* ABI v1 carrying a nonzero texture `reserved0`, ABI v2 on a kernel without
+  the advertised capability, and any unknown ABI version.
+
+The offline ladder is deliberately split across layers:
+
+1. Host kernel tests reject duplicate, descending, and unit>=8 descriptor
+   lists, missing or extra descriptor-mask bits, nonzero v1 `reserved0`, and
+   every v2/compiler sampler-mask mismatch.
+2. Packet selftests use compact entries for units four and five and require
+   their image/sampler H2 selectors and mip H3 selectors to carry the logical
+   unit while image bases still come from compact indices zero and one.
+3. Mesa's mask-`0x37` test keeps TEX sampler ids 0,1,2,4,5, emits descriptor
+   units `[0,1,2,4,5]`, does not inspect null slot 3, rejects a missing active
+   view or sampler state, and keeps depth-view swizzling keyed by logical id.
+4. Dense ABI-v1 masks and byte layout remain unchanged; repeated TEX uses
+   still emit one descriptor for their one logical unit.
+
+The guarded live ladder starts with one descriptor carrying unit five and one
+`TEX s5`, with compiler-resource A00 count one.  Next prove sparse pairs,
+then the full five-stage program with distinguishable constant colors and
+unequal combination weights.  Finally execute a six-high-water sparse draw
+followed by a one-unit draw to catch stale state closure.  Every rung checks
+color/depth guards, all retained BO guards, retirement/error counters, and
+engine state; do not jump directly to the five-stage terrain-sized case.
+
+Keep programmable A00 on the compiler-derived active texture-temporary
+resource count; neither compact descriptor population nor logical sampler
+high-water is its input.  The 32-TEX instruction capacity is likewise
+separate from this stage namespace and from the currently promoted three
+sampler slots.  Terrain's five fragment samplers therefore remain a future
+capability gate even after the ABI representation is correct.
 
 ## Multi-source resource-state tables
 
