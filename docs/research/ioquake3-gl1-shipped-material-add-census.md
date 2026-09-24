@@ -40,6 +40,9 @@ and `CGEN_IDENTITY` at `:1857..1870`, and is called at `:2356`.
 
 `pak0.pk3/maps/q3dm17.bsp` references
 `textures/base_wall/metalfloor_wall_15ow` on **two** draw surfaces.  The
+two four-vertex surface centroids are `(288, 672, 328)` and
+`(288, -544, 328)` in map coordinates; deathmatch spawns occur near both,
+so an early view may include the material.  The
 shipped shader has:
 
 ```text
@@ -132,8 +135,20 @@ It compiled as `program=28 supported=1 semantic=1 native=1 nir=1`, with
 9 semantic instructions, two TAUs and seven ALUs; the game bound that shader
 218 times during the bounded run.  This is strong compiler and live draw-state
 admission evidence for the ADD material, but not a per-pixel proof of its
-visible surface.  A screenshot or isolated material-position capture is the
-next correctness check.  The runtime also warned that installed `pak0.pk3`
+visible surface.  A subsequent bounded early-frame X capture is retained on
+target as `gl1-q3dm17-addsat-earlyshot.png` and locally at
+`artifacts/2026-09-24/gl1-q3dm17-addsat-earlyshot.png` (SHA-256
+`6ce4e7d286cd21ae22fb685761d583f4b54b07bebd4d2d76d403088d7aaf825b`).
+It shows a 640x480 floor and HUD within the 1024x768 desktop, but substantial
+black void/missing world geometry.  The particular two ADD surfaces cannot
+be identified from this frame.  The log records player entry at line 335 and
+the 32,768-triangle cap at line 682; the capture was triggered two seconds
+after entry, so it may have occurred *after* the cap and may show a partially
+drawn frame.  It is not evidence of a complete or correct q3dm17 image.  The
+run had no rejected draw or new kernel fault.  A camera-positioned uncapped
+reference or isolated material-pixel capture remains the next correctness
+check.  The
+runtime also warned that installed `pak0.pk3`
 has a noncanonical checksum; this audit describes the *installed* archive,
 not a claim that it is byte-identical to a retail CD.
 

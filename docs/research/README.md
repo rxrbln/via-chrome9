@@ -473,6 +473,10 @@ targets.
   derives exact per-base-format REPLACE/MODULATE/ADD alpha semantics, records
   compiler-exact partial-mask ADD and mixed two-unit objects, and bounds the
   closed crossbar keys and guarded promotion sequence needed by ioquake GL1.
+- [ioquake3-gl1-shipped-material-add-census.md](ioquake3-gl1-shipped-material-add-census.md)
+  separates q3dm1 additive framebuffer blends from q3dm17's live two-texture
+  GL_ADD shader, records the bounded MOV.SAT silicon oracle, and marks the
+  first q3dm17 screenshot indeterminate because it may follow the draw cap.
 - [gl-feature-matrix.md](gl-feature-matrix.md) reconstructs the exact Linux and
   Windows OpenGL extension sets, raw limits, texture/render/depth formats,
   framebuffer/query support, and conservative Gallium/NIR capability envelope.
