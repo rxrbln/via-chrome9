@@ -28,10 +28,12 @@ definitions supplied at the start of the fragment source). No GPU draw was
 submitted by this test. This proves the GL capability/link boundary, not
 refract's visual correctness.
 
-The broader Gallium smoke has two separate current failures: with experimental
-X8Z24 enabled, its D24 render-to-texture stage 13 produced the wrong sample
-color; without that gate, a later D16 triangle check failed. Neither failure
-is explained by the sampler cap change, and neither was hidden or treated as a
-pass. Refract still needs a conforming BGRA mipmapped render destination,
+The broader Gallium smoke initially reported a D24 render-to-texture mismatch,
+but the pixels, source preservation, and guards were correct; only its expected
+batch count was stale after two triangles began sharing one program submission.
+After correcting that assertion, the focused `--d24-only` test passed both
+D24 render-to-texture and D24-to-Z16 sampling. The non-D24 full smoke still
+fails a later D16 triangle check, separately under investigation. Refract
+still needs a conforming BGRA mipmapped render destination,
 producer-to-CPU-mipmap synchronization, mixed depth/color/mip descriptor
 validation, and its fragment shader ISA path before a scene validation claim.
