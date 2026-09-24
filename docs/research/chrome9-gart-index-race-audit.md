@@ -104,6 +104,18 @@ which also shows that indexed access was treated as a fallible transaction.
 The flag-enabled map therefore independently supports a post-request
 completion check, although it does not manipulate SR6C in this path.
 
+The Windows completion helper also defines a later recovery rung, not part of
+the normal invalidation transaction.  At `0x2f6e0..0x2f73b` it tries five
+immediate indexed SR6F reads.  If bit 7 remains set, it enters a timed loop;
+after the initial wait it may inject the dummy 2D MMIO packet at
+`0x2f8a2..0x2f95a` before polling again.  Its embedded diagnostics are
+`*** Insert Dummy 2D MMIO Commands %ds ***` at `0xddb00` and
+`*** GTI Flush Check Timeout ***` at `0xddad0`.  Only at the terminal timeout
+does `0x2f99a..0x2f9b7` clear SR6F.bit7 in software and return failure.  This
+is evidence that some Windows configurations used a 2D-engine kick to recover
+GTI progress, not evidence that normal Linux invalidation should blindly
+repeat the pulse or force-clear a command still owned by hardware.
+
 The current driver is deliberately stricter:
 
 ```text
