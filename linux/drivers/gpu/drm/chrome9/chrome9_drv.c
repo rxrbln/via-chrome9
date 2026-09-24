@@ -843,6 +843,7 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 		0x41780000, 0x41fc0000, 0, 0x3f800000,
 		0xffff0000, 0xffff0000,
 	};
+	static const u32 z_clip[] = { 0x1e000000, 0x1f000000, 0x20007fff };
 	u32 fvf[ARRAY_SIZE(raster_fvf)];
 	unsigned int i;
 	u32 state[] = {
@@ -861,6 +862,10 @@ static void chrome9_emit_3d_quad_h6_internal(u32 **cursor,
 	/* Exact 7122 H6 vendor emission with state+0x178 set to one. */
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
 			     state, ARRAY_SIZE(state));
+	/* Pixel Z clip persists across jobs; open it fully for VS oracles. */
+	if (vs)
+		chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
+				     z_clip, ARRAY_SIZE(z_clip));
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0xfe020000,
 			     config, ARRAY_SIZE(config));
 	memcpy(fvf, raster_fvf, sizeof(fvf));
