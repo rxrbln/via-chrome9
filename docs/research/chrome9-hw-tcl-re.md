@@ -670,6 +670,31 @@ MAX, LIT or its expansion, MOV with SAT to oD0).
 * Hardware behaviour for unaligned attributes (vendor drops address bits
   1:0 silently) and stride not a multiple of four.
 
+## Silicon results (2026-09-24)
+
+Kernel oracles `DRM_CHROME9_FIXED_QUAD_VS_*` (Chrome9 kernel commits
+`e7bcaf9`, `54912ca`, `b50ab09` and the near-plane fix after them) replace
+only the VS state of the proven 32x32 quad; runner
+`tools/re/chrome9_vs_oracle.c`.  All ran under the GPU lock with FE33
+enabled and produced no timeout, fault, canary or quarantine report.
+
+| oracle | variable | result |
+|---|---|---|
+| base | corpus `out_d0_d1` program + finalizer, rows 256..258 (`41800000 c1800000 3f800000`, `494000f8 494000f8`, bias row), A60 `60800005`, A62 `62208002`, clip-space W=1 | pass, 1024/1024 |
+| w2 | same with x, y, w doubled | pass (RCP/op 14 divide) |
+| half | first triangle only (A24 = 3) | pass, 528 pixels, TL/TR/BR set, BL clear: `sy = -16` orientation confirmed |
+| m4x4 | corpus M4x4 + `mov oPos,r0`, pixel-to-clip matrix c0..c3 at `32030000`, pixel vertices | pass (user constants, DP4, op 26) |
+| clipwide | A01 bit 11 + A40..A48 from rows 256/257 (low 24 bits, exponent bytes in A42/A45/A48; reproduces the Xorg words), +-4 clip-space quad | pass, exact coverage |
+| clipnear | same, triangle with one vertex behind the eye, near plane at w = 0.1 | **fail**: the unclipped projection is drawn (107 pixels instead of the clipped 552); no hang |
+| clipneartail | clipnear with the first `MOV dest32, src128` tail active | same as clipnear |
+| fetch | W=1 quad from an SF page: A00 bit 15, three `30030000` stream slots `base | 6`, A20 bit 0, A2C/A2D/A2E, A24 = 4, inline indices `00010000 00030002` | pass, 1024/1024 |
+
+So the programmable VS store, finalizer, viewport rows, user constants and
+indexed memory vertex fetch are qualified.  Near-plane clipping is not yet
+understood; [chrome9-near-plane-clipping-re.md](chrome9-near-plane-clipping-re.md)
+tracks the RE.  Until it passes, primitives with any vertex at `w <= 0` (or
+outside the near plane) must keep Gallium draw's software clipping.
+
 ## Recommended first silicon test
 
 Goal: execute the first compiler-generated VS on VX900 with the smallest
