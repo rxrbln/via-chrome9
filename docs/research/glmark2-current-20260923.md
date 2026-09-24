@@ -131,3 +131,23 @@ are `pulsar-default-validate.log`, `shading-phong-cat-validate.log`, and
 
 This does not yet validate multiple lights, cel shading, or the remaining
 glmark2 scenes.
+
+## 2026-09-24 Blinn-Phong and ideas boundary
+
+The reviewed Mesa TEXKILL build (SHA-256
+`9d7b11a3421ff7a7cc126b2b33d972d3dd229054d935ce1fa0ff22c084211dad`)
+was staged separately at `/root/tmp/chrome9-live/ideas-kill-20260924/`.
+Xorg PID 1167 mapped that library and initialized Chrome9 glamor and AIGLX.
+The one-frame `shading:shading=blinn-phong-inf:model=cat:num-lights=1`
+variant reported `Validation: Success` at 800x600, followed by a successful
+texture-nearest validation and no Chrome9 timeout or engine fault.
+
+The one-frame default `ideas` run is **not validated**. It exited normally
+with `Validation: Unknown`, but diagnostic output recorded one unsupported
+fragment draw. A different compiled program logged `semantic=1` with 11
+semantic ALU and one TEX, but the first frame bound the unsupported shader;
+the app run does not prove the logo-shadow draw was executed. The separate
+raw linked POSITION+A8+TEXKILL composition
+passed identity-Y and flipped-Y guarded hardware oracles, each followed by a
+successful texture baseline. The `ideas` logs and oracle outputs are retained
+in the same staging directory.
