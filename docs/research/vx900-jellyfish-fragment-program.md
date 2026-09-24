@@ -551,3 +551,48 @@ the full three-varying producer/FE/upload envelope or another shared setup
 path; the timeout does not identify one specific register.  Do not submit
 another three-varying probe or change A00/A01/A08/A09 without a full
 packet-level differential and a new bounded test rationale.
+
+### Corrected-A01 three-record chain discriminator
+
+The prior full-COLOR chain remains the smallest comparison which avoids both
+four disjoint partial COLOR writes and one instruction with three simultaneous
+class-3 sources:
+
+```text
+MOV TEMP0, T0
+ADD TEMP1, TEMP0, T1
+ADD oC0, TEMP1, T2
+```
+
+Linux 5.75 configuration two and the current kernel compiler agree on all
+three native records:
+
+```text
+01c00530 301c0053 00f2c005 000d0020
+02c10530 30140924 00f20005 00000060
+02c20530 30140924 00f20105 00000820
+
+active-resource-counts=(3,2,3,0)
+A90=90058007 A91=91000000 A92=92000003
+```
+
+The complete current three-float4 producer image is FE A00=`00000031`,
+A01=`01002523`, A08=`08030303`, A09=`09000003`; FVF A00=`00000512`,
+D3/D4/D5=`040063c2/0500a4c2/0600e5c2`, A12=`1200003f`,
+A25/A28=`25f6fff0/28fffff0`, and A62=`625081ff`; VS T0/T1/T2 end in
+`0008028f/0008029f/000802af`, with A60=`60800006`.  The H6 upload order is
+unchanged from the proprietary image: FE, raster/FVF, VS float constants, VS
+integer constants, clip, VS program, VS control, fragment controls, the
+counted H3 fragment program, then vertex data.  No uncovered Linux/Windows
+FE, FVF, VS, resource-control, or upload-order differential explains the
+split-X timeout.
+
+Tools source `a95d4ef` implements this exact program as guarded mode
+`chrome9_t2_route_guard_smoke --chain`.  It uses BGRA8 plus D16, leading and
+trailing BO guards, and a nonzero exterior color sentinel.  Exact binary
+fraction inputs avoid clamping and give four distinct host-word fingerprints:
+correct `8080809f`, missing T2 `60606060`, T2 aliased to T0 `80809f80`, and
+T2 aliased to T1 `9f9f809f`, within the tool's normal two-code tolerance.
+Kernel selftest `0e9dc60` asserts the exact ALUs, float4 widths, active
+resource count, and A90--A92.  The tool passed a strict host build; this is an
+offline-prepared discriminator and has not been submitted to the GPU.
