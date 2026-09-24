@@ -151,3 +151,25 @@ raw linked POSITION+A8+TEXKILL composition
 passed identity-Y and flipped-Y guarded hardware oracles, each followed by a
 successful texture baseline. The `ideas` logs and oracle outputs are retained
 in the same staging directory.
+
+## 2026-09-24 split-color safety regression and glxgears
+
+The kernel module now rejects fragment programs with multiple or partial
+COLOR outputs; only one terminal full-RGBA COLOR write is accepted. Its
+in-tree CPU selftest confirms that the former split-T2 packet is rejected.
+The module (`979baad`, SHA-256
+`7f7dd93c67e8d786a9d4092ca044d339127519c50aaca51a9fe6e89241f288f9`)
+was loaded on the target after quiescing and unloading the previous module,
+without a reboot. Xorg PID 608 initialized Chrome9 glamor and AIGLX using
+the TEXKILL Mesa library above. At fixed 800x600, one-frame validations of
+texture nearest, five-step medium `function`, and one-light Phong cat each
+reported `Validation: Success`; a post-scene texture validation also passed.
+The logs are under `/root/tmp/chrome9-live/safe-color-20260924/`. No Chrome9
+timeout or fault appeared in the bounded dmesg check.
+
+In the same session, vblank-disabled `/usr/X11/bin/glxgears -info` reported
+482 frames in each of two five-second intervals: 96.299 and 96.260 FPS.
+The run was bounded to 12 seconds (`timeout` exit 124), with no Chrome9
+timeout/fault in the subsequent dmesg check. This is a performance datapoint,
+not evidence of visual correctness or complete OpenGL 2.1 support; the GL
+version remains a lab-only override.
