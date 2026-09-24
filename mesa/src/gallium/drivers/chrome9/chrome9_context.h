@@ -237,6 +237,9 @@ struct chrome9_context {
    uint64_t submitted_rhw_runs;
    uint64_t submitted_rhw_chains;
    uint64_t rejected_triangles;
+   /* Per drop site (static "file:line" string) counts, CHROME9_DEBUG_REJECT. */
+   struct hash_table *reject_sites;
+   uint64_t reject_reported;
    uint64_t draw_limit;
    bool debug_draws;
    bool draw_limit_reported;
@@ -257,6 +260,12 @@ chrome9_context_depth_target(struct chrome9_context *ctx);
 void chrome9_context_render_target_written(struct chrome9_context *ctx);
 void chrome9_context_render_target_direct_written(struct chrome9_context *ctx);
 void chrome9_context_prepare_render_target(struct chrome9_context *ctx);
+void chrome9_count_reject(struct chrome9_context *ctx, const char *site,
+                          unsigned count);
+#define CHROME9_STR2(x) #x
+#define CHROME9_STR(x) CHROME9_STR2(x)
+#define CHROME9_REJECT(ctx, count) \
+   chrome9_count_reject(ctx, __FILE__ ":" CHROME9_STR(__LINE__), count)
 void chrome9_context_sync_resource(struct chrome9_context *ctx,
                                    struct pipe_resource *resource,
                                    unsigned usage);

@@ -125,6 +125,39 @@ chrome9_context_prepare_render_target(struct chrome9_context *ctx)
    ctx->render_target_stale = false;
 }
 
+void
+chrome9_count_reject(struct chrome9_context *ctx, const char *site,
+                     unsigned count)
+{
+   struct hash_entry *entry;
+
+   ctx->rejected_triangles += count;
+   if (!ctx->reject_sites)
+      return;
+   entry = _mesa_hash_table_search(ctx->reject_sites, site);
+   if (entry)
+      entry->data = (void *)((uintptr_t)entry->data + count);
+   else
+      _mesa_hash_table_insert(ctx->reject_sites, site,
+                              (void *)(uintptr_t)count);
+}
+
+/* Print every drop site whenever the total changed since the last flush. */
+static void
+chrome9_report_rejects(struct chrome9_context *ctx)
+{
+   if (!ctx->reject_sites || ctx->rejected_triangles == ctx->reject_reported)
+      return;
+   fprintf(stderr, "chrome9: rejected %" PRIu64 " (+%" PRIu64 "):",
+           ctx->rejected_triangles,
+           ctx->rejected_triangles - ctx->reject_reported);
+   hash_table_foreach(ctx->reject_sites, entry)
+      fprintf(stderr, " %s=%" PRIuPTR, (const char *)entry->key,
+              (uintptr_t)entry->data);
+   fputc('\n', stderr);
+   ctx->reject_reported = ctx->rejected_triangles;
+}
+
 static void
 chrome9_warn_once(struct chrome9_context *ctx, uint32_t warning,
                   const char *message)
@@ -6262,6 +6295,7 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    if (!ctx->vs || !ctx->fs || !chrome9_select_fs_variant(ctx)) {
       chrome9_warn_once(ctx, CHROME9_WARN_DRAW_STATE,
                         "draw rejected: unsupported bounded fragment program");
+      CHROME9_REJECT(ctx, draws[0].count);
       return;
    }
 
@@ -6330,6 +6364,7 @@ chrome9_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
 
    chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
+   chrome9_report_rejects(ctx);
    (void)flags;
    /* DRAW_TRIANGLE completes synchronously. */
    if (fence)
@@ -6386,6 +6421,10 @@ chrome9_context_destroy(struct pipe_context *pipe)
 
    chrome9_draw_flush_batch(ctx);
    chrome9_flush_render_target(ctx);
+   chrome9_report_rejects(ctx);
+   if (ctx->reject_sites)
+      _mesa_hash_table_destroy(ctx->reject_sites, NULL);
+   ctx->reject_sites = NULL;
    if (ctx->draw)
       draw_destroy(ctx->draw);
    if (pipe->stream_uploader)
@@ -6510,6 +6549,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 
    ctx->base.screen = screen;
    ctx->base.priv = priv;
+   if (debug_get_bool_option("CHROME9_DEBUG_REJECT", false))
+      ctx->reject_sites = _mesa_pointer_hash_table_create(NULL);
    ctx->base.destroy = chrome9_context_destroy;
    ctx->base.flush = chrome9_flush;
    ctx->base.flush_resource = chrome9_flush_resource;

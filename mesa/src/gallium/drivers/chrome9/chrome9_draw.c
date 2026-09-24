@@ -1852,7 +1852,7 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
       } else {
          crender->deferred_failed = true;
          crender->batch_failed = true;
-         crender->ctx->rejected_triangles += count;
+         CHROME9_REJECT(crender->ctx, count);
       }
       crender->batch_count = 0;
       crender->batch_generic_program = false;
@@ -1996,7 +1996,7 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
          chrome9_context_render_target_written(ctx);
       crender->batch_failed = false;
    } else {
-      ctx->rejected_triangles += count;
+      CHROME9_REJECT(ctx, count);
       crender->batch_failed = true;
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr,
@@ -2088,13 +2088,13 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
           ctx->draw_textured_triangle_run ||
           ctx->draw_textured_triangle_mip))) &&
        crender->batch_failed) {
-      ctx->rejected_triangles++;
+      CHROME9_REJECT(ctx, 1);
       return;
    }
    if (!crender->generic_program && crender->batch_generic_program) {
       chrome9_flush_triangle_batch(crender);
       if (crender->batch_failed) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
    }
@@ -2103,7 +2103,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                                      crender->texture_count, &depth_active,
                                      &blend_state, &blend_successor,
                                      &state_reason)) {
-      ctx->rejected_triangles++;
+      CHROME9_REJECT(ctx, 1);
       if (!(ctx->warnings & CHROME9_WARN_DRAW_STATE)) {
          const struct pipe_depth_stencil_alpha_state *dsa = ctx->dsa;
          const struct pipe_rt_blend_state *rt =
@@ -2164,7 +2164,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
    }
    if (chrome9_fs_uses_constant_color(ctx->fs->fragment_program) &&
        !chrome9_fragment_constant_color(ctx, &constant_color)) {
-      ctx->rejected_triangles++;
+      CHROME9_REJECT(ctx, 1);
       return;
    }
    program_batch = perspective_batch &&
@@ -2184,7 +2184,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       ctx->draw_triangle_d16_rhw_run && !program_batch;
    if (ctx->fs->fragment_program == CHROME9_FS_COMPILED_ALU &&
        !program_batch && !crender->generic_program) {
-      ctx->rejected_triangles++;
+      CHROME9_REJECT(ctx, 1);
       return;
    }
    if (ctx->rasterizer && ctx->rasterizer->scissor) {
@@ -2198,7 +2198,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       bool queued;
 
       if (crender->batch_failed) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       if (chrome9_queue_generic_triangle(
@@ -2209,7 +2209,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       } else {
          /* A failed flush has already counted every queued triangle. */
          if (!queued)
-            ctx->rejected_triangles++;
+            CHROME9_REJECT(ctx, 1);
          if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
             fprintf(stderr,
                     "chrome9: DRAW_FRAGMENT_PROGRAM failed after=%" PRIu64
@@ -2223,7 +2223,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (provoking >= crender->vertex_count ||
           (size_t)(provoking + 1) * crender->vertex_size >
              crender->capacity) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       memcpy(&flat_color,
@@ -2238,7 +2238,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (provoking >= crender->vertex_count ||
           (size_t)(provoking + 1) * crender->vertex_size >
              crender->capacity) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       memcpy(&gray_float,
@@ -2246,7 +2246,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                 4 * sizeof(float),
              sizeof(gray_float));
       if (!isfinite(gray_float)) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       gray = float_to_ubyte(gray_float);
@@ -2261,7 +2261,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (indices[i] >= crender->vertex_count ||
           (size_t)(indices[i] + 1) * crender->vertex_size >
           crender->capacity) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       vertex = crender->vertices + (size_t)indices[i] * crender->vertex_size;
@@ -2270,7 +2270,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
           (depth_active && !isfinite(position[2])) ||
           (perspective_batch &&
            (!isfinite(position[3]) || position[3] <= 0.0f))) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       if (crender->packed_generic) {
@@ -2280,7 +2280,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
 
             for (unsigned c = 0; c < components; c++)
                if (!isfinite(packed[c])) {
-                  ctx->rejected_triangles++;
+                  CHROME9_REJECT(ctx, 1);
                   return;
                }
             if (crender->packed_generic == 7)
@@ -2302,7 +2302,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
 
             for (unsigned c = 0; c < components; c++)
                if (!isfinite(packed[c])) {
-                  ctx->rejected_triangles++;
+                  CHROME9_REJECT(ctx, 1);
                   return;
                }
             color = (uint32_t)float_to_ubyte(packed[xxy ? 1 : 2]) |
@@ -2315,7 +2315,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
             unsigned gray;
 
             if (!isfinite(packed[0])) {
-               ctx->rejected_triangles++;
+               CHROME9_REJECT(ctx, 1);
                return;
             }
             gray = float_to_ubyte(packed[0]);
@@ -2335,7 +2335,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       if (ctx->fs->fragment_program ==
              CHROME9_FS_TWO_PROJECTED_TEXTURE_PRIMARY_RGB_ALPHA &&
           color != 0xffffffff) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       /* Chrome9 inherits D3D9 integer pixel centers.  Gallium requests GL
@@ -2380,7 +2380,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                                                 texcoord[0]) ||
                !chrome9_two_texture_coord_valid(ctx, samplers[0], false,
                                                 texcoord[1])))) {
-            ctx->rejected_triangles++;
+            CHROME9_REJECT(ctx, 1);
             return;
          }
          texture_args.vertices[i].x_16_16 = x[i];
@@ -2419,7 +2419,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                 !chrome9_two_texture_coord_valid(ctx, samplers[1], false,
                                                  texcoord1[1]) ||
                 (two_projected_primary && texcoord1_q != 0x3f800000)) {
-               ctx->rejected_triangles++;
+               CHROME9_REJECT(ctx, 1);
                return;
             }
             two_vertex->x_16_16 = texture_args.vertices[i].x_16_16;
@@ -2730,7 +2730,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
            memcmp(&crender->batch_textured_mip_state, &next, sizeof(next))))
          chrome9_flush_triangle_batch(crender);
       if (crender->batch_failed) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       if (!crender->batch_count) {
@@ -2797,7 +2797,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
            memcmp(&crender->batch_textured_run_state, &next, sizeof(next))))
          chrome9_flush_triangle_batch(crender);
       if (crender->batch_failed) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       if (!crender->batch_count) {
@@ -2857,7 +2857,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
            memcmp(&crender->batch_textured_state, &next, sizeof(next))))
          chrome9_flush_triangle_batch(crender);
       if (crender->batch_failed) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       if (!crender->batch_count) {
@@ -2982,7 +2982,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
               memcmp(&crender->batch, &next, sizeof(next)))))
          chrome9_flush_triangle_batch(crender);
       if (crender->batch_failed) {
-         ctx->rejected_triangles++;
+         CHROME9_REJECT(ctx, 1);
          return;
       }
       if (!crender->batch_count) {
@@ -3045,7 +3045,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
     * from earlier Gallium draws. */
    chrome9_flush_triangle_batch(crender);
    if (crender->batch_failed) {
-      ctx->rejected_triangles++;
+      CHROME9_REJECT(ctx, 1);
       return;
    }
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
@@ -3077,7 +3077,7 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       ctx->submitted_triangles++;
       chrome9_context_render_target_written(ctx);
    } else {
-      ctx->rejected_triangles++;
+      CHROME9_REJECT(ctx, 1);
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr,
                  "chrome9: DRAW_%sTRIANGLE%s failed after=%" PRIu64
@@ -3143,7 +3143,7 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
    if (start > crender->vertex_count || nr > crender->vertex_count - start)
       return;
    if (!chrome9_guarded_draw_domain(crender, NULL, start, nr)) {
-      crender->ctx->rejected_triangles++;
+      CHROME9_REJECT(crender->ctx, 1);
       return;
    }
    end = start + nr;
@@ -3184,7 +3184,7 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
       }
       break;
    default:
-      crender->ctx->rejected_triangles++;
+      CHROME9_REJECT(crender->ctx, 1);
       break;
    }
    if (crender->batch_generic_program)
@@ -3202,7 +3202,7 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
    if (!indices)
       return;
    if (!chrome9_guarded_draw_domain(crender, indices, 0, nr_indices)) {
-      crender->ctx->rejected_triangles++;
+      CHROME9_REJECT(crender->ctx, 1);
       return;
    }
    switch (crender->prim) {
@@ -3251,7 +3251,7 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
       }
       break;
    default:
-      crender->ctx->rejected_triangles++;
+      CHROME9_REJECT(crender->ctx, 1);
       break;
    }
    /* Shader and sampler bindings can change immediately after this call.

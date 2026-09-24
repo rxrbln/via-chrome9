@@ -1,11 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 Chrome9 contributors */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_drm.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -187,13 +191,58 @@ chrome9_draw_program_triangle_d16_rhw_batch(
                 draw) == 0;
 }
 
+/* CHROME9_DUMP_FAILED_CMD22=<dir> saves a rejected or timed-out cmd22
+ * submission (header struct, then instructions, constants, textures and
+ * vertices) for chrome9_cmd22_replay. */
+static void
+chrome9_dump_failed_fragment_program(
+   const struct drm_chrome9_draw_fragment_program *draw, int error)
+{
+   static unsigned sequence;
+   const char *dir = getenv("CHROME9_DUMP_FAILED_CMD22");
+   const struct {
+      uint64_t ptr;
+      size_t size;
+   } arrays[] = {
+      { draw->instructions_ptr, (size_t)draw->instruction_count *
+        sizeof(struct drm_chrome9_fragment_instruction) },
+      { draw->constants_ptr, (size_t)draw->constant_count * 16 },
+      { draw->textures_ptr, (size_t)draw->texture_count *
+        sizeof(struct drm_chrome9_fragment_texture_state) },
+      { draw->vertices_ptr, (size_t)draw->triangle_count * 3 *
+        sizeof(struct drm_chrome9_fragment_vertex) },
+   };
+   const uint32_t magic[2] = { 0xc9d02201, (uint32_t)error };
+   char path[4096];
+   FILE *file;
+
+   if (!dir)
+      return;
+   snprintf(path, sizeof(path), "%s/cmd22-%d-%u.bin", dir, (int)getpid(),
+            sequence++);
+   file = fopen(path, "wb");
+   if (!file)
+      return;
+   fwrite(magic, sizeof(magic), 1, file);
+   fwrite(draw, sizeof(*draw), 1, file);
+   for (unsigned i = 0; i < sizeof(arrays) / sizeof(arrays[0]); i++)
+      if (arrays[i].ptr && arrays[i].size)
+         fwrite((const void *)(uintptr_t)arrays[i].ptr, arrays[i].size, 1,
+                file);
+   fclose(file);
+   fprintf(stderr, "chrome9: failed cmd22 (%d) saved to %s\n", error, path);
+}
+
 bool
 chrome9_draw_fragment_program(
    int fd, const struct drm_chrome9_draw_fragment_program *draw)
 {
    if (!draw)
       return false;
-   return ioctl(fd, DRM_IOCTL_CHROME9_DRAW_FRAGMENT_PROGRAM, draw) == 0;
+   if (ioctl(fd, DRM_IOCTL_CHROME9_DRAW_FRAGMENT_PROGRAM, draw) == 0)
+      return true;
+   chrome9_dump_failed_fragment_program(draw, errno);
+   return false;
 }
 
 bool
