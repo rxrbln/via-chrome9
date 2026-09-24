@@ -143,7 +143,28 @@ The corrected B source is file 3, id 1, with its release marker, matching
 production SGE's two-varying linkage.  This is an offline compiler oracle,
 not a silicon test; native SLT numeric semantics remain unqualified.
 
-The first record computes `src0 + -src1` into special scratch r12.  Decoding
+Changing only the destination token to `r0` under the same registered-input
+probe gives the same first record and second record
+`01409240 30140b6d 00f20c05 20090020`, with unchanged controls.  The
+vendor `stmPPS_GetDstSetting_invi` remaps logical `r0` to physical zero.  This
+establishes the isolated TEMP-destination encoding, not a runnable fragment
+program: there is no later color-write consumer.  A defined TEMP/TEMP source
+case must include real producer instructions and a consumer, then pass the
+vendor's parser-owned dependency/lifetime setup before its bytes can become
+an executable oracle.
+
+Merely setting the instance TEMP-input mask at `+0x44` to bits 0--2 and
+calling internal MOV emitters is not that setup.  In an offline attempt to
+append `MOV r0,c0; MOV r1,c1; SLT r2,r0,r1; MOV oC0,r2`, both MOV remaps
+returned 0 and 1, but the SLT emitter did not return from its temporary
+allocator.  Immediately before that call, backend fields `+0x1338`,
+`+0x133c`, `+0x1340`, and `+0x1368` were `(3,3,0,0)`.  The attempt was stopped
+without producing an object; none of its bytes or resource controls qualify
+TEMP/TEMP SLT.  The emitter asks the manager to allocate a scratch register,
+so r12 in the isolated rows is an observed allocation, not a guaranteed
+register for a populated program.
+
+The first isolated record computes `src0 + -src1` into scratch r12.  Decoding
 the second gives A=r12/release, C=native ZERO, B=native ONE, subop 9, so the
 symbolic operation is exactly `difference >= 0 ? 0 : 1`.  This independently
 proves the strict arm order; it is not SGE with exchanged source tokens.
@@ -156,8 +177,8 @@ shape oracles, but they remain silicon-unqualified and use r12, which the
 current generic allocator does not expose.  The malformed historical row
 provides no execution oracle.
 Do not invent a one-record SLT or silently substitute SUB+CMP.  A future
-semantic SLT opcode must own this two-record expansion, special scratch
-reservation, and dependency finalization in the kernel.
+semantic SLT opcode must own this two-record expansion, scratch lifetime and
+resource accounting, and dependency finalization in the kernel.
 
 ## NIR semantics that must be preserved
 
