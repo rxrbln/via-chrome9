@@ -1735,6 +1735,7 @@ enum compact_alu_case {
    COMPACT_FSAT,
    COMPACT_FSAT_MULTI_USE,
    COMPACT_SHARED_FSAT,
+   COMPACT_FDOT2,
 };
 
 static nir_shader *
@@ -1779,6 +1780,12 @@ make_compact_alu_fragment(enum compact_alu_case test)
       result = nir_vec4(&b, inner, outer, inner, outer);
       break;
    }
+   case COMPACT_FDOT2: {
+      nir_def *dot = nir_fdot2(&b, a, c);
+
+      result = nir_vec4(&b, dot, dot, dot, dot);
+      break;
+   }
    default:
       abort();
    }
@@ -1794,10 +1801,11 @@ static bool
 check_compact_alu_lowering(struct chrome9_context *context)
 {
    for (enum compact_alu_case test = COMPACT_FMAD;
-        test <= COMPACT_SHARED_FSAT; test++) {
+        test <= COMPACT_FDOT2; test++) {
       struct chrome9_shader shader = { 0 };
       nir_shader *nir = make_compact_alu_fragment(test);
-      unsigned mad = 0, multiply = 0, add = 0, dp3_sat = 0, max_sat = 0;
+      unsigned mad = 0, multiply = 0, add = 0, dp3 = 0, dp3_sat = 0;
+      unsigned max_sat = 0;
       unsigned saturated_mov = 0, saturated_multiply = 0;
       unsigned negated = 0;
 
@@ -1809,6 +1817,7 @@ check_compact_alu_lowering(struct chrome9_context *context)
          mad += instruction->op == CHROME9_PS_OPCODE_MAD;
          multiply += instruction->op == CHROME9_PS_OPCODE_MUL;
          add += instruction->op == CHROME9_PS_OPCODE_ADD;
+         dp3 += instruction->op == CHROME9_PS_OPCODE_DP3;
          saturated_mov += instruction->op == CHROME9_PS_OPCODE_MOV &&
                           instruction->destination.saturate;
          saturated_multiply += instruction->op == CHROME9_PS_OPCODE_MUL &&
@@ -1835,15 +1844,27 @@ check_compact_alu_lowering(struct chrome9_context *context)
       else if (test == COMPACT_FSAT_MULTI_USE)
          valid &= shader.semantic_fs_ir.count == 3 && multiply == 1 &&
                   add == 1 && saturated_mov == 1 && !saturated_multiply;
-      else
+      else if (test == COMPACT_SHARED_FSAT)
          valid &= dp3_sat == 1 && max_sat == 1;
+      else {
+         const struct chrome9_ps_instruction *dot =
+            &shader.semantic_fs_ir.instruction[0];
+
+         valid &= shader.semantic_fs_ir.count == 2 && dp3 == 1 &&
+                  dot->op == CHROME9_PS_OPCODE_DP3;
+         for (unsigned s = 0; s < 2; s++)
+            valid &= dot->source[s].swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+                     dot->source[s].swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+                     dot->source[s].swizzle[2] == CHROME9_PS_SWIZZLE_ZERO &&
+                     dot->source[s].swizzle[3] == CHROME9_PS_SWIZZLE_ZERO;
+      }
       if (!valid) {
          fprintf(stderr, "compact ALU case %u failed: supported=%u "
                  "semantic=%u ir=%u mad=%u mul=%u add=%u neg=%u "
-                 "dp3sat=%u maxsat=%u movsat=%u mulsat=%u\n", test,
+                 "dp3=%u dp3sat=%u maxsat=%u movsat=%u mulsat=%u\n", test,
                  shader.supported,
                  shader.semantic_fs_valid, shader.semantic_fs_ir.count,
-                 mad, multiply, add, negated, dp3_sat, max_sat,
+                 mad, multiply, add, negated, dp3, dp3_sat, max_sat,
                  saturated_mov, saturated_multiply);
          nir_print_shader(nir, stderr);
          ralloc_free(nir);

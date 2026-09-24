@@ -3668,6 +3668,13 @@ chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
       op = CHROME9_PS_OPCODE_MAX;
       source_count = 2;
       break;
+   case nir_op_fdot2:
+      /* The native dot product consumes XYZ.  Lowering two components pads
+       * Z/W with the literal ZERO selector in lower_alu_source(). */
+      op = CHROME9_PS_OPCODE_DP3;
+      source_count = 2;
+      source_components[0] = source_components[1] = 2;
+      break;
    case nir_op_fdot3:
       op = CHROME9_PS_OPCODE_DP3;
       source_count = 2;
