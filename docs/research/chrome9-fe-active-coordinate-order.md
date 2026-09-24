@@ -152,6 +152,37 @@ which reads only T0 retains one active field.  Producer widths and
 `ComputeTexDim` can change the low two bits of each byte without changing the
 ordering or selector.
 
+## Programmable dimension cap
+
+The dimension helper is indexed by compact physical consumer ordinal, not by
+logical sampler.  Linux `stmComputeTexDim_invi:0x00176050..0x001760b7`
+returns four when the texture-state-object link at `+0x3a4` is null.  With
+that object present it tests programmable-PS flag `ctx+0x4fcf`; a nonzero flag
+returns three at `0x00176071..0x0017607a`, before the helper can inspect the
+bound texture's nominal dimensionality.  `stmUpdateTCI_invi:0x0017efc2..
+0x0017f0aa` calls the helper separately for each compact field and writes:
+
+```text
+effective_width[j] = min(producer_width[selector[j]],
+                         ComputeTexDim(ctx, j))
+```
+
+The Windows helper at `VTGUModeDX32A.dll:0x10157430..0x10157499` and its
+per-field writer at `0x10157a90..0x10157b13` agree.  For example, an ALU read
+of float4 T0 plus `TEX(s5,T5)` from float2 T5 orders the fields as T0,T5.  In
+the normal programmable textured state the effective widths are 3,2, giving
+field bytes `22,25` and A01=`01002522`; sampler five remains encoded in TAU
+and image/sampler state, not in this field order.
+
+Do not overstate the null-object branch as a recovered proprietary no-TEX
+object-lifetime rule.  The clean-room ALU-only float4 T0 tuple
+A01=`01002523`, A08=`08010301` is independently live-qualified on VX900, so
+using width four when the command has no texture descriptor is a
+silicon-backed clean-room policy.  Once a descriptor is active, cap every
+ordered field at three for the recovered programmable path.  This distinction
+also prevents a nominal 2-D sampler from incorrectly forcing the field to
+width two.
+
 ## Transition and implementation contract
 
 The Windows hardware-image initializer at `0x101549a8..0x101549c0` writes
