@@ -381,6 +381,12 @@ struct chrome9_engine {
 	u64 gart_pte_write_count;
 	u64 gart_vga_acquire_count;
 	u64 gart_flush_count;
+	u64 gart_flush_rerequests;
+	u64 gart_flush_slow;
+	/* Evicted/unmapped PTEs point here instead of the invalid entry. */
+	u32 *scratch_cpu;
+	dma_addr_t scratch_dma;
+	u32 scratch_pte;
 	unsigned int draw_cache_entries;
 	unsigned int draw_cache_pages;
 	u32 last_cookie;
@@ -465,17 +471,48 @@ static int chrome9_gart_wait_idle(struct chrome9_device *cdev)
 				  CHROME9_HW_TIMEOUT_US);
 }
 
-static int chrome9_gart_request_flush(struct chrome9_device *cdev)
+#define CHROME9_GART_FLUSH_BURST	10
+#define CHROME9_GART_FLUSH_TIMEOUT_MS	600
+
+static u8 chrome9_gart_request_flush(struct chrome9_device *cdev)
 {
 	u8 value;
-	int ret;
 
-	ret = chrome9_gart_wait_idle(cdev);
-	if (ret)
-		return ret;
-	value = readb(cdev->mmio + CHROME9_SEQ_DATA);
-	writeb(value | BIT(7), cdev->mmio + CHROME9_SEQ_DATA);
-	return 0;
+	writeb(0x6f, cdev->mmio + CHROME9_SEQ_INDEX);
+	value = (readb(cdev->mmio + CHROME9_SEQ_DATA) & 0x7f) | BIT(7);
+	writeb(value, cdev->mmio + CHROME9_SEQ_DATA);
+	return value;
+}
+
+/*
+ * Wait for SR6F bit 7 to clear.  A request the GTI did not take is
+ * re-issued: VIA rev 0-2 write it up to ten times back to back, rev 3
+ * polls every 1 ms for 600 ms (docs/research/chrome9-gart-flush-timeout.md).
+ */
+static int chrome9_gart_flush_wait(struct chrome9_engine *engine, u8 request)
+{
+	struct chrome9_device *cdev = engine->cdev;
+	unsigned int i;
+
+	writeb(0x6f, cdev->mmio + CHROME9_SEQ_INDEX);
+	for (i = 0; i < CHROME9_GART_FLUSH_BURST; i++) {
+		if (!(readb(cdev->mmio + CHROME9_SEQ_DATA) & BIT(7)))
+			return 0;
+		writeb(request, cdev->mmio + CHROME9_SEQ_DATA);
+		engine->gart_flush_rerequests++;
+	}
+	engine->gart_flush_slow++;
+	for (i = 0; i < CHROME9_GART_FLUSH_TIMEOUT_MS; i++) {
+		usleep_range(1000, 1200);
+		writeb(0x6f, cdev->mmio + CHROME9_SEQ_INDEX);
+		if (!(readb(cdev->mmio + CHROME9_SEQ_DATA) & BIT(7)))
+			return 0;
+		if (i % 10 == 9) {
+			writeb(request, cdev->mmio + CHROME9_SEQ_DATA);
+			engine->gart_flush_rerequests++;
+		}
+	}
+	return -ETIMEDOUT;
 }
 
 static void chrome9_emit_header0(u32 **cursor, const u32 *pairs,
@@ -3284,6 +3321,7 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 	struct chrome9_device *cdev = engine->cdev;
 	u8 saved_index;
 	u8 saved_6c;
+	u8 request;
 	unsigned int i;
 	int ret;
 
@@ -3297,35 +3335,31 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 		return ret;
 	engine->gart_vga_acquire_count++;
 	saved_index = readb(cdev->mmio + CHROME9_SEQ_INDEX);
-	ret = chrome9_gart_wait_idle(cdev);
-	if (ret) {
-		dev_err_ratelimited(&cdev->pdev->dev,
-			"GART pre-write idle failed first=%u count=%u ret=%d SR6F=%02x\n",
-			first, count, ret,
-			readb(cdev->mmio + CHROME9_SEQ_DATA));
-		goto out_restore_index;
-	}
+	/* A still pending earlier flush is covered by the new request. */
+	if (chrome9_gart_wait_idle(cdev))
+		dev_warn_ratelimited(&cdev->pdev->dev,
+			"GART flush still pending before update first=%u count=%u\n",
+			first, count);
 	saved_6c = chrome9_seq_read(cdev, 0x6c);
 	chrome9_seq_write(cdev, 0x6c, saved_6c & ~BIT(7));
 	for (i = 0; i < count; i++)
-		writel(ptes ? ptes[i] : CHROME9_GART_INVALID,
+		writel(ptes ? ptes[i] : engine->scratch_pte,
 		       engine->gart + (first + i) * sizeof(u32));
 	engine->gart_pte_write_count += count;
 	readl(engine->gart + (first + count - 1) * sizeof(u32));
 	/* Make every PTE visible before requesting the GTI translation flush. */
 	wmb();
 	engine->gart_flush_count++;
-	ret = chrome9_gart_request_flush(cdev);
+	request = chrome9_gart_request_flush(cdev);
 	/* The VIA mapper re-protects SR6C immediately after requesting SR6F. */
 	chrome9_seq_write(cdev, 0x6c, saved_6c | BIT(7));
-	if (!ret)
-		ret = chrome9_gart_wait_idle(cdev);
+	ret = chrome9_gart_flush_wait(engine, request);
 	if (ret)
 		dev_err_ratelimited(&cdev->pdev->dev,
-			"GART translation flush failed first=%u count=%u ret=%d SR6F=%02x\n",
-			first, count, ret,
-			chrome9_seq_read(cdev, 0x6f));
-out_restore_index:
+			"GART translation flush failed first=%u count=%u ret=%d SR6F=%02x SR3F=%02x 0400=%08x\n",
+			first, count, ret, chrome9_seq_read(cdev, 0x6f),
+			chrome9_seq_read(cdev, 0x3f),
+			readl(cdev->mmio + CHROME9_REG_ENGINE_STATUS));
 	writeb(saved_index, cdev->mmio + CHROME9_SEQ_INDEX);
 	chrome9_vga_seq_put(cdev);
 	return ret;
@@ -3336,6 +3370,7 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	struct chrome9_device *cdev = engine->cdev;
 	u32 ptes[CHROME9_RING_PAGES];
 	u8 programmed_6c;
+	u8 request;
 	unsigned int i;
 	int ret;
 
@@ -3357,20 +3392,20 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 			((engine->gart_offset >> 28) & 1);
 	chrome9_seq_write(cdev, 0x6c, programmed_6c);
 	chrome9_seq_write(cdev, 0x7b, (engine->saved_7b & 0xf0) | 4);
+	/* Unused entries translate to the scratch page, never 80000000. */
 	for (i = 0; i < CHROME9_GART_ENTRIES; i++)
-		writel(CHROME9_GART_INVALID, engine->gart + i * sizeof(u32));
+		writel(engine->scratch_pte, engine->gart + i * sizeof(u32));
 	for (i = 0; i < CHROME9_RING_PAGES; i++) {
 		ptes[i] = lower_32_bits((engine->ring_dma + i * PAGE_SIZE) >>
 					    PAGE_SHIFT) & 0x3fffffff;
 		writel(ptes[i], engine->gart + i * sizeof(u32));
 	}
 	readl(engine->gart + (CHROME9_RING_PAGES - 1) * sizeof(u32));
-	/* Publish invalid defaults and ring PTEs before the GTI flush. */
+	/* Publish scratch defaults and ring PTEs before the GTI flush. */
 	wmb();
-	ret = chrome9_gart_request_flush(cdev);
+	request = chrome9_gart_request_flush(cdev);
 	chrome9_seq_write(cdev, 0x6c, programmed_6c | BIT(7));
-	if (!ret)
-		ret = chrome9_gart_wait_idle(cdev);
+	ret = chrome9_gart_flush_wait(engine, request);
 	if (!ret)
 		engine->gart_programmed = true;
 out_restore_index:
@@ -3384,6 +3419,7 @@ static int chrome9_gart_restore(struct chrome9_engine *engine)
 	struct chrome9_device *cdev = engine->cdev;
 	u8 index;
 	u8 value;
+	u8 request;
 	int ret;
 
 	ret = chrome9_vga_seq_get(cdev);
@@ -3399,10 +3435,9 @@ static int chrome9_gart_restore(struct chrome9_engine *engine)
 	readl(engine->gart + CHROME9_GART_SIZE - sizeof(u32));
 	/* Publish the restored table before invalidating cached translations. */
 	wmb();
-	ret = chrome9_gart_request_flush(cdev);
+	request = chrome9_gart_request_flush(cdev);
 	chrome9_seq_write(cdev, 0x6c, value | BIT(7));
-	if (!ret)
-		ret = chrome9_gart_wait_idle(cdev);
+	ret = chrome9_gart_flush_wait(engine, request);
 	if (ret)
 		goto out;
 	chrome9_seq_write(cdev, 0x6a, engine->saved_6a);
@@ -4468,6 +4503,18 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 			goto err_free_ring;
 		}
 	}
+	engine->scratch_cpu = dma_alloc_coherent(&cdev->pdev->dev, PAGE_SIZE,
+						 &engine->scratch_dma, GFP_KERNEL);
+	if (!engine->scratch_cpu) {
+		ret = -ENOMEM;
+		goto err_free_ring;
+	}
+	if (upper_32_bits(engine->scratch_dma)) {
+		ret = -ERANGE;
+		goto err_free_ring;
+	}
+	engine->scratch_pte = lower_32_bits(engine->scratch_dma >> PAGE_SHIFT) &
+			      0x3fffffff;
 	engine->staging_cpu = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!engine->staging_cpu) {
 		ret = -ENOMEM;
@@ -4550,6 +4597,9 @@ err_free_ring:
 	vfree(engine->run_staging_cpu);
 	if (engine->staging_cpu)
 		free_page((unsigned long)engine->staging_cpu);
+	if (engine->scratch_cpu)
+		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE,
+				  engine->scratch_cpu, engine->scratch_dma);
 	if (engine->fence_cpu)
 		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->fence_cpu,
 				  engine->fence_dma);
@@ -8536,18 +8586,21 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (!engine->was_master)
 		pci_clear_master(cdev->pdev);
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu fe33=%llu/%u fe33_canary_faults=%llu\n",
+		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu sr6f_rerequests=%llu sr6f_slow=%llu fe33=%llu/%u fe33_canary_faults=%llu\n",
 		 engine->append_count, engine->wrap_count, engine->ring_epoch,
 		 engine->draw_cache_hits, engine->draw_cache_misses,
 		 engine->draw_cache_scanout_hits, engine->draw_cache_evictions,
 		 engine->gart_update_count, engine->gart_pte_write_count,
 		 engine->gart_vga_acquire_count, engine->gart_flush_count,
+		 engine->gart_flush_rerequests, engine->gart_flush_slow,
 		 engine->fence_count, engine->fence_last_id,
 		 engine->fence_canary_faults);
 	mutex_unlock(&engine->submit_lock);
 	cdev->engine = NULL;
 	vfree(engine->run_staging_cpu);
 	free_page((unsigned long)engine->staging_cpu);
+	dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->scratch_cpu,
+			  engine->scratch_dma);
 	if (engine->fence_cpu)
 		dma_free_coherent(&cdev->pdev->dev, PAGE_SIZE, engine->fence_cpu,
 				  engine->fence_dma);

@@ -420,6 +420,7 @@ int chrome9_detect_vram(struct chrome9_device *cdev)
 	u8 sl_size_code;
 	u8 gti[6];
 	u8 clock_control;
+	u8 revision;
 	u8 cr_gating;
 	u8 gfx_power;
 	int ret;
@@ -470,6 +471,8 @@ int chrome9_detect_vram(struct chrome9_device *cdev)
 	gti[4] = vga_io_rseq(0x6e);
 	gti[5] = vga_io_rseq(0x6f);
 	clock_control = vga_io_rseq(0x3f);
+	/* VIA gates its GART flush workarounds on this revision. */
+	revision = vga_io_rseq(0x3b);
 	cr_gating = vga_io_rseq(0x4f);
 	gfx_power = vga_io_rseq(0x59);
 	vga_io_w(VGA_SEQ_I, saved_index);
@@ -521,8 +524,8 @@ int chrome9_detect_vram(struct chrome9_device *cdev)
 		 gti[0], gti[1], gti[2], gti[3], gti[4], gti[5],
 		 (unsigned long long)cdev->sl_base);
 	dev_info(&pdev->dev,
-		 "clock state: SR3F=%02x SR4F=%02x SR59=%02x\n",
-		 clock_control, cr_gating, gfx_power);
+		 "clock state: SR3F=%02x SR4F=%02x SR59=%02x SR3B=%02x\n",
+		 clock_control, cr_gating, gfx_power, revision);
 	return 0;
 }
 
