@@ -581,8 +581,15 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
       crender->packed_generic >= 6 ? 12 :
       crender->packed_generic ? 9 : 6 + 4 * crender->texture_count;
 
-   if (vertex_size != expected_words * sizeof(uint32_t))
+   if (vertex_size != expected_words * sizeof(uint32_t)) {
+      if (crender->ctx->debug_draws)
+         fprintf(stderr, "chrome9: vbuf vertex size %u, layout expects %u "
+                         "(generic=%u packed=%u varyings=%u textures=%u)\n",
+                 vertex_size, expected_words * 4,
+                 crender->generic_program, crender->packed_generic,
+                 crender->varying_count, crender->texture_count);
       return false;
+   }
    size = (size_t)vertex_size * nr_vertices;
 
    /* Reuse the buffer: allocating and zero-faulting megabytes per batch
