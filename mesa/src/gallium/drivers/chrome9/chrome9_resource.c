@@ -965,20 +965,26 @@ chrome9_buffer_rename(struct chrome9_resource *resource, unsigned usage,
          return;
       }
    }
-   if (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) {
-      /* Nothing survives. */
-   } else if (usage & PIPE_MAP_DISCARD_RANGE) {
-      memcpy(bo.map, old.map, box->x);
-      memcpy((uint8_t *)bo.map + box->x + box->width,
-             (const uint8_t *)old.map + box->x + box->width,
-             old.size - box->x - box->width);
-   } else {
-      memcpy(bo.map, old.map, old.size);
-   }
    resource->bo = bo;
    util_dynarray_append(&resource->spare_bos, old);
    /* The copied bytes are CPU writes to the new object. */
-   chrome9_resource_cpu_access_range(resource, true, 0, 0);
+   if (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) {
+      /* Nothing survives. */
+   } else if (usage & PIPE_MAP_DISCARD_RANGE) {
+      const uint64_t end = box->x + box->width;
+
+      memcpy(bo.map, old.map, box->x);
+      memcpy((uint8_t *)bo.map + end, (const uint8_t *)old.map + end,
+             old.size - end);
+      if (box->x)
+         chrome9_resource_cpu_access_range(resource, true, 0, box->x);
+      if (end < old.size)
+         chrome9_resource_cpu_access_range(resource, true, end,
+                                           old.size - end);
+   } else {
+      memcpy(bo.map, old.map, old.size);
+      chrome9_resource_cpu_access_range(resource, true, 0, old.size);
+   }
 }
 
 static void *
