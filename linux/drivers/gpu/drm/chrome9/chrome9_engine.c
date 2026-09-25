@@ -369,6 +369,11 @@ module_param_named(local_memory, chrome9_local_memory, bool, 0400);
 MODULE_PARM_DESC(local_memory,
 	"GEM_CREATE_LOCAL objects in the local frame buffer (default: true)");
 
+static bool chrome9_mrt = true;
+module_param_named(mrt, chrome9_mrt, bool, 0600);
+MODULE_PARM_DESC(mrt,
+	"Colour targets 1..3 of DRAW_VERTEX_PROGRAMS (default: true)");
+
 static bool chrome9_index_fetch = true;
 module_param_named(index_fetch, chrome9_index_fetch, bool, 0600);
 MODULE_PARM_DESC(index_fetch,
@@ -767,6 +772,9 @@ struct chrome9_draw_request {
 	u8 fragment_texture_units[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u8 fragment_texture_flags[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_depth_format;
+	/* DRAW_VERTEX_PROGRAMS colour targets 1..color_count-1 (oC1..). */
+	u32 color_count;
+	struct drm_chrome9_color_target color[3];
 	/* FRAGMENT_QUERY: active query and its interval. */
 	struct chrome9_query *query;
 	u32 query_generation;
@@ -4372,6 +4380,7 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 #define CHROME9_LOCAL_DEPTH		BIT(1)
 #define CHROME9_LOCAL_COARSE_Z		BIT(2)
 #define CHROME9_LOCAL_TEXTURE(t)	BIT(8 + (t))
+#define CHROME9_LOCAL_COLOR(i)		BIT(3 + (i))
 
 /*
  * Worst-case dwords of one draw's state blocks (headers and their 16-byte
@@ -4528,6 +4537,7 @@ static noinline_for_stack int
 chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	struct chrome9_engine *index_arena,
 	u32 target, u32 depth, u32 coarse_z, u32 local,
+	const u32 color_base[3],
 	const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
 	const u32 *element_address, const u32 *query, u32 query_re,
 	struct chrome9_state_cache *cache, bool *constants_live, u32 **cursor,
@@ -4568,7 +4578,7 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	const struct chrome9_fragment_rt_format *rt_format =
 		chrome9_fragment_rt_format(request->destination_format);
 	struct chrome9_blend_words blend_words;
-	u32 destination_state[16];
+	u32 destination_state[28];
 	u32 config[10];
 	u32 common[32] = {
 		0x860000ff, 0x870000ff, 0x53010c0f, 0x00000011,
@@ -4642,7 +4652,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		destination_state[15] =
 			(request->blend.flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ?
 			blend_words.a33 : 0x33007000;
-		destination_count = ARRAY_SIZE(destination_state);
+		/* A50..A52, A38..A3F, A34..A37 and A33. */
+		destination_count = 16;
 		common[2] = blend_words.a53;
 		common[3] = blend_words.a00;
 	} else {
@@ -4655,6 +4666,25 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		memcpy(destination_state + 7, destination_tail + 4 + skip,
 		       (8 - skip) * sizeof(*destination_tail));
 		destination_count = 3 + ARRAY_SIZE(destination_tail) - skip;
+	}
+	/* Colour targets 1..3: A58..A5B, A60..A63, A68..A6B like A50..A53,
+	 * sharing RT0's write mask, dither and blend enable. */
+	for (i = 1; i < request->color_count; i++) {
+		const struct drm_chrome9_color_target *c = &request->color[i - 1];
+		const u32 reg = (0x50 + 8 * i) << 24;
+
+		destination_state[destination_count++] = reg |
+			(color_base[i - 1] >> 8);
+		destination_state[destination_count++] = (reg + (1 << 24)) |
+			(local & CHROME9_LOCAL_COLOR(i - 1) ? 0 : 1 << 20) |
+			(c->flags & DRM_CHROME9_COLOR_TARGET_TILED ? BIT(23) : 0);
+		destination_state[destination_count++] = (reg + (2 << 24)) |
+			chrome9_fragment_rt_format(c->format)->a52_format << 16 |
+			c->pitch >> 5;
+		destination_state[destination_count++] = (reg + (3 << 24)) |
+			(common[2] & 0x00ffffff);
+		common[3] |= (common[3] & BIT(0) ? BIT(i) : 0) |
+			     (common[3] & BIT(4) ? BIT(4 + i) : 0);
 	}
 	if (depth_active) {
 		if (!depth_func)
@@ -4693,6 +4723,9 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		       sizeof(neutral_depth_bias));
 		common_count += ARRAY_SIZE(neutral_depth_bias);
 	}
+	/* A01[16:14]: colour targets - 1 (vendor: the program's outputs). */
+	if (request->color_count > 1)
+		common[4] |= (request->color_count - 1) << 14;
 	/* The pre-depth pixel-Z clip interval is required even without depth. */
 	memcpy(common + common_count, pixel_z_clip, sizeof(pixel_z_clip));
 	common_count += ARRAY_SIZE(pixel_z_clip);
@@ -6848,6 +6881,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TILED_DEPTH;
 	if (READ_ONCE(chrome9_tiled_color))
 		caps |= DRM_CHROME9_CAP2_TILED_COLOR;
+	if (READ_ONCE(chrome9_mrt) && READ_ONCE(chrome9_hw_tcl))
+		caps |= DRM_CHROME9_CAP2_COLOR_TARGETS;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
 		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
@@ -8206,13 +8241,15 @@ enum chrome9_fragment_object_kind {
 	CHROME9_OBJECT_TEXTURE,
 	CHROME9_OBJECT_VERTEX,
 	CHROME9_OBJECT_COARSE_Z,
+	CHROME9_OBJECT_COLOR,
 };
 
 /* The job writes its destination, depth and coarse-Z objects. */
 static bool chrome9_fragment_object_written(u8 kind)
 {
 	return kind == CHROME9_OBJECT_DESTINATION ||
-	       kind == CHROME9_OBJECT_DEPTH || kind == CHROME9_OBJECT_COARSE_Z;
+	       kind == CHROME9_OBJECT_DEPTH || kind == CHROME9_OBJECT_COARSE_Z ||
+	       kind == CHROME9_OBJECT_COLOR;
 }
 
 /* Per-call bookkeeping of a fragment submission, kept off the stack. */
@@ -8836,6 +8873,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	u32 object_count = 1;
 	u32 depth_index = U32_MAX;
 	u32 coarse_index = U32_MAX;
+	u32 color_index[3];
+	u32 color_bases[3] = { 0 };
 	const struct chrome9_draw_request *coarse = NULL;
 	u32 pause, r, next, q;
 	long wait;
@@ -8880,6 +8919,15 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 							      request->depth_handle);
 		object_sizes[depth_index] = request->depth_object_size;
 	}
+	/* Colour targets 1..3 follow the destination and depth. */
+	for (i = 0; i + 1 < request->color_count; i++) {
+		color_index[i] = object_count++;
+		sub->kind[color_index[i]] = CHROME9_OBJECT_COLOR;
+		sub->handle[color_index[i]] = request->color[i].handle;
+		objects[color_index[i]] = drm_gem_object_lookup(file,
+						request->color[i].handle);
+		object_sizes[color_index[i]] = request->color[i].object_size;
+	}
 	/* Draws of one batch share one coarse-Z buffer or use none. */
 	for (r = 0; r < count; r++) {
 		const struct chrome9_draw_request *req = requests[r];
@@ -8914,7 +8962,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		     DRM_CHROME9_FRAGMENT_DESTINATION_TILED |
 		     DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED) ||
 		    req->depth_handle != request->depth_handle ||
-		    req->depth_object_size != request->depth_object_size) {
+		    req->depth_object_size != request->depth_object_size ||
+		    req->color_count != request->color_count ||
+		    memcmp(req->color, request->color, sizeof(req->color))) {
 			ret = -EINVAL;
 			goto out_put_objects;
 		}
@@ -9294,6 +9344,12 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			if (coarse_index != U32_MAX &&
 			    chrome9_gem_is_local(objects[coarse_index]))
 				local |= CHROME9_LOCAL_COARSE_Z;
+			for (t = 0; t + 1 < request->color_count; t++) {
+				color_bases[t] = sub->bases[color_index[t]] +
+						 PAGE_SIZE;
+				if (chrome9_gem_is_local(objects[color_index[t]]))
+					local |= CHROME9_LOCAL_COLOR(t);
+			}
 			for (t = 0; t < req->fragment_texture_count; t++) {
 				const u32 o = sub->draw[next].texture_object[t];
 
@@ -9314,7 +9370,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				sub->bases[depth_index] + PAGE_SIZE,
 				coarse_index == U32_MAX ? 0 :
 				sub->bases[coarse_index] + PAGE_SIZE,
-				local, texture_bases,
+				local, color_bases, texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
 				req->query ? &query_address : NULL,
 				job->query_re, cache, &constants, &p, limit);
@@ -12936,6 +12992,54 @@ out_put:
 	return ret;
 }
 
+/*
+ * Colour targets of a draw: the program writes exactly count outputs; the
+ * destination takes oC0, target[i] oC(i+1).  Targets share the
+ * destination's size and bytes per pixel and have its guarded layout.
+ */
+static int chrome9_draw_colors_prepare(struct chrome9_draw_request *request,
+		const struct drm_chrome9_draw_colors *colors)
+{
+	const struct chrome9_fragment_rt_format *rt =
+		chrome9_fragment_rt_format(request->destination_format);
+	const u32 count = colors && colors->count ? colors->count : 1;
+	unsigned int i;
+
+	if (count > 4 || request->fragment_program->color_outputs != count ||
+	    (colors && colors->reserved))
+		return -EINVAL;
+	for (i = 0; colors && i < ARRAY_SIZE(colors->target); i++) {
+		const struct drm_chrome9_color_target *c = &colors->target[i];
+		const struct chrome9_fragment_rt_format *f;
+		u32 rows;
+		u64 bytes;
+
+		if (i + 1 >= count) {
+			if (memchr_inv(c, 0, sizeof(*c)))
+				return -EINVAL;
+			continue;
+		}
+		f = chrome9_fragment_rt_format(c->format);
+		rows = c->flags & DRM_CHROME9_COLOR_TARGET_TILED ?
+		       ALIGN(request->height, 8) : request->height;
+		if (!c->handle || !f || !rt || f->cpp != rt->cpp ||
+		    c->flags & ~DRM_CHROME9_COLOR_TARGET_TILED ||
+		    (c->flags & DRM_CHROME9_COLOR_TARGET_TILED &&
+		     !(chrome9_engine_capabilities2() &
+		       DRM_CHROME9_CAP2_TILED_COLOR)) ||
+		    c->pitch < request->width * f->cpp || c->pitch % 32 ||
+		    c->pitch >> 5 > 0x3ff ||
+		    check_mul_overflow((u64)c->pitch, (u64)rows, &bytes) ||
+		    !IS_ALIGNED(c->object_size, PAGE_SIZE) ||
+		    c->object_size < bytes + 2 * PAGE_SIZE)
+			return -EINVAL;
+	}
+	request->color_count = count;
+	if (colors)
+		memcpy(request->color, colors->target, sizeof(request->color));
+	return 0;
+}
+
 static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 				 struct drm_chrome9_draw_fragment_program *args,
 				 struct chrome9_tcl_draw *tcl,
@@ -12946,7 +13050,10 @@ static int chrome9_draw_fragment(struct drm_device *drm, struct drm_file *file,
 
 	if (ret)
 		return ret;
-	ret = chrome9_submit_fragment_program(drm, file, &d.request);
+	/* Colour targets need DRAW_VERTEX_PROGRAMS. */
+	ret = chrome9_draw_colors_prepare(&d.request, NULL);
+	if (!ret)
+		ret = chrome9_submit_fragment_program(drm, file, &d.request);
 	chrome9_prof_mark(CHROME9_PROF_RETIRE);
 	chrome9_prof_job(drm);
 	chrome9_fragment_draw_fini(&d);
@@ -13417,6 +13524,7 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct drm_chrome9_draw_vertex_programs *args = data;
+	struct drm_chrome9_draw_colors *colors = NULL;
 	struct drm_chrome9_draw_vertex_program *draws;
 	const struct chrome9_draw_request **requests;
 	struct chrome9_fragment_draw *fragments;
@@ -13428,7 +13536,9 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 	if (!chrome9_hw_tcl_enabled())
 		return -EOPNOTSUPP;
 	if (!args->count || args->count > DRM_CHROME9_VERTEX_MAX_BATCH ||
-	    args->flags || memchr_inv(args->reserved, 0, sizeof(args->reserved)))
+	    args->flags || args->reserved ||
+	    (args->colors_ptr && !(chrome9_engine_capabilities2() &
+				   DRM_CHROME9_CAP2_COLOR_TARGETS)))
 		return -EINVAL;
 	chrome9_prof_start();
 	/* One arena holds every copy and compile scratch of the batch. */
@@ -13438,6 +13548,14 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 	if (IS_ERR(draws)) {
 		ret = PTR_ERR(draws);
 		goto out;
+	}
+	if (args->colors_ptr) {
+		colors = chrome9_arena_copy_user(&arena, args->colors_ptr,
+						 args->count, sizeof(*colors));
+		if (IS_ERR(colors)) {
+			ret = PTR_ERR(colors);
+			goto out;
+		}
 	}
 	requests = chrome9_arena_alloc(&arena, args->count * sizeof(*requests));
 	fragments = chrome9_arena_alloc(&arena,
@@ -13454,6 +13572,13 @@ int chrome9_draw_vertex_programs_ioctl(struct drm_device *drm, void *data,
 						    tcl, &arena, &fragments[r]);
 		if (ret)
 			goto out;
+		/* prepared counts this draw for the fini below. */
+		ret = chrome9_draw_colors_prepare(&fragments[r].request,
+						  colors ? &colors[r] : NULL);
+		if (ret) {
+			prepared++;
+			goto out;
+		}
 		requests[r] = &fragments[r].request;
 	}
 	ret = chrome9_submit_fragment_programs(drm, file, requests,

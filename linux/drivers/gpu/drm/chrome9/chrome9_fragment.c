@@ -40,6 +40,8 @@ struct chrome9_fragment_state {
 	const struct drm_chrome9_fragment_instruction *instructions;
 	/* The program ends with a DEST_DEPTH MOV. */
 	bool depth_output;
+	/* Terminal RGBA writes oC0..oC(color_outputs - 1). */
+	u8 color_outputs;
 	u16 defined_mask[CHROME9_FRAGMENT_TEMP_COUNT];
 	u16 used_mask[CHROME9_FRAGMENT_TEMP_COUNT];
 	u16 last_use[CHROME9_FRAGMENT_TEMP_COUNT];
@@ -308,21 +310,28 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			return -EINVAL;
 		}
 		if (instruction->dst.file == DRM_CHROME9_FRAGMENT_DEST_TEMP) {
-			if (instruction->dst.index >= CHROME9_FRAGMENT_TEMP_COUNT ||
+			/* Only colour writes follow the first one. */
+			if (output_mask ||
+			    instruction->dst.index >= CHROME9_FRAGMENT_TEMP_COUNT ||
 			    state->defined_mask[instruction->dst.index] &
 				instruction->dst.writemask)
 				return -EINVAL;
 		} else if (instruction->dst.file ==
 			   DRM_CHROME9_FRAGMENT_DEST_COLOR) {
 			/* Multiple partial oC0 writes are compiler-encodable but have
-			 * timed out on VX900.  Production Mesa emits one terminal RGBA
-			 * write; admit only that silicon-qualified form for now.
+			 * timed out on VX900.  Admit terminal RGBA writes of oC0,
+			 * oC1, ... in order (more than one with CAP2_COLOR_TARGETS,
+			 * the vendor MRT program form).
 			 */
 			if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX ||
-			    instruction->dst.index ||
-			    instruction->dst.writemask != 0xf || output_mask ||
-			    i != instruction_count - 1)
+			    instruction->dst.index != state->color_outputs ||
+			    instruction->dst.index >= 4 ||
+			    (instruction->dst.index &&
+			     !(chrome9_engine_capabilities2() &
+			       DRM_CHROME9_CAP2_COLOR_TARGETS)) ||
+			    instruction->dst.writemask != 0xf)
 				return -EINVAL;
+			state->color_outputs++;
 			output_mask = 0xf;
 		} else if (instruction->dst.file ==
 			   DRM_CHROME9_FRAGMENT_DEST_DEPTH) {
@@ -411,8 +420,12 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			}
 		}
 	}
+	/* The colour writes end the program; oDepth only with one target. */
 	if (output_mask != 0xf || !alu_count ||
-	    alu_count + bridge_count > alu_limit)
+	    alu_count + bridge_count > alu_limit ||
+	    state->instructions[instruction_count - 1].dst.file !=
+	    DRM_CHROME9_FRAGMENT_DEST_COLOR ||
+	    (state->depth_output && state->color_outputs > 1))
 		return -EINVAL;
 	/*
 	 * The textured FE consumer carries three lanes unless the ALU reads
@@ -662,7 +675,8 @@ static void chrome9_fragment_encode_destination(u32 record[4],
 	const struct drm_chrome9_fragment_destination *destination)
 {
 	u32 file = destination->file == DRM_CHROME9_FRAGMENT_DEST_TEMP ? 0 : 2;
-	u32 id = destination->file == DRM_CHROME9_FRAGMENT_DEST_COLOR ? 0 :
+	u32 id = destination->file == DRM_CHROME9_FRAGMENT_DEST_COLOR ?
+		 destination->index :
 		 destination->file == DRM_CHROME9_FRAGMENT_DEST_DEPTH ? 4 :
 		 state->physical[destination->index];
 
@@ -1448,6 +1462,7 @@ int chrome9_fragment_compile_targets(
 	program->constant_count = constant_count;
 	program->texture_count = texture_count;
 	program->depth_output = state.depth_output;
+	program->color_outputs = state.color_outputs;
 	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; i++) {
 		u32 packed = program->varying_count;
 
