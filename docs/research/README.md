@@ -343,6 +343,9 @@ targets.
 - [chrome9-mrt-re.md](chrome9-mrt-re.md) recovers RT1..RT3 words, the A01
   shader-derived target count, shared/per-RT blend and mask state, vendor
   post-render format rule, and a guarded MRT silicon ladder.
+- [chrome9-varying-t4-re.md](chrome9-varying-t4-re.md) finds that VS outputs
+  after oT3 need A61[22:20] = 4 (wide output transfer); without it T4..T7
+  arrive stale in both the TCL and cmd22 paths.
 - [chrome9-texkill-depth-combo-audit.md](chrome9-texkill-depth-combo-audit.md)
   closes combined discard/color/depth scheduling and defines the guarded
   kill-before-depth suppression oracle.
