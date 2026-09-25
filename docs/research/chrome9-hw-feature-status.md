@@ -61,7 +61,8 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | state |
 |---|---|
-| surface tiling | RE in progress |
+| surface tiling | RE done (`chrome9-tiling-re.md`); SR42 bit 7 = 0 forces linear addressing on this board |
+| pixel-shader depth output | encoded (kernel `42677af`, `depth_output=0`): the first draw locked up the engine; RE of the difference in progress |
 | stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes), B14 (NaN kill) | open; B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
 | per-segment state cache | patch ready (default off), rungs R2/R3 |
 | render targets in local frame buffer memory | not started: needs an SL allocator, per-BO domain, WC mapping and extent checks; ladder in `chrome9-local-fb-placement.md` |

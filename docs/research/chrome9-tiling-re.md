@@ -332,6 +332,15 @@ FE      A00 unchanged (bit 1 = 0: 512-bit fetch)
 Any hang or guard change disables the knob.  R2 and R5 cover the tiled SF
 combination the vendor never produced (section 3); R9 checks SL separately.
 
+### R0 result, 2026-09-25
+
+Target read via `~/tmp/sr/sr` (VGA ports 0x3c4/0x3d4, read only):
+`SR42=30`, `CR43=90`, `CR62=00`.  SR42 bit 7 is 0, "force all engines
+to use linear addressing mode", and the manual lists the bit as read
+only.  Tiling is therefore unavailable on this board and R1-R9 were not
+run.  Whether the bit follows a strap or a BIOS register write that can
+be changed before the lock is not known.
+
 ## 7. Implementation plan (after R1-R7 pass)
 
 **Kernel** (it owns validation):
