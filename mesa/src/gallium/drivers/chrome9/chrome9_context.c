@@ -3186,11 +3186,35 @@ static bool
 chrome9_ps_source_modifier_allowed(enum chrome9_ps_opcode op,
                                    unsigned source)
 {
-   /* Only the A operand of MAD and CMP has a silicon-qualified NEG source
-    * modifier.  Keep every other opcode/slot on the explicit MUL(-1)
-    * fallback until its native modifier is qualified independently. */
-   return source == 0 &&
-          (op == CHROME9_PS_OPCODE_MAD || op == CHROME9_PS_OPCODE_CMP);
+   /* The A operand of MAD and CMP has a silicon-qualified NEG source
+    * modifier.  CHROME9_PS_NEG_SLOTS extends it to every A operand and to
+    * the B operand (qualified by the kernel's ABS lowering); C stays on
+    * the explicit MUL(-1) fallback. */
+   static int slots = -1;
+
+   if (slots < 0)
+      slots = debug_get_bool_option("CHROME9_PS_NEG_SLOTS", false);
+   switch (op) {
+   case CHROME9_PS_OPCODE_MAD:
+   case CHROME9_PS_OPCODE_CMP:
+      return source == 0 || (slots && source == 2);
+   case CHROME9_PS_OPCODE_ADD:
+   case CHROME9_PS_OPCODE_SUB:
+      return slots;
+   case CHROME9_PS_OPCODE_MOV:
+   case CHROME9_PS_OPCODE_MUL:
+   case CHROME9_PS_OPCODE_MIN:
+   case CHROME9_PS_OPCODE_MAX:
+   case CHROME9_PS_OPCODE_DP3:
+   case CHROME9_PS_OPCODE_DP4:
+   case CHROME9_PS_OPCODE_EXP2:
+   case CHROME9_PS_OPCODE_LOG2:
+   case CHROME9_PS_OPCODE_RCP:
+   case CHROME9_PS_OPCODE_RSQ:
+      return slots && source == 0;
+   default:
+      return false;
+   }
 }
 
 static bool
@@ -6840,28 +6864,38 @@ chrome9_ps_ir_coalesce_lanes(struct chrome9_ps_ir *ir)
       struct chrome9_ps_instruction *mov = &ir->instruction[i];
       struct chrome9_ps_instruction *producer;
       const struct chrome9_ps_source *from = &mov->source[0];
-      unsigned writer, dst_lane, src_lane;
-      bool lane_wise;
+      uint8_t map[4] = { 0xff, 0xff, 0xff, 0xff };
+      unsigned writer, read = 0;
+      bool lane_wise, injective = true;
 
       if (mov->op != CHROME9_PS_OPCODE_MOV ||
           mov->destination.file != CHROME9_PS_DESTINATION_TEMP ||
-          mov->destination.saturate ||
-          util_bitcount(mov->destination.writemask) != 1 ||
+          mov->destination.saturate || !mov->destination.writemask ||
           from->file != CHROME9_PS_SOURCE_TEMP || from->modifier ||
           from->id == mov->destination.id)
          continue;
-      dst_lane = ffs(mov->destination.writemask) - 1;
-      src_lane = from->swizzle[dst_lane];
-      if (src_lane > CHROME9_PS_SWIZZLE_W ||
+      /* Source lane l of the copy lands in destination lane map[l]. */
+      u_foreach_bit(d, mov->destination.writemask) {
+         const uint8_t l = from->swizzle[d];
+
+         if (l > CHROME9_PS_SWIZZLE_W || map[l] != 0xff)
+            injective = false;
+         else
+            map[l] = d;
+         read |= 1u << (l & 3);
+      }
+      if (!injective ||
           !chrome9_ps_single_writer(ir, from->id, &writer) || writer >= i)
          continue;
       producer = &ir->instruction[writer];
       if (producer->op == CHROME9_PS_OPCODE_TEX ||
-          producer->destination.writemask != 1u << src_lane)
+          producer->destination.writemask != read)
          continue;
       lane_wise = chrome9_ps_componentwise(producer->op) ||
                   producer->op == CHROME9_PS_OPCODE_ABS ||
                   producer->op == CHROME9_PS_OPCODE_FRC;
+      if (!lane_wise && util_bitcount(read) != 1)
+         continue;
       /* TEX coordinates and KILL keep their own temporaries. */
       {
          bool special = false;
@@ -6873,7 +6907,7 @@ chrome9_ps_ir_coalesce_lanes(struct chrome9_ps_ir *ir)
          if (special)
             continue;
       }
-      /* The target lane must not be written before this MOV. */
+      /* The target lanes must not be written before this MOV. */
       {
          bool written = false;
 
@@ -6892,13 +6926,19 @@ chrome9_ps_ir_coalesce_lanes(struct chrome9_ps_ir *ir)
          const unsigned from_id = from->id, to_id = mov->destination.id;
          const struct chrome9_ps_ir before = *ir;
 
-         if (lane_wise)
+         if (lane_wise) {
             for (unsigned s = 0; s < chrome9_ps_source_count(producer->op);
-                 s++)
-               producer->source[s].swizzle[dst_lane] =
-                  producer->source[s].swizzle[src_lane];
+                 s++) {
+               uint8_t swizzle[4];
+
+               memcpy(swizzle, producer->source[s].swizzle, 4);
+               for (unsigned l = 0; l < 4; l++)
+                  if (map[l] != 0xff)
+                     producer->source[s].swizzle[map[l]] = swizzle[l];
+            }
+         }
          producer->destination.id = to_id;
-         producer->destination.writemask = 1u << dst_lane;
+         producer->destination.writemask = mov->destination.writemask;
          for (unsigned j = writer + 1; j < ir->count; j++) {
             struct chrome9_ps_instruction *reader = &ir->instruction[j];
 
@@ -6909,22 +6949,248 @@ chrome9_ps_ir_coalesce_lanes(struct chrome9_ps_ir *ir)
                   continue;
                src->id = to_id;
                for (unsigned c = 0; c < 4; c++)
-                  if (src->swizzle[c] == src_lane)
-                     src->swizzle[c] = dst_lane;
+                  if (src->swizzle[c] <= CHROME9_PS_SWIZZLE_W &&
+                      map[src->swizzle[c]] != 0xff)
+                     src->swizzle[c] = map[src->swizzle[c]];
             }
          }
          if (ir->depth_output && ir->depth.file == CHROME9_PS_SOURCE_TEMP &&
              ir->depth.id == from_id) {
             ir->depth.id = to_id;
             for (unsigned c = 0; c < 4; c++)
-               if (ir->depth.swizzle[c] == src_lane)
-                  ir->depth.swizzle[c] = dst_lane;
+               if (ir->depth.swizzle[c] <= CHROME9_PS_SWIZZLE_W &&
+                   map[ir->depth.swizzle[c]] != 0xff)
+                  ir->depth.swizzle[c] = map[ir->depth.swizzle[c]];
          }
          chrome9_ps_ir_remove(ir, i--);
          if (!chrome9_ps_ir_translates(ir)) {
             *ir = before;
             i++;
          }
+      }
+   }
+}
+
+static bool
+chrome9_ps_same_operand(const struct chrome9_ps_source *a,
+                        const struct chrome9_ps_source *b)
+{
+   return a->file == b->file && a->id == b->id && a->modifier == b->modifier;
+}
+
+/*
+ * A temporary gathered by MOVs from varyings or constants and read only by
+ * componentwise ALU ops is substituted into its readers, splitting a reader
+ * into one record per source combination when that saves records.
+ */
+static void
+chrome9_ps_ir_split_gathers(struct chrome9_ps_ir *ir)
+{
+   for (unsigned first = 0; first < ir->count; first++) {
+      const struct chrome9_ps_instruction *seed = &ir->instruction[first];
+      const unsigned g = seed->destination.id;
+      uint8_t origin[4] = { 0xff, 0xff, 0xff, 0xff };
+      unsigned writers = 0, added = 0;
+      bool ok = true;
+
+      if (seed->op != CHROME9_PS_OPCODE_MOV ||
+          seed->destination.file != CHROME9_PS_DESTINATION_TEMP)
+         continue;
+      if (ir->depth_output && ir->depth.file == CHROME9_PS_SOURCE_TEMP &&
+          ir->depth.id == g)
+         continue;
+      for (unsigned i = 0; i < ir->count && ok; i++) {
+         const struct chrome9_ps_instruction *in = &ir->instruction[i];
+
+         if (in->op != CHROME9_PS_OPCODE_KILL &&
+             in->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+             in->destination.id == g) {
+            if (i < first || in->op != CHROME9_PS_OPCODE_MOV ||
+                in->destination.saturate || in->source[0].modifier ||
+                in->source[0].file == CHROME9_PS_SOURCE_TEMP ||
+                in->source[0].file == CHROME9_PS_SOURCE_POSITION) {
+               ok = false;
+               break;
+            }
+            u_foreach_bit(l, in->destination.writemask)
+               origin[l] = i;
+            writers++;
+            continue;
+         }
+         if (!chrome9_ps_reads_temp(in, g))
+            continue;
+         if (!chrome9_ps_componentwise(in->op) ||
+             in->destination.file != CHROME9_PS_DESTINATION_TEMP) {
+            ok = false;
+            break;
+         }
+      }
+      if (!ok)
+         continue;
+      /* Count the records each reader splits into. */
+      for (unsigned i = 0; i < ir->count && ok; i++) {
+         const struct chrome9_ps_instruction *in = &ir->instruction[i];
+         uint32_t keys[4];
+         unsigned groups = 0;
+
+         if (!chrome9_ps_reads_temp(in, g))
+            continue;
+         u_foreach_bit(c, in->destination.writemask) {
+            uint32_t key = 0;
+            bool seen = false;
+
+            for (unsigned s = 0; s < chrome9_ps_source_count(in->op); s++) {
+               const struct chrome9_ps_source *src = &in->source[s];
+               uint8_t l = src->swizzle[c];
+
+               if (src->file != CHROME9_PS_SOURCE_TEMP || src->id != g ||
+                   l > CHROME9_PS_SWIZZLE_W)
+                  continue;
+               if (origin[l] == 0xff)
+                  ok = false;
+               key |= (origin[l] + 1u) << (8 * s);
+            }
+            for (unsigned k = 0; k < groups; k++)
+               seen |= keys[k] == key;
+            if (!seen)
+               keys[groups++] = key;
+         }
+         added += groups - 1;
+      }
+      if (!ok || added >= writers)
+         continue;
+      {
+         const struct chrome9_ps_ir before = *ir;
+         struct chrome9_ps_ir out = *ir;
+
+         out.count = 0;
+         for (unsigned i = 0; i < before.count; i++) {
+            const struct chrome9_ps_instruction *in = &before.instruction[i];
+            uint8_t done = 0;
+
+            if (in->op != CHROME9_PS_OPCODE_KILL &&
+                in->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+                in->destination.id == g)
+               continue;
+            if (!chrome9_ps_reads_temp(in, g)) {
+               out.instruction[out.count++] = *in;
+               continue;
+            }
+            u_foreach_bit(c, in->destination.writemask) {
+               struct chrome9_ps_instruction split = *in;
+
+               if (done & (1u << c))
+                  continue;
+               split.destination.writemask = 0;
+               /* Lanes whose g operands come from the same MOVs. */
+               u_foreach_bit(d, in->destination.writemask) {
+                  bool same = true;
+
+                  for (unsigned s = 0; s < chrome9_ps_source_count(in->op);
+                       s++) {
+                     const struct chrome9_ps_source *src = &in->source[s];
+                     uint8_t lc = src->swizzle[c], ld = src->swizzle[d];
+
+                     if (src->file != CHROME9_PS_SOURCE_TEMP || src->id != g)
+                        continue;
+                     if ((lc <= CHROME9_PS_SWIZZLE_W) !=
+                         (ld <= CHROME9_PS_SWIZZLE_W) ||
+                         (lc <= CHROME9_PS_SWIZZLE_W &&
+                          origin[lc] != origin[ld]))
+                        same = false;
+                  }
+                  if (same)
+                     split.destination.writemask |= 1u << d;
+               }
+               done |= split.destination.writemask;
+               for (unsigned s = 0; s < chrome9_ps_source_count(in->op); s++) {
+                  struct chrome9_ps_source *src = &split.source[s];
+                  const struct chrome9_ps_source *from = NULL;
+
+                  if (src->file != CHROME9_PS_SOURCE_TEMP || src->id != g)
+                     continue;
+                  u_foreach_bit(d, split.destination.writemask)
+                     if (src->swizzle[d] <= CHROME9_PS_SWIZZLE_W)
+                        from = &before.instruction[
+                           origin[src->swizzle[d]]].source[0];
+                  /* Only literal lanes: any gathered operand reads them. */
+                  for (unsigned l = 0; !from && l < 4; l++)
+                     if (origin[l] != 0xff)
+                        from = &before.instruction[origin[l]].source[0];
+                  src->file = from->file;
+                  src->id = from->id;
+                  u_foreach_bit(d, split.destination.writemask)
+                     if (src->swizzle[d] <= CHROME9_PS_SWIZZLE_W)
+                        src->swizzle[d] = from->swizzle[src->swizzle[d]];
+               }
+               out.instruction[out.count++] = split;
+            }
+         }
+         *ir = out;
+         if (!chrome9_ps_ir_translates(ir))
+            *ir = before;
+         else
+            first = UINT_MAX;
+      }
+   }
+}
+
+/*
+ * Two partial writes of one temporary by the same op on the same operands
+ * become one record, e.g. MUL t.z = a.z * T1.x and MUL t.w = a.w * T1.y.
+ */
+static void
+chrome9_ps_ir_merge_lanes(struct chrome9_ps_ir *ir)
+{
+   for (unsigned j = 1; j < ir->count; j++) {
+      struct chrome9_ps_instruction *b = &ir->instruction[j];
+
+      if (!chrome9_ps_componentwise(b->op) ||
+          b->destination.file != CHROME9_PS_DESTINATION_TEMP)
+         continue;
+      for (unsigned i = 0; i < j; i++) {
+         struct chrome9_ps_instruction *a = &ir->instruction[i];
+         bool ok = a->op == b->op &&
+                   a->destination.file == b->destination.file &&
+                   a->destination.id == b->destination.id &&
+                   a->destination.saturate == b->destination.saturate &&
+                   !(a->destination.writemask & b->destination.writemask);
+
+         for (unsigned s = 0; ok && s < chrome9_ps_source_count(b->op); s++)
+            ok = chrome9_ps_same_operand(&a->source[s], &b->source[s]) &&
+                 !(b->source[s].file == CHROME9_PS_SOURCE_TEMP &&
+                   b->source[s].id == b->destination.id);
+         /* b's operands must be final at a, and nothing in between may
+          * read or write the temporary b defines. */
+         for (unsigned k = i; ok && k < j; k++) {
+            const struct chrome9_ps_instruction *in = &ir->instruction[k];
+
+            if (k > i && chrome9_ps_reads_temp(in, b->destination.id))
+               ok = false;
+            if (in->op == CHROME9_PS_OPCODE_KILL ||
+                in->destination.file != CHROME9_PS_DESTINATION_TEMP)
+               continue;
+            for (unsigned s = 0; ok && s < chrome9_ps_source_count(b->op); s++)
+               if (b->source[s].file == CHROME9_PS_SOURCE_TEMP &&
+                   b->source[s].id == in->destination.id)
+                  ok = false;
+         }
+         if (!ok)
+            continue;
+         {
+            const struct chrome9_ps_ir before = *ir;
+
+            u_foreach_bit(c, b->destination.writemask)
+               for (unsigned s = 0; s < chrome9_ps_source_count(b->op); s++)
+                  a->source[s].swizzle[c] = b->source[s].swizzle[c];
+            a->destination.writemask |= b->destination.writemask;
+            chrome9_ps_ir_remove(ir, j--);
+            if (!chrome9_ps_ir_translates(ir)) {
+               *ir = before;
+               j++;
+            }
+         }
+         break;
       }
    }
 }
@@ -7063,6 +7329,12 @@ chrome9_ps_ir_fold_copies(struct chrome9_ps_ir *ir,
    }
 }
 
+static unsigned
+chrome9_ps_config_tier(unsigned peak)
+{
+   return peak <= 3 ? 3 : peak <= 4 ? 2 : peak <= 6 ? 1 : 0;
+}
+
 static bool
 chrome9_compile_native_fs(struct chrome9_context *ctx,
                           struct chrome9_shader *shader, nir_shader *nir)
@@ -7106,6 +7378,8 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
       chrome9_ps_ir_fold_copies(&folded, &shader->native_fs);
       if (debug_get_bool_option("CHROME9_PS_COALESCE", true)) {
          chrome9_ps_ir_coalesce_lanes(&folded);
+         chrome9_ps_ir_split_gathers(&folded);
+         chrome9_ps_ir_merge_lanes(&folded);
          chrome9_ps_ir_fold_copies(&folded, &shader->native_fs);
       }
       if (chrome9_ps_ir_temp_pressure(&folded, &folded_peak))
@@ -7126,6 +7400,18 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
              scheduled_peak > 12)
             lowered = false;
          else
+            shader->semantic_fs_ir = scheduled;
+      } else if (source_peak > 3) {
+         /* A90 HPSConFig keeps 2x, 3x or 4x the pixels in flight for
+          * programs within 6, 4 or 3 physical temps. */
+         struct chrome9_ps_ir scheduled;
+         unsigned scheduled_peak;
+
+         if (chrome9_schedule_ps_ir_target(&shader->semantic_fs_ir,
+                                           &scheduled, &scheduled_peak,
+                                           3, 512) &&
+             chrome9_ps_config_tier(scheduled_peak) >
+             chrome9_ps_config_tier(source_peak))
             shader->semantic_fs_ir = scheduled;
       }
    }
@@ -7534,8 +7820,11 @@ chrome9_dump_semantic_fs(const struct chrome9_shader *shader)
    if (!debug_get_bool_option("CHROME9_DUMP_SEMANTIC_FS", false) ||
        !shader->semantic_fs_valid)
       return;
-   fprintf(stderr, "chrome9: semantic FS count=%u constants=%08x "
-           "uniforms=%08x immediates=%08x\n", ir->count,
+   unsigned peak = 0;
+
+   chrome9_ps_ir_temp_pressure(ir, &peak);
+   fprintf(stderr, "chrome9: semantic FS count=%u peak=%u constants=%08x "
+           "uniforms=%08x immediates=%08x\n", ir->count, peak,
            shader->semantic_constant_mask, shader->semantic_uniform_mask,
            shader->native_fs.immediate_mask);
    for (unsigned i = 0; i < ir->count; i++) {

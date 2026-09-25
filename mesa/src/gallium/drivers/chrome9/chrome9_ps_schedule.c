@@ -46,6 +46,13 @@ source_count(enum chrome9_ps_opcode op)
    }
 }
 
+static bool
+writes_temp(const struct chrome9_ps_instruction *instruction)
+{
+   return instruction->op != CHROME9_PS_OPCODE_KILL &&
+          instruction->destination.file == CHROME9_PS_DESTINATION_TEMP;
+}
+
 static void
 set_bit(uint64_t bits[CHROME9_PS_SCHEDULE_WORDS], unsigned bit)
 {
@@ -115,7 +122,7 @@ chrome9_ps_ir_temp_pressure(const struct chrome9_ps_ir *ir,
    for (unsigned i = 0; i < ir->count; i++) {
       const struct chrome9_ps_instruction *instruction = &ir->instruction[i];
 
-      if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP) {
+      if (writes_temp(instruction)) {
          unsigned temp = instruction->destination.id;
 
          if (temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
@@ -175,7 +182,7 @@ chrome9_schedule_ps_attempt(
          if (test_bit(done, i) || !dependencies_done(&node[i], done))
             continue;
          instruction = &original->instruction[i];
-         if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+         if (writes_temp(instruction) &&
              remaining_uses[instruction->destination.id] &&
              !live[instruction->destination.id])
             birth = 1;
@@ -210,7 +217,7 @@ chrome9_schedule_ps_attempt(
          } else {
             /* Deterministic bounded retries diversify legal ready-node
              * choices only after the fast critical-path greedy pass misses
-             * the twelve-register hardware envelope. */
+             * the requested register target. */
             diversity ^= diversity << 13;
             diversity ^= diversity >> 17;
             diversity ^= diversity << 5;
@@ -232,7 +239,7 @@ chrome9_schedule_ps_attempt(
 
       output->instruction[out] = *instruction;
       set_bit(done, best);
-      if (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+      if (writes_temp(instruction) &&
           remaining_uses[instruction->destination.id] &&
           !live[instruction->destination.id]) {
          live[instruction->destination.id] = true;
@@ -266,6 +273,17 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
                        struct chrome9_ps_ir *output,
                        unsigned *peak_live)
 {
+   return chrome9_schedule_ps_ir_target(input, output, peak_live,
+                                        CHROME9_PS_SCHEDULE_TARGET,
+                                        CHROME9_PS_SCHEDULE_VARIANTS);
+}
+
+bool
+chrome9_schedule_ps_ir_target(const struct chrome9_ps_ir *input,
+                              struct chrome9_ps_ir *output,
+                              unsigned *peak_live, unsigned target,
+                              unsigned variants)
+{
    struct chrome9_ps_schedule_node node[CHROME9_PS_MAX_INSTRUCTIONS] = { 0 };
    uint64_t definition[CHROME9_PS_MAX_VIRTUAL_TEMPS]
                       [CHROME9_PS_SCHEDULE_WORDS] = { 0 };
@@ -292,9 +310,15 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
       const struct chrome9_ps_destination *destination =
          &instruction->destination;
 
-      if (!source_count(instruction->op) ||
-          instruction->op == CHROME9_PS_OPCODE_KILL ||
-          !destination->writemask || destination->writemask > 0xf)
+      if (!source_count(instruction->op))
+         return false;
+      /* KILL has no destination and only has to precede the colour writes. */
+      if (instruction->op == CHROME9_PS_OPCODE_KILL) {
+         if (colors || destination->writemask)
+            return false;
+         continue;
+      }
+      if (!destination->writemask || destination->writemask > 0xf)
          return false;
       /* Colour writes oC0, oC1, ... end the program in order. */
       if (destination->file == CHROME9_PS_DESTINATION_COLOR) {
@@ -331,7 +355,7 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
             continue;
          if (source->id >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
              !defined_components[source->id] ||
-             (instruction->destination.file == CHROME9_PS_DESTINATION_TEMP &&
+             (writes_temp(instruction) &&
               instruction->destination.id == source->id))
             return false;
          for (unsigned w = 0; w < CHROME9_PS_SCHEDULE_WORDS; w++)
@@ -342,9 +366,11 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
       }
    }
 
-   /* All work must contribute to a COLOR result: rejects dead code. */
-   for (unsigned c = color; c < original.count; c++)
-      set_bit(reachable, c);
+   /* All work must contribute to a COLOR result or a KILL: rejects dead
+    * code. */
+   for (unsigned i = 0; i < original.count; i++)
+      if (i >= color || original.instruction[i].op == CHROME9_PS_OPCODE_KILL)
+         set_bit(reachable, i);
    for (unsigned pass = 0; pass < original.count; pass++) {
       bool progress = false;
 
@@ -399,9 +425,8 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
    if (!chrome9_schedule_ps_attempt(&original, node, total_uses, output,
                                     &best_peak, 0))
       return false;
-   if (best_peak > CHROME9_PS_SCHEDULE_TARGET) {
-      for (unsigned variant = 1;
-           variant <= CHROME9_PS_SCHEDULE_VARIANTS; variant++) {
+   if (best_peak > target) {
+      for (unsigned variant = 1; variant <= variants; variant++) {
          unsigned candidate_peak;
 
          if (!chrome9_schedule_ps_attempt(&original, node, total_uses,
@@ -412,7 +437,7 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
             *output = candidate;
             best_peak = candidate_peak;
          }
-         if (best_peak <= CHROME9_PS_SCHEDULE_TARGET)
+         if (best_peak <= target)
             break;
       }
    }

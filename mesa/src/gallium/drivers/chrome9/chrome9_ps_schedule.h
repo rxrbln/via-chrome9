@@ -21,4 +21,11 @@ bool chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
                             struct chrome9_ps_ir *output,
                             unsigned *peak_live);
 
+/* Stop at the first schedule with peak_live <= target, trying at most
+ * variants randomized orders after the greedy one. */
+bool chrome9_schedule_ps_ir_target(const struct chrome9_ps_ir *input,
+                                   struct chrome9_ps_ir *output,
+                                   unsigned *peak_live, unsigned target,
+                                   unsigned variants);
+
 #endif

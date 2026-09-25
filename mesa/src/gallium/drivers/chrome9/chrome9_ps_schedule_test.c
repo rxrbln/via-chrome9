@@ -3,6 +3,7 @@
 #include "chrome9_ps_schedule.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <string.h>
 
 struct compact_source {
@@ -368,6 +369,39 @@ main(void)
               "shadow stream changed: alu=%u tex=%u sat=%u neg=%u\n",
               shadow_alu, shadow_tex, shadow_saturate, shadow_negate);
       return 1;
+   }
+
+   build_lightall(&input);
+   {
+      struct chrome9_ps_instruction *kill = &input.instruction[input.count - 1];
+      struct chrome9_ps_instruction color = *kill;
+      unsigned kill_index = UINT_MAX, color_index = UINT_MAX;
+
+      input.instruction[input.count++] = color;
+      memset(kill, 0, sizeof(*kill));
+      kill->op = CHROME9_PS_OPCODE_KILL;
+      kill->source[0] = input.instruction[0].source[0];
+      kill->source[0].file = CHROME9_PS_SOURCE_TEMP;
+      kill->source[0].id = input.instruction[0].destination.id;
+      for (unsigned c = 0; c < 4; c++)
+         kill->source[0].swizzle[c] = c;
+      if (!chrome9_schedule_ps_ir(&input, &scheduled, &peak) ||
+          !same_multiset(&input, &scheduled)) {
+         fprintf(stderr, "KILL schedule failed\n");
+         return 1;
+      }
+      for (unsigned i = 0; i < scheduled.count; i++) {
+         if (scheduled.instruction[i].op == CHROME9_PS_OPCODE_KILL)
+            kill_index = i;
+         else if (scheduled.instruction[i].destination.file ==
+                  CHROME9_PS_DESTINATION_COLOR)
+            color_index = i;
+      }
+      if (kill_index > color_index || color_index != scheduled.count - 1) {
+         fprintf(stderr, "KILL order: kill=%u color=%u\n", kill_index,
+                 color_index);
+         return 1;
+      }
    }
 
    build_lightall(&input);
