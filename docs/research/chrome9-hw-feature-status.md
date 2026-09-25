@@ -61,7 +61,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | smooth (AA) lines, also from polygon mode LINE | llvmpipe (Mesa `34b1ffa`) | no AA line hardware; draw's AA line stage is not installed |
 | polygon POINT mode, unfilled quads/polygons, per-vertex edge flags | draw module | GL draws the clipped polygon's vertices; quads hide inner edges |
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
-| fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size (below) |
+| fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size in every vendor driver (overflow silently truncated); multi-pass splitting needs R32F targets (untested) and denser code (`chrome9-long-fragment-programs.md`) |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
 | terrain fragment shader, glmark2 ideas (one FS above 96 records), some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work; cel runs on hardware since flagged arithmetic of finite operands counts as finite (32 -> 81 fps) |
 | desktop blur | validation fails (sampler precision) | open |
@@ -72,6 +72,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 |---|---|
 | stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes) | open (B14 done); B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
 | per-segment state cache | patch ready (default off), rungs R2/R3 |
+| vertex IF nesting | depth 4 by default, reported by GET_PARAM VS_FLOW_DEPTH (kernel `a5fee45`, Mesa `7d88b30`); most vertex IFs are flattened to selects before TCL emission |
 
 ## Texture sampler: border, GL_CLAMP, mirror once, 1D, shadow, LOD limits
 
