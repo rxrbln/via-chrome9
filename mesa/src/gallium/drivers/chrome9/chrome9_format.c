@@ -27,6 +27,9 @@ static const struct chrome9_texture_format_info texture_formats[] = {
      { D(0), D(1), D(2), O } },
    { PIPE_FORMAT_X8Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4,
      { D(0), Z, Z, O } },
+   /* Depth in [31:8] like X8Z24; the sampler ignores the stencil byte. */
+   { PIPE_FORMAT_S8_UINT_Z24_UNORM, DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24, 4,
+     { D(0), Z, Z, O } },
    /* The DXT1 decoder always applies punch-through alpha; the fragment
     * path forces A = 1 for the RGB view. */
    { PIPE_FORMAT_DXT1_RGB, DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGB, 8,
@@ -158,7 +161,7 @@ chrome9_texture_swizzle_supported(enum pipe_format format,
    /* A raw D24 sample returns depth in every native lane.  The generic
     * fragment path composes the Gallium view swizzle (including constants)
     * into later source selectors before submitting the program. */
-   if (format == PIPE_FORMAT_X8Z24_UNORM)
+   if (chrome9_format_is_d24(format))
       return r <= PIPE_SWIZZLE_1 && g <= PIPE_SWIZZLE_1 &&
              b <= PIPE_SWIZZLE_1 && a <= PIPE_SWIZZLE_1;
 

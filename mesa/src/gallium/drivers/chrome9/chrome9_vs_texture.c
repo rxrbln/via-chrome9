@@ -95,7 +95,7 @@ chrome9_vs_fetch_texel(const struct pipe_sampler_view *view,
       view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a,
    };
 
-   if (view->format == PIPE_FORMAT_X8Z24_UNORM) {
+   if (chrome9_format_is_d24(view->format)) {
       util_format_unpack_z_float(view->format, &decoded[0], pixel, 1);
       decoded[1] = decoded[2] = 0.0f;
       decoded[3] = 1.0f;

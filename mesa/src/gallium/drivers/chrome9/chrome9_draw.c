@@ -200,7 +200,7 @@ chrome9_draw_needs_sw_textures(const struct chrome9_context *ctx)
       /* Sampler states beyond the hardware (fractional LINEAR LOD limits,
        * filtered D24 without a compare) sample in llvmpipe. */
       if ((sampler && !sampler->supported) ||
-          (sampler && res->format == PIPE_FORMAT_X8Z24_UNORM &&
+          (sampler && chrome9_format_is_d24(res->format) &&
            !chrome9_depth_compare(ctx, i) &&
            (sampler->min_filter != DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
             sampler->mag_filter != DRM_CHROME9_TEXTURE_FILTER_NEAREST)))
@@ -1328,7 +1328,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          *reason = "mip-view-state";
          /* D24 is point sampled only; a compare may request LINEAR, whose
           * result GL leaves implementation-dependent (vendor: nearest). */
-         if (source->format == PIPE_FORMAT_X8Z24_UNORM &&
+         if (chrome9_format_is_d24(source->format) &&
              ((!chrome9_depth_compare(ctx, logical) &&
                (samplers[unit]->min_filter !=
                    DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
@@ -1479,6 +1479,7 @@ chrome9_fragment_unit_interval_texture(enum pipe_format format)
    case PIPE_FORMAT_L8A8_UNORM:
    case PIPE_FORMAT_B5G6R5_UNORM:
    case PIPE_FORMAT_X8Z24_UNORM:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
    case PIPE_FORMAT_DXT1_RGB:
    case PIPE_FORMAT_DXT1_RGBA:
    case PIPE_FORMAT_DXT3_RGBA:
@@ -1660,7 +1661,7 @@ chrome9_generic_fragment_state(
          continue;
       }
       /* The lowered compare reads the raw depth and swizzles itself. */
-      if (textures[unit]->base.format != PIPE_FORMAT_X8Z24_UNORM ||
+      if (!chrome9_format_is_d24(textures[unit]->base.format) ||
           chrome9_depth_compare(crender->ctx, logical))
          continue;
       if (!view)
@@ -1730,7 +1731,7 @@ chrome9_generic_fragment_state(
       texture_state[unit].last_level = last_level;
       texture_state[unit].min_filter = samplers[unit]->min_filter;
       texture_state[unit].mag_filter = samplers[unit]->mag_filter;
-      if (resource->format == PIPE_FORMAT_X8Z24_UNORM) {
+      if (chrome9_format_is_d24(resource->format)) {
          texture_state[unit].min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
          texture_state[unit].mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
       }

@@ -1139,7 +1139,7 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
         pres->target != PIPE_TEXTURE_CUBE) || pres->depth0 != 1 ||
        pres->nr_samples > 1 ||
        pres->nr_storage_samples > 1 || format != pres->format ||
-       format == PIPE_FORMAT_X8Z24_UNORM || chrome9_format_is_dxt(format) ||
+       chrome9_format_is_d24(format) || chrome9_format_is_dxt(format) ||
        (!format_info && format != PIPE_FORMAT_Z16_UNORM) ||
        base_level > last_level || last_level > pres->last_level ||
        first_layer > last_layer || last_layer >= pres->array_size)
