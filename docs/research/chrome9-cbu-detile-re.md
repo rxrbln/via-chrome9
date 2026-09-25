@@ -656,3 +656,25 @@ CPU access to tiled surfaces then stays on `chrome9_tiled_copy` or a
 * **Open:** GPU accesses to an active window range (C7) must bypass the
   translation; not covered by the ladder yet, since it needs a tiled draw
   into a local object while a view is mapped.
+
+## 13. DFA enable variants on silicon (2026-09-26)
+
+Kernel with the DFA-variant probe (module `k134-dfa`), `cbu_selftest=13`:
+
+| `cbu_route` | UNLOCK (D1F0 RxB0[3]) | B9 write | D1F0 RxB9 after |
+|---|---|---|---|
+| `0x17` | not set | dword RMW of B8 | `00` |
+| `0x27` | `01 -> 09` (latches) | byte | `00` |
+| `0x37` | `01 -> 09` | dword RMW | `00` |
+
+D1F0 B0..BF read `00408001 00000000 00000000 00000000` before, after and on
+restore.  The DFA enable bit never latches, with or without UNLOCK and with
+either write width, although D0F3 RxA0 places the DFA base and size exactly
+on BAR2.  Direct frame-buffer access is therefore not reachable from
+software on this board (**D**, board BIOS/strap policy by inference), and
+with the CPU routed through the graphics controller the CBU windows do not
+translate CPU accesses in any tested mode (section 12, routes 1/3/9).
+Result: the CBU is not usable as a CPU detiling aperture on this VX900
+board.  CPU access to tiled surfaces stays on `chrome9_tiled_copy` staging
+copies; the linear-view production patch stays unmerged.  The ladder and
+probe remain in the kernel behind default-off parameters.
