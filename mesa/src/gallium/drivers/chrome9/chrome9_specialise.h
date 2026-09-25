@@ -24,6 +24,9 @@ void chrome9_nir_lower_integers(struct nir_shader *nir);
  * pipe_context::set_inlinable_constants. */
 void chrome9_nir_find_inlinable_uniforms(struct nir_shader *nir);
 
+/* Fragment ifs to selects; loops the unroller keeps stay. */
+void chrome9_nir_flatten_ifs(struct nir_shader *nir);
+
 /* Substitute the raw values recorded above, then fold and unroll until the
  * shader reaches a stable form. */
 void chrome9_nir_inline_uniforms(struct nir_shader *nir,

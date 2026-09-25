@@ -349,6 +349,7 @@ chrome9_finalize_nir(struct pipe_screen *screen, nir_shader *nir,
    if (nir->info.stage != MESA_SHADER_FRAGMENT)
       return;
    chrome9_nir_lower_integers(nir);
+   chrome9_nir_flatten_ifs(nir);
    /* The state tracker finalizes again per variant but delivers the values
     * of the link-time list: keep it. */
    if (!nir->info.num_inlinable_uniforms)

@@ -421,6 +421,30 @@ chrome9_inline_ubo_vec4(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* The pixel engine has no flow control: every if whose arms hold no loop
+ * becomes selects, discards inside it conditional. */
+static const nir_opt_peephole_select_options chrome9_flatten = {
+   .limit = ~0u,
+   .indirect_load_ok = true,
+   .expensive_alu_ok = true,
+   .discard_ok = true,
+};
+
+void
+chrome9_nir_flatten_ifs(nir_shader *nir)
+{
+   bool progress;
+
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &chrome9_flatten);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+   } while (progress);
+}
+
 static void
 chrome9_fold_after_inline(nir_shader *nir)
 {
@@ -433,8 +457,7 @@ chrome9_fold_after_inline(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
-      NIR_PASS(progress, nir, nir_opt_peephole_select,
-               &(nir_opt_peephole_select_options){ .limit = 8 });
+      NIR_PASS(progress, nir, nir_opt_peephole_select, &chrome9_flatten);
       NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_cse);
