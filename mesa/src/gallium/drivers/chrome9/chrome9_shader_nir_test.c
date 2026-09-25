@@ -862,13 +862,14 @@ check_equal_zero_select_compilation(struct chrome9_context *context,
       default: break;
       }
    }
-   /* NIR CSE merges the three selects.  A nonzero reference takes the
-    * general finite path: SUB, ABS and a negated CMP, without a guard. */
-   valid = shader.supported && shader.semantic_fs_valid &&
+   /* NIR CSE merges the three selects.  Interpolation of other values is
+    * not exact, so equality of a varying to a nonzero value stays closed. */
+   valid = expect_supported ?
+      shader.supported && shader.semantic_fs_valid &&
       shader.native_fs_valid &&
-      shader.semantic_equal_zero_input_mask ==
-         (expect_supported ? 1u << 6 : 0) &&
-      abs_count == 1 && sub_count == 1 && cmp_count == 1;
+      shader.semantic_equal_zero_input_mask == 1u << 6 &&
+      abs_count == 1 && sub_count == 1 && cmp_count == 1 :
+      !shader.supported && !shader.semantic_fs_valid;
    if (!valid)
       fprintf(stderr, "equal-zero select compilation failed: ref=%g "
               "expected=%u supported=%u semantic=%u native=%u "
@@ -1937,6 +1938,50 @@ check_condition_lowering(struct chrome9_context *context)
    return true;
 }
 
+/* Equality on an interpolated varying is not exact; ordered compares are. */
+static bool
+check_interpolated_equality(struct chrome9_context *context)
+{
+   bool valid = true;
+
+   for (unsigned test = 0; test < 3; test++) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "chrome9-interpolated-equality");
+      struct chrome9_shader shader = { 0 };
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *barycentric = nir_load_barycentric_pixel(
+         &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+      nir_def *v = nir_load_interpolated_input(
+         &b, 4, 32, barycentric, zero,
+         .io_semantics.location = VARYING_SLOT_VAR0);
+      nir_def *u = nir_load_ubo_vec4(&b, 4, 32, zero, zero);
+      nir_def *p = test == 0 ? nir_feq(&b, nir_channel(&b, v, 0),
+                                       nir_channel(&b, u, 0)) :
+                   test == 1 ? nir_ball_fequal2(&b, nir_channels(&b, v, 3),
+                                                nir_channels(&b, u, 3)) :
+                               nir_flt(&b, nir_channel(&b, v, 0),
+                                       nir_channel(&b, u, 0));
+
+      b.shader->info.io_lowered = true;
+      nir_store_output(&b, nir_bcsel(&b, p,
+                                     nir_imm_vec4(&b, 0, 1, 0, 1),
+                                     nir_imm_vec4(&b, 1, 0, 0, 1)),
+                       zero, .write_mask = 0xf,
+                       .io_semantics.location = FRAG_RESULT_COLOR);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      nir_recompute_io_bases(b.shader,
+                             nir_var_shader_in | nir_var_shader_out);
+      chrome9_compile_fs_nir(context, &shader, b.shader);
+      if (shader.supported != (test == 2)) {
+         fprintf(stderr, "interpolated equality case %u failed: "
+                 "supported=%u\n", test, shader.supported);
+         valid = false;
+      }
+      ralloc_free(b.shader);
+   }
+   return valid;
+}
+
 /* Two discards merge into one KILL of MIN(CMP(c0, -1, 1), CMP(c1, -1, 1)). */
 static bool
 check_discard_lowering(struct chrome9_context *context)
@@ -2848,6 +2893,7 @@ main(void)
    failures += !check_position_alias_compilation(&context);
    failures += !check_condition_lowering(&context);
    failures += !check_discard_lowering(&context);
+   failures += !check_interpolated_equality(&context);
    failures += !check_blinn_phong_integer_power(&context);
    failures += !check_function_medium_sqrt_boundary(&context);
    failures += !check_ideas_logo_shadow_compilation(&context);

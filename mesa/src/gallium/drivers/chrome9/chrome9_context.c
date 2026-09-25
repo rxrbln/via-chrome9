@@ -3548,6 +3548,7 @@ enum chrome9_ps_proof_kind {
    CHROME9_PS_PROOF_FINITE,
    CHROME9_PS_PROOF_NONNEGATIVE,
    CHROME9_PS_PROOF_BOUND,
+   CHROME9_PS_PROOF_UNINTERPOLATED,
 };
 
 #define CHROME9_PS_PROOF_NODES 4096
@@ -3911,6 +3912,73 @@ chrome9_ps_default_finite_alu_source(nir_alu_instr *alu, unsigned source,
           !chrome9_ps_default_finite(
              (nir_scalar) { alu->src[source].src.ssa, component }, proof))
          return false;
+   }
+   return true;
+}
+
+/* Perspective interpolation of a triangle-constant value is not exact in
+ * general, so float equality is lowered only on values that no interpolated
+ * varying reaches: constants, uniforms, texels, the pixel position, and
+ * 0.0/1.0 selections. */
+static bool
+chrome9_ps_uninterpolated_uncached(nir_scalar scalar,
+                                   struct chrome9_ps_proof *proof);
+
+static bool
+chrome9_ps_uninterpolated(nir_scalar scalar, struct chrome9_ps_proof *proof)
+{
+   return chrome9_ps_proof_memo(proof, scalar,
+                                CHROME9_PS_PROOF_UNINTERPOLATED,
+                                chrome9_ps_uninterpolated_uncached);
+}
+
+static bool
+chrome9_ps_uninterpolated_uncached(nir_scalar scalar,
+                                   struct chrome9_ps_proof *proof)
+{
+   nir_instr *instr;
+   nir_alu_instr *alu;
+
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   instr = nir_def_instr(scalar.def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_tex:
+      return true;
+   case nir_instr_type_intrinsic:
+      switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+      case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_ubo_vec4:
+      case nir_intrinsic_load_frag_coord:
+      case nir_intrinsic_load_front_face:
+         return true;
+      default:
+         return false;
+      }
+   case nir_instr_type_alu:
+      break;
+   default:
+      return false;
+   }
+   alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_b2f32)
+      return true;
+   for (unsigned s = alu->op == nir_op_bcsel ? 1 : 0;
+        s < nir_op_infos[alu->op].num_inputs; s++) {
+      const unsigned size = nir_op_infos[alu->op].input_sizes[s];
+
+      if (!alu->src[s].src.ssa)
+         return false;
+      /* Reductions read every lane of their sources. */
+      for (unsigned c = 0; c < (size ? size : 1); c++) {
+         const unsigned lane = size ? c : scalar.comp;
+
+         if (alu->src[s].swizzle[lane] >= alu->src[s].src.ssa->num_components ||
+             !chrome9_ps_uninterpolated(
+                (nir_scalar) { alu->src[s].src.ssa,
+                               alu->src[s].swizzle[lane] }, proof))
+            return false;
+      }
    }
    return true;
 }
@@ -4414,7 +4482,9 @@ chrome9_ps_lower_compare_lanes(struct chrome9_ps_nir_builder *builder,
          if (lanes[c] >= alu->def.num_components ||
              (convert ? !chrome9_ps_canonical_bool(scalar) :
               !boolean && !chrome9_ps_default_finite(scalar,
-                                                     &builder->proof)))
+                                                     &builder->proof)) ||
+             (equality && !boolean && !convert &&
+              !chrome9_ps_uninterpolated(scalar, &builder->proof)))
             return false;
          operand[s].swizzle[c] = alu->src[s].swizzle[lanes[c]];
       }
@@ -4485,13 +4555,19 @@ chrome9_ps_lower_vector_equality(struct chrome9_ps_nir_builder *builder,
                         alu->src[0].src.ssa->bit_size == 1;
    uint8_t difference, magnitude, sum;
 
-   for (unsigned s = 0; s < 2; s++)
+   for (unsigned s = 0; s < 2; s++) {
       if (!alu->src[s].src.ssa ||
           alu->src[s].src.ssa->bit_size != (boolean ? 1 : 32) ||
           (!boolean &&
            !chrome9_ps_default_finite_alu_source(alu, s, count,
                                                  &builder->proof)))
          return false;
+      for (unsigned c = 0; !boolean && c < count; c++)
+         if (!chrome9_ps_uninterpolated(
+                (nir_scalar) { alu->src[s].src.ssa, alu->src[s].swizzle[c] },
+                &builder->proof))
+            return false;
+   }
    for (unsigned s = 0; s < 2; s++)
       if (!(boolean ?
             chrome9_ps_lower_bool_float(builder, &alu->src[s], count,
