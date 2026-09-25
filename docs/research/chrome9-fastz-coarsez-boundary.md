@@ -369,6 +369,45 @@ engine hang (FE/3D idle within the existing timeout), and a GART/SL guard
 page after the coarse-Z BO unchanged.  Any mismatch or timeout disables
 the capability again.  Only then measure glmark2 refract.
 
+## Silicon results, 2026-09-25
+
+Kernel `coarse_z=1` (CAP2 bit 23, flags `FRAGMENT_COARSE_Z` and
+`FRAGMENT_COARSE_Z_RESET`, `coarse_z_handle`/`coarse_z_pitch` in the
+fragment draw), rung `tools/re/chrome9_coarsez_rung.c`, 64x64 and
+1024x1024 targets, D16 and X8Z24, with the debug parameter `coarse_z_re`
+toggling A29 bits.  No hang, no guard damage in any run.
+
+**Entry format.**  After one full quad at depth z on a buffer filled with
+ones, each 16-byte entry reads `{00000000, 00000000, c000c000, Vffff}`
+with `V = 0xc000 | round(z * 16384)` (z = 0.125, 0.25, 0.5, 0.75,
+0.9375, 0.99 give `c800, d000, e000, f000, fc00, ff5c`): 16-bit fields
+whose bits 15:14 are `11` and whose low 14 bits are the top 14 depth
+bits, the same value the vendor clear packs.  D16 and X8Z24 are
+identical.  The first two dwords behave like per-sub-block masks (all
+ones after a clear, zero once the block is covered).
+
+**Mode and direction.**  With A29 bit 16 set and `[13:12] = 01` (the
+kernel default) the correctness sequence (clear, red 0.25, green 0.75
+behind, blue 0.10 left) is byte-identical to the run without coarse-Z,
+and depth-failing full quads behind a near quad are rejected: 32 hidden
+1024x1024 quads take 24.5 ms instead of 39.3 ms (explicit-access
+objects; implicit objects spend the job in whole-object cache flushes).
+`[13:12] = 10` keeps the entries at the running minimum (`c666` after
+0.10, `c333` after 0.05) but rejects nothing; `00` does not update and
+drops visible fragments.  A29 bit 17 set with LESS rejects visible
+fragments (wrong image) in every mode, so bit 17 selects GREATER/GEQUAL
+as recovered.  Bit 16 made no visible difference.
+
+**GL.**  Mesa fills the buffer with a 1-record constant draw after every
+full GPU depth clear to 1.0 and uses it for filled-triangle draws with
+LESS/LEQUAL, no stencil, no alpha test and no KILL; other depth-moving
+writes and CPU writes invalidate it.  `fill` probe, 1600x1200 X8Z24, eight
+full layers back to front (all but the first hidden): 55.8 -> 31.3 ms per
+frame.  Front to back and in glmark2 refract (104.8 ms) and ioquake3
+(GL1 about 61, GL2 about 42 fps) there is no measurable gain: their depth
+cost is not in depth-failing fragments.  The extra fill job costs about
+0.1-0.2 ms per cleared frame.
+
 ## Implementation and proof order
 
 1. Keep A01 bits 13/9 clear and A27 zero for all ordinary depth, shadow, and
