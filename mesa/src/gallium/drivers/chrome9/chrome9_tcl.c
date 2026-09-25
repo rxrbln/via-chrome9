@@ -135,6 +135,10 @@ tcl_scalar_width(const nir_instr *instr, const void *data)
    case nir_op_flog2:
    case nir_op_fpow:
    case nir_op_fsqrt:
+   /* Vector selects picked wrong lanes on silicon (mr3.shader_test,
+    * vs-temp-array-mat4-col-row-wr); scalar selects are exact. */
+   case nir_op_bcsel:
+   case nir_op_fcsel:
    /* Vector equality reductions become scalar compares. */
    case nir_op_ball_fequal2:
    case nir_op_ball_fequal3:
@@ -304,6 +308,35 @@ tcl_vector_width(const nir_instr *instr, const void *data)
    return tcl_scalar_width(instr, NULL) ? 1 : 4;
 }
 
+/* Selects whose condition lanes are constant (inlined control uniforms)
+ * become plain lane moves. */
+static bool
+tcl_fold_const_select(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   nir_scalar lanes[NIR_MAX_VEC_COMPONENTS];
+   const unsigned n = alu->def.num_components;
+
+   (void)data;
+   if (alu->op != nir_op_bcsel && alu->op != nir_op_fcsel &&
+       alu->op != nir_op_b32csel)
+      return false;
+   for (unsigned c = 0; c < n; c++) {
+      nir_scalar cond = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, c),
+                                                 0);
+      bool take;
+
+      if (!nir_scalar_is_const(cond))
+         return false;
+      take = alu->op == nir_op_fcsel ? nir_scalar_as_float(cond) != 0.0 :
+                                       nir_scalar_as_bool(cond);
+      lanes[c] = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, c),
+                                          take ? 1 : 2);
+   }
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def_replace(&alu->def, nir_vec_scalars(b, lanes, n));
+   return true;
+}
+
 static void
 tcl_optimize(nir_shader *nir)
 {
@@ -325,6 +358,8 @@ tcl_optimize(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_peephole_select, &select);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_shader_alu_pass, tcl_fold_const_select,
+               nir_metadata_control_flow, NULL);
       NIR_PASS(progress, nir, nir_opt_vectorize, tcl_vector_width, NULL);
    } while (progress);
 }
@@ -2226,6 +2261,9 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       NIR_PASS(_, nir, nir_lower_bool_to_float, true);
       tcl_optimize(nir);
    }
+   /* CHROME9_DEBUG_TCL_NIR=3 also prints the lowered program. */
+   if (debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0) > 2)
+      nir_print_shader(nir, stderr);
    b.impl = nir_shader_get_entrypoint(nir);
    if (!b.flow && !tcl_single_block(nir, &block)) {
       if (debug_get_bool_option("CHROME9_DEBUG_TCL", false)) {
