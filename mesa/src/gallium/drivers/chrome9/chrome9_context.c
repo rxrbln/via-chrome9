@@ -35,6 +35,7 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
+#include "util/u_prim.h"
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 
@@ -7347,6 +7348,23 @@ chrome9_framebuffer_color_count(const struct pipe_framebuffer_state *fb)
    return count;
 }
 
+
+/* Non-multisample smooth lines, also from polygon mode LINE: draw would
+ * hand them to the vbuf render unwidened, which draws triangles only. */
+static bool
+chrome9_draw_smooth_lines(const struct chrome9_context *ctx,
+                          const struct pipe_draw_info *info)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   const enum mesa_prim prim = u_reduced_prim(info->mode);
+
+   if (!rs || !rs->line_smooth || rs->multisample)
+      return false;
+   return prim == MESA_PRIM_LINES ||
+          (prim == MESA_PRIM_TRIANGLES &&
+           (rs->fill_front == PIPE_POLYGON_MODE_LINE ||
+            rs->fill_back == PIPE_POLYGON_MODE_LINE));
+}
 static void
 chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                  unsigned drawid_offset,
@@ -7404,14 +7422,16 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    /* The pixel engine writes exactly one colour target and blends without
-    * logic ops or polygon stipple: other states render in llvmpipe. */
+    * logic ops or polygon stipple, and draw has no AA line stage: other
+    * states render in llvmpipe. */
    if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture ||
         chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 ||
         /* The kernel binds single-level depth objects only. */
         (ctx->framebuffer.zsbuf.texture &&
          ctx->framebuffer.zsbuf.texture->last_level) ||
         !chrome9_draw_blend_supported(ctx) ||
-        (ctx->rasterizer && ctx->rasterizer->poly_stipple_enable)) &&
+        (ctx->rasterizer && ctx->rasterizer->poly_stipple_enable) ||
+        chrome9_draw_smooth_lines(ctx, info)) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    chrome9_refresh_vs_textures(ctx);
