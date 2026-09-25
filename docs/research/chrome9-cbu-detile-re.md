@@ -555,6 +555,75 @@ at the end of R.
 Suggested order: 1, 3, 7, then 9 (and `0xf` only if 7 and 9 each change
 something).
 
+### Step R results, 2026-09-25
+
+Kernel `0b6ea00` (route patches on `ac343fb`, write-combined pool), one
+load per value, no lock-up.  Every run ended with `restored D0F2.9E=cc
+D1F0.B9=00 SR42=30` and step R "pass".
+
+| `cbu_route` | change as read back | tile read pixels / columns | rotate 180 read | tile write |
+|---|---|---|---|---|
+| 1 | none | 16384 raw, 0 tiled / same | ctl `15` read `15`: 16384 raw | 128/16384 tiled, 16256 untranslated |
+| 3 | D0F2 9E `cc -> ce` | all raw | all raw | same |
+| 7 | 9E `ce`; DFA base `0xd0000000` size 256 MiB equal to BAR2; **D1F0 B9 `00 -> 00`** | all raw | all raw | same |
+| 9 | SR42 `30 -> b0` | all raw | all raw | same |
+
+Findings (D):
+
+* Control bit 0 latches (`25` reads `25`, `15` reads `15`), so the
+  window is enabled in the register.
+* Neither tile nor rotate function changes any CPU read or write of
+  BAR2 while CPU cycles reach GFXCTL through the SL BAR path.  This holds
+  with Rx9E[1] set, and with SR42 bit 7 set.
+* The CBU therefore does not act on the SL BAR path.  SR42 bit 7 and the
+  NB tile-window bit alone are not the missing enable.
+* D1F0 RxB9 does not accept a byte write of bit 1, so DFA was never on:
+  the route 7 result says nothing about DFA.
+
+### Why D1F0 RxB9 does not latch (open)
+
+Evidence collected (S, M; none measured beyond the byte write):
+
+* No vendor component writes it.  The board VBIOS (`VT3410 Embed NoTV
+  Ver07`) reaches PCI configuration only through its CF8/CFC helpers
+  (`0x6caf` read, `0x6ccb` write).  Their only callers touch D0F0 RxC4
+  (bit 17) and read D1F0 Rx18 (BAR2).  `VTROM.bin` has the same two
+  helpers.  The Windows KMD, `via_drv.so` and `via_chrome9.ko` contain
+  no D1F0 B0/B9 or D0F2 9E access (constant search).  DFA is therefore
+  a system-BIOS decision, and this BIOS left it off after setting the
+  DFA base to BAR2.
+* SPM: D1F0 RxB9 exists, with bit 1 = DFA enable (D0F3 RxA1 text) and
+  bit 0 = debug-signal routing to VCP/DVP1 (D0F4 Rx41[5] text).  The
+  OGPM lists D1F0 B3..F2 as reserved.
+* OGPM D1F0 RxB0 (Memory Base Control): bit 3 "UNLOCK", RW, default 0,
+  no description; it reads `01` on the target.  It is the only
+  documented lock near B9.
+* The D0F3 DFA fields are "RWS" (sticky, BIOS-owned); a matching
+  write-once or strap attribute on D1F0 B9 would explain the result,
+  but no document says so.
+
+Candidates: (a) B9 is write-protected until D1F0 RxB0[3] UNLOCK;
+(b) this configuration block ignores byte enables at a non-aligned
+offset, so a dword write is needed; (c) DFA is fused or strapped off, or
+BIOS-locked on this board.
+
+### Next probe (patch "CBU routing probe, DFA enable variants")
+
+Two new `cbu_route` bits:
+* bit 4: write B9 as a read-modify-write of the B8 dword;
+* bit 5: set D1F0 RxB0[3] before the change and restore it after.
+
+D1F0 B0..BF are logged before, after and on restore.  If B9 bit 1 still
+reads 0, step R restores and ends without the window probe.  If it
+latches, the existing read-back check (surface and GART hash with the
+window off) runs before any write through DFA.
+
+Order: `0x17` (dword write), then `0x27` (UNLOCK, byte write), then
+`0x37` (both).  If none latches, DFA is not reachable from software on
+this board, and the CBU is unusable as a CPU detiling aperture here.
+CPU access to tiled surfaces then stays on `chrome9_tiled_copy` or a
+2D-engine detile blit.
+
 ## 11. Production path (`cbu_linear`, default off)
 
 * **uAPI** (`GEM_LINEAR_VIEW` 0x25, CAP2 bit 32 `LINEAR_VIEW`): `ADD`
