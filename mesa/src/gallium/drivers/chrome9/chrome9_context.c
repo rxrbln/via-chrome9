@@ -7653,6 +7653,10 @@ chrome9_draw_smooth_lines(const struct chrome9_context *ctx,
 
    if (!rs || !rs->line_smooth || rs->multisample)
       return false;
+   /* One-pixel smooth lines use TCL edge antialiasing. */
+   if (prim == MESA_PRIM_LINES && ctx->tcl_edge_aa && ctx->tcl_lines &&
+       !rs->line_stipple_enable && rs->line_width < 1.5f)
+      return false;
    return prim == MESA_PRIM_LINES ||
           (prim == MESA_PRIM_TRIANGLES &&
            (rs->fill_front == PIPE_POLYGON_MODE_LINE ||
@@ -7735,6 +7739,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    /* No GPU job may start while llvmpipe still accesses a BO. */
    chrome9_sw_finish(ctx);
    if (chrome9_tcl_draw(ctx, info, &draws[0]))
+      return;
+   /* Smooth lines TCL declined: the draw module cannot widen them. */
+   if (ctx->rasterizer && ctx->rasterizer->line_smooth &&
+       u_reduced_prim(info->mode) == MESA_PRIM_LINES &&
+       chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
 
    for (unsigned i = 0; i < ctx->num_vertex_buffers; i++) {
@@ -7990,6 +7999,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
    ctx->tcl_dedupe = ctx->tcl_buffers &&
       debug_get_bool_option("CHROME9_TCL_DEDUPE", true);
+   ctx->tcl_edge_aa = ctx->tcl_enabled &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_EDGE_AA) &&
+      debug_get_bool_option("CHROME9_TCL_SMOOTH_LINES", true);
    ctx->fast_z = ctx->draw_fragment_program &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_FAST_Z) &&
       debug_get_bool_option("CHROME9_FAST_Z", true);

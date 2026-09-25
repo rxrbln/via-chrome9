@@ -2724,11 +2724,16 @@ struct tcl_raster {
 };
 
 /* GL aliased lines one pixel wide (widths below 1.5 round to one) under
- * the diamond-exit rule, which A01[22] selects. */
+ * the diamond-exit rule, which A01[22] selects; smooth lines of that
+ * width with hardware edge antialiasing. */
 static const char *
-tcl_raster_lines(const struct pipe_rasterizer_state *rs)
+tcl_raster_lines(const struct chrome9_context *ctx,
+                 const struct pipe_rasterizer_state *rs)
 {
-   if (rs->line_smooth || rs->line_stipple_enable || rs->line_rectangular ||
+   if ((rs->line_smooth && !ctx->tcl_edge_aa) ||
+       rs->line_stipple_enable ||
+       /* st asks for rectangular smooth lines; the hardware AA's shape. */
+       (rs->line_rectangular && !rs->line_smooth) ||
        rs->line_last_pixel || rs->point_line_tri_clip ||
        !rs->half_pixel_center || !(rs->line_width < 1.5f))
       return "wide, smooth or stippled lines";
@@ -2845,12 +2850,21 @@ tcl_raster(const struct chrome9_context *ctx, const struct pipe_draw_info *info,
       r->primitives = info->mode == MESA_PRIM_LINES ? count / 2 :
                       count < 2 ? 0 :
                       info->mode == MESA_PRIM_LINE_LOOP ? count : count - 1;
-      return tcl_raster_lines(rs);
+      if (rs->line_smooth)
+         r->flags |= DRM_CHROME9_RASTER_EDGE_AA;
+      return tcl_raster_lines(ctx, rs);
    default:
       break;
    }
    r->triangles = true;
    r->primitives = tcl_triangle_count(info->mode, count);
+   /* Polygon smooth without blending: the hardware's coverage blend
+    * (it applies coverage once more to blended fragments). */
+   if (rs->poly_smooth && ctx->tcl_edge_aa && ctx->blend &&
+       !ctx->blend->rt[0].blend_enable &&
+       rs->fill_front == PIPE_POLYGON_MODE_FILL &&
+       rs->fill_back == PIPE_POLYGON_MODE_FILL)
+      r->flags |= DRM_CHROME9_RASTER_EDGE_AA;
    if (!r->primitives &&
        !tcl_triangle(info->mode, 0, false, (unsigned[3]){ 0 }))
       return "primitive type";
@@ -2874,7 +2888,9 @@ tcl_raster(const struct chrome9_context *ctx, const struct pipe_draw_info *info,
        (front == PIPE_POLYGON_MODE_POINT && rs->offset_point))
       return "polygon mode";
    if (front == PIPE_POLYGON_MODE_LINE || back == PIPE_POLYGON_MODE_LINE) {
-      why = tcl_raster_lines(rs);
+      /* Smooth polygon-mode lines stay in llvmpipe. */
+      why = rs->line_smooth ? "smooth polygon-mode lines" :
+                              tcl_raster_lines(ctx, rs);
       if (why)
          return why;
    }

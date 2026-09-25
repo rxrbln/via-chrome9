@@ -311,6 +311,8 @@ struct chrome9_context {
    bool coarse_z_last;
    /* CAP2_FAST_Z: X8Z24 clears to 1.0 advance a scene index. */
    bool fast_z;
+   /* CAP2_EDGE_AA: smooth TCL lines with hardware edge antialiasing. */
+   bool tcl_edge_aa;
    /* The current draw rasterizes filled triangles. */
    bool draw_filled_triangles;
    /* TCL draws queued for one DRAW_VERTEX_PROGRAMS submission. */
