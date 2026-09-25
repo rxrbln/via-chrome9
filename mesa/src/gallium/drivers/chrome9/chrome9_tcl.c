@@ -401,6 +401,300 @@ tcl_optimize(nir_shader *nir)
    } while (progress);
 }
 
+/* Source operands of a vertex op. */
+static unsigned
+tcl_op_sources(unsigned op)
+{
+   switch (op) {
+   case DRM_CHROME9_VERTEX_OP_MAD:
+      return 3;
+   case DRM_CHROME9_VERTEX_OP_ADD:
+   case DRM_CHROME9_VERTEX_OP_SUB:
+   case DRM_CHROME9_VERTEX_OP_MUL:
+   case DRM_CHROME9_VERTEX_OP_DP3:
+   case DRM_CHROME9_VERTEX_OP_DP4:
+   case DRM_CHROME9_VERTEX_OP_DPH:
+   case DRM_CHROME9_VERTEX_OP_MIN:
+   case DRM_CHROME9_VERTEX_OP_MAX:
+   case DRM_CHROME9_VERTEX_OP_SGE:
+   case DRM_CHROME9_VERTEX_OP_SLT:
+      return 2;
+   default:
+      return 1;
+   }
+}
+
+static bool
+tcl_op_scalar(unsigned op)
+{
+   return op >= DRM_CHROME9_VERTEX_OP_RCP && op <= DRM_CHROME9_VERTEX_OP_LOG2;
+}
+
+static bool
+tcl_op_dot(unsigned op)
+{
+   return op == DRM_CHROME9_VERTEX_OP_DP3 || op == DRM_CHROME9_VERTEX_OP_DP4 ||
+          op == DRM_CHROME9_VERTEX_OP_DPH;
+}
+
+/* Selectors of src that the op reads. */
+static unsigned
+tcl_source_lanes(const struct drm_chrome9_vertex_instruction *insn,
+                 unsigned src)
+{
+   switch (insn->op) {
+   case DRM_CHROME9_VERTEX_OP_DP3:
+      return 0x7;
+   case DRM_CHROME9_VERTEX_OP_DPH:
+      return src ? 0xf : 0x7;
+   case DRM_CHROME9_VERTEX_OP_DP4:
+   case DRM_CHROME9_VERTEX_OP_RCP:
+   case DRM_CHROME9_VERTEX_OP_RSQ:
+   case DRM_CHROME9_VERTEX_OP_EXP2:
+   case DRM_CHROME9_VERTEX_OP_LOG2:
+      return 0xf;
+   default:
+      return insn->dst.writemask;
+   }
+}
+
+/* Maximum number of temps live at one instruction. */
+static unsigned
+tcl_temp_pressure(const struct chrome9_tcl_program *p, unsigned temp_count,
+                  int *first, int *last)
+{
+   unsigned pressure = 0;
+
+   for (unsigned t = 0; t < temp_count; t++)
+      first[t] = last[t] = -1;
+   for (unsigned i = 0; i < p->instruction_count; i++) {
+      const struct drm_chrome9_vertex_instruction *insn = &p->instructions[i];
+
+      for (unsigned s = 0; s < tcl_op_sources(insn->op); s++)
+         if (insn->src[s].file == DRM_CHROME9_VERTEX_FILE_TEMP &&
+             insn->src[s].index < temp_count && tcl_source_lanes(insn, s))
+            last[insn->src[s].index] = i;
+      if (insn->dst.file == DRM_CHROME9_VERTEX_DEST_TEMP &&
+          insn->dst.index < temp_count) {
+         if (first[insn->dst.index] < 0)
+            first[insn->dst.index] = i;
+         last[insn->dst.index] = i;
+      }
+   }
+   for (unsigned i = 0; i < p->instruction_count; i++) {
+      unsigned live = 0;
+
+      for (unsigned t = 0; t < temp_count; t++)
+         live += first[t] >= 0 && first[t] <= (int)i && last[t] >= (int)i;
+      pressure = MAX2(pressure, live);
+   }
+   return pressure;
+}
+
+static unsigned
+tcl_lane_root(uint16_t *parent, unsigned v)
+{
+   while (parent[v] != v)
+      v = parent[v] = parent[parent[v]];
+   return v;
+}
+
+/*
+ * The kernel maps every temp to one of 16 physical vec4 registers for its
+ * whole live range.  Selects and other lane-wise sequences keep one live
+ * lane per temp, so a program with many of them fails with -E2BIG.  Lanes
+ * written by one instruction or read by one source stay together; such
+ * groups move into free lanes of temps that are live anyway.  Lanes are
+ * written once (the kernel rejects redefinition).  Straight-line programs
+ * only; the program is kept when the pressure does not drop.
+ */
+static void
+tcl_pack_temp_lanes(struct chrome9_tcl_program *p, unsigned temp_count)
+{
+   enum { LANES = DRM_CHROME9_VERTEX_MAX_TEMPS * 4 };
+   const unsigned n = p->instruction_count;
+   struct drm_chrome9_vertex_instruction *saved;
+   int first[DRM_CHROME9_VERTEX_MAX_TEMPS], last[DRM_CHROME9_VERTEX_MAX_TEMPS];
+   int def[LANES], end[LANES], host_last[DRM_CHROME9_VERTEX_MAX_TEMPS];
+   uint16_t parent[LANES];
+   uint8_t host[LANES], lane[LANES], host_used[DRM_CHROME9_VERTEX_MAX_TEMPS];
+   unsigned hosts = 0, before, after;
+
+   if (temp_count > DRM_CHROME9_VERTEX_MAX_TEMPS)
+      return;
+   before = tcl_temp_pressure(p, temp_count, first, last);
+   if (debug_get_bool_option("CHROME9_DEBUG_TCL_DUMP", false))
+      for (unsigned i = 0; i < n; i++) {
+         const struct drm_chrome9_vertex_instruction *insn = &p->instructions[i];
+
+         fprintf(stderr, "TCLDUMP %u %u %u %u %u", insn->op, insn->dst.file,
+                 insn->dst.index, insn->dst.writemask, insn->dst.modifier);
+         for (unsigned s = 0; s < 3; s++)
+            fprintf(stderr, " %u %u %u %u %u %u %u %u", insn->src[s].file,
+                    insn->src[s].index, insn->src[s].swizzle[0],
+                    insn->src[s].swizzle[1], insn->src[s].swizzle[2],
+                    insn->src[s].swizzle[3], insn->src[s].modifier,
+                    insn->src[s].relative);
+         fputc('\n', stderr);
+      }
+   /* The kernel also needs scratch registers for read-port copies. */
+   if (before < 12)
+      return;
+   for (unsigned v = 0; v < temp_count * 4; v++) {
+      parent[v] = v;
+      def[v] = end[v] = -1;
+   }
+   for (unsigned i = 0; i < n; i++) {
+      const struct drm_chrome9_vertex_instruction *insn = &p->instructions[i];
+
+      if (insn->op >= DRM_CHROME9_VERTEX_OP_REP &&
+          insn->op != DRM_CHROME9_VERTEX_OP_ARL)
+         return;
+      for (unsigned s = 0; s < tcl_op_sources(insn->op); s++) {
+         const struct drm_chrome9_vertex_source *src = &insn->src[s];
+         const unsigned used = tcl_source_lanes(insn, s);
+         int joined = -1;
+
+         if (src->file != DRM_CHROME9_VERTEX_FILE_TEMP)
+            continue;
+         for (unsigned c = 0; c < 4; c++) {
+            unsigned v;
+
+            if (!(used & BITFIELD_BIT(c)) || src->swizzle[c] > 3)
+               continue;
+            v = src->index * 4 + src->swizzle[c];
+            if (src->index >= temp_count || def[v] < 0)
+               return;
+            end[v] = i;
+            if (joined >= 0)
+               parent[tcl_lane_root(parent, v)] = tcl_lane_root(parent, joined);
+            joined = v;
+         }
+      }
+      if (insn->dst.file == DRM_CHROME9_VERTEX_DEST_TEMP) {
+         int joined = -1;
+
+         if (insn->dst.index >= temp_count)
+            return;
+         u_foreach_bit(c, insn->dst.writemask) {
+            const unsigned v = insn->dst.index * 4 + c;
+
+            def[v] = i;
+            end[v] = MAX2(end[v], (int)i);
+            if (joined >= 0)
+               parent[tcl_lane_root(parent, v)] = tcl_lane_root(parent, joined);
+            joined = v;
+         }
+      }
+   }
+   /* Groups in order of their first definition; best fit into a live host. */
+   for (unsigned i = 0; i < n; i++) {
+      const struct drm_chrome9_vertex_instruction *insn = &p->instructions[i];
+
+      if (insn->dst.file != DRM_CHROME9_VERTEX_DEST_TEMP)
+         continue;
+      u_foreach_bit(c, insn->dst.writemask) {
+         const unsigned root = tcl_lane_root(parent, insn->dst.index * 4 + c);
+         unsigned size = 0, h = hosts, next;
+         int start = INT_MAX, stop = -1;
+
+         if (def[root] == -2)
+            continue;
+         for (unsigned v = 0; v < temp_count * 4; v++)
+            if (def[v] >= 0 && tcl_lane_root(parent, v) == root) {
+               size++;
+               start = MIN2(start, def[v]);
+               stop = MAX2(stop, end[v]);
+            }
+         /* Values ending close together share a host, so a long-lived
+          * lane never keeps a register of scratch lanes alive. */
+         for (unsigned k = 0; k < hosts; k++)
+            if (host_last[k] >= start && host_used[k] + size <= 4 &&
+                abs(host_last[k] - stop) <= 8 &&
+                (h == hosts ||
+                 abs(host_last[k] - stop) < abs(host_last[h] - stop)))
+               h = k;
+         if (h == hosts) {
+            if (hosts == temp_count)
+               return;
+            hosts++;
+            host_used[h] = 0;
+            host_last[h] = -1;
+         }
+         next = host_used[h];
+         for (unsigned v = 0; v < temp_count * 4; v++)
+            if (def[v] >= 0 && tcl_lane_root(parent, v) == root) {
+               host[v] = h;
+               lane[v] = next++;
+            }
+         host_used[h] = next;
+         host_last[h] = MAX2(host_last[h], stop);
+         /* Placed; the root's own def is recorded in host/lane. */
+         def[root] = -2;
+      }
+   }
+   saved = MALLOC(n * sizeof(*saved));
+   if (!saved)
+      return;
+   memcpy(saved, p->instructions, n * sizeof(*saved));
+   for (unsigned i = 0; i < n; i++) {
+      struct drm_chrome9_vertex_instruction *insn = &p->instructions[i];
+      const bool temp_dst = insn->dst.file == DRM_CHROME9_VERTEX_DEST_TEMP;
+      const unsigned d = insn->dst.index;
+      uint8_t writemask = 0;
+
+      /* Lane-wise ops move their selectors with the destination lanes. */
+      for (unsigned s = 0; s < tcl_op_sources(insn->op); s++) {
+         struct drm_chrome9_vertex_source *src = &insn->src[s];
+         const unsigned t = src->index;
+         uint8_t swizzle[4];
+         unsigned used = tcl_source_lanes(insn, s), fill = TCL_SEL_ZERO;
+
+         memcpy(swizzle, src->swizzle, sizeof(swizzle));
+         if (temp_dst && !tcl_op_dot(insn->op) &&
+             !tcl_op_scalar(insn->op)) {
+            used = 0;
+            u_foreach_bit(c, insn->dst.writemask) {
+               const unsigned to = lane[d * 4 + c];
+
+               swizzle[to] = src->swizzle[c];
+               used |= BITFIELD_BIT(to);
+            }
+         }
+         for (unsigned c = 0; c < 4; c++) {
+            if (!(used & BITFIELD_BIT(c)))
+               continue;
+            if (src->file == DRM_CHROME9_VERTEX_FILE_TEMP &&
+                swizzle[c] <= 3) {
+               const unsigned v = t * 4 + swizzle[c];
+
+               swizzle[c] = lane[v];
+               src->index = host[v];
+            }
+            fill = swizzle[c];
+         }
+         for (unsigned c = 0; c < 4; c++)
+            if (!(used & BITFIELD_BIT(c)))
+               swizzle[c] = fill;
+         memcpy(src->swizzle, swizzle, sizeof(swizzle));
+      }
+      if (temp_dst) {
+         u_foreach_bit(c, insn->dst.writemask)
+            writemask |= BITFIELD_BIT(lane[d * 4 + c]);
+         insn->dst.index = host[d * 4 + __builtin_ctz(insn->dst.writemask)];
+         insn->dst.writemask = writemask;
+      }
+   }
+   after = tcl_temp_pressure(p, hosts, first, last);
+   if (after >= before)
+      memcpy(p->instructions, saved, n * sizeof(*saved));
+   FREE(saved);
+   if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL lane packing %u -> %u temps, pressure "
+              "%u -> %u%s\n", temp_count, hosts, before, after,
+              after >= before ? " (kept)" : "");
+}
+
 static unsigned
 tcl_new_temp(struct tcl_builder *b)
 {
@@ -2383,6 +2677,8 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       tcl_fill_outputs(&b);
    if (b.address_count && !b.failed)
       tcl_relative_finish(&b);
+   if (!b.failed)
+      tcl_pack_temp_lanes(p, b.next_temp);
    if (indirect)
       nir_free_fp_analysis_state(&b.fp);
    util_dynarray_fini(&b.uniform_ifs);
