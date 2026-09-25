@@ -308,6 +308,8 @@ enum drm_chrome9_param {
  * window in the object, and textures may sample the object outside it.
  */
 #define DRM_CHROME9_CAP2_DESTINATION_OFFSET	(1ULL << 22)
+/* Fragment draw flags FRAGMENT_COARSE_Z and FRAGMENT_COARSE_Z_RESET. */
+#define DRM_CHROME9_CAP2_COARSE_Z		(1ULL << 23)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1178,6 +1180,17 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 #define DRM_CHROME9_FRAGMENT_STENCIL	(1U << 3)
 /* Count the draw's passing samples into the active query named by query. */
 #define DRM_CHROME9_FRAGMENT_QUERY	(1U << 4)
+/*
+ * CAP2_COARSE_Z: test (and with depth writes update) the coarse-Z buffer
+ * coarse_z_handle, one 16-byte entry per 8x8 pixel block, rows of
+ * coarse_z_pitch bytes from PAGE_SIZE, followed by a guard page.  Requires
+ * DEPTH with LESS or LEQUAL.  Userspace keeps the buffer consistent with
+ * the depth buffer: it fills it on full depth clears and stops using it
+ * after any depth write outside coarse-Z draws.
+ */
+#define DRM_CHROME9_FRAGMENT_COARSE_Z	(1U << 12)
+/* Reset the coarse-Z tag cache before the draw (after a fill). */
+#define DRM_CHROME9_FRAGMENT_COARSE_Z_RESET	(1U << 13)
 
 /* Native stencil operations; note INVERT precedes the wrapping forms. */
 #define DRM_CHROME9_STENCIL_OP_KEEP		0
@@ -1396,7 +1409,9 @@ struct drm_chrome9_draw_fragment_program {
 	__u32 destination_offset;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_scissor_state scissor;
-	__u32 pad;
+	/* FRAGMENT_COARSE_Z: at least ALIGN(DIV_ROUND_UP(width, 8) * 16, 32),
+	 * a multiple of 32 below 16384; zero otherwise. */
+	__u32 coarse_z_pitch;
 	__u64 vertices_ptr;
 	__u64 instructions_ptr;
 	__u64 constants_ptr;
@@ -1404,7 +1419,8 @@ struct drm_chrome9_draw_fragment_program {
 	struct drm_chrome9_stencil_state stencil;
 	/* FRAGMENT_QUERY: id of an active DRM_CHROME9_QUERY object. */
 	__u32 query;
-	__u32 reserved1;
+	/* FRAGMENT_COARSE_Z: the coarse-Z buffer object; zero otherwise. */
+	__u32 coarse_z_handle;
 	/*
 	 * CAP2_BLEND_COLOR: blend colour R, G, B, A in unsigned 1.10 fixed
 	 * point (0..0x400) for the CONST factors; zero otherwise.
