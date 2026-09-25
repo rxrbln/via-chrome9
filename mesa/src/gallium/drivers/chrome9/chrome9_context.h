@@ -68,6 +68,8 @@ struct chrome9_fs_variant {
    uint8_t face_mode;
    /* chrome9_shadow_key() of every shadow sampler, zero otherwise. */
    uint16_t shadow_keys[PIPE_MAX_SAMPLERS];
+   /* chrome9_sprite_flip_key() of the draw. */
+   uint32_t sprite_flip;
    enum chrome9_fragment_program fragment_program;
    uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
@@ -112,6 +114,10 @@ struct chrome9_shader {
    /* Fragment samplers read by shadow TEX; variants lower the compare. */
    uint32_t shadow_sampler_mask;
    struct chrome9_fs_variant *variants;
+   /* The canonical compile of a canonical_supported shader, and the
+    * variant whose program the shader fields hold. */
+   const struct chrome9_fs_variant *canonical;
+   const struct chrome9_fs_variant *applied;
    unsigned variant_count;
    enum chrome9_fragment_program fragment_program;
    uint32_t literal_color;
@@ -279,6 +285,8 @@ struct chrome9_context {
    struct pipe_constant_buffer fs_constants[PIPE_MAX_CONSTANT_BUFFERS];
    uint32_t fs_inline[MAX_INLINABLE_UNIFORMS];
    unsigned fs_inline_count;
+   /* Lower-left sprite coordinates the FS variant flips, zero without. */
+   uint32_t fs_sprite_flip;
    struct chrome9_sampler_state *sampler_states[PIPE_MAX_SAMPLERS];
    unsigned num_sampler_states;
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
@@ -295,6 +303,8 @@ struct chrome9_context {
    struct pipe_blend_state *blend;
    struct pipe_depth_stencil_alpha_state *dsa;
    struct pipe_rasterizer_state *rasterizer;
+   /* The rasterizer copy bound to the draw module. */
+   const struct pipe_rasterizer_state *draw_rasterizer;
    struct chrome9_vertex_elements *vertex_elements;
    struct pipe_scissor_state scissor;
    bool scissor_valid;

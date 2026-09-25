@@ -488,3 +488,67 @@ chrome9_nir_specialize_front_face(nir_shader *nir, bool front_face)
    chrome9_fold_after_inline(nir);
    return true;
 }
+
+static bool
+chrome9_sprite_coord_slot(unsigned location, uint32_t enable)
+{
+   if (location == VARYING_SLOT_PNTC)
+      return true;
+   if (location >= VARYING_SLOT_TEX0 && location <= VARYING_SLOT_TEX7)
+      return enable & BITFIELD_BIT(location - VARYING_SLOT_TEX0);
+   if (location >= VARYING_SLOT_VAR0 && location - VARYING_SLOT_VAR0 < 23)
+      return enable & BITFIELD_BIT(9 + location - VARYING_SLOT_VAR0);
+   return false;
+}
+
+static bool
+chrome9_flip_sprite_coord(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   const uint32_t enable = *(const uint32_t *)data;
+   unsigned location, component;
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_input:
+      location = nir_intrinsic_io_semantics(intr).location;
+      component = nir_intrinsic_component(intr);
+      break;
+   case nir_intrinsic_load_deref: {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = nir_intrinsic_get_var(intr, 0);
+
+      if (!deref || deref->deref_type != nir_deref_type_var || !var ||
+          var->data.mode != nir_var_shader_in)
+         return false;
+      location = var->data.location;
+      component = var->data.location_frac;
+      break;
+   }
+   default:
+      return false;
+   }
+   if (!chrome9_sprite_coord_slot(location, enable) || component > 1 ||
+       1 - component >= intr->def.num_components ||
+       intr->def.bit_size != 32)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   for (unsigned c = 0; c < intr->def.num_components; c++)
+      comps[c] = nir_channel(b, &intr->def, c);
+   comps[1 - component] = nir_fsub_imm(b, 1.0, comps[1 - component]);
+   nir_def_rewrite_uses_after(&intr->def,
+                              nir_vec(b, comps, intr->def.num_components));
+   return true;
+}
+
+/* Lower-left point sprite origin: the hardware and the draw module generate
+ * upper-left coordinates, t becomes 1 - t for the enabled coordinates. */
+bool
+chrome9_nir_flip_sprite_coords(nir_shader *nir, uint32_t enable)
+{
+   if (!nir_shader_intrinsics_pass(nir, chrome9_flip_sprite_coord,
+                                   nir_metadata_control_flow, &enable))
+      return false;
+   chrome9_fold_after_inline(nir);
+   return true;
+}

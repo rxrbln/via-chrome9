@@ -34,5 +34,6 @@ void chrome9_nir_inline_uniforms(struct nir_shader *nir,
  * call this helper. */
 bool chrome9_nir_specialize_front_face(struct nir_shader *nir,
                                        bool front_face);
+bool chrome9_nir_flip_sprite_coords(struct nir_shader *nir, uint32_t enable);
 
 #endif

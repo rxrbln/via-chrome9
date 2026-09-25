@@ -443,8 +443,16 @@ static void *
 chrome9_create_rasterizer_state(struct pipe_context *pipe,
                                 const struct pipe_rasterizer_state *state)
 {
+   struct pipe_rasterizer_state *copies;
+
    (void)pipe;
-   return chrome9_dup_state(state, sizeof(*state));
+   /* The second copy is the draw module's for lower-left sprites. */
+   copies = MALLOC(2 * sizeof(*state));
+   if (!copies)
+      return NULL;
+   copies[0] = copies[1] = *state;
+   copies[1].sprite_coord_mode = PIPE_SPRITE_COORD_UPPER_LEFT;
+   return copies;
 }
 
 static void
@@ -457,6 +465,7 @@ chrome9_bind_rasterizer_state(struct pipe_context *pipe, void *state)
     * last or the hardware paths keep drawing with the old one. */
    draw_set_rasterizer_state(ctx->draw, state, state);
    ctx->rasterizer = state;
+   ctx->draw_rasterizer = state;
 }
 
 /* DRM_CHROME9_TEXTURE_WRAP_* of a Gallium wrap mode, zero without one. */
@@ -6403,6 +6412,9 @@ static void
 chrome9_apply_fs_variant(struct chrome9_shader *shader,
                          const struct chrome9_fs_variant *variant)
 {
+   if (shader->applied == variant)
+      return;
+   shader->applied = variant;
    shader->fragment_program = variant->fragment_program;
    shader->literal_color = variant->literal_color;
    shader->native_fs_key = variant->native_fs_key;
@@ -6487,8 +6499,10 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
    /* A dynamic canonical program needs no variants.  In particular, a
     * natively lowered select must not exhaust the bounded variant cache as
     * its control uniform takes on many different values. */
-   if (shader->canonical_supported)
+   if (shader->canonical_supported && !ctx->fs_sprite_flip) {
+      chrome9_apply_fs_variant(shader, shader->canonical);
       return true;
+   }
    canonical = shader->nir;
    count = canonical->info.num_inlinable_uniforms;
    if (ctx->rasterizer) {
@@ -6497,13 +6511,16 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
       else if (ctx->rasterizer->cull_face == PIPE_FACE_FRONT)
          face_mode = 2;
    }
-   if (!count && !face_mode && !shader->shadow_sampler_mask) {
+   if (!count && !face_mode && !shader->shadow_sampler_mask &&
+       !ctx->fs_sprite_flip) {
       /* A previous cull-specialized variant must not survive a transition
        * back to dynamic FACE with no uniform specialization key. */
+      shader->applied = NULL;
       shader->supported = false;
       return false;
    }
    if (count && ctx->fs_inline_count != count) {
+      shader->applied = NULL;
       shader->supported = false;
       return false;
    }
@@ -6511,7 +6528,8 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
 
    for (struct chrome9_fs_variant *variant = shader->variants;
         variant; variant = variant->next) {
-      if (variant->face_mode == face_mode &&
+      if (variant != shader->canonical && variant->face_mode == face_mode &&
+          variant->sprite_flip == ctx->fs_sprite_flip &&
           !memcmp(variant->inline_values, ctx->fs_inline, bytes) &&
           !memcmp(variant->shadow_keys, shadow_keys, sizeof(shadow_keys))) {
          chrome9_apply_fs_variant(shader, variant);
@@ -6519,6 +6537,7 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
       }
    }
    if (shader->variant_count >= CHROME9_MAX_FS_VARIANTS) {
+      shader->applied = NULL;
       shader->supported = false;
       return false;
    }
@@ -6528,12 +6547,14 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
 
    if (!clone) {
       FREE(variant);
+      shader->applied = NULL;
       shader->supported = false;
       return false;
    }
    struct chrome9_shader compiled = { 0 };
 
    variant->face_mode = face_mode;
+   variant->sprite_flip = ctx->fs_sprite_flip;
    memcpy(variant->inline_values, ctx->fs_inline, bytes);
    memcpy(variant->shadow_keys, shadow_keys, sizeof(shadow_keys));
    if (count)
@@ -6542,6 +6563,8 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
       chrome9_nir_lower_shadow(clone, PIPE_MAX_SAMPLERS, shadow_keys);
    if (face_mode)
       chrome9_nir_specialize_front_face(clone, face_mode == 1);
+   if (ctx->fs_sprite_flip)
+      chrome9_nir_flip_sprite_coords(clone, ctx->fs_sprite_flip);
    chrome9_compile_fs_nir(ctx, &compiled, clone);
    chrome9_capture_fs_variant(variant, &compiled);
    variant->next = shader->variants;
@@ -6655,6 +6678,20 @@ chrome9_create_fs_state(struct pipe_context *pipe,
          nir_print_shader(state->ir.nir, stderr);
       chrome9_compile_fs_nir(ctx, shader, state->ir.nir);
       shader->canonical_supported = shader->supported;
+      if (shader->canonical_supported) {
+         struct chrome9_fs_variant *variant =
+            CALLOC_STRUCT(chrome9_fs_variant);
+
+         /* Without the copy every draw selects a variant. */
+         if (variant) {
+            chrome9_capture_fs_variant(variant, shader);
+            variant->next = shader->variants;
+            shader->variants = variant;
+            shader->canonical = shader->applied = variant;
+         } else {
+            shader->canonical_supported = false;
+         }
+      }
       chrome9_dump_semantic_fs(shader);
       if (!state->ir.nir->info.num_inlinable_uniforms && !shader->supported &&
           debug_get_bool_option("CHROME9_DUMP_UNSUPPORTED_NIR", false)) {
@@ -7775,6 +7812,35 @@ chrome9_draw_smooth_lines(const struct chrome9_context *ctx,
            (rs->fill_front == PIPE_POLYGON_MODE_LINE ||
             rs->fill_back == PIPE_POLYGON_MODE_LINE));
 }
+/* Lower-left sprite coordinates on point rasterization: the draw module
+ * gets the upper-left copy of the rasterizer like the hardware, the FS
+ * variant flips t. */
+static void
+chrome9_update_sprite_flip(struct chrome9_context *ctx,
+                           const struct pipe_draw_info *info)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   const struct pipe_rasterizer_state *draw_rs = rs;
+   bool points;
+
+   ctx->fs_sprite_flip = 0;
+   if (!rs)
+      return;
+   points = info->mode == MESA_PRIM_POINTS ||
+            (u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES &&
+             rs->fill_front == PIPE_POLYGON_MODE_POINT &&
+             rs->fill_back == PIPE_POLYGON_MODE_POINT);
+   if (points && rs->point_quad_rasterization &&
+       rs->sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT) {
+      ctx->fs_sprite_flip = rs->sprite_coord_enable | BITFIELD_BIT(31);
+      draw_rs = rs + 1;
+   }
+   if (ctx->draw_rasterizer != draw_rs) {
+      draw_set_rasterizer_state(ctx->draw, draw_rs, ctx->rasterizer);
+      ctx->draw_rasterizer = draw_rs;
+   }
+}
+
 static void
 chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                  unsigned drawid_offset,
@@ -7803,6 +7869,7 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!chrome9_render_condition_passes(ctx))
       return;
+   chrome9_update_sprite_flip(ctx, info);
    if (!ctx->vs || !ctx->fs || !chrome9_select_fs_variant(ctx)) {
       /* Beyond the pixel engine: llvmpipe renders into the same BOs. */
       if (chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))

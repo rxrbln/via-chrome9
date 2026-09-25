@@ -2745,7 +2745,7 @@ tcl_raster_lines(const struct chrome9_context *ctx,
  * only whole sizes are accepted) or of the rounded VS size, and sprite
  * coordinates for the logical varyings sprite_coord_enable names (TEXn is
  * generic n, VARn generic 9 + n) with the upper-left origin of the
- * hardware.
+ * hardware; the FS variant flips t for lower-left.
  */
 static const char *
 tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
@@ -2792,7 +2792,11 @@ tcl_raster_points(const struct chrome9_context *ctx, bool polygon,
       }
    }
    if (sprite) {
-      if (polygon || rs->sprite_coord_mode != PIPE_SPRITE_COORD_UPPER_LEFT)
+      /* Lower-left takes the FS variant that flips t. */
+      if (polygon ||
+          (rs->sprite_coord_mode != PIPE_SPRITE_COORD_UPPER_LEFT &&
+           !(ctx->fs_sprite_flip && ctx->fs->applied &&
+             ctx->fs->applied->sprite_flip == ctx->fs_sprite_flip)))
          return "point sprite origin";
       /* A01[21] replaces every coordinate, A2F[9:0] selects none (rung
        * sprite P3b); user clip distances ride on coordinates too. */
