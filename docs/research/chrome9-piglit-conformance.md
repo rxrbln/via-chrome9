@@ -132,3 +132,23 @@ An apparent drop to about 42 fps was a benchmark artefact. The old script
 killed the `flock` wrapper, not ioquake3. The leftover instance rendered its
 menu with `com_maxfps 0` for up to the 60 s timeout and took CPU from the
 next run. `q3time.sh` now ends ioquake3 itself.
+
+## 2026-09-25 afternoon: indexed arrays and texture formats
+
+| Mesa commit | fix | tests |
+|---|---|---|
+| `ea70e83` | TCL keeps selects scalar (vector selects over a0-relative rows picked wrong lanes on silicon) and folds selects on inlined control uniforms. | vs-temp-array-*-col-row-wr, vs-uniform-*mat4*-rd |
+| `2c236d6` | TCL writes whole colour and varying registers; lanes NIR left undefined are zero. The kernel rejects partial varyings. | texcoord-array, glsl-texcoord-array-2 |
+| `fedbe6d` | `prefer_imm_arrays_as_constbuf = false`. The 32 fragment constant rows cannot hold indexed constant arrays. | fs-vec4-const-array-indirect-access-* |
+| `706090d` | Mipmapped render targets are cleared on the GPU (DESTINATION_EXTENDED). | glmark2 refract 6 -> 7 fps |
+| `d00d9cb` | NPOT DXT mip chains and DXT cube maps are created (sampler_unsupported) and sampled in llvmpipe. | s3tc-errors, texwrap/fbo-generatemipmap-formats S3TC, getteximage-targets CUBE S3TC |
+| `c0016cc` | Z16 textures, views of formats without a sampler encoding, and mipmapped D24 textures go through llvmpipe; draws with a mipmapped depth attachment too. | getteximage-depth, texsubimage-depth-formats, fbo-depthtex |
+
+Known remaining indexing failure:
+- `vs-output-array-vec2-index-wr-no-unroll`. The fragment NIR the driver
+  receives already lacks the `i < 1` arm of the packed-varying ladder. The
+  fault is in the common varying lowering, not in chrome9.
+
+Hardware limit:
+- `gl_lightsource_indirect`. Indexing `gl_LightSource` in a fragment
+  shader needs more than the 32 fragment constant rows.
