@@ -766,6 +766,18 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
    return true;
 }
 
+/* The pixel engine takes the bound blend state (no logic op, equation
+ * and factor limits). */
+bool
+chrome9_draw_blend_supported(const struct chrome9_context *ctx)
+{
+   struct drm_chrome9_blend_state blend;
+   bool successor;
+
+   return chrome9_translate_blend(ctx->blend, &blend,
+                                  ctx->blend_extended_factors, &successor);
+}
+
 static bool
 chrome9_blend_is_source_over(const struct drm_chrome9_blend_state *blend)
 {

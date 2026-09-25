@@ -7177,10 +7177,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
        BITSET_COUNT(ctx->vs->sw_nir->info.textures_used) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
-   /* The pixel engine writes exactly one colour target: depth/stencil-only
-    * and multiple-target framebuffers render in llvmpipe. */
+   /* The pixel engine writes exactly one colour target and blends without
+    * logic ops: other framebuffers and blend states render in llvmpipe. */
    if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture ||
-        chrome9_framebuffer_color_count(&ctx->framebuffer) > 1) &&
+        chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 ||
+        !chrome9_draw_blend_supported(ctx)) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    chrome9_refresh_vs_textures(ctx);
