@@ -231,6 +231,21 @@ module_param_named(coarse_z_re, chrome9_coarse_z_re, uint, 0600);
 MODULE_PARM_DESC(coarse_z_re,
 	"Debug: bits toggled in the coarse-Z A29 word (default: 0)");
 
+static bool chrome9_fast_z = true;
+module_param_named(fast_z, chrome9_fast_z, bool, 0600);
+MODULE_PARM_DESC(fast_z,
+	"Fast-Z clears of X8Z24 depth buffers (default: true)");
+
+static uint chrome9_fast_z_re;
+module_param_named(fast_z_re, chrome9_fast_z_re, uint, 0600);
+MODULE_PARM_DESC(fast_z_re,
+	"Debug: Fast-Z A27 low bits for depth draws, 0 keeps it off (default: 0)");
+
+static uint chrome9_fast_z_clear = 0xffffff00;
+module_param_named(fast_z_clear, chrome9_fast_z_clear, uint, 0600);
+MODULE_PARM_DESC(fast_z_clear,
+	"Debug: Fast-Z clear word in depth layout, A14 low and A15 high bits, with fast_z_re (default: 0xffffff00)");
+
 static bool chrome9_texture_bias = true;
 module_param_named(texture_bias, chrome9_texture_bias, bool, 0600);
 MODULE_PARM_DESC(texture_bias,
@@ -4556,6 +4571,25 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000;
 		common[10] = 0x13000000 | depth_func << 16;
 		common_count = 11;
+		/* Fast-Z: clear data 1.0 (A14 low, A15 high byte of the X8Z24
+		 * word), index length 3; otherwise the vendor baseline A27. */
+		if (request->flags & DRM_CHROME9_FRAGMENT_FAST_Z) {
+			common[common_count++] = 0x14ffff00;
+			common[common_count++] = 0x150000ff;
+			common[common_count++] = 0x27000301 |
+				((request->flags &
+				  DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK) >>
+				 DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_SHIFT) << 12;
+		} else if (READ_ONCE(chrome9_fast_z_re)) {
+			u32 clear = READ_ONCE(chrome9_fast_z_clear);
+
+			common[common_count++] = 0x14000000 | (clear & 0xffffff);
+			common[common_count++] = 0x15000000 | clear >> 24;
+			common[common_count++] = 0x27000000 |
+				(READ_ONCE(chrome9_fast_z_re) & 0xffffff);
+		} else {
+			common[common_count++] = 0x27000000;
+		}
 		memcpy(common + common_count, neutral_depth_bias,
 		       sizeof(neutral_depth_bias));
 		common_count += ARRAY_SIZE(neutral_depth_bias);
@@ -6658,6 +6692,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_coarse_z))
 		caps |= DRM_CHROME9_CAP2_COARSE_Z;
+	if (READ_ONCE(chrome9_fast_z))
+		caps |= DRM_CHROME9_CAP2_FAST_Z;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
@@ -9034,6 +9070,16 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			if (ret)
 				goto out_prepublication;
 		}
+		/* Other command builders never write A27: leave Fast-Z off. */
+		for (r = first; r < next; r++)
+			if (requests[r]->flags & DRM_CHROME9_FRAGMENT_FAST_Z) {
+				static const u32 fast_z_off[] = { 0x27000000 };
+
+				chrome9_emit_header2(&p, 0x440, 0x0000043c,
+						     0x00010000, fast_z_off,
+						     ARRAY_SIZE(fast_z_off));
+				break;
+			}
 		/* Other builders close only A38/A3B/A39/A3C: leave all zero. */
 		engine->blend_constants_dirty |= constants;
 		if (constants && !(READ_ONCE(chrome9_blend_re) & 2))
@@ -12355,6 +12401,9 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	if (caps2 & DRM_CHROME9_CAP2_COARSE_Z)
 		allowed_flags |= DRM_CHROME9_FRAGMENT_COARSE_Z |
 				 DRM_CHROME9_FRAGMENT_COARSE_Z_RESET;
+	if (caps2 & DRM_CHROME9_CAP2_FAST_Z)
+		allowed_flags |= DRM_CHROME9_FRAGMENT_FAST_Z |
+				 DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK;
 
 	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
 	     !sparse_textures) ||
@@ -12365,6 +12414,10 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	      !IS_ALIGNED(args->destination_offset, 256))) ||
 	    (!coarse_z && (args->flags &
 			   DRM_CHROME9_FRAGMENT_COARSE_Z_RESET)) ||
+	    ((args->flags & DRM_CHROME9_FRAGMENT_FAST_Z) ?
+	     !depth || stencil ||
+	     args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 :
+	     args->flags & DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK) ||
 	    (coarse_z && (!args->coarse_z_handle ||
 			  (depth_func != DRM_CHROME9_COMPARE_LESS &&
 			   depth_func != DRM_CHROME9_COMPARE_LEQUAL &&
