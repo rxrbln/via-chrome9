@@ -135,6 +135,8 @@ struct chrome9_sw_context {
    /* chrome9 references held while llvmpipe may still access them. */
    struct util_dynarray held;
    bool pending;
+   /* The chrome9 screen reports integer fragment-position centers. */
+   bool pixel_center_integer;
    uint64_t draws;
    uint64_t us;
 };
@@ -216,6 +218,8 @@ chrome9_sw_context(struct chrome9_context *ctx)
    if (!sw)
       return NULL;
    sw->screen = chrome9_screen_sw(ctx->base.screen);
+   sw->pixel_center_integer =
+      ctx->base.screen->caps.fs_coord_pixel_center_integer;
    if (sw->screen)
       sw->lp = sw->screen->context_create(sw->screen, NULL, 0);
    util_dynarray_init(&sw->held, NULL);
@@ -523,6 +527,9 @@ chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
             };
 
             chrome9_sw_lower_face_input(shader.ir.nir);
+            /* The state tracker biased gl_FragCoord for those centers. */
+            shader.ir.nir->info.fs.pixel_center_integer =
+               sw->pixel_center_integer;
             chrome9_sw_scalarize_derivs(shader.ir.nir);
             if (nir_lower_sysvals_to_varyings(shader.ir.nir, &pos))
                nir_shader_gather_info(shader.ir.nir,
@@ -764,7 +771,9 @@ chrome9_sw_bind_state(struct chrome9_context *ctx, struct chrome9_sw_context *sw
        !(cso = chrome9_sw_object(sw, ctx->vs, CHROME9_SW_VS, ctx->vs->sw_nir)))
       return false;
    lp->bind_vs_state(lp, cso);
-   if (!(cso = chrome9_sw_object(sw, ctx->fs, CHROME9_SW_FS, ctx->fs->nir)))
+   if (!(cso = chrome9_sw_object(sw, ctx->fs, CHROME9_SW_FS,
+                                 ctx->fs->sw_nir ? ctx->fs->sw_nir :
+                                                   ctx->fs->nir)))
       return false;
    lp->bind_fs_state(lp, cso);
 
