@@ -45,6 +45,7 @@ struct chrome9_screen {
    /* llvmpipe fragment fallback, created on first use under shared_lock. */
    struct pipe_screen *sw_screen;
    bool sw_tried;
+   struct nir_shader_compiler_options fs_nir_options;
 };
 
 static inline struct chrome9_screen *
@@ -516,7 +517,10 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
                            !!(screen->capabilities &
                               DRM_CHROME9_CAP_DRAW_TRIANGLE));
    screen->base.nir_options[MESA_SHADER_VERTEX] = &chrome9_nir_options;
-   screen->base.nir_options[MESA_SHADER_FRAGMENT] = &chrome9_nir_options;
+   /* The PS rounds with FRC of |x|: FRC of a negative x can return 1.0. */
+   screen->fs_nir_options = chrome9_nir_options;
+   screen->fs_nir_options.lower_fceil = false;
+   screen->base.nir_options[MESA_SHADER_FRAGMENT] = &screen->fs_nir_options;
    chrome9_init_shader_caps(screen);
    caps = (struct pipe_caps *)&screen->base.caps;
    chrome9_restrict_generic_caps(caps);

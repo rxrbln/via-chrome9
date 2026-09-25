@@ -109,6 +109,8 @@ struct chrome9_ps_instruction {
    struct chrome9_ps_destination destination;
    struct chrome9_ps_source source[3];
    uint8_t sampler;
+   /* TEX: DRM_CHROME9_FRAGMENT_TEX_BIAS, LOD bias in coordinate W. */
+   uint8_t flags;
 };
 
 /* Ordered straight-line compiler IR.  Texture and ALU operations share one

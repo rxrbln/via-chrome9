@@ -520,7 +520,7 @@ chrome9_compile_ps_ir(const struct chrome9_ps_ir *ir,
          continue;
       }
       if (saw_alu || texture_count >= CHROME9_PS_MAX_TAU ||
-          instruction->sampler >= 8 ||
+          instruction->sampler >= 8 || instruction->flags ||
           instruction->destination.file != CHROME9_PS_DESTINATION_TEMP ||
           instruction->destination.id >= 12 ||
           instruction->destination.writemask != 0xf ||

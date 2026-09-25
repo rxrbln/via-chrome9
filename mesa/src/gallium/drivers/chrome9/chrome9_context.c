@@ -2940,6 +2940,7 @@ struct chrome9_ps_nir_builder {
    uint32_t unit_interval_input_mask;
    uint8_t cube_sampler_mask;
    uint8_t volume_sampler_mask;
+   bool allow_bias;
    struct {
       nir_def *predicate;
       uint8_t temp;
@@ -3018,6 +3019,9 @@ chrome9_ps_source_from_leaf(enum chrome9_fs_leaf leaf,
 static bool chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder,
                                  nir_def *def,
                                  struct chrome9_ps_source *source);
+static bool chrome9_ps_lower_round(struct chrome9_ps_nir_builder *builder,
+                                   nir_alu_instr *alu, nir_def *def,
+                                   struct chrome9_ps_source *source);
 
 static bool
 chrome9_ps_lower_alu_source_depth(struct chrome9_ps_nir_builder *builder,
@@ -4515,13 +4519,18 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       struct chrome9_ps_source coordinate;
       int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
       int projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
+      int bias = nir_tex_instr_src_index(tex, nir_tex_src_bias);
       /* Cube and 3D lookups are selected by the texture state; TEX reads
        * STR. */
       const bool volume = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
       const bool str = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || volume;
       const unsigned lanes = str ? 3 : 2;
 
-      if (tex->op != nir_texop_tex ||
+      /* TEXLDB: 2D only, LOD bias in coordinate lane W. */
+      if ((tex->op != nir_texop_tex &&
+           (tex->op != nir_texop_txb || !builder->allow_bias || str ||
+            projector >= 0 || bias < 0 ||
+            tex->src[bias].src.ssa->num_components != 1)) ||
           (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && !str) ||
           tex->is_array || tex->is_shadow || tex->texture_index >= 8 ||
           tex->sampler_index != tex->texture_index || coord < 0 ||
@@ -4531,7 +4540,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
           builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
          return false;
       for (unsigned s = 0; s < tex->num_srcs; s++)
-         if ((int)s != coord && (int)s != projector)
+         if ((int)s != coord && (int)s != projector && (int)s != bias)
             return false;
       if (!chrome9_ps_lower_def(builder, tex->src[coord].src.ssa,
                                 &coordinate) ||
@@ -4676,6 +4685,40 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
          coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
       }
+      if (bias >= 0) {
+         struct chrome9_ps_instruction *move;
+         struct chrome9_ps_source lod;
+         uint8_t biased;
+
+         /* (s, t, 0, bias) through the computed-coordinate bridge */
+         if (!chrome9_ps_lower_def(builder, tex->src[bias].src.ssa, &lod) ||
+             builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         biased = builder->next_temp++;
+         move = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+         if (!move)
+            return false;
+         move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         move->destination.id = biased;
+         move->destination.writemask = 0x3;
+         move->source[0] = coordinate;
+         move->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+         move->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ZERO;
+         move = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+         if (!move)
+            return false;
+         move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         move->destination.id = biased;
+         move->destination.writemask = 0x8;
+         move->source[0] = lod;
+         for (unsigned c = 1; c < 4; c++)
+            move->source[0].swizzle[c] = lod.swizzle[0];
+         memset(&coordinate, 0, sizeof(coordinate));
+         coordinate.file = CHROME9_PS_SOURCE_TEMP;
+         coordinate.id = biased;
+         coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+         coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
+      }
       if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
          return false;
       texture = chrome9_ps_append_instruction(builder,
@@ -4706,7 +4749,10 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          /* 2D TEX reads XY.  An XY-only computed TEMP must not appear to
           * read undefined Z/W lanes during kernel validation. */
          texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
-         texture->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ONE;
+         texture->source[0].swizzle[3] = bias >= 0 ?
+            CHROME9_PS_SWIZZLE_W : CHROME9_PS_SWIZZLE_ONE;
+         if (bias >= 0)
+            texture->flags = DRM_CHROME9_FRAGMENT_TEX_BIAS;
       } else {
          /* Direct varyings retain their native four-lane coordinate map;
           * the kernel's direct-input gate does not admit literals here. */
@@ -4743,6 +4789,8 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
              chrome9_ps_lower_general_select(builder, alu, def, source);
    if (alu->op == nir_op_b2f32)
       return chrome9_ps_lower_general_select(builder, alu, def, source);
+   if (alu->op == nir_op_ftrunc || alu->op == nir_op_fceil)
+      return chrome9_ps_lower_round(builder, alu, def, source);
    for (unsigned s = 0; s < ARRAY_SIZE(source_components); s++)
       source_components[s] = components;
    if (alu->op == nir_op_fpow) {
@@ -4987,6 +5035,94 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
    return true;
 }
 
+/*
+ * Integer rounding from FRC of |x| only: on negative inputs FRC returns 1.0
+ * just below an integer (silicon), which makes x - FRC(x) one too small.
+ * t = |x| - FRC(|x|), c = t + (FRC(|x|) > 0); ftrunc = x >= 0 ? t : -t,
+ * fceil = x >= 0 ? c : -t.  NEG is qualified on the CMP A operand only.
+ */
+static bool
+chrome9_ps_lower_round(struct chrome9_ps_nir_builder *builder,
+                       nir_alu_instr *alu, nir_def *def,
+                       struct chrome9_ps_source *source)
+{
+   static const uint32_t zero_one[4] = { 0, 0x3f800000 };
+   static const enum chrome9_ps_opcode trunc_ops[] = {
+      CHROME9_PS_OPCODE_ABS, CHROME9_PS_OPCODE_FRC, CHROME9_PS_OPCODE_SUB,
+      CHROME9_PS_OPCODE_SUB, CHROME9_PS_OPCODE_CMP,
+   };
+   static const enum chrome9_ps_opcode ceil_ops[] = {
+      CHROME9_PS_OPCODE_ABS, CHROME9_PS_OPCODE_FRC, CHROME9_PS_OPCODE_SUB,
+      CHROME9_PS_OPCODE_SUB, CHROME9_PS_OPCODE_CMP, CHROME9_PS_OPCODE_ADD,
+      CHROME9_PS_OPCODE_CMP,
+   };
+   const bool ceil = alu->op == nir_op_fceil;
+   const enum chrome9_ps_opcode *ops = ceil ? ceil_ops : trunc_ops;
+   const unsigned count = ceil ? ARRAY_SIZE(ceil_ops) : ARRAY_SIZE(trunc_ops);
+   const unsigned components = def->num_components;
+   struct chrome9_ps_instruction *native[ARRAY_SIZE(ceil_ops)];
+   struct chrome9_ps_source x, constant, zero, one;
+   struct chrome9_ps_source temp[ARRAY_SIZE(ceil_ops)];
+   unsigned value;
+
+   if (!chrome9_ps_lower_alu_source(builder, &alu->src[0], components, &x) ||
+       (ceil && !chrome9_ps_immediate(builder, zero_one, 2, &constant)) ||
+       builder->next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS - count ||
+       builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
+      return false;
+   for (unsigned i = 0; i < count; i++) {
+      native[i] = chrome9_ps_append_instruction(builder, ops[i]);
+      if (!native[i])
+         return false;
+      memset(&temp[i], 0, sizeof(temp[i]));
+      temp[i].file = CHROME9_PS_SOURCE_TEMP;
+      temp[i].id = builder->next_temp++;
+      for (unsigned c = 0; c < 4; c++)
+         temp[i].swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
+      native[i]->destination.file = CHROME9_PS_DESTINATION_TEMP;
+      native[i]->destination.id = temp[i].id;
+      native[i]->destination.writemask = (1u << components) - 1;
+   }
+   /* a = |x|, f = FRC a, t = a - f, n = f - a */
+   native[0]->source[0] = x;
+   native[1]->source[0] = temp[0];
+   native[2]->source[0] = temp[0];
+   native[2]->source[1] = temp[1];
+   native[3]->source[0] = temp[1];
+   native[3]->source[1] = temp[0];
+   if (ceil) {
+      zero = one = constant;
+      for (unsigned c = 0; c < 4; c++) {
+         zero.swizzle[c] = c < components ? constant.swizzle[0] :
+                           CHROME9_PS_SWIZZLE_ZERO;
+         one.swizzle[c] = c < components ? constant.swizzle[1] :
+                          CHROME9_PS_SWIZZLE_ZERO;
+      }
+      /* s = -f >= 0 ? 0 : 1, c = t + s, r = x >= 0 ? c : n */
+      native[4]->source[0] = temp[1];
+      native[4]->source[0].modifier = CHROME9_PS_SOURCE_NEGATE;
+      native[4]->source[1] = zero;
+      native[4]->source[2] = one;
+      native[5]->source[0] = temp[2];
+      native[5]->source[1] = temp[4];
+      native[6]->source[0] = x;
+      native[6]->source[1] = temp[5];
+      native[6]->source[2] = temp[3];
+   } else {
+      /* r = x >= 0 ? t : n */
+      native[4]->source[0] = x;
+      native[4]->source[1] = temp[2];
+      native[4]->source[2] = temp[3];
+   }
+
+   value = builder->value_count++;
+   builder->value[value].def = def;
+   builder->value[value].source = temp[count - 1];
+   builder->value[value].complete = true;
+   *source = temp[count - 1];
+   return true;
+}
+
 static bool
 chrome9_ps_sample_alpha(nir_scalar scalar, nir_tex_instr **texture)
 {
@@ -5169,10 +5305,10 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint32_t *unit_interval_input_mask,
                        uint8_t *cube_sampler_mask,
                        uint8_t *volume_sampler_mask,
-                       bool allow_kill,
+                       bool allow_kill, bool allow_bias,
                        bool *lowered)
 {
-   struct chrome9_ps_nir_builder builder = { 0 };
+   struct chrome9_ps_nir_builder builder = { .allow_bias = allow_bias };
    struct chrome9_ps_instruction *terminal;
    struct chrome9_ps_source operands[3] = { 0 };
    enum chrome9_ps_opcode op;
@@ -5572,6 +5708,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      &shader->semantic_cube_sampler_mask,
                                      &shader->semantic_volume_sampler_mask,
                                      ctx->fragment_kill,
+                                     ctx->texture_bias,
                                      &lowered);
    if (lowered) {
       unsigned source_peak;
@@ -7560,6 +7697,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_KILL);
+   ctx->texture_bias = chrome9_screen_has_capability2(
+      screen, DRM_CHROME9_CAP2_TEXTURE_BIAS);
    ctx->fragment_add =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_ADD);
    ctx->draw_textured_triangle =

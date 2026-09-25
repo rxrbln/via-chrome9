@@ -231,6 +231,7 @@ struct chrome9_context {
    bool fragment_sparse_textures;
    bool fragment_primary;
    bool fragment_kill;
+   bool texture_bias;
    bool fragment_add;
    bool draw_textured_triangle;
    bool draw_textured_triangle_batch;

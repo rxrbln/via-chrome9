@@ -333,6 +333,9 @@ chrome9_fragment_build_instructions(
             return false;
          /* TAU records retain the logical sampler id, including gaps. */
          instruction->sampler = source->sampler;
+         instruction->flags = source->flags;
+      } else if (source->flags) {
+         return false;
       }
       for (unsigned s = 0; s < source_count; s++)
          if (!chrome9_fragment_source(&source->source[s],
