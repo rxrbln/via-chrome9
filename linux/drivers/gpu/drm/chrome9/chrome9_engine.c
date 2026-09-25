@@ -221,6 +221,16 @@ module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
 MODULE_PARM_DESC(blend_equation,
 	"Blend SUBTRACT, REVERSE_SUBTRACT, MIN and MAX (default: true)");
 
+static bool chrome9_coarse_z;
+module_param_named(coarse_z, chrome9_coarse_z, bool, 0600);
+MODULE_PARM_DESC(coarse_z,
+	"Coarse-Z depth rejection for fragment draws (default: false)");
+
+static uint chrome9_coarse_z_re;
+module_param_named(coarse_z_re, chrome9_coarse_z_re, uint, 0600);
+MODULE_PARM_DESC(coarse_z_re,
+	"Debug: bits toggled in the coarse-Z A29 word (default: 0)");
+
 static bool chrome9_texture_bias = true;
 module_param_named(texture_bias, chrome9_texture_bias, bool, 0600);
 MODULE_PARM_DESC(texture_bias,
@@ -637,6 +647,10 @@ struct chrome9_draw_request {
 	u64 object_size;
 	u32 depth_pitch;
 	u64 depth_object_size;
+	/* Fragment programs: coarse-Z buffer, rows from PAGE_SIZE. */
+	u32 coarse_z_handle;
+	u32 coarse_z_pitch;
+	u64 coarse_z_object_size;
 	u32 texture_width;
 	u32 texture_height;
 	u32 texture_pitch;
@@ -4408,7 +4422,8 @@ static void chrome9_state_cache_forget(struct chrome9_state_cache *cache)
  */
 static noinline_for_stack int
 chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
-	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+	u32 target, u32 depth, u32 coarse_z,
+	const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
 	const u32 *element_address, const u32 *query, u32 query_re,
 	struct chrome9_state_cache *cache, bool *constants_live, u32 **cursor,
 	const u32 *limit)
@@ -4548,6 +4563,19 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	/* The pre-depth pixel-Z clip interval is required even without depth. */
 	memcpy(common + common_count, pixel_z_clip, sizeof(pixel_z_clip));
 	common_count += ARRAY_SIZE(pixel_z_clip);
+	if (request->flags & DRM_CHROME9_FRAGMENT_COARSE_Z) {
+		/* SF location, write-back on cell change, conservative merge. */
+		u32 a29 = (0x29000000 | 1 << 20 | BIT(16) | 1 << 12 |
+			   request->coarse_z_pitch >> 5) ^
+			  (READ_ONCE(chrome9_coarse_z_re) & 0x00ffffff);
+
+		/* A01 bit 13 tests, bit 9 updates like the Z write (bit 2). */
+		common[4] |= BIT(13) | (common[4] & BIT(2) ? BIT(9) : 0);
+		if (request->flags & DRM_CHROME9_FRAGMENT_COARSE_Z_RESET)
+			common[common_count++] = a29 | BIT(15);
+		common[common_count++] = a29;
+		common[common_count++] = 0x2a000000 | coarse_z >> 8;
+	}
 	if (depth_active) {
 		if (request->flags & DRM_CHROME9_FRAGMENT_STENCIL) {
 			common[4] |= BIT(4);
@@ -6628,6 +6656,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_BIAS;
 	if (READ_ONCE(chrome9_destination_offset))
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
+	if (READ_ONCE(chrome9_coarse_z))
+		caps |= DRM_CHROME9_CAP2_COARSE_Z;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
@@ -7932,7 +7962,15 @@ enum chrome9_fragment_object_kind {
 	CHROME9_OBJECT_DEPTH,
 	CHROME9_OBJECT_TEXTURE,
 	CHROME9_OBJECT_VERTEX,
+	CHROME9_OBJECT_COARSE_Z,
 };
+
+/* The job writes its destination, depth and coarse-Z objects. */
+static bool chrome9_fragment_object_written(u8 kind)
+{
+	return kind == CHROME9_OBJECT_DESTINATION ||
+	       kind == CHROME9_OBJECT_DEPTH || kind == CHROME9_OBJECT_COARSE_Z;
+}
 
 /* Per-call bookkeeping of a fragment submission, kept off the stack. */
 struct chrome9_fragment_submit {
@@ -8198,7 +8236,6 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 	u64 *object_sizes = sub->object_sizes;
 	u64 *mapping_sizes = sub->mapping_sizes;
 	u32 object_count = job->fsub_count;
-	u32 depth_index = job->fsub_depth;
 	unsigned int i;
 	int ret = 0;
 
@@ -8207,8 +8244,7 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
-		/* The job writes only its color and depth destinations. */
-		if (i != 0 && i != depth_index)
+		if (!chrome9_fragment_object_written(sub->kind[i]))
 			continue;
 		if (!bo->explicit_access) {
 			chrome9_cache_flush(job->fragment_maps[i].vaddr,
@@ -8226,7 +8262,7 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 	dma_rmb();
 	for (i = 0; i < object_count; i++) {
 		/* Sampled textures and vertex buffers are only read. */
-		if (i != 0 && i != depth_index) {
+		if (!chrome9_fragment_object_written(sub->kind[i])) {
 			chrome9_sf_resync_object_locked(engine, objects[i]);
 			continue;
 		}
@@ -8552,6 +8588,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	u64 mapped_size = 0;
 	u32 object_count = 1;
 	u32 depth_index = U32_MAX;
+	u32 coarse_index = U32_MAX;
+	const struct chrome9_draw_request *coarse = NULL;
 	u32 pause, r, next, q;
 	long wait;
 	bool exec_initialized = false;
@@ -8593,6 +8631,28 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		objects[depth_index] = drm_gem_object_lookup(file,
 							      request->depth_handle);
 		object_sizes[depth_index] = request->depth_object_size;
+	}
+	/* Draws of one batch share one coarse-Z buffer or use none. */
+	for (r = 0; r < count; r++) {
+		const struct chrome9_draw_request *req = requests[r];
+
+		if (!req->coarse_z_handle)
+			continue;
+		if (coarse_index == U32_MAX) {
+			coarse = req;
+			coarse_index = object_count++;
+			sub->kind[coarse_index] = CHROME9_OBJECT_COARSE_Z;
+			sub->handle[coarse_index] = req->coarse_z_handle;
+			objects[coarse_index] = drm_gem_object_lookup(file,
+						req->coarse_z_handle);
+			object_sizes[coarse_index] = req->coarse_z_object_size;
+		} else if (req->coarse_z_handle != coarse->coarse_z_handle ||
+			   req->coarse_z_pitch != coarse->coarse_z_pitch ||
+			   req->coarse_z_object_size !=
+			   coarse->coarse_z_object_size) {
+			ret = -EINVAL;
+			goto out_put_objects;
+		}
 	}
 	for (r = 0; r < count; r++) {
 		const struct chrome9_draw_request *req = requests[r];
@@ -8674,8 +8734,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		/* Read-only objects may alias each other, never a target. */
 		for (j = 0; j < i; j++)
 			if (objects[i] == objects[j] &&
-			    (i == 0 || i == depth_index ||
-			     j == 0 || j == depth_index)) {
+			    (chrome9_fragment_object_written(sub->kind[i]) ||
+			     chrome9_fragment_object_written(sub->kind[j]))) {
 				ret = -EINVAL;
 				goto out_put_objects;
 			}
@@ -8732,7 +8792,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		}
 	}
 	for (i = 0; i < object_count; i++) {
-		bool write = i == 0 || i == depth_index;
+		bool write = chrome9_fragment_object_written(sub->kind[i]);
 
 		wait = chrome9_resv_wait_deps(engine, objects[i]->resv,
 					      dma_resv_usage_rw(write));
@@ -8903,7 +8963,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				(i == 0 ? 0 : i == depth_index ? 1 : 2)]++;
 		}
 		/* The job never writes a sampled object's pages. */
-		if (bo->explicit_access && i != 0 && i != depth_index) {
+		if (bo->explicit_access &&
+		    !chrome9_fragment_object_written(sub->kind[i])) {
 			bo->guard_object_size = object_sizes[i];
 			bo->guard_mapping_size = mapping_sizes[i];
 		}
@@ -8914,8 +8975,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	device_owned = true;
 	for (i = 0; i < object_count; i++)
 		dma_resv_add_fence(objects[i]->resv, &job->fence.base,
-			(i == 0 || i == depth_index) ? DMA_RESV_USAGE_WRITE :
-							  DMA_RESV_USAGE_READ);
+			chrome9_fragment_object_written(sub->kind[i]) ?
+			DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ);
 	job->fence_attached = true;
 	chrome9_prof_mark(CHROME9_PROF_FLUSH);
 	/* The last segment retires asynchronously when every object keeps a
@@ -8961,6 +9022,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				sub->bases[0] + req->destination_offset,
 				depth_index == U32_MAX ? 0 :
 				sub->bases[depth_index] + PAGE_SIZE,
+				coarse_index == U32_MAX ? 0 :
+				sub->bases[coarse_index] + PAGE_SIZE,
 				texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
 				req->query ? &query_address : NULL,
@@ -12250,6 +12313,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		.kind = CHROME9_DRAW_FRAGMENT_PROGRAM,
 		.destination_handle = args->destination_handle,
 		.depth_handle = args->depth_handle,
+		.coarse_z_handle = args->coarse_z_handle,
+		.coarse_z_pitch = args->coarse_z_pitch,
 		.flags = args->flags,
 		.width = args->width,
 		.height = args->height,
@@ -12268,6 +12333,9 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED |
 		DRM_CHROME9_FRAGMENT_STENCIL;
 	bool stencil = args->flags & DRM_CHROME9_FRAGMENT_STENCIL;
+	bool coarse_z = args->flags & DRM_CHROME9_FRAGMENT_COARSE_Z;
+	u32 depth_func = (args->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+			 DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	u64 surface_size;
 	u64 total_size;
 	u32 vertex_count;
@@ -12284,6 +12352,9 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 
 	if (caps2 & DRM_CHROME9_CAP2_OCCLUSION_QUERY)
 		allowed_flags |= DRM_CHROME9_FRAGMENT_QUERY;
+	if (caps2 & DRM_CHROME9_CAP2_COARSE_Z)
+		allowed_flags |= DRM_CHROME9_FRAGMENT_COARSE_Z |
+				 DRM_CHROME9_FRAGMENT_COARSE_Z_RESET;
 
 	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
 	     !sparse_textures) ||
@@ -12292,7 +12363,20 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	     (!extended || !(caps2 & DRM_CHROME9_CAP2_DESTINATION_OFFSET) ||
 	      args->destination_offset < PAGE_SIZE ||
 	      !IS_ALIGNED(args->destination_offset, 256))) ||
-	    args->pad || args->reserved1 ||
+	    (!coarse_z && (args->flags &
+			   DRM_CHROME9_FRAGMENT_COARSE_Z_RESET)) ||
+	    (coarse_z && (!args->coarse_z_handle ||
+			  (depth_func != DRM_CHROME9_COMPARE_LESS &&
+			   depth_func != DRM_CHROME9_COMPARE_LEQUAL &&
+			   depth_func))) ||
+	    /* A batch may name the buffer on draws that do not use it. */
+	    (args->coarse_z_handle &&
+	     (!depth || !(caps2 & DRM_CHROME9_CAP2_COARSE_Z) ||
+	      args->coarse_z_pitch < ALIGN(DIV_ROUND_UP(args->width, 8) * 16,
+					   32) ||
+	      !IS_ALIGNED(args->coarse_z_pitch, 32) ||
+	      args->coarse_z_pitch >= 16384)) ||
+	    (!args->coarse_z_handle && args->coarse_z_pitch) ||
 	    (!blend && memchr_inv(args->blend_color, 0,
 				  sizeof(args->blend_color))) ||
 	    (!(args->flags & DRM_CHROME9_FRAGMENT_QUERY) && args->query) ||
@@ -12365,6 +12449,13 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 				       &total_size))
 			return -E2BIG;
 	}
+	/* Guard page, one row per 8 pixel rows, guard page. */
+	if (args->coarse_z_handle &&
+	    check_add_overflow(ALIGN((u64)args->coarse_z_pitch *
+				     DIV_ROUND_UP(args->height, 8), PAGE_SIZE),
+			       2ULL * PAGE_SIZE,
+			       &request.coarse_z_object_size))
+		return -E2BIG;
 	if (check_mul_overflow(args->triangle_count, 3U, &vertex_count))
 		return -E2BIG;
 	instructions = chrome9_arena_copy_user(arena, args->instructions_ptr,
