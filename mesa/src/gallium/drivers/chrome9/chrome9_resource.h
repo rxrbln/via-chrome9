@@ -36,6 +36,9 @@ struct chrome9_resource {
    uint64_t data_offset;
    uint64_t data_size;
    bool guarded;
+   /* A layout the sampler cannot read (NPOT DXT mip chains, DXT cubes);
+    * only llvmpipe samples it. */
+   bool sampler_unsupported;
    /* Guarded, yet external layout offset 0 names the first row. */
    bool guarded_shared;
    /* The kernel defers cache maintenance; CPU accesses are bracketed with

@@ -43,6 +43,7 @@ struct chrome9_resource_layout {
    uint64_t layer_stride;
    uint64_t allocation_size;
    bool guarded;
+   bool sampler_unsupported;
 };
 
 static bool
@@ -76,9 +77,14 @@ chrome9_resource_cube_layout(const struct pipe_resource *templ,
 {
    uint64_t face = 0;
 
+   /* DXT faces (llvmpipe only) hold their block rows. */
+   const bool blocks = util_format_is_compressed(templ->format);
+
    for (unsigned level = 0; level <= templ->last_level; level++) {
       layout->level_offset[level] = page_size + face;
-      face += (uint64_t)layout->level_stride[level] *
+      face += blocks ? ALIGN_POT(layout->level_size[level],
+                                 CHROME9_MIP_ALIGNMENT) :
+              (uint64_t)layout->level_stride[level] *
               ALIGN_POT(u_minify(templ->height0, level), 8);
    }
    layout->layer_stride = ALIGN_POT(face, CHROME9_MIP_ALIGNMENT);
@@ -144,7 +150,7 @@ chrome9_resource_layout(struct pipe_screen *screen,
        !cpp ||
        (chrome9_format_is_d24(templ->format) &&
         (!chrome9_is_surface_target(templ->target) || templ->last_level)) ||
-       (dxt && templ->target != PIPE_TEXTURE_2D) ||
+       (dxt && templ->target != PIPE_TEXTURE_2D && !cube) ||
        (volume && (!templ->depth0 ||
                    templ->depth0 > CHROME9_MAX_VOLUME_DEPTH ||
                    templ->last_level >
@@ -170,12 +176,15 @@ chrome9_resource_layout(struct pipe_screen *screen,
        page_size > UINT32_MAX || page_size < CHROME9_MIP_ALIGNMENT)
       return false;
 
-   /* DXT mip chains exist only in the sampler-derived POT layout. */
-   if (dxt && templ->last_level &&
-       (!chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_DXT_MIP) ||
-        !util_is_power_of_two_nonzero(templ->width0) ||
-        !util_is_power_of_two_nonzero(templ->height0)))
-      return false;
+   /* The sampler reads DXT mip chains only in the POT layout; other chains
+    * keep the table layout for the CPU and llvmpipe. */
+   layout->sampler_unsupported =
+      dxt && (cube ||
+              (templ->last_level &&
+               (!chrome9_screen_has_capability2(screen,
+                                                DRM_CHROME9_CAP2_DXT_MIP) ||
+                !util_is_power_of_two_nonzero(templ->width0) ||
+                !util_is_power_of_two_nonzero(templ->height0))));
 
    for (unsigned level = 0; level <= templ->last_level; level++) {
       const unsigned width = u_minify(templ->width0, level);
@@ -265,6 +274,7 @@ chrome9_resource_apply_layout(struct chrome9_resource *resource,
    resource->data_size = layout->level_size[0];
    resource->layer_stride = layout->layer_stride;
    resource->guarded = layout->guarded;
+   resource->sampler_unsupported = layout->sampler_unsupported;
 }
 
 static bool
@@ -350,7 +360,10 @@ chrome9_format_supported(struct pipe_screen *screen,
                                             DRM_CHROME9_CAP2_CUBE_MAP) &&
              chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM) &&
-             !chrome9_format_is_dxt(format) &&
+             /* DXT cube faces are sampled by llvmpipe only. */
+             (!chrome9_format_is_dxt(format) ||
+              (chrome9_sw_enabled() &&
+               !(bindings & PIPE_BIND_RENDER_TARGET))) &&
              !(bindings & ~(sampler_bindings | PIPE_BIND_RENDER_TARGET)) &&
              chrome9_format_supported(screen, format, PIPE_TEXTURE_2D,
                                       sample_count, storage_sample_count,

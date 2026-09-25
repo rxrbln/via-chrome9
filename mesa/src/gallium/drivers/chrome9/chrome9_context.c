@@ -6550,7 +6550,8 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
          templ->format, templ->swizzle_r, templ->swizzle_g,
          templ->swizzle_b, templ->swizzle_a) ||
          /* The cube sampler takes POT faces only. */
-         (cube && !util_is_power_of_two_nonzero(texture->width0));
+         (cube && !util_is_power_of_two_nonzero(texture->width0)) ||
+         chrome9_resource(texture)->sampler_unsupported;
    if (supported && !chrome9_resource(texture)->guarded) {
       struct pipe_resource shadow_templ = *texture;
 
