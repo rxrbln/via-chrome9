@@ -15,6 +15,7 @@
 #include "chrome9_draw.h"
 #include "chrome9_resource.h"
 #include "chrome9_specialise.h"
+#include "chrome9_swfb.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "pipe/p_defines.h"
@@ -3246,8 +3247,13 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       flags[0] |= rs->front_ccw ? DRM_CHROME9_VERTEX_BFC_CW :
                                   DRM_CHROME9_VERTEX_BFC_CCW;
    } else if (twoside) {
-      if (!tcl_face_order_invisible(ctx))
+      /* Two culled passes would reorder overlapping faces: llvmpipe
+       * keeps primitive order. */
+      if (!tcl_face_order_invisible(ctx)) {
+         if (chrome9_sw_draw_vbo(ctx, info, 0, range, 1))
+            return true;
          return tcl_fallback(ctx, "two-sided color with visible face order");
+      }
       if (rs->cull_face == PIPE_FACE_FRONT) {
          colours[0] = CHROME9_TCL_COLOUR_BACK;
       } else {
