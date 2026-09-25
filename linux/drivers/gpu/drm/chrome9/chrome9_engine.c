@@ -239,6 +239,24 @@ module_param_named(edge_aa, chrome9_edge_aa, bool, 0600);
 MODULE_PARM_DESC(edge_aa,
 	"Edge antialiasing for vertex-program lines and triangles (default: true)");
 
+/* Tiling experiments (chrome9-tiling-re.md): bit 0 A51 bit 23 (tiled
+ * render target), bit 2 A12 bit 0 (tiled depth). */
+static uint chrome9_tile_re;
+module_param_named(tile_re, chrome9_tile_re, uint, 0600);
+MODULE_PARM_DESC(tile_re,
+	"Debug: tile bits for fragment draw targets, see chrome9-tiling-re.md (default: 0)");
+
+/* A00[23:18] = 010101: drop primitives with a NaN position (Windows 7122). */
+static bool chrome9_tcl_nan_kill = true;
+module_param_named(tcl_nan_kill, chrome9_tcl_nan_kill, bool, 0600);
+MODULE_PARM_DESC(tcl_nan_kill,
+	"Hardware TCL drops primitives with NaN positions, rung B14 (default: true)");
+
+static bool chrome9_tiled_depth = true;
+module_param_named(tiled_depth, chrome9_tiled_depth, bool, 0600);
+MODULE_PARM_DESC(tiled_depth,
+	"Tiled depth buffers for fragment draws (default: true)");
+
 static bool chrome9_depth_output = true;
 module_param_named(depth_output, chrome9_depth_output, bool, 0600);
 MODULE_PARM_DESC(depth_output,
@@ -3419,7 +3437,8 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	/* Stage B: SF memory type (A00[16:15] = 01); element bits 19:12 hold
 	 * address bits 9:2 inside the slot's 1-KiB window. */
 	raster[i++] = (tcl->element_count - 1) << 8 | tcl->stride_dw |
-		      (addresses ? BIT(15) : 0);
+		      (addresses ? BIT(15) : 0) |
+		      (READ_ONCE(chrome9_tcl_nan_kill) ? 0x540000 : 0);
 	for (e = 0; e < tcl->element_count; e++)
 		raster[i++] = (1 + e) << 24 |
 			      (addresses ? (addresses[e] >> 2) & 0xff :
@@ -4555,6 +4574,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			(READ_ONCE(chrome9_vram_target_test) >> 8);
 		destination_state[1] = 0x51000000;
 	}
+	if (READ_ONCE(chrome9_tile_re) & 1)
+		destination_state[1] |= BIT(23);
 	destination_state[2] = 0x52000000 |
 		(rt_format->a52_format << 16) | (request->pitch >> 5);
 	if (blend) {
@@ -4590,8 +4611,10 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		common[4] = chrome9_depth_control_word(request, true);
 		common[7] = 0x10000000 | (depth >> 8);
 		common[8] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
-		common[9] = request->fragment_depth_format ==
-			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000;
+		common[9] = (request->fragment_depth_format ==
+			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000) |
+			(request->flags & DRM_CHROME9_FRAGMENT_DEPTH_TILED ||
+			 READ_ONCE(chrome9_tile_re) & 4 ? BIT(0) : 0);
 		common[10] = 0x13000000 | depth_func << 16 |
 			     (program->depth_output ? BIT(23) : 0);
 		common_count = 11;
@@ -6728,6 +6751,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_FAST_Z;
 	if (READ_ONCE(chrome9_depth_output))
 		caps |= DRM_CHROME9_CAP2_DEPTH_OUTPUT;
+	if (READ_ONCE(chrome9_tiled_depth))
+		caps |= DRM_CHROME9_CAP2_TILED_DEPTH;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
 		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
@@ -8749,6 +8774,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		    req->object_size != request->object_size ||
 		    (req->flags ^ request->flags) &
 		    (DRM_CHROME9_FRAGMENT_DEPTH |
+		     DRM_CHROME9_FRAGMENT_DEPTH_TILED |
 		     DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED) ||
 		    req->depth_handle != request->depth_handle ||
 		    req->depth_object_size != request->depth_object_size) {
@@ -12455,6 +12481,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	if (caps2 & DRM_CHROME9_CAP2_FAST_Z)
 		allowed_flags |= DRM_CHROME9_FRAGMENT_FAST_Z |
 				 DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK;
+	if (caps2 & DRM_CHROME9_CAP2_TILED_DEPTH)
+		allowed_flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
 
 	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
 	     !sparse_textures) ||
@@ -12465,6 +12493,7 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	      !IS_ALIGNED(args->destination_offset, 256))) ||
 	    (!coarse_z && (args->flags &
 			   DRM_CHROME9_FRAGMENT_COARSE_Z_RESET)) ||
+	    ((args->flags & DRM_CHROME9_FRAGMENT_DEPTH_TILED) && !depth) ||
 	    ((args->flags & DRM_CHROME9_FRAGMENT_FAST_Z) ?
 	     !depth || stencil ||
 	     args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 :
@@ -12542,10 +12571,14 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		u32 bytes_per_pixel = args->depth_format ==
 			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 4 : 2;
 
+		/* A tiled buffer covers whole 8-row tiles. */
+		u32 rows = args->flags & DRM_CHROME9_FRAGMENT_DEPTH_TILED ?
+			   ALIGN(args->height, 8) : args->height;
+
 		if (args->depth_pitch !=
 		    ALIGN(args->width * bytes_per_pixel, 32) ||
 		    check_mul_overflow((u64)args->depth_pitch,
-				       (u64)args->height, &surface_size) ||
+				       (u64)rows, &surface_size) ||
 		    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
 				       2ULL * PAGE_SIZE,
 				       &request.depth_object_size) ||
