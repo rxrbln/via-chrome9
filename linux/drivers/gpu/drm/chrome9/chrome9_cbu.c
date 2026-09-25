@@ -176,6 +176,8 @@ struct chrome9_cbu_test {
 	/* Bits of each field that read back as written (C1). */
 	u32 mask[CHROME9_CBU_FIELDS];
 	unsigned long touched;
+	/* Uncached map of the occlusion page and GART table. */
+	void __iomem *tail;
 	u64 gart_hash;
 	int mode;
 	const char *step;
@@ -207,16 +209,20 @@ static const char *chrome9_cbu_mode_name(int mode)
 	return mode == CHROME9_CBU_PITCH_TILES ? "columns" : "pixels";
 }
 
+/* Scratch surfaces live in the local pool, mapped write-combined only. */
+static void __iomem *chrome9_cbu_sl(struct chrome9_cbu_test *t, u64 offset)
+{
+	return t->cdev->sl_wc + (offset - t->cdev->sl_pool_start);
+}
+
 static u64 chrome9_cbu_gart_hash(struct chrome9_cbu_test *t)
 {
-	struct chrome9_device *cdev = t->cdev;
-	resource_size_t start = cdev->vram_size - CHROME9_ENGINE_VRAM_RESERVED;
 	void *copy = kvmalloc(CHROME9_ENGINE_VRAM_RESERVED, GFP_KERNEL);
 	u64 hash;
 
 	if (!copy)
 		return 0;
-	memcpy_fromio(copy, cdev->vram + start, CHROME9_ENGINE_VRAM_RESERVED);
+	memcpy_fromio(copy, t->tail, CHROME9_ENGINE_VRAM_RESERVED);
 	hash = xxh64(copy, CHROME9_ENGINE_VRAM_RESERVED, 0);
 	kvfree(copy);
 	return hash;
@@ -252,9 +258,10 @@ static int chrome9_cbu_surface_alloc(struct chrome9_cbu_test *t,
 	}
 	s->base = s->node.start + PAGE_SIZE;
 	for (o = s->node.start; o < s->base; o += 4)
-		writel(CHROME9_CBU_GUARD, cdev->vram + o);
+		writel(CHROME9_CBU_GUARD, chrome9_cbu_sl(t, o));
 	for (o = s->base + s->extent; o < s->node.start + size; o += 4)
-		writel(CHROME9_CBU_GUARD, cdev->vram + o);
+		writel(CHROME9_CBU_GUARD, chrome9_cbu_sl(t, o));
+	wmb();
 	return 0;
 }
 
@@ -266,9 +273,9 @@ static unsigned int chrome9_cbu_guards_damaged(struct chrome9_cbu_test *t,
 	u64 o;
 
 	for (o = s->node.start; o < s->base; o += 4)
-		bad += readl(t->cdev->vram + o) != CHROME9_CBU_GUARD;
+		bad += readl(chrome9_cbu_sl(t, o)) != CHROME9_CBU_GUARD;
 	for (o = s->base + s->extent; o < end; o += 4)
-		bad += readl(t->cdev->vram + o) != CHROME9_CBU_GUARD;
+		bad += readl(chrome9_cbu_sl(t, o)) != CHROME9_CBU_GUARD;
 	return bad;
 }
 
@@ -292,7 +299,7 @@ static void chrome9_cbu_fill_raw(struct chrome9_cbu_test *t,
 
 	for (o = 0; o < s->extent; o += 4)
 		s->buf[o / 4] = chrome9_cbu_pattern(CHROME9_CBU_TAG_RAW, o);
-	memcpy_toio(t->cdev->vram + s->base, s->buf, s->extent);
+	memcpy_toio(chrome9_cbu_sl(t, s->base), s->buf, s->extent);
 	wmb();
 }
 
@@ -337,7 +344,7 @@ static u32 chrome9_cbu_check_view(struct chrome9_cbu_test *t,
 	u64 o;
 
 	*untranslated = 0;
-	memcpy_fromio(s->buf, t->cdev->vram + s->base, linear);
+	memcpy_fromio(s->buf, chrome9_cbu_sl(t, s->base), linear);
 	for (y = 0; y < s->height; y++) {
 		for (xb = 0; xb < width_bytes; xb += 4) {
 			u32 got = s->buf[(y * s->pitch + xb) / 4];
@@ -372,11 +379,13 @@ static u32 chrome9_cbu_check_view(struct chrome9_cbu_test *t,
 /* After linear writes of rows < height: raw dwords of those rows hold the
  * linear pattern, the tail rows keep the raw one. */
 static u32 chrome9_cbu_check_raw(struct chrome9_cbu_test *t,
-				 struct chrome9_cbu_surface *s)
+				 struct chrome9_cbu_surface *s,
+				 u32 *untranslated)
 {
 	u32 bad = 0, o, xb, y, expect;
 
-	memcpy_fromio(s->buf, t->cdev->vram + s->base, s->extent);
+	*untranslated = 0;
+	memcpy_fromio(s->buf, chrome9_cbu_sl(t, s->base), s->extent);
 	for (o = 0; o < s->extent; o += 4) {
 		chrome9_cbu_untile(o, s->pitch, s->tile_rows, &xb, &y);
 		expect = y < s->height ?
@@ -385,6 +394,10 @@ static u32 chrome9_cbu_check_raw(struct chrome9_cbu_test *t,
 			 chrome9_cbu_pattern(CHROME9_CBU_TAG_RAW, o);
 		if (s->buf[o / 4] == expect)
 			continue;
+		/* The linear write landed at its own offset. */
+		if (o < s->pitch * s->height &&
+		    s->buf[o / 4] == chrome9_cbu_pattern(CHROME9_CBU_TAG_LIN, o))
+			(*untranslated)++;
 		if (++bad <= 4)
 			dev_info(t->dev,
 				 "CBU %s:   raw +%#x (byte %u row %u) holds %08x, expected %08x\n",
@@ -397,7 +410,7 @@ static u32 chrome9_cbu_first_read(struct chrome9_cbu_test *t,
 				  struct chrome9_cbu_surface *s, u32 xb,
 				  u32 y)
 {
-	u32 got = readl(t->cdev->vram + s->base + y * s->pitch + xb);
+	u32 got = readl(chrome9_cbu_sl(t, s->base + y * s->pitch + xb));
 
 	dev_info(t->dev,
 		 "CBU %s: first read byte %u row %u = %08x (tiled %08x)\n",
@@ -630,31 +643,69 @@ enum {
 };
 
 static const char * const chrome9_cbu_write_name[] = {
-	"dword UC", "byte/word UC", "qword UC", "memcpy WC",
+	"dword", "byte/word", "qword", "memcpy WC",
 };
+
+/* The pool is write-combined: a fence after every store keeps each one a
+ * transaction of its own size; memcpy lets the CPU combine them. */
+static void chrome9_cbu_store(void __iomem *dst, const u32 *buf, u32 bytes,
+			      int kind)
+{
+	u32 l, v;
+
+	switch (kind) {
+	case CHROME9_CBU_WRITE_DWORD:
+		for (l = 0; l < bytes; l += 4) {
+			writel(buf[l / 4], dst + l);
+			wmb();
+		}
+		break;
+	case CHROME9_CBU_WRITE_BYTE_WORD:
+		for (l = 0; l < bytes; l += 4) {
+			v = buf[l / 4];
+			if (l & 4) {
+				writew(v, dst + l);
+				wmb();
+				writew(v >> 16, dst + l + 2);
+			} else {
+				writeb(v, dst + l);
+				wmb();
+				writeb(v >> 8, dst + l + 1);
+				wmb();
+				writeb(v >> 16, dst + l + 2);
+				wmb();
+				writeb(v >> 24, dst + l + 3);
+			}
+			wmb();
+		}
+		break;
+	case CHROME9_CBU_WRITE_QWORD:
+#ifdef CONFIG_64BIT
+		for (l = 0; l < bytes; l += 8) {
+			writeq((u64)buf[l / 4 + 1] << 32 | buf[l / 4], dst + l);
+			wmb();
+		}
+#endif
+		break;
+	case CHROME9_CBU_WRITE_WC:
+		memcpy_toio(dst, buf, bytes);
+		wmb();
+		break;
+	}
+}
 
 static int chrome9_cbu_write_case(struct chrome9_cbu_test *t, u32 width,
 				  u32 height, u32 cpp, int kind)
 {
 	struct chrome9_device *cdev = t->cdev;
-	void __iomem *wc = NULL, *dst;
 	struct chrome9_cbu_surface s;
-	u32 linear, l, v, bad;
+	u32 linear, l, bad, untranslated;
 	int ret;
 
 	ret = chrome9_cbu_surface_alloc(t, &s, width, height, cpp, 8);
 	if (ret)
 		return ret;
 	linear = s.pitch * height;
-	if (kind == CHROME9_CBU_WRITE_WC) {
-		/* PAT keeps an overlapping UC- mapping's type (see report). */
-		wc = ioremap_wc(pci_resource_start(cdev->pdev, 2) + s.base,
-				linear);
-		if (!wc) {
-			ret = -ENOMEM;
-			goto out;
-		}
-	}
 	chrome9_cbu_fill_raw(t, &s);
 	ret = chrome9_cbu_arm(t, t->win, &s, s.pitch / cpp, t->mode,
 			      CHROME9_CBU_ENABLE | chrome9_cbu_bpp(cpp) |
@@ -662,51 +713,19 @@ static int chrome9_cbu_write_case(struct chrome9_cbu_test *t, u32 width,
 	if (ret)
 		goto out;
 	chrome9_cbu_first_read(t, &s, 0, 0);
-	dst = cdev->vram + s.base;
 	for (l = 0; l < linear; l += 4)
 		s.buf[l / 4] = chrome9_cbu_pattern(CHROME9_CBU_TAG_LIN, l);
-	switch (kind) {
-	case CHROME9_CBU_WRITE_DWORD:
-		for (l = 0; l < linear; l += 4)
-			writel(s.buf[l / 4], dst + l);
-		break;
-	case CHROME9_CBU_WRITE_BYTE_WORD:
-		for (l = 0; l < linear; l += 4) {
-			v = s.buf[l / 4];
-			if (l & 4) {
-				writew(v, dst + l);
-				writew(v >> 16, dst + l + 2);
-			} else {
-				writeb(v, dst + l);
-				writeb(v >> 8, dst + l + 1);
-				writeb(v >> 16, dst + l + 2);
-				writeb(v >> 24, dst + l + 3);
-			}
-		}
-		break;
-	case CHROME9_CBU_WRITE_QWORD:
-#ifdef CONFIG_64BIT
-		for (l = 0; l < linear; l += 8)
-			writeq((u64)s.buf[l / 4 + 1] << 32 | s.buf[l / 4],
-			       dst + l);
-#endif
-		break;
-	case CHROME9_CBU_WRITE_WC:
-		memcpy_toio(wc, s.buf, linear);
-		break;
-	}
+	chrome9_cbu_store(chrome9_cbu_sl(t, s.base), s.buf, linear, kind);
 	ret = chrome9_cbu_finish(t, &s, t->win);
-	bad = chrome9_cbu_check_raw(t, &s);
+	bad = chrome9_cbu_check_raw(t, &s, &untranslated);
 	dev_info(t->dev,
-		 "CBU C4: %s %ux%u cpp %u pitch %u: %u/%u raw dwords as expected\n",
-		 chrome9_cbu_write_name[kind], width, height, cpp, s.pitch,
-		 s.extent / 4 - bad, s.extent / 4);
+		 "CBU %s: %s %ux%u cpp %u pitch %u: %u/%u raw dwords as expected, untranslated %u\n",
+		 t->step, chrome9_cbu_write_name[kind], width, height, cpp,
+		 s.pitch, s.extent / 4 - bad, s.extent / 4, untranslated);
 	if (!ret && bad)
 		ret = 1;
 out:
 	chrome9_cbu_disable(cdev, t->win);
-	if (wc)
-		iounmap(wc);
 	chrome9_cbu_surface_free(t, &s);
 	return ret;
 }
@@ -734,7 +753,7 @@ static int chrome9_cbu_step_write(struct chrome9_cbu_test *t)
 static const char *chrome9_cbu_classify(struct chrome9_cbu_test *t, u32 at,
 					u32 expect_raw, u32 expect_tiled)
 {
-	u32 got = readl(t->cdev->vram + at);
+	u32 got = readl(chrome9_cbu_sl(t, at));
 
 	if (got == expect_raw)
 		return "untranslated";
@@ -770,15 +789,17 @@ static int chrome9_cbu_step_bounds(struct chrome9_cbu_test *t)
 				     chrome9_cbu_pattern(CHROME9_CBU_TAG_RAW,
 							 tiled_end));
 	/* Stores just outside [base, end) must land untranslated. */
-	writel(0x0badf00d, cdev->vram + s.base - 16);
-	writel(0x0badf00d, cdev->vram + s.base + linear);
+	writel(0x0badf00d, chrome9_cbu_sl(t, s.base - 16));
+	wmb();
+	writel(0x0badf00d, chrome9_cbu_sl(t, s.base + linear));
 	chrome9_cbu_disable(cdev, t->win);
-	got = readl(cdev->vram + s.base - 16);
-	writel(CHROME9_CBU_GUARD, cdev->vram + s.base - 16);
+	got = readl(chrome9_cbu_sl(t, s.base - 16));
+	writel(CHROME9_CBU_GUARD, chrome9_cbu_sl(t, s.base - 16));
 	if (got != 0x0badf00d)
 		before = "store lost";
-	got = readl(cdev->vram + s.base + linear);
-	writel(end_raw, cdev->vram + s.base + linear);
+	got = readl(chrome9_cbu_sl(t, s.base + linear));
+	writel(end_raw, chrome9_cbu_sl(t, s.base + linear));
+	wmb();
 	if (got != 0x0badf00d)
 		after = "store lost";
 	/* Window width 100 of the 104-pixel pitch. */
@@ -787,7 +808,7 @@ static int chrome9_cbu_step_bounds(struct chrome9_cbu_test *t)
 			      CHROME9_CBU_TILE);
 	if (ret)
 		goto out;
-	memcpy_fromio(s.buf, cdev->vram + s.base, linear);
+	memcpy_fromio(s.buf, chrome9_cbu_sl(t, s.base), linear);
 	for (y = 0; y < s.height; y++) {
 		for (xb = 0; xb < s.pitch; xb += 4) {
 			got = s.buf[(y * s.pitch + xb) / 4];
@@ -900,7 +921,7 @@ static int chrome9_cbu_step_two(struct chrome9_cbu_test *t)
 	bad[2] = chrome9_cbu_check_view(t, &s[2], s[2].pitch, 8, &untranslated);
 	bad[3] = chrome9_cbu_check_view(t, &s[0], s[0].pitch, 8, &untranslated);
 	/* The released range reads raw again. */
-	memcpy_fromio(s[1].buf, t->cdev->vram + s[1].base, s[1].extent);
+	memcpy_fromio(s[1].buf, chrome9_cbu_sl(t, s[1].base), s[1].extent);
 	for (i = 0; i < s[1].extent; i += 4)
 		if (s[1].buf[i / 4] !=
 		    chrome9_cbu_pattern(CHROME9_CBU_TAG_RAW, i))
@@ -935,26 +956,26 @@ static int chrome9_cbu_step_timing(struct chrome9_cbu_test *t)
 {
 	struct chrome9_device *cdev = t->cdev;
 	struct chrome9_cbu_surface s;
-	u32 linear, xb, y, bad;
-	void __iomem *wc;
+	u32 linear, xb, y, bad, untranslated;
+	void __iomem *sl;
 	u32 *lin = NULL;
-	u64 ns[6];
+	u64 ns[4];
 	int ret;
 
 	ret = chrome9_cbu_surface_alloc(t, &s, 1600, 1200, 4, 8);
 	if (ret)
 		return ret;
 	linear = s.pitch * s.height;
-	wc = ioremap_wc(pci_resource_start(cdev->pdev, 2) + s.base, linear);
+	sl = chrome9_cbu_sl(t, s.base);
 	lin = vmalloc(linear);
-	if (!wc || !lin) {
+	if (!lin) {
 		ret = -ENOMEM;
 		goto out;
 	}
 	chrome9_cbu_fill_raw(t, &s);
 	/* Raw read and CPU detile in 32-byte runs. */
 	ns[0] = ktime_get_ns();
-	memcpy_fromio(s.buf, cdev->vram + s.base, s.extent);
+	memcpy_fromio(s.buf, sl, s.extent);
 	for (y = 0; y < s.height; y++)
 		for (xb = 0; xb < s.pitch; xb += 32)
 			memcpy((u8 *)lin + y * s.pitch + xb, (u8 *)s.buf +
@@ -965,49 +986,37 @@ static int chrome9_cbu_step_timing(struct chrome9_cbu_test *t)
 		goto out;
 	chrome9_cbu_first_read(t, &s, 0, 0);
 	ns[1] = ktime_get_ns();
-	memcpy_fromio(lin, cdev->vram + s.base, linear);
+	memcpy_fromio(lin, sl, linear);
 	ns[1] = ktime_get_ns() - ns[1];
 	for (y = 0; y < linear; y += 4)
 		lin[y / 4] = chrome9_cbu_pattern(CHROME9_CBU_TAG_LIN, y);
 	ns[2] = ktime_get_ns();
-	memcpy_toio(cdev->vram + s.base, lin, linear);
+	memcpy_toio(sl, lin, linear);
 	wmb();
 	ns[2] = ktime_get_ns() - ns[2];
-	ns[3] = ktime_get_ns();
-	memcpy_toio(wc, lin, linear);
-	wmb();
-	ns[3] = ktime_get_ns() - ns[3];
 	ret = chrome9_cbu_finish(t, &s, t->win);
-	bad = chrome9_cbu_check_raw(t, &s);
-	/* Raw writes after CPU tiling, UC and WC mapping. */
-	ns[4] = ktime_get_ns();
+	bad = chrome9_cbu_check_raw(t, &s, &untranslated);
+	/* CPU tiling and a raw write. */
+	ns[3] = ktime_get_ns();
 	for (y = 0; y < s.height; y++)
 		for (xb = 0; xb < s.pitch; xb += 32)
 			memcpy((u8 *)s.buf +
 			       chrome9_cbu_tiled_offset(xb, y, s.pitch, 8),
 			       (u8 *)lin + y * s.pitch + xb, 32);
-	memcpy_toio(cdev->vram + s.base, s.buf, s.extent);
+	memcpy_toio(sl, s.buf, s.extent);
 	wmb();
-	ns[4] = ktime_get_ns() - ns[4];
-	ns[5] = ktime_get_ns();
-	memcpy_toio(wc, s.buf, linear);
-	wmb();
-	ns[5] = ktime_get_ns() - ns[5];
+	ns[3] = ktime_get_ns() - ns[3];
 	dev_info(t->dev,
-		 "CBU C10: 1600x1200 MB/s: read raw+detile %u, window %u; write window UC %u, WC map %u; tile+raw UC %u, WC map %u; window writes %u mismatches\n",
+		 "CBU C10: 1600x1200 MB/s: read raw+detile %u, window %u; write window %u, tile+raw %u; window writes %u mismatches\n",
 		 chrome9_cbu_mbps(linear, ns[0]),
 		 chrome9_cbu_mbps(linear, ns[1]),
 		 chrome9_cbu_mbps(linear, ns[2]),
-		 chrome9_cbu_mbps(linear, ns[3]),
-		 chrome9_cbu_mbps(linear, ns[4]),
-		 chrome9_cbu_mbps(linear, ns[5]), bad);
+		 chrome9_cbu_mbps(linear, ns[3]), bad);
 	if (!ret && bad)
 		ret = 1;
 out:
 	chrome9_cbu_disable(cdev, t->win);
 	vfree(lin);
-	if (wc)
-		iounmap(wc);
 	chrome9_cbu_surface_free(t, &s);
 	return ret;
 }
@@ -1106,7 +1115,7 @@ static void chrome9_cbu_selftest(struct chrome9_device *cdev)
 	u32 ctl;
 	u64 hash;
 
-	if (!cdev->sl_ready || !cdev->mmio || !cdev->vram) {
+	if (!cdev->sl_ready || !cdev->mmio || !cdev->sl_wc) {
 		dev_warn(&cdev->pdev->dev,
 			 "CBU ladder skipped: no engine or local pool\n");
 		return;
@@ -1125,6 +1134,13 @@ static void chrome9_cbu_selftest(struct chrome9_device *cdev)
 	t->mode = chrome9_cbu_pitch_mode;
 	/* Manual: control bits 7:0 are RW; C1 measures the other fields. */
 	t->mask[CHROME9_CBU_CTL] = 0xff;
+	t->tail = ioremap(pci_resource_start(cdev->pdev, 2) + cdev->vram_size -
+			  CHROME9_ENGINE_VRAM_RESERVED,
+			  CHROME9_ENGINE_VRAM_RESERVED);
+	if (!t->tail) {
+		kfree(t);
+		return;
+	}
 	t->gart_hash = chrome9_cbu_gart_hash(t);
 	dev_info(t->dev,
 		 "CBU ladder: steps 1..%d skip %#x window %u pitch mode %d GART hash %016llx\n",
@@ -1193,6 +1209,7 @@ static void chrome9_cbu_selftest(struct chrome9_device *cdev)
 		 ret ? "stopped" : "completed", i,
 		 i ? chrome9_cbu_step_name[i] : "none",
 		 t->mode < 0 ? "unknown" : chrome9_cbu_mode_name(t->mode));
+	iounmap(t->tail);
 	kfree(t);
 }
 
