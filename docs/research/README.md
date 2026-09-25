@@ -48,6 +48,10 @@ targets.
   recovers the vendor clip-engine enable (type-01 A01 bits 11 and 20).
 - [chrome9-fragment-capacity-strategies.md](chrome9-fragment-capacity-strategies.md)
   shows terrain's noise pass cannot fit the 96-ALU store and ranks fallbacks.
+- [chrome9-long-fragment-programs.md](chrome9-long-fragment-programs.md)
+  shows no vendor driver runs more than 96 ALU records (shared unchecked
+  append, upload at address 0), bounds a multi-pass splitter by its R32F
+  carrier and cut widths, and gives the R32F silicon ladder.
 - [ioquake3-gl2-remaining-features.md](ioquake3-gl2-remaining-features.md)
   re-ranks the ioquake3 GL2 blockers after the lightmap fix.
 - [chrome9-modulate-blend-cmd22-hang.md](chrome9-modulate-blend-cmd22-hang.md)
