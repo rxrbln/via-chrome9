@@ -61,6 +61,10 @@ struct chrome9_resource {
     * word holds its depth; fast_z_disabled after a sampler view. */
    uint8_t fast_z_index;
    bool fast_z_disabled;
+   /* CAP2_TILED_DEPTH: 32-byte x 8-row tiles until the first access the
+    * engine cannot make tiled (CPU, sampler, fixed draw builders), which
+    * rewrites it linear for good. */
+   bool tiled;
    /* Single-image render view of a level or layer of parent: same BO,
     * pixels at data_offset. */
    struct pipe_resource *parent;
@@ -85,6 +89,7 @@ void chrome9_resource_cpu_access(struct chrome9_resource *resource,
 bool chrome9_resource_coarse_z_fill(struct pipe_context *pipe,
                                     struct chrome9_resource *depth);
 void chrome9_resource_fast_z_resolve(struct chrome9_resource *depth);
+void chrome9_resource_detile(struct chrome9_resource *resource);
 
 /* Fast-Z indices cycle 1..6: 7 is the tag of 1.0 cleared memory. */
 #define CHROME9_FAST_Z_LAST_INDEX 6

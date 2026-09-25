@@ -6806,6 +6806,7 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
 
    /* The sampler reads memory: sampled depth stays materialized. */
    if (texture && util_format_is_depth_or_stencil(texture->format)) {
+      chrome9_resource_detile(chrome9_resource(texture));
       chrome9_resource_fast_z_resolve(chrome9_resource(texture));
       chrome9_resource(texture)->fast_z_disabled = true;
    }
@@ -7403,6 +7404,8 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
       if (clear_depth && d24 && fabs(z / 65536.0 - depth) > 1e-9)
          return false;
       draw.depth_handle = zs->bo.handle;
+      if (zs->tiled)
+         draw.flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
       draw.depth_pitch = zs->stride;
       draw.depth_format = d24 ? DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 :
                                 DRM_CHROME9_FRAGMENT_DEPTH_D16;

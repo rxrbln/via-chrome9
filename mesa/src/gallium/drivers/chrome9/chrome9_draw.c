@@ -1855,6 +1855,8 @@ chrome9_generic_fragment_state(
                 (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
    if (depth_active && chrome9_stencil_active(crender->ctx))
       draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+   if (depth_active && depth->tiled)
+      draw->flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
    if (depth_active && depth->fast_z_index &&
        (draw->flags & DRM_CHROME9_FRAGMENT_STENCIL)) {
       chrome9_resource_fast_z_resolve(depth);
@@ -2694,6 +2696,9 @@ chrome9_emit_triangle_state(struct chrome9_vbuf_render *crender,
       return;
    }
    chrome9_draw_scissor(ctx, target, &scissor);
+   /* The fixed draw builders address depth linearly. */
+   if (depth_active && depth->tiled && !crender->generic_program)
+      chrome9_resource_detile(depth);
    /* The fixed draw builders leave Fast-Z off. */
    if (depth_active && depth->fast_z_index && !crender->generic_program) {
       chrome9_resource_fast_z_resolve(depth);

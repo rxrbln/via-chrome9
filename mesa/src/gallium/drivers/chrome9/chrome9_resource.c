@@ -534,6 +534,15 @@ chrome9_resource_create(struct pipe_screen *screen,
 
    chrome9_resource_apply_layout(resource, &layout);
    resource->guarded_shared = guarded_shared;
+   /* Tiled rows come in eights: other heights stay linear so the object
+    * size is the same either way. */
+   resource->tiled = resource->guarded && !guarded_shared &&
+      util_format_is_depth_or_stencil(templ->format) &&
+      templ->target == PIPE_TEXTURE_2D && !templ->last_level &&
+      !(templ->height0 % 8) &&
+      !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)) &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_TILED_DEPTH) &&
+      debug_get_bool_option("CHROME9_TILED_DEPTH", true);
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
@@ -646,6 +655,8 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
 {
    struct pipe_screen *screen = resource->base.screen;
 
+   if (resource->tiled)
+      chrome9_resource_detile(resource);
    /* The CPU reads and writes materialized depths only. */
    if (resource->fast_z_index)
       chrome9_resource_fast_z_resolve(resource);
@@ -662,6 +673,31 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
                                             DRM_CHROME9_GEM_CPU_PREPARE_READ,
                                     offset, size))
       fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n", strerror(errno));
+}
+
+/* Rewrite a tiled surface linear (32-byte x 8-row tiles, left to right
+ * across the pitch); it stays linear afterwards. */
+void
+chrome9_resource_detile(struct chrome9_resource *resource)
+{
+   const size_t size = (size_t)resource->stride * resource->base.height0;
+   uint8_t *data = (uint8_t *)resource->bo.map + resource->data_offset;
+   uint8_t *copy;
+
+   if (!resource->tiled)
+      return;
+   resource->tiled = false;
+   chrome9_resource_cpu_access(resource, true);
+   copy = malloc(size);
+   if (!copy)
+      return;
+   memcpy(copy, data, size);
+   for (unsigned y = 0; y < resource->base.height0; y++)
+      for (unsigned x = 0; x < resource->stride; x += 32)
+         memcpy(data + (size_t)y * resource->stride + x,
+                copy + (size_t)(y >> 3) * resource->stride * 8 +
+                   (x / 32) * 256 + (y & 7) * 32, 32);
+   free(copy);
 }
 
 /* Rewrite the words of older Fast-Z clears (stale index) as 1.0. */
