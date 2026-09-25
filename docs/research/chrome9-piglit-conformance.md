@@ -181,3 +181,29 @@ Hardware limit:
 * `gl-2.0-large-point-fs` failed after any point sprite test: A2F (sprite
   enables per coordinate) was written only for sprite draws.  Kernel
   `7d077a9` writes it for every draw.
+
+## 2026-09-25 night: conditionals, varyings and dropped draws
+
+Full list (2102 tests) on kernel k126, Mesa p69: 1775 pass, 3 fail, 2
+timeout, 1 warn, 5 not built (binaries missing on the target: GLES2/GLES3
+and GLX-only tests; `run-chunk.sh` now reports exit 127 as NOTBUILT).
+
+| Mesa / kernel | cause | tests |
+|---|---|---|
+| `73a0655` | idiv was trunc(x * rcp(y)), one low for exact quotients (76/76 = 0); corrected by the exact remainder | vs-op-div-*, vs-op-assign-div-* (10) |
+| `2ff7b5a` | TCL SGN reads source lane w only (silicon: sign((-5,5,-0.5,0.5)) = (1,1,1,1)); emitted per lane | glsl-vs-sign, vs-sign-times-sign |
+| `7224d7e` | select as b + mask(a - b) cancels b beside a large a; now MAD(a, mask, MAD(-b, mask, b)), possibly infinite arithmetic operands clamped | vs-atan-* (4) |
+| `10be88a` | pixel EXP2/LOG2/RCP/RSQ read one lane and replicate; vector forms split per lane | glsl-fs-exp2, glsl-fs-sqrt-branch |
+| `9bf9e42` | NaN/Inf program constants (NaN folded from reading an unwritten varying) dropped the draw; NaN -> 0, Inf -> +-FLT_MAX | glsl-routing (most probes) |
+| `d3bf93f` | edge AA blends coverage into the destination even with blending off | line-flat-clip-color smooth cases |
+| `580a72e`, `ff0fa1a`, `5218a71` | unwritten varyings zero-filled; TEXn/VARn collision moved to a free fragment varying index; vbuf path fills undefined varyings, sprite coordinates from the wide-point stage | glsl-orangebook-ch06-bump, glsl-routing (non-TCL), arb_point_sprite-checkerboard |
+| kernel `4dd77fc` | VS outputs after oT3 need A61[22:20] = 4 (`chrome9-varying-t4-re.md`) | glsl-max-varyings (2), glsl-routing |
+| kernel `df442d4` | `trace_einval=1` logs the function:line of every validator -EINVAL | debugging aid |
+
+Remaining: `gl-1.0-user-clip-all-planes` (clip-distance interpolation vs.
+polygon edge at one pixel), `line-flat-clip-color` non-smooth cases (last
+column of draw-module lines), `triangle-rasterization*` (random geometry,
+seed-dependent, identical before and after), `gl-2.1-point_smooth` (warn),
+`copypixels-draw-sync` (7.5 s, just over the 7 s run limit) and
+`streaming-texture-leak` (5000 uploads of 4 MiB textures, over 120 s: kernel
+`memset_io` zeroing of local objects plus tiled staging copy, about 170 MB/s).
