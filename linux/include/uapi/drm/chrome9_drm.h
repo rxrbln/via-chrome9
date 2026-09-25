@@ -1255,7 +1255,7 @@ enum drm_chrome9_fragment_file {
 #define DRM_CHROME9_FRAGMENT_DEST_COLOR	1
 /*
  * CAP2_DEPTH_OUTPUT: a MOV with writemask 0xf and a replicated scalar
- * source directly after the terminal color write replaces the fragment's
+ * source directly before the terminal color write replaces the fragment's
  * depth (the draw needs FRAGMENT_DEPTH).
  */
 #define DRM_CHROME9_FRAGMENT_DEST_DEPTH	2
