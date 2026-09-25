@@ -234,6 +234,8 @@ struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,
 						 size_t size);
 int chrome9_fence_ioctl(struct drm_device *drm, void *data,
 			struct drm_file *file);
+int chrome9_gem_busy_ioctl(struct drm_device *drm, void *data,
+			   struct drm_file *file);
 int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file);
 int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,

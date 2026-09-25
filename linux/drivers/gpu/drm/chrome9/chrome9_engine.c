@@ -6452,6 +6452,25 @@ int chrome9_fence_ioctl(struct drm_device *drm, void *data,
 	}
 }
 
+/* Whether queued jobs use or write an object, without waiting. */
+int chrome9_gem_busy_ioctl(struct drm_device *drm, void *data,
+			   struct drm_file *file)
+{
+	struct drm_chrome9_gem_busy *args = data;
+	struct drm_gem_object *obj;
+
+	obj = drm_gem_object_lookup(file, args->handle);
+	if (!obj)
+		return -ENOENT;
+	args->busy = 0;
+	if (!dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_READ))
+		args->busy |= DRM_CHROME9_GEM_BUSY_USE;
+	if (!dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_WRITE))
+		args->busy |= DRM_CHROME9_GEM_BUSY_WRITE;
+	drm_gem_object_put(obj);
+	return 0;
+}
+
 int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {
@@ -6898,6 +6917,7 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TILED_COLOR;
 	if (READ_ONCE(chrome9_mrt) && READ_ONCE(chrome9_hw_tcl))
 		caps |= DRM_CHROME9_CAP2_COLOR_TARGETS;
+	caps |= DRM_CHROME9_CAP2_GEM_BUSY;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
 		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
