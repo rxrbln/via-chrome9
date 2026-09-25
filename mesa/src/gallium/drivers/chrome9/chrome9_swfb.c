@@ -45,7 +45,7 @@ struct chrome9_sw_dt {
    uint8_t *map;
 };
 
-/* The display target is the chrome9 level-0 mapping itself. */
+/* The display target is the chrome9 mapping of one level. */
 static struct sw_displaytarget *
 chrome9_sw_dt_from_handle(struct sw_winsys *ws,
                           const struct pipe_resource *templ,
@@ -58,8 +58,8 @@ chrome9_sw_dt_from_handle(struct sw_winsys *ws,
    (void)templ;
    if (!dt)
       return NULL;
-   dt->map = (uint8_t *)res->bo.map + res->level_offset[0];
-   *stride = res->level_stride[0];
+   dt->map = (uint8_t *)res->bo.map + whandle->offset;
+   *stride = whandle->stride;
    return (struct sw_displaytarget *)dt;
 }
 
@@ -129,9 +129,9 @@ struct chrome9_sw_context {
    struct pipe_context *lp;
    /* chrome9 CSO/shader/resource pointer -> llvmpipe object. */
    struct hash_table *objects;
-   /* Level-0 aliases of the pending draws, released by chrome9_sw_finish
+   /* Per-level aliases of the pending draws, released by chrome9_sw_finish
     * so none outlives its chrome9 BO. */
-   struct hash_table *aliases;
+   struct hash_table_u64 *aliases;
    /* chrome9 references held while llvmpipe may still access them. */
    struct util_dynarray held;
    bool pending;
@@ -168,12 +168,12 @@ chrome9_sw_release_held(struct chrome9_sw_context *sw)
                              PIPE_MAX_SHADER_SAMPLER_VIEWS, NULL);
    sw->lp->set_sampler_views(sw->lp, MESA_SHADER_VERTEX, 0, 0,
                              PIPE_MAX_SHADER_SAMPLER_VIEWS, NULL);
-   hash_table_foreach(sw->aliases, entry) {
-      struct pipe_resource *alias = entry->data;
+   hash_table_u64_foreach(sw->aliases, entry) {
+      struct pipe_resource *alias = entry.data;
 
       pipe_resource_reference(&alias, NULL);
    }
-   _mesa_hash_table_clear(sw->aliases, NULL);
+   _mesa_hash_table_u64_clear(sw->aliases);
    util_dynarray_foreach(&sw->held, struct pipe_resource *, res)
       pipe_resource_reference(res, NULL);
    util_dynarray_clear(&sw->held);
@@ -224,12 +224,12 @@ chrome9_sw_context(struct chrome9_context *ctx)
       sw->lp = sw->screen->context_create(sw->screen, NULL, 0);
    util_dynarray_init(&sw->held, NULL);
    sw->objects = _mesa_pointer_hash_table_create(NULL);
-   sw->aliases = _mesa_pointer_hash_table_create(NULL);
+   sw->aliases = _mesa_hash_table_u64_create(NULL);
    if (!sw->lp || !sw->objects || !sw->aliases) {
       if (sw->lp)
          sw->lp->destroy(sw->lp);
       _mesa_hash_table_destroy(sw->objects, NULL);
-      _mesa_hash_table_destroy(sw->aliases, NULL);
+      _mesa_hash_table_u64_destroy(sw->aliases);
       FREE(sw);
       return NULL;
    }
@@ -354,7 +354,7 @@ chrome9_sw_context_destroy(struct chrome9_context *ctx)
    hash_table_foreach(sw->objects, entry)
       chrome9_sw_delete_object(sw->lp, entry->data);
    _mesa_hash_table_destroy(sw->objects, NULL);
-   _mesa_hash_table_destroy(sw->aliases, NULL);
+   _mesa_hash_table_u64_destroy(sw->aliases);
    util_dynarray_fini(&sw->held);
    if (chrome9_sw_debug())
       fprintf(stderr, "chrome9: sw fallback draws=%" PRIu64 " time=%" PRIu64
@@ -553,35 +553,54 @@ chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
    return o->cso;
 }
 
-/* Level-0 display-target alias of a chrome9 surface, created once. */
+/* CHROME9_SW_DEBUG names the state llvmpipe could not take. */
+static bool
+chrome9_sw_unavailable(const char *what)
+{
+   if (chrome9_sw_debug())
+      fprintf(stderr, "chrome9: sw fallback: no %s\n", what);
+   return false;
+}
+
+/* Display-target alias of one level of a chrome9 surface, created once. */
 static struct pipe_resource *
 chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
-                 unsigned bind)
+                 unsigned level, unsigned bind)
 {
    struct chrome9_resource *res = chrome9_resource(resource);
-   struct hash_entry *entry = _mesa_hash_table_search(sw->aliases, resource);
+   /* Allocations are 16-byte aligned; levels fit in the low bits. */
+   const uint64_t key = (uint64_t)(uintptr_t)resource << 4 | level;
+   struct pipe_resource *alias = _mesa_hash_table_u64_search(sw->aliases, key);
    struct pipe_resource templ = *resource;
+   const unsigned height = u_minify(resource->height0, level);
    struct winsys_handle handle = {
       .type = WINSYS_HANDLE_TYPE_SHARED,
       .com_obj = res,
+      .offset = res->level_offset[level],
+      .stride = res->level_stride[level],
    };
-   struct pipe_resource *alias;
 
    /* llvmpipe accesses the pages directly in this draw. */
    chrome9_resource_cpu_access(res, bind != 0);
-   if (entry)
-      return entry->data;
-   /* Cube faces and 3D slices have no level-0 display-target form. */
-   if (!res->bo.map || (resource->target != PIPE_TEXTURE_2D &&
-                        resource->target != PIPE_TEXTURE_RECT))
+   if (alias)
+      return alias;
+   /* Cube faces and 3D slices have no display-target form. */
+   if (!res->bo.map || !chrome9_is_surface_target(resource->target) ||
+       level > resource->last_level || level >= 16) {
+      chrome9_sw_unavailable("surface form of the target");
       return NULL;
-   /* llvmpipe touches whole 4x4 blocks: the row overhang must stay in the
-    * page padding before the guard page. */
-   if ((resource->height0 & 3) &&
-       (uint64_t)res->level_stride[0] * align(resource->height0, 4) >
-          align64(res->level_size[0], 4096))
+   }
+   /* llvmpipe touches whole 4x4 blocks: the row overhang must stay inside
+    * the object, before its trailing guard page. */
+   if ((height & 3) &&
+       res->level_offset[level] +
+          (uint64_t)res->level_stride[level] * align(height, 4) >
+          res->bo.size - (res->guarded ? 4096 : 0)) {
+      chrome9_sw_unavailable("room for 4x4 block overhang");
       return NULL;
-   (void)bind;
+   }
+   templ.width0 = u_minify(resource->width0, level);
+   templ.height0 = height;
    templ.last_level = 0;
    /* One alias serves sampling and rendering within a draw sequence. */
    templ.bind = PIPE_BIND_SAMPLER_VIEW |
@@ -591,7 +610,7 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
    pipe_reference_init(&templ.reference, 1);
    alias = sw->screen->resource_from_handle(sw->screen, &templ, &handle, 0);
    if (alias)
-      _mesa_hash_table_insert(sw->aliases, resource, alias);
+      _mesa_hash_table_u64_insert(sw->aliases, key, alias);
    return alias;
 }
 
@@ -610,7 +629,7 @@ chrome9_sw_texture(struct chrome9_sw_context *sw,
    if (!resource->last_level && resource->target != PIPE_TEXTURE_CUBE &&
        resource->target != PIPE_TEXTURE_3D &&
        !util_format_is_compressed(resource->format))
-      return chrome9_sw_alias(sw, resource, 0);
+      return chrome9_sw_alias(sw, resource, 0, 0);
    chrome9_resource_cpu_access(res, false);
    templ.bind = PIPE_BIND_SAMPLER_VIEW;
    templ.next = NULL;
@@ -735,46 +754,52 @@ chrome9_sw_bind_state(struct chrome9_context *ctx, struct chrome9_sw_context *sw
 
       if (!target)
          continue;
-      fb.cbufs[i].texture = chrome9_sw_alias(sw, target,
+      /* The shadow of a subimage target is its own level zero. */
+      if (target == ctx->render_target && target != fb.cbufs[i].texture)
+         fb.cbufs[i].level = 0;
+      fb.cbufs[i].texture = chrome9_sw_alias(sw, target, fb.cbufs[i].level,
                                              PIPE_BIND_RENDER_TARGET);
-      if (!fb.cbufs[i].texture || fb.cbufs[i].level)
-         return false;
+      fb.cbufs[i].level = 0;
+      if (!fb.cbufs[i].texture)
+         return chrome9_sw_unavailable("color target");
       chrome9_sw_hold(sw, target);
    }
    if (fb.zsbuf.texture) {
       struct pipe_resource *zs = fb.zsbuf.texture;
 
-      fb.zsbuf.texture = chrome9_sw_alias(sw, zs, PIPE_BIND_DEPTH_STENCIL);
-      if (!fb.zsbuf.texture || fb.zsbuf.level)
-         return false;
+      fb.zsbuf.texture = chrome9_sw_alias(sw, zs, fb.zsbuf.level,
+                                          PIPE_BIND_DEPTH_STENCIL);
+      fb.zsbuf.level = 0;
+      if (!fb.zsbuf.texture)
+         return chrome9_sw_unavailable("depth target");
       chrome9_sw_hold(sw, zs);
    }
    lp->set_framebuffer_state(lp, &fb);
 
    if (!ctx->blend || !ctx->dsa || !ctx->rasterizer || !ctx->vertex_elements)
-      return false;
+      return chrome9_sw_unavailable("unbound state");
    if (!(cso = chrome9_sw_object(sw, ctx->blend, CHROME9_SW_BLEND, ctx->blend)))
-      return false;
+      return chrome9_sw_unavailable("blend");
    lp->bind_blend_state(lp, cso);
    if (!(cso = chrome9_sw_object(sw, ctx->dsa, CHROME9_SW_DSA, ctx->dsa)))
-      return false;
+      return chrome9_sw_unavailable("depth/stencil/alpha");
    lp->bind_depth_stencil_alpha_state(lp, cso);
    if (!(cso = chrome9_sw_object(sw, ctx->rasterizer, CHROME9_SW_RASTERIZER,
                                  ctx->rasterizer)))
-      return false;
+      return chrome9_sw_unavailable("rasterizer");
    lp->bind_rasterizer_state(lp, cso);
    if (!(cso = chrome9_sw_object(sw, ctx->vertex_elements, CHROME9_SW_VELEMS,
                                  ctx->vertex_elements)))
-      return false;
+      return chrome9_sw_unavailable("vertex elements");
    lp->bind_vertex_elements_state(lp, cso);
    if (!ctx->vs->sw_nir || !ctx->fs->nir ||
        !(cso = chrome9_sw_object(sw, ctx->vs, CHROME9_SW_VS, ctx->vs->sw_nir)))
-      return false;
+      return chrome9_sw_unavailable("vertex shader");
    lp->bind_vs_state(lp, cso);
    if (!(cso = chrome9_sw_object(sw, ctx->fs, CHROME9_SW_FS,
                                  ctx->fs->sw_nir ? ctx->fs->sw_nir :
                                                    ctx->fs->nir)))
-      return false;
+      return chrome9_sw_unavailable("fragment shader");
    lp->bind_fs_state(lp, cso);
 
    lp->set_stencil_ref(lp, ctx->stencil_ref);
@@ -789,7 +814,7 @@ chrome9_sw_bind_state(struct chrome9_context *ctx, struct chrome9_sw_context *sw
           !(samplers[i] = chrome9_sw_object(sw, ctx->sampler_states[i],
                                             CHROME9_SW_SAMPLER,
                                             &ctx->sampler_states[i]->base)))
-         return false;
+         return chrome9_sw_unavailable("fragment sampler");
    lp->bind_sampler_states(lp, MESA_SHADER_FRAGMENT, 0,
                            ctx->num_sampler_states, samplers);
    memset(samplers, 0, sizeof(samplers));
@@ -798,17 +823,17 @@ chrome9_sw_bind_state(struct chrome9_context *ctx, struct chrome9_sw_context *sw
           !(samplers[i] = chrome9_sw_object(sw, ctx->vs_sampler_states[i],
                                             CHROME9_SW_SAMPLER,
                                             ctx->vs_sampler_states[i])))
-         return false;
+         return chrome9_sw_unavailable("vertex sampler");
    lp->bind_sampler_states(lp, MESA_SHADER_VERTEX, 0,
                            ctx->num_vs_sampler_states, samplers);
    if (!chrome9_sw_bind_views(sw, MESA_SHADER_FRAGMENT, ctx->sampler_views,
                               ctx->num_sampler_views) ||
        !chrome9_sw_bind_views(sw, MESA_SHADER_VERTEX, ctx->vs_sampler_views,
                               ctx->num_vs_sampler_views))
-      return false;
+      return chrome9_sw_unavailable("sampler views");
    if (!chrome9_sw_bind_constants(sw, MESA_SHADER_VERTEX, ctx->vs_constants) ||
        !chrome9_sw_bind_constants(sw, MESA_SHADER_FRAGMENT, ctx->fs_constants))
-      return false;
+      return chrome9_sw_unavailable("constants");
 
    /* Vertex data is consumed synchronously inside draw_vbo. */
    for (unsigned i = 0; i < ctx->num_vertex_buffers; i++) {
