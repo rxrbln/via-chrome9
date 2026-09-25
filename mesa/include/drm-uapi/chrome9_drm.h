@@ -287,10 +287,18 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_GEM_CPU_NOWAIT		(1ULL << 12)
 /* DRM_CHROME9_FENCE sequence number fences. */
 #define DRM_CHROME9_CAP2_FENCE_SEQNO		(1ULL << 13)
+/* DRAW_VERTEX_PROGRAM ARL, DEST_ADDRESS and a0-relative constant sources. */
+#define DRM_CHROME9_CAP2_VERTEX_RELATIVE	(1ULL << 14)
+/* Fences retire on the FE33 CR interrupt instead of polling. */
+#define DRM_CHROME9_CAP2_FENCE_IRQ		(1ULL << 15)
 /* Fragment textures: WRAP_CLAMP_TO_BORDER and border_color. */
 #define DRM_CHROME9_CAP2_TEXTURE_BORDER		(1ULL << 16)
 /* Fragment textures: WRAP_MIRROR_CLAMP_TO_EDGE (hardware mirror once). */
 #define DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE	(1ULL << 17)
+/* Blend rgb_func/alpha_func SUBTRACT, REVERSE_SUBTRACT, MIN and MAX. */
+#define DRM_CHROME9_CAP2_BLEND_EQUATION		(1ULL << 18)
+/* RASTER_POINT_SIZE_VERTEX: the VS point size reaches the rasterizer. */
+#define DRM_CHROME9_CAP2_POINT_SIZE_VERTEX	(1ULL << 19)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -664,7 +672,12 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_BLEND_FACTOR_INV_DST_COLOR	9
 #define DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE	10
 
+/* Non-ADD functions need DRM_CHROME9_CAP2_BLEND_EQUATION; MIN/MAX ignore factors. */
 #define DRM_CHROME9_BLEND_FUNC_ADD	0
+#define DRM_CHROME9_BLEND_FUNC_SUBTRACT	1
+#define DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT	2
+#define DRM_CHROME9_BLEND_FUNC_MIN	3
+#define DRM_CHROME9_BLEND_FUNC_MAX	4
 
 #define DRM_CHROME9_COMPARE_NEVER	0
 #define DRM_CHROME9_COMPARE_LESS		1
@@ -1415,6 +1428,15 @@ enum drm_chrome9_vertex_op {
 	DRM_CHROME9_VERTEX_OP_IF = 22,		/* src[0] BOOL, identity swizzle */
 	DRM_CHROME9_VERTEX_OP_ELSE = 23,
 	DRM_CHROME9_VERTEX_OP_ENDIF = 24,
+	/*
+	 * CAP2_VERTEX_RELATIVE: DEST_ADDRESS a0[writemask] = floor(src[0]),
+	 * clamped so every relative read of that lane stays inside
+	 * [constant_first, constant_first + constant_count).  src[0] is
+	 * absolute; a0 lanes stay defined like temp lanes (flow regions).
+	 * The kernel owns rows constant_first + constant_count and the next
+	 * one, so both must lie below MAX_CONSTANTS (-E2BIG otherwise).
+	 */
+	DRM_CHROME9_VERTEX_OP_ARL = 25,
 	DRM_CHROME9_VERTEX_OP_COUNT
 };
 
@@ -1448,15 +1470,28 @@ enum drm_chrome9_vertex_dest {
 	/* Point size, index zero, writemask X, no SAT; used only with
 	 * RASTER_POINT_SIZE_VERTEX (written once), dropped otherwise. */
 	DRM_CHROME9_VERTEX_DEST_POINT_SIZE = 6,
+	/* Address register a0, index zero, no modifier; ARL only. */
+	DRM_CHROME9_VERTEX_DEST_ADDRESS = 7,
 };
 
-/* Swizzles, NEG and SAT use the DRM_CHROME9_FRAGMENT_* values. */
+/*
+ * Swizzles, NEG and SAT use the DRM_CHROME9_FRAGMENT_* values.  relative
+ * 1..4 (CONSTANT only) reads c[index + a0.x..w]; at most one constant row
+ * per instruction, where (index, relative) names the row, and none on
+ * the scalar ops.
+ */
+#define DRM_CHROME9_VERTEX_RELATIVE_NONE	0
+#define DRM_CHROME9_VERTEX_RELATIVE_A0_X	1
+#define DRM_CHROME9_VERTEX_RELATIVE_A0_Y	2
+#define DRM_CHROME9_VERTEX_RELATIVE_A0_Z	3
+#define DRM_CHROME9_VERTEX_RELATIVE_A0_W	4
+
 struct drm_chrome9_vertex_source {
 	__u8 file;
 	__u8 index;
 	__u8 swizzle[4];
 	__u8 modifier;
-	__u8 reserved;
+	__u8 relative;
 };
 
 struct drm_chrome9_vertex_destination {
