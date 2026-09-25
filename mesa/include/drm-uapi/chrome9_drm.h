@@ -299,6 +299,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_BLEND_EQUATION		(1ULL << 18)
 /* RASTER_POINT_SIZE_VERTEX: the VS point size reaches the rasterizer. */
 #define DRM_CHROME9_CAP2_POINT_SIZE_VERTEX	(1ULL << 19)
+/* Fragment draws: CONST_COLOR/ALPHA blend factors and blend_color. */
+#define DRM_CHROME9_CAP2_BLEND_COLOR		(1ULL << 20)
+/* Fragment TEX flag DRM_CHROME9_FRAGMENT_TEX_BIAS (TEXLDB). */
+#define DRM_CHROME9_CAP2_TEXTURE_BIAS		(1ULL << 21)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -671,6 +675,11 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_BLEND_FACTOR_DST_COLOR	8
 #define DRM_CHROME9_BLEND_FACTOR_INV_DST_COLOR	9
 #define DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE	10
+/* Fragment program draws with DRM_CHROME9_CAP2_BLEND_COLOR only. */
+#define DRM_CHROME9_BLEND_FACTOR_CONST_COLOR	11
+#define DRM_CHROME9_BLEND_FACTOR_INV_CONST_COLOR	12
+#define DRM_CHROME9_BLEND_FACTOR_CONST_ALPHA	13
+#define DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA	14
 
 /* Non-ADD functions need DRM_CHROME9_CAP2_BLEND_EQUATION; MIN/MAX ignore factors. */
 #define DRM_CHROME9_BLEND_FUNC_ADD	0
@@ -1258,11 +1267,17 @@ struct drm_chrome9_fragment_destination {
 	__u8 modifier;
 };
 
-/* Fixed-width 32-byte semantic record.  sampler is used only by TEX. */
+/*
+ * TEX of a 2D sampler with a TEMP coordinate: add coordinate lane W to the
+ * level of detail (TEXLDB, CAP2_TEXTURE_BIAS).
+ */
+#define DRM_CHROME9_FRAGMENT_TEX_BIAS	(1U << 0)
+
+/* Fixed-width 32-byte semantic record.  sampler and flags are TEX only. */
 struct drm_chrome9_fragment_instruction {
 	__u8 op;
 	__u8 sampler;
-	__u16 reserved;
+	__u16 flags;
 	struct drm_chrome9_fragment_destination dst;
 	struct drm_chrome9_fragment_source src[3];
 };
@@ -1374,7 +1389,11 @@ struct drm_chrome9_draw_fragment_program {
 	/* FRAGMENT_QUERY: id of an active DRM_CHROME9_QUERY object. */
 	__u32 query;
 	__u32 reserved1;
-	__u64 reserved[1];
+	/*
+	 * CAP2_BLEND_COLOR: blend colour R, G, B, A in unsigned 1.10 fixed
+	 * point (0..0x400) for the CONST factors; zero otherwise.
+	 */
+	__u16 blend_color[4];
 };
 
 #define DRM_CHROME9_VERTEX_ABI_VERSION		1U
