@@ -310,6 +310,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_DESTINATION_OFFSET	(1ULL << 22)
 /* Fragment draw flags FRAGMENT_COARSE_Z and FRAGMENT_COARSE_Z_RESET. */
 #define DRM_CHROME9_CAP2_COARSE_Z		(1ULL << 23)
+/* Fragment draw flags FRAGMENT_FAST_Z and FRAGMENT_FAST_Z_INDEX. */
+#define DRM_CHROME9_CAP2_FAST_Z			(1ULL << 24)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1191,6 +1193,17 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 #define DRM_CHROME9_FRAGMENT_COARSE_Z	(1U << 12)
 /* Reset the coarse-Z tag cache before the draw (after a fill). */
 #define DRM_CHROME9_FRAGMENT_COARSE_Z_RESET	(1U << 13)
+/*
+ * CAP2_FAST_Z, X8Z24 depth: Fast-Z with a 3-bit scene index in depth bits
+ * 10:8.  Stored depths whose index differs read as 1.0; depths the draw
+ * writes carry the index.  Userspace clears by advancing the index and
+ * rewrites stale words before any other access to the depth buffer.
+ */
+#define DRM_CHROME9_FRAGMENT_FAST_Z		(1U << 14)
+#define DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_SHIFT	15
+#define DRM_CHROME9_FRAGMENT_FAST_Z_INDEX(i)	\
+	((__u32)(i) << DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_SHIFT)
+#define DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK	(7U << 15)
 
 /* Native stencil operations; note INVERT precedes the wrapping forms. */
 #define DRM_CHROME9_STENCIL_OP_KEEP		0
