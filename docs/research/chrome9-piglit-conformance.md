@@ -69,6 +69,9 @@ terrain at 2 fps and refract at 6 fps.
 | `41f1601` | Two-sided colour with visible face order goes to llvmpipe. Before, the post-TNL path dropped it. | interpolation-none-gl_Back* |
 | `cdb3b5e` | Constant blend colour in the pixel engine (kernel `5f9fb6f`); EXT_blend_equation_separate advertised. Under `MESA_GL_VERSION_OVERRIDE=2.1` `glBlendEquationSeparate` raised GL_INVALID_OPERATION before. | gl-1.0-blend-func: timeout (>200 s in llvmpipe) to pass in 19 s; `--quick` 60 s timeout to pass in 1 s |
 | `00785c4` | `txb` as TEXLDB (kernel `dbadc6e`); exact `ftrunc` and `fceil` from FRC of \|x\|. | glsl-lod-bias, glsl-fs-texture2d-bias, glsl-fs-integer-multiplication now on hardware |
+| `46cfd50` | Local arrays become SSA before `nir_lower_int_to_float`, which otherwise turned a CSE-shared index constant into float bits (`m[1]` -> `m[0x3f800000]`); the link-time inline-uniform list is kept when the state tracker finalizes a variant again; the texture-alias check applies only to the fixed two-texture ioctls. | 368-test fs indexing list: 59 fail -> 0 (fs-temp-mat*-col-row-rd, fs-varying-*mat*, glsl-fs-vec4-indexing-temp-*-nested-loop-*, glsl-fs-texture-uniforms-share-same-unit) |
+| `16180ff` | Depth views of S8_UINT_Z24_UNORM sample with the X8Z24 format (depth in bits 31:8, the stencil byte is ignored). | fbo-depthtex, texsubimage-depth-formats (+pbo) |
+| `34b1ffa` | Smooth lines render in llvmpipe; draw passed them unwidened to the triangle-only vbuf render, which dropped them. | line-aa-width, line-smooth-coverage, line-smooth-stipple, point-line-no-cull |
 
 ### Hardware limits found
 
@@ -109,10 +112,11 @@ terrain at 2 fps and refract at 6 fps.
 - Done 2026-09-25: blend equations (`71d7d78`), constant blend colour and
   separate equations (`cdb3b5e`), `txb` and `ftrunc` in the hardware FS
   (`00785c4`).
-- Smooth and stippled lines. Pure llvmpipe passes `point-line-no-cull` and
-  `line-flat-clip-color`, but the chrome9 paths (including the llvmpipe
-  fallback under chrome9 caps) cull, stipple or polygon-mode AA lines like
-  polygons.
+- Smooth lines: fixed in `34b1ffa` (AA lines were dropped, not culled).
+  `line-flat-clip-color` also fails in pure llvmpipe with
+  `MESA_GL_VERSION_OVERRIDE=2.1`.
+- `depth-tex-modes`: one draw fails with EINVAL in DRAW_VERTEX_PROGRAMS
+  (independent of the depth format).
 - `glsl-fs-bug25902`,
   and the uniform-initializer and out-parameter-indexing groups have not been
   triaged yet.

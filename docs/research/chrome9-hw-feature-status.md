@@ -33,6 +33,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | constant blend colour (CONST_COLOR/ALPHA and inverses, A38..A3F), on by default | `5f9fb6f` / `cdb3b5e`, CAP2 bit 20 `blend_color` | rungs `blendconst`, `blendstale`; piglit gl-1.0-blend-func pass in 19 s (llvmpipe: timeout) |
 | fragment TEX with LOD bias (TEXLDB, TAU op 3, bias in coordinate W), on by default | `dbadc6e` / `00785c4`, CAP2 bit 21 `texture_bias` | rung `texbias`; piglit glsl-lod-bias, glsl-fs-texture2d-bias |
 | exact `ftrunc` and `fceil` in the PS (FRC of \|x\| only) | Mesa `00785c4` | piglit glsl-fs-integer-multiplication, fs-ceil-* |
+| sampling depth of S8_UINT_Z24_UNORM (D24S8) textures with the X8Z24 sampler format | Mesa `16180ff` | piglit fbo-depthtex, texsubimage-depth-formats (+pbo) |
 | render to cube faces and mip levels (guarded shadow per image), base-level views | Mesa `d4eb87d` | `chrome9_gl_rtt_smoke` 8/8 |
 | DXT1/3/5 incl. POT mip chains | `4b06bc2` / `58b8d2f` | `dxt d1..d6` (d2/d5 within 3 LSB), `m1`/`m2`, `chrome9_gl_cube_dxt_smoke` |
 | 2D COPY_RECT, KMS scanout, hardware cursor | | Xorg |
@@ -41,7 +42,8 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | today | plan |
 |---|---|---|
-| wide, smooth or stippled lines, smooth points, lower-left sprite origin | draw module turns them into triangles | no line-width register; LL origin needs an FS coordinate flip |
+| wide or stippled lines, smooth points, lower-left sprite origin | draw module turns them into triangles | no line-width register; LL origin needs an FS coordinate flip |
+| smooth (AA) lines, also from polygon mode LINE | llvmpipe (Mesa `34b1ffa`) | no AA line hardware; draw's AA line stage is not installed |
 | polygon POINT mode, unfilled quads/polygons, per-vertex edge flags | draw module | GL draws the clipped polygon's vertices; quads hide inner edges |
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
 | fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size (below) |
