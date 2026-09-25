@@ -3794,8 +3794,9 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
       return false;
    alu = nir_instr_as_alu(instr);
    /* Value-preserving ops cannot create an exceptional value from finite
-    * inputs, so their preserve request is vacuous.  Other flagged arithmetic
-    * is admitted only when a magnitude bound excludes overflow. */
+    * inputs, so their preserve request is vacuous.  Flagged arithmetic of
+    * finite operands can reach infinity only by overflow, which GLSL leaves
+    * undefined, so the operands decide. */
    if (alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan) {
       switch (alu->op) {
       case nir_op_mov:
@@ -3804,7 +3805,6 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
       case nir_op_fsat:
       case nir_op_fmin:
       case nir_op_fmax:
-         break;
       case nir_op_fadd:
       case nir_op_fsub:
       case nir_op_fmul:
@@ -3812,9 +3812,7 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
       case nir_op_fdot2:
       case nir_op_fdot3:
       case nir_op_fdot4:
-         if (chrome9_ps_magnitude_bound(scalar, proof) < FLT_MAX)
-            break;
-         FALLTHROUGH;
+         break;
       default:
          return false;
       }
