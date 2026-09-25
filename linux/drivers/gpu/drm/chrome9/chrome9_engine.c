@@ -42,7 +42,7 @@
 /* Default and minimum ring; ring_pages may enlarge it up to the maximum. */
 #define CHROME9_RING_PAGES		16U
 #define CHROME9_RING_SIZE		(CHROME9_RING_PAGES * PAGE_SIZE)
-#define CHROME9_RING_MAX_PAGES		256U
+#define CHROME9_RING_MAX_PAGES		1024U
 #define CHROME9_RUN_STAGING_SIZE	SZ_64K
 #define CHROME9_CR_READ_AHEAD		0x220U
 #define CHROME9_PRIME_PAUSE		0x70U
@@ -198,10 +198,10 @@ module_param_named(max_inflight, chrome9_max_inflight, uint, 0400);
 MODULE_PARM_DESC(max_inflight,
 	"Fragment/vertex program jobs in flight, 1..64 (default: 8)");
 
-static uint chrome9_ring_pages = 256;
+static uint chrome9_ring_pages = 1024;
 module_param_named(ring_pages, chrome9_ring_pages, uint, 0400);
 MODULE_PARM_DESC(ring_pages,
-	"Command ring pages, 16..256 (default: 256)");
+	"Command ring pages, 16..1024, halved while the allocation fails (default: 1024)");
 
 static bool chrome9_texture_3d = true;
 module_param_named(texture_3d, chrome9_texture_3d, bool, 0600);
@@ -7024,9 +7024,18 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 		goto err_free_engine;
 	}
 	memcpy_fromio(engine->gart_saved, engine->gart, CHROME9_GART_SIZE);
-	engine->ring_cpu = dma_alloc_coherent(&cdev->pdev->dev,
-					      engine->ring_size,
-					      &engine->ring_dma, GFP_KERNEL);
+	/* A wrap drains the queue: take the largest contiguous ring. */
+	for (;;) {
+		engine->ring_cpu = dma_alloc_coherent(&cdev->pdev->dev,
+						      engine->ring_size,
+						      &engine->ring_dma,
+						      GFP_KERNEL | __GFP_NOWARN);
+		if (engine->ring_cpu ||
+		    engine->ring_pages / 2 < CHROME9_RING_PAGES)
+			break;
+		engine->ring_pages /= 2;
+		engine->ring_size = engine->ring_pages * PAGE_SIZE;
+	}
 	if (!engine->ring_cpu) {
 		ret = -ENOMEM;
 		goto err_free_saved;
