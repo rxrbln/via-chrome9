@@ -192,6 +192,17 @@ module_param_named(texture_3d, chrome9_texture_3d, bool, 0600);
 MODULE_PARM_DESC(texture_3d,
 	"3D fragment texture target (default: true)");
 
+static bool chrome9_texture_border = true;
+module_param_named(texture_border, chrome9_texture_border, bool, 0600);
+MODULE_PARM_DESC(texture_border,
+	"Clamp-to-border fragment texture wrapping (default: true)");
+
+static bool chrome9_texture_mirror_once;
+module_param_named(texture_mirror_once, chrome9_texture_mirror_once, bool,
+		   0600);
+MODULE_PARM_DESC(texture_mirror_once,
+	"Mirror-once fragment texture wrapping (default: false)");
+
 static bool chrome9_vs_flow = true;
 module_param_named(vs_flow, chrome9_vs_flow, bool, 0400);
 MODULE_PARM_DESC(vs_flow,
@@ -2780,11 +2791,56 @@ static void chrome9_fragment_mip_state(
 			  texture->level_offset[texture->first_level]) >> 8);
 }
 
-static void chrome9_fragment_sampler_state(
-	const struct drm_chrome9_fragment_texture_state *texture, u32 sampler[4])
+static bool chrome9_fragment_wrap_valid(u32 wrap, u64 caps2)
+{
+	switch (wrap) {
+	case DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE:
+	case DRM_CHROME9_TEXTURE_WRAP_REPEAT:
+	case DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT:
+		return true;
+	case DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER:
+		return caps2 & DRM_CHROME9_CAP2_TEXTURE_BORDER;
+	case DRM_CHROME9_TEXTURE_WRAP_MIRROR_CLAMP_TO_EDGE:
+		return caps2 & DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE;
+	default:
+		return false;
+	}
+}
+
+/* A32 address codes: 0 border, 1 clamp, 2 repeat, 3 mirror, 7 mirror once. */
+static u32 chrome9_fragment_wrap_code(u32 wrap)
+{
+	switch (wrap) {
+	case DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER:
+		return 0;
+	case DRM_CHROME9_TEXTURE_WRAP_MIRROR_CLAMP_TO_EDGE:
+		return 7;
+	default:
+		return wrap;
+	}
+}
+
+static bool chrome9_fragment_texture_border(
+	const struct drm_chrome9_fragment_texture_state *texture)
+{
+	return texture->wrap_s == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+	       texture->wrap_t == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+	       texture->wrap_r == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER;
+}
+
+/* One ARGB8888 channel as the sampler's sign-magnitude s1.10 border. */
+static u32 chrome9_border_s1_10(u32 argb, unsigned int shift)
+{
+	return ((argb >> shift) & 0xff) * 0x400 / 0xff;
+}
+
+/* Returns the number of sampler words: A30..A32, with a border A35/A36. */
+static unsigned int chrome9_fragment_sampler_state(
+	const struct drm_chrome9_fragment_texture_state *texture, u32 sampler[8])
 {
 	u32 lod_min = texture->min_lod_s5_5 / 32;
 	u32 lod_max = texture->max_lod_s5_5 / 32;
+	u32 border = texture->border_color;
 
 	sampler[0] = 0x30000000 |
 		((u32)texture->lod_bias_s5_5 & 0x3ff) << 12 |
@@ -2793,11 +2849,25 @@ static void chrome9_fragment_sampler_state(
 		texture->min_filter << 10 | texture->mag_filter << 7 |
 		texture->min_filter << 4 | texture->mip_filter;
 	/* A32 [8:6] R wrap, [21:19]/[18:16] R filters; 2D keeps R clamped. */
-	sampler[2] = 0x32000000 | texture->wrap_t << 3 | texture->wrap_s |
+	sampler[2] = 0x32000000 |
+		chrome9_fragment_wrap_code(texture->wrap_t) << 3 |
+		chrome9_fragment_wrap_code(texture->wrap_s) |
 		(texture->target == DRM_CHROME9_FRAGMENT_TARGET_3D ?
 		 texture->mag_filter << 19 | texture->min_filter << 16 |
-		 texture->wrap_r << 6 : 0x40);
-	sampler[3] = 0xcccccccc;
+		 chrome9_fragment_wrap_code(texture->wrap_r) << 6 : 0x40);
+	if (!chrome9_fragment_texture_border(texture)) {
+		sampler[3] = 0xcccccccc;
+		return 4;
+	}
+	/* A35 R/G, A36 B/A; the group keeps its vendor 16-byte shape. */
+	sampler[3] = 0x35000000 | chrome9_border_s1_10(border, 16) << 12 |
+		chrome9_border_s1_10(border, 8);
+	sampler[4] = 0x36000000 | chrome9_border_s1_10(border, 0) << 12 |
+		chrome9_border_s1_10(border, 24);
+	sampler[5] = 0xcc000000;
+	sampler[6] = 0xcc000000;
+	sampler[7] = 0xcc000000;
+	return 8;
 }
 
 static u32 chrome9_fragment_varying_format(u32 width)
@@ -3770,7 +3840,8 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 	u32 root = texture_base + texture->level_offset[texture->first_level];
 	u32 mip[8];
 	u32 image[11];
-	u32 sampler[4];
+	u32 sampler[8];
+	unsigned int sampler_count;
 	unsigned int count = 0;
 	unsigned int face;
 
@@ -3796,7 +3867,7 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 		(texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24 ?
 		 0x2000 : 0);
 
-	chrome9_fragment_sampler_state(texture, sampler);
+	sampler_count = chrome9_fragment_sampler_state(texture, sampler);
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c,
 		unit << 24 | 0x00020000, image, count);
 	if (level_count) {
@@ -3805,7 +3876,7 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 			ARRAY_SIZE(mip));
 	}
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c,
-		unit << 24 | 0x20020000, sampler, ARRAY_SIZE(sampler));
+		unit << 24 | 0x20020000, sampler, sampler_count);
 }
 
 /*
@@ -6132,6 +6203,10 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_OCCLUSION_QUERY;
 	if (READ_ONCE(chrome9_texture_3d))
 		caps |= DRM_CHROME9_CAP2_TEXTURE_3D;
+	if (READ_ONCE(chrome9_texture_border))
+		caps |= DRM_CHROME9_CAP2_TEXTURE_BORDER;
+	if (READ_ONCE(chrome9_texture_mirror_once))
+		caps |= DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	return caps | DRM_CHROME9_CAP2_GEM_CPU_NOWAIT |
@@ -10624,16 +10699,14 @@ static int chrome9_validate_fragment_texture(
 	    texture->min_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
 	    texture->mag_filter > DRM_CHROME9_TEXTURE_FILTER_LINEAR ||
 	    texture->mip_filter > DRM_CHROME9_TEXTURE_MIP_FILTER_LINEAR ||
-	    (texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
-	     texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
-	     texture->wrap_s != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
-	    (texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
-	     texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
-	     texture->wrap_t != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) ||
+	    !chrome9_fragment_wrap_valid(texture->wrap_s, caps2) ||
+	    !chrome9_fragment_wrap_valid(texture->wrap_t, caps2) ||
 	    texture->lod_bias_s5_5 < -512 || texture->lod_bias_s5_5 > 511 ||
 	    texture->min_lod_s5_5 < 0 || texture->max_lod_s5_5 < 0 ||
 	    (texture->min_lod_s5_5 & 31) ||
-	    (texture->max_lod_s5_5 & 31) || texture->border_color ||
+	    (texture->max_lod_s5_5 & 31) ||
+	    (texture->border_color &&
+	     !(caps2 & DRM_CHROME9_CAP2_TEXTURE_BORDER)) ||
 	    (sparse_textures ?
 	     texture->reserved0 >= DRM_CHROME9_FRAGMENT_MAX_TEXTURES :
 	     texture->reserved0) ||
@@ -10671,9 +10744,7 @@ static int chrome9_validate_fragment_texture(
 		     !is_power_of_2(texture->height) ||
 		     !is_power_of_2(texture->depth) || texture->depth > 2048 ||
 		     texture->last_level ||
-		     (texture->wrap_r != DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE &&
-		      texture->wrap_r != DRM_CHROME9_TEXTURE_WRAP_REPEAT &&
-		      texture->wrap_r != DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT) :
+		     !chrome9_fragment_wrap_valid(texture->wrap_r, caps2) :
 		   texture->target != DRM_CHROME9_FRAGMENT_TARGET_2D ||
 		   texture->face_stride)
 		return -EINVAL;
@@ -11050,6 +11121,71 @@ static int chrome9_fragment_texture_3d_selftest(void)
 	return 0;
 }
 
+/* Packet of the vendor opaque green border oracle (xorg-one-texture-oracle). */
+static int chrome9_fragment_texture_border_selftest(void)
+{
+	static const u32 expected[] = {
+		0xfe020440, 0x0000043c, 0x00020000, 0xcc000000,
+		0x00000050, 0x18001101, 0x20004004, 0x21000001,
+		0x22008022, 0x30990000, 0xcc000000, 0xcc000000,
+		0xfe020440, 0x0000043c, 0x20020000, 0xcc000000,
+		0x30000000, 0x31100000, 0x32000040, 0x35000400,
+		0x36000400, 0xcc000000, 0xcc000000, 0xcc000000,
+	};
+	const u64 caps = DRM_CHROME9_CAP2_TEXTURE_BORDER;
+	struct drm_chrome9_fragment_texture_state texture = {
+		.handle = 1,
+		.format = DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888,
+		.width = 4,
+		.height = 4,
+		.wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER,
+		.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER,
+		.border_color = 0xff00ff00,
+		.level_offset = { PAGE_SIZE },
+		.level_pitch = { 32 },
+	};
+	struct drm_chrome9_fragment_texture_state other = texture;
+	u32 packet[32] __aligned(16);
+	u32 *cursor = packet;
+	u64 object_size;
+	u32 flags;
+
+	if (chrome9_validate_fragment_texture(&texture, &object_size, false, 0,
+					      &flags) != -EINVAL ||
+	    chrome9_validate_fragment_texture(&texture, &object_size, false,
+					      caps, &flags) || flags)
+		return -EINVAL;
+	chrome9_emit_fragment_texture(&cursor, &texture, 0x4000, 0, flags);
+	if (cursor != packet + ARRAY_SIZE(expected) ||
+	    memcmp(packet, expected, sizeof(expected)))
+		return -EINVAL;
+	/* Half grey and alpha: floor(0x80 * 0x400 / 0xff) = 0x202. */
+	other.border_color = 0x80808080;
+	cursor = packet;
+	chrome9_emit_fragment_texture(&cursor, &other, 0x4000, 0, flags);
+	if (packet[19] != 0x35202202 || packet[20] != 0x36202202)
+		return -EINVAL;
+	/* A border colour alone keeps the four-word sampler group. */
+	other.wrap_s = DRM_CHROME9_TEXTURE_WRAP_MIRROR_CLAMP_TO_EDGE;
+	other.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+	if (chrome9_validate_fragment_texture(&other, &object_size, false,
+					      caps, &flags) != -EINVAL ||
+	    chrome9_validate_fragment_texture(&other, &object_size, false,
+			caps | DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE, &flags))
+		return -EINVAL;
+	cursor = packet;
+	chrome9_emit_fragment_texture(&cursor, &other, 0x4000, 0, flags);
+	if (cursor != packet + 20 || packet[18] != 0x3200004f ||
+	    packet[19] != 0xcccccccc)
+		return -EINVAL;
+	other.wrap_s = 6;
+	if (chrome9_validate_fragment_texture(&other, &object_size, false,
+			caps | DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE,
+			&flags) != -EINVAL)
+		return -EINVAL;
+	return 0;
+}
+
 static int chrome9_fragment_texture_selftest(void)
 {
 	static const struct {
@@ -11180,7 +11316,8 @@ static int chrome9_fragment_texture_selftest(void)
 			return -EINVAL;
 	}
 	ret = chrome9_fragment_texture_feature_selftest();
-	return ret ?: chrome9_fragment_texture_3d_selftest();
+	return ret ?: chrome9_fragment_texture_3d_selftest() ?:
+		chrome9_fragment_texture_border_selftest();
 }
 
 /*
