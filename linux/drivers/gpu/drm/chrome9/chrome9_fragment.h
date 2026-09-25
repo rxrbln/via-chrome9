@@ -6,8 +6,9 @@
 #include <linux/types.h>
 #include <drm/chrome9_drm.h>
 
-/* A95..A9A address 144 ALU records; ps_alu_max probes the store above 96. */
-#define CHROME9_FRAGMENT_STORE_ALU	144U
+/* The 9-bit length and A95..A9A switch bits describe 128 ALU records
+ * (A9A[23:8] are destination checks); silicon locks up above 96. */
+#define CHROME9_FRAGMENT_STORE_ALU	128U
 #define CHROME9_FRAGMENT_STORE_INSTRUCTIONS \
 	(CHROME9_FRAGMENT_STORE_ALU + DRM_CHROME9_FRAGMENT_MAX_TAU)
 

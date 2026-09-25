@@ -17,7 +17,7 @@
 static uint chrome9_ps_alu_max = DRM_CHROME9_FRAGMENT_MAX_ALU;
 module_param_named(ps_alu_max, chrome9_ps_alu_max, uint, 0600);
 MODULE_PARM_DESC(ps_alu_max,
-	"Pixel shader ALU records per program, 96..144 (default: 96)");
+	"Debug: pixel shader ALU records per program, 96..128; above 96 locks up (default: 96)");
 
 u32 chrome9_fragment_alu_limit(void)
 {
