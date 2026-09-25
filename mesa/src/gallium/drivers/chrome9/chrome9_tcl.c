@@ -452,10 +452,12 @@ tcl_op_sources(unsigned op)
    }
 }
 
+/* SGN reads source lane w and writes it to every enabled lane on silicon. */
 static bool
 tcl_op_scalar(unsigned op)
 {
-   return op >= DRM_CHROME9_VERTEX_OP_RCP && op <= DRM_CHROME9_VERTEX_OP_LOG2;
+   return op == DRM_CHROME9_VERTEX_OP_SGN ||
+          (op >= DRM_CHROME9_VERTEX_OP_RCP && op <= DRM_CHROME9_VERTEX_OP_LOG2);
 }
 
 static bool
@@ -476,6 +478,7 @@ tcl_source_lanes(const struct drm_chrome9_vertex_instruction *insn,
    case DRM_CHROME9_VERTEX_OP_DPH:
       return src ? 0xf : 0x7;
    case DRM_CHROME9_VERTEX_OP_DP4:
+   case DRM_CHROME9_VERTEX_OP_SGN:
    case DRM_CHROME9_VERTEX_OP_RCP:
    case DRM_CHROME9_VERTEX_OP_RSQ:
    case DRM_CHROME9_VERTEX_OP_EXP2:
@@ -1045,7 +1048,7 @@ tcl_trunc(struct tcl_builder *b, unsigned lanes,
    tcl_op(b, DRM_CHROME9_VERTEX_OP_ABS, mask, mag, &src, 1);
    m[0] = tcl_temp_source(mag, lanes, false);
    tcl_op(b, DRM_CHROME9_VERTEX_OP_FLR, mask, whole, m, 1);
-   tcl_op(b, DRM_CHROME9_VERTEX_OP_SGN, mask, sign, &src, 1);
+   tcl_scalar(b, DRM_CHROME9_VERTEX_OP_SGN, sign, lanes, src);
    m[0] = tcl_temp_source(whole, lanes, false);
    m[1] = tcl_temp_source(sign, lanes, false);
    return tcl_op(b, DRM_CHROME9_VERTEX_OP_MUL, mask, out, m, 2);
@@ -1063,7 +1066,6 @@ tcl_alu(struct tcl_builder *b, nir_alu_instr *alu)
       { nir_op_fmin, DRM_CHROME9_VERTEX_OP_MIN, 2 },
       { nir_op_fmax, DRM_CHROME9_VERTEX_OP_MAX, 2 },
       { nir_op_fabs, DRM_CHROME9_VERTEX_OP_ABS, 1 },
-      { nir_op_fsign, DRM_CHROME9_VERTEX_OP_SGN, 1 },
       { nir_op_ffract, DRM_CHROME9_VERTEX_OP_FRC, 1 },
       { nir_op_ffloor, DRM_CHROME9_VERTEX_OP_FLR, 1 },
       { nir_op_slt, DRM_CHROME9_VERTEX_OP_SLT, 2 },
@@ -1142,6 +1144,9 @@ tcl_alu(struct tcl_builder *b, nir_alu_instr *alu)
    case nir_op_frcp:
       tcl_scalar(b, DRM_CHROME9_VERTEX_OP_RCP, temp, n, src[0]);
       break;
+   case nir_op_fsign:
+      tcl_scalar(b, DRM_CHROME9_VERTEX_OP_SGN, temp, n, src[0]);
+      break;
    case nir_op_frsq:
       tcl_scalar(b, DRM_CHROME9_VERTEX_OP_RSQ, temp, n, src[0]);
       break;
@@ -1210,7 +1215,7 @@ tcl_alu(struct tcl_builder *b, nir_alu_instr *alu)
          const unsigned sign = tcl_new_temp(b);
 
          /* c != 0 as |sgn(c)|. */
-         tcl_op(b, DRM_CHROME9_VERTEX_OP_SGN, mask, sign, src, 1);
+         tcl_scalar(b, DRM_CHROME9_VERTEX_OP_SGN, sign, n, src[0]);
          c[0] = tcl_temp_source(sign, n, false);
          tcl_op(b, DRM_CHROME9_VERTEX_OP_ABS, mask, cond, c, 1);
       } else if (alu->op == nir_op_fcsel_gt) {
