@@ -6541,6 +6541,98 @@ chrome9_nir_vec_of_products(nir_builder *b, nir_alu_instr *vec, void *data)
    return true;
 }
 
+/* Lanes form one source record: one swizzled value plus literal 0/1. */
+static bool
+chrome9_nir_factor_literal(const nir_scalar *lane, unsigned count)
+{
+   nir_def *def = NULL;
+
+   for (unsigned c = 0; c < count; c++) {
+      if (nir_scalar_is_const(lane[c])) {
+         const uint32_t bits = nir_scalar_as_uint(lane[c]);
+
+         if (bits != 0 && bits != 0x3f800000)
+            return false;
+      } else if (def && lane[c].def != def) {
+         return false;
+      } else {
+         def = lane[c].def;
+      }
+   }
+   return true;
+}
+
+/* vecN of products and pass-through lanes -> one product: the passed
+ * lane x becomes 1 * x (tex.rgb * col.rgb with col.a: one MUL record). */
+static bool
+chrome9_nir_vec_product_passthrough(nir_builder *b, nir_alu_instr *vec,
+                                    void *data)
+{
+   const unsigned count = vec->def.num_components;
+   nir_scalar factor[2][NIR_MAX_VEC_COMPONENTS];
+   nir_def *lanes[2][NIR_MAX_VEC_COMPONENTS];
+   unsigned products = 0, ctrl = 0;
+
+   (void)data;
+   if (!nir_op_is_vec(vec->op) || vec->def.bit_size != 32 || count < 2)
+      return false;
+   for (unsigned c = 0; c < count; c++) {
+      nir_scalar lane = nir_scalar_resolved(vec->src[c].src.ssa,
+                                            vec->src[c].swizzle[0]);
+
+      if (nir_scalar_is_alu(lane) &&
+          nir_def_as_alu(lane.def)->op == nir_op_fmul) {
+         ctrl |= nir_def_as_alu(lane.def)->fp_math_ctrl;
+         factor[0][c] = nir_scalar_chase_alu_src(lane, 0);
+         factor[1][c] = nir_scalar_chase_alu_src(lane, 1);
+         products++;
+      } else {
+         factor[0][c] = nir_get_scalar(NULL, 0);
+         factor[1][c] = lane;
+      }
+   }
+   if (products < 2 || products == count)
+      return false;
+   /* Put each product's factor from the pass-through value second. */
+   for (unsigned c = 0; c < count; c++) {
+      if (!factor[0][c].def)
+         continue;
+      for (unsigned d = 0; d < count; d++) {
+         if (factor[0][d].def || nir_scalar_is_const(factor[1][d]))
+            continue;
+         if (factor[0][c].def == factor[1][d].def) {
+            nir_scalar swap = factor[0][c];
+
+            factor[0][c] = factor[1][c];
+            factor[1][c] = swap;
+         }
+         break;
+      }
+   }
+   b->cursor = nir_before_instr(&vec->instr);
+   for (unsigned c = 0; c < count; c++) {
+      lanes[0][c] = factor[0][c].def ? nir_mov_scalar(b, factor[0][c]) :
+                                       nir_imm_float(b, 1.0f);
+      lanes[1][c] = nir_mov_scalar(b, factor[1][c]);
+   }
+   {
+      nir_scalar check[2][NIR_MAX_VEC_COMPONENTS];
+
+      for (unsigned c = 0; c < count; c++) {
+         check[0][c] = nir_scalar_resolved(lanes[0][c], 0);
+         check[1][c] = nir_scalar_resolved(lanes[1][c], 0);
+      }
+      if (!chrome9_nir_factor_literal(check[0], count) ||
+          !chrome9_nir_factor_literal(check[1], count))
+         return false;
+   }
+   nir_def *product = nir_fmul(b, nir_vec(b, lanes[0], count),
+                               nir_vec(b, lanes[1], count));
+   nir_def_as_alu(product)->fp_math_ctrl = ctrl;
+   nir_def_replace(&vec->def, product);
+   return true;
+}
+
 /* Fuse MUL+ADD into MAD and fold negations into SUB and the MAD A
  * operand before the one-record-per-op backend sees the program. */
 static void
@@ -6549,6 +6641,9 @@ chrome9_nir_optimize_semantic(nir_shader *nir)
    bool progress;
 
    if (nir_shader_alu_pass(nir, chrome9_nir_vec_of_products,
+                           nir_metadata_control_flow, NULL))
+      nir_opt_dce(nir);
+   if (nir_shader_alu_pass(nir, chrome9_nir_vec_product_passthrough,
                            nir_metadata_control_flow, NULL))
       nir_opt_dce(nir);
    do {
