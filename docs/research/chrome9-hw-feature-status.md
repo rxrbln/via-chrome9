@@ -61,7 +61,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
 | fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size (below) |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
-| terrain fragment shader, glmark2 cel, some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work; cel: predicate selects on values not provably finite (`rsq` of a possibly zero length) |
+| terrain fragment shader, glmark2 ideas (one FS above 96 records), some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work; cel runs on hardware since flagged arithmetic of finite operands counts as finite (32 -> 81 fps) |
 | desktop blur | validation fails (sampler precision) | open |
 
 ## Not implemented
