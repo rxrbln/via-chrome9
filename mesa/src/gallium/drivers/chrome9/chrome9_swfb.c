@@ -402,6 +402,39 @@ chrome9_sw_lower_face_input(nir_shader *nir)
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
+static bool
+chrome9_sw_scalarize_deriv_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                 void *data)
+{
+   (void)data;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy_coarse:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddy_fine:
+      break;
+   default:
+      return false;
+   }
+   if (intr->def.num_components == 1)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+                   nir_build_deriv(b, intr->src[0].ssa, intr->intrinsic));
+   return true;
+}
+
+/* gallivm emits one channel per derivative intrinsic; llvmpipe relies on
+ * scalarize_ddx at NIR build time, which the chrome9 options do not set. */
+static void
+chrome9_sw_scalarize_derivs(nir_shader *nir)
+{
+   nir_shader_intrinsics_pass(nir, chrome9_sw_scalarize_deriv_instr,
+                              nir_metadata_control_flow, NULL);
+}
+
 static void *
 chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
                   enum chrome9_sw_kind kind, const void *state)
@@ -457,6 +490,7 @@ chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
             };
 
             chrome9_sw_lower_face_input(shader.ir.nir);
+            chrome9_sw_scalarize_derivs(shader.ir.nir);
             if (nir_lower_sysvals_to_varyings(shader.ir.nir, &pos))
                nir_shader_gather_info(shader.ir.nir,
                   nir_shader_get_entrypoint(shader.ir.nir));
