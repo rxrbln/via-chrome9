@@ -221,6 +221,11 @@ module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
 MODULE_PARM_DESC(blend_equation,
 	"Blend SUBTRACT, REVERSE_SUBTRACT, MIN and MAX (default: true)");
 
+static bool chrome9_blend_color = true;
+module_param_named(blend_color, chrome9_blend_color, bool, 0600);
+MODULE_PARM_DESC(blend_color,
+	"Constant colour and alpha blend factors (default: true)");
+
 static bool chrome9_vs_flow = true;
 module_param_named(vs_flow, chrome9_vs_flow, bool, 0400);
 MODULE_PARM_DESC(vs_flow,
@@ -646,6 +651,7 @@ struct chrome9_draw_request {
 	u64 texture3_object_size;
 	struct drm_chrome9_scissor_state scissor;
 	struct drm_chrome9_blend_state blend;
+	u16 blend_color[4];
 	struct drm_chrome9_vertex vertices[3];
 	struct drm_chrome9_vertex_d16 depth_vertices[3];
 	struct drm_chrome9_textured_vertex textured_vertices[3];
@@ -719,6 +725,7 @@ static_assert(sizeof(struct drm_chrome9_draw_two_textured_triangle_d16_blend) ==
 
 struct chrome9_blend_words {
 	u32 a00;
+	u32 a38[8];
 	u32 a33;
 	u32 a34;
 	u32 a35;
@@ -827,6 +834,8 @@ struct chrome9_engine {
 	bool ready;
 	bool stopping;
 	bool wedged;
+	/* A38..A3F may hold constants (unknown after load); submit_lock. */
+	bool blend_constants_dirty;
 	bool was_master;
 	bool quarantine_hold;
 	bool module_hold;
@@ -1824,6 +1833,13 @@ static u32 chrome9_blend_factor_code(u32 factor, bool alpha)
 		return alpha ? 0x12 : 0x11;
 	case DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE:
 		return alpha ? 0x19 : 0x08;
+	/* ZERO/ONE are these selectors with zero constant registers. */
+	case DRM_CHROME9_BLEND_FACTOR_CONST_COLOR:
+	case DRM_CHROME9_BLEND_FACTOR_CONST_ALPHA:
+		return alpha ? 0x09 : 0x05;
+	case DRM_CHROME9_BLEND_FACTOR_INV_CONST_COLOR:
+	case DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA:
+		return alpha ? 0x19 : 0x15;
 	default:
 		/* The ioctl validator rejects unsupported factors. */
 		return 0;
@@ -1938,7 +1954,7 @@ static int chrome9_stencil_selftest(void)
  * A35/A37.  Operands are RGB source/destination 0/1 and alpha 1/2.
  */
 static void chrome9_lower_blend_lane(u32 func, u32 src_factor, u32 dst_factor,
-				     bool alpha, u32 *a, u32 *b)
+				     bool alpha, u32 *a, u32 *b, u32 factor[2])
 {
 	u32 src = alpha ? 1 : 0;
 	u32 dst = alpha ? 2 : 1;
@@ -1965,12 +1981,54 @@ static void chrome9_lower_blend_lane(u32 func, u32 src_factor, u32 dst_factor,
 	*a = src << 10 | chrome9_blend_factor_code(src_factor, alpha) << 4;
 	*b = op << 14 | dst << 8 |
 		chrome9_blend_factor_code(dst_factor, alpha) << 2;
+	factor[0] = src_factor;
+	factor[1] = dst_factor;
 }
 
-/* Debug: 1 sets A34/A36 bit 16 on every blend lane. */
+static bool chrome9_blend_factor_constant(u32 factor)
+{
+	return factor >= DRM_CHROME9_BLEND_FACTOR_CONST_COLOR &&
+	       factor <= DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA;
+}
+
+static bool chrome9_blend_uses_constant(const struct drm_chrome9_blend_state *state)
+{
+	return (state->flags & DRM_CHROME9_BLEND_ENABLE) &&
+	       (chrome9_blend_factor_constant(state->rgb_src_factor) ||
+		chrome9_blend_factor_constant(state->rgb_dst_factor) ||
+		chrome9_blend_factor_constant(state->alpha_src_factor) ||
+		chrome9_blend_factor_constant(state->alpha_dst_factor));
+}
+
+static const u32 chrome9_blend_constant_closure[] = {
+	0x38000000, 0x39000000, 0x3a000000, 0x3b000000,
+	0x3c000000, 0x3d000000, 0x3e000000, 0x3f000000,
+};
+
+/* Value a CONST factor reads from its 1.10 register lane, else zero. */
+static u32 chrome9_blend_constant(u32 factor, const u16 *color, unsigned int c)
+{
+	if (!color)
+		return 0;
+	switch (factor) {
+	case DRM_CHROME9_BLEND_FACTOR_CONST_COLOR:
+	case DRM_CHROME9_BLEND_FACTOR_INV_CONST_COLOR:
+		return color[c];
+	case DRM_CHROME9_BLEND_FACTOR_CONST_ALPHA:
+	case DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA:
+		return color[3];
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Debug: 1 sets A34/A36 bit 16 on every blend lane, 2 leaves A3A, A3D, A3E
+ * and A3F stale outside constant-colour draws.
+ */
 static uint chrome9_blend_re;
 module_param_named(blend_re, chrome9_blend_re, uint, 0600);
-MODULE_PARM_DESC(blend_re, "Debug: blend clamp probe (default: 0)");
+MODULE_PARM_DESC(blend_re, "Debug: blend clamp and constant probe (default: 0)");
 
 /* A34/A36 bit 16 clamps below zero; clear, negative results give one. */
 static u32 chrome9_blend_clamp(u32 func)
@@ -1980,12 +2038,18 @@ static u32 chrome9_blend_clamp(u32 func)
 	       READ_ONCE(chrome9_blend_re) & 1 ? BIT(16) : 0;
 }
 
+/*
+ * A38..A3F hold the factor constants of the physical A and B terms
+ * (FCa/FCb RGB, FAa/FAb alpha); the operand-constant halves stay zero.
+ */
 static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
+				const u16 *color,
 				struct chrome9_blend_words *words)
 {
-
 	u32 ref = state->alpha_test_ref;
+	u32 rgb[2], alpha[2];
 	u32 a, b;
+	unsigned int i;
 
 	words->a00 = 0x00000001;
 	if (state->flags & DRM_CHROME9_BLEND_ENABLE)
@@ -1998,14 +2062,81 @@ static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
 		ref = 0x400;
 	words->a33 = 0x33000000 | state->alpha_test_func << 12 | ref;
 	chrome9_lower_blend_lane(state->rgb_func, state->rgb_src_factor,
-				 state->rgb_dst_factor, false, &a, &b);
+				 state->rgb_dst_factor, false, &a, &b, rgb);
 	words->a34 = 0x34000000 | chrome9_blend_clamp(state->rgb_func) | a;
 	words->a35 = 0x35000000 | b;
 	chrome9_lower_blend_lane(state->alpha_func, state->alpha_src_factor,
-				 state->alpha_dst_factor, true, &a, &b);
+				 state->alpha_dst_factor, true, &a, &b, alpha);
 	words->a36 = 0x36000000 | chrome9_blend_clamp(state->alpha_func) | a;
 	words->a37 = 0x37000000 | b;
 	words->a53 = 0x53010c00 | chrome9_blend_color_mask(state->color_mask);
+	for (i = 0; i < 8; i++)
+		words->a38[i] = (0x38 + i) << 24;
+	for (i = 0; i < 2; i++) {
+		words->a38[1 + 3 * i] |=
+			chrome9_blend_constant(rgb[i], color, 0) << 12;
+		words->a38[2 + 3 * i] |=
+			chrome9_blend_constant(rgb[i], color, 1) << 12 |
+			chrome9_blend_constant(rgb[i], color, 2);
+		words->a38[6 + i] |= chrome9_blend_constant(alpha[i], color, 3);
+	}
+}
+
+/* Golden A34..A3F constant-factor words of blend-alpha-packet-recipes.md. */
+static int chrome9_blend_constant_selftest(void)
+{
+	static const struct {
+		u32 func, src, dst;
+		u16 color[4];
+		u32 words[12];
+	} vectors[] = {
+		/* src * CONST + dst * (1 - CONST), colour (1, 0, 1, 0) */
+		{ DRM_CHROME9_BLEND_FUNC_ADD,
+		  DRM_CHROME9_BLEND_FACTOR_CONST_COLOR,
+		  DRM_CHROME9_BLEND_FACTOR_INV_CONST_COLOR,
+		  { 0x400, 0, 0x400, 0 },
+		  { 0x34000050, 0x35000154, 0x36000490, 0x37000264,
+		    0x38000000, 0x39400000, 0x3a000400, 0x3b000000,
+		    0x3c400000, 0x3d000400, 0x3e000000, 0x3f000000 } },
+		/* both terms CONST, colour (0.25, 0.5, 0.75, 1.0) */
+		{ DRM_CHROME9_BLEND_FUNC_ADD,
+		  DRM_CHROME9_BLEND_FACTOR_CONST_COLOR,
+		  DRM_CHROME9_BLEND_FACTOR_CONST_COLOR,
+		  { 0x100, 0x200, 0x300, 0x400 },
+		  { 0x34000050, 0x35000114, 0x36000490, 0x37000224,
+		    0x38000000, 0x39100000, 0x3a200300, 0x3b000000,
+		    0x3c100000, 0x3d200300, 0x3e000400, 0x3f000400 } },
+		/* REVERSE_SUBTRACT: the API source factor is the B term */
+		{ DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT,
+		  DRM_CHROME9_BLEND_FACTOR_CONST_ALPHA,
+		  DRM_CHROME9_BLEND_FACTOR_ONE,
+		  { 0x100, 0x200, 0x300, 0x180 },
+		  { 0x34010550, 0x35004014, 0x36010990, 0x37004124,
+		    0x38000000, 0x39000000, 0x3a000000, 0x3b000000,
+		    0x3c180000, 0x3d180180, 0x3e000000, 0x3f000180 } },
+	};
+	struct drm_chrome9_blend_state state = {
+		.flags = DRM_CHROME9_BLEND_ENABLE,
+		.color_mask = 0xf,
+	};
+	struct chrome9_blend_words words;
+	unsigned int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(vectors); i++) {
+		state.rgb_func = state.alpha_func = vectors[i].func;
+		state.rgb_src_factor = state.alpha_src_factor = vectors[i].src;
+		state.rgb_dst_factor = state.alpha_dst_factor = vectors[i].dst;
+		chrome9_lower_blend(&state, vectors[i].color, &words);
+		if (words.a34 != vectors[i].words[0] ||
+		    words.a35 != vectors[i].words[1] ||
+		    words.a36 != vectors[i].words[2] ||
+		    words.a37 != vectors[i].words[3])
+			return -EINVAL;
+		for (j = 0; j < 8; j++)
+			if (words.a38[j] != vectors[i].words[4 + j])
+				return -EINVAL;
+	}
+	return 0;
 }
 
 /* Golden A34..A37 of blend-alpha-packet-recipes.md. */
@@ -2077,7 +2208,7 @@ static int chrome9_blend_selftest(void)
 		state.rgb_dst_factor = vectors[i].rgb_dst;
 		state.alpha_src_factor = vectors[i].alpha_src;
 		state.alpha_dst_factor = vectors[i].alpha_dst;
-		chrome9_lower_blend(&state, &words);
+		chrome9_lower_blend(&state, NULL, &words);
 		if (words.a34 != vectors[i].words[0] ||
 		    words.a35 != vectors[i].words[1] ||
 		    words.a36 != vectors[i].words[2] ||
@@ -2085,7 +2216,7 @@ static int chrome9_blend_selftest(void)
 		    words.a00 != 0x00000011 || words.a53 != 0x53010c0f)
 			return -EINVAL;
 	}
-	return 0;
+	return chrome9_blend_constant_selftest();
 }
 
 static int chrome9_build_triangle(struct chrome9_engine *engine,
@@ -2121,7 +2252,7 @@ static int chrome9_build_triangle(struct chrome9_engine *engine,
 	if (blend) {
 		/* Expand the partial legacy constant block to closed A38--A3F. */
 		memmove(body + 19, body + 15, (188 - 15) * sizeof(*body));
-		chrome9_lower_blend(&request->blend, &blend_words);
+		chrome9_lower_blend(&request->blend, NULL, &blend_words);
 		for (i = 0; i < 8; i++)
 			body[7 + i] = (0x38 + i) << 24;
 		body[15] = blend_words.a34;
@@ -2387,7 +2518,7 @@ static int chrome9_build_textured_triangle(struct chrome9_engine *engine,
 		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
 		 0x00980000) | (request->pitch >> 5);
 	if (blend) {
-		chrome9_lower_blend(&request->blend, &blend_words);
+		chrome9_lower_blend(&request->blend, NULL, &blend_words);
 		for (i = 0; i < 8; i++)
 			destination_state[3 + i] = (0x38 + i) << 24;
 		destination_state[11] = blend_words.a34;
@@ -2726,7 +2857,7 @@ static int chrome9_build_two_textured_triangle(struct chrome9_engine *engine,
 		 DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 ? 0x00990000 :
 		 0x00980000) | (request->pitch >> 5);
 	if (blend) {
-		chrome9_lower_blend(&request->blend, &blend_words);
+		chrome9_lower_blend(&request->blend, NULL, &blend_words);
 		for (i = 0; i < 8; i++)
 			destination_state[3 + i] = (0x38 + i) << 24;
 		destination_state[11] = blend_words.a34;
@@ -4214,10 +4345,13 @@ static noinline_for_stack int
 chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 target, u32 depth, const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
 	const u32 *element_address, const u32 *query, u32 query_re,
-	struct chrome9_state_cache *cache, u32 **cursor, const u32 *limit)
+	struct chrome9_state_cache *cache, bool *constants_live, u32 **cursor,
+	const u32 *limit)
 {
+	/* All of A38..A3F: stale constants turn ZERO/ONE into CONST factors. */
 	static const u32 destination_tail[] = {
 		0x38000000, 0x3b000000, 0x39000000, 0x3c000000,
+		0x3a000000, 0x3d000000, 0x3e000000, 0x3f000000,
 		0x34000150, 0x35000114, 0x36000500, 0x37000200,
 	};
 	static const u32 pixel_z_clip[] = {
@@ -4306,9 +4440,11 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	destination_state[2] = 0x52000000 |
 		(rt_format->a52_format << 16) | (request->pitch >> 5);
 	if (blend) {
-		chrome9_lower_blend(&request->blend, &blend_words);
-		for (i = 0; i < 8; i++)
-			destination_state[3 + i] = (0x38 + i) << 24;
+		chrome9_lower_blend(&request->blend, request->blend_color,
+				    &blend_words);
+		*constants_live |= chrome9_blend_uses_constant(&request->blend);
+		memcpy(destination_state + 3, blend_words.a38,
+		       sizeof(blend_words.a38));
 		destination_state[11] = blend_words.a34;
 		destination_state[12] = blend_words.a35;
 		destination_state[13] = blend_words.a36;
@@ -4320,9 +4456,15 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		common[2] = blend_words.a53;
 		common[3] = blend_words.a00;
 	} else {
+		/* Other builders zero only A38/A3B/A39/A3C (blend_re bit 1). */
+		u32 skip = !*constants_live ||
+			   READ_ONCE(chrome9_blend_re) & 2 ? 4 : 0;
+
 		memcpy(destination_state + 3, destination_tail,
-		       sizeof(destination_tail));
-		destination_count = 3 + ARRAY_SIZE(destination_tail);
+		       4 * sizeof(*destination_tail));
+		memcpy(destination_state + 7, destination_tail + 4 + skip,
+		       (8 - skip) * sizeof(*destination_tail));
+		destination_count = 3 + ARRAY_SIZE(destination_tail) - skip;
 	}
 	if (depth_active) {
 		if (!depth_func)
@@ -4658,7 +4800,7 @@ static int chrome9_build_depth_triangle(struct chrome9_engine *engine,
 	if (blend) {
 		/* Close A38--A3F before adding depth state to the successor. */
 		memmove(body + 19, body + 15, (188 - 15) * sizeof(*body));
-		chrome9_lower_blend(&request->blend, &blend_words);
+		chrome9_lower_blend(&request->blend, NULL, &blend_words);
 		for (i = 0; i < 8; i++)
 			body[7 + i] = (0x38 + i) << 24;
 		body[15] = blend_words.a34;
@@ -6396,6 +6538,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE;
 	if (READ_ONCE(chrome9_blend_equation))
 		caps |= DRM_CHROME9_CAP2_BLEND_EQUATION;
+	if (READ_ONCE(chrome9_blend_color))
+		caps |= DRM_CHROME9_CAP2_BLEND_COLOR;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
@@ -6591,6 +6735,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	if (!engine)
 		return -ENOMEM;
 	engine->cdev = cdev;
+	engine->blend_constants_dirty = true;
 	mutex_init(&engine->submit_lock);
 	mutex_init(&engine->vm_lock);
 	INIT_LIST_HEAD(&engine->quarantine);
@@ -8654,6 +8799,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		const u32 *limit = chrome9_fragment_segment_limit(engine);
 		u32 *p = chrome9_fragment_segment_begin(engine);
 		struct chrome9_state_cache *cache = NULL;
+		bool constants = engine->blend_constants_dirty;
 		u32 first = next;
 
 		/* Sampled once: a cache must see every draw of its segment. */
@@ -8690,13 +8836,21 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
 				req->query ? &query_address : NULL,
-				job->query_re, cache, &p, limit);
+				job->query_re, cache, &constants, &p, limit);
 			/* A full segment is retired before the next draw. */
 			if (ret == -E2BIG && next > first)
 				break;
 			if (ret)
 				goto out_prepublication;
 		}
+		/* Other builders close only A38/A3B/A39/A3C: leave all zero. */
+		engine->blend_constants_dirty |= constants;
+		if (constants && !(READ_ONCE(chrome9_blend_re) & 2))
+			chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+					     chrome9_blend_constant_closure,
+					     ARRAY_SIZE(chrome9_blend_constant_closure));
+		else
+			constants = false;
 		job->cookie = chrome9_next_cookie_locked(engine);
 		job->fence_id = 0;
 		job->retirement_proven = false;
@@ -8723,6 +8877,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		ret = chrome9_append_segment(engine, job, engine->run_staging_cpu,
 			engine->run_staging_size, pause, &must_quarantine);
 		chrome9_prof_mark(CHROME9_PROF_APPEND);
+		if (!ret && constants)
+			engine->blend_constants_dirty = false;
 		if (ret) {
 			if (!must_quarantine)
 				goto out_prepublication;
@@ -8910,7 +9066,25 @@ chrome9_validate_scissor(const struct drm_chrome9_scissor_state *scissor,
 	return 0;
 }
 
-static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *state)
+/* Constant factors only on fragment program draws, which carry a colour. */
+static int chrome9_validate_blend_color(const struct drm_chrome9_blend_state *state,
+					const u16 *color)
+{
+	unsigned int i;
+
+	if (!chrome9_blend_uses_constant(state))
+		return color && memchr_inv(color, 0, 4 * sizeof(*color)) ?
+		       -EINVAL : 0;
+	if (!color || !READ_ONCE(chrome9_blend_color))
+		return -EOPNOTSUPP;
+	for (i = 0; i < 4; i++)
+		if (color[i] > 0x400)
+			return -EINVAL;
+	return 0;
+}
+
+static int chrome9_validate_blend_state_color(
+		const struct drm_chrome9_blend_state *state, const u16 *color)
 {
 	if (state->flags & ~(DRM_CHROME9_BLEND_ENABLE |
 			     DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE) ||
@@ -8927,13 +9101,13 @@ static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *st
 		return -EINVAL;
 	}
 	if (state->rgb_src_factor >
-		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+		DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA ||
 	    state->rgb_dst_factor >
-		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+		DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA ||
 	    state->alpha_src_factor >
-		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+		DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA ||
 	    state->alpha_dst_factor >
-		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
+		DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA ||
 	    state->rgb_func > DRM_CHROME9_BLEND_FUNC_MAX ||
 	    state->alpha_func > DRM_CHROME9_BLEND_FUNC_MAX ||
 	    ((state->rgb_func != DRM_CHROME9_BLEND_FUNC_ADD ||
@@ -8948,7 +9122,12 @@ static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *st
 	     state->alpha_src_factor != DRM_CHROME9_BLEND_FACTOR_ONE ||
 	     state->alpha_dst_factor != DRM_CHROME9_BLEND_FACTOR_ZERO))
 		return -EINVAL;
-	return 0;
+	return chrome9_validate_blend_color(state, color);
+}
+
+static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *state)
+{
+	return chrome9_validate_blend_state_color(state, NULL);
 }
 
 int chrome9_draw_triangle_ioctl(struct drm_device *drm, void *data,
@@ -11915,7 +12094,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	     !sparse_textures) ||
 	    (sparse_textures && !chrome9_fragment_sparse_textures_enabled()) ||
 	    args->reserved0 || args->pad || args->reserved1 ||
-	    memchr_inv(args->reserved, 0, sizeof(args->reserved)) ||
+	    (!blend && memchr_inv(args->blend_color, 0,
+				  sizeof(args->blend_color))) ||
 	    (!(args->flags & DRM_CHROME9_FRAGMENT_QUERY) && args->query) ||
 	    chrome9_validate_depth_flags(args->flags, allowed_flags) ||
 	    (!depth && (args->flags & (DRM_CHROME9_DEPTH_FUNC_MASK |
@@ -11955,9 +12135,12 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	if (ret)
 		return ret;
 	if (blend) {
-		ret = chrome9_validate_blend_state(&args->blend);
+		ret = chrome9_validate_blend_state_color(&args->blend,
+							 args->blend_color);
 		if (ret)
 			return ret;
+		memcpy(request.blend_color, args->blend_color,
+		       sizeof(request.blend_color));
 	}
 	if (check_mul_overflow((u64)args->destination_pitch,
 			       (u64)args->height, &surface_size) ||
