@@ -565,6 +565,10 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
     * filters the otherwise supported Z16 format from every 32-bit visual. */
    caps->mixed_color_depth_bits = true;
    caps->max_vertex_buffers = 16;
+   /* The fragment engine has 32 constant rows: constant arrays moved into
+    * the default uniform block failed to link (fs-vec4-const-array-
+    * indirect-access-*); indexed constants lower to selects instead. */
+   caps->prefer_imm_arrays_as_constbuf = false;
    /* Every varying, generic or colour, takes one fragment input slot. */
    caps->max_varyings =
       screen->base.shader_caps[MESA_SHADER_FRAGMENT].max_inputs;
