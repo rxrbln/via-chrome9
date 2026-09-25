@@ -364,6 +364,11 @@ static bool chrome9_gart_nosnoop = true;
 module_param_named(gart_nosnoop, chrome9_gart_nosnoop, bool, 0400);
 MODULE_PARM_DESC(gart_nosnoop, "Map draw objects with non-snooped GART PTEs (default: true)");
 
+static bool chrome9_local_memory = true;
+module_param_named(local_memory, chrome9_local_memory, bool, 0400);
+MODULE_PARM_DESC(local_memory,
+	"GEM_CREATE_LOCAL objects in the local frame buffer (default: true)");
+
 static ulong chrome9_vram_target_test;
 module_param_named(vram_target_test, chrome9_vram_target_test, ulong, 0600);
 MODULE_PARM_DESC(vram_target_test, "Debug: VRAM offset for fragment color writes");
@@ -4285,6 +4290,8 @@ chrome9_fragment_rt_format(u32 format)
 /* Validated emission choice: write A01..A05 and A18 so no cube state of a
  * unit leaks into a later 2D draw. */
 #define CHROME9_TEXTURE_FACE_CLOSURE	BIT(0)
+/* The texture object is local (SL, location code 00), not SF (01). */
+#define CHROME9_TEXTURE_LOCAL		BIT(1)
 
 static void chrome9_emit_fragment_texture(u32 **cursor,
 	const struct drm_chrome9_fragment_texture_state *texture,
@@ -4315,7 +4322,10 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 	 * always authoritative, so A22 carries no POT flag.  3D: mode 2 with
 	 * the R length in A21 and its exponent in A22.
 	 */
-	image[count++] = cube ? 0x18015355 : volume ? 0x18001201 : 0x18001101;
+	/* A18 location of faces 0..5 ([1:0]..[7:6], [15:14], [17:16]). */
+	image[count++] = flags & CHROME9_TEXTURE_LOCAL ?
+		(cube ? 0x18001300 : volume ? 0x18001200 : 0x18001100) :
+		(cube ? 0x18015355 : volume ? 0x18001201 : 0x18001101);
 	image[count++] = 0x20000000 | height << 12 | width;
 	image[count++] = 0x21000000 | (volume ? texture->depth : 1);
 	image[count++] = 0x22000000 |
@@ -4334,12 +4344,22 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 		unit << 24 | 0x00020000, image, count);
 	if (level_count) {
 		chrome9_fragment_mip_state(texture, mip);
+		/* Level entries carry their location in bits 31:30. */
+		if (flags & CHROME9_TEXTURE_LOCAL)
+			for (unsigned int l = 0; l < ARRAY_SIZE(mip); l++)
+				mip[l] &= ~0xc0000000U;
 		chrome9_emit_header3(cursor, 0x10030000 | unit << 3, mip,
 			ARRAY_SIZE(mip));
 	}
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c,
 		unit << 24 | 0x20020000, sampler, sampler_count);
 }
+
+/* chrome9_emit_fragment_draw() local mask: objects in SL, not SF. */
+#define CHROME9_LOCAL_DESTINATION	BIT(0)
+#define CHROME9_LOCAL_DEPTH		BIT(1)
+#define CHROME9_LOCAL_COARSE_Z		BIT(2)
+#define CHROME9_LOCAL_TEXTURE(t)	BIT(8 + (t))
 
 /*
  * Worst-case dwords of one draw's state blocks (headers and their 16-byte
@@ -4494,7 +4514,7 @@ static void chrome9_state_cache_forget(struct chrome9_state_cache *cache)
  */
 static noinline_for_stack int
 chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
-	u32 target, u32 depth, u32 coarse_z,
+	u32 target, u32 depth, u32 coarse_z, u32 local,
 	const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
 	const u32 *element_address, const u32 *query, u32 query_re,
 	struct chrome9_state_cache *cache, bool *constants_live, u32 **cursor,
@@ -4584,7 +4604,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	}
 	vs_control[0] = 0x60800000 | (3 + program->varying_count);
 	destination_state[0] = 0x50000000 | (target >> 8);
-	destination_state[1] = 0x51100000;
+	destination_state[1] = local & CHROME9_LOCAL_DESTINATION ? 0x51000000 :
+			       0x51100000;
 	if (READ_ONCE(chrome9_vram_target_test)) {
 		destination_state[0] = 0x50000000 |
 			(READ_ONCE(chrome9_vram_target_test) >> 8);
@@ -4627,7 +4648,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			depth_func = DRM_CHROME9_COMPARE_LESS;
 		common[4] = chrome9_depth_control_word(request, true);
 		common[7] = 0x10000000 | (depth >> 8);
-		common[8] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
+		common[8] = (local & CHROME9_LOCAL_DEPTH ? 0x11000000 :
+			     0x11000001) | ((request->depth_pitch >> 5) << 13);
 		common[9] = (request->fragment_depth_format ==
 			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000) |
 			(request->flags & DRM_CHROME9_FRAGMENT_DEPTH_TILED ||
@@ -4663,7 +4685,9 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	common_count += ARRAY_SIZE(pixel_z_clip);
 	if (request->flags & DRM_CHROME9_FRAGMENT_COARSE_Z) {
 		/* SF location, write-back on cell change, conservative merge. */
-		u32 a29 = (0x29000000 | 1 << 20 | BIT(16) | 1 << 12 |
+		u32 a29 = (0x29000000 |
+			   (local & CHROME9_LOCAL_COARSE_Z ? 0 : 1 << 20) |
+			   BIT(16) | 1 << 12 |
 			   request->coarse_z_pitch >> 5) ^
 			  (READ_ONCE(chrome9_coarse_z_re) & 0x00ffffff);
 
@@ -4742,7 +4766,9 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		group = chrome9_group_begin(&p);
 		chrome9_emit_fragment_texture(&p, &request->fragment_textures[i],
 			texture_base[i], request->fragment_texture_units[i],
-			request->fragment_texture_flags[i]);
+			request->fragment_texture_flags[i] |
+			(local & CHROME9_LOCAL_TEXTURE(i) ?
+			 CHROME9_TEXTURE_LOCAL : 0));
 		textures_written |= chrome9_group_end(cache,
 			CHROME9_GROUP_TEXTURE + request->fragment_texture_units[i],
 			group, &p);
@@ -5944,7 +5970,7 @@ int chrome9_sf_pin(struct chrome9_device *cdev, struct drm_gem_object *obj,
 	int ret;
 
 	if (!out_mapping || !obj || obj->dev != &cdev->drm ||
-	    drm_gem_is_imported(obj) || !obj->size ||
+	    drm_gem_is_imported(obj) || chrome9_gem_is_local(obj) || !obj->size ||
 	    !IS_ALIGNED(obj->size, PAGE_SIZE) || obj->size > U32_MAX)
 		return -EINVAL;
 	engine = READ_ONCE(cdev->engine);
@@ -6375,13 +6401,21 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 	/* An unsynchronized write only needs its range flushed before the
 	 * next job that uses the object. */
 	if (args->flags & DRM_CHROME9_GEM_CPU_NOWAIT) {
-		chrome9_bo_cpu_dirty(bo, args->offset, size);
+		if (!chrome9_bo_is_local(bo))
+			chrome9_bo_cpu_dirty(bo, args->offset, size);
 		goto out_unlock;
 	}
 	wait = dma_resv_wait_timeout(obj->resv, DMA_RESV_USAGE_BOOKKEEP, true,
 				     CHROME9_DEP_TIMEOUT);
 	if (wait <= 0) {
 		ret = wait < 0 ? wait : -ETIMEDOUT;
+		goto out_unlock;
+	}
+	/* Write-combined local objects need no cache maintenance. */
+	if (chrome9_bo_is_local(bo)) {
+		bo->explicit_access = args->flags & DRM_CHROME9_GEM_CPU_EXPLICIT ||
+			(bo->explicit_access &&
+			 !(args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT));
 		goto out_unlock;
 	}
 	/* Invalidate lines that may predate the device's writes. */
@@ -7011,6 +7045,10 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	/* Occlusion snapshots go to the SL page below the GART; the slots
 	 * exist always so occlusion_query can be switched at run time. */
 	engine->query_offset = gart_offset - PAGE_SIZE;
+	/* The local object pool ends below the occlusion page. */
+	if (READ_ONCE(chrome9_local_memory) &&
+	    chrome9_sl_init(cdev, engine->query_offset))
+		dev_warn(&cdev->pdev->dev, "no local frame buffer pool\n");
 	engine->query_slot_count = PAGE_SIZE / CHROME9_QUERY_SLOT_SIZE;
 	engine->query_slots = bitmap_zalloc(engine->query_slot_count,
 					    GFP_KERNEL);
@@ -7301,7 +7339,9 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 		ret = -ENOENT;
 		goto out_dev_exit;
 	}
+	/* The fixed builders address SF pages only. */
 	if (obj->dev != drm || drm_gem_is_imported(obj) ||
+	    chrome9_gem_is_local(obj) ||
 	    obj->size != request->object_size) {
 		ret = -EINVAL;
 		goto out_put_object;
@@ -7581,6 +7621,9 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 	    drm_gem_is_imported(obj) || drm_gem_is_imported(depth_obj) ||
 	    (three_objects && drm_gem_is_imported(texture2_obj)) ||
 	    (four_objects && drm_gem_is_imported(texture3_obj)) ||
+	    chrome9_gem_is_local(obj) || chrome9_gem_is_local(depth_obj) ||
+	    (three_objects && chrome9_gem_is_local(texture2_obj)) ||
+	    (four_objects && chrome9_gem_is_local(texture3_obj)) ||
 	    obj->size != request->object_size ||
 	    (request->kind == CHROME9_DRAW_COPY_RECT ?
 	     depth_obj->size != request->depth_object_size :
@@ -8382,6 +8425,8 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 	for (i = 0; i < object_count; i++) {
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
 
+		if (chrome9_bo_is_local(bo))
+			continue;
 		dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 			job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 		if (!chrome9_fragment_object_written(sub->kind[i]))
@@ -8401,6 +8446,8 @@ static int chrome9_fragment_job_finish_locked(struct chrome9_engine *engine,
 	}
 	dma_rmb();
 	for (i = 0; i < object_count; i++) {
+		if (chrome9_gem_is_local(objects[i]))
+			continue;
 		/* Sampled textures and vertex buffers are only read. */
 		if (!chrome9_fragment_object_written(sub->kind[i])) {
 			chrome9_sf_resync_object_locked(engine, objects[i]);
@@ -8857,7 +8904,10 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			ret = -ENOENT;
 			goto out_put_objects;
 		}
+		/* Stage B buffers are fetched through SF only. */
 		if (objects[i]->dev != drm || drm_gem_is_imported(objects[i]) ||
+		    (sub->kind[i] == CHROME9_OBJECT_VERTEX &&
+		     chrome9_gem_is_local(objects[i])) ||
 		    (i == 0 ?
 		     !chrome9_fragment_destination_size_valid(
 			objects[i]->size, object_sizes[i],
@@ -8913,6 +8963,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	INIT_LIST_HEAD(&job->quarantine_link);
 	INIT_LIST_HEAD(&job->queue_link);
 	for (i = 0; i < object_count; i++) {
+		/* Local objects have no pages; the engine addresses SL. */
+		if (chrome9_gem_is_local(objects[i]))
+			continue;
 		job->fragment_objects[i] = to_drm_gem_shmem_obj(objects[i]);
 		job->fragment_sgts[i] =
 			drm_gem_shmem_get_pages_sgt(job->fragment_objects[i]);
@@ -8942,6 +8995,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			ret = wait < 0 ? wait : -ETIMEDOUT;
 			goto out_exec;
 		}
+		if (chrome9_gem_is_local(objects[i]))
+			continue;
 		ret = drm_gem_shmem_vmap_locked(job->fragment_objects[i],
 						 &job->fragment_maps[i]);
 		if (ret)
@@ -8991,6 +9046,10 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	if (ret)
 		goto out_prepublication;
 	for (i = 0; i < object_count; i++) {
+		if (chrome9_gem_is_local(objects[i])) {
+			sub->bases[i] = to_chrome9_bo(objects[i])->local.start;
+			continue;
+		}
 		ret = chrome9_job_acquire_mapping_locked(engine, job, objects[i],
 				job->fragment_sgts[i], &sub->bases[i]);
 		if (ret)
@@ -9003,6 +9062,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	for (i = 0; i < object_count && !list_empty(&engine->queue); i++) {
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
 
+		if (chrome9_bo_is_local(bo))
+			continue;
 		if (sub->kind[i] != CHROME9_OBJECT_VERTEX &&
 		    bo->explicit_access && !bo->cpu_dirty &&
 		    bo->guard_object_size == object_sizes[i] &&
@@ -9024,6 +9085,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		struct chrome9_bo *bo = to_chrome9_bo(objects[i]);
 		ktime_t t0 = ktime_get(), t1;
 
+		/* Write-combined SL: no guards, lines or bounce buffers. */
+		if (chrome9_bo_is_local(bo))
+			continue;
 		if (sub->kind[i] == CHROME9_OBJECT_VERTEX) {
 			/* Explicit objects flush only announced CPU writes. */
 			if (!bo->explicit_access) {
@@ -9125,7 +9189,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	 * kernel mapping for the post-job work. */
 	async = READ_ONCE(chrome9_async_retire);
 	for (i = 0; i < object_count; i++)
-		async &= !iosys_map_is_null(&to_chrome9_bo(objects[i])->kmap);
+		async &= chrome9_gem_is_local(objects[i]) ||
+			 !iosys_map_is_null(&to_chrome9_bo(objects[i])->kmap);
 	for (next = 0, q = 0; next < count; ) {
 		const u32 *limit = chrome9_fragment_segment_limit(engine);
 		u32 *p = chrome9_fragment_segment_begin(engine);
@@ -9143,6 +9208,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			const struct chrome9_draw_request *req = requests[next];
 			const struct chrome9_tcl_draw *tcl = req->tcl;
 			u32 query_address = 0;
+			u32 local;
 
 			while (q < job->query_count && job->queries[q].draw < next)
 				q++;
@@ -9151,9 +9217,21 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 					engine, job->query_re,
 					job->queries[q].slot);
 
-			for (t = 0; t < req->fragment_texture_count; t++)
-				texture_bases[t] =
-					sub->bases[sub->draw[next].texture_object[t]];
+			local = chrome9_gem_is_local(objects[0]) ?
+				CHROME9_LOCAL_DESTINATION : 0;
+			if (depth_index != U32_MAX &&
+			    chrome9_gem_is_local(objects[depth_index]))
+				local |= CHROME9_LOCAL_DEPTH;
+			if (coarse_index != U32_MAX &&
+			    chrome9_gem_is_local(objects[coarse_index]))
+				local |= CHROME9_LOCAL_COARSE_Z;
+			for (t = 0; t < req->fragment_texture_count; t++) {
+				const u32 o = sub->draw[next].texture_object[t];
+
+				texture_bases[t] = sub->bases[o];
+				if (chrome9_gem_is_local(objects[o]))
+					local |= CHROME9_LOCAL_TEXTURE(t);
+			}
 			for (t = 0; tcl && tcl->buffer_count &&
 				    t < tcl->element_count; t++)
 				element_address[t] = sub->bases[
@@ -9166,7 +9244,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				sub->bases[depth_index] + PAGE_SIZE,
 				coarse_index == U32_MAX ? 0 :
 				sub->bases[coarse_index] + PAGE_SIZE,
-				texture_bases,
+				local, texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
 				req->query ? &query_address : NULL,
 				job->query_re, cache, &constants, &p, limit);
@@ -9298,6 +9376,8 @@ out_unlock_submit:
 out_unmap:
 	if (device_owned) {
 		for (i = 0; i < object_count; i++) {
+			if (chrome9_gem_is_local(objects[i]))
+				continue;
 			dma_sync_sgtable_for_cpu(&cdev->pdev->dev,
 				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 			chrome9_cache_flush(job->fragment_maps[i].vaddr,

@@ -16,6 +16,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_vma_manager.h>
@@ -128,6 +129,131 @@ struct drm_gem_object *chrome9_gem_cursor_create(struct drm_device *drm)
 	/* Cursor SF PTEs are 32-bit even when scanout uses a wider DMA mask. */
 	chrome9_gem_set_dma32(shmem);
 	return &shmem->base;
+}
+
+/*
+ * GEM_CREATE_LOCAL objects occupy an SL range: the engine addresses it with
+ * location code 00, the CPU through a write-combined BAR mapping.
+ */
+static void chrome9_sl_takedown(struct drm_device *drm, void *data)
+{
+	struct chrome9_device *cdev = to_chrome9(drm);
+
+	drm_mm_takedown(&cdev->sl_mm);
+	iounmap(cdev->sl_wc);
+}
+
+/* The pool ends below the engine's SL use (occlusion page, GART table). */
+int chrome9_sl_init(struct chrome9_device *cdev, resource_size_t end)
+{
+	resource_size_t start = SZ_16M;
+
+	if (cdev->sl_ready)
+		return 0;
+	/* An SL scanout stays outside the pool. */
+	if (cdev->scanout_size && cdev->scanout_offset < end)
+		start = max_t(resource_size_t, start,
+			      cdev->scanout_offset + cdev->scanout_size);
+	start = ALIGN(start, PAGE_SIZE);
+	end = ALIGN_DOWN(min_t(resource_size_t, end,
+			       pci_resource_len(cdev->pdev, 2)), PAGE_SIZE);
+	if (end <= start + SZ_16M)
+		return -ENOSPC;
+	cdev->sl_wc = ioremap_wc(pci_resource_start(cdev->pdev, 2) + start,
+				 end - start);
+	if (!cdev->sl_wc)
+		return -ENOMEM;
+	drm_mm_init(&cdev->sl_mm, start, end - start);
+	cdev->sl_pool_start = start;
+	cdev->sl_ready = true;
+	return drmm_add_action_or_reset(&cdev->drm, chrome9_sl_takedown, NULL);
+}
+
+static void chrome9_local_free(struct drm_gem_object *obj)
+{
+	struct chrome9_device *cdev = to_chrome9(obj->dev);
+	struct chrome9_bo *bo = to_chrome9_bo(obj);
+
+	mutex_lock(&cdev->sl_lock);
+	drm_mm_remove_node(&bo->local);
+	mutex_unlock(&cdev->sl_lock);
+	drm_gem_object_release(obj);
+	kfree(bo);
+}
+
+static int chrome9_local_mmap(struct drm_gem_object *obj,
+			      struct vm_area_struct *vma)
+{
+	struct chrome9_device *cdev = to_chrome9(obj->dev);
+	struct chrome9_bo *bo = to_chrome9_bo(obj);
+
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+	return io_remap_pfn_range(vma, vma->vm_start,
+		(pci_resource_start(cdev->pdev, 2) + bo->local.start) >>
+		PAGE_SHIFT, vma->vm_end - vma->vm_start, vma->vm_page_prot);
+}
+
+static struct dma_buf *chrome9_local_export(struct drm_gem_object *obj,
+					    int flags)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static const struct vm_operations_struct chrome9_local_vm_ops = {
+	.open = drm_gem_vm_open,
+	.close = drm_gem_vm_close,
+};
+
+static const struct drm_gem_object_funcs chrome9_local_funcs = {
+	.free = chrome9_local_free,
+	.export = chrome9_local_export,
+	.mmap = chrome9_local_mmap,
+	.vm_ops = &chrome9_local_vm_ops,
+};
+
+static int chrome9_gem_create_local(struct drm_device *drm,
+				    struct drm_file *file,
+				    struct drm_chrome9_gem_create *args)
+{
+	struct chrome9_device *cdev = to_chrome9(drm);
+	size_t size = args->size;
+	struct chrome9_bo *bo;
+	int ret;
+
+	if (!cdev->sl_ready || args->flags != DRM_CHROME9_GEM_CREATE_LOCAL)
+		return -EOPNOTSUPP;
+	/* Draw requests name the exact object size. */
+	if (!IS_ALIGNED(args->size, PAGE_SIZE))
+		return -EINVAL;
+	bo = kzalloc_obj(*bo);
+	if (!bo)
+		return -ENOMEM;
+	bo->create_flags = args->flags;
+	bo->base.base.funcs = &chrome9_local_funcs;
+	drm_gem_private_object_init(drm, &bo->base.base, size);
+	mutex_lock(&cdev->sl_lock);
+	ret = drm_mm_insert_node_generic(&cdev->sl_mm, &bo->local, size,
+					 PAGE_SIZE, 0, DRM_MM_INSERT_BEST);
+	mutex_unlock(&cdev->sl_lock);
+	if (ret) {
+		drm_gem_object_release(&bo->base.base);
+		kfree(bo);
+		return ret == -ENOSPC ? -ENOMEM : ret;
+	}
+	/* The range held another process's data. */
+	memset_io(cdev->sl_wc + (bo->local.start - cdev->sl_pool_start), 0,
+		  size);
+	wmb();
+	ret = drm_gem_create_mmap_offset(&bo->base.base);
+	if (!ret)
+		ret = drm_gem_handle_create(file, &bo->base.base,
+					    &args->handle);
+	if (!ret)
+		args->mmap_offset =
+			drm_vma_node_offset_addr(&bo->base.base.vma_node);
+	drm_gem_object_put(&bo->base.base);
+	return ret;
 }
 
 static inline struct chrome9_framebuffer *
@@ -287,7 +413,8 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		return ERR_PTR(ret);
 	}
 	obj = drm_gem_fb_get_obj(&chrome9_fb->base, 0);
-	if (!obj || obj->dev != drm || drm_gem_is_imported(obj)) {
+	if (!obj || obj->dev != drm || drm_gem_is_imported(obj) ||
+	    chrome9_gem_is_local(obj)) {
 		chrome9_fb_destroy(&chrome9_fb->base);
 		return ERR_PTR(-EINVAL);
 	}
@@ -489,9 +616,14 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	if (args->flags & ~(DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT |
-			    DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) ||
+			    DRM_CHROME9_GEM_CREATE_GUARDED_SHARED |
+			    DRM_CHROME9_GEM_CREATE_LOCAL) ||
 	    !args->size || args->handle || args->mmap_offset)
 		return -EINVAL;
+	if (args->size > CHROME9_MAX_BO_SIZE)
+		return -E2BIG;
+	if (args->flags & DRM_CHROME9_GEM_CREATE_LOCAL)
+		return chrome9_gem_create_local(drm, file, args);
 	if ((args->flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) &&
 	    (!IS_ALIGNED(args->size, PAGE_SIZE) || args->size <= 2 * PAGE_SIZE))
 		return -EINVAL;

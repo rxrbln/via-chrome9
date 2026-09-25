@@ -10,6 +10,7 @@
 #include <linux/vgaarb.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_mm.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_simple_kms_helper.h>
@@ -126,6 +127,13 @@ struct chrome9_device {
 	u64 sl_base;
 	resource_size_t scanout_offset;
 	resource_size_t scanout_size;
+	/* GEM_CREATE_LOCAL pool: SL byte range, allocator and a
+	 * write-combined mapping for clearing new objects. */
+	struct drm_mm sl_mm;
+	struct mutex sl_lock;
+	bool sl_ready;
+	resource_size_t sl_pool_start;
+	void __iomem *sl_wc;
 	/* vgaarb permits nested same-device users; serialize SEQ index/data. */
 	struct mutex seq_lock;
 	/* Serializes CPU copies into the single BAR2 staging interval. */
@@ -185,6 +193,8 @@ struct chrome9_bo {
 	u64 guard_mapping_size;
 	/* DRM_CHROME9_GEM_CREATE_* flags of the object. */
 	u32 create_flags;
+	/* GEM_CREATE_LOCAL: the SL range; the object has no shmem pages. */
+	struct drm_mm_node local;
 	/* Cached draw mapping (engine submit lock). */
 	struct chrome9_sf_mapping *draw_mapping;
 	/* Vertex elements found finite since the last announced CPU write
@@ -202,10 +212,22 @@ struct chrome9_finite_element {
 };
 
 void chrome9_bo_hold_kmap(struct chrome9_bo *bo);
+int chrome9_sl_init(struct chrome9_device *cdev, resource_size_t end);
 
 static inline struct chrome9_bo *to_chrome9_bo(struct drm_gem_object *obj)
 {
 	return container_of(obj, struct chrome9_bo, base.base);
+}
+
+/* Objects in the local frame buffer (no shmem pages, no SF mapping). */
+static inline bool chrome9_bo_is_local(const struct chrome9_bo *bo)
+{
+	return bo->create_flags & DRM_CHROME9_GEM_CREATE_LOCAL;
+}
+
+static inline bool chrome9_gem_is_local(struct drm_gem_object *obj)
+{
+	return obj && chrome9_bo_is_local(to_chrome9_bo(obj));
 }
 
 struct drm_gem_object *chrome9_gem_create_object(struct drm_device *drm,

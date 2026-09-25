@@ -2657,6 +2657,8 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			args->value |= chrome9_engine_capabilities2();
 		if (chrome9_engine_ready(cdev) && chrome9_engine_fence_irq(cdev))
 			args->value |= DRM_CHROME9_CAP2_FENCE_IRQ;
+		if (chrome9_engine_ready(cdev) && cdev->sl_ready)
+			args->value |= DRM_CHROME9_CAP2_LOCAL_MEMORY;
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
@@ -2841,6 +2843,7 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 		return PTR_ERR(cdev);
 	cdev->pdev = pdev;
 	mutex_init(&cdev->seq_lock);
+	mutex_init(&cdev->sl_lock);
 	ret = chrome9_read_status(cdev);
 	if (ret)
 		return ret;
