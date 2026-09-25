@@ -930,12 +930,17 @@ chrome9_buffer_rename(struct chrome9_resource *resource, unsigned usage,
    struct pipe_screen *screen = resource->base.screen;
    const int fd = screen->get_screen_fd(screen);
    struct chrome9_bo old = resource->bo, bo;
+   const uint64_t copy = (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) ? 0 :
+                         (usage & PIPE_MAP_DISCARD_RANGE) ?
+                            old.size - box->width : old.size;
    uint32_t busy;
 
    if (resource->base.target != PIPE_BUFFER ||
        (usage & (PIPE_MAP_READ | PIPE_MAP_UNSYNCHRONIZED |
                  PIPE_MAP_PERSISTENT | PIPE_MAP_COHERENT)) ||
        !(usage & PIPE_MAP_WRITE) || !old.handle_owned || old.shared ||
+       /* Copying more than the map writes costs more than the wait. */
+       copy > (uint64_t)box->width ||
        !old.map || chrome9_resource_is_local(resource) ||
        !chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_GEM_BUSY) ||
        !chrome9_bo_busy(fd, &old, &busy) ||
