@@ -1,7 +1,44 @@
 # Chrome9 glmark2 terrain current boundary
 
 Status: source-exact offline audit against installed glmark2 2023.01 and
-Chrome9 driver commit `d56f61f`.  No DRM node or GPU was used.
+Chrome9 driver commit `d56f61f` (no GPU), extended by the silicon frame-time
+audit of 2026-09-25 below.
+
+## Frame-time audit on silicon (2026-09-25, lib `tbias2`, 800x600)
+
+Measured with `CHROME9_SW_DEBUG=1 CHROME9_SW_SYNC=1` and two `perf` runs
+(logs on the target in `/root/tmp/terrain-inv/`): 560-710 ms per frame.
+
+| part | cost per frame | reason |
+|---|---|---|
+| main terrain draw, 393216 vertices, in llvmpipe | ~380 ms (~220 ms vertex/setup/clip, ~160 ms fragments) | every vertex shader that samples a texture renders in llvmpipe (`chrome9_context.c`, VS `textures_used`); the TCL engine has no vertex fetch from textures |
+| of which `draw_reset_vertex_ids` | ~70 ms | llvmpipe's 4 KiB vbuf flushes every ~40 vertices and each flush walks the whole vertex array |
+| bloom and tilt-shift passes (hardware) plus CPU mipmap generation | ~127 ms | 557 -> 430 ms with `bloom=false:tilt-shift=false` |
+| noise pass (256x256, two triangles) in llvmpipe | ~12 ms | the only rejected fragment program |
+
+Only the noise program (`terrain-noise.frag`) is rejected (`reject ir=96
+temps=98` twice: create and the face variant).  The rejection lands in
+octave 1's third `permute`; a single octave is already beyond 96 records.
+All other programs compile: normal map 26, main terrain 85 records with
+5 TEX, bloom 34, overlay 2, tilt 64 (before the MAD fusion below).
+
+The noise program cannot run natively even when it fits: `permute()`
+needs exact integers up to about 2.8e6 (22 bits), while the 16-bit
+fragment mantissa is exact only up to 2^17 and `1/289` is inexact; the
+terrain would differ far beyond an LSB.  A best-case compiler still needs
+about 90 records per octave (about 360 in total).  Keep it in llvmpipe.
+Nothing is cacheable under GL semantics: `uvOffset` changes every frame, so
+the height map and the normal map derived from it change too.
+
+To reach 15 fps the main draw has to leave llvmpipe: either prefetch the
+LOD 0 vertex texture reads on the CPU into an extra vertex stream for the
+TCL engine (786k bilinear reads per frame, estimated 15-40 ms), or run
+the vertex stage in the LLVM draw module with hardware fragments (then the
+16-triangle draw batch has to grow towards the kernel's 128).  Both also
+need the post-processing chain well below 66 ms.
+
+With MAD fusion (Mesa, `chrome9_nir_optimize_semantic`) the records drop
+to: main 85 -> 72, tilt 64 -> 55, bloom 34 -> 30, normal map 26 -> 23.
 
 ## Result
 
