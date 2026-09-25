@@ -312,6 +312,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_COARSE_Z		(1ULL << 23)
 /* Fragment draw flags FRAGMENT_FAST_Z and FRAGMENT_FAST_Z_INDEX. */
 #define DRM_CHROME9_CAP2_FAST_Z			(1ULL << 24)
+/* Vertex program raster flag RASTER_EDGE_AA. */
+#define DRM_CHROME9_CAP2_EDGE_AA		(1ULL << 25)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1627,6 +1629,12 @@ struct drm_chrome9_vertex_buffer {
  * POINT_LIST; bit 1 is reserved. */
 #define DRM_CHROME9_RASTER_POINT_SPRITE		(1U << 0)
 #define DRM_CHROME9_RASTER_POINT_SIZE_VERTEX	(1U << 2)
+/*
+ * CAP2_EDGE_AA, lines and filled triangles: edge antialiasing (A01 bit 5).
+ * Edge pixels are blended with the destination by coverage after the
+ * blend stage, whatever the blend state.
+ */
+#define DRM_CHROME9_RASTER_EDGE_AA		(1U << 3)
 #define DRM_CHROME9_RASTER_SPRITE_MASK(m)	((__u32)(m) << 8)
 /* Polygon mode per screen winding of a triangle topology; a POINT face
  * requires POINT on both windings. */
