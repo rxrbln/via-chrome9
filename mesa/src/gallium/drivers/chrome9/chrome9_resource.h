@@ -12,6 +12,14 @@
 struct pipe_context;
 struct pipe_screen;
 
+/* Single-image targets; 1D is a height-1 2D image. */
+static inline bool
+chrome9_is_surface_target(enum pipe_texture_target target)
+{
+   return target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT ||
+          target == PIPE_TEXTURE_1D;
+}
+
 /* Created through a LINEAR modifier: shared yet guarded (BO + PAGE). */
 #define CHROME9_RESOURCE_FLAG_CANONICAL_SHARED PIPE_RESOURCE_FLAG_DRV_PRIV
 

@@ -29,6 +29,7 @@ libchrome9 = static_library(
     'chrome9_shader_offline.c',
     'chrome9_specialise.c',
     'chrome9_tcl.c',
+    'chrome9_tex_lower.c',
     'chrome9_vs_texture.c',
     chrome9_sw_files,
   ),

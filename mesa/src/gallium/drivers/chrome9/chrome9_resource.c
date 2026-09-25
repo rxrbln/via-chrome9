@@ -46,12 +46,6 @@ struct chrome9_resource_layout {
 };
 
 static bool
-chrome9_is_surface_target(enum pipe_texture_target target)
-{
-   return target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT;
-}
-
-static bool
 chrome9_u64_add(uint64_t a, uint64_t b, uint64_t *result)
 {
    if (a > UINT64_MAX - b)
@@ -149,7 +143,7 @@ chrome9_resource_layout(struct pipe_screen *screen,
    if ((!chrome9_is_surface_target(templ->target) && !cube && !volume) ||
        !cpp ||
        (chrome9_format_is_d24(templ->format) &&
-        (templ->target != PIPE_TEXTURE_2D || templ->last_level)) ||
+        (templ->target == PIPE_TEXTURE_RECT || templ->last_level)) ||
        (dxt && templ->target != PIPE_TEXTURE_2D) ||
        (volume && (!templ->depth0 ||
                    templ->depth0 > CHROME9_MAX_VOLUME_DEPTH ||
@@ -327,7 +321,7 @@ chrome9_format_supported(struct pipe_screen *screen,
                                       PIPE_BIND_SCANOUT);
    }
    if (format == PIPE_FORMAT_X8Z24_UNORM)
-      return target == PIPE_TEXTURE_2D &&
+      return (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_1D) &&
              /* Enable only for guarded validation until the complete
               * Gallium FBO/draw/clear/rebind path passes on silicon. */
              debug_get_bool_option("CHROME9_EXPERIMENTAL_X8Z24", false) &&
@@ -336,7 +330,7 @@ chrome9_format_supported(struct pipe_screen *screen,
              !(bindings & ~depth_bindings);
    /* Stencil shares the D24 gate until its guarded silicon oracles pass. */
    if (format == PIPE_FORMAT_S8_UINT_Z24_UNORM)
-      return target == PIPE_TEXTURE_2D &&
+      return (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_1D) &&
              debug_get_bool_option("CHROME9_EXPERIMENTAL_X8Z24", false) &&
              chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_FRAGMENT_STENCIL) &&
@@ -1133,6 +1127,7 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
    format_info = chrome9_texture_format_info(format);
    if (!pipe || !pres || !pipe->texture_map || !pipe->texture_unmap ||
        (pres->target != PIPE_TEXTURE_2D &&
+        pres->target != PIPE_TEXTURE_1D &&
         pres->target != PIPE_TEXTURE_CUBE) || pres->depth0 != 1 ||
        pres->nr_samples > 1 ||
        pres->nr_storage_samples > 1 || format != pres->format ||

@@ -15,6 +15,7 @@
 #include "chrome9_ps_schedule.h"
 #include "chrome9_resource.h"
 #include "chrome9_specialise.h"
+#include "chrome9_tex_lower.h"
 
 #include <float.h>
 #include <math.h>
@@ -427,6 +428,64 @@ chrome9_bind_rasterizer_state(struct pipe_context *pipe, void *state)
    ctx->rasterizer = state;
 }
 
+/* DRM_CHROME9_TEXTURE_WRAP_* of a Gallium wrap mode, zero without one. */
+static uint8_t
+chrome9_sampler_wrap(struct pipe_screen *screen, unsigned wrap)
+{
+   switch (wrap) {
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
+      return DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   case PIPE_TEX_WRAP_REPEAT:
+      return DRM_CHROME9_TEXTURE_WRAP_REPEAT;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT:
+      return DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      return chrome9_screen_has_capability2(screen,
+                DRM_CHROME9_CAP2_TEXTURE_BORDER) ?
+             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER : 0;
+   case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE:
+      return chrome9_screen_has_capability2(screen,
+                DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE) ?
+             DRM_CHROME9_TEXTURE_WRAP_MIRROR_CLAMP_TO_EDGE : 0;
+   default:
+      return 0;
+   }
+}
+
+/* The sampler takes an ARGB8888 border, as the vendor drivers do. */
+static uint32_t
+chrome9_border_argb(const union pipe_color_union *color)
+{
+   uint32_t argb = 0;
+
+   for (unsigned i = 0; i < 4; i++) {
+      static const unsigned shift[4] = { 16, 8, 0, 24 };
+
+      argb |= (uint32_t)lroundf(CLAMP(color->f[i], 0.0f, 1.0f) * 255.0f) <<
+              shift[i];
+   }
+   return argb;
+}
+
+/*
+ * The A30 LOD limits are whole levels.  A fractional limit under NEAREST mip
+ * selection becomes the level GL selects at that LOD; LINEAR blends need it.
+ */
+static bool
+chrome9_lod_level(float lod, unsigned mip_filter, float *level)
+{
+   if (!isfinite(lod))
+      return false;
+   if (lod <= 0.0f || lod == floorf(lod)) {
+      *level = MAX2(lod, 0.0f);
+      return true;
+   }
+   if (mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
+      return false;
+   *level = lod <= 0.5f ? 0.0f : ceilf(lod + 0.5f) - 1.0f;
+   return true;
+}
+
 static void *
 chrome9_create_sampler_state(struct pipe_context *pipe,
                              const struct pipe_sampler_state *state)
@@ -434,7 +493,6 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
    struct chrome9_sampler_state *sampler =
       CALLOC_STRUCT(chrome9_sampler_state);
 
-   (void)pipe;
    if (!sampler)
       return NULL;
    sampler->base = *state;
@@ -460,29 +518,25 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
       break;
    default: sampler->supported = false; break;
    }
-   switch (state->wrap_s) {
-   case PIPE_TEX_WRAP_CLAMP_TO_EDGE: sampler->wrap_s = 1; break;
-   case PIPE_TEX_WRAP_REPEAT: sampler->wrap_s = 2; break;
-   case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_s = 3; break;
-   default: sampler->supported = false; break;
+   sampler->wrap_s = chrome9_sampler_wrap(pipe->screen, state->wrap_s);
+   sampler->wrap_t = chrome9_sampler_wrap(pipe->screen, state->wrap_t);
+   sampler->wrap_r = chrome9_sampler_wrap(pipe->screen, state->wrap_r);
+   if (!sampler->wrap_s || !sampler->wrap_t)
+      sampler->supported = false;
+   if (sampler->wrap_s == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       sampler->wrap_t == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       sampler->wrap_r == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER) {
+      if (state->border_color_is_integer)
+         sampler->supported = false;
+      sampler->border_color = chrome9_border_argb(&state->border_color);
    }
-   switch (state->wrap_t) {
-   case PIPE_TEX_WRAP_CLAMP_TO_EDGE: sampler->wrap_t = 1; break;
-   case PIPE_TEX_WRAP_REPEAT: sampler->wrap_t = 2; break;
-   case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_t = 3; break;
-   default: sampler->supported = false; break;
-   }
-   switch (state->wrap_r) {
-   case PIPE_TEX_WRAP_CLAMP_TO_EDGE: sampler->wrap_r = 1; break;
-   case PIPE_TEX_WRAP_REPEAT: sampler->wrap_r = 2; break;
-   case PIPE_TEX_WRAP_MIRROR_REPEAT: sampler->wrap_r = 3; break;
-   default: sampler->wrap_r = 0; break;
-   }
-   if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
-       state->unnormalized_coords || !isfinite(state->lod_bias) ||
+   /* The comparison runs in the fragment shader (chrome9_nir_lower_shadow). */
+   if (state->unnormalized_coords || !isfinite(state->lod_bias) ||
        state->lod_bias < -16.0f || state->lod_bias > 511.0f / 32.0f ||
-       state->min_lod != 0.0f || !isfinite(state->max_lod) ||
-       state->max_lod < 0.0f ||
+       !chrome9_lod_level(state->min_lod, state->min_mip_filter,
+                          &sampler->min_level) ||
+       !chrome9_lod_level(state->max_lod, state->min_mip_filter,
+                          &sampler->max_level) ||
        state->max_anisotropy > 1 || state->seamless_cube_map ||
        state->reduction_mode != PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE)
       sampler->supported = false;
@@ -5967,6 +6021,7 @@ static bool
 chrome9_select_fs_variant(struct chrome9_context *ctx)
 {
    struct chrome9_shader *shader = ctx->fs;
+   uint16_t shadow_keys[PIPE_MAX_SAMPLERS] = { 0 };
    nir_shader *canonical;
    unsigned count;
    uint8_t face_mode = 0;
@@ -5974,6 +6029,11 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
 
    if (!shader || !shader->nir)
       return shader && shader->supported;
+   u_foreach_bit(unit, shader->shadow_sampler_mask & BITFIELD_MASK(PIPE_MAX_SAMPLERS))
+      shadow_keys[unit] = chrome9_shadow_key(
+         unit < ctx->num_sampler_states && ctx->sampler_states[unit] ?
+         &ctx->sampler_states[unit]->base : NULL,
+         unit < ctx->num_sampler_views ? ctx->sampler_views[unit] : NULL);
    /* A dynamic canonical program needs no variants.  In particular, a
     * natively lowered select must not exhaust the bounded variant cache as
     * its control uniform takes on many different values. */
@@ -5987,7 +6047,7 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
       else if (ctx->rasterizer->cull_face == PIPE_FACE_FRONT)
          face_mode = 2;
    }
-   if (!count && !face_mode) {
+   if (!count && !face_mode && !shader->shadow_sampler_mask) {
       /* A previous cull-specialized variant must not survive a transition
        * back to dynamic FACE with no uniform specialization key. */
       shader->supported = false;
@@ -6002,7 +6062,8 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
    for (struct chrome9_fs_variant *variant = shader->variants;
         variant; variant = variant->next) {
       if (variant->face_mode == face_mode &&
-          !memcmp(variant->inline_values, ctx->fs_inline, bytes)) {
+          !memcmp(variant->inline_values, ctx->fs_inline, bytes) &&
+          !memcmp(variant->shadow_keys, shadow_keys, sizeof(shadow_keys))) {
          chrome9_apply_fs_variant(shader, variant);
          return shader->supported;
       }
@@ -6024,8 +6085,11 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
 
    variant->face_mode = face_mode;
    memcpy(variant->inline_values, ctx->fs_inline, bytes);
+   memcpy(variant->shadow_keys, shadow_keys, sizeof(shadow_keys));
    if (count)
       chrome9_nir_inline_uniforms(clone, variant->inline_values);
+   if (shader->shadow_sampler_mask)
+      chrome9_nir_lower_shadow(clone, PIPE_MAX_SAMPLERS, shadow_keys);
    if (face_mode)
       chrome9_nir_specialize_front_face(clone, face_mode == 1);
    chrome9_compile_fs_nir(ctx, &compiled, clone);
@@ -6129,6 +6193,13 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       return NULL;
    }
    if (state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
+      if (chrome9_nir_needs_hw_texture_lowering(state->ir.nir)) {
+         if (chrome9_sw_enabled())
+            shader->sw_nir = nir_shader_clone(NULL, state->ir.nir);
+         chrome9_nir_lower_hw_textures(state->ir.nir);
+      }
+      shader->shadow_sampler_mask =
+         chrome9_nir_shadow_sampler_mask(state->ir.nir);
       shader->nir = state->ir.nir;
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);
@@ -6212,6 +6283,7 @@ chrome9_delete_fs_state(struct pipe_context *pipe, void *state)
       shader->variants = variant->next;
       FREE(variant);
    }
+   ralloc_free(shader->sw_nir);
    ralloc_free(shader->nir);
    FREE(shader);
 }
@@ -6320,8 +6392,7 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                        templ->u.tex.last_level <= texture->last_level &&
                        chrome9_resource(texture)->guarded;
    bool supported = view && texture && !volume &&
-                    (((texture->target == PIPE_TEXTURE_2D ||
-                       texture->target == PIPE_TEXTURE_RECT) &&
+                    ((chrome9_is_surface_target(texture->target) &&
                       templ->target == texture->target) || cube) &&
                     templ->format == texture->format &&
                     chrome9_texture_format_info(templ->format) &&

@@ -147,6 +147,13 @@ chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
           (!ctx->fs->semantic_passthrough || chrome9_query_counting(ctx));
 }
 
+/* A shadow TEX whose comparison the current FS variant computes. */
+static bool
+chrome9_depth_compare(const struct chrome9_context *ctx, unsigned unit)
+{
+   return ctx->fs && (ctx->fs->shadow_sampler_mask & (1u << unit));
+}
+
 /*
  * A shader-visible 3D view the sampler cannot take sends the draw to
  * llvmpipe: native volumes are POT, level zero, without mip filtering
@@ -167,6 +174,14 @@ chrome9_draw_needs_sw_textures(const struct chrome9_context *ctx)
           (generic && !(ctx->fs->semantic_sampler_mask & (1u << i))))
          continue;
       if (chrome9_sampler_view((struct pipe_sampler_view *)view)->sw_only)
+         return true;
+      /* Sampler states beyond the hardware (fractional LINEAR LOD limits,
+       * filtered D24 without a compare) sample in llvmpipe. */
+      if ((sampler && !sampler->supported) ||
+          (sampler && res->format == PIPE_FORMAT_X8Z24_UNORM &&
+           !chrome9_depth_compare(ctx, i) &&
+           (sampler->min_filter != DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+            sampler->mag_filter != DRM_CHROME9_TEXTURE_FILTER_NEAREST)))
          return true;
       if (res->target != PIPE_TEXTURE_3D)
          continue;
@@ -851,7 +866,8 @@ chrome9_mip_view_supported(const struct chrome9_context *ctx,
    if (!last_level || last_level > 9 || last_level > resource->last_level ||
        last_level > util_logbase2(resource->width0) ||
        (last_level == 9 && resource->width0 != 512) ||
-       sampler->base.max_lod < (float)last_level)
+       sampler->min_level != 0.0f ||
+       sampler->max_level < (float)last_level)
       return false;
 
    page_size = sysconf(_SC_PAGESIZE);
@@ -988,8 +1004,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          surface->first_layer != surface->last_layer)) ||
        (depth_only && ctx->render_target !=
                       ctx->depth_only_scratch) ||
-       (resource->target != PIPE_TEXTURE_2D &&
-        resource->target != PIPE_TEXTURE_RECT) ||
+       !chrome9_is_surface_target(resource->target) ||
        (resource->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         resource->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
        (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM &&
@@ -1090,8 +1105,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
           (surface->format != PIPE_FORMAT_Z16_UNORM && !d24) ||
           surface->level ||
           surface->first_layer || surface->last_layer ||
-          ((*depth)->base.target != PIPE_TEXTURE_2D &&
-           (*depth)->base.target != PIPE_TEXTURE_RECT) ||
+          !chrome9_is_surface_target((*depth)->base.target) ||
           (*depth)->base.format != surface->format ||
           !(*depth)->guarded || !(*depth)->bo.handle ||
           (*depth)->base.width0 != resource->width0 ||
@@ -1202,14 +1216,20 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
          *reason = "sampler-state";
          if (!samplers[unit] || !samplers[unit]->supported || !source)
             return false;
+         /* Border and mirror-once exist in the fragment program ABI only. */
+         if (!chrome9_use_generic_fragment_program(ctx) &&
+             (samplers[unit]->wrap_s >
+                 DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT ||
+              samplers[unit]->wrap_t >
+                 DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT))
+            return false;
          textures[unit] = chrome9_resource(source);
          *reason = "texture-resource";
          if (original == resource || source == resource ||
              textures[unit]->bo.handle == (*target)->bo.handle ||
              (*depth_active &&
               textures[unit]->bo.handle == (*depth)->bo.handle) ||
-             (source->target != PIPE_TEXTURE_2D &&
-              source->target != PIPE_TEXTURE_RECT &&
+             (!chrome9_is_surface_target(source->target) &&
               ((source->target != PIPE_TEXTURE_CUBE &&
                 source->target != PIPE_TEXTURE_3D) ||
                !chrome9_use_generic_fragment_program(ctx))) ||
@@ -1238,11 +1258,14 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
                  (source->target == PIPE_TEXTURE_3D)))
             return false;
          *reason = "mip-view-state";
+         /* D24 is point sampled only; a compare may request LINEAR, whose
+          * result GL leaves implementation-dependent (vendor: nearest). */
          if (source->format == PIPE_FORMAT_X8Z24_UNORM &&
-             (samplers[unit]->min_filter !=
-                 DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
-              samplers[unit]->mag_filter !=
-                 DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+             ((!chrome9_depth_compare(ctx, logical) &&
+               (samplers[unit]->min_filter !=
+                   DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+                samplers[unit]->mag_filter !=
+                   DRM_CHROME9_TEXTURE_FILTER_NEAREST)) ||
               samplers[unit]->mip_filter !=
                  DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
               view->u.tex.last_level || source->last_level))
@@ -1564,7 +1587,9 @@ chrome9_generic_fragment_state(
          memcpy(depth_swizzle[logical], opaque, sizeof(opaque));
          continue;
       }
-      if (textures[unit]->base.format != PIPE_FORMAT_X8Z24_UNORM)
+      /* The lowered compare reads the raw depth and swizzles itself. */
+      if (textures[unit]->base.format != PIPE_FORMAT_X8Z24_UNORM ||
+          chrome9_depth_compare(crender->ctx, logical))
          continue;
       if (!view)
          return false;
@@ -1633,9 +1658,16 @@ chrome9_generic_fragment_state(
       texture_state[unit].last_level = last_level;
       texture_state[unit].min_filter = samplers[unit]->min_filter;
       texture_state[unit].mag_filter = samplers[unit]->mag_filter;
+      if (resource->format == PIPE_FORMAT_X8Z24_UNORM) {
+         texture_state[unit].min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+         texture_state[unit].mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+      }
       texture_state[unit].mip_filter = samplers[unit]->mip_filter;
       texture_state[unit].wrap_s = samplers[unit]->wrap_s;
       texture_state[unit].wrap_t = samplers[unit]->wrap_t;
+      /* 1D samples its single row at T = 0.5 whatever the T mode. */
+      if (resource->target == PIPE_TEXTURE_1D)
+         texture_state[unit].wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
       if (resource->target == PIPE_TEXTURE_CUBE) {
          /* No seamless filtering: face coordinates clamp to the edge. */
          texture_state[unit].target = DRM_CHROME9_FRAGMENT_TARGET_CUBE;
@@ -1651,14 +1683,21 @@ chrome9_generic_fragment_state(
          texture_state[unit].mip_filter =
             DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
       }
+      if (texture_state[unit].wrap_s ==
+             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+          texture_state[unit].wrap_t ==
+             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+          texture_state[unit].wrap_r ==
+             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER)
+         texture_state[unit].border_color = samplers[unit]->border_color;
       texture_state[unit].lod_bias_s5_5 = CLAMP(
          lroundf(samplers[unit]->base.lod_bias * 32.0f), -512, 511);
       /* Sampler LOD limits count from the view's base level. */
       texture_state[unit].min_lod_s5_5 = CLAMP(
-         lroundf((samplers[unit]->base.min_lod + view_first_level) * 32.0f),
+         lroundf((samplers[unit]->min_level + view_first_level) * 32.0f),
          (int)view_first_level * 32, max_lod);
       texture_state[unit].max_lod_s5_5 = CLAMP(
-         lroundf((samplers[unit]->base.max_lod + view_first_level) * 32.0f),
+         lroundf((samplers[unit]->max_level + view_first_level) * 32.0f),
          texture_state[unit].min_lod_s5_5, max_lod);
       for (unsigned level = 0; level <= last_level; level++) {
          if (textures[unit]->level_offset[level] > UINT32_MAX)

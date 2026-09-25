@@ -66,6 +66,8 @@ struct chrome9_fs_variant {
    uint32_t inline_values[MAX_INLINABLE_UNIFORMS];
    /* 0: dynamic FACE, 1: surviving front face, 2: surviving back face. */
    uint8_t face_mode;
+   /* chrome9_shadow_key() of every shadow sampler, zero otherwise. */
+   uint16_t shadow_keys[PIPE_MAX_SAMPLERS];
    enum chrome9_fragment_program fragment_program;
    uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
@@ -105,8 +107,10 @@ struct chrome9_shader {
    void *nir;
    /* Hardware TCL form of a vertex shader, compiled on first use. */
    struct chrome9_tcl_shader *tcl;
-   /* Vertex shader NIR kept for the llvmpipe fragment fallback. */
+   /* NIR before hardware-only lowering, kept for the llvmpipe fallback. */
    struct nir_shader *sw_nir;
+   /* Fragment samplers read by shadow TEX; variants lower the compare. */
+   uint32_t shadow_sampler_mask;
    struct chrome9_fs_variant *variants;
    unsigned variant_count;
    enum chrome9_fragment_program fragment_program;
@@ -146,6 +150,11 @@ struct chrome9_sampler_state {
    uint8_t wrap_t;
    /* Zero when R wrapping has no native mode; only 3D reads it. */
    uint8_t wrap_r;
+   /* ARGB8888, set when an axis wraps to the border. */
+   uint32_t border_color;
+   /* Whole-level LOD limits (chrome9_lod_level). */
+   float min_level;
+   float max_level;
    bool supported;
 };
 

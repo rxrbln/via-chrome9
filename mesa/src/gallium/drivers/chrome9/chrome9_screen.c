@@ -554,6 +554,11 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
        chrome9_screen_has_capability(&screen->base,
                                      DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM))
       caps->max_texture_cube_levels = 9;
+   /* Depth compare runs in the fragment shader on the raw D24 sample. */
+   caps->texture_shadow_map = chrome9_screen_has_capability(
+      &screen->base, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
+   caps->texture_mirror_clamp_to_edge = chrome9_screen_has_capability2(
+      &screen->base, DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE);
    caps->max_render_targets = 1;
    /* The bounded draw paths support a 16-bit Z buffer with both 32-bit
     * XRGB and BGRA color targets.  DRI needs this explicit contract or it
