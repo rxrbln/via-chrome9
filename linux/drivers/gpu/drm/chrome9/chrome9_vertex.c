@@ -225,7 +225,7 @@ static int chrome9_vertex_validate_relative(struct chrome9_vertex_state *state,
 	unsigned int lane = src->relative - DRM_CHROME9_VERTEX_RELATIVE_A0_X;
 
 	if (!(state->address & BIT(lane)))
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	if (!selected)
 		return 0;
 	if (!(state->address_read & BIT(lane))) {
@@ -251,25 +251,25 @@ static int chrome9_vertex_validate_source(struct chrome9_vertex_state *state,
 	    src->relative > DRM_CHROME9_VERTEX_RELATIVE_A0_W ||
 	    (src->relative && (src->file != DRM_CHROME9_VERTEX_FILE_CONSTANT ||
 			       insn->op == DRM_CHROME9_VERTEX_OP_ARL)))
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	for (lane = 0; lane < 4; lane++)
 		if (src->swizzle[lane] > DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 	/* Silicon: the scalar unit reads constants incorrectly (RCP(1.25) =
 	 * 1/1.5); temps and inputs are exact. */
 	if (chrome9_vertex_scalar_op(insn->op) &&
 	    src->file == DRM_CHROME9_VERTEX_FILE_CONSTANT)
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	if (chrome9_vertex_scalar_op(insn->op))
 		for (lane = 1; lane < 4; lane++)
 			if (src->swizzle[lane] != src->swizzle[0])
-				return -EINVAL;
+				return CHROME9_EINVAL;
 	selected = chrome9_vertex_selected(insn, source);
 	switch (src->file) {
 	case DRM_CHROME9_VERTEX_FILE_TEMP:
 		if (src->index >= DRM_CHROME9_VERTEX_MAX_TEMPS ||
 		    (selected & ~state->defined[src->index]))
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		if (selected)
 			state->last_touch[src->index] = instruction;
 		break;
@@ -277,14 +277,14 @@ static int chrome9_vertex_validate_source(struct chrome9_vertex_state *state,
 		if (src->index >= state->input_count ||
 		    (state->input_lanes &&
 		     (selected & ~state->input_lanes[src->index])))
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		break;
 	case DRM_CHROME9_VERTEX_FILE_CONSTANT:
 		if (src->relative)
 			return chrome9_vertex_validate_relative(state, src, selected);
 		if (src->index < state->constant_first ||
 		    src->index >= state->constant_end)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		break;
 	}
 	return 0;
@@ -319,7 +319,7 @@ static int chrome9_vertex_validate_ports(
 				distinct++;
 		}
 		if (distinct > 1)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 	}
 	return 0;
 }
@@ -354,36 +354,36 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	if (!mask || mask > 0xf || dst->modifier & ~DRM_CHROME9_FRAGMENT_DEST_SAT ||
 	    (insn->op == DRM_CHROME9_VERTEX_OP_ARL) !=
 	    (dst->file == DRM_CHROME9_VERTEX_DEST_ADDRESS))
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	switch (dst->file) {
 	case DRM_CHROME9_VERTEX_DEST_ADDRESS:
 		if (!state->relative || dst->index || dst->modifier)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		state->arl = true;
 		state->address |= mask;
 		state->writemask[instruction] = mask;
 		return 0;
 	case DRM_CHROME9_VERTEX_DEST_TEMP:
 		if (dst->index >= DRM_CHROME9_VERTEX_MAX_TEMPS)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		state->last_touch[dst->index] = instruction;
 		if (state->first_def[dst->index] == CHROME9_VERTEX_NO_DEF)
 			state->first_def[dst->index] = instruction;
 		/* Flow regions may rewrite a temp (loop-carried values). */
 		if (state->defined[dst->index] & mask && !state->depth)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		state->defined[dst->index] |= mask;
 		state->writemask[instruction] = mask;
 		return 0;
 	case DRM_CHROME9_VERTEX_DEST_POSITION:
 		if (dst->index)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		defined = &state->position_mask;
 		state->position_writes++;
 		break;
 	case DRM_CHROME9_VERTEX_DEST_PRIMARY:
 		if (dst->index)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		/* Outputs are write-only: drop what the fragment ignores. */
 		if (!fragment->primary_used)
 			mask = 0;
@@ -391,7 +391,7 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 		break;
 	case DRM_CHROME9_VERTEX_DEST_VARYING:
 		if (dst->index >= DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		packed = chrome9_vertex_packed_varying(fragment, dst->index);
 		/* Sprite coordinates replace the VS value. */
 		if (packed < 0 || state->sprite_mask & BIT(dst->index)) {
@@ -405,7 +405,7 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 		break;
 	case DRM_CHROME9_VERTEX_DEST_BACK_PRIMARY:
 		if (dst->index || !state->two_side)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		if (!fragment->primary_used)
 			mask = 0;
 		defined = &state->back_mask;
@@ -413,13 +413,13 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	case DRM_CHROME9_VERTEX_DEST_CLIP_DISTANCE:
 		if (dst->index >= DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES ||
 		    mask != 1)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		if (!(state->clip_mask & BIT(dst->index))) {
 			state->writemask[instruction] = 0;
 			return 0;
 		}
 		if (state->clip_written & BIT(dst->index))
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		state->clip_written |= BIT(dst->index);
 		state->writemask[instruction] =
 			BIT(chrome9_vertex_clip_rank(state, dst->index) % 3);
@@ -427,16 +427,16 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	case DRM_CHROME9_VERTEX_DEST_POINT_SIZE:
 		if (dst->index || mask != 1 || dst->modifier ||
 		    (state->point_size && state->point_size_written))
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		state->point_size_written = state->point_size;
 		/* The vendor writes oPts with all lanes (0008027f). */
 		state->writemask[instruction] = state->point_size ? 0xf : 0;
 		return 0;
 	default:
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	}
 	if (*defined & mask)
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	*defined |= mask;
 	state->writemask[instruction] = mask;
 	return 0;
@@ -452,11 +452,11 @@ static int chrome9_vertex_validate_condition(struct chrome9_vertex_state *state,
 	unsigned int lane;
 
 	if (src->modifier || src->relative)
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	if (src->file == file) {
 		for (lane = 0; lane < 4; lane++)
 			if (src->swizzle[lane] != lane)
-				return -EINVAL;
+				return CHROME9_EINVAL;
 		return src->index < (file == DRM_CHROME9_VERTEX_FILE_INT ?
 				     DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS :
 				     DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS) ?
@@ -466,7 +466,7 @@ static int chrome9_vertex_validate_condition(struct chrome9_vertex_state *state,
 	if (insn->op != DRM_CHROME9_VERTEX_OP_IF || !state->dynamic ||
 	    src->file != DRM_CHROME9_VERTEX_FILE_TEMP ||
 	    !chrome9_vertex_selected(insn, 0))
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	return chrome9_vertex_validate_source(state, insn, 0, instruction);
 }
 
@@ -480,13 +480,13 @@ static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 	int ret;
 
 	if (!state->max_depth || memchr_inv(&insn->dst, 0, sizeof(insn->dst)))
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	for (s = opens; s < ARRAY_SIZE(insn->src); s++)
 		if (memchr_inv(&insn->src[s], 0, sizeof(insn->src[s])))
-			return -EINVAL;
+			return CHROME9_EINVAL;
 	if (opens) {
 		if (state->depth == state->max_depth)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		ret = chrome9_vertex_validate_condition(state, insn, instruction);
 		if (ret)
 			return ret;
@@ -499,12 +499,12 @@ static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 		return 0;
 	}
 	if (!state->depth)
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	frame = &state->frames[state->depth - 1];
 	switch (insn->op) {
 	case DRM_CHROME9_VERTEX_OP_ELSE:
 		if (frame->op != DRM_CHROME9_VERTEX_OP_IF || frame->has_else)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		frame->has_else = true;
 		memcpy(frame->then, state->defined, sizeof(frame->then));
 		memcpy(state->defined, frame->entry, sizeof(frame->entry));
@@ -513,7 +513,7 @@ static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 		return 0;
 	case DRM_CHROME9_VERTEX_OP_ENDIF:
 		if (frame->op != DRM_CHROME9_VERTEX_OP_IF)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		/* Only lanes written on both arms become defined. */
 		for (t = 0; t < ARRAY_SIZE(state->defined); t++)
 			state->defined[t] = frame->has_else ?
@@ -525,7 +525,7 @@ static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 		break;
 	default:
 		if (frame->op != DRM_CHROME9_VERTEX_OP_REP)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		/* The body may run zero times; a temp defined before the loop
 		 * and touched inside stays live until its end. */
 		for (t = 0; t < ARRAY_SIZE(state->defined); t++)
@@ -553,7 +553,7 @@ static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 
 		if (insn->op >= DRM_CHROME9_VERTEX_OP_COUNT ||
 		    insn->reserved0 || insn->reserved1)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		if (chrome9_vertex_flow_op(insn->op)) {
 			ret = chrome9_vertex_validate_flow(state, insn, i);
 			if (ret)
@@ -565,17 +565,17 @@ static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 		if (state->depth &&
 		    insn->dst.file != DRM_CHROME9_VERTEX_DEST_TEMP &&
 		    insn->dst.file != DRM_CHROME9_VERTEX_DEST_ADDRESS)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		for (s = 0; s < ARRAY_SIZE(insn->src); s++) {
 			if (s >= count) {
 				if (memchr_inv(&insn->src[s], 0, sizeof(insn->src[s])))
-					return -EINVAL;
+					return CHROME9_EINVAL;
 				continue;
 			}
 			if (state->depth &&
 			    insn->src[s].file == DRM_CHROME9_VERTEX_FILE_INPUT &&
 			    chrome9_vertex_selected(insn, s))
-				return -EINVAL;
+				return CHROME9_EINVAL;
 			ret = chrome9_vertex_validate_source(state, insn, s, i);
 			if (ret)
 				return ret;
@@ -593,12 +593,12 @@ static int chrome9_vertex_validate(struct chrome9_vertex_state *state,
 	     state->back_mask != 0xf) ||
 	    state->clip_written != state->clip_mask ||
 	    state->point_size_written != state->point_size)
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	for (i = 0; i < fragment->varying_count; i++)
 		if (!(state->sprite_mask & BIT(fragment->varying_logical[i])) &&
 		    state->varying_mask[i] !=
 		    GENMASK(fragment->varying_width[i] - 1, 0))
-			return -EINVAL;
+			return CHROME9_EINVAL;
 	return 0;
 }
 
@@ -636,7 +636,7 @@ static int chrome9_vertex_bounds(const struct chrome9_vertex_state *state,
 		low = (s32)state->constant_first - state->base_min[lane];
 		high = (s32)state->constant_end - 1 - state->base_max[lane];
 		if (low > high)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		program->bounds[0][lane] = chrome9_vertex_float_bits(low);
 		program->bounds[1][lane] = chrome9_vertex_float_bits(high);
 	}
@@ -967,7 +967,7 @@ static int chrome9_vertex_encode_flow(struct chrome9_vertex_state *state,
 		frame = &state->frames[--state->depth];
 		/* Zero-length bodies are not in the vendor corpus. */
 		if (here == frame->record + 1)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 		program->records[frame->record][2] = CHROME9_VS_FLOW_NOT_TAKEN |
 			(here - frame->record - 1) << 10;
 		break;
@@ -1012,7 +1012,7 @@ int chrome9_vertex_compile(
 	    constant_count > DRM_CHROME9_VERTEX_MAX_CONSTANTS - constant_first ||
 	    clip_mask & ~GENMASK(DRM_CHROME9_VERTEX_MAX_CLIP_DISTANCES - 1, 0) ||
 	    sprite_mask & ~GENMASK(DRM_CHROME9_FRAGMENT_MAX_VARYINGS - 1, 0))
-		return -EINVAL;
+		return CHROME9_EINVAL;
 	/* UCP coordinates follow the packed varyings inside A..H. */
 	if (fragment->varying_count + DIV_ROUND_UP(hweight32(clip_mask), 3) >
 	    DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
@@ -1025,7 +1025,7 @@ int chrome9_vertex_compile(
 		for (i = 0; i < fragment->varying_count; i++)
 			all |= BIT(fragment->varying_logical[i]);
 		if (sprite_mask != all || clip_mask)
-			return -EINVAL;
+			return CHROME9_EINVAL;
 	}
 	back = two_side && fragment->primary_used;
 	state = kzalloc(sizeof(*state), GFP_KERNEL);

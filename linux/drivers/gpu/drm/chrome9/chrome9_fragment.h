@@ -11,6 +11,14 @@
 #define CHROME9_FRAGMENT_STORE_INSTRUCTIONS \
 	(CHROME9_FRAGMENT_STORE_ALU + DRM_CHROME9_FRAGMENT_MAX_TAU)
 
+/* -EINVAL of the command validators, logged with trace_einval=1. */
+#ifdef __KERNEL__
+int chrome9_einval(const char *func, int line);
+#define CHROME9_EINVAL	chrome9_einval(__func__, __LINE__)
+#else
+#define CHROME9_EINVAL	(-EINVAL)
+#endif
+
 u32 chrome9_fragment_alu_limit(void);
 u32 chrome9_fragment_instruction_limit(void);
 
