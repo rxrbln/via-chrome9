@@ -6,6 +6,14 @@
 #include <linux/types.h>
 #include <drm/chrome9_drm.h>
 
+/* A95..A9A address 144 ALU records; ps_alu_max probes the store above 96. */
+#define CHROME9_FRAGMENT_STORE_ALU	144U
+#define CHROME9_FRAGMENT_STORE_INSTRUCTIONS \
+	(CHROME9_FRAGMENT_STORE_ALU + DRM_CHROME9_FRAGMENT_MAX_TAU)
+
+u32 chrome9_fragment_alu_limit(void);
+u32 chrome9_fragment_instruction_limit(void);
+
 struct chrome9_fragment_program {
 	u32 alu_count;
 	u32 tau_count;
@@ -19,7 +27,7 @@ struct chrome9_fragment_program {
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 varying_alu_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u32 controls[12];
-	u32 alu[DRM_CHROME9_FRAGMENT_MAX_ALU][4];
+	u32 alu[CHROME9_FRAGMENT_STORE_ALU][4];
 	u32 tau[DRM_CHROME9_FRAGMENT_MAX_TAU];
 };
 

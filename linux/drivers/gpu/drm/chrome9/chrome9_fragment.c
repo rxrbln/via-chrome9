@@ -4,6 +4,7 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -11,6 +12,22 @@
 
 #define CHROME9_FRAGMENT_TEMP_COUNT	128U
 #define CHROME9_FRAGMENT_PHYS_TEMPS	12U
+
+static uint chrome9_ps_alu_max = DRM_CHROME9_FRAGMENT_MAX_ALU;
+module_param_named(ps_alu_max, chrome9_ps_alu_max, uint, 0600);
+MODULE_PARM_DESC(ps_alu_max,
+	"Pixel shader ALU records per program, 96..144 (default: 96)");
+
+u32 chrome9_fragment_alu_limit(void)
+{
+	return clamp(READ_ONCE(chrome9_ps_alu_max), DRM_CHROME9_FRAGMENT_MAX_ALU,
+		     CHROME9_FRAGMENT_STORE_ALU);
+}
+
+u32 chrome9_fragment_instruction_limit(void)
+{
+	return chrome9_fragment_alu_limit() + DRM_CHROME9_FRAGMENT_MAX_TAU;
+}
 
 enum chrome9_fragment_slot {
 	CHROME9_FRAGMENT_SLOT_B,
@@ -25,7 +42,7 @@ struct chrome9_fragment_state {
 	u16 last_use[CHROME9_FRAGMENT_TEMP_COUNT];
 	u8 physical[CHROME9_FRAGMENT_TEMP_COUNT];
 	u16 physical_last_use[CHROME9_FRAGMENT_PHYS_TEMPS];
-	u8 source_count[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+	u8 source_count[CHROME9_FRAGMENT_STORE_INSTRUCTIONS];
 	u32 constant_mask;
 	u32 sampler_mask;
 	u32 varying_mask;
@@ -34,14 +51,14 @@ struct chrome9_fragment_state {
 	u32 physical_high_water;
 	u16 position_last_alu;
 	u8 position_id;
-	u8 position_slots[DRM_CHROME9_FRAGMENT_MAX_ALU];
+	u8 position_slots[CHROME9_FRAGMENT_STORE_ALU];
 	bool position_used;
 	bool primary_used;
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 alu_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 tex_varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 coordinate_for_varying[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
-	u8 coordinate_for_instruction[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+	u8 coordinate_for_instruction[CHROME9_FRAGMENT_STORE_INSTRUCTIONS];
 	u8 coordinate_last_tau[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u16 varying_last_alu[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 };
@@ -196,10 +213,11 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 	u32 tau_count = 0;
 	u32 bridge_count = 0;
 	u32 kill_count = 0;
+	u32 alu_limit = chrome9_fragment_alu_limit();
 	unsigned int i;
 
 	if (!instruction_count ||
-	    instruction_count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS ||
+	    instruction_count > alu_limit + DRM_CHROME9_FRAGMENT_MAX_TAU ||
 	    constant_count > DRM_CHROME9_FRAGMENT_MAX_CONSTANTS ||
 	    texture_count > DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
 	    varying_count > DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
@@ -241,7 +259,7 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 				&instruction->src[0];
 
 			if (++kill_count > 1 || output_mask ||
-			    ++alu_count > DRM_CHROME9_FRAGMENT_MAX_ALU ||
+			    ++alu_count > alu_limit ||
 			    ++tau_count > DRM_CHROME9_FRAGMENT_MAX_TAU ||
 			    instruction->sampler || instruction->dst.file ||
 			    instruction->dst.index || instruction->dst.writemask ||
@@ -277,7 +295,7 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			    instruction->dst.writemask != 0xf)
 				return -EINVAL;
 			state->sampler_mask |= BIT(instruction->sampler);
-		} else if (++alu_count > DRM_CHROME9_FRAGMENT_MAX_ALU ||
+		} else if (++alu_count > alu_limit ||
 			   instruction->sampler) {
 			return -EINVAL;
 		}
@@ -365,7 +383,7 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 		}
 	}
 	if (output_mask != 0xf || !alu_count ||
-	    alu_count + bridge_count > DRM_CHROME9_FRAGMENT_MAX_ALU)
+	    alu_count + bridge_count > alu_limit)
 		return -EINVAL;
 	/*
 	 * The textured FE consumer carries three lanes unless the ALU reads
@@ -1250,10 +1268,11 @@ static int chrome9_fragment_split_texture_reads(
 	u32 count = *instruction_count;
 	u32 copies = 0, n = 0;
 	int temp = CHROME9_FRAGMENT_TEMP_COUNT - 1;
+	u32 limit = chrome9_fragment_instruction_limit();
 	unsigned int i, source, lane;
 
 	*split = NULL;
-	if (!count || count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+	if (!count || count > limit)
 		return 0;
 	for (i = 0; i < count; i++) {
 		const struct drm_chrome9_fragment_instruction *instruction =
@@ -1278,7 +1297,7 @@ static int chrome9_fragment_split_texture_reads(
 	}
 	if (!copies)
 		return 0;
-	if (count + copies > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+	if (count + copies > limit)
 		return -E2BIG;
 	out = kcalloc(count + copies, sizeof(*out), GFP_KERNEL);
 	if (!out)

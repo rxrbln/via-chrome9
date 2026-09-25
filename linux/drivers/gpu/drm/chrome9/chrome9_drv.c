@@ -2651,9 +2651,12 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 			args->value |= DRM_CHROME9_CAP2_VERTEX_TOPOLOGY |
 				       DRM_CHROME9_CAP2_NATIVE_POINTS |
 				       DRM_CHROME9_CAP2_NATIVE_LINES |
-				       DRM_CHROME9_CAP2_POLYGON_MODE;
+				       DRM_CHROME9_CAP2_POLYGON_MODE |
+				       DRM_CHROME9_CAP2_POINT_SIZE_VERTEX;
 		if (chrome9_engine_ready(cdev))
 			args->value |= chrome9_engine_capabilities2();
+		if (chrome9_engine_ready(cdev) && chrome9_engine_fence_irq(cdev))
+			args->value |= DRM_CHROME9_CAP2_FENCE_IRQ;
 		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:

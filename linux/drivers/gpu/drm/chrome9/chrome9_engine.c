@@ -5,6 +5,7 @@
 #include <linux/dma-fence.h>
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
+#include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
@@ -62,6 +63,13 @@
 	(CHROME9_GART_ENTRIES - (engine)->ring_pages - 1)
 #define CHROME9_FE33_SYSTEM_WRITE	0xfe330004U
 #define CHROME9_FE33_WAIT_3D		0x00200000U
+/* FE33 mode bits: interrupt generate, fence queue full skip (p.83). */
+#define CHROME9_FE33_IRQ		0x00000022U
+/* 0x200: bit 31 global interrupt gate; enable bits 30:16, 11. */
+#define CHROME9_IRQ_GLOBAL		BIT(31)
+#define CHROME9_IRQ_ENABLE_MASK		0xf7ff0800U
+/* 0x204 bit 5: CR (fence) interrupt status, write one to clear. */
+#define CHROME9_IRQ_CR			BIT(5)
 #define CHROME9_FE33_SLOT_SIZE		16U
 #define CHROME9_FE33_CANARY		0x5afe3300U
 /* Occlusion snapshots: one result dword plus three canaries per slot. */
@@ -161,6 +169,11 @@ module_param_named(fe33_fence, chrome9_fe33_fence, bool, 0400);
 MODULE_PARM_DESC(fe33_fence,
 	"Require a coherent FE330004 3D completion write per 3D job (default: false)");
 
+static uint chrome9_fence_irq;
+module_param_named(fence_irq, chrome9_fence_irq, uint, 0400);
+MODULE_PARM_DESC(fence_irq,
+	"Retire FE33 fences on the CR interrupt, needs fe33_fence; 2 gate only, FE33 without interrupt (default: 0)");
+
 static bool chrome9_hw_tcl;
 module_param_named(hw_tcl, chrome9_hw_tcl, bool, 0400);
 MODULE_PARM_DESC(hw_tcl,
@@ -203,6 +216,11 @@ module_param_named(texture_mirror_once, chrome9_texture_mirror_once, bool,
 MODULE_PARM_DESC(texture_mirror_once,
 	"Mirror-once fragment texture wrapping (default: false)");
 
+static bool chrome9_blend_equation = true;
+module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
+MODULE_PARM_DESC(blend_equation,
+	"Blend SUBTRACT, REVERSE_SUBTRACT, MIN and MAX (default: true)");
+
 static bool chrome9_vs_flow = true;
 module_param_named(vs_flow, chrome9_vs_flow, bool, 0400);
 MODULE_PARM_DESC(vs_flow,
@@ -217,6 +235,16 @@ static bool chrome9_vs_flow_dynamic;
 module_param_named(vs_flow_dynamic, chrome9_vs_flow_dynamic, bool, 0600);
 MODULE_PARM_DESC(vs_flow_dynamic,
 	"Debug: IF on a temporary lane, rung F3 (default: false)");
+
+static bool chrome9_vs_relative = true;
+module_param_named(vs_relative, chrome9_vs_relative, bool, 0400);
+MODULE_PARM_DESC(vs_relative,
+	"Hardware TCL ARL and a0-relative constant reads (default: true)");
+
+static bool chrome9_vs_relative_re;
+module_param_named(vs_relative_re, chrome9_vs_relative_re, bool, 0600);
+MODULE_PARM_DESC(vs_relative_re,
+	"Debug: ARL as bare MOVA without floor and bounds clamp (default: false)");
 
 /* RE knob for the two-side/UCP ladder: 1 clear A61[19], 2 no saturate on
  * oBFD0, 4 UCP perspective (A05[6]/[14]), 8 UCP bits in A28/A29. */
@@ -234,6 +262,12 @@ MODULE_PARM_DESC(vs_flow_dynamic,
  * lines and wireframe from vertex a to b (A01[23] clear, rung L3). */
 #define CHROME9_TCL_RE_NO_A2F		BIT(8)
 #define CHROME9_TCL_RE_LINE_AB		BIT(9)
+
+/* Debug: force A61[22:20] (vendor output transfer field) to 0..7. */
+static int chrome9_tcl_a61_out = -1;
+module_param_named(tcl_a61_out, chrome9_tcl_a61_out, int, 0600);
+MODULE_PARM_DESC(tcl_a61_out,
+	"Debug: A61[22:20] override for hardware TCL, -1 automatic (default: -1)");
 
 /*
  * Debug: fragment/TCL job phase profile.  With profile=N every N jobs log
@@ -731,6 +765,17 @@ struct chrome9_engine {
 	void *run_staging_cpu;
 	u32 *fence_cpu;
 	dma_addr_t fence_dma;
+	/* FE33 interrupt: the handler bumps irq_seq and wakes irq_wq. */
+	bool irq_requested;
+	bool irq_enabled;
+	u32 irq_saved_enables;
+	atomic_t irq_seq;
+	atomic_t irq_foreign;
+	u32 irq_foreign_status[2];
+	u32 irq_foreign_regs[12];
+	wait_queue_head_t irq_wq;
+	u64 irq_waits;
+	u64 irq_fallbacks;
 	/* Header plus ring bytes of the most recent timed-out segment. */
 	u32 *timeout_segment;
 	size_t timeout_segment_size;
@@ -1214,13 +1259,14 @@ static void chrome9_count_vertex_payload(u32 *header, u32 dwords)
 	header[3] = 0xcc000000;
 }
 
-static int chrome9_fe33_encode(u32 record[4], u32 id, dma_addr_t address)
+static int chrome9_fe33_encode(u32 record[4], u32 id, dma_addr_t address,
+			       bool irq)
 {
 	if (!id || !IS_ALIGNED(address, CHROME9_FE33_SLOT_SIZE) ||
 	    upper_32_bits(address) ||
 	    address > U32_MAX - (CHROME9_FE33_SLOT_SIZE - 1))
 		return -EINVAL;
-	record[0] = CHROME9_FE33_SYSTEM_WRITE;
+	record[0] = CHROME9_FE33_SYSTEM_WRITE | (irq ? CHROME9_FE33_IRQ : 0);
 	record[1] = CHROME9_FE33_WAIT_3D | (id & 0xff) << 24;
 	record[2] = (id >> 8) | ((u32)address & 0x00000ff0) << 20;
 	record[3] = ((u32)address >> 12) & 0x000fffff;
@@ -1242,22 +1288,26 @@ static int chrome9_fe33_selftest(void)
 	u32 address;
 	u32 id;
 
-	if (chrome9_fe33_encode(record, 0x12345678, 0x01088120) ||
+	if (chrome9_fe33_encode(record, 0x12345678, 0x01088120, false) ||
 	    memcmp(record, golden, sizeof(golden)))
+		return -EINVAL;
+	if (chrome9_fe33_encode(record, 0x12345678, 0x01088120, true) ||
+	    record[0] != 0xfe330026 ||
+	    memcmp(record + 1, golden + 1, sizeof(golden) - sizeof(u32)))
 		return -EINVAL;
 	chrome9_fe33_decode(record, &id, &address);
 	if (id != 0x12345678 || address != 0x01088120)
 		return -EINVAL;
-	if (chrome9_fe33_encode(record, 0xffffffff, 0xfffffff0))
+	if (chrome9_fe33_encode(record, 0xffffffff, 0xfffffff0, false))
 		return -EINVAL;
 	chrome9_fe33_decode(record, &id, &address);
 	if (id != 0xffffffff || address != 0xfffffff0)
 		return -EINVAL;
-	if (!chrome9_fe33_encode(record, 0, 0x1000) ||
-	    !chrome9_fe33_encode(record, 1, 0x1008) ||
-	    !chrome9_fe33_encode(record, 1, (dma_addr_t)0xfffffff8) ||
+	if (!chrome9_fe33_encode(record, 0, 0x1000, false) ||
+	    !chrome9_fe33_encode(record, 1, 0x1008, false) ||
+	    !chrome9_fe33_encode(record, 1, (dma_addr_t)0xfffffff8, false) ||
 	    (sizeof(dma_addr_t) > 4 &&
-	     !chrome9_fe33_encode(record, 1, (dma_addr_t)BIT_ULL(32))))
+	     !chrome9_fe33_encode(record, 1, (dma_addr_t)BIT_ULL(32), false)))
 		return -EINVAL;
 	return 0;
 }
@@ -1291,7 +1341,8 @@ static int chrome9_emit_fe33(struct chrome9_engine *engine,
 			break;
 		}
 	}
-	ret = chrome9_fe33_encode(record, id, chrome9_fence_slot_dma(engine, id));
+	ret = chrome9_fe33_encode(record, id, chrome9_fence_slot_dma(engine, id),
+				  engine->irq_enabled && chrome9_fence_irq == 1);
 	if (ret)
 		return ret;
 	engine->fence_last_id = id;
@@ -1882,10 +1933,59 @@ static int chrome9_stencil_selftest(void)
 	return 0;
 }
 
+/*
+ * One equation lane: A term in bits [15:4] of A34/A36, op and B term in
+ * A35/A37.  Operands are RGB source/destination 0/1 and alpha 1/2.
+ */
+static void chrome9_lower_blend_lane(u32 func, u32 src_factor, u32 dst_factor,
+				     bool alpha, u32 *a, u32 *b)
+{
+	u32 src = alpha ? 1 : 0;
+	u32 dst = alpha ? 2 : 1;
+	u32 op = 0;
+
+	switch (func) {
+	case DRM_CHROME9_BLEND_FUNC_SUBTRACT:
+		op = 1;
+		break;
+	case DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT:
+		/* dst * dst_factor - src * src_factor */
+		op = 1;
+		swap(src, dst);
+		swap(src_factor, dst_factor);
+		break;
+	case DRM_CHROME9_BLEND_FUNC_MIN:
+	case DRM_CHROME9_BLEND_FUNC_MAX:
+		op = func == DRM_CHROME9_BLEND_FUNC_MIN ? 3 : 2;
+		swap(src, dst);
+		src_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+		dst_factor = DRM_CHROME9_BLEND_FACTOR_ONE;
+		break;
+	}
+	*a = src << 10 | chrome9_blend_factor_code(src_factor, alpha) << 4;
+	*b = op << 14 | dst << 8 |
+		chrome9_blend_factor_code(dst_factor, alpha) << 2;
+}
+
+/* Debug: 1 sets A34/A36 bit 16 on every blend lane. */
+static uint chrome9_blend_re;
+module_param_named(blend_re, chrome9_blend_re, uint, 0600);
+MODULE_PARM_DESC(blend_re, "Debug: blend clamp probe (default: 0)");
+
+/* A34/A36 bit 16 clamps below zero; clear, negative results give one. */
+static u32 chrome9_blend_clamp(u32 func)
+{
+	return func == DRM_CHROME9_BLEND_FUNC_SUBTRACT ||
+	       func == DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT ||
+	       READ_ONCE(chrome9_blend_re) & 1 ? BIT(16) : 0;
+}
+
 static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
 				struct chrome9_blend_words *words)
 {
+
 	u32 ref = state->alpha_test_ref;
+	u32 a, b;
 
 	words->a00 = 0x00000001;
 	if (state->flags & DRM_CHROME9_BLEND_ENABLE)
@@ -1897,15 +1997,95 @@ static void chrome9_lower_blend(const struct drm_chrome9_blend_state *state,
 	else
 		ref = 0x400;
 	words->a33 = 0x33000000 | state->alpha_test_func << 12 | ref;
-	words->a34 = 0x34000000 |
-		chrome9_blend_factor_code(state->rgb_src_factor, false) << 4;
-	words->a35 = 0x35000100 |
-		chrome9_blend_factor_code(state->rgb_dst_factor, false) << 2;
-	words->a36 = 0x36000400 |
-		chrome9_blend_factor_code(state->alpha_src_factor, true) << 4;
-	words->a37 = 0x37000200 |
-		chrome9_blend_factor_code(state->alpha_dst_factor, true) << 2;
+	chrome9_lower_blend_lane(state->rgb_func, state->rgb_src_factor,
+				 state->rgb_dst_factor, false, &a, &b);
+	words->a34 = 0x34000000 | chrome9_blend_clamp(state->rgb_func) | a;
+	words->a35 = 0x35000000 | b;
+	chrome9_lower_blend_lane(state->alpha_func, state->alpha_src_factor,
+				 state->alpha_dst_factor, true, &a, &b);
+	words->a36 = 0x36000000 | chrome9_blend_clamp(state->alpha_func) | a;
+	words->a37 = 0x37000000 | b;
 	words->a53 = 0x53010c00 | chrome9_blend_color_mask(state->color_mask);
+}
+
+/* Golden A34..A37 of blend-alpha-packet-recipes.md. */
+static int chrome9_blend_selftest(void)
+{
+	static const struct {
+		u32 rgb_func, alpha_func;
+		u32 rgb_src, rgb_dst, alpha_src, alpha_dst;
+		u32 words[4];
+	} vectors[] = {
+		/* COPY and canonical source-over (live) */
+		{ DRM_CHROME9_BLEND_FUNC_ADD, DRM_CHROME9_BLEND_FUNC_ADD,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ZERO,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ZERO,
+		  { 0x34000150, 0x35000114, 0x36000590, 0x37000224 } },
+		{ DRM_CHROME9_BLEND_FUNC_ADD, DRM_CHROME9_BLEND_FUNC_ADD,
+		  DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA,
+		  DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA,
+		  DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA,
+		  { 0x34000020, 0x35000148, 0x36000590, 0x37000244 } },
+		/* ONE/ONE equation discriminator matrix; subtract lanes clamp */
+		{ DRM_CHROME9_BLEND_FUNC_ADD, DRM_CHROME9_BLEND_FUNC_ADD,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  { 0x34000150, 0x35000154, 0x36000590, 0x37000264 } },
+		{ DRM_CHROME9_BLEND_FUNC_SUBTRACT, DRM_CHROME9_BLEND_FUNC_SUBTRACT,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  { 0x34010150, 0x35004154, 0x36010590, 0x37004264 } },
+		{ DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT,
+		  DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  { 0x34010550, 0x35004054, 0x36010990, 0x37004164 } },
+		{ DRM_CHROME9_BLEND_FUNC_MIN, DRM_CHROME9_BLEND_FUNC_MIN,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  { 0x34000550, 0x3500c054, 0x36000990, 0x3700c164 } },
+		{ DRM_CHROME9_BLEND_FUNC_MAX, DRM_CHROME9_BLEND_FUNC_MAX,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_ONE, DRM_CHROME9_BLEND_FACTOR_ONE,
+		  { 0x34000550, 0x35008054, 0x36000990, 0x37008164 } },
+		/* MIN/MAX force ONE whatever the factors say */
+		{ DRM_CHROME9_BLEND_FUNC_MIN, DRM_CHROME9_BLEND_FUNC_MAX,
+		  DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA, DRM_CHROME9_BLEND_FACTOR_ZERO,
+		  DRM_CHROME9_BLEND_FACTOR_DST_ALPHA, DRM_CHROME9_BLEND_FACTOR_ZERO,
+		  { 0x34000550, 0x3500c054, 0x36000990, 0x37008164 } },
+		/* REVERSE_SUBTRACT swaps factor codes with the operands */
+		{ DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT,
+		  DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT,
+		  DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA,
+		  DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA,
+		  DRM_CHROME9_BLEND_FACTOR_ONE,
+		  DRM_CHROME9_BLEND_FACTOR_INV_SRC_ALPHA,
+		  { 0x34010520, 0x35004008, 0x36010910, 0x37004164 } },
+	};
+	struct drm_chrome9_blend_state state = {
+		.flags = DRM_CHROME9_BLEND_ENABLE,
+		.color_mask = 0xf,
+	};
+	struct chrome9_blend_words words;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(vectors); i++) {
+		state.rgb_func = vectors[i].rgb_func;
+		state.alpha_func = vectors[i].alpha_func;
+		state.rgb_src_factor = vectors[i].rgb_src;
+		state.rgb_dst_factor = vectors[i].rgb_dst;
+		state.alpha_src_factor = vectors[i].alpha_src;
+		state.alpha_dst_factor = vectors[i].alpha_dst;
+		chrome9_lower_blend(&state, &words);
+		if (words.a34 != vectors[i].words[0] ||
+		    words.a35 != vectors[i].words[1] ||
+		    words.a36 != vectors[i].words[2] ||
+		    words.a37 != vectors[i].words[3] ||
+		    words.a00 != 0x00000011 || words.a53 != 0x53010c0f)
+			return -EINVAL;
+	}
+	return 0;
 }
 
 static int chrome9_build_triangle(struct chrome9_engine *engine,
@@ -3892,7 +4072,8 @@ static u32 chrome9_fragment_state_bound(const struct chrome9_draw_request *reque
 	       (request->query ? CHROME9_QUERY_STATE_DWORDS : 0) +
 	       4 * program->constant_count + 4 * program->alu_count +
 	       program->tau_count +
-	       (tcl ? 4 * tcl->constant_count + 4 * tcl->program->record_count +
+	       (tcl ? 4 * tcl->constant_count + 16 +
+		      4 * tcl->program->record_count +
 		      DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS :
 		      4 * (4 + program->varying_count));
 }
@@ -4260,6 +4441,12 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	if (tcl && tcl->constant_count)
 		chrome9_emit_header3(&p, 0x32030000 + 4 * tcl->constant_first,
 				     tcl->constants, 4 * tcl->constant_count);
+	/* ARL clamp rows directly after the user constants. */
+	if (tcl && tcl->program->bound_rows)
+		chrome9_emit_header3(&p, 0x32030000 + 4 * (tcl->constant_first +
+				     tcl->constant_count),
+				     tcl->program->bounds[0],
+				     2 * ARRAY_SIZE(tcl->program->bounds[0]));
 	chrome9_group_end(cache, CHROME9_GROUP_VS_CONSTANTS, group, &p);
 	group = chrome9_group_begin(&p);
 	if (tcl)
@@ -6207,10 +6394,100 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_BORDER;
 	if (READ_ONCE(chrome9_texture_mirror_once))
 		caps |= DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE;
+	if (READ_ONCE(chrome9_blend_equation))
+		caps |= DRM_CHROME9_CAP2_BLEND_EQUATION;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
+	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
+		caps |= DRM_CHROME9_CAP2_VERTEX_RELATIVE;
 	return caps | DRM_CHROME9_CAP2_GEM_CPU_NOWAIT |
 	       DRM_CHROME9_CAP2_FENCE_SEQNO;
+}
+
+bool chrome9_engine_fence_irq(const struct chrome9_device *cdev)
+{
+	return cdev->engine && cdev->engine->irq_enabled;
+}
+
+static irqreturn_t chrome9_fence_irq_handler(int irq, void *data)
+{
+	struct chrome9_engine *engine = data;
+	void __iomem *mmio = engine->cdev->mmio;
+	u32 gate = readl(mmio + CHROME9_REG_DISPLAY_STATUS);
+	u32 status;
+
+	if (gate == U32_MAX || !(gate & CHROME9_IRQ_GLOBAL))
+		return IRQ_NONE;
+	status = readl(mmio + CHROME9_REG_BASE_UPDATE_STATUS);
+	if (!(status & CHROME9_IRQ_CR)) {
+		/* Record the first foreign source; the worker gives up the gate. */
+		if (atomic_inc_return(&engine->irq_foreign) == 1) {
+			static const u16 regs[] = {
+				0x208, 0x20c, 0x210, 0x214, 0x218, 0x21c,
+				0x1280, 0x400, 0x40c, 0x444, 0x494, 0x200,
+			};
+			unsigned int r;
+
+			engine->irq_foreign_status[0] = gate;
+			engine->irq_foreign_status[1] = status;
+			for (r = 0; r < ARRAY_SIZE(regs); r++)
+				engine->irq_foreign_regs[r] = readl(mmio + regs[r]);
+		}
+		if (atomic_read(&engine->irq_foreign) > 64) {
+			writel(engine->irq_saved_enables,
+			       mmio + CHROME9_REG_DISPLAY_STATUS);
+			wake_up(&engine->irq_wq);
+		}
+		return IRQ_NONE;
+	}
+	writel(CHROME9_IRQ_CR, mmio + CHROME9_REG_BASE_UPDATE_STATUS);
+	atomic_inc(&engine->irq_seq);
+	wake_up(&engine->irq_wq);
+	return IRQ_HANDLED;
+}
+
+/* Only the global gate stays enabled: no other source can raise the line. */
+static void chrome9_fence_irq_setup(struct chrome9_engine *engine)
+{
+	struct chrome9_device *cdev = engine->cdev;
+	u32 old;
+	int ret;
+
+	if (!chrome9_fence_irq || !engine->fence_cpu ||
+	    engine->max_inflight == 1)
+		return;
+	writel(CHROME9_IRQ_CR, cdev->mmio + CHROME9_REG_BASE_UPDATE_STATUS);
+	ret = request_irq(cdev->pdev->irq, chrome9_fence_irq_handler,
+			  IRQF_SHARED, "chrome9", engine);
+	if (ret) {
+		dev_warn(&cdev->pdev->dev,
+			 "fence interrupt %d unavailable (%d), polling\n",
+			 cdev->pdev->irq, ret);
+		return;
+	}
+	old = readl(cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
+	engine->irq_saved_enables = old & CHROME9_IRQ_ENABLE_MASK;
+	engine->irq_requested = true;
+	engine->irq_enabled = true;
+	writel(CHROME9_IRQ_GLOBAL, cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
+	readl(cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
+	dev_info(&cdev->pdev->dev,
+		 "FE33 fences on interrupt %d (0x200 was %08x)\n",
+		 cdev->pdev->irq, old);
+}
+
+static void chrome9_fence_irq_teardown(struct chrome9_engine *engine)
+{
+	struct chrome9_device *cdev = engine->cdev;
+
+	if (!engine->irq_requested)
+		return;
+	writel(engine->irq_saved_enables,
+	       cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
+	readl(cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
+	free_irq(cdev->pdev->irq, engine);
+	engine->irq_requested = false;
+	engine->irq_enabled = false;
 }
 
 static int chrome9_fragment_texture_selftest(void);
@@ -6252,6 +6529,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	if (ret) {
 		dev_err(&cdev->pdev->dev,
 			"stencil-state self-test failed: %d\n", ret);
+		return ret;
+	}
+	ret = chrome9_blend_selftest();
+	if (ret) {
+		dev_err(&cdev->pdev->dev,
+			"blend-state self-test failed: %d\n", ret);
 		return ret;
 	}
 	ret = chrome9_fragment_fe_config_selftest();
@@ -6313,6 +6596,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	INIT_LIST_HEAD(&engine->quarantine);
 	INIT_LIST_HEAD(&engine->queue);
 	init_waitqueue_head(&engine->retire_wq);
+	init_waitqueue_head(&engine->irq_wq);
 	engine->job_us_avg = 1000;
 	INIT_LIST_HEAD(&engine->reaped);
 	INIT_WORK(&engine->retire_work, chrome9_retire_work);
@@ -6470,6 +6754,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	/* Persistent-engine mode is deliberately reboot-scoped during bring-up. */
 	__module_get(THIS_MODULE);
 	engine->module_hold = true;
+	chrome9_fence_irq_setup(engine);
 	engine->ready = true;
 	dev_info(&cdev->pdev->dev,
 		 "persistent SF engine ready: GART=%#llx ring=%pad/%u KiB fe33=%s max_inflight=%u\n",
@@ -7930,13 +8215,46 @@ static void chrome9_retire_work(struct work_struct *work)
 	}
 	/* Poll without holding submit_lock, so submitters append meanwhile. */
 	for (;;) {
+		int seq = atomic_read(&engine->irq_seq);
+		struct chrome9_job *head;
+		bool written = false;
+
 		mutex_lock(&engine->submit_lock);
 		pending = chrome9_engine_retire_completed_locked(engine);
 		delay = pending ? chrome9_retire_delay_us(engine) : 0;
+		head = list_first_entry_or_null(&engine->queue,
+						struct chrome9_job, queue_link);
+		if (head && head->fence_id)
+			written = READ_ONCE(chrome9_fence_slot(engine,
+					head->fence_id)[0]) == head->fence_id;
 		chrome9_submit_unlock(engine);
 		if (!pending)
 			break;
-		usleep_range(delay, delay + delay / 4);
+		if (engine->irq_enabled &&
+		    atomic_read(&engine->irq_foreign) > 64) {
+			dev_warn_once(&engine->cdev->pdev->dev,
+				"foreign interrupt (0x200 %08x, 0x204 %08x), polling fences\n",
+				engine->irq_foreign_status[0],
+				engine->irq_foreign_status[1]);
+			dev_warn(&engine->cdev->pdev->dev,
+				 "208..21c %*ph, 1280/400/40c/444/494/200 %*ph\n",
+				 24, engine->irq_foreign_regs,
+				 24, engine->irq_foreign_regs + 6);
+			engine->irq_enabled = false;
+		}
+		/* The cookie and PAUSE follow the FE33 write closely. */
+		if (!engine->irq_enabled || written) {
+			if (engine->irq_enabled)
+				delay = CHROME9_RETIRE_MIN_US;
+			usleep_range(delay, delay + delay / 4);
+			continue;
+		}
+		engine->irq_waits++;
+		if (wait_event_hrtimeout(engine->irq_wq,
+					 atomic_read(&engine->irq_seq) != seq,
+					 us_to_ktime(max_t(unsigned long, delay,
+						CHROME9_RETIRE_MAX_US))))
+			engine->irq_fallbacks++;
 	}
 }
 
@@ -8616,11 +8934,16 @@ static int chrome9_validate_blend_state(const struct drm_chrome9_blend_state *st
 		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
 	    state->alpha_dst_factor >
 		DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE ||
-	    state->rgb_func != DRM_CHROME9_BLEND_FUNC_ADD ||
-	    state->alpha_func != DRM_CHROME9_BLEND_FUNC_ADD)
+	    state->rgb_func > DRM_CHROME9_BLEND_FUNC_MAX ||
+	    state->alpha_func > DRM_CHROME9_BLEND_FUNC_MAX ||
+	    ((state->rgb_func != DRM_CHROME9_BLEND_FUNC_ADD ||
+	      state->alpha_func != DRM_CHROME9_BLEND_FUNC_ADD) &&
+	     !READ_ONCE(chrome9_blend_equation)))
 		return -EOPNOTSUPP;
 	if (!(state->flags & DRM_CHROME9_BLEND_ENABLE) &&
-	    (state->rgb_src_factor != DRM_CHROME9_BLEND_FACTOR_ONE ||
+	    (state->rgb_func != DRM_CHROME9_BLEND_FUNC_ADD ||
+	     state->alpha_func != DRM_CHROME9_BLEND_FUNC_ADD ||
+	     state->rgb_src_factor != DRM_CHROME9_BLEND_FACTOR_ONE ||
 	     state->rgb_dst_factor != DRM_CHROME9_BLEND_FACTOR_ZERO ||
 	     state->alpha_src_factor != DRM_CHROME9_BLEND_FACTOR_ONE ||
 	     state->alpha_dst_factor != DRM_CHROME9_BLEND_FACTOR_ZERO))
@@ -11366,6 +11689,7 @@ struct chrome9_vertex_key {
 	u32 max_depth;
 	u32 re;
 	u32 varying_count;
+	u32 relative;
 	u8 two_side;
 	u8 point_size;
 	u8 dynamic;
@@ -11375,7 +11699,7 @@ struct chrome9_vertex_key {
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 };
 
-static_assert(sizeof(struct chrome9_vertex_key) == 76);
+static_assert(sizeof(struct chrome9_vertex_key) == 80);
 
 /*
  * The compiled program of these inputs: a cached copy, else compiled into
@@ -11484,6 +11808,7 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 					  DRM_CHROME9_VERTEX_BFC_CCW));
 	params.point_size = tcl->point_size_vertex;
 	params.dynamic = tcl->flow.dynamic;
+	params.relative = tcl->flow.relative | tcl->flow.relative_raw << 1;
 	params.primary_used = fp->primary_used;
 	memcpy(params.input_lanes, tcl->input_lanes, tcl->element_count);
 	memcpy(params.varying_logical, fp->varying_logical, fp->varying_count);
@@ -11510,6 +11835,24 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 		CHROME9_VERTEX_PROGRAM_BYTES(vp->record_count), entry);
 	tcl->program = cached ?: vp;
 	return 0;
+}
+
+/*
+ * A61[22:20] as the vendor derives it from the output linkage
+ * (VTGUModeDX32A.dll 0x10206cd5): the VS point size is lost without it.
+ */
+static u32 chrome9_tcl_a61_outputs(const struct chrome9_tcl_draw *tcl,
+				   const struct chrome9_fragment_program *fp)
+{
+	int knob = READ_ONCE(chrome9_tcl_a61_out);
+	u32 extra = fp->varying_count +
+		    DIV_ROUND_UP(hweight32(tcl->clip_mask), 3);
+
+	if (knob >= 0)
+		return knob & 7;
+	if (!tcl->point_size_vertex)
+		return 0;
+	return extra > 3 ? 4 : 1;
 }
 
 /* Validate, copy and compile one fragment draw into d->request. */
@@ -11584,7 +11927,7 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	     !args->vertices_ptr) ||
 	    !args->instructions_ptr ||
 	    !args->instruction_count ||
-	    args->instruction_count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS ||
+	    args->instruction_count > chrome9_fragment_instruction_limit() ||
 	    args->constant_count > DRM_CHROME9_FRAGMENT_MAX_CONSTANTS ||
 	    args->texture_count > DRM_CHROME9_FRAGMENT_MAX_TEXTURES ||
 	    args->varying_count > DRM_CHROME9_FRAGMENT_MAX_VARYINGS ||
@@ -11736,7 +12079,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		if (ret)
 			goto out_put;
 		/* b0..b15 are A61[15:0] (stmUpdateIntBoolConst_inv). */
-		tcl->a61 = tcl->program->a61 | tcl->bool_constants;
+		tcl->a61 = tcl->program->a61 | tcl->bool_constants |
+			   chrome9_tcl_a61_outputs(tcl, program) << 20;
 		request.triangle_count = tcl->primitive_count;
 		request.tcl = tcl;
 	}
@@ -12108,6 +12452,10 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 					    1U, 4U);
 		tcl->flow.dynamic = READ_ONCE(chrome9_vs_flow_dynamic);
 	}
+	if (READ_ONCE(chrome9_vs_relative)) {
+		tcl->flow.relative = true;
+		tcl->flow.relative_raw = READ_ONCE(chrome9_vs_relative_re);
+	}
 	tcl->bool_constants = args->bool_constants;
 	if (args->int_constants_ptr) {
 		u8 ints[DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS][4];
@@ -12362,6 +12710,11 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
 	if (!engine->was_master)
 		pci_clear_master(cdev->pdev);
+	chrome9_fence_irq_teardown(engine);
+	dev_info(&cdev->pdev->dev,
+		 "fence interrupts %d, waits %llu, poll fallbacks %llu\n",
+		 atomic_read(&engine->irq_seq), engine->irq_waits,
+		 engine->irq_fallbacks);
 	dev_info(&cdev->pdev->dev,
 		 "persistent SF engine stopped: appends=%llu wraps=%llu epochs=%u cache_hits=%llu cache_misses=%llu scanout_hits=%llu evictions=%llu gart_updates=%llu pte_writes=%llu vga_acquires=%llu sr6f_requests=%llu sr6f_rerequests=%llu sr6f_slow=%llu sr6f_kicks=%llu fe33=%llu/%u fe33_canary_faults=%llu\n",
 		 engine->append_count, engine->wrap_count, engine->ring_epoch,

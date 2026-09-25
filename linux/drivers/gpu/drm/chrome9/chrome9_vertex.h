@@ -8,12 +8,17 @@
 
 struct chrome9_fragment_program;
 
-/* Static flow control accepted by chrome9_vertex_compile(). */
+/* Static flow control and relative addressing accepted by
+ * chrome9_vertex_compile(). */
 struct chrome9_vertex_flow {
 	/* Maximum REP/IF nesting; zero rejects every flow op. */
 	u32 max_depth;
 	/* RE: IF may test a temporary (rung F3). */
 	bool dynamic;
+	/* ARL and a0-relative constant reads. */
+	bool relative;
+	/* RE: ARL as one bare MOVA, without floor and bounds clamp. */
+	bool relative_raw;
 };
 
 struct chrome9_vertex_program {
@@ -24,6 +29,10 @@ struct chrome9_vertex_program {
 	u32 a60;
 	u32 a61;
 	u32 a62;
+	/* ARL clamp rows c[constant_end] (low) and c[constant_end + 1]
+	 * (high) as float bits per a0 lane, uploaded when bound_rows. */
+	bool bound_rows;
+	u32 bounds[2][4];
 	u32 records[][4];
 };
 
