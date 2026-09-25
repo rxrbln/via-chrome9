@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/swiotlb.h>
 
+#include <drm/drm_prime.h>
 #include <drm/drm_dumb_buffers.h>
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
@@ -194,10 +195,20 @@ static int chrome9_local_mmap(struct drm_gem_object *obj,
 		PAGE_SHIFT, vma->vm_end - vma->vm_start, vma->vm_page_prot);
 }
 
+/*
+ * Local objects are shared only with this device: the PRIME import of our
+ * own dma-buf returns the object itself, another device's attach finds no
+ * pages.
+ */
+static struct sg_table *chrome9_local_get_sg_table(struct drm_gem_object *obj)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
 static struct dma_buf *chrome9_local_export(struct drm_gem_object *obj,
 					    int flags)
 {
-	return ERR_PTR(-EOPNOTSUPP);
+	return drm_gem_prime_export(obj, flags);
 }
 
 static const struct vm_operations_struct chrome9_local_vm_ops = {
@@ -208,6 +219,7 @@ static const struct vm_operations_struct chrome9_local_vm_ops = {
 static const struct drm_gem_object_funcs chrome9_local_funcs = {
 	.free = chrome9_local_free,
 	.export = chrome9_local_export,
+	.get_sg_table = chrome9_local_get_sg_table,
 	.mmap = chrome9_local_mmap,
 	.vm_ops = &chrome9_local_vm_ops,
 };
@@ -221,7 +233,9 @@ static int chrome9_gem_create_local(struct drm_device *drm,
 	struct chrome9_bo *bo;
 	int ret;
 
-	if (!cdev->sl_ready || args->flags != DRM_CHROME9_GEM_CREATE_LOCAL)
+	if (!cdev->sl_ready ||
+	    (args->flags & ~DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) !=
+	    DRM_CHROME9_GEM_CREATE_LOCAL)
 		return -EOPNOTSUPP;
 	/* Draw requests name the exact object size. */
 	if (!IS_ALIGNED(args->size, PAGE_SIZE))
@@ -413,8 +427,7 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		return ERR_PTR(ret);
 	}
 	obj = drm_gem_fb_get_obj(&chrome9_fb->base, 0);
-	if (!obj || obj->dev != drm || drm_gem_is_imported(obj) ||
-	    chrome9_gem_is_local(obj)) {
+	if (!obj || obj->dev != drm || drm_gem_is_imported(obj)) {
 		chrome9_fb_destroy(&chrome9_fb->base);
 		return ERR_PTR(-EINVAL);
 	}
@@ -451,6 +464,11 @@ int chrome9_gem_fb_pin(struct drm_framebuffer *fb)
 			chrome9_fb->pin_count++;
 		goto out_unlock;
 	}
+	/* A local framebuffer is scanned out from its fixed SL range. */
+	if (chrome9_gem_is_local(obj)) {
+		chrome9_fb->pin_count = 1;
+		goto out_unlock;
+	}
 	ret = chrome9_sf_pin(cdev, obj, &mapping);
 	if (!ret) {
 		chrome9_fb->mapping = mapping;
@@ -478,19 +496,23 @@ out_unlock:
 	chrome9_sf_unpin(mapping);
 }
 
-int chrome9_gem_fb_sf_base(struct drm_framebuffer *fb, u32 *base)
+/* Scanout byte address of a pinned framebuffer; *sf selects the
+ * translated SF space (CR48[7:6] = 01) over SL. */
+int chrome9_gem_fb_base(struct drm_framebuffer *fb, u32 *base, bool *sf)
 {
 	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
 	u64 address;
 	int ret = 0;
 
 	mutex_lock(&chrome9_fb->lock);
-	if (!chrome9_fb->pin_count || !chrome9_fb->mapping) {
+	*sf = !chrome9_gem_is_local(obj);
+	if (!chrome9_fb->pin_count || (*sf && !chrome9_fb->mapping)) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
-	address = (u64)chrome9_sf_mapping_base(chrome9_fb->mapping) +
-		  fb->offsets[0];
+	address = (*sf ? (u64)chrome9_sf_mapping_base(chrome9_fb->mapping) :
+		   to_chrome9_bo(obj)->local.start) + fb->offsets[0];
 	if (address > U32_MAX || !chrome9_iga1_base_valid(address)) {
 		ret = -ERANGE;
 		goto out_unlock;
@@ -506,7 +528,7 @@ void chrome9_gem_fb_sync_for_device(struct drm_framebuffer *fb)
 	struct chrome9_framebuffer *chrome9_fb = to_chrome9_framebuffer(fb);
 
 	mutex_lock(&chrome9_fb->lock);
-	if (WARN_ON(!chrome9_fb->pin_count || !chrome9_fb->mapping))
+	if (WARN_ON(!chrome9_fb->pin_count) || !chrome9_fb->mapping)
 		goto out_unlock;
 	chrome9_sf_sync_for_device(chrome9_fb->mapping);
 out_unlock:

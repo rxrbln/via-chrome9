@@ -1048,6 +1048,11 @@ static int chrome9_pipe_check(struct drm_simple_display_pipe *pipe,
 	    old_plane_state->fb != plane_state->fb &&
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
 		return -EOPNOTSUPP;
+	if (crtc_state->enable && chrome9_direct_flips && old_plane_state &&
+	    old_plane_state->fb != plane_state->fb && plane_state->fb &&
+	    chrome9_gem_is_local(drm_gem_fb_get_obj(plane_state->fb, 0)) &&
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return -EOPNOTSUPP;
 	if (crtc_state->enable && READ_ONCE(cdev->kms_state->flip_blocked) &&
 	    old_plane_state && old_plane_state->fb != plane_state->fb &&
 	    !drm_atomic_crtc_needs_modeset(crtc_state))
@@ -1090,6 +1095,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *retired_fb = NULL;
 	u32 scanout_base = 0;
 	bool system_framebuffer;
+	bool sf = false;
 	bool enabled = false;
 	int ret;
 
@@ -1107,10 +1113,10 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 		scanout_base = cdev->scanout_offset;
 		system_framebuffer = false;
 	} else {
-		ret = chrome9_gem_fb_sf_base(plane_state->fb, &scanout_base);
+		ret = chrome9_gem_fb_base(plane_state->fb, &scanout_base, &sf);
 		if (ret) {
 			dev_err(&cdev->pdev->dev,
-				"direct framebuffer has no valid SF base: %d\n", ret);
+				"direct framebuffer has no valid base: %d\n", ret);
 			return;
 		}
 		chrome9_gem_fb_sync_for_device(plane_state->fb);
@@ -1152,8 +1158,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 		chrome9_iga1_save(cdev);
 	chrome9_cursor_hw_setup(cdev);
 	ret = chrome9_iga1_program(cdev, &crtc_state->adjusted_mode,
-				  plane_state->fb->pitches[0], scanout_base,
-				  system_framebuffer);
+				  plane_state->fb->pitches[0], scanout_base, sf);
 	if (ret) {
 		kms->flip_blocked = true;
 		chrome9_vga_seq_put(cdev);
@@ -1175,7 +1180,7 @@ static void chrome9_pipe_enable(struct drm_simple_display_pipe *pipe,
 		 crtc_state->adjusted_mode.hdisplay,
 		 crtc_state->adjusted_mode.vdisplay,
 		 crtc_state->adjusted_mode.clock,
-		 system_framebuffer ? "SF" : "BAR2", scanout_base,
+		 sf ? "SF" : "SL", scanout_base,
 		 plane_state->fb->pitches[0]);
 
 out_unlock_engine:
@@ -1282,6 +1287,7 @@ static void chrome9_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *display_fb = NULL;
 	struct drm_framebuffer *old_display_fb = NULL;
 	u32 scanout_base = 0;
+	bool sf;
 	u32 old_base;
 	u32 expected;
 	u32 value;
@@ -1311,7 +1317,10 @@ static void chrome9_pipe_update(struct drm_simple_display_pipe *pipe,
 	}
 
 	event = chrome9_pipe_take_event(pipe);
-	ret = chrome9_gem_fb_sf_base(plane_state->fb, &scanout_base);
+	ret = chrome9_gem_fb_base(plane_state->fb, &scanout_base, &sf);
+	/* Direct flips keep the SF space of the enabled mode (CR48). */
+	if (!ret && !sf)
+		ret = -EOPNOTSUPP;
 	if (ret)
 		goto out_block;
 	chrome9_gem_fb_sync_for_device(plane_state->fb);

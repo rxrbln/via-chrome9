@@ -258,7 +258,7 @@ int chrome9_gem_copy_fb_to_scanout(struct chrome9_device *cdev,
 				   struct drm_framebuffer *fb);
 int chrome9_gem_fb_pin(struct drm_framebuffer *fb);
 void chrome9_gem_fb_unpin(struct drm_framebuffer *fb);
-int chrome9_gem_fb_sf_base(struct drm_framebuffer *fb, u32 *base);
+int chrome9_gem_fb_base(struct drm_framebuffer *fb, u32 *base, bool *sf);
 void chrome9_gem_fb_sync_for_device(struct drm_framebuffer *fb);
 int chrome9_kms_init(struct chrome9_device *cdev,
 		     unsigned long scanout_offset,
