@@ -19,6 +19,11 @@ module_param_named(ps_alu_max, chrome9_ps_alu_max, uint, 0600);
 MODULE_PARM_DESC(ps_alu_max,
 	"Debug: pixel shader ALU records per program, 96..128; above 96 locks up (default: 96)");
 
+static uint chrome9_ps_config_max = 3;
+module_param_named(ps_config_max, chrome9_ps_config_max, uint, 0600);
+MODULE_PARM_DESC(ps_config_max,
+	"Debug: highest A90 HPSConFig pixels-in-flight mode, 0=normal..3=4-time (default: 3)");
+
 u32 chrome9_fragment_alu_limit(void)
 {
 	return clamp(READ_ONCE(chrome9_ps_alu_max), DRM_CHROME9_FRAGMENT_MAX_ALU,
@@ -467,13 +472,15 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 
 static u32 chrome9_fragment_resource_bucket(u32 active0, u32 physical)
 {
+	u32 mode = 0;
+
 	if (active0 <= 4 && physical <= 3)
-		return 0x18000;
-	if (active0 <= 5 && physical <= 4)
-		return 0x10000;
-	if (active0 <= 8 && physical <= 6)
-		return 0x08000;
-	return 0;
+		mode = 3;
+	else if (active0 <= 5 && physical <= 4)
+		mode = 2;
+	else if (active0 <= 8 && physical <= 6)
+		mode = 1;
+	return min(mode, chrome9_ps_config_max) << 15;
 }
 
 static int chrome9_fragment_allocate(struct chrome9_fragment_state *state,
