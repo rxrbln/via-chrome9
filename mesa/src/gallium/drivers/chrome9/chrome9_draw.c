@@ -32,7 +32,8 @@
 #include "util/u_memory.h"
 #include "util/u_prim.h"
 
-#define CHROME9_FRAGMENT_BATCH_TRIANGLES 16U
+/* Triangles per generic fragment-program submission: the kernel limit. */
+#define CHROME9_FRAGMENT_BATCH_TRIANGLES DRM_CHROME9_FRAGMENT_MAX_TRIANGLES
 #define CHROME9_DEFERRED_FRAGMENT_MAX_TRIANGLES 4096U
 
 struct chrome9_deferred_fragment_batch {
@@ -84,6 +85,18 @@ struct chrome9_vbuf_render {
    struct drm_chrome9_fragment_vertex
       batch_fragment_vertices[CHROME9_FRAGMENT_BATCH_TRIANGLES * 3];
    unsigned batch_count;
+   /* Generic fragment state of the current vbuf draw call: state cannot
+    * change within one call, so its triangles share it. */
+   bool generic_state_valid;
+   struct chrome9_resource *generic_target;
+   struct chrome9_resource *generic_depth;
+   bool generic_depth_active;
+   struct drm_chrome9_draw_fragment_program generic_draw;
+   struct drm_chrome9_fragment_instruction
+      generic_instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   uint32_t generic_constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+   struct drm_chrome9_fragment_texture_state
+      generic_textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
    bool batch_failed;
    bool batch_perspective;
    bool batch_large_run;
@@ -1914,13 +1927,14 @@ chrome9_queue_generic_triangle(
    const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
    bool *queued)
 {
-   struct drm_chrome9_fragment_instruction
-      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
-   struct drm_chrome9_fragment_texture_state
-      texture_state[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   struct drm_chrome9_fragment_instruction *instructions =
+      crender->generic_instructions;
+   struct drm_chrome9_fragment_texture_state *texture_state =
+      crender->generic_textures;
    struct drm_chrome9_fragment_vertex vertices[3] = { 0 };
-   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+   uint32_t (*constants)[4] = crender->generic_constants;
    struct drm_chrome9_draw_fragment_program draw;
+   bool cached = crender->generic_state_valid;
    unsigned constant_count;
    unsigned instruction_count;
    const float pixel_center_bias = crender->ctx->rasterizer &&
@@ -1948,10 +1962,18 @@ chrome9_queue_generic_triangle(
       crender->prim == MESA_PRIM_TRIANGLES ||
       crender->prim == MESA_PRIM_TRIANGLE_STRIP ||
       crender->prim == MESA_PRIM_TRIANGLE_FAN;
-   if (!chrome9_generic_fragment_state(crender, target, depth, textures,
-          samplers, depth_active, blend_active, blend, scissor, depth_flags,
-          &draw, instructions, constants, texture_state))
-      return false;
+   if (!cached) {
+      if (!chrome9_generic_fragment_state(crender, target, depth, textures,
+             samplers, depth_active, blend_active, blend, scissor,
+             depth_flags, &crender->generic_draw, instructions, constants,
+             texture_state))
+         return false;
+      crender->generic_target = target;
+      crender->generic_depth = depth;
+      crender->generic_depth_active = depth_active;
+      crender->generic_state_valid = true;
+   }
+   draw = crender->generic_draw;
    instruction_count = draw.instruction_count;
    constant_count = draw.constant_count;
    for (unsigned i = 0; i < 3; i++) {
@@ -2027,15 +2049,17 @@ chrome9_queue_generic_triangle(
    }
    if (depth_active && chrome9_stencil_active(crender->ctx))
       chrome9_triangle_stencil(crender->ctx, vertices, &draw.stencil);
+   /* Within one call only the per-face stencil can differ. */
    if (crender->batch_count &&
        (!crender->batch_generic_program ||
         memcmp(&crender->batch_fragment, &draw, sizeof(draw)) ||
-        memcmp(crender->batch_fragment_instructions, instructions,
-               instruction_count * sizeof(instructions[0])) ||
-        memcmp(crender->batch_fragment_constants, constants,
-               constant_count * sizeof(constants[0])) ||
-        memcmp(crender->batch_fragment_textures, texture_state,
-               crender->texture_count * sizeof(texture_state[0]))))
+        (!cached &&
+         (memcmp(crender->batch_fragment_instructions, instructions,
+                 instruction_count * sizeof(instructions[0])) ||
+          memcmp(crender->batch_fragment_constants, constants,
+                 constant_count * sizeof(constants[0])) ||
+          memcmp(crender->batch_fragment_textures, texture_state,
+                 crender->texture_count * sizeof(texture_state[0]))))))
       chrome9_flush_triangle_batch(crender);
    if (crender->batch_failed)
       return false;
@@ -2471,9 +2495,42 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
 }
 
 static void
+chrome9_emit_triangle_state(struct chrome9_vbuf_render *crender,
+                            unsigned ia, unsigned ib, unsigned ic,
+                            unsigned provoking);
+
+/* Later triangles of a generic draw call reuse its validated state. */
+static void
 chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
                       unsigned ia, unsigned ib, unsigned ic,
                       unsigned provoking)
+{
+   const unsigned indices[3] = { ia, ib, ic };
+   struct chrome9_context *ctx = crender->ctx;
+   bool queued;
+
+   if (!crender->generic_program || !crender->generic_state_valid ||
+       crender->batch_failed) {
+      chrome9_emit_triangle_state(crender, ia, ib, ic, provoking);
+      return;
+   }
+   if (!chrome9_queue_generic_triangle(crender, indices,
+          crender->generic_target, crender->generic_depth, NULL, NULL,
+          crender->generic_depth_active, false, NULL, NULL, 0, &queued)) {
+      if (!queued)
+         CHROME9_REJECT(ctx, 1);
+      if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
+         fprintf(stderr, "chrome9: DRAW_FRAGMENT_PROGRAM failed after=%"
+                 PRIu64 ": %s\n", ctx->submitted_triangles, strerror(errno));
+         ctx->warnings |= CHROME9_WARN_SUBMIT;
+      }
+   }
+}
+
+static void
+chrome9_emit_triangle_state(struct chrome9_vbuf_render *crender,
+                            unsigned ia, unsigned ib, unsigned ic,
+                            unsigned provoking)
 {
    struct chrome9_context *ctx = crender->ctx;
    const float pixel_center_bias =
@@ -3575,6 +3632,7 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
       crender->ctx->rasterizer->flatshade_first;
    unsigned end;
 
+   crender->generic_state_valid = false;
    if (start > crender->vertex_count || nr > crender->vertex_count - start)
       return;
    if (!chrome9_guarded_draw_domain(crender, NULL, start, nr)) {
@@ -3634,6 +3692,7 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
    const bool first = crender->ctx->rasterizer &&
       crender->ctx->rasterizer->flatshade_first;
 
+   crender->generic_state_valid = false;
    if (!indices)
       return;
    if (!chrome9_guarded_draw_domain(crender, indices, 0, nr_indices)) {

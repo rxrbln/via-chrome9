@@ -313,6 +313,9 @@ struct chrome9_context {
    bool fast_z;
    /* CAP2_EDGE_AA: smooth TCL lines with hardware edge antialiasing. */
    bool tcl_edge_aa;
+   /* The draw module JIT-compiles vertex shaders (and samples vertex
+    * textures through mapped levels). */
+   bool draw_llvm;
    /* The current draw rasterizes filled triangles. */
    bool draw_filled_triangles;
    /* TCL draws queued for one DRAW_VERTEX_PROGRAMS submission. */

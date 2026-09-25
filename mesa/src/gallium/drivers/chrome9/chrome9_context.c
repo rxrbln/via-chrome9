@@ -7712,9 +7712,9 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          chrome9_query_mark_inexact(ctx);
    }
 
-   /* Vertex texturing runs in the interpreter on the draw path; llvmpipe
-    * compiles it instead. */
-   if (ctx->vs->sw_nir &&
+   /* Interpreted vertex texturing is slower than llvmpipe; JIT-compiled
+    * vertex shaders keep the fragments on the hardware. */
+   if (!ctx->draw_llvm && ctx->vs->sw_nir &&
        BITSET_COUNT(ctx->vs->sw_nir->info.textures_used) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
@@ -8172,9 +8172,12 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.resource_release = u_default_resource_release;
    chrome9_init_context_resource_functions(&ctx->base);
 
-   /* The vertex sampler is a TGSI-exec callback.  LLVM draw shaders use
-    * their own sampler ABI and cannot safely share that callback. */
-   ctx->draw = draw_create_no_llvm(&ctx->base);
+   /* LLVM vertex shaders sample the levels chrome9_refresh_vs_textures
+    * maps; the TGSI-exec callback below serves the interpreter. */
+   ctx->draw_llvm = draw_get_option_use_llvm() &&
+      debug_get_bool_option("CHROME9_DRAW_LLVM", true);
+   ctx->draw = ctx->draw_llvm ? draw_create(&ctx->base) :
+                                draw_create_no_llvm(&ctx->base);
    if (!ctx->draw)
       goto fail;
    ctx->vs_tgsi_sampler = chrome9_vs_texture_sampler_create(ctx);
