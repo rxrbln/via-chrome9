@@ -258,6 +258,11 @@ module_param_named(tiled_depth, chrome9_tiled_depth, bool, 0600);
 MODULE_PARM_DESC(tiled_depth,
 	"Tiled depth buffers for fragment draws (default: true)");
 
+static bool chrome9_tiled_color = true;
+module_param_named(tiled_color, chrome9_tiled_color, bool, 0600);
+MODULE_PARM_DESC(tiled_color,
+	"Tiled colour render targets and textures (default: true)");
+
 static bool chrome9_depth_output = true;
 module_param_named(depth_output, chrome9_depth_output, bool, 0600);
 MODULE_PARM_DESC(depth_output,
@@ -3168,6 +3173,7 @@ static bool chrome9_fragment_levels_derived(
 	const struct drm_chrome9_fragment_texture_state *texture)
 {
 	return texture->target != DRM_CHROME9_FRAGMENT_TARGET_CUBE &&
+	       !(texture->flags & DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED) &&
 	       is_power_of_2(max(texture->width >> texture->first_level, 1U)) &&
 	       is_power_of_2(max(texture->height >> texture->first_level, 1U));
 }
@@ -4308,9 +4314,10 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 	image[count++] = 0x20000000 | height << 12 | width;
 	image[count++] = 0x21000000 | (volume ? texture->depth : 1);
 	image[count++] = 0x22000000 |
-		(!cube && is_power_of_2(width) && is_power_of_2(height) ?
-		 BIT(15) : 0) |
-		(READ_ONCE(chrome9_tile_re) & 8 ? BIT(17) : 0) |
+		(chrome9_fragment_levels_derived(texture) &&
+		 is_power_of_2(width) && is_power_of_2(height) ? BIT(15) : 0) |
+		(texture->flags & DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED ||
+		 READ_ONCE(chrome9_tile_re) & 8 ? BIT(17) : 0) |
 		(volume ? ilog2(texture->depth) << 8 : 0) | log_size;
 	image[count++] = 0x30000000 |
 		chrome9_fragment_texture_format(texture->format) << 16 |
@@ -4578,7 +4585,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			(READ_ONCE(chrome9_vram_target_test) >> 8);
 		destination_state[1] = 0x51000000;
 	}
-	if (READ_ONCE(chrome9_tile_re) & 1)
+	if (request->flags & DRM_CHROME9_FRAGMENT_DESTINATION_TILED ||
+	    READ_ONCE(chrome9_tile_re) & 1)
 		destination_state[1] |= BIT(23);
 	destination_state[2] = 0x52000000 |
 		(rt_format->a52_format << 16) | (request->pitch >> 5);
@@ -6757,6 +6765,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_DEPTH_OUTPUT;
 	if (READ_ONCE(chrome9_tiled_depth))
 		caps |= DRM_CHROME9_CAP2_TILED_DEPTH;
+	if (READ_ONCE(chrome9_tiled_color))
+		caps |= DRM_CHROME9_CAP2_TILED_COLOR;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
 		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
@@ -8779,6 +8789,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		    (req->flags ^ request->flags) &
 		    (DRM_CHROME9_FRAGMENT_DEPTH |
 		     DRM_CHROME9_FRAGMENT_DEPTH_TILED |
+		     DRM_CHROME9_FRAGMENT_DESTINATION_TILED |
 		     DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED) ||
 		    req->depth_handle != request->depth_handle ||
 		    req->depth_object_size != request->depth_object_size) {
@@ -11530,7 +11541,10 @@ static int chrome9_validate_fragment_texture(
 	    (sparse_textures ?
 	     texture->reserved0 >= DRM_CHROME9_FRAGMENT_MAX_TEXTURES :
 	     texture->reserved0) ||
-	    memchr_inv(texture->reserved, 0, sizeof(texture->reserved)))
+	    (texture->flags & ~DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED) ||
+	    (texture->flags &&
+	     (!(caps2 & DRM_CHROME9_CAP2_TILED_COLOR) || block_bytes ||
+	      texture->target != DRM_CHROME9_FRAGMENT_TARGET_2D)))
 		return -EINVAL;
 	level_count = texture->last_level - texture->first_level;
 	if (texture->min_lod_s5_5 > texture->max_lod_s5_5 ||
@@ -11591,6 +11605,9 @@ static int chrome9_validate_fragment_texture(
 			height = DIV_ROUND_UP(height, 4);
 		} else {
 			pitch = ALIGN(width * bytes_per_pixel, 32);
+			/* Tiled layouts hold whole 8-row tiles. */
+			if (texture->flags & DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED)
+				height = ALIGN(height, 8);
 		}
 		if (texture->level_pitch[i] != pitch ||
 		    (pot && i > texture->first_level &&
@@ -12487,6 +12504,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 				 DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK;
 	if (caps2 & DRM_CHROME9_CAP2_TILED_DEPTH)
 		allowed_flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
+	if (caps2 & DRM_CHROME9_CAP2_TILED_COLOR)
+		allowed_flags |= DRM_CHROME9_FRAGMENT_DESTINATION_TILED;
 
 	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
 	     !sparse_textures) ||
@@ -12565,7 +12584,10 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	/* A50 holds the base in 256-byte units (manual, silicon rung). */
 	request.destination_offset = args->destination_offset ?: PAGE_SIZE;
 	if (check_mul_overflow((u64)args->destination_pitch,
-			       (u64)args->height, &surface_size) ||
+			       (u64)(args->flags &
+				     DRM_CHROME9_FRAGMENT_DESTINATION_TILED ?
+				     ALIGN(args->height, 8) : args->height),
+			       &surface_size) ||
 	    check_add_overflow(ALIGN(request.destination_offset + surface_size,
 				     PAGE_SIZE),
 			       (u64)PAGE_SIZE, &request.object_size))
