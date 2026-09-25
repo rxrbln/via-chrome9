@@ -68,6 +68,9 @@
 /* 0x200: bit 31 global interrupt gate; enable bits 30:16, 11. */
 #define CHROME9_IRQ_GLOBAL		BIT(31)
 #define CHROME9_IRQ_ENABLE_MASK		0xf7ff0800U
+/* 0x1280 bits 13/11/9: internal DP status, write one to clear. */
+#define CHROME9_REG_DP_STATUS		0x1280
+#define CHROME9_DP_STATUS_IRQ		0x2a00
 /* 0x204 bit 5: CR (fence) interrupt status, write one to clear. */
 #define CHROME9_IRQ_CR			BIT(5)
 #define CHROME9_FE33_SLOT_SIZE		16U
@@ -169,10 +172,10 @@ module_param_named(fe33_fence, chrome9_fe33_fence, bool, 0400);
 MODULE_PARM_DESC(fe33_fence,
 	"Require a coherent FE330004 3D completion write per 3D job (default: false)");
 
-static uint chrome9_fence_irq;
+static uint chrome9_fence_irq = 1;
 module_param_named(fence_irq, chrome9_fence_irq, uint, 0400);
 MODULE_PARM_DESC(fence_irq,
-	"Retire FE33 fences on the CR interrupt, needs fe33_fence; 2 gate only, FE33 without interrupt (default: 0)");
+	"Retire FE33 fences on the CR interrupt, needs fe33_fence; 2 gate only, FE33 without interrupt (default: 1)");
 
 static bool chrome9_hw_tcl;
 module_param_named(hw_tcl, chrome9_hw_tcl, bool, 0400);
@@ -832,6 +835,8 @@ struct chrome9_engine {
 	u32 irq_saved_enables;
 	atomic_t irq_seq;
 	atomic_t irq_foreign;
+	/* Acknowledged internal DP status interrupts (0x1280). */
+	atomic_t irq_dp;
 	u32 irq_foreign_status[2];
 	u32 irq_foreign_regs[12];
 	wait_queue_head_t irq_wq;
@@ -6729,11 +6734,20 @@ static irqreturn_t chrome9_fence_irq_handler(int irq, void *data)
 	struct chrome9_engine *engine = data;
 	void __iomem *mmio = engine->cdev->mmio;
 	u32 gate = readl(mmio + CHROME9_REG_DISPLAY_STATUS);
-	u32 status;
+	u32 status, hp;
 
 	if (gate == U32_MAX || !(gate & CHROME9_IRQ_GLOBAL))
 		return IRQ_NONE;
 	status = readl(mmio + CHROME9_REG_BASE_UPDATE_STATUS);
+	/* Internal DP status (0x1280 bits 13/11/9) raises the line without
+	 * an enable bit; acknowledge it as the vendor ISR does. */
+	hp = readl(mmio + CHROME9_REG_DP_STATUS);
+	if (hp & CHROME9_DP_STATUS_IRQ) {
+		writel(hp & 0x7fffffe0, mmio + CHROME9_REG_DP_STATUS);
+		atomic_inc(&engine->irq_dp);
+		if (!(status & CHROME9_IRQ_CR))
+			return IRQ_HANDLED;
+	}
 	if (!(status & CHROME9_IRQ_CR)) {
 		/* Record the first foreign source; the worker gives up the gate. */
 		if (atomic_inc_return(&engine->irq_foreign) == 1) {
@@ -6772,6 +6786,9 @@ static void chrome9_fence_irq_setup(struct chrome9_engine *engine)
 	    engine->max_inflight == 1)
 		return;
 	writel(CHROME9_IRQ_CR, cdev->mmio + CHROME9_REG_BASE_UPDATE_STATUS);
+	old = readl(cdev->mmio + CHROME9_REG_DP_STATUS);
+	if (old & CHROME9_DP_STATUS_IRQ)
+		writel(old & 0x7fffffe0, cdev->mmio + CHROME9_REG_DP_STATUS);
 	ret = request_irq(cdev->pdev->irq, chrome9_fence_irq_handler,
 			  IRQF_SHARED, "chrome9", engine);
 	if (ret) {
@@ -6801,6 +6818,9 @@ static void chrome9_fence_irq_teardown(struct chrome9_engine *engine)
 	       cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
 	readl(cdev->mmio + CHROME9_REG_DISPLAY_STATUS);
 	free_irq(cdev->pdev->irq, engine);
+	if (atomic_read(&engine->irq_dp))
+		dev_info(&cdev->pdev->dev, "%d internal DP status interrupts\n",
+			 atomic_read(&engine->irq_dp));
 	engine->irq_requested = false;
 	engine->irq_enabled = false;
 }
