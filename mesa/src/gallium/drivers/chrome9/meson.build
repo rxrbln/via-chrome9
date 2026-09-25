@@ -21,6 +21,7 @@ libchrome9 = static_library(
     'chrome9_drm.c',
     'chrome9_format.c',
     'chrome9_fragment.c',
+    'chrome9_blit.c',
     'chrome9_resource.c',
     'chrome9_screen.c',
     'chrome9_ps_schedule.c',

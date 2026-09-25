@@ -2,6 +2,7 @@
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 
 #include "chrome9_context.h"
+#include "chrome9_blit.h"
 
 #include "chrome9_draw.h"
 #include "chrome9_query.h"
@@ -7501,6 +7502,7 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.flush_resource = chrome9_flush_resource;
    ctx->base.draw_vbo = chrome9_draw_vbo;
    ctx->base.clear = chrome9_clear;
+   ctx->base.blit = chrome9_blit;
    ctx->base.clear_render_target = chrome9_clear_render_target;
    ctx->base.clear_depth_stencil = chrome9_clear_depth_stencil;
    ctx->base.create_blend_state = chrome9_create_blend_state;
