@@ -67,7 +67,7 @@ MODULE_PARM_DESC(cbu_window,
 static uint chrome9_cbu_route;
 module_param_named(cbu_route, chrome9_cbu_route, uint, 0400);
 MODULE_PARM_DESC(cbu_route,
-	"Debug: CBU routing probe instead of steps 3..12: bit 0 probe, 1 D0F2 9E[1], 2 DFA D1F0 B9[1] (with bit 1), 3 SR42[7]");
+	"Debug: CBU routing probe instead of steps 3..12: bit 0 probe, 1 D0F2 9E[1], 2 DFA D1F0 B9[1] (with bit 1), 3 SR42[7], 4 B9 by dword write, 5 D1F0 B0[3] unlock");
 
 static int chrome9_cbu_pitch_mode = -1;
 module_param_named(cbu_pitch_mode, chrome9_cbu_pitch_mode, int, 0400);
@@ -1071,10 +1071,13 @@ out:
 #define CHROME9_CBU_ROUTE_NB	BIT(1)
 #define CHROME9_CBU_ROUTE_DFA	BIT(2)
 #define CHROME9_CBU_ROUTE_SR42	BIT(3)
+#define CHROME9_CBU_ROUTE_DWORD	BIT(4)
+#define CHROME9_CBU_ROUTE_UNLOCK	BIT(5)
 
 struct chrome9_cbu_route {
 	struct pci_dev *d0f2;
 	u8 d0f2_9e;
+	u8 b0;
 	u8 b9;
 	u8 sr42;
 	unsigned int applied;
@@ -1097,6 +1100,35 @@ static int chrome9_cbu_sr42(struct chrome9_cbu_test *t, int value)
 	return ret;
 }
 
+/* D1F0 B9 by byte write, or by a read-modify-write of the B8 dword. */
+static u8 chrome9_cbu_write_b9(struct pci_dev *pdev, u8 value)
+{
+	u32 dword = 0;
+	u8 v = 0;
+
+	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_DWORD) {
+		pci_read_config_dword(pdev, 0xb8, &dword);
+		pci_write_config_dword(pdev, 0xb8,
+				       (dword & ~GENMASK(15, 8)) | value << 8);
+	} else {
+		pci_write_config_byte(pdev, 0xb9, value);
+	}
+	pci_read_config_byte(pdev, 0xb9, &v);
+	return v;
+}
+
+static void chrome9_cbu_dump_d1f0(struct chrome9_cbu_test *t,
+				  const char *when)
+{
+	u32 v[4];
+	int i;
+
+	for (i = 0; i < 4; i++)
+		pci_read_config_dword(t->cdev->pdev, 0xb0 + 4 * i, &v[i]);
+	dev_info(t->dev, "CBU R: D1F0 B0..BF %s: %08x %08x %08x %08x\n",
+		 when, v[0], v[1], v[2], v[3]);
+}
+
 static void chrome9_cbu_route_restore(struct chrome9_cbu_test *t,
 				      struct chrome9_cbu_route *r)
 {
@@ -1107,9 +1139,12 @@ static void chrome9_cbu_route_restore(struct chrome9_cbu_test *t,
 	if (r->applied & CHROME9_CBU_ROUTE_SR42)
 		sr42 = chrome9_cbu_sr42(t, r->sr42);
 	if (r->applied & CHROME9_CBU_ROUTE_DFA)
-		pci_write_config_byte(pdev, 0xb9, r->b9);
+		chrome9_cbu_write_b9(pdev, r->b9);
 	if (r->applied & CHROME9_CBU_ROUTE_NB)
 		pci_write_config_byte(r->d0f2, 0x9e, r->d0f2_9e);
+	if (r->applied & CHROME9_CBU_ROUTE_UNLOCK)
+		pci_write_config_byte(pdev, 0xb0, r->b0);
+	chrome9_cbu_dump_d1f0(t, "restored");
 	pci_read_config_byte(pdev, 0xb9, &b9);
 	pci_read_config_byte(r->d0f2, 0x9e, &nb);
 	dev_info(t->dev, "CBU R: restored D0F2.9E=%02x D1F0.B9=%02x SR42=%02x\n",
@@ -1157,14 +1192,26 @@ static int chrome9_cbu_route_apply(struct chrome9_cbu_test *t,
 		pci_read_config_byte(r->d0f2, 0x9e, &v);
 		dev_info(t->dev, "CBU R: D0F2.9E %02x -> %02x\n", r->d0f2_9e, v);
 	}
+	chrome9_cbu_dump_d1f0(t, "before");
+	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_UNLOCK) {
+		r->applied |= CHROME9_CBU_ROUTE_UNLOCK;
+		pci_write_config_byte(pdev, 0xb0, r->b0 | BIT(3));
+		pci_read_config_byte(pdev, 0xb0, &v);
+		dev_info(t->dev, "CBU R: D1F0.B0 %02x -> %02x\n", r->b0, v);
+	}
 	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_DFA) {
 		if (!(chrome9_cbu_route & CHROME9_CBU_ROUTE_NB) ||
 		    !chrome9_cbu_dfa_matches(t))
 			return -EINVAL;
 		r->applied |= CHROME9_CBU_ROUTE_DFA;
-		pci_write_config_byte(pdev, 0xb9, r->b9 | BIT(1));
-		pci_read_config_byte(pdev, 0xb9, &v);
-		dev_info(t->dev, "CBU R: D1F0.B9 %02x -> %02x\n", r->b9, v);
+		v = chrome9_cbu_write_b9(pdev, r->b9 | BIT(1));
+		dev_info(t->dev, "CBU R: D1F0.B9 %02x -> %02x (%s write)\n",
+			 r->b9, v, chrome9_cbu_route & CHROME9_CBU_ROUTE_DWORD ?
+			 "dword" : "byte");
+		chrome9_cbu_dump_d1f0(t, "after");
+		/* Without DFA the probe would repeat route 3. */
+		if (!(v & BIT(1)))
+			return -EAGAIN;
 	}
 	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_SR42) {
 		r->applied |= CHROME9_CBU_ROUTE_SR42;
@@ -1264,6 +1311,7 @@ static int chrome9_cbu_step_route(struct chrome9_cbu_test *t)
 	if (!r.d0f2)
 		return -ENODEV;
 	pci_read_config_byte(r.d0f2, 0x9e, &r.d0f2_9e);
+	pci_read_config_byte(pdev, 0xb0, &r.b0);
 	pci_read_config_byte(pdev, 0xb9, &r.b9);
 	sr42 = chrome9_cbu_sr42(t, -1);
 	ret = sr42 < 0 ? sr42 :
@@ -1276,6 +1324,11 @@ static int chrome9_cbu_step_route(struct chrome9_cbu_test *t)
 	/* Filled before any routing change, read back after it. */
 	chrome9_cbu_fill_raw(t, &s);
 	ret = chrome9_cbu_route_apply(t, &r);
+	if (ret == -EAGAIN) {
+		dev_info(t->dev, "CBU R: DFA enable did not latch, no probe\n");
+		ret = 0;
+		goto out;
+	}
 	if (ret) {
 		dev_err(t->dev, "CBU R: route %#x not applicable\n",
 			chrome9_cbu_route);
