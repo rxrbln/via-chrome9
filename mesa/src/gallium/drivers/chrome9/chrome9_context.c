@@ -6723,6 +6723,212 @@ chrome9_ps_ir_remove(struct chrome9_ps_ir *ir, unsigned index)
    ir->count--;
 }
 
+/* The one instruction writing temporary id, if exactly one does. */
+static bool
+chrome9_ps_single_writer(const struct chrome9_ps_ir *ir, unsigned id,
+                         unsigned *writer)
+{
+   bool found = false;
+
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *in = &ir->instruction[i];
+
+      if (in->op == CHROME9_PS_OPCODE_KILL ||
+          in->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+          in->destination.id != id)
+         continue;
+      if (found)
+         return false;
+      *writer = i;
+      found = true;
+   }
+   return found;
+}
+
+/*
+ * vecN assembly: MOV D.L = S.l, where the only producer of S writes just
+ * lane l, becomes the producer writing D.L directly and every read of S.l
+ * reads D.L.  A terminal colour copy takes literal lanes from their MOV as
+ * ONE/ZERO selectors first.
+ */
+/* The program still translates to the DRM UAPI. */
+static bool
+chrome9_ps_ir_translates(const struct chrome9_ps_ir *ir)
+{
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   unsigned count, samplers = 0;
+
+   for (unsigned i = 0; i < ir->count; i++)
+      if (ir->instruction[i].op == CHROME9_PS_OPCODE_TEX)
+         samplers |= 1u << ir->instruction[i].sampler;
+   return chrome9_fragment_build_instructions(ir, samplers, instructions,
+                                              &count);
+}
+
+static void
+chrome9_ps_ir_coalesce_lanes(struct chrome9_ps_ir *ir)
+{
+   struct chrome9_ps_instruction *last;
+
+   if (!ir->count)
+      return;
+   last = &ir->instruction[ir->count - 1];
+   if (last->op == CHROME9_PS_OPCODE_MOV &&
+       last->destination.file == CHROME9_PS_DESTINATION_COLOR &&
+       last->source[0].file == CHROME9_PS_SOURCE_TEMP &&
+       !last->source[0].modifier) {
+      const struct chrome9_ps_ir before = *ir;
+
+      for (unsigned c = 0; c < 4; c++) {
+         const uint8_t lane = last->source[0].swizzle[c];
+
+         if (lane > CHROME9_PS_SWIZZLE_W)
+            continue;
+         for (unsigned i = 0; i + 1 < ir->count; i++) {
+            struct chrome9_ps_instruction *mov = &ir->instruction[i];
+            uint8_t literal;
+            bool other_reader = false;
+
+            if (mov->op != CHROME9_PS_OPCODE_MOV ||
+                mov->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+                mov->destination.id != last->source[0].id ||
+                !(mov->destination.writemask & (1u << lane)) ||
+                mov->destination.saturate)
+               continue;
+            literal = mov->source[0].swizzle[lane];
+            if (literal != CHROME9_PS_SWIZZLE_ONE &&
+                literal != CHROME9_PS_SWIZZLE_ZERO)
+               break;
+            for (unsigned j = 0; j + 1 < ir->count; j++)
+               other_reader |= chrome9_ps_reads_temp(&ir->instruction[j],
+                                                     mov->destination.id);
+            if (other_reader ||
+                (ir->depth_output &&
+                 ir->depth.file == CHROME9_PS_SOURCE_TEMP &&
+                 ir->depth.id == mov->destination.id))
+               break;
+            last->source[0].swizzle[c] = literal;
+            break;
+         }
+      }
+      /* Drop literal lanes nobody reads any more. */
+      for (unsigned i = 0; i + 1 < ir->count; i++) {
+         struct chrome9_ps_instruction *mov = &ir->instruction[i];
+         uint8_t read = 0;
+
+         if (mov->op != CHROME9_PS_OPCODE_MOV ||
+             mov->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+             mov->destination.id != last->source[0].id)
+            continue;
+         for (unsigned c = 0; c < 4; c++)
+            if (last->source[0].swizzle[c] <= CHROME9_PS_SWIZZLE_W)
+               read |= 1u << last->source[0].swizzle[c];
+         for (unsigned c = 0; c < 4; c++)
+            if ((mov->destination.writemask & (1u << c)) && !(read & (1u << c)) &&
+                mov->source[0].swizzle[c] >= CHROME9_PS_SWIZZLE_ONE)
+               mov->destination.writemask &= ~(1u << c);
+         if (!mov->destination.writemask) {
+            chrome9_ps_ir_remove(ir, i--);
+            last = &ir->instruction[ir->count - 1];
+         }
+      }
+      if (!chrome9_ps_ir_translates(ir))
+         *ir = before;
+   }
+   for (unsigned i = 0; i < ir->count; i++) {
+      struct chrome9_ps_instruction *mov = &ir->instruction[i];
+      struct chrome9_ps_instruction *producer;
+      const struct chrome9_ps_source *from = &mov->source[0];
+      unsigned writer, dst_lane, src_lane;
+      bool lane_wise;
+
+      if (mov->op != CHROME9_PS_OPCODE_MOV ||
+          mov->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+          mov->destination.saturate ||
+          util_bitcount(mov->destination.writemask) != 1 ||
+          from->file != CHROME9_PS_SOURCE_TEMP || from->modifier ||
+          from->id == mov->destination.id)
+         continue;
+      dst_lane = ffs(mov->destination.writemask) - 1;
+      src_lane = from->swizzle[dst_lane];
+      if (src_lane > CHROME9_PS_SWIZZLE_W ||
+          !chrome9_ps_single_writer(ir, from->id, &writer) || writer >= i)
+         continue;
+      producer = &ir->instruction[writer];
+      if (producer->op == CHROME9_PS_OPCODE_TEX ||
+          producer->destination.writemask != 1u << src_lane)
+         continue;
+      lane_wise = chrome9_ps_componentwise(producer->op) ||
+                  producer->op == CHROME9_PS_OPCODE_ABS ||
+                  producer->op == CHROME9_PS_OPCODE_FRC;
+      /* TEX coordinates and KILL keep their own temporaries. */
+      {
+         bool special = false;
+
+         for (unsigned j = writer + 1; j < ir->count; j++)
+            special |= (ir->instruction[j].op == CHROME9_PS_OPCODE_TEX ||
+                        ir->instruction[j].op == CHROME9_PS_OPCODE_KILL) &&
+                       chrome9_ps_reads_temp(&ir->instruction[j], from->id);
+         if (special)
+            continue;
+      }
+      /* The target lane must not be written before this MOV. */
+      {
+         bool written = false;
+
+         for (unsigned j = 0; j < i; j++)
+            written |= ir->instruction[j].op != CHROME9_PS_OPCODE_KILL &&
+                       ir->instruction[j].destination.file ==
+                          CHROME9_PS_DESTINATION_TEMP &&
+                       ir->instruction[j].destination.id ==
+                          mov->destination.id &&
+                       (ir->instruction[j].destination.writemask &
+                        mov->destination.writemask);
+         if (written)
+            continue;
+      }
+      {
+         const unsigned from_id = from->id, to_id = mov->destination.id;
+         const struct chrome9_ps_ir before = *ir;
+
+         if (lane_wise)
+            for (unsigned s = 0; s < chrome9_ps_source_count(producer->op);
+                 s++)
+               producer->source[s].swizzle[dst_lane] =
+                  producer->source[s].swizzle[src_lane];
+         producer->destination.id = to_id;
+         producer->destination.writemask = 1u << dst_lane;
+         for (unsigned j = writer + 1; j < ir->count; j++) {
+            struct chrome9_ps_instruction *reader = &ir->instruction[j];
+
+            for (unsigned s = 0; s < 3; s++) {
+               struct chrome9_ps_source *src = &reader->source[s];
+
+               if (src->file != CHROME9_PS_SOURCE_TEMP || src->id != from_id)
+                  continue;
+               src->id = to_id;
+               for (unsigned c = 0; c < 4; c++)
+                  if (src->swizzle[c] == src_lane)
+                     src->swizzle[c] = dst_lane;
+            }
+         }
+         if (ir->depth_output && ir->depth.file == CHROME9_PS_SOURCE_TEMP &&
+             ir->depth.id == from_id) {
+            ir->depth.id = to_id;
+            for (unsigned c = 0; c < 4; c++)
+               if (ir->depth.swizzle[c] == src_lane)
+                  ir->depth.swizzle[c] = dst_lane;
+         }
+         chrome9_ps_ir_remove(ir, i--);
+         if (!chrome9_ps_ir_translates(ir)) {
+            *ir = before;
+            i++;
+         }
+      }
+   }
+}
+
 /*
  * Pixel throughput follows the ALU record count, so remove copies the
  * backend's one-record-per-NIR-op lowering leaves: a MOV of literal 1.0
@@ -6898,6 +7104,10 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
       unsigned folded_peak;
 
       chrome9_ps_ir_fold_copies(&folded, &shader->native_fs);
+      if (debug_get_bool_option("CHROME9_PS_COALESCE", true)) {
+         chrome9_ps_ir_coalesce_lanes(&folded);
+         chrome9_ps_ir_fold_copies(&folded, &shader->native_fs);
+      }
       if (chrome9_ps_ir_temp_pressure(&folded, &folded_peak))
          shader->semantic_fs_ir = folded;
    }
