@@ -368,6 +368,12 @@ static bool chrome9_gart_nosnoop = true;
 module_param_named(gart_nosnoop, chrome9_gart_nosnoop, bool, 0400);
 MODULE_PARM_DESC(gart_nosnoop, "Map draw objects with non-snooped GART PTEs (default: true)");
 
+/* T6 of chrome9-gart-snoop-re.md: only after the snoop ladder passed. */
+static bool chrome9_gart_snoop_ring;
+module_param_named(gart_snoop_ring, chrome9_gart_snoop_ring, bool, 0400);
+MODULE_PARM_DESC(gart_snoop_ring,
+	"Debug: map ring and index arena with snooped GART PTEs, no per-append CLFLUSH (default: false)");
+
 static bool chrome9_local_memory = true;
 module_param_named(local_memory, chrome9_local_memory, bool, 0400);
 MODULE_PARM_DESC(local_memory,
@@ -897,6 +903,8 @@ struct chrome9_engine {
 	struct list_head draw_mappings;
 	void *ring_cpu;
 	dma_addr_t ring_dma;
+	/* Ring and index arena PTEs carry the snoop bit (gart_snoop_ring). */
+	bool ring_snoop;
 	void *staging_cpu;
 	void *run_staging_cpu;
 	u32 *fence_cpu;
@@ -1249,6 +1257,16 @@ static void chrome9_cache_flush(void *address, size_t size)
 #endif
 	/* Complete eviction before the caller transfers ownership to the GPU. */
 	mb();
+}
+
+/* CPU-written ring and index bytes; snooped PTEs need ordering only. */
+static void chrome9_ring_flush(struct chrome9_engine *engine, void *address,
+			       size_t size)
+{
+	if (engine->ring_snoop)
+		mb();
+	else
+		chrome9_cache_flush(address, size);
 }
 
 static u8 chrome9_seq_read(struct chrome9_device *cdev, u8 index)
@@ -4967,8 +4985,9 @@ draw:
 
 			memcpy((u8 *)index_arena->index_cpu + at, tcl->indices,
 			       bytes);
-			chrome9_cache_flush((u8 *)index_arena->index_cpu + at,
-					    bytes);
+			chrome9_ring_flush(index_arena,
+					   (u8 *)index_arena->index_cpu + at,
+					   bytes);
 			index_arena->index_head = ALIGN(at + bytes, 16);
 			while (!IS_ALIGNED((unsigned long)p, 16))
 				*p++ = 0xcc000000;
@@ -5388,7 +5407,7 @@ static int chrome9_install_prime_ring(struct chrome9_engine *engine,
 	ring[0x84 / sizeof(*ring)] = 0x0000041c;
 	ring[0x88 / sizeof(*ring)] = 0x00300000;
 	ring[0x8c / sizeof(*ring)] = 0xcc000000;
-	chrome9_cache_flush(ring, engine->ring_size);
+	chrome9_ring_flush(engine, ring, engine->ring_size);
 	dma_wmb();
 	chrome9_install_stopped_ring(cdev, 1, engine->ring_size,
 				     CHROME9_PRIME_PAUSE);
@@ -5535,7 +5554,8 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 		/* Stay beyond every byte fetched while the prime reached PAUSE. */
 		append = chrome9_ring_append_after(CHROME9_PRIME_STOP);
 		memcpy((u8 *)engine->ring_cpu + append, source, copy_len);
-		chrome9_cache_flush((u8 *)engine->ring_cpu + append, copy_len);
+		chrome9_ring_flush(engine, (u8 *)engine->ring_cpu + append,
+				   copy_len);
 		dma_wmb();
 		job->ring_pause = append + segment_pause;
 		job->ring_stop = append + job->segment_stop;
@@ -5548,7 +5568,8 @@ static int chrome9_append_segment(struct chrome9_engine *engine,
 	} else {
 		memcpy((u8 *)engine->ring_cpu + append, source,
 		       copy_len);
-		chrome9_cache_flush((u8 *)engine->ring_cpu + append, copy_len);
+		chrome9_ring_flush(engine, (u8 *)engine->ring_cpu + append,
+				   copy_len);
 		dma_wmb();
 		job->ring_pause = append + segment_pause;
 		job->ring_stop = append + job->segment_stop;
@@ -5633,6 +5654,7 @@ static int chrome9_gart_set(struct chrome9_engine *engine, u32 first,
 static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 {
 	struct chrome9_device *cdev = engine->cdev;
+	u32 snoop = engine->ring_snoop ? CHROME9_GART_CACHED : 0;
 	u8 programmed_6c;
 	u8 request;
 	unsigned int i;
@@ -5660,12 +5682,12 @@ static int chrome9_gart_bind_ring(struct chrome9_engine *engine)
 	for (i = 0; i < CHROME9_GART_ENTRIES; i++)
 		writel(engine->scratch_pte, engine->gart + i * sizeof(u32));
 	for (i = 0; i < engine->ring_pages; i++)
-		writel(lower_32_bits((engine->ring_dma + i * PAGE_SIZE) >>
-				     PAGE_SHIFT) & 0x3fffffff,
+		writel((lower_32_bits((engine->ring_dma + i * PAGE_SIZE) >>
+				      PAGE_SHIFT) & 0x3fffffff) | snoop,
 		       engine->gart + i * sizeof(u32));
 	for (i = 0; i < engine->index_pages; i++)
-		writel(lower_32_bits((engine->index_dma + i * PAGE_SIZE) >>
-				     PAGE_SHIFT) & 0x3fffffff,
+		writel((lower_32_bits((engine->index_dma + i * PAGE_SIZE) >>
+				      PAGE_SHIFT) & 0x3fffffff) | snoop,
 		       engine->gart + (engine->ring_pages + i) * sizeof(u32));
 	if (engine->query_sf_cpu)
 		writel(lower_32_bits(engine->query_sf_dma >> PAGE_SHIFT) &
@@ -7275,6 +7297,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 		goto err_free_ring;
 	}
 	cdev->engine = engine;
+	engine->ring_snoop = chrome9_gart_snoop_ring;
 	engine->saved_dst_pos = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
 	ret = chrome9_gart_bind_ring(engine);
 	if (ret)
@@ -7329,10 +7352,12 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	chrome9_fence_irq_setup(engine);
 	engine->ready = true;
 	dev_info(&cdev->pdev->dev,
-		 "persistent SF engine ready: GART=%#llx ring=%pad/%u KiB fe33=%s max_inflight=%u\n",
+		 "persistent SF engine ready: GART=%#llx ring=%pad/%u KiB fe33=%s max_inflight=%u%s\n",
 		 (unsigned long long)engine->gart_offset, &engine->ring_dma,
 		 engine->ring_size / SZ_1K, engine->fence_cpu ? "on" : "off",
-		 engine->max_inflight);
+		 engine->max_inflight,
+		 engine->ring_snoop ?
+		 " ring/index GART snoop (bit 25), no per-append CLFLUSH" : "");
 	return 0;
 
 err_restore_gart:
