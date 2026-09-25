@@ -231,10 +231,20 @@ module_param_named(coarse_z_re, chrome9_coarse_z_re, uint, 0600);
 MODULE_PARM_DESC(coarse_z_re,
 	"Debug: bits toggled in the coarse-Z A29 word (default: 0)");
 
+static bool chrome9_edge_aa = true;
+module_param_named(edge_aa, chrome9_edge_aa, bool, 0600);
+MODULE_PARM_DESC(edge_aa,
+	"Edge antialiasing for vertex-program lines and triangles (default: true)");
+
 static bool chrome9_fast_z = true;
 module_param_named(fast_z, chrome9_fast_z, bool, 0600);
 MODULE_PARM_DESC(fast_z,
 	"Fast-Z clears of X8Z24 depth buffers (default: true)");
+
+static uint chrome9_edge_aa_re;
+module_param_named(edge_aa_re, chrome9_edge_aa_re, uint, 0600);
+MODULE_PARM_DESC(edge_aa_re,
+	"Debug: bits ORed into A01 of fragment draws, 0x20 edge antialiasing (default: 0)");
 
 static uint chrome9_fast_z_re;
 module_param_named(fast_z_re, chrome9_fast_z_re, uint, 0600);
@@ -594,6 +604,8 @@ enum chrome9_draw_kind {
  */
 struct chrome9_tcl_draw {
 	const struct chrome9_vertex_program *program;
+	/* A01 bit 5 edge antialiasing (RASTER_EDGE_AA). */
+	bool edge_aa;
 	/* Program A61 with this draw's bool constants. */
 	u32 a61;
 	const struct drm_chrome9_vertex_instruction *instructions;
@@ -4632,6 +4644,9 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			     (tcl->cull & (DRM_CHROME9_VERTEX_CULL_CW |
 					   DRM_CHROME9_VERTEX_CULL_CCW) ? BIT(7) : 0) |
 			     (tcl->sprite_mask ? BIT(21) : 0);
+	common[4] |= READ_ONCE(chrome9_edge_aa_re) & 0x00ffffff;
+	if (tcl && tcl->edge_aa)
+		common[4] = (common[4] | BIT(5)) & ~(BIT(13) | BIT(9));
 	if (tcl && tcl->re & CHROME9_TCL_RE_LINE_AB &&
 	    (tcl->raster == CHROME9_TCL_LINES || tcl->polygon))
 		common[4] &= ~BIT(23);
@@ -6694,6 +6709,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_COARSE_Z;
 	if (READ_ONCE(chrome9_fast_z))
 		caps |= DRM_CHROME9_CAP2_FAST_Z;
+	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
+		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
@@ -12747,7 +12764,10 @@ static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *ar
 	bool points;
 
 	if (raster & ~(DRM_CHROME9_RASTER_POINT_SPRITE |
-		       DRM_CHROME9_RASTER_POINT_SIZE_VERTEX | GENMASK(19, 8)) ||
+		       DRM_CHROME9_RASTER_POINT_SIZE_VERTEX | GENMASK(19, 8) |
+		       (chrome9_engine_capabilities2() &
+			DRM_CHROME9_CAP2_EDGE_AA ?
+			DRM_CHROME9_RASTER_EDGE_AA : 0)) ||
 	    cw > DRM_CHROME9_POLYGON_POINT || ccw > DRM_CHROME9_POLYGON_POINT ||
 	    (cw == DRM_CHROME9_POLYGON_POINT) != (ccw == DRM_CHROME9_POLYGON_POINT) ||
 	    size < 0x3f800000 || size > 0x45000000)
@@ -12816,6 +12836,12 @@ static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *ar
 			(tcl->point_size_vertex ? 0x3f800000 : size) >> 8;
 	}
 	tcl->sprite_mask = sprite;
+	/* Edge antialiasing for lines and filled triangles only. */
+	if (raster & DRM_CHROME9_RASTER_EDGE_AA) {
+		if (points || cw || ccw)
+			return -EINVAL;
+		tcl->edge_aa = true;
+	}
 	return 0;
 }
 
