@@ -332,6 +332,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_COLOR_TARGETS		(1ULL << 30)
 /* GEM_BUSY. */
 #define DRM_CHROME9_CAP2_GEM_BUSY		(1ULL << 31)
+/* DESTINATION_FORMAT_R32F and FRAGMENT_TEXTURE_R32F. */
+#define DRM_CHROME9_CAP2_R32F			(1ULL << 32)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -760,6 +762,12 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_DESTINATION_FORMAT_L8A8	3
 #define DRM_CHROME9_DESTINATION_FORMAT_ARGB1555	4
 #define DRM_CHROME9_DESTINATION_FORMAT_ARGB4444	5
+/*
+ * CAP2_R32F: one IEEE float channel.  Float targets take no blending,
+ * alpha test or edge AA; every colour target of the draw is then written
+ * with the full mask and without dithering.
+ */
+#define DRM_CHROME9_DESTINATION_FORMAT_R32F	6
 
 struct drm_chrome9_blend_state {
 	__u32 flags;
@@ -1346,6 +1354,8 @@ enum drm_chrome9_fragment_file {
 #define DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGBA	8
 #define DRM_CHROME9_FRAGMENT_TEXTURE_DXT3	9
 #define DRM_CHROME9_FRAGMENT_TEXTURE_DXT5	10
+/* CAP2_R32F: returned as (r, 1, 1, 1); NEAREST filtering only. */
+#define DRM_CHROME9_FRAGMENT_TEXTURE_R32F	11
 
 #define DRM_CHROME9_FRAGMENT_TARGET_2D		0
 /* Square POT, faces +X -X +Y -Y +Z -Z, TEX reads three coordinate lanes. */
