@@ -272,6 +272,29 @@ chrome9_ubo_offset_to_int(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* x * rcp(y) truncates exact quotients one low (76 / 76 = 0), so correct
+ * the magnitude from the exact remainder of float-held integers. */
+static bool
+chrome9_lower_idiv(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   (void)data;
+   if (alu->op != nir_op_idiv)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
+   nir_def *ax = nir_iabs(b, x), *ay = nir_iabs(b, y);
+   nir_def *q = nir_f2i32(b, nir_ftrunc(b, nir_fmul(b, nir_i2f32(b, ax),
+                                        nir_frcp(b, nir_i2f32(b, ay)))));
+   nir_def *r = nir_isub(b, ax, nir_imul(b, q, ay));
+
+   q = nir_iadd(b, q, nir_isub(b, nir_b2i32(b, nir_ige(b, r, ay)),
+                               nir_b2i32(b, nir_ilt_imm(b, r, 0))));
+   q = nir_bcsel(b, nir_ilt_imm(b, nir_imul(b, x, y), 0), nir_ineg(b, q), q);
+   nir_def_replace(&alu->def, q);
+   return true;
+}
+
 void
 chrome9_nir_lower_integers(nir_shader *nir)
 {
@@ -282,6 +305,8 @@ chrome9_nir_lower_integers(nir_shader *nir)
     * integer operand (m[1] became m[0x3f800000]). */
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+   NIR_PASS(_, nir, nir_shader_alu_pass, chrome9_lower_idiv,
+            nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_int_to_float);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, chrome9_ubo_offset_to_int,
             nir_metadata_control_flow, NULL);
