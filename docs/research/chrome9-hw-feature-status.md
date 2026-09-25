@@ -39,6 +39,8 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | GPU mipmap generation (level L from L-1 of one object, 4 NEAREST taps), on by default | Mesa `d298db6` | rung `mipgen` (within 1 LSB), piglit fbo-generatemipmap*, refract 7 -> 9 fps |
 | DXT1/3/5 incl. POT mip chains | `4b06bc2` / `58b8d2f` | `dxt d1..d6` (d2/d5 within 3 LSB), `m1`/`m2`, `chrome9_gl_cube_dxt_smoke` |
 | 2D COPY_RECT, KMS scanout, hardware cursor | | Xorg |
+| coarse-Z depth rejection (A01 bits 13/9, A29/A2A, 16-byte entry per 8x8 block), module `coarse_z` (default off: ioquake3 about 1.6 % slower, no glmark2 gain) | `dcccfc5` / Mesa coarse-Z, CAP2 bit 23 | `chrome9_coarsez_rung` (image identical, 39.3 -> 24.5 ms for hidden quads), back-to-front GL layers 55.8 -> 31.3 ms |
+| Fast-Z clear (A27 index in X8Z24 depth bits 10:8, A14/A15 clear data), on by default | `5ca17f7` / Mesa Fast-Z, CAP2 bit 24 | rung `fastz`, 24-bit FBO probe identical; Z16 windows do not use it |
 
 ## Emulated or falling back
 
@@ -57,12 +59,11 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | state |
 |---|---|
-| occlusion queries (A1C/A1D Z-pass counter) | RE done, patches in preparation (CAP2 bit 6) |
-| 3D textures (POT, single level) | RE done, patches in preparation (CAP2 bit 7) |
-| vertex-shader flow control (static loops/branches) | encodings recovered, execution unmeasured (CAP2 bit 8) |
+| edge antialiasing (A01 bit 5, A23 edge flags) | RE done (`chrome9-edge-aa-re.md`); GL_POLYGON_SMOOTH is drawn aliased today |
+| surface tiling | RE in progress |
 | stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes), B14 (NaN kill) | open; B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
 | per-segment state cache | patch ready (default off), rungs R2/R3 |
-| IRQ fence signalling | `fence_irq` (off): the 0x200 global gate alone raises an undocumented interrupt source (0x204 bit 5 clear); falls back to polling, §12.6 |
+| IRQ fence signalling | `fence_irq` (off): the 0x200 global gate alone raises an undocumented interrupt source (0x204 bit 5 clear); falls back to polling, §12.6; likely 0x1280 bits 11/13 internal DP status (`chrome9-fence-irq-re.md`) |
 | render targets in local frame buffer memory | not started: needs an SL allocator, per-BO domain, WC mapping and extent checks; ladder in `chrome9-local-fb-placement.md` |
 
 ## Texture sampler: border, GL_CLAMP, mirror once, 1D, shadow, LOD limits

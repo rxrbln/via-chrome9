@@ -543,6 +543,27 @@ class exactly), and a hidden enable on the A11 reading-Z cache (bit 12,
 clear bit 11): repeat 1 with `A11 |= 0x800` (one-shot cache clear) to
 exclude cached stale depth.
 
+### Fast-Z on silicon, 2026-09-25
+
+Kernel debug knobs `fast_z_re` (A27 image) and `fast_z_clear` (clear word,
+A14 low 24 bits, A15 [7:0] top byte), rung mode `fastz`, 64x64 X8Z24:
+
+* X8Z24 stores the depth in bits 31:8 (0.5 = `80000000`); the index sits
+  in bits 8.. (`len` bits).  A27 `27001301` (length 3, index 1): stored
+  words with index 1 are used as stored, others read as the clear word.
+  Draws write their depth with the index (`80000100`); index 2 then makes
+  the index-1 words stale (blue at 0.9 passes over them, `e6660200`).
+* With A15 = `15000000` stale words read as depth below 1/256 whatever A14
+  holds (the first run's failure); with `A14 14ffff00, A15 150000ff` they
+  read as 1.0, with clear word 0 or 0.5 as that value.
+* Implemented (kernel `5ca17f7`, CAP2 bit 24, flags `FRAGMENT_FAST_Z` and
+  a 3-bit index; Mesa): clear data fixed at 1.0, indices 1..6 (the
+  written 1.0 carries index 7), memory written on every sixth clear, CPU
+  resolve before CPU access, disabled for sampled depth, stencil draws
+  and the fixed draw builders.  A 24-bit FBO probe renders identical
+  images; no measurable time difference there, and the current
+  workloads (Z16 windows, refract's sampled depth) do not use it.
+
 ## Implementation and proof order
 
 1. Keep A01 bits 13/9 clear and A27 zero for all ordinary depth, shadow, and
