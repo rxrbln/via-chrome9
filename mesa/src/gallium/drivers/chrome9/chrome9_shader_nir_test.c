@@ -2321,7 +2321,10 @@ main(void)
    nir_shader *nir = make_alpha_primary_multiply();
    const struct chrome9_ps_instruction *instruction;
    const struct chrome9_ps_source *primary;
+   unsigned failures = 0;
 
+   /* The stub screen has no llvmpipe fallback behind it. */
+   setenv("CHROME9_SW_FALLBACK", "0", 1);
    chrome9_compile_fs_nir(&context, &shader, nir);
    if (!shader.native_fs_valid || !shader.native_fs_from_nir ||
        !shader.semantic_fs_valid || shader.supported ||
@@ -2384,37 +2387,39 @@ main(void)
       return 1;
    }
    ralloc_free(nir);
-   if (!check_identity_projector_compilation(&context) ||
-       !check_scalar_literal_packing(&context, false, 17, true) ||
-       !check_scalar_literal_packing(&context, true, 17, true) ||
-       !check_scalar_literal_packing(&context, false, 64, true) ||
-       !check_scalar_literal_packing(&context, false, 65, false) ||
-       !check_reordered_vector_literals(&context) ||
-       !check_packed_alpha_kill(&context) ||
-       !check_vector_conditional_compilation(&context, 1, false) ||
-       !check_vector_conditional_compilation(&context, 2, false) ||
-       !check_vector_conditional_compilation(&context, 3, false) ||
-       !check_vector_conditional_compilation(&context, 4, false) ||
-       !check_vector_conditional_compilation(&context, 1, true) ||
-       !check_nonnegative_select_compilation(&context) ||
-       !check_general_predicate_compilation(&context) ||
-       !check_cel_compilation(&context) ||
-       !check_swizzled_texcoord_bridge(&context) ||
-       !check_equal_zero_select_compilation(&context, 0.0f, true) ||
-       !check_equal_zero_select_compilation(&context, 1.0f, false) ||
-       !check_canonical_uniform_select_context() ||
-       !check_front_face_variant_context() ||
-       !check_saturated_add_rgb_alpha_split(&context) ||
-       !check_position_alias_compilation(&context) ||
-       !check_per_lane_conditional_rejected(&context) ||
-       !check_blinn_phong_integer_power(&context) ||
-       !check_function_medium_sqrt_boundary(&context) ||
-       !check_ideas_logo_shadow_compilation(&context) ||
-       !check_product_alpha_kill_compilation(&context) ||
-       !check_product_alpha_unit_interval() ||
-       !check_compact_alu_lowering(&context) ||
-       !check_separable_blur_compilation(&context) ||
-       !check_max_varyings_compilation(&context))
+   /* Run every case so one failure does not hide the others. */
+   failures += !check_identity_projector_compilation(&context);
+   failures += !check_scalar_literal_packing(&context, false, 17, true);
+   failures += !check_scalar_literal_packing(&context, true, 17, true);
+   failures += !check_scalar_literal_packing(&context, false, 64, true);
+   failures += !check_scalar_literal_packing(&context, false, 65, false);
+   failures += !check_reordered_vector_literals(&context);
+   failures += !check_packed_alpha_kill(&context);
+   failures += !check_vector_conditional_compilation(&context, 1, false);
+   failures += !check_vector_conditional_compilation(&context, 2, false);
+   failures += !check_vector_conditional_compilation(&context, 3, false);
+   failures += !check_vector_conditional_compilation(&context, 4, false);
+   failures += !check_vector_conditional_compilation(&context, 1, true);
+   failures += !check_nonnegative_select_compilation(&context);
+   failures += !check_general_predicate_compilation(&context);
+   failures += !check_cel_compilation(&context);
+   failures += !check_swizzled_texcoord_bridge(&context);
+   failures += !check_equal_zero_select_compilation(&context, 0.0f, true);
+   failures += !check_equal_zero_select_compilation(&context, 1.0f, false);
+   failures += !check_canonical_uniform_select_context();
+   failures += !check_front_face_variant_context();
+   failures += !check_saturated_add_rgb_alpha_split(&context);
+   failures += !check_position_alias_compilation(&context);
+   failures += !check_per_lane_conditional_rejected(&context);
+   failures += !check_blinn_phong_integer_power(&context);
+   failures += !check_function_medium_sqrt_boundary(&context);
+   failures += !check_ideas_logo_shadow_compilation(&context);
+   failures += !check_product_alpha_kill_compilation(&context);
+   failures += !check_product_alpha_unit_interval();
+   failures += !check_compact_alu_lowering(&context);
+   failures += !check_separable_blur_compilation(&context);
+   failures += !check_max_varyings_compilation(&context);
+   if (failures)
       return 1;
    puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur and max-varyings compilation passed");
    return 0;

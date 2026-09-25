@@ -51,7 +51,7 @@ chrome9_screen_smoke = executable(
   'chrome9_screen_smoke.c',
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_mesautil, idep_nir],
-  link_with : [libchrome9, libgallium],
+  link_with : [libchrome9, chrome9_sw_libs, libgallium],
   install : false,
 )
 
@@ -60,7 +60,7 @@ chrome9_mip_target_smoke = executable(
   'chrome9_mip_target_smoke.c',
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_mesautil, idep_nir],
-  link_with : [libchrome9, libgallium],
+  link_with : [libchrome9, chrome9_sw_libs, libgallium],
   install : false,
 )
 
@@ -107,7 +107,7 @@ chrome9_shader_nir_test = executable(
   'chrome9_shader_nir_test.c',
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_nir, idep_mesautil],
-  link_with : [libchrome9, libgallium],
+  link_with : [libchrome9, chrome9_sw_libs, libgallium],
   install : false,
 )
 test('chrome9-shader-nir', chrome9_shader_nir_test, suite : ['chrome9'])
@@ -117,7 +117,7 @@ chrome9_tcl_flow_test = executable(
   'chrome9_tcl_flow_test.c',
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_nir, idep_mesautil],
-  link_with : [libchrome9, libgallium],
+  link_with : [libchrome9, chrome9_sw_libs, libgallium],
   install : false,
 )
 test('chrome9-tcl-flow', chrome9_tcl_flow_test, suite : ['chrome9'])
@@ -146,7 +146,7 @@ chrome9_mipmap_test = executable(
   'chrome9_mipmap_test.c',
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_mesautil, idep_nir],
-  link_with : [libchrome9, libgallium],
+  link_with : [libchrome9, chrome9_sw_libs, libgallium],
   install : false,
 )
 test('chrome9-mipmap', chrome9_mipmap_test, suite : ['chrome9'])
