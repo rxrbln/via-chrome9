@@ -9,9 +9,36 @@ targets.
 
 ## Documents
 
+- [chrome9-hw-feature-status.md](chrome9-hw-feature-status.md) tracks every
+  3D engine feature: verified on silicon, emulated, or not implemented, with
+  the smoke test that covers it.
+- [chrome9-piglit-conformance.md](chrome9-piglit-conformance.md) records
+  piglit GL 2.1 runs, the fixes they drove, measured hardware limits (FP24
+  fragment ALU) and open failure classes.
+- [chrome9-present-path.md](chrome9-present-path.md) explains the guarded
+  shadows and publish copies of the present chain and the zero-copy plan.
+- [chrome9-per-draw-state.md](chrome9-per-draw-state.md) measures the per-draw
+  state stream and plans a segment-local state cache with rungs R1..R5.
 - [chrome9-hw-tcl-implementation-plan.md](chrome9-hw-tcl-implementation-plan.md)
   designs the semantic vertex-program UAPI, kernel compiler, vertex fetch and
   Mesa bypass for hardware TCL, with a one-variable silicon ladder.
+- [chrome9-tcl-twoside-clip-plan.md](chrome9-tcl-twoside-clip-plan.md)
+  plans hardware-TCL two-sided color (oD2/oBFD0, A61[19], A23[7]) and FE A05
+  user clip planes: current fallbacks, encodings with evidence, UAPI/kernel/
+  Mesa drafts and the `twoside`/`ucp` oracle ladders (unmeasured).
+- [chrome9-twoside-enable-re.md](chrome9-twoside-enable-re.md) lists every
+  word the vendor changes for back colors (oD2/oD3, A61[19], A23[7], strip
+  decomposition, nothing else).  It shows that vendor cull-front two-sided
+  lighting depends on the hardware selection, and ranks silicon experiments.
+- [chrome9-queries-msaa-3d-flow-re.md](chrome9-queries-msaa-3d-flow-re.md)
+  ranks occlusion queries (A1C/A1D counter, vendor CR read-back, PPC 17h),
+  volume textures (POT, single level, slice = pitch x height), VS static flow
+  control and native points/lines/polygon modes with CAP2 bits 6-11 and
+  bounded rungs; timer queries, MSAA and PS flow control are negative.
+- [chrome9-next-hw-features.md](chrome9-next-hw-features.md) ranks cube
+  maps, DXTn, native strips/fans and two-sided colour; single-BO cube layout,
+  vendor compressed layout, the POT mip-table question, a culling split for
+  two-sided colour, and the `chrome9_next_oracle` rungs.
 - [chrome9-near-plane-clipping-re.md](chrome9-near-plane-clipping-re.md)
   recovers the vendor clip-engine enable (type-01 A01 bits 11 and 20).
 - [chrome9-fragment-capacity-strategies.md](chrome9-fragment-capacity-strategies.md)
@@ -67,6 +94,10 @@ targets.
   counts, and normalized finalizer provenance in Linux, D3D, and OpenGL.
 - [chrome9-mov-mul-short-chain-corpus.tsv](chrome9-mov-mul-short-chain-corpus.tsv)
   retains the eight exact two/three-record allocation rows.
+- [chrome9-ps-read-ports.md](chrome9-ps-read-ports.md) closes the PS read-port
+  rule (one distinct texture-class T/MISC register per ALU record) from the
+  vendor GL split pass, the silicon timeouts and byte-exact compiler goldens,
+  with the kernel legalization and a ranked silicon ladder.
 - [chrome9-ps-canonical-temp-allocation.md](chrome9-ps-canonical-temp-allocation.md)
   recovers Linux sorted-rank logical-to-physical temp allocation and defines
   the dense semantic-SSA kernel boundary.
@@ -97,6 +128,20 @@ targets.
 - [chrome9-nir-lowering-matrix.md](chrome9-nir-lowering-matrix.md) routes the
   wider Mesa fragment NIR surface to exact native shapes, guarded expansions,
   or explicit fail-closed rejection.
+- [glmark2-generic-fragment-backend-plan.md](glmark2-generic-fragment-backend-plan.md)
+  maps the captured glmark2 NIR to a reusable straight-line SSA/ALU/TAU
+  compiler, exact opcode/control encodings, control-flow lowerings, and a
+  correctness-first implementation sequence without shader keys.
+- [chrome9-glmark-buffer-production-corpus.tsv](chrome9-glmark-buffer-production-corpus.tsv)
+  retains the preferred fresh-temp MIN/EXP2/LRP Linux production object and
+  the malformed Windows-wrapper result as a negative boundary; replay its
+  packing invariants with
+  [`../../tools/re/chrome9_glmark_buffer_corpus_check.py`](../../tools/re/chrome9_glmark_buffer_corpus_check.py).
+- [chrome9-glmark-lighting-production-corpus.tsv](chrome9-glmark-lighting-production-corpus.tsv)
+  retains fresh-temp Linux production objects for DP3/RSQ/MAX and generic
+  integer POW20/30/100 chains, including direct-T0 usage and A90 bucket
+  crossings; replay them with
+  [`../../tools/re/chrome9_glmark_lighting_corpus_check.py`](../../tools/re/chrome9_glmark_lighting_corpus_check.py).
 - [chrome9-two-texture-callback-provenance.md](chrome9-two-texture-callback-provenance.md)
   separates the production r0/r1 compiler object from the still-valid,
   live-proven fixed/Xorg tuple reproduced by the old swapped callback probe.
