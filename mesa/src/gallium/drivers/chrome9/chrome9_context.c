@@ -6764,6 +6764,12 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
    struct chrome9_context *ctx = chrome9_context(pipe);
    struct chrome9_sampler_view *cview = CALLOC_STRUCT(chrome9_sampler_view);
    struct pipe_sampler_view *view = cview ? &cview->base : NULL;
+
+   /* The sampler reads memory: sampled depth stays materialized. */
+   if (texture && util_format_is_depth_or_stencil(texture->format)) {
+      chrome9_resource_fast_z_resolve(chrome9_resource(texture));
+      chrome9_resource(texture)->fast_z_disabled = true;
+   }
    /* A cube view covers all six faces of a guarded cube resource. */
    const bool cube = texture && texture->target == PIPE_TEXTURE_CUBE &&
                      templ->target == PIPE_TEXTURE_CUBE &&
@@ -7264,6 +7270,16 @@ chrome9_clear_target_masked(struct chrome9_resource *target,
    }
 }
 
+/* An X8Z24 depth surface Fast-Z may clear to depth: not sampled, one level. */
+static bool
+chrome9_fast_z_surface(const struct chrome9_context *ctx,
+                       const struct chrome9_resource *zs, double depth)
+{
+   return ctx->fast_z && zs && depth == 1.0 && zs->guarded &&
+          zs->base.format == PIPE_FORMAT_X8Z24_UNORM &&
+          !zs->base.last_level && !zs->parent && !zs->fast_z_disabled;
+}
+
 /*
  * Full-surface clears as one DRAW_FRAGMENT_PROGRAM rectangle, so the CPU
  * neither writes the surfaces nor forces whole-surface cache flushes: the
@@ -7318,6 +7334,18 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
        (clear_color && ((color_mask & 0xf) != 0xf || !fb->nr_cbufs)) ||
        (clear_stencil && stencil_mask != 0xff))
       return false;
+   /* Fast-Z clear: advance the index instead of writing every depth. */
+   if (clear_depth && !clear_stencil && zs &&
+       zs->base.width0 == fb->width && zs->base.height0 == fb->height &&
+       chrome9_fast_z_surface(ctx, zs, depth) && zs->fast_z_index &&
+       zs->fast_z_index < CHROME9_FAST_Z_LAST_INDEX) {
+      zs->fast_z_index++;
+      if (ctx->coarse_z)
+         chrome9_resource_coarse_z_fill(&ctx->base, zs);
+      return !clear_color ||
+             chrome9_clear_gpu(ctx, buffers & ~PIPE_CLEAR_DEPTH, color_mask,
+                               stencil_mask, scissor, color, depth, stencil);
+   }
    if (clear_depth || clear_stencil) {
       const bool d24 = zs && chrome9_format_is_d24(zs->base.format);
 
@@ -7404,6 +7432,9 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
       return false;
    if (clear_color)
       chrome9_context_render_target_written(ctx);
+   /* The written 1.0 carries index 7: stale for the indices 1..6. */
+   if (clear_depth && chrome9_fast_z_surface(ctx, zs, depth))
+      zs->fast_z_index = 1;
    /* A full clear to 1.0 makes every coarse-Z entry all ones. */
    if (clear_depth && ctx->coarse_z && depth == 1.0)
       chrome9_resource_coarse_z_fill(&ctx->base, zs);
@@ -7959,6 +7990,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
    ctx->tcl_dedupe = ctx->tcl_buffers &&
       debug_get_bool_option("CHROME9_TCL_DEDUPE", true);
+   ctx->fast_z = ctx->draw_fragment_program &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_FAST_Z) &&
+      debug_get_bool_option("CHROME9_FAST_Z", true);
    ctx->coarse_z = ctx->draw_fragment_program &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_COARSE_Z) &&
       debug_get_bool_option("CHROME9_COARSE_Z", true);

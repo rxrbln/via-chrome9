@@ -309,6 +309,8 @@ struct chrome9_context {
     * the last draw used it (else the next use resets the tag cache). */
    bool coarse_z;
    bool coarse_z_last;
+   /* CAP2_FAST_Z: X8Z24 clears to 1.0 advance a scene index. */
+   bool fast_z;
    /* The current draw rasterizes filled triangles. */
    bool draw_filled_triangles;
    /* TCL draws queued for one DRAW_VERTEX_PROGRAMS submission. */

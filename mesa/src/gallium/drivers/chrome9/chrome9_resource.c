@@ -646,6 +646,10 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
 {
    struct pipe_screen *screen = resource->base.screen;
 
+   /* The CPU reads and writes materialized depths only. */
+   if (resource->fast_z_index)
+      chrome9_resource_fast_z_resolve(resource);
+
    if (write) {
       resource->cpu_write_generation++;
       resource->coarse_z_valid = false;
@@ -658,6 +662,27 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
                                             DRM_CHROME9_GEM_CPU_PREPARE_READ,
                                     offset, size))
       fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n", strerror(errno));
+}
+
+/* Rewrite the words of older Fast-Z clears (stale index) as 1.0. */
+void
+chrome9_resource_fast_z_resolve(struct chrome9_resource *depth)
+{
+   const uint32_t index = depth->fast_z_index;
+
+   if (!index)
+      return;
+   depth->fast_z_index = 0;
+   chrome9_resource_cpu_access(depth, true);
+   for (unsigned y = 0; y < depth->base.height0; y++) {
+      uint32_t *row = (uint32_t *)((uint8_t *)depth->bo.map +
+                                   depth->data_offset +
+                                   (uint64_t)y * depth->stride);
+
+      for (unsigned x = 0; x < depth->base.width0; x++)
+         if (((row[x] >> 8) & 7) != index)
+            row[x] = 0xffffff00;
+   }
 }
 
 void

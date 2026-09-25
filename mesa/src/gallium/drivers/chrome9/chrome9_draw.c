@@ -1829,6 +1829,14 @@ chrome9_generic_fragment_state(
                 (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
    if (depth_active && chrome9_stencil_active(crender->ctx))
       draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+   if (depth_active && depth->fast_z_index &&
+       (draw->flags & DRM_CHROME9_FRAGMENT_STENCIL)) {
+      chrome9_resource_fast_z_resolve(depth);
+      depth->fast_z_disabled = true;
+   }
+   if (depth_active && depth->fast_z_index)
+      draw->flags |= DRM_CHROME9_FRAGMENT_FAST_Z |
+                     DRM_CHROME9_FRAGMENT_FAST_Z_INDEX(depth->fast_z_index);
    if (depth_active && depth->coarse_z.handle && crender->ctx->coarse_z) {
       struct chrome9_context *ctx = crender->ctx;
 
@@ -2616,6 +2624,11 @@ chrome9_emit_triangle(struct chrome9_vbuf_render *crender,
       return;
    }
    chrome9_draw_scissor(ctx, target, &scissor);
+   /* The fixed draw builders leave Fast-Z off. */
+   if (depth_active && depth->fast_z_index && !crender->generic_program) {
+      chrome9_resource_fast_z_resolve(depth);
+      depth->fast_z_disabled = true;
+   }
    if (crender->generic_program) {
       bool queued;
 

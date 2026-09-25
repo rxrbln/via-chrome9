@@ -57,6 +57,10 @@ struct chrome9_resource {
    uint32_t coarse_z_pitch;
    bool coarse_z_valid;
    bool coarse_z_reset;
+   /* CAP2_FAST_Z scene index of an X8Z24 depth surface, 0 when every
+    * word holds its depth; fast_z_disabled after a sampler view. */
+   uint8_t fast_z_index;
+   bool fast_z_disabled;
    /* Single-image render view of a level or layer of parent: same BO,
     * pixels at data_offset. */
    struct pipe_resource *parent;
@@ -80,6 +84,10 @@ void chrome9_resource_cpu_access(struct chrome9_resource *resource,
                                  bool write);
 bool chrome9_resource_coarse_z_fill(struct pipe_context *pipe,
                                     struct chrome9_resource *depth);
+void chrome9_resource_fast_z_resolve(struct chrome9_resource *depth);
+
+/* Fast-Z indices cycle 1..6: 7 is the tag of 1.0 cleared memory. */
+#define CHROME9_FAST_Z_LAST_INDEX 6
 void chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
                                        bool write, uint64_t offset,
                                        uint64_t size);
