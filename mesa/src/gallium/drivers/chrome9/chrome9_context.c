@@ -28,6 +28,7 @@
 #include "util/format/u_format.h"
 #include "util/hash_table.h"
 #include "util/u_draw.h"
+#include "util/u_dynarray.h"
 #include "util/u_debug.h"
 #include "util/u_debug_cb.h"
 #include "util/u_framebuffer.h"
@@ -5919,6 +5920,84 @@ chrome9_ps_lower_alpha_terminate(struct chrome9_ps_nir_builder *builder,
    return true;
 }
 
+/*
+ * discard if any predicate holds: each becomes CMP(condition, -1, +1) over
+ * four lanes, several merge with MIN, and one KILL tests the result.  A
+ * NULL predicate is an unconditional discard.
+ */
+static bool
+chrome9_ps_lower_terminates(struct chrome9_ps_nir_builder *builder,
+                            const struct util_dynarray *predicates)
+{
+   static const uint32_t signs[4] = { 0xbf800000, 0x3f800000 };
+   static const uint8_t broadcast[4] = { 0, 0, 0, 0 };
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+   struct chrome9_ps_source sign, operand[3];
+   struct chrome9_ps_instruction *kill;
+   uint8_t kill_value = 0, temp;
+   bool have = false;
+
+   /* A single discard keeps the qualified sampled-alpha form. */
+   if (util_dynarray_num_elements(predicates, nir_def *) == 1 &&
+       *util_dynarray_element(predicates, nir_def *, 0) &&
+       chrome9_ps_lower_alpha_terminate(
+          builder, *util_dynarray_element(predicates, nir_def *, 0)))
+      return true;
+   if (!chrome9_ps_immediate(builder, signs, 2, &sign))
+      return false;
+   operand[1] = operand[2] = sign;
+   for (unsigned c = 0; c < 4; c++) {
+      operand[1].swizzle[c] = sign.swizzle[0];
+      operand[2].swizzle[c] = sign.swizzle[1];
+   }
+   util_dynarray_foreach(predicates, nir_def *, entry) {
+      struct chrome9_ps_condition condition;
+      nir_scalar predicate;
+
+      if (*entry) {
+         predicate = nir_scalar_resolved(*entry, 0);
+         if (nir_scalar_is_const(predicate)) {
+            if (!nir_scalar_as_bool(predicate))
+               continue;
+            *entry = NULL;
+         }
+      }
+      if (!*entry) {
+         if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_MOV,
+                                   &operand[1], 1, 0xf, &temp))
+            return false;
+      } else {
+         if (!chrome9_ps_lower_condition(builder, predicate, 0, &condition) ||
+             builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+            return false;
+         temp = builder->next_temp++;
+         if (!chrome9_ps_emit_condition_cmp(builder, &condition, broadcast,
+                                            &operand[1], &operand[2], 0xf,
+                                            temp))
+            return false;
+      }
+      if (have) {
+         struct chrome9_ps_source merge[2] = {
+            chrome9_ps_temp_source(kill_value, identity),
+            chrome9_ps_temp_source(temp, identity),
+         };
+
+         if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_MIN, merge, 2,
+                                   0xf, &temp))
+            return false;
+      }
+      kill_value = temp;
+      have = true;
+   }
+   if (!have)
+      return true;
+   kill = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_KILL);
+   if (!kill)
+      return false;
+   kill->source[0] = chrome9_ps_temp_source(kill_value, identity);
+   return true;
+}
+
 static bool
 chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        struct chrome9_ps_program *program,
@@ -5936,7 +6015,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    struct chrome9_ps_source operands[4][3] = { 0 };
    enum chrome9_ps_opcode op[4];
    unsigned source_count[4] = { 0 };
-   unsigned kill_count = 0;
+   struct util_dynarray terminates;
    nir_block *block;
    /* oCn of FRAG_RESULT_DATAn (COLOR is oC0). */
    nir_def *results[4] = { NULL };
@@ -5945,6 +6024,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    *lowered = false;
    builder.proof.budget = CHROME9_PS_PROOF_NODES;
    builder.proof.mem_ctx = nir;
+   util_dynarray_init(&terminates, nir);
    if (!chrome9_fs_straight_line_entrypoint(nir, NULL, &block) ||
        nir->info.float_controls_execution_mode)
       return false;
@@ -5962,12 +6042,15 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       if (instr->type != nir_instr_type_intrinsic)
          return false;
       intr = nir_instr_as_intrinsic(instr);
-      if (intr->intrinsic == nir_intrinsic_terminate_if) {
-         /* The kernel capability admits only the qualified sampled-alpha
-          * form; reject other discard predicates and sample domains. */
-         if (!allow_kill || outputs || kill_count++ ||
-             !chrome9_ps_lower_alpha_terminate(&builder, intr->src[0].ssa))
+      if (intr->intrinsic == nir_intrinsic_terminate_if ||
+          intr->intrinsic == nir_intrinsic_terminate) {
+         nir_def *predicate =
+            intr->intrinsic == nir_intrinsic_terminate_if ?
+            intr->src[0].ssa : NULL;
+
+         if (!allow_kill)
             return false;
+         util_dynarray_append(&terminates, predicate);
          continue;
       }
       if (intr->intrinsic == nir_intrinsic_store_output &&
@@ -6058,6 +6141,9 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       results[n] = stored;
       outputs = MAX2(outputs, n + 1);
    }
+   /* The KILL precedes every output, as the kernel requires. */
+   if (!chrome9_ps_lower_terminates(&builder, &terminates))
+      return false;
    /* Dense outputs; oDepth only with one colour output. */
    if (!outputs || (depth && outputs > 1))
       return false;

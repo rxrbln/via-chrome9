@@ -1937,6 +1937,70 @@ check_condition_lowering(struct chrome9_context *context)
    return true;
 }
 
+/* Two discards merge into one KILL of MIN(CMP(c0, -1, 1), CMP(c1, -1, 1)). */
+static bool
+check_discard_lowering(struct chrome9_context *context)
+{
+   static const float values[] = { 0.0f, -0.0f, 1.0f, -1.0f, 0.5f };
+   const unsigned n = ARRAY_SIZE(values);
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-discard");
+   struct chrome9_shader shader = { 0 };
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *a = nir_load_ubo_vec4(&b, 4, 32, zero, zero);
+   nir_def *c = nir_load_ubo_vec4(&b, 4, 32, zero, nir_imm_int(&b, 1));
+   unsigned kills = 0, cmp = 0, min = 0, mismatches = 0;
+   bool old_fragment_kill = context->fragment_kill;
+   bool valid;
+
+   nir_terminate_if(&b, nir_flt(&b, nir_channel(&b, a, 0),
+                                nir_channel(&b, c, 0)));
+   nir_terminate_if(&b, nir_feq(&b, nir_channel(&b, a, 1),
+                                nir_channel(&b, c, 1)));
+   nir_store_output(&b, nir_imm_vec4(&b, 0.0f, 1.0f, 0.0f, 1.0f), zero,
+                    .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   b.shader->info.fs.uses_discard = true;
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader,
+                          nir_var_shader_in | nir_var_shader_out);
+   context->fragment_kill = true;
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   context->fragment_kill = old_fragment_kill;
+   for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+      kills += shader.semantic_fs_ir.instruction[i].op ==
+               CHROME9_PS_OPCODE_KILL;
+      cmp += shader.semantic_fs_ir.instruction[i].op == CHROME9_PS_OPCODE_CMP;
+      min += shader.semantic_fs_ir.instruction[i].op == CHROME9_PS_OPCODE_MIN;
+   }
+   valid = shader.supported && shader.semantic_fs_valid && kills == 1 &&
+           cmp == 2 && min == 1;
+   for (unsigned i = 0; valid && i < n * n * n * n; i++) {
+      float constant[32][4] = { { 0 } }, color[4];
+      bool killed;
+
+      memcpy(constant, shader.native_fs.immediate, sizeof(constant));
+      constant[0][0] = values[i % n];
+      constant[1][0] = values[i / n % n];
+      constant[0][1] = values[i / (n * n) % n];
+      constant[1][1] = values[i / (n * n * n)];
+      if (!eval_ps_ir(&shader.semantic_fs_ir, constant, color, &killed)) {
+         valid = false;
+         break;
+      }
+      mismatches += killed != (constant[0][0] < constant[1][0] ||
+                               constant[0][1] == constant[1][1]);
+   }
+   valid &= !mismatches;
+   if (!valid)
+      fprintf(stderr, "discard lowering failed: supported=%u semantic=%u "
+              "kill=%u cmp=%u min=%u ir=%u mismatches=%u\n",
+              shader.supported, shader.semantic_fs_valid, kills, cmp, min,
+              shader.semantic_fs_ir.count, mismatches);
+   ralloc_free(b.shader);
+   return valid;
+}
+
 static bool
 check_blinn_phong_integer_power(struct chrome9_context *context)
 {
@@ -2280,9 +2344,10 @@ check_ideas_logo_shadow_compilation(struct chrome9_context *context)
       p[8].source[0].file == CHROME9_PS_SOURCE_TEMP &&
       p[8].source[0].id == p[5].destination.id &&
       !p[8].source[0].modifier &&
-      !wrong_reference.supported && !wrong_reference.semantic_fs_valid &&
-      !reversed.supported && !reversed.semantic_fs_valid &&
-      !non_alpha.supported && !non_alpha.semantic_fs_valid &&
+      /* Other predicates take the general CMP discard. */
+      wrong_reference.supported && wrong_reference.semantic_fs_valid &&
+      reversed.supported && reversed.semantic_fs_valid &&
+      non_alpha.supported && non_alpha.semantic_fs_valid &&
       !no_kill_capability.supported &&
       !no_kill_capability.semantic_fs_valid;
    if (valid)
@@ -2412,9 +2477,10 @@ check_product_alpha_kill_compilation(struct chrome9_context *context)
       shader.semantic_sampler_mask == 1 &&
       shader.semantic_unit_interval_input_mask == (1u << 5) &&
       texture == 1 && multiply == 2 && subtract == 1 && kill == 1 &&
-      !transformed.supported && !transformed.semantic_fs_valid &&
-      !wrong_lane.supported && !wrong_lane.semantic_fs_valid &&
-      !reversed.supported && !reversed.semantic_fs_valid &&
+      /* Other predicates take the general CMP discard. */
+      transformed.supported && transformed.semantic_fs_valid &&
+      wrong_lane.supported && wrong_lane.semantic_fs_valid &&
+      reversed.supported && reversed.semantic_fs_valid &&
       !no_kill.supported && !no_kill.semantic_fs_valid;
    if (!valid)
       fprintf(stderr, "product-alpha KILL compilation failed: "
@@ -2781,6 +2847,7 @@ main(void)
    failures += !check_saturated_add_rgb_alpha_split(&context);
    failures += !check_position_alias_compilation(&context);
    failures += !check_condition_lowering(&context);
+   failures += !check_discard_lowering(&context);
    failures += !check_blinn_phong_integer_power(&context);
    failures += !check_function_medium_sqrt_boundary(&context);
    failures += !check_ideas_logo_shadow_compilation(&context);
