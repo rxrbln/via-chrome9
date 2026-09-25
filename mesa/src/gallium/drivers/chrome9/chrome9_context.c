@@ -6331,12 +6331,14 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                     templ->u.tex.last_level <= texture->last_level &&
                     !templ->u.tex.first_layer &&
                     templ->u.tex.last_layer ==
-                       (cube ? texture->array_size - 1 : 0) &&
-                    chrome9_texture_swizzle_supported(
-                       templ->format, templ->swizzle_r, templ->swizzle_g,
-                       templ->swizzle_b, templ->swizzle_a);
+                       (cube ? texture->array_size - 1 : 0);
 
    supported |= volume;
+   /* llvmpipe samples swizzles the native decoders cannot express. */
+   if (supported)
+      cview->sw_only = !chrome9_texture_swizzle_supported(
+         templ->format, templ->swizzle_r, templ->swizzle_g,
+         templ->swizzle_b, templ->swizzle_a);
    if (supported && !chrome9_resource(texture)->guarded) {
       struct pipe_resource shadow_templ = *texture;
 

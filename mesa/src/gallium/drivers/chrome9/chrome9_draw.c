@@ -163,8 +163,12 @@ chrome9_draw_needs_sw_textures(const struct chrome9_context *ctx)
       const struct chrome9_sampler_state *sampler =
          i < ctx->num_sampler_states ? ctx->sampler_states[i] : NULL;
 
-      if (!res || res->target != PIPE_TEXTURE_3D ||
+      if (!res ||
           (generic && !(ctx->fs->semantic_sampler_mask & (1u << i))))
+         continue;
+      if (chrome9_sampler_view((struct pipe_sampler_view *)view)->sw_only)
+         return true;
+      if (res->target != PIPE_TEXTURE_3D)
          continue;
       if (!ctx->texture_3d || !generic ||
           !(ctx->fs->semantic_volume_sampler_mask & (1u << i)) ||

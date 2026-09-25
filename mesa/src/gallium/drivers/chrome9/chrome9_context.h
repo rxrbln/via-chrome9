@@ -154,6 +154,8 @@ struct chrome9_sampler_view {
    /* Unguarded external images remain the Gallium-visible texture.  The
     * hardware samples this guarded, draw-refreshed copy instead. */
    struct pipe_resource *shadow;
+   /* Only llvmpipe can sample this view. */
+   bool sw_only;
 };
 
 static inline struct chrome9_sampler_view *
