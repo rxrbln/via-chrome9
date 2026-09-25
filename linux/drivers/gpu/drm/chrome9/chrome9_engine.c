@@ -240,7 +240,8 @@ MODULE_PARM_DESC(edge_aa,
 	"Edge antialiasing for vertex-program lines and triangles (default: true)");
 
 /* Tiling experiments (chrome9-tiling-re.md): bit 0 A51 bit 23 (tiled
- * render target), bit 2 A12 bit 0 (tiled depth). */
+ * render target), bit 2 A12 bit 0 (tiled depth), bit 3 A22 bit 17 (tiled
+ * textures). */
 static uint chrome9_tile_re;
 module_param_named(tile_re, chrome9_tile_re, uint, 0600);
 MODULE_PARM_DESC(tile_re,
@@ -632,6 +633,8 @@ struct chrome9_tcl_draw {
 	const struct chrome9_vertex_program *program;
 	/* A01 bit 5 edge antialiasing (RASTER_EDGE_AA). */
 	bool edge_aa;
+	/* A00[23:18] = 010101: drop primitives with a NaN position. */
+	bool nan_kill;
 	/* Program A61 with this draw's bool constants. */
 	u32 a61;
 	const struct drm_chrome9_vertex_instruction *instructions;
@@ -3438,7 +3441,7 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	 * address bits 9:2 inside the slot's 1-KiB window. */
 	raster[i++] = (tcl->element_count - 1) << 8 | tcl->stride_dw |
 		      (addresses ? BIT(15) : 0) |
-		      (READ_ONCE(chrome9_tcl_nan_kill) ? 0x540000 : 0);
+		      (tcl->nan_kill ? 0x540000 : 0);
 	for (e = 0; e < tcl->element_count; e++)
 		raster[i++] = (1 + e) << 24 |
 			      (addresses ? (addresses[e] >> 2) & 0xff :
@@ -4307,6 +4310,7 @@ static void chrome9_emit_fragment_texture(u32 **cursor,
 	image[count++] = 0x22000000 |
 		(!cube && is_power_of_2(width) && is_power_of_2(height) ?
 		 BIT(15) : 0) |
+		(READ_ONCE(chrome9_tile_re) & 8 ? BIT(17) : 0) |
 		(volume ? ilog2(texture->depth) << 8 : 0) | log_size;
 	image[count++] = 0x30000000 |
 		chrome9_fragment_texture_format(texture->format) << 16 |
@@ -12908,6 +12912,7 @@ static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *ar
 			(tcl->point_size_vertex ? 0x3f800000 : size) >> 8;
 	}
 	tcl->sprite_mask = sprite;
+	tcl->nan_kill = READ_ONCE(chrome9_tcl_nan_kill);
 	/* Edge antialiasing for lines and filled triangles only. */
 	if (raster & DRM_CHROME9_RASTER_EDGE_AA) {
 		if (points || cw || ccw)
