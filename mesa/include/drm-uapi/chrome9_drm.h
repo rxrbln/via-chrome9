@@ -314,6 +314,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_FAST_Z			(1ULL << 24)
 /* Vertex program raster flag RASTER_EDGE_AA. */
 #define DRM_CHROME9_CAP2_EDGE_AA		(1ULL << 25)
+/* Fragment instruction destination DEST_DEPTH. */
+#define DRM_CHROME9_CAP2_DEPTH_OUTPUT		(1ULL << 26)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1251,6 +1253,12 @@ enum drm_chrome9_fragment_file {
 
 #define DRM_CHROME9_FRAGMENT_DEST_TEMP	0
 #define DRM_CHROME9_FRAGMENT_DEST_COLOR	1
+/*
+ * CAP2_DEPTH_OUTPUT: a MOV with writemask 0xf and a replicated scalar
+ * source directly before the terminal color write replaces the fragment's
+ * depth (the draw needs FRAGMENT_DEPTH).
+ */
+#define DRM_CHROME9_FRAGMENT_DEST_DEPTH	2
 #define DRM_CHROME9_FRAGMENT_MOD_NONE	0
 #define DRM_CHROME9_FRAGMENT_MOD_NEG	1
 #define DRM_CHROME9_FRAGMENT_DEST_SAT	(1U << 0)
