@@ -322,6 +322,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_TILED_COLOR		(1ULL << 28)
 /* GEM_CREATE_LOCAL. */
 #define DRM_CHROME9_CAP2_LOCAL_MEMORY		(1ULL << 29)
+/* Fragment draw color_count 2..4: colour targets written by oC1..oC3. */
+#define DRM_CHROME9_CAP2_COLOR_TARGETS		(1ULL << 30)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1231,6 +1233,31 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 /* CAP2_TILED_COLOR: the destination window is tiled, ALIGN(height, 8) rows. */
 #define DRM_CHROME9_FRAGMENT_DESTINATION_TILED	(1U << 19)
 
+/* Colour target 1..3 beside the destination (CAP2_COLOR_TARGETS). */
+#define DRM_CHROME9_COLOR_TARGET_TILED		(1U << 0)
+struct drm_chrome9_color_target {
+	__u32 handle;
+	/* A destination format with the destination's bytes per pixel. */
+	__u32 format;
+	__u32 pitch;
+	/* DRM_CHROME9_COLOR_TARGET_*. */
+	__u32 flags;
+	/* Guarded object: rows from byte PAGE_SIZE, a trailing guard page. */
+	__u64 object_size;
+};
+
+/*
+ * Colour targets of one DRAW_VERTEX_PROGRAMS draw: the program writes
+ * oC0..oC(count-1); target[i] receives oC(i+1), the destination oC0.
+ * count 0 or 1 is the destination alone.  The targets share the
+ * destination's size, scissor, blend equation and colour write mask.
+ */
+struct drm_chrome9_draw_colors {
+	__u32 count;
+	__u32 reserved;
+	struct drm_chrome9_color_target target[3];
+};
+
 /* Native stencil operations; note INVERT precedes the wrapping forms. */
 #define DRM_CHROME9_STENCIL_OP_KEEP		0
 #define DRM_CHROME9_STENCIL_OP_ZERO		1
@@ -1742,7 +1769,9 @@ struct drm_chrome9_draw_vertex_programs {
 	__u32 count;
 	__u32 flags;
 	__u64 draws_ptr;	/* struct drm_chrome9_draw_vertex_program[count] */
-	__u64 reserved[2];
+	/* CAP2_COLOR_TARGETS: struct drm_chrome9_draw_colors[count] or 0. */
+	__u64 colors_ptr;
+	__u64 reserved;
 };
 
 /*
