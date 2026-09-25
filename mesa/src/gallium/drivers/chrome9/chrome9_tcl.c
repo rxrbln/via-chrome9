@@ -3324,7 +3324,9 @@ tcl_raster(const struct chrome9_context *ctx, const struct pipe_draw_info *info,
       r->primitives = info->mode == MESA_PRIM_LINES ? count / 2 :
                       count < 2 ? 0 :
                       info->mode == MESA_PRIM_LINE_LOOP ? count : count - 1;
-      if (rs->line_smooth)
+      /* Edge AA blends coverage into the destination; without blending
+       * GL coverage changes only alpha, so those lines stay aliased. */
+      if (rs->line_smooth && ctx->blend && ctx->blend->rt[0].blend_enable)
          r->flags |= DRM_CHROME9_RASTER_EDGE_AA;
       return tcl_raster_lines(ctx, rs);
    default:
