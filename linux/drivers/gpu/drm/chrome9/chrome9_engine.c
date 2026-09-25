@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/vgaarb.h>
 #include <linux/vmalloc.h>
+#include <linux/xxhash.h>
 
 #include <video/vga.h>
 
@@ -33,6 +34,7 @@
 #include "chrome9_fragment.h"
 #include "chrome9_progcache.h"
 #include "chrome9_query.h"
+#include "chrome9_snoop.h"
 #include "chrome9_vertex.h"
 
 #define CHROME9_GART_SIZE		SZ_64K
@@ -13747,4 +13749,160 @@ void chrome9_engine_fini(struct chrome9_device *cdev)
 	if (engine->module_hold)
 		module_put(THIS_MODULE);
 	kfree(engine);
+}
+
+/*
+ * GART snoop ladder helpers (chrome9_snoop.c).  The ladder runs at probe
+ * before the DRM device is registered, on kernel-owned scratch pages only.
+ */
+int chrome9_snoop_begin(struct chrome9_device *cdev)
+{
+	struct chrome9_engine *engine = READ_ONCE(cdev->engine);
+
+	if (!engine || !chrome9_engine_ready(cdev))
+		return -ENODEV;
+	chrome9_submit_lock(engine);
+	if (engine->stopping || engine->wedged || !engine->ready) {
+		chrome9_submit_unlock(engine);
+		return -EIO;
+	}
+	return 0;
+}
+
+void chrome9_snoop_end(struct chrome9_device *cdev)
+{
+	chrome9_submit_unlock(cdev->engine);
+}
+
+/* A node left allocated after an error has live PTEs: keep its pages. */
+int chrome9_snoop_map(struct chrome9_device *cdev, const u32 *ptes,
+		      unsigned int count, struct drm_mm_node *node)
+{
+	struct chrome9_engine *engine = cdev->engine;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (engine->wedged)
+		return -EIO;
+	mutex_lock(&engine->vm_lock);
+	ret = drm_mm_insert_node_generic(&engine->sf_mm, node,
+					 (u64)count << PAGE_SHIFT, PAGE_SIZE, 0,
+					 DRM_MM_INSERT_HIGH);
+	if (!ret) {
+		ret = chrome9_gart_set_kick(engine, node->start >> PAGE_SHIFT,
+					    ptes, count, true);
+		if (ret && chrome9_gart_set_kick(engine,
+						 node->start >> PAGE_SHIFT,
+						 NULL, count, true)) {
+			engine->wedged = true;
+			chrome9_take_quarantine_hold(engine);
+		} else if (ret) {
+			drm_mm_remove_node(node);
+		}
+	}
+	mutex_unlock(&engine->vm_lock);
+	return ret;
+}
+
+int chrome9_snoop_unmap(struct chrome9_device *cdev, struct drm_mm_node *node)
+{
+	struct chrome9_engine *engine = cdev->engine;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (engine->wedged)
+		return -EIO;
+	mutex_lock(&engine->vm_lock);
+	ret = chrome9_gart_set_kick(engine, node->start >> PAGE_SHIFT, NULL,
+				    node->size >> PAGE_SHIFT, true);
+	if (ret) {
+		engine->wedged = true;
+		chrome9_take_quarantine_hold(engine);
+	} else {
+		drm_mm_remove_node(node);
+	}
+	mutex_unlock(&engine->vm_lock);
+	return ret;
+}
+
+u64 chrome9_snoop_gart_hash(struct chrome9_device *cdev)
+{
+	struct chrome9_engine *engine = cdev->engine;
+	struct xxh64_state state;
+	u32 chunk[64];
+	unsigned int off;
+
+	xxh64_reset(&state, 0);
+	for (off = 0; off < CHROME9_GART_SIZE; off += sizeof(chunk)) {
+		memcpy_fromio(chunk, engine->gart + off, sizeof(chunk));
+		xxh64_update(&state, chunk, sizeof(chunk));
+	}
+	return xxh64_digest(&state);
+}
+
+/*
+ * One kernel-owned COPY_RECT job.  cpu_step runs with preemption disabled
+ * directly before the doorbell, so the ring must not wrap in between.
+ */
+int chrome9_snoop_run_copy(struct chrome9_device *cdev,
+			   const struct chrome9_snoop_copy *copy,
+			   void (*cpu_step)(void *arg), void *arg)
+{
+	struct chrome9_engine *engine = cdev->engine;
+	struct chrome9_draw_request request = {
+		.kind = CHROME9_DRAW_COPY_RECT,
+		.pitch = copy->pitch,
+		.texture_pitch = copy->pitch,
+		.source_x = copy->x,
+		.destination_x = copy->x,
+		.copy_width = copy->width,
+		.copy_height = copy->height,
+	};
+	struct chrome9_job *job;
+	bool must_quarantine = false;
+	u32 pause;
+	int ret;
+
+	lockdep_assert_held(&engine->submit_lock);
+	if (engine->wedged || !list_empty(&engine->queue))
+		return -EIO;
+	/* Cookie jobs advance the ring until a segment page fits unwrapped. */
+	while (engine->append > engine->ring_size - PAGE_SIZE) {
+		ret = chrome9_gart_kick(engine);
+		if (ret)
+			return ret;
+	}
+	job = kzalloc_obj(*job);
+	if (!job)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&job->quarantine_link);
+	INIT_LIST_HEAD(&job->queue_link);
+	job->kind = CHROME9_DRAW_COPY_RECT;
+	job->cookie = chrome9_next_cookie_locked(engine);
+	ret = chrome9_build_copy_rect(engine, &request, job, copy->dst,
+				      copy->src, &pause);
+	if (ret)
+		goto out;
+	preempt_disable();
+	if (cpu_step)
+		cpu_step(arg);
+	ret = chrome9_append_segment(engine, job, engine->staging_cpu,
+				     PAGE_SIZE, pause, &must_quarantine);
+	preempt_enable();
+	if (!ret)
+		ret = chrome9_wait_job(engine, job);
+	else if (!must_quarantine)
+		goto out;
+	if (ret) {
+		/* The ring may still own the segment and the scratch pages. */
+		engine->wedged = true;
+		chrome9_take_quarantine_hold(engine);
+		dev_crit(&cdev->pdev->dev,
+			 "snoop ladder copy did not retire: %d\n", ret);
+		goto out;
+	}
+	engine->last_cookie = job->cookie;
+out:
+	kfree(job);
+	return ret;
 }

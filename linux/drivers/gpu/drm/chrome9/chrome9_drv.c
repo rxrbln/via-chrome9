@@ -31,6 +31,7 @@
 
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
+#include "chrome9_snoop.h"
 #include "chrome9_query.h"
 
 #define CHROME9_DRIVER_NAME	"chrome9"
@@ -2872,6 +2873,7 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	ret = chrome9_engine_init(cdev);
 	if (ret)
 		return ret;
+	chrome9_snoop_selftest(cdev);
 	if (chrome9_fixed_iga1 && !chrome9_engine_ready(cdev)) {
 		chrome9_engine_fini(cdev);
 		return dev_err_probe(&pdev->dev, -EINVAL,
