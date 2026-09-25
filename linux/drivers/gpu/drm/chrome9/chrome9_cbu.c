@@ -64,6 +64,11 @@ module_param_named(cbu_window, chrome9_cbu_window, uint, 0400);
 MODULE_PARM_DESC(cbu_window,
 	"Debug: CBU window of the ladder, 3..15; step 10 also uses the one below (default: 15)");
 
+static uint chrome9_cbu_route;
+module_param_named(cbu_route, chrome9_cbu_route, uint, 0400);
+MODULE_PARM_DESC(cbu_route,
+	"Debug: CBU routing probe instead of steps 3..12: bit 0 probe, 1 D0F2 9E[1], 2 DFA D1F0 B9[1] (with bit 1), 3 SR42[7]");
+
 static int chrome9_cbu_pitch_mode = -1;
 module_param_named(cbu_pitch_mode, chrome9_cbu_pitch_mode, int, 0400);
 MODULE_PARM_DESC(cbu_pitch_mode,
@@ -161,6 +166,7 @@ enum {
 	CHROME9_CBU_STEP_TWO,		/* C9 */
 	CHROME9_CBU_STEP_TIMING,	/* C10 */
 	CHROME9_CBU_STEP_TILE16,	/* C8 */
+	CHROME9_CBU_STEP_ROUTE,		/* R */
 	CHROME9_CBU_STEPS,
 };
 
@@ -1053,6 +1059,248 @@ out:
 	return ret;
 }
 
+/*
+ * Routing probe (after C3 read the raw bytes through an enabled window).
+ * SPM D0F2 Rx9E[1]: under direct frame buffer access (DFA, D1F0 RxB9[1])
+ * the NB sends CPU cycles in 16 "tile mode" windows to GFXCTL and all
+ * others straight to DRAM; the vendor X driver gates CBU rotation on a
+ * "direct access window" chip capability.  Each bit changes one routing
+ * register for the probe and restores it afterwards.
+ */
+#define CHROME9_CBU_ROUTE_PROBE	BIT(0)
+#define CHROME9_CBU_ROUTE_NB	BIT(1)
+#define CHROME9_CBU_ROUTE_DFA	BIT(2)
+#define CHROME9_CBU_ROUTE_SR42	BIT(3)
+
+struct chrome9_cbu_route {
+	struct pci_dev *d0f2;
+	u8 d0f2_9e;
+	u8 b9;
+	u8 sr42;
+	unsigned int applied;
+};
+
+static int chrome9_cbu_sr42(struct chrome9_cbu_test *t, int value)
+{
+	u8 index;
+	int ret;
+
+	ret = chrome9_vga_seq_get(t->cdev);
+	if (ret)
+		return ret;
+	index = vga_io_r(VGA_SEQ_I);
+	if (value >= 0)
+		vga_io_wseq(0x42, value);
+	ret = vga_io_rseq(0x42);
+	vga_io_w(VGA_SEQ_I, index);
+	chrome9_vga_seq_put(t->cdev);
+	return ret;
+}
+
+static void chrome9_cbu_route_restore(struct chrome9_cbu_test *t,
+				      struct chrome9_cbu_route *r)
+{
+	struct pci_dev *pdev = t->cdev->pdev;
+	u8 b9 = 0, nb = 0;
+	int sr42 = -1;
+
+	if (r->applied & CHROME9_CBU_ROUTE_SR42)
+		sr42 = chrome9_cbu_sr42(t, r->sr42);
+	if (r->applied & CHROME9_CBU_ROUTE_DFA)
+		pci_write_config_byte(pdev, 0xb9, r->b9);
+	if (r->applied & CHROME9_CBU_ROUTE_NB)
+		pci_write_config_byte(r->d0f2, 0x9e, r->d0f2_9e);
+	pci_read_config_byte(pdev, 0xb9, &b9);
+	pci_read_config_byte(r->d0f2, 0x9e, &nb);
+	dev_info(t->dev, "CBU R: restored D0F2.9E=%02x D1F0.B9=%02x SR42=%02x\n",
+		 nb, b9, sr42 < 0 ? chrome9_cbu_sr42(t, -1) : sr42);
+	r->applied = 0;
+}
+
+/* DFA translates [base, base + size) to the frame buffer: only enable it
+ * when that range is exactly BAR2. */
+static bool chrome9_cbu_dfa_matches(struct chrome9_cbu_test *t)
+{
+	struct pci_dev *pdev = t->cdev->pdev;
+	struct pci_dev *d0f3;
+	u16 a0 = 0;
+	u64 base, size;
+
+	d0f3 = pci_get_domain_bus_and_slot(pci_domain_nr(pdev->bus), 0,
+					   PCI_DEVFN(0, 3));
+	if (d0f3)
+		pci_read_config_word(d0f3, 0xa0, &a0);
+	pci_dev_put(d0f3);
+	base = (u64)((a0 >> 3) & 0x1ff) << 23 | (u64)((a0 >> 2) & 1) << 32;
+	size = SZ_4M << ((a0 >> 12) & 7);
+	dev_info(t->dev, "CBU R: D0F3.A0=%04x DFA base %#llx size %#llx, BAR2 %#llx size %#llx\n",
+		 a0, base, size, (u64)pci_resource_start(pdev, 2),
+		 (u64)pci_resource_len(pdev, 2));
+	return (a0 & BIT(15)) && !(a0 & BIT(1)) && (a0 >> 12) & 7 &&
+	       base == pci_resource_start(pdev, 2) &&
+	       size == pci_resource_len(pdev, 2);
+}
+
+static int chrome9_cbu_route_apply(struct chrome9_cbu_test *t,
+				   struct chrome9_cbu_route *r)
+{
+	struct pci_dev *pdev = t->cdev->pdev;
+	u8 v = 0;
+	int sr42;
+
+	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_NB) {
+		/* SPM: bit 5 must be 0 while bit 1 is set. */
+		if (r->d0f2_9e & BIT(5))
+			return -EINVAL;
+		r->applied |= CHROME9_CBU_ROUTE_NB;
+		pci_write_config_byte(r->d0f2, 0x9e, r->d0f2_9e | BIT(1));
+		pci_read_config_byte(r->d0f2, 0x9e, &v);
+		dev_info(t->dev, "CBU R: D0F2.9E %02x -> %02x\n", r->d0f2_9e, v);
+	}
+	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_DFA) {
+		if (!(chrome9_cbu_route & CHROME9_CBU_ROUTE_NB) ||
+		    !chrome9_cbu_dfa_matches(t))
+			return -EINVAL;
+		r->applied |= CHROME9_CBU_ROUTE_DFA;
+		pci_write_config_byte(pdev, 0xb9, r->b9 | BIT(1));
+		pci_read_config_byte(pdev, 0xb9, &v);
+		dev_info(t->dev, "CBU R: D1F0.B9 %02x -> %02x\n", r->b9, v);
+	}
+	if (chrome9_cbu_route & CHROME9_CBU_ROUTE_SR42) {
+		r->applied |= CHROME9_CBU_ROUTE_SR42;
+		sr42 = chrome9_cbu_sr42(t, r->sr42 | 0x80);
+		dev_info(t->dev, "CBU R: SR42 %02x -> %02x\n", r->sr42, sr42);
+	}
+	return 0;
+}
+
+/* Where each linear dword of the view came from, for any mapping. */
+static void chrome9_cbu_route_view(struct chrome9_cbu_test *t,
+				   struct chrome9_cbu_surface *s,
+				   const char *what, u32 control)
+{
+	u32 linear = s->pitch * s->height, l, o, got;
+	u32 raw = 0, tiled = 0, rot180 = 0, other = 0, ctl;
+
+	ctl = readl(chrome9_cbu_reg(t->cdev, t->win, CHROME9_CBU_CTL));
+	memcpy_fromio(s->buf, chrome9_cbu_sl(t, s->base), linear);
+	for (l = 0; l < linear; l += 4) {
+		u32 x = l % s->pitch, y = l / s->pitch;
+
+		got = s->buf[l / 4];
+		o = (got & GENMASK(23, 0)) * 4;
+		if (got >> 24 != CHROME9_CBU_TAG_RAW)
+			other++;
+		else if (o == l)
+			raw++;
+		else if (o == chrome9_cbu_tiled_offset(x, y, s->pitch, 8))
+			tiled++;
+		else if (o == (s->height - 1 - y) * s->pitch + s->pitch - 4 - x)
+			rot180++;
+		else if (other++ < 3)
+			dev_info(t->dev,
+				 "CBU R:   %s linear byte %u row %u reads raw byte %u row %u\n",
+				 what, x, y, o % s->pitch, o / s->pitch);
+	}
+	dev_info(t->dev,
+		 "CBU R: %s ctl wrote %02x read %08x: %u dwords raw, %u tiled, %u rotated 180, %u other\n",
+		 what, control, ctl, raw, tiled, rot180, other);
+}
+
+static int chrome9_cbu_route_probe(struct chrome9_cbu_test *t,
+				   struct chrome9_cbu_surface *s)
+{
+	const u32 tile = CHROME9_CBU_ENABLE | CHROME9_CBU_BPP32 |
+			 CHROME9_CBU_TILE;
+	const u32 rot180 = CHROME9_CBU_ENABLE | CHROME9_CBU_BPP32 | 2 << 3;
+	u32 linear = s->pitch * s->height, l, bad, untranslated;
+	int ret, mode;
+
+	for (mode = CHROME9_CBU_PITCH_PIXELS; mode <= CHROME9_CBU_PITCH_TILES;
+	     mode++) {
+		ret = chrome9_cbu_arm(t, t->win, s, s->pitch / 4, mode, tile);
+		if (ret)
+			return ret;
+		chrome9_cbu_first_read(t, s, 0, 0);
+		chrome9_cbu_route_view(t, s, mode ? "tile read columns" :
+				       "tile read pixels", tile);
+		chrome9_cbu_disable(t->cdev, t->win);
+	}
+	ret = chrome9_cbu_arm(t, t->win, s, s->pitch / 4,
+			      CHROME9_CBU_PITCH_PIXELS, rot180);
+	if (ret)
+		return ret;
+	chrome9_cbu_first_read(t, s, 0, 0);
+	chrome9_cbu_route_view(t, s, "rotate 180 read", rot180);
+	chrome9_cbu_disable(t->cdev, t->win);
+	/* Stores may be translated even where loads are not. */
+	ret = chrome9_cbu_arm(t, t->win, s, s->pitch / 4,
+			      CHROME9_CBU_PITCH_PIXELS, tile);
+	if (ret)
+		return ret;
+	for (l = 0; l < linear; l += 4)
+		s->buf[l / 4] = chrome9_cbu_pattern(CHROME9_CBU_TAG_LIN, l);
+	chrome9_cbu_store(chrome9_cbu_sl(t, s->base), s->buf, linear,
+			  CHROME9_CBU_WRITE_DWORD);
+	chrome9_cbu_disable(t->cdev, t->win);
+	bad = chrome9_cbu_check_raw(t, s, &untranslated);
+	dev_info(t->dev,
+		 "CBU R: tile write pixels: %u/%u raw dwords tiled as expected, untranslated %u\n",
+		 s->extent / 4 - bad, s->extent / 4, untranslated);
+	chrome9_cbu_fill_raw(t, s);
+	return 0;
+}
+
+static int chrome9_cbu_step_route(struct chrome9_cbu_test *t)
+{
+	struct pci_dev *pdev = t->cdev->pdev;
+	struct chrome9_cbu_route r = { };
+	struct chrome9_cbu_surface s;
+	u32 bad, untranslated;
+	int ret, sr42;
+
+	r.d0f2 = pci_get_domain_bus_and_slot(pci_domain_nr(pdev->bus), 0,
+					     PCI_DEVFN(0, 2));
+	if (!r.d0f2)
+		return -ENODEV;
+	pci_read_config_byte(r.d0f2, 0x9e, &r.d0f2_9e);
+	pci_read_config_byte(pdev, 0xb9, &r.b9);
+	sr42 = chrome9_cbu_sr42(t, -1);
+	ret = sr42 < 0 ? sr42 :
+	      chrome9_cbu_surface_alloc(t, &s, 256, 64, 4, 8);
+	if (ret) {
+		pci_dev_put(r.d0f2);
+		return ret;
+	}
+	r.sr42 = sr42;
+	/* Filled before any routing change, read back after it. */
+	chrome9_cbu_fill_raw(t, &s);
+	ret = chrome9_cbu_route_apply(t, &r);
+	if (ret) {
+		dev_err(t->dev, "CBU R: route %#x not applicable\n",
+			chrome9_cbu_route);
+		goto out;
+	}
+	bad = chrome9_cbu_check_view(t, &s, s.pitch, 0, &untranslated);
+	if (bad || chrome9_cbu_gart_hash(t) != t->gart_hash) {
+		dev_err(t->dev,
+			"CBU R: window off, %u dwords or the GART hash differ after the routing change, restored\n",
+			bad);
+		ret = -EIO;
+		goto out;
+	}
+	dev_info(t->dev, "CBU R: window off, raw surface and GART unchanged\n");
+	ret = chrome9_cbu_route_probe(t, &s);
+out:
+	chrome9_cbu_disable(t->cdev, t->win);
+	chrome9_cbu_route_restore(t, &r);
+	if (!ret)
+		ret = chrome9_cbu_finish(t, &s, t->win);
+	chrome9_cbu_surface_free(t, &s);
+	pci_dev_put(r.d0f2);
+	return ret;
+}
+
 static const char * const chrome9_cbu_step_name[CHROME9_CBU_STEPS] = {
 	[CHROME9_CBU_STEP_DUMP] = "C0",
 	[CHROME9_CBU_STEP_READBACK] = "C1",
@@ -1066,6 +1314,7 @@ static const char * const chrome9_cbu_step_name[CHROME9_CBU_STEPS] = {
 	[CHROME9_CBU_STEP_TWO] = "C9",
 	[CHROME9_CBU_STEP_TIMING] = "C10",
 	[CHROME9_CBU_STEP_TILE16] = "C8",
+	[CHROME9_CBU_STEP_ROUTE] = "R",
 };
 
 static int chrome9_cbu_run_step(struct chrome9_cbu_test *t, int step)
@@ -1095,6 +1344,8 @@ static int chrome9_cbu_run_step(struct chrome9_cbu_test *t, int step)
 		return chrome9_cbu_step_timing(t);
 	case CHROME9_CBU_STEP_TILE16:
 		return chrome9_cbu_step_tile16(t);
+	case CHROME9_CBU_STEP_ROUTE:
+		return chrome9_cbu_step_route(t);
 	}
 	return -EINVAL;
 }
@@ -1102,13 +1353,14 @@ static int chrome9_cbu_run_step(struct chrome9_cbu_test *t, int step)
 /* A step that needs the pitch unit, when neither C3 step decided it. */
 static bool chrome9_cbu_needs_mode(int step)
 {
-	return step >= CHROME9_CBU_STEP_MATRIX;
+	return step >= CHROME9_CBU_STEP_MATRIX && step != CHROME9_CBU_STEP_ROUTE;
 }
 
 static void chrome9_cbu_selftest(struct chrome9_device *cdev)
 {
-	const int last = min(chrome9_cbu_selftest_steps,
-			     CHROME9_CBU_STEPS - 1);
+	const int last = chrome9_cbu_route ? CHROME9_CBU_STEP_ROUTE :
+			 min(chrome9_cbu_selftest_steps,
+			     CHROME9_CBU_STEP_ROUTE - 1);
 	struct chrome9_cbu_test *t;
 	unsigned int w, i;
 	int step, ret = 0;
@@ -1143,13 +1395,16 @@ static void chrome9_cbu_selftest(struct chrome9_device *cdev)
 	}
 	t->gart_hash = chrome9_cbu_gart_hash(t);
 	dev_info(t->dev,
-		 "CBU ladder: steps 1..%d skip %#x window %u pitch mode %d GART hash %016llx\n",
-		 last, chrome9_cbu_skip, t->win, t->mode, t->gart_hash);
+		 "CBU ladder: steps 1..%d skip %#x route %#x window %u pitch mode %d GART hash %016llx\n",
+		 last, chrome9_cbu_skip, chrome9_cbu_route, t->win, t->mode,
+		 t->gart_hash);
 	for (step = 1; step <= last; step++) {
 		t->step = chrome9_cbu_step_name[step];
 		/* C0 takes the snapshot the restore needs. */
 		if ((step > CHROME9_CBU_STEP_DUMP &&
 		     chrome9_cbu_skip & BIT(step)) ||
+		    (chrome9_cbu_route && step > CHROME9_CBU_STEP_READBACK &&
+		     step < CHROME9_CBU_STEP_ROUTE) ||
 		    (step == CHROME9_CBU_STEP_PITCH_PIXELS &&
 		     t->mode == CHROME9_CBU_PITCH_TILES) ||
 		    (step == CHROME9_CBU_STEP_PITCH_TILES && t->mode >= 0)) {
