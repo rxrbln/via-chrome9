@@ -286,3 +286,21 @@ target; stop and power-cycle via NanoKVM on the first timeout.
 Only after F1..F6 pass is a Mesa splitter worth prototyping, behind an
 environment variable, default off until a full piglit run shows zero
 regressions against `results/pg-all81.tsv`.
+
+## 7. R32F silicon results (2026-09-26)
+
+Kernel `b5f0b7c` (CAP2 bit 32, `r32f`), `chrome9_rq_rungs r32f`, 64x64
+targets and textures:
+
+| rung | result |
+|---|---|
+| F1 constant write | 1.5, 1/3 (`3eaaaa80`), -2^-20, 65504, 1e18 (`5d5e0b00`), 0, -2.75 stored with the 16 fragment mantissa bits in all 4096 pixels; 1e30 saturates to `5f7fff80` (the pixel ALU range ends near 2^64) |
+| F2 R32F texture into BGRA8 | exact; the sampler returns (r, 1, 1, 1), not (r, 0, 0, 1) |
+| F3 R32F texture -> R32F target | bit-exact for 16-mantissa-bit values, 0/4096 mismatch |
+| F4 render R32F, sample in the next job | 0/4096 mismatch, 4095 distinct values |
+| F5 MRT with R32F targets, F6 ALU rate | not run (needs the vertex-program MRT path) |
+
+R32F is therefore an exact carrier for fragment values within the ALU
+range, as section 3 required.  GL cannot reach it (Mesa exposes GL_R32F
+only with ARB_texture_float or ARB_texture_rg, which need formats this
+hardware lacks), so its first user is the Mesa multi-pass splitter.
