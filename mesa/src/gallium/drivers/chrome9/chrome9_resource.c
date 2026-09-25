@@ -996,6 +996,24 @@ chrome9_buffer_rename(struct chrome9_resource *resource, unsigned usage,
    }
 }
 
+/* glBufferData(NULL) of the same size: fresh or idle storage, the queued
+ * jobs keep reading the old object. */
+static void
+chrome9_invalidate_resource(struct pipe_context *pipe,
+                            struct pipe_resource *resource)
+{
+   const struct pipe_box box = {
+      .width = resource->width0, .height = 1, .depth = 1,
+   };
+
+   if (resource->target != PIPE_BUFFER)
+      return;
+   chrome9_tcl_batch_flush_resource(chrome9_context(pipe), resource);
+   chrome9_buffer_rename(chrome9_resource(resource),
+                         PIPE_MAP_WRITE | PIPE_MAP_DISCARD_WHOLE_RESOURCE,
+                         &box);
+}
+
 static void *
 chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                      unsigned level, unsigned usage,
@@ -1798,6 +1816,7 @@ void
 chrome9_init_context_resource_functions(struct pipe_context *pipe)
 {
    pipe->buffer_map = chrome9_transfer_map;
+   pipe->invalidate_resource = chrome9_invalidate_resource;
    pipe->buffer_unmap = chrome9_transfer_unmap;
    pipe->texture_map = chrome9_transfer_map;
    pipe->texture_unmap = chrome9_transfer_unmap;

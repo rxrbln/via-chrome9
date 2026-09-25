@@ -571,6 +571,9 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
       caps->conditional_render = true;
       caps->conditional_render_inverted = true;
    }
+   /* invalidate_resource renames busy buffers (GEM_BUSY). */
+   caps->invalidate_buffer =
+      chrome9_screen_has_capability2(&screen->base, DRM_CHROME9_CAP2_GEM_BUSY);
    /* Nine levels: every face root has eight level-table successors. */
    if (chrome9_screen_has_capability2(&screen->base,
                                       DRM_CHROME9_CAP2_CUBE_MAP) &&
