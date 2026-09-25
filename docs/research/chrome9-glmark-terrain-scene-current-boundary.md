@@ -224,3 +224,24 @@ exterior, source, and destination guards.  Extend to the exact four-mip-plus-
 one-L0 mix only after that discriminator passes.  This remains a generic
 texture-state test and does not special-case terrain.
 
+
+## Limit (2026-09-25 evening, kernel k124, Mesa p67)
+
+| measurement | 800x600 | 400x300 |
+|---|---:|---:|
+| default | 246 ms | 145 ms |
+| every fragment program replaced by a constant (`CHROME9_DEBUG_FS_MARK=id`) | 100 ms | 89 ms |
+| coarse-Z on | 245 ms | |
+
+* Fragment shading costs about 146 ms per frame at 800x600, more than the
+  ALU record counts predict (about 90 ms at 750 M records/s): the main
+  program samples 5 textures and each tilt-shift pass 9, about 23 texture
+  fetches per pixel.  Coarse-Z changes nothing, so hidden-fragment overdraw
+  is not the cost.
+* Without any shading the frame still takes 100 ms, above the 66 ms of
+  15 fps: 131k TCL triangles, CPU prefetch of the VS lookups, index
+  handling, the llvmpipe noise pass (exact 22-bit integer arithmetic, beyond
+  96 records) and CPU/GPU hand-offs (VS lookups need the GPU-rendered
+  height and normal maps).
+* 15 fps would need both halves about four times faster; the scene stays at
+  about 4 fps on this hardware.
