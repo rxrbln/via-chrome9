@@ -1140,6 +1140,23 @@ chrome9_draw_scissor(const struct chrome9_context *ctx,
    }
 }
 
+/* Stencil needs the kernel stencil block and a D24S8 surface; without a
+ * depth test it runs as depth ALWAYS with writes disabled. */
+bool
+chrome9_draw_stencil_supported(const struct chrome9_context *ctx)
+{
+   if (ctx->dsa && (ctx->dsa->depth_bounds_test ||
+                    (ctx->dsa->stencil[1].enabled &&
+                     !ctx->dsa->stencil[0].enabled)))
+      return false;
+   return !chrome9_stencil_active(ctx) ||
+          (ctx->fragment_stencil &&
+           chrome9_use_generic_fragment_program(ctx) &&
+           ctx->framebuffer.zsbuf.format == PIPE_FORMAT_S8_UINT_Z24_UNORM &&
+           (ctx->dsa->depth_enabled ||
+            (ctx->depth_always_supported && ctx->depth_read_only_supported)));
+}
+
 static bool
 chrome9_draw_state_supported(struct chrome9_context *ctx,
                              struct chrome9_resource **target,
@@ -1250,18 +1267,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        ctx->fs->fragment_program != CHROME9_FS_TEXTURE_RGBX)
       return false;
    *reason = "stencil/depth-bounds";
-   if (ctx->dsa && (ctx->dsa->depth_bounds_test ||
-                    (ctx->dsa->stencil[1].enabled &&
-                     !ctx->dsa->stencil[0].enabled)))
-      return false;
-   /* Stencil needs the kernel stencil block and a D24S8 surface; without
-    * a depth test it runs as depth ALWAYS with writes disabled. */
-   if (chrome9_stencil_active(ctx) &&
-       (!ctx->fragment_stencil ||
-        !chrome9_use_generic_fragment_program(ctx) ||
-        ctx->framebuffer.zsbuf.format != PIPE_FORMAT_S8_UINT_Z24_UNORM ||
-        (!ctx->dsa->depth_enabled &&
-         (!ctx->depth_always_supported || !ctx->depth_read_only_supported))))
+   if (!chrome9_draw_stencil_supported(ctx))
       return false;
    if (ctx->dsa && (ctx->dsa->depth_enabled || chrome9_stencil_active(ctx))) {
       const struct pipe_surface *surface = &ctx->framebuffer.zsbuf;

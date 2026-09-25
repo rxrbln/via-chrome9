@@ -44,6 +44,7 @@ struct chrome9_tcl_fragment {
 bool chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
                                struct chrome9_tcl_fragment *fragment,
                                const char **why);
+bool chrome9_draw_stencil_supported(const struct chrome9_context *ctx);
 void chrome9_tcl_batch_flush(struct chrome9_context *ctx);
 void chrome9_tcl_batch_flush_resource(struct chrome9_context *ctx,
                                       const struct pipe_resource *resource);
