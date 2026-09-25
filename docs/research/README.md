@@ -340,6 +340,9 @@ targets.
   unproved secondary-render-target state boundary.
 - [chrome9-mrt-output-corpus.tsv](chrome9-mrt-output-corpus.tsv) preserves four
   individual outputs and one combined oC0+oC1 compiler differential.
+- [chrome9-mrt-re.md](chrome9-mrt-re.md) recovers RT1..RT3 words, the A01
+  shader-derived target count, shared/per-RT blend and mask state, vendor
+  post-render format rule, and a guarded MRT silicon ladder.
 - [chrome9-texkill-depth-combo-audit.md](chrome9-texkill-depth-combo-audit.md)
   closes combined discard/color/depth scheduling and defines the guarded
   kill-before-depth suppression oracle.
