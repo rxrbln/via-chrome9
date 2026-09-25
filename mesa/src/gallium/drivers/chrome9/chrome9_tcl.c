@@ -171,6 +171,7 @@ struct tcl_builder {
    const struct chrome9_tcl_flow *flow;
    nir_function_impl *impl;
    unsigned depth;
+   bool rep_open;
    unsigned scope_serial;
    uint16_t scope[TCL_MAX_FLOW_DEPTH + 1];
    /* NIR scalar of each program expression node. */
@@ -2390,21 +2391,9 @@ tcl_emit_if(struct tcl_builder *b, nir_if *nif)
       b->p->bool_expr[b->p->bool_count] = expr;
       tcl_flow_source(&cond, DRM_CHROME9_VERTEX_FILE_BOOL,
                       b->p->bool_count++);
-   } else if (b->flow->dynamic) {
-      const struct tcl_value *v = tcl_value(b, nif->condition.ssa);
-      unsigned temp;
-
-      if (b->failed)
-         return;
-      temp = v->index;
-      if (v->file != DRM_CHROME9_VERTEX_FILE_TEMP || v->sel[0] > 3 || v->neg) {
-         temp = tcl_new_temp(b);
-         tcl_move(b, temp, v, 1);
-      }
-      tcl_flow_source(&cond, DRM_CHROME9_VERTEX_FILE_TEMP, temp);
-      memset(cond.swizzle, v->file == DRM_CHROME9_VERTEX_FILE_TEMP &&
-             v->sel[0] <= 3 && !v->neg ? v->sel[0] : 0, sizeof(cond.swizzle));
    } else {
+      /* Op 29 on a temporary tests b# of its register number on silicon
+       * (rung vsdyn): there is no data-dependent branch. */
       tcl_flow_fail(b, "data-dependent branch");
       return;
    }
@@ -2572,6 +2561,11 @@ tcl_emit_loop(struct tcl_builder *b, nir_loop *loop)
       tcl_flow_fail(b, "nesting depth");
       return;
    }
+   /* One loop counter: an inner REP ends the outer one (rung vsnest). */
+   if (b->rep_open) {
+      tcl_flow_fail(b, "REP inside REP");
+      return;
+   }
    if (!tcl_match_rep(b, loop, &rep, &terminator)) {
       tcl_flow_fail(b, "loop without a CB0 or literal trip count");
       return;
@@ -2600,9 +2594,11 @@ tcl_emit_loop(struct tcl_builder *b, nir_loop *loop)
    at = b->p->instruction_count;
    tcl_flow_op(b, DRM_CHROME9_VERTEX_OP_REP, &count);
    tcl_enter(b, &region);
+   b->rep_open = true;
    foreach_list_typed(nir_cf_node, node, node, &loop->body)
       if (node != &terminator->cf_node && !b->failed)
          tcl_emit_node(b, node);
+   b->rep_open = false;
    if (!b->failed)
       tcl_back_moves(b, header, nir_loop_last_block(loop), carried);
    tcl_leave(b, &region);

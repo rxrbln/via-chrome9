@@ -9074,16 +9074,14 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->tcl_polygon_mode = ctx->tcl_enabled &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_POLYGON_MODE) &&
       debug_get_bool_option("CHROME9_TCL_POLYGON_MODE", true);
-   /* The cap grants depth one; CHROME9_TCL_FLOW_DEPTH and
-    * CHROME9_TCL_DYNAMIC_FLOW follow the kernel RE knobs. */
+   /* The cap grants depth one; CHROME9_TCL_FLOW_DEPTH follows the kernel
+    * RE knob vs_flow_depth. */
    if (ctx->tcl_enabled &&
        chrome9_screen_has_capability2(screen,
                                       DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW) &&
        debug_get_bool_option("CHROME9_TCL_FLOW", true)) {
       ctx->tcl_flow.max_depth =
          CLAMP(debug_get_num_option("CHROME9_TCL_FLOW_DEPTH", 1), 1, 4);
-      ctx->tcl_flow.dynamic =
-         debug_get_bool_option("CHROME9_TCL_DYNAMIC_FLOW", false);
    }
    /* CHROME9_TCL_RELATIVE=0 leaves indirect uniform reads to the draw
     * module. */

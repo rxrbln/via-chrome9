@@ -37,6 +37,8 @@ enum shape {
    SHAPE_SWAP,
    /* the loop with a literal count of 40, beyond the unroll limit */
    SHAPE_LITERAL_LOOP,
+   /* for (i < cb0.x) for (j < cb0.x) d = d * 0.5 + 0.25: one loop counter */
+   SHAPE_NESTED_LOOP,
    /* d = x * 0.5 + 0.25 without control flow */
    SHAPE_STRAIGHT,
 };
@@ -106,6 +108,21 @@ build(enum shape shape)
    case SHAPE_LITERAL_LOOP:
       counted_loop(&b, d, e, nir_imm_float(&b, 40.0), false);
       break;
+   case SHAPE_NESTED_LOOP: {
+      nir_variable *j = nir_local_variable_create(b.impl, glsl_int_type(), "j");
+
+      nir_store_var(&b, j, nir_imm_int(&b, 0), 1);
+      nir_push_loop(&b);
+      {
+         nir_def *jv = nir_load_var(&b, j);
+
+         nir_break_if(&b, nir_ige(&b, jv, nir_f2i32(&b, nir_channel(&b, cb, 0))));
+         counted_loop(&b, d, e, nir_channel(&b, cb, 0), false);
+         nir_store_var(&b, j, nir_iadd_imm(&b, jv, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      break;
+   }
    case SHAPE_STRAIGHT:
       nir_store_var(&b, d, nir_fadd_imm(&b, nir_fmul_imm(&b, x, 0.5), 0.25),
                     1);
@@ -242,8 +259,8 @@ run(struct machine *m, const struct drm_chrome9_vertex_instruction *in,
          continue;
       }
       case DRM_CHROME9_VERTEX_OP_IF: {
-         const bool taken = i->src[0].file == DRM_CHROME9_VERTEX_FILE_BOOL ?
-            m->bools >> i->src[0].index & 1 : lane(m, &i->src[0], 0) != 0.0f;
+         /* Silicon tests b# of the source register number (rung vsdyn). */
+         const bool taken = m->bools >> i->src[0].index & 1;
          unsigned mid = skip_region(in, pc + 1, count, true);
          unsigned end = in[mid].op == DRM_CHROME9_VERTEX_OP_ELSE ?
                         skip_region(in, mid + 1, count, false) : mid;
@@ -406,7 +423,7 @@ check(const char *name, enum shape shape, const struct chrome9_tcl_flow *flow,
    if (p->supported && getenv("CHROME9_TCL_FLOW_TEST_EXPORT")) {
       FILE *f = fopen(getenv("CHROME9_TCL_FLOW_TEST_EXPORT"), "ab");
       const uint32_t head[5] = {
-         flow->max_depth, flow->dynamic, p->instruction_count,
+         flow->max_depth, 0u, p->instruction_count,
          p->input_count, p->uniform_rows + p->immediate_count,
       };
 
@@ -689,7 +706,7 @@ check_relative(const char *name, enum relative_shape shape,
    if (p->supported && getenv("CHROME9_TCL_FLOW_TEST_EXPORT")) {
       FILE *f = fopen(getenv("CHROME9_TCL_FLOW_TEST_EXPORT"), "ab");
       const uint32_t head[5] = {
-         flow->max_depth, flow->dynamic, p->instruction_count,
+         flow->max_depth, 0u, p->instruction_count,
          p->input_count, chrome9_tcl_constant_count(p),
       };
 
@@ -937,8 +954,7 @@ main(void)
    failures += check("uniform if", SHAPE_UNIFORM_IF_LOOP, &depth2, true, 1, 1);
    failures += check("dynamic if, static", SHAPE_DYNAMIC_IF_LOOP, &depth2,
                      false, 0, 0);
-   failures += check("dynamic if", SHAPE_DYNAMIC_IF_LOOP, &dynamic2, true, 1,
-                     0);
+   failures += check("nested loops", SHAPE_NESTED_LOOP, &depth2, false, 0, 0);
    failures += check("literal 40 loop", SHAPE_LITERAL_LOOP, &depth1, true, 1,
                      0);
    failures += check("straight line", SHAPE_STRAIGHT, &depth1, true, 0, 0);

@@ -29,8 +29,6 @@ enum chrome9_tcl_origin {
 struct chrome9_tcl_flow {
    /* REP/IF nesting; zero keeps the straight-line requirement. */
    unsigned max_depth;
-   /* IF on a computed value (kernel RE knob vs_flow_dynamic, rung F3). */
-   bool dynamic;
    /* ARL and a0-relative CB0 reads (CAP2_VERTEX_RELATIVE). */
    bool relative;
 };
