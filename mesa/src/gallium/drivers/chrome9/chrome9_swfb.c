@@ -124,6 +124,15 @@ chrome9_sw_screen_create(void)
    return screen;
 }
 
+/* llvmpipe copy of a level whose 4x4-block overhang does not fit the
+ * chrome9 object; rendered rows are copied back when it is released. */
+struct chrome9_sw_bounce {
+   struct pipe_resource *target;
+   struct pipe_resource *copy;
+   unsigned level;
+   bool render;
+};
+
 struct chrome9_sw_context {
    struct pipe_screen *screen;
    struct pipe_context *lp;
@@ -134,6 +143,7 @@ struct chrome9_sw_context {
    struct hash_table_u64 *aliases;
    /* chrome9 references held while llvmpipe may still access them. */
    struct util_dynarray held;
+   struct util_dynarray bounces;
    bool pending;
    /* The chrome9 screen reports integer fragment-position centers. */
    bool pixel_center_integer;
@@ -158,6 +168,38 @@ chrome9_sw_enabled(void)
 }
 
 static void
+chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
+                       struct chrome9_sw_bounce *bounce)
+{
+   struct chrome9_resource *res = chrome9_resource(bounce->target);
+   const unsigned level = bounce->level;
+   const unsigned rows =
+      util_format_get_nblocksy(bounce->target->format,
+                               u_minify(bounce->target->height0, level));
+   const size_t row_bytes =
+      util_format_get_stride(bounce->target->format,
+                             u_minify(bounce->target->width0, level));
+   struct pipe_transfer *transfer;
+   struct pipe_box box;
+   const uint8_t *src;
+
+   if (bounce->render) {
+      u_box_2d(0, 0, bounce->copy->width0, bounce->copy->height0, &box);
+      src = sw->lp->texture_map(sw->lp, bounce->copy, 0, PIPE_MAP_READ,
+                                &box, &transfer);
+      if (src) {
+         chrome9_resource_cpu_access(res, true);
+         for (unsigned y = 0; y < rows; y++)
+            memcpy((uint8_t *)res->bo.map + res->level_offset[level] +
+                      (size_t)y * res->level_stride[level],
+                   src + (size_t)y * transfer->stride, row_bytes);
+         sw->lp->texture_unmap(sw->lp, transfer);
+      }
+   }
+   pipe_resource_reference(&bounce->target, NULL);
+}
+
+static void
 chrome9_sw_release_held(struct chrome9_sw_context *sw)
 {
    struct pipe_framebuffer_state empty = { 0 };
@@ -168,6 +210,9 @@ chrome9_sw_release_held(struct chrome9_sw_context *sw)
                              PIPE_MAX_SHADER_SAMPLER_VIEWS, NULL);
    sw->lp->set_sampler_views(sw->lp, MESA_SHADER_VERTEX, 0, 0,
                              PIPE_MAX_SHADER_SAMPLER_VIEWS, NULL);
+   util_dynarray_foreach(&sw->bounces, struct chrome9_sw_bounce, bounce)
+      chrome9_sw_bounce_back(sw, bounce);
+   util_dynarray_clear(&sw->bounces);
    hash_table_u64_foreach(sw->aliases, entry) {
       struct pipe_resource *alias = entry.data;
 
@@ -223,6 +268,7 @@ chrome9_sw_context(struct chrome9_context *ctx)
    if (sw->screen)
       sw->lp = sw->screen->context_create(sw->screen, NULL, 0);
    util_dynarray_init(&sw->held, NULL);
+   util_dynarray_init(&sw->bounces, NULL);
    sw->objects = _mesa_pointer_hash_table_create(NULL);
    sw->aliases = _mesa_hash_table_u64_create(NULL);
    if (!sw->lp || !sw->objects || !sw->aliases) {
@@ -356,6 +402,7 @@ chrome9_sw_context_destroy(struct chrome9_context *ctx)
    _mesa_hash_table_destroy(sw->objects, NULL);
    _mesa_hash_table_u64_destroy(sw->aliases);
    util_dynarray_fini(&sw->held);
+   util_dynarray_fini(&sw->bounces);
    if (chrome9_sw_debug())
       fprintf(stderr, "chrome9: sw fallback draws=%" PRIu64 " time=%" PRIu64
                       " us\n", sw->draws, sw->us);
@@ -590,15 +637,6 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
       chrome9_sw_unavailable("surface form of the target");
       return NULL;
    }
-   /* llvmpipe touches whole 4x4 blocks: the row overhang must stay inside
-    * the object, before its trailing guard page. */
-   if ((height & 3) &&
-       res->level_offset[level] +
-          (uint64_t)res->level_stride[level] * align(height, 4) >
-          res->bo.size - (res->guarded ? 4096 : 0)) {
-      chrome9_sw_unavailable("room for 4x4 block overhang");
-      return NULL;
-   }
    templ.width0 = u_minify(resource->width0, level);
    templ.height0 = height;
    templ.last_level = 0;
@@ -608,7 +646,33 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
                  PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET);
    templ.next = NULL;
    pipe_reference_init(&templ.reference, 1);
-   alias = sw->screen->resource_from_handle(sw->screen, &templ, &handle, 0);
+   /* llvmpipe touches whole 4x4 blocks: without room for the row overhang
+    * before the trailing guard page it renders into a padded copy. */
+   if ((height & 3) &&
+       res->level_offset[level] +
+          (uint64_t)res->level_stride[level] * align(height, 4) >
+          res->bo.size - (res->guarded ? 4096 : 0)) {
+      struct chrome9_sw_bounce bounce = { .level = level, .render = bind };
+      struct pipe_box box;
+
+      alias = sw->screen->resource_create(sw->screen, &templ);
+      if (!alias) {
+         chrome9_sw_unavailable("padded copy of the target");
+         return NULL;
+      }
+      u_box_2d(0, 0, templ.width0, height, &box);
+      sw->lp->texture_subdata(sw->lp, alias, 0, PIPE_MAP_WRITE, &box,
+                              (uint8_t *)res->bo.map +
+                                 res->level_offset[level],
+                              res->level_stride[level],
+                              res->level_size[level]);
+      pipe_resource_reference(&bounce.target, resource);
+      bounce.copy = alias;
+      util_dynarray_append(&sw->bounces, bounce);
+   } else {
+      alias = sw->screen->resource_from_handle(sw->screen, &templ, &handle,
+                                               0);
+   }
    if (alias)
       _mesa_hash_table_u64_insert(sw->aliases, key, alias);
    return alias;

@@ -214,14 +214,10 @@ chrome9_resource_layout(struct pipe_screen *screen,
 
    layout->level_offset[0] = page_size;
    if (!templ->last_level) {
-      /* One leading guard, L0 rows, page padding, trailing guard.  The
-       * padding holds whole 4-row blocks for the llvmpipe fallback. */
-      const uint64_t block_rows_size =
-         (uint64_t)layout->level_stride[0] *
-         align(chrome9_format_level_rows(templ->format, templ->height0), 4);
-
-      if (!chrome9_u64_align(MAX2(layout->level_size[0], block_rows_size),
-                             page_size, &aligned_level0_size) ||
+      /* One leading guard, L0 rows, page padding, trailing guard: the
+       * kernel requires this exact size. */
+      if (!chrome9_u64_align(layout->level_size[0], page_size,
+                             &aligned_level0_size) ||
           !chrome9_u64_add(layout->level_offset[0], aligned_level0_size,
                            &cursor) ||
           !chrome9_u64_add(cursor, page_size, &cursor))
