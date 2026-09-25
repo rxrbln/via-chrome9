@@ -22,6 +22,7 @@
 #include <asm/cacheflush.h>
 #endif
 
+#include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_exec.h>
 #include <drm/drm_file.h>
@@ -417,6 +418,11 @@ int chrome9_einval(const char *func, int line)
 	return -EINVAL;
 }
 
+static uint chrome9_ppc_profile;
+module_param_named(ppc_profile, chrome9_ppc_profile, uint, 0600);
+MODULE_PARM_DESC(ppc_profile,
+	"Debug: mask of PPC counter types (bit n = type n, 0..23) written back after every fragment job (debugfs chrome9_ppc)");
+
 static bool chrome9_r32f = true;
 module_param_named(r32f, chrome9_r32f, bool, 0600);
 MODULE_PARM_DESC(r32f,
@@ -594,6 +600,8 @@ struct chrome9_job_query {
 
 struct chrome9_job {
 	struct chrome9_fence fence;
+	/* PPC counter types the tail writes back (ppc_profile). */
+	u32 ppc;
 	struct drm_gem_shmem_object *destination;
 	struct drm_gem_shmem_object *depth;
 	struct drm_gem_shmem_object *texture2;
@@ -990,6 +998,9 @@ struct chrome9_engine {
 	unsigned long *query_slots;
 	unsigned int query_slot_count;
 	u32 query_offset;
+	/* SL page below the occlusion page: PPC counter write-backs. */
+	u32 ppc_offset;
+	u32 ppc_next;
 	/* The same slots in a coherent page at GART entry QUERY_SF_INDEX. */
 	u32 *query_sf_cpu;
 	dma_addr_t query_sf_dma;
@@ -1527,6 +1538,34 @@ static int chrome9_emit_fe33(struct chrome9_engine *engine,
 	return 0;
 }
 
+/*
+ * HParaType 08h PPC types 00h..17h, one write-back group each.  As for the
+ * occlusion counter the address is a byte address (not the manual's dword
+ * units), aligned down to 16 bytes, and stores the count and a zero dword.
+ */
+#define CHROME9_PPC_COUNTERS	0x18
+#define CHROME9_PPC_STRIDE	16
+
+/* One type per job, rotating through the mask: back-to-back fires keep
+ * only the last write, and four in a row stopped the engine (silicon). */
+static void chrome9_emit_ppc(struct chrome9_engine *engine, u32 mask,
+			     u32 **cursor)
+{
+	unsigned int i = engine->ppc_next;
+	u32 a, words[4];
+
+	while (!(mask & BIT(i)))
+		i = (i + 1) % CHROME9_PPC_COUNTERS;
+	engine->ppc_next = (i + 1) % CHROME9_PPC_COUNTERS;
+	a = engine->ppc_offset + CHROME9_PPC_STRIDE * i;
+	words[0] = 0x01000000 | i;
+	words[1] = 0x02000000 | (a & 0x00ffffff);
+	words[2] = 0x03000000 | BIT(8) | a >> 24;
+	words[3] = 0xcccccccc;
+	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00080000, words,
+			     ARRAY_SIZE(words));
+}
+
 static int chrome9_emit_3d_tail(struct chrome9_engine *engine,
 				struct chrome9_job *job, u32 **cursor)
 {
@@ -1541,6 +1580,8 @@ static int chrome9_emit_3d_tail(struct chrome9_engine *engine,
 	if (ret)
 		return ret;
 	chrome9_emit_header0(cursor, sync, ARRAY_SIZE(sync) / 2);
+	if (job->ppc)
+		chrome9_emit_ppc(engine, job->ppc, cursor);
 	chrome9_emit_header2(cursor, 0x440, 0x0000043c, 0x00010000,
 			     status, ARRAY_SIZE(status));
 	chrome9_emit_header2(cursor, 0x420, 0x0000041c, 0x00300000, NULL, 0);
@@ -5092,13 +5133,17 @@ static u32 *chrome9_fragment_segment_begin(struct chrome9_engine *engine)
 static const u32 *chrome9_fragment_segment_limit(struct chrome9_engine *engine)
 {
 	return (u32 *)engine->run_staging_cpu +
-	       (engine->run_staging_size - CHROME9_CR_READ_AHEAD) / 4 - 0x100;
+	       (engine->run_staging_size - CHROME9_CR_READ_AHEAD) / 4 - 0x180;
 }
 
 static int chrome9_fragment_segment_end(struct chrome9_engine *engine,
 		struct chrome9_job *job, u32 *p, u32 *pause)
 {
-	int ret = chrome9_emit_3d_tail(engine, job, &p);
+	int ret;
+
+	job->ppc = READ_ONCE(chrome9_ppc_profile) &
+		   GENMASK(CHROME9_PPC_COUNTERS - 1, 0);
+	ret = chrome9_emit_3d_tail(engine, job, &p);
 
 	if (ret)
 		return ret;
@@ -7079,6 +7124,30 @@ static void chrome9_fence_irq_teardown(struct chrome9_engine *engine)
 
 static int chrome9_fragment_texture_selftest(void);
 
+/* Latest PPC counter write-back (ppc_profile): cumulative, diff two reads. */
+static int chrome9_ppc_show(struct seq_file *m, void *data)
+{
+	struct drm_debugfs_entry *entry = m->private;
+	struct chrome9_device *cdev = to_chrome9(entry->dev);
+	static const char * const names[CHROME9_PPC_COUNTERS] = {
+		"vertices", "vertex_cache_hits", "vs_instructions",
+		"primitives", "primitives_valid", "pixels", "pixels_valid",
+		"ps_tau", "ps_alu", "read_vb", "read_coarse_z",
+		"write_coarse_z", "read_z", "write_z", "read_color",
+		"write_color", "read_texture_sl", "read_texture_sf",
+		"read_sl", "write_sl", "read_sf", "write_sf", "working",
+		"occlusion",
+	};
+	unsigned int i;
+
+	if (!cdev->engine)
+		return -ENODEV;
+	for (i = 0; i < CHROME9_PPC_COUNTERS; i++)
+		seq_printf(m, "%02x %-18s %u\n", i, names[i],
+			   readl(cdev->engine->tail + CHROME9_PPC_STRIDE * i));
+	return 0;
+}
+
 int chrome9_engine_init(struct chrome9_device *cdev)
 {
 	struct chrome9_engine *engine;
@@ -7214,20 +7283,21 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	/* Occlusion snapshots go to the SL page below the GART; the slots
 	 * exist always so occlusion_query can be switched at run time. */
 	engine->query_offset = gart_offset - PAGE_SIZE;
+	engine->ppc_offset = engine->query_offset - PAGE_SIZE;
 	engine->tail = cdev->vram_mapped >= cdev->vram_size ?
-		cdev->vram + engine->query_offset :
+		cdev->vram + engine->ppc_offset :
 		devm_ioremap(&cdev->pdev->dev,
 			     pci_resource_start(cdev->pdev, 2) +
-			     engine->query_offset,
-			     cdev->vram_size - engine->query_offset);
+			     engine->ppc_offset,
+			     cdev->vram_size - engine->ppc_offset);
 	if (!engine->tail) {
 		kfree(engine);
 		return -ENOMEM;
 	}
-	engine->gart = engine->tail + PAGE_SIZE;
+	engine->gart = engine->tail + 2 * PAGE_SIZE;
 	/* The local object pool ends below the occlusion page. */
 	if (READ_ONCE(chrome9_local_memory) &&
-	    chrome9_sl_init(cdev, engine->query_offset))
+	    chrome9_sl_init(cdev, engine->ppc_offset))
 		dev_warn(&cdev->pdev->dev, "no local frame buffer pool\n");
 	engine->query_slot_count = PAGE_SIZE / CHROME9_QUERY_SLOT_SIZE;
 	engine->query_slots = bitmap_zalloc(engine->query_slot_count,
@@ -7339,6 +7409,7 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 		goto err_free_ring;
 	}
 	cdev->engine = engine;
+	drm_debugfs_add_file(&cdev->drm, "chrome9_ppc", chrome9_ppc_show, NULL);
 	engine->ring_snoop = chrome9_gart_snoop_ring;
 	engine->saved_dst_pos = readl(cdev->mmio + CHROME9_2D_REG_DST_POS);
 	ret = chrome9_gart_bind_ring(engine);
@@ -8402,7 +8473,7 @@ static u32 chrome9_fragment_submit_object(struct drm_file *file,
 static void __iomem *chrome9_query_slot(struct chrome9_engine *engine,
 					u32 slot)
 {
-	return engine->tail +
+	return engine->tail + PAGE_SIZE +
 	       slot * CHROME9_QUERY_SLOT_SIZE;
 }
 
