@@ -35,7 +35,7 @@ bool chrome9_bo_cpu_access_range(int fd, const struct chrome9_bo *bo,
 int chrome9_query_ioctl(int fd, struct drm_chrome9_query *args);
 bool chrome9_draw_vertex_programs(
    int fd, const struct drm_chrome9_draw_vertex_program *draws,
-   unsigned count);
+   const struct drm_chrome9_draw_colors *colors, unsigned count);
 bool chrome9_draw_triangle(int fd,
                            const struct drm_chrome9_draw_triangle *draw);
 bool chrome9_draw_triangle_d16(

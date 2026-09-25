@@ -330,11 +330,12 @@ chrome9_draw_vertex_program(
 bool
 chrome9_draw_vertex_programs(
    int fd, const struct drm_chrome9_draw_vertex_program *draws,
-   unsigned count)
+   const struct drm_chrome9_draw_colors *colors, unsigned count)
 {
    struct drm_chrome9_draw_vertex_programs args = {
       .count = count,
       .draws_ptr = (uintptr_t)draws,
+      .colors_ptr = (uintptr_t)colors,
    };
 
    return draws && count &&

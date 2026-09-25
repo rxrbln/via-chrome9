@@ -274,6 +274,7 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
    unsigned total_uses[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { 0 };
    struct chrome9_ps_ir original, candidate;
    unsigned color = UINT_MAX;
+   unsigned colors = 0;
    unsigned best_peak;
 
    if (!input || !output || !input->count ||
@@ -295,11 +296,15 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
           instruction->op == CHROME9_PS_OPCODE_KILL ||
           !destination->writemask || destination->writemask > 0xf)
          return false;
+      /* Colour writes oC0, oC1, ... end the program in order. */
       if (destination->file == CHROME9_PS_DESTINATION_COLOR) {
-         if (color != UINT_MAX || destination->id ||
-             destination->writemask != 0xf || i + 1 != original.count)
+         if (destination->id != colors ||
+             destination->writemask != 0xf)
             return false;
-         color = i;
+         if (!colors++)
+            color = i;
+      } else if (colors) {
+         return false;
       } else if (destination->file == CHROME9_PS_DESTINATION_TEMP) {
          unsigned temp = destination->id;
 
@@ -337,10 +342,9 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
       }
    }
 
-   /* All work must contribute to the sole COLOR result.  Besides rejecting
-    * dead code, this proves the COLOR record remains terminal under every
-    * valid topological order. */
-   set_bit(reachable, color);
+   /* All work must contribute to a COLOR result: rejects dead code. */
+   for (unsigned c = color; c < original.count; c++)
+      set_bit(reachable, c);
    for (unsigned pass = 0; pass < original.count; pass++) {
       bool progress = false;
 
@@ -361,6 +365,13 @@ chrome9_schedule_ps_ir(const struct chrome9_ps_ir *input,
    for (unsigned i = 0; i < original.count; i++)
       if (!test_bit(reachable, i))
          return false;
+
+   /* Each colour write follows all other work and the previous colour
+    * write, so the writes stay terminal and ordered under every schedule. */
+   for (unsigned c = color; c < original.count; c++)
+      for (unsigned i = 0; i < c; i++)
+         if (i < color || i == c - 1)
+            set_bit(node[c].dependency, i);
 
    /* Height is a deterministic critical-path tie breaker.  Dependencies may
     * point forward because all partial definitions are grouped, so iterate to

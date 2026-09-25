@@ -851,13 +851,17 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
    *successor = false;
    if (!state)
       return true;
-   /* With one render target independent blending changes nothing. */
    if (state->logicop_enable ||
        state->alpha_to_coverage ||
        state->alpha_to_coverage_dither || state->alpha_to_one ||
-       state->max_rt || state->advanced_blend_func ||
+       state->max_rt > 3 || state->advanced_blend_func ||
        state->blend_coherent)
       return false;
+   /* Colour targets share RT0's blend equation and write mask. */
+   for (unsigned i = 1; state->independent_blend_enable &&
+                        i <= state->max_rt; i++)
+      if (memcmp(&state->rt[i], &state->rt[0], sizeof(state->rt[0])))
+         return false;
 
    rt = &state->rt[0];
    result->color_mask = 0;
@@ -1144,7 +1148,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
        !(*target = chrome9_context_render_target(ctx)))
       return false;
    resource = &(*target)->base;
-   surface = ctx->framebuffer.nr_cbufs == 1 ?
+   surface = ctx->framebuffer.nr_cbufs ?
              &ctx->framebuffer.cbufs[0] : NULL;
    *reason = "color-surface";
    if ((!depth_only &&
@@ -4000,6 +4004,57 @@ chrome9_tcl_stencil_face(const struct chrome9_context *ctx, unsigned face,
  * winding follows chrome9_triangle_stencil(): front faces are CCW in
  * window coordinates when front_ccw is set.
  */
+/*
+ * Colour buffers 1..3 as kernel colour targets: guarded private BGRA/BGRX
+ * level-zero images of RT0's size, one per fragment program output.
+ */
+static bool
+chrome9_draw_color_targets(const struct chrome9_context *ctx,
+                           const struct chrome9_resource *target,
+                           struct drm_chrome9_draw_colors *colors)
+{
+   const struct pipe_framebuffer_state *fb = &ctx->framebuffer;
+
+   unsigned outputs = 0;
+
+   for (unsigned i = 0; i < ctx->fs->semantic_fs_ir.count; i++)
+      outputs += ctx->fs->semantic_fs_ir.instruction[i].destination.file ==
+                 CHROME9_PS_DESTINATION_COLOR;
+   memset(colors, 0, sizeof(*colors));
+   if (fb->nr_cbufs <= 1)
+      return outputs <= 1;
+   if (fb->nr_cbufs > 4 || outputs != fb->nr_cbufs ||
+       !chrome9_screen_has_capability2(ctx->base.screen,
+                                       DRM_CHROME9_CAP2_COLOR_TARGETS))
+      return false;
+   colors->count = fb->nr_cbufs;
+   for (unsigned i = 1; i < fb->nr_cbufs; i++) {
+      const struct pipe_surface *surface = &fb->cbufs[i];
+      const struct chrome9_resource *res = surface->texture ?
+         chrome9_resource_const(surface->texture) : NULL;
+      struct drm_chrome9_color_target *c = &colors->target[i - 1];
+
+      if (!res || !res->guarded || res->guarded_shared || res->parent ||
+          surface->level || surface->first_layer ||
+          res->base.target != PIPE_TEXTURE_2D ||
+          res->base.width0 != target->base.width0 ||
+          res->base.height0 != target->base.height0 ||
+          (res->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+           res->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
+          res->data_offset != 4096)
+         return false;
+      c->handle = res->bo.handle;
+      c->format = res->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+         DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+         DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+      c->pitch = res->stride;
+      c->flags = chrome9_resource_is_tiled(res) ?
+         DRM_CHROME9_COLOR_TARGET_TILED : 0;
+      c->object_size = res->bo.size;
+   }
+   return true;
+}
+
 bool
 chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
                           struct chrome9_tcl_fragment *fragment,
@@ -4040,9 +4095,15 @@ chrome9_draw_tcl_fragment(struct chrome9_context *ctx,
       *why = reason ? reason : "draw state";
       goto out;
    }
+   *why = "colour targets";
+   if (!chrome9_draw_color_targets(ctx, target, &fragment->colors))
+      goto out;
    *why = "fragment program state";
    fragment->resource_count = 0;
    fragment->resources[fragment->resource_count++] = &target->base;
+   for (unsigned i = 1; i < ctx->framebuffer.nr_cbufs; i++)
+      fragment->resources[fragment->resource_count++] =
+         ctx->framebuffer.cbufs[i].texture;
    if (depth_active)
       fragment->resources[fragment->resource_count++] = &depth->base;
    for (unsigned unit = 0; unit < crender->texture_count; unit++)
@@ -4079,6 +4140,7 @@ out:
 struct chrome9_tcl_batch {
    unsigned count;
    struct drm_chrome9_draw_vertex_program draws[DRM_CHROME9_VERTEX_MAX_BATCH];
+   struct drm_chrome9_draw_colors colors[DRM_CHROME9_VERTEX_MAX_BATCH];
    void *blocks[DRM_CHROME9_VERTEX_MAX_BATCH];
    unsigned triangles[DRM_CHROME9_VERTEX_MAX_BATCH];
    struct util_dynarray resources;
@@ -4138,8 +4200,13 @@ chrome9_tcl_batch_flush(struct chrome9_context *ctx)
 
    if (!b || !b->count)
       return;
-   if (b->count == 1 ? !chrome9_draw_vertex_program(fd, &b->draws[0]) :
-       !chrome9_draw_vertex_programs(fd, b->draws, b->count)) {
+   /* A batch shares its colour targets (the batch flushes on a change). */
+   const struct drm_chrome9_draw_colors *colors =
+      b->colors[0].count > 1 ? b->colors : NULL;
+
+   if (b->count == 1 && !colors ?
+       !chrome9_draw_vertex_program(fd, &b->draws[0]) :
+       !chrome9_draw_vertex_programs(fd, b->draws, colors, b->count)) {
       /* Retry singly so one rejected draw loses only its triangles; the
        * kernel may already have counted segments of the failed batch. */
       chrome9_query_mark_inexact(ctx);
@@ -4149,7 +4216,9 @@ chrome9_tcl_batch_flush(struct chrome9_context *ctx)
          ctx->warnings |= CHROME9_WARN_SUBMIT;
       }
       for (unsigned i = 0; b->count > 1 && i < b->count; i++)
-         if (!chrome9_draw_vertex_program(fd, &b->draws[i]))
+         if (colors ?
+             !chrome9_draw_vertex_programs(fd, &b->draws[i], &colors[i], 1) :
+             !chrome9_draw_vertex_program(fd, &b->draws[i]))
             CHROME9_REJECT(ctx, b->triangles[i]);
       if (b->count == 1)
          CHROME9_REJECT(ctx, b->triangles[0]);
@@ -4201,6 +4270,7 @@ tcl_batch_copy(uint8_t **cursor, const void *source, size_t bytes)
 static bool
 tcl_batch_append(struct chrome9_context *ctx,
                  const struct drm_chrome9_draw_vertex_program *draw,
+                 const struct drm_chrome9_draw_colors *colors,
                  unsigned triangles, struct pipe_resource *const *resources,
                  unsigned resource_count)
 {
@@ -4237,6 +4307,7 @@ tcl_batch_append(struct chrome9_context *ctx,
        (b->count == DRM_CHROME9_VERTEX_MAX_BATCH ||
         b->draws[0].fragment.destination_handle != f->destination_handle ||
         b->draws[0].fragment.depth_handle != f->depth_handle ||
+        memcmp(&b->colors[0], colors, sizeof(*colors)) ||
         2 + b->texture_handle_count + b->buffer_handle_count +
            tcl_batch_new_objects(b, draw, textures, buffers) >
            CHROME9_TCL_BATCH_MAX_OBJECTS))
@@ -4248,6 +4319,7 @@ tcl_batch_append(struct chrome9_context *ctx,
       return false;
    copy = &b->draws[b->count];
    *copy = *draw;
+   b->colors[b->count] = *colors;
    copy->fragment.instructions_ptr = (uintptr_t)tcl_batch_copy(&cursor,
       (const void *)(uintptr_t)f->instructions_ptr, sizes[0]);
    copy->fragment.constants_ptr = f->constant_count ?
@@ -4313,14 +4385,15 @@ chrome9_draw_tcl_submit(struct chrome9_context *ctx,
       (uintptr_t)fragment->textures : 0;
    chrome9_context_prepare_render_target(ctx);
    if (ctx->tcl_batching) {
-      struct pipe_resource *resources[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES +
+      struct pipe_resource *resources[5 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES +
                                       DRM_CHROME9_VERTEX_MAX_INPUTS];
       unsigned count = fragment->resource_count;
 
       memcpy(resources, fragment->resources, count * sizeof(resources[0]));
       for (unsigned i = 0; i < buffer_count; i++)
          resources[count++] = buffers[i];
-      if (tcl_batch_append(ctx, draw, triangles, resources, count)) {
+      if (tcl_batch_append(ctx, draw, &fragment->colors, triangles,
+                           resources, count)) {
          ctx->submitted_triangles += triangles;
          ctx->submitted_program_batches++;
          chrome9_context_render_target_written(ctx);
@@ -4328,7 +4401,10 @@ chrome9_draw_tcl_submit(struct chrome9_context *ctx,
       }
    }
    chrome9_tcl_batch_flush(ctx);
-   if (!chrome9_draw_vertex_program(fd, draw)) {
+   /* Colour targets travel only with DRAW_VERTEX_PROGRAMS. */
+   if (fragment->colors.count > 1 ?
+       !chrome9_draw_vertex_programs(fd, draw, &fragment->colors, 1) :
+       !chrome9_draw_vertex_program(fd, draw)) {
       /* The caller falls back or accounts the rejected triangles. */
       if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
          fprintf(stderr, "chrome9: DRAW_VERTEX_PROGRAM failed after=%" PRIu64

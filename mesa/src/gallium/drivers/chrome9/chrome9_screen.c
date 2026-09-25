@@ -575,7 +575,11 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
       &screen->base, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
    caps->texture_mirror_clamp_to_edge = chrome9_screen_has_capability2(
       &screen->base, DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE);
-   caps->max_render_targets = 1;
+   /* Colour targets on hardware TCL, llvmpipe otherwise. */
+   caps->max_render_targets =
+      chrome9_screen_has_capability2(&screen->base,
+                                     DRM_CHROME9_CAP2_COLOR_TARGETS) ||
+      chrome9_sw_enabled() ? 4 : 1;
    /* The bounded draw paths support a 16-bit Z buffer with both 32-bit
     * XRGB and BGRA color targets.  DRI needs this explicit contract or it
     * filters the otherwise supported Z16 format from every 32-bit visual. */

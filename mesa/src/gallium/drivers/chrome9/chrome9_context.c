@@ -5433,13 +5433,14 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
 {
    struct chrome9_ps_nir_builder builder = { .allow_bias = allow_bias };
    nir_def *depth = NULL;
-   struct chrome9_ps_instruction *terminal;
-   struct chrome9_ps_source operands[3] = { 0 };
-   enum chrome9_ps_opcode op;
-   unsigned source_count = 0;
+   struct chrome9_ps_source operands[4][3] = { 0 };
+   enum chrome9_ps_opcode op[4];
+   unsigned source_count[4] = { 0 };
    unsigned kill_count = 0;
    nir_block *block;
-   nir_def *result = NULL;
+   /* oCn of FRAG_RESULT_DATAn (COLOR is oC0). */
+   nir_def *results[4] = { NULL };
+   unsigned outputs = 0;
 
    *lowered = false;
    builder.proof.budget = CHROME9_PS_PROOF_NODES;
@@ -5464,7 +5465,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       if (intr->intrinsic == nir_intrinsic_terminate_if) {
          /* The kernel capability admits only the qualified sampled-alpha
           * form; reject other discard predicates and sample domains. */
-         if (!allow_kill || result || kill_count++ ||
+         if (!allow_kill || outputs || kill_count++ ||
              !chrome9_ps_lower_alpha_terminate(&builder, intr->src[0].ssa))
             return false;
          continue;
@@ -5547,60 +5548,73 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       } else {
          return false;
       }
+      const unsigned n = location == FRAG_RESULT_COLOR ? 0 :
+                         location - FRAG_RESULT_DATA0;
+
       if ((location != FRAG_RESULT_COLOR &&
-           location != FRAG_RESULT_DATA0) || result)
+           (location < FRAG_RESULT_DATA0 ||
+            location > FRAG_RESULT_DATA3)) || results[n])
          return false;
-      result = stored;
+      results[n] = stored;
+      outputs = MAX2(outputs, n + 1);
    }
-   if (!result || result->num_components != 4 || result->bit_size != 32)
+   /* Dense outputs; oDepth only with one colour output. */
+   if (!outputs || (depth && outputs > 1))
       return false;
+   for (unsigned n = 0; n < outputs; n++) {
+      nir_def *result = results[n];
 
-   nir_instr *result_instr = nir_def_instr(result);
-
-   if (result_instr->type == nir_instr_type_alu) {
-      nir_alu_instr *alu = nir_instr_as_alu(result_instr);
-
-      switch (alu->op) {
-      case nir_op_fmul:
-         op = CHROME9_PS_OPCODE_MUL;
-         source_count = 2;
-         break;
-      case nir_op_fadd:
-         op = CHROME9_PS_OPCODE_ADD;
-         source_count = 2;
-         break;
-      case nir_op_fsub:
-         op = CHROME9_PS_OPCODE_SUB;
-         source_count = 2;
-         break;
-      case nir_op_ffma:
-         op = CHROME9_PS_OPCODE_MAD;
-         source_count = 3;
-         break;
-      case nir_op_fmin:
-         op = CHROME9_PS_OPCODE_MIN;
-         source_count = 2;
-         break;
-      default:
-         source_count = 0;
-         break;
-      }
-      for (unsigned s = 0; s < source_count; s++) {
-         bool modifier = chrome9_ps_source_modifier_allowed(op, s);
-
-         if (!(modifier ?
-               chrome9_ps_lower_alu_source_modifier(&builder, &alu->src[s],
-                                                     4, &operands[s]) :
-               chrome9_ps_lower_alu_source(&builder, &alu->src[s], 4,
-                                           &operands[s])))
-            return false;
-      }
-   }
-   if (!source_count) {
-      op = CHROME9_PS_OPCODE_MOV;
-      if (!chrome9_ps_lower_def(&builder, result, &operands[0]))
+      if (!result || result->num_components != 4 || result->bit_size != 32)
          return false;
-      source_count = 1;
+
+      nir_instr *result_instr = nir_def_instr(result);
+
+      source_count[n] = 0;
+      if (result_instr->type == nir_instr_type_alu) {
+         nir_alu_instr *alu = nir_instr_as_alu(result_instr);
+
+         switch (alu->op) {
+         case nir_op_fmul:
+            op[n] = CHROME9_PS_OPCODE_MUL;
+            source_count[n] = 2;
+            break;
+         case nir_op_fadd:
+            op[n] = CHROME9_PS_OPCODE_ADD;
+            source_count[n] = 2;
+            break;
+         case nir_op_fsub:
+            op[n] = CHROME9_PS_OPCODE_SUB;
+            source_count[n] = 2;
+            break;
+         case nir_op_ffma:
+            op[n] = CHROME9_PS_OPCODE_MAD;
+            source_count[n] = 3;
+            break;
+         case nir_op_fmin:
+            op[n] = CHROME9_PS_OPCODE_MIN;
+            source_count[n] = 2;
+            break;
+         default:
+            source_count[n] = 0;
+            break;
+         }
+         for (unsigned s = 0; s < source_count[n]; s++) {
+            bool modifier = chrome9_ps_source_modifier_allowed(op[n], s);
+
+            if (!(modifier ?
+                  chrome9_ps_lower_alu_source_modifier(&builder, &alu->src[s],
+                                                        4, &operands[n][s]) :
+                  chrome9_ps_lower_alu_source(&builder, &alu->src[s], 4,
+                                              &operands[n][s])))
+               return false;
+         }
+      }
+      if (!source_count[n]) {
+         op[n] = CHROME9_PS_OPCODE_MOV;
+         if (!chrome9_ps_lower_def(&builder, result, &operands[n][0]))
+            return false;
+         source_count[n] = 1;
+      }
    }
    if (depth) {
       /* One lane, replicated: the depth MOV reads a scalar. */
@@ -5610,13 +5624,19 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
          builder.ir.depth.swizzle[c] = builder.ir.depth.swizzle[0];
       builder.ir.depth_output = true;
    }
-   terminal = chrome9_ps_append_instruction(&builder, op);
-   if (!terminal)
-      return false;
-   terminal->destination.file = CHROME9_PS_DESTINATION_COLOR;
-   terminal->destination.writemask = 0xf;
-   for (unsigned s = 0; s < source_count; s++)
-      terminal->source[s] = operands[s];
+   /* Terminal RGBA writes oC0, oC1, ... in order, after all other work. */
+   for (unsigned n = 0; n < outputs; n++) {
+      struct chrome9_ps_instruction *terminal =
+         chrome9_ps_append_instruction(&builder, op[n]);
+
+      if (!terminal)
+         return false;
+      terminal->destination.file = CHROME9_PS_DESTINATION_COLOR;
+      terminal->destination.id = n;
+      terminal->destination.writemask = 0xf;
+      for (unsigned s = 0; s < source_count[n]; s++)
+         terminal->source[s] = operands[n][s];
+   }
    if (!chrome9_fragment_legalize_constant_ports(&builder.ir))
       return false;
    *ir = builder.ir;
@@ -6083,6 +6103,11 @@ chrome9_ps_ir_fold_copies(struct chrome9_ps_ir *ir,
    if (!ir->count)
       return;
    last = &ir->instruction[ir->count - 1];
+   /* Several colour outputs keep their MOVs: the writes stay terminal. */
+   if (ir->count > 1 &&
+       ir->instruction[ir->count - 2].destination.file ==
+       CHROME9_PS_DESTINATION_COLOR)
+      return;
    if (last->op != CHROME9_PS_OPCODE_MOV ||
        last->destination.file != CHROME9_PS_DESTINATION_COLOR ||
        last->destination.writemask != 0xf ||
@@ -7299,7 +7324,8 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
                               const struct pipe_framebuffer_state *framebuffer)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
-   const struct pipe_surface *surface = framebuffer->nr_cbufs == 1 ?
+   /* Colour buffers 1..3 are colour targets of the same draw. */
+   const struct pipe_surface *surface = framebuffer->nr_cbufs ?
                                         &framebuffer->cbufs[0] : NULL;
    struct pipe_resource *color = surface ? surface->texture : NULL;
    bool shadow_attempted = false;
@@ -8074,7 +8100,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
     * logic ops or polygon stipple, and draw has no AA line stage: other
     * states render in llvmpipe. */
    if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture ||
-        chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 ||
+        /* Several colour buffers only as hardware TCL colour targets. */
+        (chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 &&
+         (!ctx->tcl_enabled ||
+          !chrome9_screen_has_capability2(ctx->base.screen,
+                                          DRM_CHROME9_CAP2_COLOR_TARGETS))) ||
         /* The kernel binds single-level depth objects only. */
         (ctx->framebuffer.zsbuf.texture &&
          ctx->framebuffer.zsbuf.texture->last_level) ||
@@ -8094,6 +8124,12 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    chrome9_sw_finish(ctx);
    if (chrome9_tcl_draw(ctx, info, &draws[0]))
       return;
+   /* The draw module writes one colour buffer. */
+   if (chrome9_framebuffer_color_count(&ctx->framebuffer) > 1) {
+      if (!chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+         CHROME9_REJECT(ctx, draws[0].count);
+      return;
+   }
    /* Smooth lines TCL declined: the draw module cannot widen them. */
    if (ctx->rasterizer && ctx->rasterizer->line_smooth &&
        u_reduced_prim(info->mode) == MESA_PRIM_LINES &&

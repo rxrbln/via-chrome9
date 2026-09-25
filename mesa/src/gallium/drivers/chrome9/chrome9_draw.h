@@ -30,8 +30,11 @@ struct chrome9_tcl_fragment {
    uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
    struct drm_chrome9_fragment_texture_state
       textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
-   /* Target, depth and texture resources behind the handles above. */
-   struct pipe_resource *resources[2 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   /* Colour targets 1..3 (CAP2_COLOR_TARGETS), count <= 1 without. */
+   struct drm_chrome9_draw_colors colors;
+   /* Target, depth, colour target and texture resources behind the
+    * handles above. */
+   struct pipe_resource *resources[5 + DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
    unsigned resource_count;
 };
 
