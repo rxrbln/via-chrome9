@@ -1209,6 +1209,10 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
               !chrome9_mip_view_supported(ctx, samplers[unit], view,
                                           textures[unit])))
             return false;
+         /* The fixed programs below read one source layout; the generic
+          * program is compiled for the bound formats. */
+         if (chrome9_use_generic_fragment_program(ctx))
+            continue;
          *reason = "rgbx-source-format";
          if (!unit && ctx->fs->fragment_program == CHROME9_FS_TEXTURE_RGBX &&
              source->format != PIPE_FORMAT_B8G8R8X8_UNORM)
