@@ -664,6 +664,15 @@ chrome9_fs_straight_line_entrypoint(nir_shader *nir,
    return true;
 }
 
+/* GLSL 1.20 cannot declare noperspective inputs: only nir_opt_varyings
+ * assigns it, to convergent varyings, whose value any mode interpolates. */
+static bool
+chrome9_fs_interpolated_mode(enum glsl_interp_mode mode)
+{
+   return mode == INTERP_MODE_NONE || mode == INTERP_MODE_SMOOTH ||
+          mode == INTERP_MODE_NOPERSPECTIVE;
+}
+
 static bool
 chrome9_fs_smooth_variable(const nir_variable *var, unsigned location)
 {
@@ -672,8 +681,7 @@ chrome9_fs_smooth_variable(const nir_variable *var, unsigned location)
           !var->data.location_frac && !var->data.centroid &&
           !var->data.sample && !var->data.patch && !var->data.compact &&
           !var->data.per_primitive && !var->data.per_vertex &&
-          (var->data.interpolation == INTERP_MODE_NONE ||
-           var->data.interpolation == INTERP_MODE_SMOOTH);
+          chrome9_fs_interpolated_mode(var->data.interpolation);
 }
 
 static bool
@@ -714,8 +722,7 @@ chrome9_fs_smooth_pixel_load_range(const nir_intrinsic_instr *load,
       return false;
    bary = nir_instr_as_intrinsic(instr);
    return bary->intrinsic == nir_intrinsic_load_barycentric_pixel &&
-          (nir_intrinsic_interp_mode(bary) == INTERP_MODE_NONE ||
-           nir_intrinsic_interp_mode(bary) == INTERP_MODE_SMOOTH);
+          chrome9_fs_interpolated_mode(nir_intrinsic_interp_mode(bary));
 }
 
 static bool
