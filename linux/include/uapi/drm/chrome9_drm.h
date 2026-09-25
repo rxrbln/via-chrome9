@@ -316,6 +316,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_EDGE_AA		(1ULL << 25)
 /* Fragment instruction destination DEST_DEPTH. */
 #define DRM_CHROME9_CAP2_DEPTH_OUTPUT		(1ULL << 26)
+/* Fragment draw flag FRAGMENT_DEPTH_TILED. */
+#define DRM_CHROME9_CAP2_TILED_DEPTH		(1ULL << 27)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1208,6 +1210,12 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 #define DRM_CHROME9_FRAGMENT_FAST_Z_INDEX(i)	\
 	((__u32)(i) << DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_SHIFT)
 #define DRM_CHROME9_FRAGMENT_FAST_Z_INDEX_MASK	(7U << 15)
+/*
+ * CAP2_TILED_DEPTH: the depth buffer is tiled, 32-byte by 8-row tiles of
+ * 256 bytes left to right across the pitch; the object then holds
+ * ALIGN(height, 8) rows.
+ */
+#define DRM_CHROME9_FRAGMENT_DEPTH_TILED	(1U << 18)
 
 /* Native stencil operations; note INVERT precedes the wrapping forms. */
 #define DRM_CHROME9_STENCIL_OP_KEEP		0
