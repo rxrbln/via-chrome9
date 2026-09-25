@@ -7039,8 +7039,16 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
    uint32_t constant[4];
    int32_t z = 0;
 
+   /* A mipmapped target is drawn at level zero, the only level a draw
+    * binds directly (other levels render through a shadow). */
    if (!ctx->draw_fragment_program || !target || !target->guarded ||
-       target->base.last_level || !fb->width || !fb->height ||
+       (target->base.last_level &&
+        (!fb->nr_cbufs || fb->cbufs[0].level ||
+         &target->base != fb->cbufs[0].texture ||
+         !chrome9_screen_has_capability(
+            ctx->base.screen,
+            DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))) ||
+       !fb->width || !fb->height ||
        target->base.width0 != fb->width || target->base.height0 != fb->height ||
        (target->base.format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         target->base.format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
@@ -7107,6 +7115,8 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
       vertices[v].z_16_16 = z;
       vertices[v].rhw_float = 0x3f800000;
    }
+   if (target->base.last_level)
+      draw.flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
    draw.abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION;
    draw.destination_handle = target->bo.handle;
    draw.width = target->base.width0;
