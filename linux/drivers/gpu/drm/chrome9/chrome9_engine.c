@@ -3760,7 +3760,51 @@ static int chrome9_tcl_buffer_bounds(const struct chrome9_tcl_draw *tcl,
 	return 0;
 }
 
+/* Whether an element of an explicit object was verified since the last
+ * CPU store to its bytes; records it otherwise when record is set. */
+static bool chrome9_finite_cached(struct chrome9_bo *bo, u64 start,
+				  u32 stride, u32 count, u8 type, bool record)
+{
+	struct chrome9_finite_element *entry;
+	u32 i;
+
+	if (!bo->explicit_access)
+		return false;
+	for (i = 0; i < bo->finite_count; i++) {
+		entry = &bo->finite[i];
+		if (entry->start == start && entry->stride == stride &&
+		    entry->type == type) {
+			if (count <= entry->count)
+				return true;
+			if (record)
+				entry->count = count;
+			return false;
+		}
+	}
+	if (!record)
+		return false;
+	if (bo->finite_count == bo->finite_capacity) {
+		u32 capacity = max(8u, bo->finite_capacity * 2);
+		struct chrome9_finite_element *grown;
+
+		/* A misbehaving client could list unbounded elements. */
+		if (capacity > 1024)
+			return false;
+		grown = kvrealloc(bo->finite, capacity * sizeof(*grown),
+				  GFP_KERNEL);
+		if (!grown)
+			return false;
+		bo->finite = grown;
+		bo->finite_capacity = capacity;
+	}
+	bo->finite[bo->finite_count++] = (struct chrome9_finite_element){
+		.start = start, .stride = stride, .count = count, .type = type,
+	};
+	return false;
+}
+
 static bool chrome9_tcl_buffers_finite(const struct chrome9_tcl_draw *tcl,
+		struct drm_gem_object *const *objects,
 		const struct iosys_map *maps, const u32 *buffer_object,
 		const u64 *element_start)
 {
@@ -3769,11 +3813,16 @@ static bool chrome9_tcl_buffers_finite(const struct chrome9_tcl_draw *tcl,
 	for (e = 0; e < tcl->element_count; e++) {
 		u8 type = tcl->element_type[e];
 		u8 b = tcl->element_buffer[e];
+		struct chrome9_bo *bo = to_chrome9_bo(objects[buffer_object[b]]);
 		const u8 *data = (const u8 *)maps[buffer_object[b]].vaddr +
 				 element_start[e];
 
 		if (!chrome9_tcl_formats[type].float32 &&
 		    !chrome9_tcl_formats[type].float16)
+			continue;
+		if (chrome9_finite_cached(bo, element_start[e],
+					  tcl->buffers[b].stride,
+					  tcl->index_range + 1, type, false))
 			continue;
 		for (v = 0; v <= tcl->index_range; v++) {
 			const u32 *vertex = (const u32 *)(data +
@@ -3786,6 +3835,9 @@ static bool chrome9_tcl_buffers_finite(const struct chrome9_tcl_draw *tcl,
 				if (!chrome9_tcl_half_finite(READ_ONCE(vertex[c])))
 					return false;
 		}
+		chrome9_finite_cached(bo, element_start[e],
+				      tcl->buffers[b].stride,
+				      tcl->index_range + 1, type, true);
 	}
 	return true;
 }
@@ -6088,6 +6140,22 @@ static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo, u64 offset,
 	return 0;
 }
 
+/* Drop finite verifications of elements a CPU store may have changed. */
+static void chrome9_finite_forget(struct chrome9_bo *bo, u64 offset, u64 size)
+{
+	u32 i = 0;
+
+	while (i < bo->finite_count) {
+		const struct chrome9_finite_element *e = &bo->finite[i];
+		u64 end = e->start + (u64)e->count * e->stride + 16;
+
+		if (e->start < offset + size && offset < end)
+			bo->finite[i] = bo->finite[--bo->finite_count];
+		else
+			i++;
+	}
+}
+
 /* Record CPU stores to [offset, offset + size) for the next device use. */
 static void chrome9_bo_cpu_dirty(struct chrome9_bo *bo, u64 offset, u64 size)
 {
@@ -6099,6 +6167,7 @@ static void chrome9_bo_cpu_dirty(struct chrome9_bo *bo, u64 offset, u64 size)
 		bo->dirty_high = max(bo->dirty_high, offset + size);
 	}
 	bo->cpu_dirty = true;
+	chrome9_finite_forget(bo, offset, size);
 }
 
 int chrome9_fence_ioctl(struct drm_device *drm, void *data,
@@ -6194,8 +6263,10 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 		chrome9_bo_cpu_dirty(bo, args->offset, size);
 	if (args->flags & DRM_CHROME9_GEM_CPU_EXPLICIT)
 		bo->explicit_access = true;
-	if (args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT)
+	if (args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT) {
 		bo->explicit_access = false;
+		bo->finite_count = 0;
+	}
 out_unlock:
 	dma_resv_unlock(obj->resv);
 out_put:
@@ -8684,7 +8755,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		const struct chrome9_tcl_draw *tcl = requests[r]->tcl;
 
 		if (tcl && tcl->buffer_count &&
-		    !chrome9_tcl_buffers_finite(tcl, job->fragment_maps,
+		    !chrome9_tcl_buffers_finite(tcl, objects, job->fragment_maps,
 				sub->draw[r].buffer_object, sub->draw[r].element_start)) {
 			ret = -EINVAL;
 			goto out_unmap;
@@ -8752,10 +8823,33 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		ktime_t t0 = ktime_get(), t1;
 
 		if (sub->kind[i] == CHROME9_OBJECT_VERTEX) {
-			chrome9_cache_flush((u8 *)job->fragment_maps[i].vaddr +
-					    sub->object_low[i],
-					    sub->object_high[i] -
-					    sub->object_low[i]);
+			/* Explicit objects flush only announced CPU writes. */
+			if (!bo->explicit_access) {
+				chrome9_cache_flush((u8 *)job->fragment_maps[i].vaddr +
+						    sub->object_low[i],
+						    sub->object_high[i] -
+						    sub->object_low[i]);
+			} else if (bo->cpu_dirty) {
+				/* Flush the announced lines this job reads; the
+				 * object stays dirty while others remain. */
+				u64 size = objects[i]->size;
+				u64 low = max(bo->dirty_low, sub->object_low[i]);
+				u64 high = min3(bo->dirty_high,
+						sub->object_high[i], size);
+
+				if (high > low) {
+					chrome9_cache_flush(
+						(u8 *)job->fragment_maps[i].vaddr +
+						low, high - low);
+					/* Shrink the interval by a flushed end. */
+					if (low <= bo->dirty_low)
+						bo->dirty_low = high;
+					if (high >= min(bo->dirty_high, size))
+						bo->dirty_high = low;
+				}
+				if (bo->dirty_low >= min(bo->dirty_high, size))
+					bo->cpu_dirty = false;
+			}
 			dma_sync_sgtable_for_device(&cdev->pdev->dev,
 				job->fragment_sgts[i], DMA_BIDIRECTIONAL);
 			continue;

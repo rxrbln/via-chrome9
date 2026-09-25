@@ -49,6 +49,7 @@ static void chrome9_gem_free(struct drm_gem_object *obj)
 		drm_gem_shmem_vunmap_locked(&bo->base, &bo->kmap);
 		dma_resv_unlock(obj->resv);
 	}
+	kvfree(bo->finite);
 	drm_gem_shmem_object_free(obj);
 }
 

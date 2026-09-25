@@ -187,6 +187,18 @@ struct chrome9_bo {
 	u32 create_flags;
 	/* Cached draw mapping (engine submit lock). */
 	struct chrome9_sf_mapping *draw_mapping;
+	/* Vertex elements found finite since the last announced CPU write
+	 * (explicit objects only, under the object lock). */
+	struct chrome9_finite_element *finite;
+	u32 finite_count;
+	u32 finite_capacity;
+};
+
+struct chrome9_finite_element {
+	u64 start;
+	u32 stride;
+	u32 count;
+	u8 type;
 };
 
 void chrome9_bo_hold_kmap(struct chrome9_bo *bo);
