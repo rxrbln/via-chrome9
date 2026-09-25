@@ -320,6 +320,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_TILED_DEPTH		(1ULL << 27)
 /* FRAGMENT_DESTINATION_TILED and FRAGMENT_TEXTURE_FLAG_TILED. */
 #define DRM_CHROME9_CAP2_TILED_COLOR		(1ULL << 28)
+/* GEM_CREATE_LOCAL. */
+#define DRM_CHROME9_CAP2_LOCAL_MEMORY		(1ULL << 29)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -377,6 +379,14 @@ struct drm_chrome9_gem_cpu_access {
  * refers to its first row at byte PAGE_SIZE.
  */
 #define DRM_CHROME9_GEM_CREATE_GUARDED_SHARED	(1U << 1)
+/*
+ * CAP2_LOCAL_MEMORY: the object lives in the local frame buffer (SL, the
+ * UMA carve-out), which the engine reads and writes about 2.7 times faster
+ * than GART pages.  The CPU maps it write-combined; reads are uncached.
+ * Only fragment program destinations, depth, coarse-Z and textures may be
+ * local; the object cannot be exported or scanned out.
+ */
+#define DRM_CHROME9_GEM_CREATE_LOCAL		(1U << 2)
 
 /*
  * Occlusion queries.  The kernel keeps a 64-bit sample accumulator per
