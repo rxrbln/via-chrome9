@@ -973,6 +973,19 @@ chrome9_sw_draw_vbo(struct chrome9_context *ctx,
    if (ctx->dsa && ctx->dsa->depth_enabled &&
        ctx->dsa->depth_func == PIPE_FUNC_EQUAL)
       return false;
+   /* llvmpipe reads its targets and textures on the CPU: none may stay
+    * in uncached local memory. */
+   for (unsigned i = 0; i < ctx->framebuffer.nr_cbufs; i++)
+      if (ctx->framebuffer.cbufs[i].texture)
+         chrome9_context_demote_local(ctx, ctx->framebuffer.cbufs[i].texture);
+   if (ctx->framebuffer.zsbuf.texture)
+      chrome9_context_demote_local(ctx, ctx->framebuffer.zsbuf.texture);
+   for (unsigned i = 0; i < ctx->num_sampler_views; i++)
+      if (ctx->sampler_views[i] && ctx->sampler_views[i]->texture)
+         chrome9_context_demote_local(ctx, ctx->sampler_views[i]->texture);
+   for (unsigned i = 0; i < ctx->num_vs_sampler_views; i++)
+      if (ctx->vs_sampler_views[i] && ctx->vs_sampler_views[i]->texture)
+         chrome9_context_demote_local(ctx, ctx->vs_sampler_views[i]->texture);
    /* Retire GPU batches that wrote the targets or textures read here. */
    chrome9_draw_flush_gpu_batch(ctx);
    chrome9_context_prepare_render_target(ctx);

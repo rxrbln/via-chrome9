@@ -82,7 +82,9 @@ chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
    }
 
    mapping->base = (const uint8_t *)resource->bo.map + first_offset;
-   if (chrome9_resource_is_tiled(resource)) {
+   /* Tiled levels are detiled; uncached local levels are read once. */
+   if (chrome9_resource_is_tiled(resource) ||
+       chrome9_resource_is_local(resource)) {
       if (span > SIZE_MAX)
          return false;
       if (mapping->staging_size < span) {
@@ -96,7 +98,8 @@ chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
       for (unsigned level = first; level <= last; level++)
          chrome9_tiled_copy((uint8_t *)resource->bo.map +
                                resource->level_offset[level],
-                            resource->level_stride[level], true, 0, 0,
+                            resource->level_stride[level],
+                            chrome9_resource_is_tiled(resource), 0, 0,
                             u_minify(texture->width0, level) * cpp,
                             u_minify(texture->height0, level),
                             (uint8_t *)mapping->staging +

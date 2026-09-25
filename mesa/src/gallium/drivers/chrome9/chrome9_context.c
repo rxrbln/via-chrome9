@@ -237,6 +237,38 @@ chrome9_copy_surface_gpu(struct chrome9_context *ctx,
    return chrome9_copy_rect(fd, &copy);
 }
 
+/*
+ * Uncached CPU reads of a local resource cost more than the faster engine
+ * access saves: a resource the CPU reads moves to GART pages once.  Views
+ * share the BO, so a resource with live views stays local.
+ */
+void
+chrome9_context_demote_local(struct chrome9_context *ctx,
+                             struct pipe_resource *pres)
+{
+   struct chrome9_resource *res = chrome9_resource(pres);
+   struct pipe_screen *screen = ctx->base.screen;
+   const int fd = screen->get_screen_fd(screen);
+   struct chrome9_bo bo;
+
+   if (!res->local || res->parent || res->views)
+      return;
+   chrome9_draw_flush_batch(ctx);
+   chrome9_tcl_batch_flush(ctx);
+   chrome9_sw_finish(ctx);
+   chrome9_resource_cpu_access(res, false);
+   if (!chrome9_bo_create(fd, res->bo.size, 0, &bo))
+      return;
+   memcpy(bo.map, res->bo.map, res->bo.size);
+   chrome9_screen_bo_destroy(screen, &res->bo);
+   res->bo = bo;
+   res->local = false;
+   if (res->explicit_access)
+      res->explicit_access =
+         chrome9_bo_cpu_access(fd, &res->bo, DRM_CHROME9_GEM_CPU_EXPLICIT);
+   chrome9_resource_cpu_access(res, true);
+}
+
 static void
 chrome9_flush_render_target(struct chrome9_context *ctx)
 {
@@ -7896,6 +7928,8 @@ chrome9_refresh_vs_textures(struct chrome9_context *ctx)
 
       if (view && view->texture == external)
          chrome9_flush_render_target(ctx);
+      if (view && chrome9_resource_is_local(chrome9_resource(view->texture)))
+         chrome9_context_demote_local(ctx, view->texture);
       if (view && chrome9_sampler_view(view)->shadow) {
          chrome9_copy_surface(chrome9_sampler_view(view)->shadow,
                               view->texture);

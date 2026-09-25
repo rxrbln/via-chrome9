@@ -500,6 +500,27 @@ chrome9_guarded_shared(struct pipe_screen *screen,
           debug_get_bool_option("CHROME9_GUARDED_SHARED", true);
 }
 
+static bool
+chrome9_resource_local(struct pipe_screen *screen,
+                       const struct pipe_resource *templ,
+                       const struct chrome9_resource_layout *layout,
+                       bool guarded_shared)
+{
+   static int enabled = -1;
+
+   if (enabled < 0)
+      enabled = debug_get_bool_option("CHROME9_LOCAL_MEMORY", true);
+   return enabled && layout->guarded && !guarded_shared &&
+          templ->target == PIPE_TEXTURE_2D &&
+          /* Linear shadows are copied by the CPU to the drawable. */
+          !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_SHARED |
+                           PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
+          (templ->bind & (PIPE_BIND_DEPTH_STENCIL |
+                          PIPE_BIND_RENDER_TARGET)) &&
+          chrome9_screen_has_capability2(screen,
+                                         DRM_CHROME9_CAP2_LOCAL_MEMORY);
+}
+
 struct pipe_resource *
 chrome9_resource_create(struct pipe_screen *screen,
                         const struct pipe_resource *templ)
@@ -543,10 +564,19 @@ chrome9_resource_create(struct pipe_screen *screen,
       create_flags |= DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT;
 
    fd = screen->get_screen_fd(screen);
-   if (fd < 0 ||
-       !chrome9_bo_create(fd, layout.allocation_size, create_flags,
-                          &resource->bo))
+   if (fd < 0)
       goto fail;
+   /* Private depth buffers and render targets go to the local frame
+    * buffer, which the engine reads and writes about 2.7 times faster than
+    * GART pages; GART pages when the pool is full. */
+   if (chrome9_resource_local(screen, templ, &layout, guarded_shared) &&
+       chrome9_bo_create(fd, align64(layout.allocation_size, 4096),
+                         DRM_CHROME9_GEM_CREATE_LOCAL, &resource->bo)) {
+      resource->local = true;
+   } else if (!chrome9_bo_create(fd, layout.allocation_size, create_flags,
+                                 &resource->bo)) {
+      goto fail;
+   }
 
    chrome9_resource_apply_layout(resource, &layout);
    resource->guarded_shared = guarded_shared;
@@ -767,8 +797,10 @@ chrome9_resource_destroy(struct pipe_screen *screen,
    struct chrome9_resource *cresource = chrome9_resource(resource);
 
    /* A view borrows its parent's BO. */
-   if (cresource->parent)
+   if (cresource->parent) {
+      chrome9_resource(cresource->parent)->views--;
       pipe_resource_reference(&cresource->parent, NULL);
+   }
    else
       chrome9_screen_bo_destroy(screen, &cresource->bo);
    if (cresource->coarse_z.handle)
@@ -830,6 +862,7 @@ chrome9_resource_image_view(struct pipe_resource *pres, unsigned level,
    view->guarded = true;
    view->explicit_access = res->explicit_access;
    pipe_resource_reference(&view->parent, pres);
+   res->views++;
    return &view->base;
 }
 
@@ -898,6 +931,9 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    if (!out_transfer || !chrome9_transfer_box_valid(resource, level, box))
       return NULL;
 
+   /* Reads of uncached local memory: move the resource to GART pages. */
+   if ((usage & PIPE_MAP_READ) && chrome9_resource_is_local(cresource))
+      chrome9_context_demote_local(chrome9_context(pipe), resource);
    /* Retained triangle batches and the shadow color target are not visible
     * through a direct persistent mapping until submitted and resolved. */
    if (resource->target != PIPE_BUFFER)

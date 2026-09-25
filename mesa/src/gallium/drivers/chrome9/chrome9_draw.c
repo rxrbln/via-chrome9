@@ -173,22 +173,32 @@ chrome9_blend_uses_constant(const struct pipe_blend_state *state)
            chrome9_blend_factor_constant(rt->alpha_dst_factor));
 }
 
-/* The fixed draw builders address every surface linearly. */
+static bool
+chrome9_draw_fixed_unaddressable(const struct chrome9_resource *resource)
+{
+   return chrome9_resource_is_tiled(resource) ||
+          chrome9_resource_is_local(resource);
+}
+
+/* The fixed draw builders address linear surfaces in GART pages only. */
 bool
 chrome9_draw_tiled_surfaces(const struct chrome9_context *ctx)
 {
    const struct pipe_framebuffer_state *fb = &ctx->framebuffer;
 
    if ((fb->nr_cbufs && fb->cbufs[0].texture &&
-        chrome9_resource_is_tiled(chrome9_resource(fb->cbufs[0].texture))) ||
+        chrome9_draw_fixed_unaddressable(
+           chrome9_resource(fb->cbufs[0].texture))) ||
        (fb->zsbuf.texture &&
-        chrome9_resource_is_tiled(chrome9_resource(fb->zsbuf.texture))))
+        chrome9_draw_fixed_unaddressable(
+           chrome9_resource(fb->zsbuf.texture))))
       return true;
    for (unsigned i = 0; i < ctx->num_sampler_views; i++) {
       const struct pipe_sampler_view *view = ctx->sampler_views[i];
 
       if (view && view->texture &&
-          chrome9_resource_is_tiled(chrome9_resource_const(view->texture)))
+          chrome9_draw_fixed_unaddressable(
+             chrome9_resource_const(view->texture)))
          return true;
    }
    return false;

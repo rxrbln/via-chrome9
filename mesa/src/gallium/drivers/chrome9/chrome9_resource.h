@@ -8,6 +8,8 @@
 #include <string.h>
 
 #include "chrome9_drm.h"
+
+struct chrome9_context;
 #include "pipe/p_state.h"
 #include "util/macros.h"
 
@@ -66,6 +68,11 @@ struct chrome9_resource {
    /* CAP2_TILED_DEPTH/COLOR: every level in 32-byte x 8-row tiles; CPU
     * access goes through chrome9_tiled_copy(). */
    bool tiled;
+   /* GEM_CREATE_LOCAL: the object is in the local frame buffer, mapped
+    * write-combined (CPU reads are uncached). */
+   bool local;
+   /* Live level views borrowing the BO (chrome9_resource_image_view). */
+   unsigned views;
    /* Single-image render view of a level or layer of parent: same BO,
     * pixels at data_offset. */
    struct pipe_resource *parent;
@@ -164,6 +171,17 @@ chrome9_resource_is_tiled(const struct chrome9_resource *resource)
           chrome9_resource_const(resource->parent)->tiled : resource->tiled;
 }
 
+/* The resource (or the parent of a level view) is in the local frame
+ * buffer, which only fragment program draws address. */
+static inline bool
+chrome9_resource_is_local(const struct chrome9_resource *resource)
+{
+   return resource->parent ?
+          chrome9_resource_const(resource->parent)->local : resource->local;
+}
+
+void chrome9_context_demote_local(struct chrome9_context *ctx,
+                                  struct pipe_resource *resource);
 bool chrome9_is_format_supported(struct pipe_screen *screen,
                                  enum pipe_format format,
                                  enum pipe_texture_target target,
