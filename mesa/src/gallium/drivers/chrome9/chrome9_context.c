@@ -6313,8 +6313,9 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                        templ->u.tex.last_level <= texture->last_level &&
                        chrome9_resource(texture)->guarded;
    bool supported = view && texture && !volume &&
-                    ((texture->target == PIPE_TEXTURE_2D &&
-                      templ->target == PIPE_TEXTURE_2D) || cube) &&
+                    (((texture->target == PIPE_TEXTURE_2D ||
+                       texture->target == PIPE_TEXTURE_RECT) &&
+                      templ->target == texture->target) || cube) &&
                     templ->format == texture->format &&
                     chrome9_texture_format_info(templ->format) &&
                     templ->u.tex.first_level <= templ->u.tex.last_level &&
@@ -7138,6 +7139,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
     * compiles it instead. */
    if (ctx->vs->sw_nir &&
        BITSET_COUNT(ctx->vs->sw_nir->info.textures_used) &&
+       chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+      return;
+   /* The pixel engine always writes a colour target: depth/stencil-only
+    * framebuffers render in llvmpipe. */
+   if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    chrome9_refresh_vs_textures(ctx);

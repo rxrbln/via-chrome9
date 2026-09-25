@@ -1160,6 +1160,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              (*depth_active &&
               textures[unit]->bo.handle == (*depth)->bo.handle) ||
              (source->target != PIPE_TEXTURE_2D &&
+              source->target != PIPE_TEXTURE_RECT &&
               ((source->target != PIPE_TEXTURE_CUBE &&
                 source->target != PIPE_TEXTURE_3D) ||
                !chrome9_use_generic_fragment_program(ctx))) ||
