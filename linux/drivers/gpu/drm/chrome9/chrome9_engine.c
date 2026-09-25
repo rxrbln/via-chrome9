@@ -239,6 +239,11 @@ module_param_named(edge_aa, chrome9_edge_aa, bool, 0600);
 MODULE_PARM_DESC(edge_aa,
 	"Edge antialiasing for vertex-program lines and triangles (default: true)");
 
+static bool chrome9_depth_output;
+module_param_named(depth_output, chrome9_depth_output, bool, 0600);
+MODULE_PARM_DESC(depth_output,
+	"Fragment program depth output, DEST_DEPTH; locks up the engine as encoded (default: false)");
+
 static bool chrome9_fast_z = true;
 module_param_named(fast_z, chrome9_fast_z, bool, 0600);
 MODULE_PARM_DESC(fast_z,
@@ -4586,7 +4591,8 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		common[8] = 0x11000001 | ((request->depth_pitch >> 5) << 13);
 		common[9] = request->fragment_depth_format ==
 			DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 ? 0x123e0000 : 0x12380000;
-		common[10] = 0x13000000 | depth_func << 16;
+		common[10] = 0x13000000 | depth_func << 16 |
+			     (program->depth_output ? BIT(23) : 0);
 		common_count = 11;
 		/* Fast-Z: clear data 1.0 (A14 low, A15 high byte of the X8Z24
 		 * word), index length 3; otherwise the vendor baseline A27. */
@@ -6714,6 +6720,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_COARSE_Z;
 	if (READ_ONCE(chrome9_fast_z))
 		caps |= DRM_CHROME9_CAP2_FAST_Z;
+	if (READ_ONCE(chrome9_depth_output))
+		caps |= DRM_CHROME9_CAP2_DEPTH_OUTPUT;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
 		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
@@ -12657,6 +12665,11 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		constants, &key, &fragment_entry);
 	if (IS_ERR(program)) {
 		ret = PTR_ERR(program);
+		goto out_put;
+	}
+	/* Shader depth replaces the depth test's input. */
+	if (program->depth_output && !depth) {
+		ret = -EINVAL;
 		goto out_put;
 	}
 	if (tcl) {

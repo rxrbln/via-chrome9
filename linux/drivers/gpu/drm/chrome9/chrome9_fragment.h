@@ -23,6 +23,8 @@ struct chrome9_fragment_program {
 	u32 active_texture_count;
 	u8 tau_coordinate_mask;
 	bool primary_used;
+	/* Shader depth replaces raster depth (A13 bit 23, HZSrcPS). */
+	bool depth_output;
 	u8 varying_logical[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 varying_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
 	u8 varying_alu_width[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];

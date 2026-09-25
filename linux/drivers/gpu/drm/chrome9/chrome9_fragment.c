@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "chrome9_engine.h"
 #include "chrome9_fragment.h"
 
 #define CHROME9_FRAGMENT_TEMP_COUNT	128U
@@ -37,6 +38,8 @@ enum chrome9_fragment_slot {
 
 struct chrome9_fragment_state {
 	const struct drm_chrome9_fragment_instruction *instructions;
+	/* The program ends with a DEST_DEPTH MOV. */
+	bool depth_output;
 	u16 defined_mask[CHROME9_FRAGMENT_TEMP_COUNT];
 	u16 used_mask[CHROME9_FRAGMENT_TEMP_COUNT];
 	u16 last_use[CHROME9_FRAGMENT_TEMP_COUNT];
@@ -318,9 +321,30 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX ||
 			    instruction->dst.index ||
 			    instruction->dst.writemask != 0xf || output_mask ||
-			    i != instruction_count - 1)
+			    (i != instruction_count - 1 &&
+			     (i != instruction_count - 2 ||
+			      state->instructions[i + 1].dst.file !=
+			      DRM_CHROME9_FRAGMENT_DEST_DEPTH)))
 				return -EINVAL;
 			output_mask = 0xf;
+		} else if (instruction->dst.file ==
+			   DRM_CHROME9_FRAGMENT_DEST_DEPTH) {
+			const struct drm_chrome9_fragment_source *src =
+				&instruction->src[0];
+
+			/* Linux vendor order: color, then a replicated MOV
+			 * to oDepth (native oC4) with A13 bit 23. */
+			if (!(chrome9_engine_capabilities2() &
+			      DRM_CHROME9_CAP2_DEPTH_OUTPUT) ||
+			    instruction->op != DRM_CHROME9_FRAGMENT_OP_MOV ||
+			    instruction->dst.index || instruction->dst.modifier ||
+			    instruction->dst.writemask != 0xf ||
+			    output_mask != 0xf || i != instruction_count - 1 ||
+			    src->swizzle[1] != src->swizzle[0] ||
+			    src->swizzle[2] != src->swizzle[0] ||
+			    src->swizzle[3] != src->swizzle[0])
+				return -EINVAL;
+			state->depth_output = true;
 		} else {
 			return -EINVAL;
 		}
@@ -637,8 +661,9 @@ static void chrome9_fragment_encode_destination(u32 record[4],
 	const struct chrome9_fragment_state *state,
 	const struct drm_chrome9_fragment_destination *destination)
 {
-	u32 file = destination->file == DRM_CHROME9_FRAGMENT_DEST_COLOR ? 2 : 0;
+	u32 file = destination->file == DRM_CHROME9_FRAGMENT_DEST_TEMP ? 0 : 2;
 	u32 id = destination->file == DRM_CHROME9_FRAGMENT_DEST_COLOR ? 0 :
+		 destination->file == DRM_CHROME9_FRAGMENT_DEST_DEPTH ? 4 :
 		 state->physical[destination->index];
 
 	record[2] &= ~GENMASK(23, 20);
@@ -1422,6 +1447,7 @@ int chrome9_fragment_compile_targets(
 		goto out;
 	program->constant_count = constant_count;
 	program->texture_count = texture_count;
+	program->depth_output = state.depth_output;
 	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; i++) {
 		u32 packed = program->varying_count;
 
