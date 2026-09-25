@@ -5733,6 +5733,188 @@ chrome9_nir_optimize_semantic(nir_shader *nir)
 }
 
 static bool
+chrome9_ps_componentwise(enum chrome9_ps_opcode op)
+{
+   switch (op) {
+   case CHROME9_PS_OPCODE_MOV:
+   case CHROME9_PS_OPCODE_MUL:
+   case CHROME9_PS_OPCODE_ADD:
+   case CHROME9_PS_OPCODE_SUB:
+   case CHROME9_PS_OPCODE_MAD:
+   case CHROME9_PS_OPCODE_MIN:
+   case CHROME9_PS_OPCODE_MAX:
+   case CHROME9_PS_OPCODE_CMP:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static unsigned
+chrome9_ps_source_count(enum chrome9_ps_opcode op)
+{
+   switch (op) {
+   case CHROME9_PS_OPCODE_MAD:
+   case CHROME9_PS_OPCODE_CMP:
+      return 3;
+   case CHROME9_PS_OPCODE_MUL:
+   case CHROME9_PS_OPCODE_ADD:
+   case CHROME9_PS_OPCODE_SUB:
+   case CHROME9_PS_OPCODE_MIN:
+   case CHROME9_PS_OPCODE_MAX:
+   case CHROME9_PS_OPCODE_DP3:
+   case CHROME9_PS_OPCODE_DP4:
+      return 2;
+   default:
+      return 1;
+   }
+}
+
+static bool
+chrome9_ps_reads_temp(const struct chrome9_ps_instruction *instruction,
+                      unsigned id)
+{
+   for (unsigned s = 0; s < chrome9_ps_source_count(instruction->op); s++)
+      if (instruction->source[s].file == CHROME9_PS_SOURCE_TEMP &&
+          instruction->source[s].id == id)
+         return true;
+   return false;
+}
+
+static void
+chrome9_ps_ir_remove(struct chrome9_ps_ir *ir, unsigned index)
+{
+   memmove(&ir->instruction[index], &ir->instruction[index + 1],
+           (ir->count - index - 1) * sizeof(ir->instruction[0]));
+   ir->count--;
+}
+
+/*
+ * Pixel throughput follows the ALU record count, so remove copies the
+ * backend's one-record-per-NIR-op lowering leaves: a MOV of literal 1.0
+ * lanes merges into the MOV defining the other lanes of that temporary,
+ * and the terminal oC0 copy of a temporary folds into its producer.
+ */
+static void
+chrome9_ps_ir_fold_copies(struct chrome9_ps_ir *ir,
+                          const struct chrome9_ps_program *program)
+{
+   struct chrome9_ps_instruction *last, *producer = NULL;
+   unsigned producer_index = 0, id;
+
+   /* Literal ONE for compiler immediates of exactly 1.0 in MOVs. */
+   for (unsigned i = 0; i < ir->count; i++) {
+      struct chrome9_ps_instruction *mov = &ir->instruction[i];
+      struct chrome9_ps_source *source = &mov->source[0];
+      bool literal = true;
+
+      if (mov->op != CHROME9_PS_OPCODE_MOV ||
+          source->file != CHROME9_PS_SOURCE_CONSTANT || source->modifier ||
+          !(program->immediate_mask & (1u << source->id)))
+         continue;
+      for (unsigned c = 0; c < 4; c++) {
+         if (!(mov->destination.writemask & (1u << c)))
+            continue;
+         if (source->swizzle[c] > CHROME9_PS_SWIZZLE_W ||
+             program->immediate[source->id][source->swizzle[c]] !=
+                0x3f800000)
+            literal = false;
+      }
+      if (!literal || mov->destination.file != CHROME9_PS_DESTINATION_TEMP)
+         continue;
+      /* Merge into an earlier modifier-free MOV of the same temporary. */
+      for (unsigned j = 0; j < i; j++) {
+         struct chrome9_ps_instruction *into = &ir->instruction[j];
+
+         if (into->op != CHROME9_PS_OPCODE_MOV ||
+             into->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+             into->destination.id != mov->destination.id ||
+             into->destination.saturate != mov->destination.saturate ||
+             into->source[0].modifier ||
+             into->source[0].file == CHROME9_PS_SOURCE_POSITION)
+            continue;
+         for (unsigned c = 0; c < 4; c++)
+            if (mov->destination.writemask & (1u << c))
+               into->source[0].swizzle[c] = CHROME9_PS_SWIZZLE_ONE;
+         into->destination.writemask |= mov->destination.writemask;
+         chrome9_ps_ir_remove(ir, i--);
+         break;
+      }
+   }
+
+   if (!ir->count)
+      return;
+   last = &ir->instruction[ir->count - 1];
+   if (last->op != CHROME9_PS_OPCODE_MOV ||
+       last->destination.file != CHROME9_PS_DESTINATION_COLOR ||
+       last->destination.writemask != 0xf ||
+       last->source[0].file != CHROME9_PS_SOURCE_TEMP ||
+       last->source[0].modifier)
+      return;
+   id = last->source[0].id;
+   for (unsigned i = 0; i + 1 < ir->count; i++) {
+      struct chrome9_ps_instruction *instruction = &ir->instruction[i];
+
+      if (chrome9_ps_reads_temp(instruction, id))
+         return;
+      if (instruction->op == CHROME9_PS_OPCODE_TEX ||
+          instruction->op == CHROME9_PS_OPCODE_KILL ||
+          instruction->destination.file != CHROME9_PS_DESTINATION_TEMP ||
+          instruction->destination.id != id)
+         continue;
+      if (producer)
+         return;
+      producer = instruction;
+      producer_index = i;
+   }
+   if (!producer)
+      return;
+   for (unsigned i = 0; i < ir->count - 1; i++)
+      if (ir->instruction[i].destination.file ==
+             CHROME9_PS_DESTINATION_TEMP &&
+          ir->instruction[i].destination.id == id &&
+          &ir->instruction[i] != producer)
+         return;
+   if (!chrome9_ps_componentwise(producer->op))
+      return;
+   for (unsigned c = 0; c < 4; c++) {
+      const uint8_t lane = last->source[0].swizzle[c];
+
+      if (lane == CHROME9_PS_SWIZZLE_ONE) {
+         /* 1 * 1 or a copy of 1 keeps a literal lane exact. */
+         if (producer->op != CHROME9_PS_OPCODE_MOV &&
+             producer->op != CHROME9_PS_OPCODE_MUL)
+            return;
+         for (unsigned s = 0; s < chrome9_ps_source_count(producer->op); s++)
+            if (producer->source[s].modifier ||
+                producer->source[s].file == CHROME9_PS_SOURCE_POSITION)
+               return;
+      } else if (lane > CHROME9_PS_SWIZZLE_W ||
+                 !(producer->destination.writemask & (1u << lane))) {
+         return;
+      }
+   }
+   {
+      struct chrome9_ps_instruction folded = *producer;
+
+      for (unsigned s = 0; s < chrome9_ps_source_count(producer->op); s++)
+         for (unsigned c = 0; c < 4; c++) {
+            const uint8_t lane = last->source[0].swizzle[c];
+
+            folded.source[s].swizzle[c] =
+               lane == CHROME9_PS_SWIZZLE_ONE ? CHROME9_PS_SWIZZLE_ONE :
+               producer->source[s].swizzle[lane];
+         }
+      folded.destination = last->destination;
+      folded.destination.saturate |= producer->destination.saturate;
+      /* Temporaries are written once per lane, so the producer's sources
+       * still hold its operands at the end of the program. */
+      ir->instruction[ir->count - 1] = folded;
+      chrome9_ps_ir_remove(ir, producer_index);
+   }
+}
+
+static bool
 chrome9_compile_native_fs(struct chrome9_context *ctx,
                           struct chrome9_shader *shader, nir_shader *nir)
 {
@@ -5767,6 +5949,14 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      ctx->fragment_kill,
                                      ctx->texture_bias,
                                      &lowered);
+   if (lowered && debug_get_bool_option("CHROME9_PS_FOLD", true)) {
+      struct chrome9_ps_ir folded = shader->semantic_fs_ir;
+      unsigned folded_peak;
+
+      chrome9_ps_ir_fold_copies(&folded, &shader->native_fs);
+      if (chrome9_ps_ir_temp_pressure(&folded, &folded_peak))
+         shader->semantic_fs_ir = folded;
+   }
    if (lowered) {
       unsigned source_peak;
 
