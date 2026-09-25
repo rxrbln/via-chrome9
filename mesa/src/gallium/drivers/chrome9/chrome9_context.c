@@ -2991,6 +2991,14 @@ struct chrome9_ps_proof {
    struct hash_table_u64 *memo;
 };
 
+/* A lowered Boolean: (negate ? -temp : temp) >= 0, complemented by invert.
+ * CMP evaluates it with its qualified A-operand NEG. */
+struct chrome9_ps_condition {
+   uint8_t temp;
+   bool negate;
+   bool invert;
+};
+
 struct chrome9_ps_nir_builder {
    struct chrome9_ps_ir ir;
    struct chrome9_ps_proof proof;
@@ -3018,6 +3026,11 @@ struct chrome9_ps_nir_builder {
       uint8_t temp;
    } equal_zero[16];
    uint8_t equal_zero_count;
+   struct {
+      nir_scalar predicate;
+      struct chrome9_ps_condition condition;
+   } condition[CHROME9_PS_MAX_INSTRUCTIONS];
+   uint8_t condition_count;
 };
 
 static struct chrome9_ps_instruction *
@@ -3812,15 +3825,30 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
       case nir_op_fdot2:
       case nir_op_fdot3:
       case nir_op_fdot4:
+      case nir_op_fsign:
          break;
       default:
          return false;
       }
    }
    switch (alu->op) {
+   case nir_op_b2f32:
+      return true;
+   case nir_op_bcsel:
+      /* Either arm is finite; the predicate only chooses. */
+      for (unsigned s = 1; s < 3; s++)
+         if (!alu->src[s].src.ssa ||
+             alu->src[s].swizzle[scalar.comp] >=
+                alu->src[s].src.ssa->num_components ||
+             !chrome9_ps_default_finite(
+                (nir_scalar) { alu->src[s].src.ssa,
+                               alu->src[s].swizzle[scalar.comp] }, proof))
+            return false;
+      return true;
    case nir_op_mov:
    case nir_op_fneg:
    case nir_op_fabs:
+   case nir_op_fsign:
    case nir_op_fsat:
    case nir_op_fexp2:
    case nir_op_flog2:
@@ -4230,72 +4258,416 @@ static bool
 chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                      struct chrome9_ps_source *source);
 
-/* Emit CMP(condition.x, when_nonnegative, when_negative) into a new temp. */
+/* Append op into a new temp with the given writemask. */
 static bool
-chrome9_ps_emit_cmp(struct chrome9_ps_nir_builder *builder,
-                    uint8_t condition_temp,
-                    const struct chrome9_ps_source *when_nonnegative,
-                    const struct chrome9_ps_source *when_negative,
-                    unsigned components, struct chrome9_ps_source *result)
+chrome9_ps_emit_temp(struct chrome9_ps_nir_builder *builder,
+                     enum chrome9_ps_opcode op,
+                     const struct chrome9_ps_source *sources, unsigned count,
+                     unsigned writemask, uint8_t *temp)
 {
-   struct chrome9_ps_instruction *conditional;
-   uint8_t temp;
+   struct chrome9_ps_instruction *instruction;
 
    if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
       return false;
-   temp = builder->next_temp++;
-   conditional = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_CMP);
+   *temp = builder->next_temp++;
+   instruction = chrome9_ps_append_instruction(builder, op);
+   if (!instruction)
+      return false;
+   instruction->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   instruction->destination.id = *temp;
+   instruction->destination.writemask = writemask;
+   for (unsigned s = 0; s < count; s++)
+      instruction->source[s] = sources[s];
+   return true;
+}
+
+static struct chrome9_ps_source
+chrome9_ps_temp_source(uint8_t temp, const uint8_t swizzle[4])
+{
+   struct chrome9_ps_source source = {
+      .file = CHROME9_PS_SOURCE_TEMP,
+      .id = temp,
+   };
+
+   memcpy(source.swizzle, swizzle, sizeof(source.swizzle));
+   return source;
+}
+
+static bool
+chrome9_ps_scalar_is_zero(nir_scalar scalar)
+{
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   return nir_scalar_is_const(scalar) &&
+          !(nir_scalar_as_uint(scalar) & 0x7fffffff);
+}
+
+static bool
+chrome9_ps_emit_lane_select(struct chrome9_ps_nir_builder *builder,
+                            const nir_alu_src *predicate,
+                            const struct chrome9_ps_source *when_true,
+                            const struct chrome9_ps_source *when_false,
+                            unsigned components,
+                            struct chrome9_ps_source *result);
+
+/* GL stores Boolean uniforms of a driver without integers as exactly 0.0
+ * or 1.0, so b2b1 of such a load is its float value. */
+static bool
+chrome9_ps_canonical_bool(nir_scalar scalar)
+{
+   scalar = nir_scalar_resolved(scalar.def, scalar.comp);
+   if (nir_scalar_is_const(scalar))
+      return nir_scalar_as_uint(scalar) == 0 ||
+             nir_scalar_as_uint(scalar) == 0x3f800000;
+   return nir_scalar_is_intrinsic(scalar) &&
+          (nir_scalar_intrinsic_op(scalar) == nir_intrinsic_load_ubo ||
+           nir_scalar_intrinsic_op(scalar) == nir_intrinsic_load_ubo_vec4);
+}
+
+/* A 1-bit vector as 1.0/0.0 lanes: canonical Boolean uniforms directly,
+ * anything else through a per-lane select. */
+static bool
+chrome9_ps_lower_bool_float(struct chrome9_ps_nir_builder *builder,
+                            const nir_alu_src *value, unsigned count,
+                            struct chrome9_ps_source *source)
+{
+   static const uint32_t one[4] = {
+      0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+   };
+   static const uint32_t zero[4] = { 0 };
+   struct chrome9_ps_source when_true, when_false;
+   nir_alu_instr *convert = NULL;
+   uint32_t literal[4] = { 0 };
+   bool constant = true;
+   nir_alu_src stored;
+
+   for (unsigned c = 0; c < count; c++) {
+      nir_scalar lane = nir_scalar_resolved(value->src.ssa, value->swizzle[c]);
+
+      constant &= nir_scalar_is_const(lane);
+      if (constant && nir_scalar_as_bool(lane))
+         literal[c] = 0x3f800000;
+   }
+   if (constant)
+      return chrome9_ps_immediate(builder, literal, count, source);
+   for (unsigned c = 0; c < count; c++) {
+      nir_scalar lane = nir_scalar_resolved(value->src.ssa, value->swizzle[c]);
+
+      if (!nir_scalar_is_alu(lane) || nir_scalar_alu_op(lane) != nir_op_b2b1 ||
+          (convert && convert != nir_instr_as_alu(nir_def_instr(lane.def))) ||
+          !chrome9_ps_canonical_bool(nir_scalar_chase_alu_src(lane, 0))) {
+         convert = NULL;
+         break;
+      }
+      convert = nir_instr_as_alu(nir_def_instr(lane.def));
+   }
+   if (convert) {
+      stored = convert->src[0];
+      for (unsigned c = 0; c < count; c++)
+         stored.swizzle[c] = convert->src[0].swizzle[nir_scalar_resolved(
+            value->src.ssa, value->swizzle[c]).comp];
+      return chrome9_ps_lower_alu_source(builder, &stored, count, source);
+   }
+   return chrome9_ps_immediate(builder, one, count, &when_true) &&
+          chrome9_ps_immediate(builder, zero, count, &when_false) &&
+          chrome9_ps_emit_lane_select(builder, value, &when_true,
+                                      &when_false, count, source);
+}
+
+/* Condition lanes of lhs op rhs, one per result lane (lanes[c] selects the
+ * compare component); ordered compares test the difference, equality its
+ * negated magnitude.  Float operands must be proven finite; Boolean
+ * operands compare as 1.0/0.0. */
+static bool
+chrome9_ps_lower_compare_lanes(struct chrome9_ps_nir_builder *builder,
+                               nir_alu_instr *alu, const uint8_t *lanes,
+                               unsigned count,
+                               struct chrome9_ps_condition *condition)
+{
+   nir_alu_src operand[2] = { alu->src[0], alu->src[1] };
+   struct chrome9_ps_source source[2];
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+   uint8_t swizzle[4] = {
+      CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO,
+      CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO,
+   };
+   const bool boolean = alu->op == nir_op_ieq || alu->op == nir_op_ine ||
+                        alu->op == nir_op_ixor;
+   const bool convert = alu->op == nir_op_b2b1;
+   const bool equality = alu->op == nir_op_feq || alu->op == nir_op_fneu ||
+                         boolean || convert;
+   const unsigned sources = convert ? 1 : 2;
+   const unsigned mask = BITFIELD_MASK(count);
+   int zero_side = convert ? 1 : -1;
+   uint8_t temp = 0;
+
+   if (alu->op != nir_op_fge && alu->op != nir_op_flt && !equality)
+      return false;
+   for (unsigned s = 0; s < sources; s++) {
+      if (!alu->src[s].src.ssa ||
+          alu->src[s].src.ssa->bit_size != (boolean ? 1 : 32))
+         return false;
+      for (unsigned c = 0; c < count; c++) {
+         nir_scalar scalar = nir_scalar_chase_alu_src(
+            (nir_scalar) { &alu->def, lanes[c] }, s);
+
+         if (lanes[c] >= alu->def.num_components ||
+             (convert ? !chrome9_ps_canonical_bool(scalar) :
+              !boolean && !chrome9_ps_default_finite(scalar,
+                                                     &builder->proof)))
+            return false;
+         operand[s].swizzle[c] = alu->src[s].swizzle[lanes[c]];
+      }
+   }
+   /* Equality with a literal zero needs only the magnitude. */
+   if (equality && !boolean && !convert) {
+      for (int s = 1; s >= 0 && zero_side < 0; s--) {
+         bool zero = true;
+
+         for (unsigned c = 0; c < count; c++)
+            zero &= chrome9_ps_scalar_is_zero(nir_scalar_chase_alu_src(
+               (nir_scalar) { &alu->def, lanes[c] }, s));
+         if (zero)
+            zero_side = s;
+      }
+   }
+   if (zero_side >= 0) {
+      if (!chrome9_ps_lower_alu_source(builder, &operand[!zero_side], count,
+                                       &source[0]))
+         return false;
+   } else {
+      for (unsigned s = 0; s < 2; s++)
+         if (!(boolean ?
+               chrome9_ps_lower_bool_float(builder, &operand[s], count,
+                                           &source[s]) :
+               chrome9_ps_lower_alu_source(builder, &operand[s], count,
+                                           &source[s])))
+            return false;
+      if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_SUB, source, 2,
+                                mask, &temp))
+         return false;
+      memcpy(swizzle, identity, count);
+      source[0] = chrome9_ps_temp_source(temp, swizzle);
+   }
+   if (equality) {
+      if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_ABS, source, 1,
+                                mask, &temp))
+         return false;
+      condition->negate = true;
+   } else {
+      condition->negate = false;
+   }
+   condition->temp = temp;
+   condition->invert = alu->op == nir_op_flt || alu->op == nir_op_fneu ||
+                       alu->op == nir_op_ine || alu->op == nir_op_ixor ||
+                       convert;
+   return true;
+}
+
+/* all(equal(a, b)) and any(notEqual(a, b)) of floats or Booleans: the
+ * summed magnitude of the differences is zero exactly when every lane is
+ * equal. */
+static bool
+chrome9_ps_lower_vector_equality(struct chrome9_ps_nir_builder *builder,
+                                 nir_alu_instr *alu, unsigned count,
+                                 struct chrome9_ps_condition *condition)
+{
+   static const uint32_t one[4] = {
+      0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+   };
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+   struct chrome9_ps_source source[2];
+   uint8_t swizzle[4] = {
+      CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO,
+      CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO,
+   };
+   const bool boolean = alu->src[0].src.ssa &&
+                        alu->src[0].src.ssa->bit_size == 1;
+   uint8_t difference, magnitude, sum;
+
+   for (unsigned s = 0; s < 2; s++)
+      if (!alu->src[s].src.ssa ||
+          alu->src[s].src.ssa->bit_size != (boolean ? 1 : 32) ||
+          (!boolean &&
+           !chrome9_ps_default_finite_alu_source(alu, s, count,
+                                                 &builder->proof)))
+         return false;
+   for (unsigned s = 0; s < 2; s++)
+      if (!(boolean ?
+            chrome9_ps_lower_bool_float(builder, &alu->src[s], count,
+                                        &source[s]) :
+            chrome9_ps_lower_alu_source(builder, &alu->src[s], count,
+                                        &source[s])))
+         return false;
+   if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_SUB, source, 2,
+                             BITFIELD_MASK(count), &difference))
+      return false;
+   memcpy(swizzle, identity, count);
+   source[0] = chrome9_ps_temp_source(difference, swizzle);
+   if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_ABS, source, 1,
+                             BITFIELD_MASK(count), &magnitude))
+      return false;
+   if (count == 2) {
+      source[0] = chrome9_ps_temp_source(magnitude, (uint8_t[4]) {
+         CHROME9_PS_SWIZZLE_X, CHROME9_PS_SWIZZLE_ZERO,
+         CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO });
+      source[1] = chrome9_ps_temp_source(magnitude, (uint8_t[4]) {
+         CHROME9_PS_SWIZZLE_Y, CHROME9_PS_SWIZZLE_ZERO,
+         CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO });
+      if (!chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_MAX, source, 2, 1,
+                                &sum))
+         return false;
+   } else {
+      source[0] = chrome9_ps_temp_source(magnitude, swizzle);
+      if (!chrome9_ps_immediate(builder, one, count, &source[1]) ||
+          !chrome9_ps_emit_temp(builder, count == 3 ? CHROME9_PS_OPCODE_DP3 :
+                                                      CHROME9_PS_OPCODE_DP4,
+                                source, 2, 1, &sum))
+         return false;
+   }
+   condition->temp = sum;
+   condition->negate = true;
+   condition->invert = alu->op == nir_op_bany_fnequal2 ||
+                       alu->op == nir_op_bany_fnequal3 ||
+                       alu->op == nir_op_bany_fnequal4 ||
+                       alu->op == nir_op_bany_inequal2 ||
+                       alu->op == nir_op_bany_inequal3 ||
+                       alu->op == nir_op_bany_inequal4;
+   return true;
+}
+
+/*
+ * Lower a scalar Boolean to one CMP condition, memoized per scalar so a
+ * predicate shared by several selects is computed once.  A conjunction or
+ * disjunction of two conditions of the same form is their MIN or MAX.
+ */
+static bool
+chrome9_ps_lower_condition(struct chrome9_ps_nir_builder *builder,
+                           nir_scalar predicate, unsigned depth,
+                           struct chrome9_ps_condition *condition)
+{
+   struct chrome9_ps_condition operand[2];
+   struct chrome9_ps_source source[2];
+   nir_alu_instr *alu;
+   bool lowered;
+
+   predicate = nir_scalar_resolved(predicate.def, predicate.comp);
+   if (depth > 8 || predicate.def->bit_size != 1 ||
+       nir_def_instr(predicate.def)->type != nir_instr_type_alu)
+      return false;
+   for (unsigned i = 0; i < builder->condition_count; i++) {
+      if (nir_scalar_equal(builder->condition[i].predicate, predicate)) {
+         *condition = builder->condition[i].condition;
+         return true;
+      }
+   }
+   alu = nir_instr_as_alu(nir_def_instr(predicate.def));
+   if (predicate.comp >= alu->def.num_components)
+      return false;
+   switch (alu->op) {
+   case nir_op_fge:
+   case nir_op_flt:
+   case nir_op_feq:
+   case nir_op_fneu:
+   case nir_op_ieq:
+   case nir_op_ine:
+   case nir_op_ixor:
+   case nir_op_b2b1: {
+      const uint8_t lane = predicate.comp;
+
+      lowered = chrome9_ps_lower_compare_lanes(builder, alu, &lane, 1,
+                                               condition);
+      break;
+   }
+   case nir_op_ball_fequal2:
+   case nir_op_bany_fnequal2:
+   case nir_op_ball_iequal2:
+   case nir_op_bany_inequal2:
+      lowered = chrome9_ps_lower_vector_equality(builder, alu, 2, condition);
+      break;
+   case nir_op_ball_fequal3:
+   case nir_op_bany_fnequal3:
+   case nir_op_ball_iequal3:
+   case nir_op_bany_inequal3:
+      lowered = chrome9_ps_lower_vector_equality(builder, alu, 3, condition);
+      break;
+   case nir_op_ball_fequal4:
+   case nir_op_bany_fnequal4:
+   case nir_op_ball_iequal4:
+   case nir_op_bany_inequal4:
+      lowered = chrome9_ps_lower_vector_equality(builder, alu, 4, condition);
+      break;
+   case nir_op_inot:
+      lowered = chrome9_ps_lower_condition(
+         builder, nir_scalar_chase_alu_src(predicate, 0), depth + 1,
+         condition);
+      condition->invert = !condition->invert;
+      break;
+   case nir_op_iand:
+   case nir_op_ior:
+      if (!chrome9_ps_lower_condition(
+             builder, nir_scalar_chase_alu_src(predicate, 0), depth + 1,
+             &operand[0]) ||
+          !chrome9_ps_lower_condition(
+             builder, nir_scalar_chase_alu_src(predicate, 1), depth + 1,
+             &operand[1]) ||
+          operand[0].negate != operand[1].negate ||
+          operand[0].invert != operand[1].invert)
+         return false;
+      /* Both negation and complement exchange MIN and MAX. */
+      for (unsigned s = 0; s < 2; s++)
+         source[s] = chrome9_ps_temp_source(operand[s].temp, (uint8_t[4]) {
+            CHROME9_PS_SWIZZLE_X, CHROME9_PS_SWIZZLE_ZERO,
+            CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO });
+      *condition = operand[0];
+      lowered = chrome9_ps_emit_temp(
+         builder, (alu->op == nir_op_iand) ^ operand[0].negate ^
+                  operand[0].invert ? CHROME9_PS_OPCODE_MIN :
+                                      CHROME9_PS_OPCODE_MAX,
+         source, 2, 1, &condition->temp);
+      break;
+   default:
+      return false;
+   }
+   if (!lowered || builder->condition_count >= ARRAY_SIZE(builder->condition))
+      return lowered;
+   builder->condition[builder->condition_count].predicate = predicate;
+   builder->condition[builder->condition_count++].condition = *condition;
+   return true;
+}
+
+/* CMP(condition, when_true, when_false) over the written lanes; lane c of
+ * the condition is read from condition_swizzle[c]. */
+static bool
+chrome9_ps_emit_condition_cmp(struct chrome9_ps_nir_builder *builder,
+                              const struct chrome9_ps_condition *condition,
+                              const uint8_t condition_swizzle[4],
+                              const struct chrome9_ps_source *when_true,
+                              const struct chrome9_ps_source *when_false,
+                              unsigned writemask, uint8_t temp)
+{
+   struct chrome9_ps_instruction *conditional =
+      chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_CMP);
+
    if (!conditional)
       return false;
    conditional->destination.file = CHROME9_PS_DESTINATION_TEMP;
    conditional->destination.id = temp;
-   conditional->destination.writemask = (1u << components) - 1;
-   conditional->source[0].file = CHROME9_PS_SOURCE_TEMP;
-   conditional->source[0].id = condition_temp;
-   for (unsigned c = 0; c < 4; c++)
-      conditional->source[0].swizzle[c] = c < components ?
-         CHROME9_PS_SWIZZLE_X : CHROME9_PS_SWIZZLE_ZERO;
-   conditional->source[1] = *when_nonnegative;
-   conditional->source[2] = *when_negative;
-   memset(result, 0, sizeof(*result));
-   result->file = CHROME9_PS_SOURCE_TEMP;
-   result->id = temp;
-   for (unsigned c = 0; c < 4; c++)
-      result->swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
-   return true;
-}
-
-/* Scalar lhs - rhs into a new temp; its sign orders the two operands. */
-static bool
-chrome9_ps_emit_difference(struct chrome9_ps_nir_builder *builder,
-                           nir_alu_src *lhs, nir_alu_src *rhs,
-                           uint8_t *condition_temp)
-{
-   struct chrome9_ps_source a, b;
-   struct chrome9_ps_instruction *subtract;
-
-   if (!chrome9_ps_lower_alu_source(builder, lhs, 1, &a) ||
-       !chrome9_ps_lower_alu_source(builder, rhs, 1, &b) ||
-       builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
-      return false;
-   *condition_temp = builder->next_temp++;
-   subtract = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_SUB);
-   if (!subtract)
-      return false;
-   subtract->destination.file = CHROME9_PS_DESTINATION_TEMP;
-   subtract->destination.id = *condition_temp;
-   subtract->destination.writemask = 1;
-   subtract->source[0] = a;
-   subtract->source[1] = b;
+   conditional->destination.writemask = writemask;
+   conditional->source[0] = chrome9_ps_temp_source(condition->temp,
+                                                   condition_swizzle);
+   conditional->source[0].modifier = condition->negate ?
+      CHROME9_PS_SOURCE_NEGATE : 0;
+   conditional->source[1] = condition->invert ? *when_false : *when_true;
+   conditional->source[2] = condition->invert ? *when_true : *when_false;
    return true;
 }
 
 /*
  * Select between two lowered values under a scalar boolean predicate without
- * materializing integers: ordered float compares become SUB+CMP, and
- * iand/ior/inot become nested or exchanged CMP arms.  Compares are admitted
- * only in the default float mode on operands proven free of defined
- * exceptional values; NaN preservation is never admitted.
+ * materializing integers: ordered float compares become SUB+CMP, equality
+ * SUB+ABS and a negated CMP condition.  Mixed conjunctions fall back to
+ * nested or exchanged CMP arms.  Compares are admitted only on operands
+ * proven free of defined exceptional values.
  */
 static bool
 chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
@@ -4305,9 +4677,10 @@ chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
                                  unsigned components, unsigned depth,
                                  struct chrome9_ps_source *result)
 {
-   nir_alu_instr *alu;
+   struct chrome9_ps_condition condition;
    struct chrome9_ps_source inner;
-   uint8_t condition, reverse;
+   uint8_t swizzle[4], temp;
+   nir_alu_instr *alu;
 
    if (depth > 8)
       return false;
@@ -4318,12 +4691,25 @@ chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
       *result = nir_scalar_as_bool(predicate) ? *when_true : *when_false;
       return true;
    }
+   if (chrome9_ps_lower_condition(builder, predicate, 0, &condition)) {
+      if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+         return false;
+      temp = builder->next_temp++;
+      for (unsigned c = 0; c < 4; c++)
+         swizzle[c] = c < components ? CHROME9_PS_SWIZZLE_X :
+                                       CHROME9_PS_SWIZZLE_ZERO;
+      if (!chrome9_ps_emit_condition_cmp(builder, &condition, swizzle,
+                                         when_true, when_false,
+                                         BITFIELD_MASK(components), temp))
+         return false;
+      for (unsigned c = 0; c < 4; c++)
+         swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
+      *result = chrome9_ps_temp_source(temp, swizzle);
+      return true;
+   }
    if (nir_def_instr(predicate.def)->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(nir_def_instr(predicate.def));
-   if (predicate.comp >= alu->def.num_components)
-      return false;
-
    switch (alu->op) {
    case nir_op_inot:
       return chrome9_ps_emit_predicate_select(
@@ -4343,53 +4729,93 @@ chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
              chrome9_ps_emit_predicate_select(
                 builder, nir_scalar_chase_alu_src(predicate, 0), when_true,
                 &inner, components, depth + 1, result);
-   case nir_op_fge:
-   case nir_op_flt:
-   case nir_op_feq:
-   case nir_op_fneu:
-      break;
    default:
       return false;
    }
-   /* Finite operands make a NaN preserve request vacuous. */
-   if (!alu->src[0].src.ssa || !alu->src[1].src.ssa ||
-       alu->src[0].src.ssa->bit_size != 32 ||
-       alu->src[1].src.ssa->bit_size != 32 ||
-       !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 0),
-                                  &builder->proof) ||
-       !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 1),
-                                  &builder->proof))
-      return false;
-   {
-      /* Lower one component of each operand as a scalar source. */
-      nir_alu_src lhs = alu->src[0], rhs = alu->src[1];
+}
 
-      lhs.swizzle[0] = alu->src[0].swizzle[predicate.comp];
-      rhs.swizzle[0] = alu->src[1].swizzle[predicate.comp];
-      if (!chrome9_ps_emit_difference(builder, &lhs, &rhs, &condition))
-         return false;
-      switch (alu->op) {
-      case nir_op_fge:
-         return chrome9_ps_emit_cmp(builder, condition, when_true,
-                                    when_false, components, result);
-      case nir_op_flt:
-         return chrome9_ps_emit_cmp(builder, condition, when_false,
-                                    when_true, components, result);
-      default:
-         /* Equality holds when both differences are nonnegative. */
-         if (!chrome9_ps_emit_difference(builder, &rhs, &lhs, &reverse))
-            return false;
-         if (alu->op == nir_op_feq)
-            return chrome9_ps_emit_cmp(builder, reverse, when_true,
-                                       when_false, components, &inner) &&
-                   chrome9_ps_emit_cmp(builder, condition, &inner,
-                                       when_false, components, result);
-         return chrome9_ps_emit_cmp(builder, reverse, when_false,
-                                    when_true, components, &inner) &&
-                chrome9_ps_emit_cmp(builder, condition, &inner,
-                                    when_true, components, result);
-      }
+/* Per-lane predicates: lanes of one compare share a vector condition, other
+ * lanes are grouped by predicate, one CMP per group into the result. */
+static bool
+chrome9_ps_emit_lane_select(struct chrome9_ps_nir_builder *builder,
+                            const nir_alu_src *predicate,
+                            const struct chrome9_ps_source *when_true,
+                            const struct chrome9_ps_source *when_false,
+                            unsigned components,
+                            struct chrome9_ps_source *result)
+{
+   struct chrome9_ps_condition condition;
+   nir_scalar lane[4];
+   uint8_t compare_lane[4], swizzle[4], temp;
+   nir_alu_instr *compare = NULL;
+   unsigned remaining = BITFIELD_MASK(components);
+
+   if (components > 4)
+      return false;
+   for (unsigned c = 0; c < components; c++) {
+      lane[c] = nir_scalar_resolved(predicate->src.ssa, predicate->swizzle[c]);
+      compare_lane[c] = lane[c].comp;
    }
+   if (nir_scalar_is_alu(lane[0]))
+      compare = nir_instr_as_alu(nir_def_instr(lane[0].def));
+   for (unsigned c = 1; c < components && compare; c++)
+      if (lane[c].def != lane[0].def)
+         compare = NULL;
+   if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+      return false;
+   temp = builder->next_temp++;
+   for (unsigned c = 0; c < 4; c++)
+      swizzle[c] = c < components ? c : CHROME9_PS_SWIZZLE_ZERO;
+   if (compare &&
+       chrome9_ps_lower_compare_lanes(builder, compare, compare_lane,
+                                      components, &condition)) {
+      remaining = 0;
+      if (!chrome9_ps_emit_condition_cmp(builder, &condition, swizzle,
+                                         when_true, when_false,
+                                         BITFIELD_MASK(components), temp))
+         return false;
+   }
+   while (remaining) {
+      const unsigned first = __builtin_ctz(remaining);
+      unsigned mask = 0;
+
+      if (nir_scalar_is_const(lane[first])) {
+         struct chrome9_ps_instruction *move =
+            chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+
+         for (unsigned c = first; c < components; c++)
+            if (nir_scalar_is_const(lane[c]) &&
+                nir_scalar_as_bool(lane[c]) ==
+                   nir_scalar_as_bool(lane[first]))
+               mask |= 1u << c;
+         if (!move)
+            return false;
+         move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         move->destination.id = temp;
+         move->destination.writemask = mask;
+         move->source[0] = nir_scalar_as_bool(lane[first]) ? *when_true :
+                                                             *when_false;
+      } else {
+         uint8_t condition_swizzle[4];
+
+         if (!chrome9_ps_lower_condition(builder, lane[first], 0,
+                                         &condition))
+            return false;
+         for (unsigned c = first; c < components; c++)
+            if (nir_scalar_equal(lane[c], lane[first]))
+               mask |= 1u << c;
+         for (unsigned c = 0; c < 4; c++)
+            condition_swizzle[c] = mask & (1u << c) ?
+               CHROME9_PS_SWIZZLE_X : CHROME9_PS_SWIZZLE_ZERO;
+         if (!chrome9_ps_emit_condition_cmp(builder, &condition,
+                                            condition_swizzle, when_true,
+                                            when_false, mask, temp))
+            return false;
+      }
+      remaining &= ~mask;
+   }
+   *result = chrome9_ps_temp_source(temp, swizzle);
+   return true;
 }
 
 static bool
@@ -4409,7 +4835,7 @@ chrome9_ps_record_value(struct chrome9_ps_nir_builder *builder, nir_def *def,
    return true;
 }
 
-/* General bcsel and b2f32 under one broadcast scalar predicate. */
+/* General bcsel and b2f32 under a broadcast or per-lane predicate. */
 static bool
 chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
                                 nir_alu_instr *alu, nir_def *def,
@@ -4422,6 +4848,7 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
    const unsigned predicate_src = 0;
    unsigned components = def->num_components;
    struct chrome9_ps_source when_true, when_false, result;
+   bool lane_predicates = false;
 
    if ((alu->op != nir_op_bcsel && alu->op != nir_op_b2f32) ||
        !components || components > 4 ||
@@ -4431,7 +4858,7 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
    for (unsigned c = 1; c < components; c++)
       if (alu->src[predicate_src].swizzle[c] !=
           alu->src[predicate_src].swizzle[0])
-         return false;
+         lane_predicates = true;
    if (alu->op == nir_op_bcsel) {
       if (!chrome9_ps_lower_alu_source(builder, &alu->src[1], components,
                                        &when_true) ||
@@ -4442,12 +4869,65 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
               !chrome9_ps_immediate(builder, zero, components, &when_false)) {
       return false;
    }
+   if (lane_predicates)
+      return chrome9_ps_emit_lane_select(builder, &alu->src[predicate_src],
+                                         &when_true, &when_false,
+                                         components, &result) &&
+             chrome9_ps_record_value(builder, def, &result, source);
    return chrome9_ps_emit_predicate_select(
              builder,
              (nir_scalar) { alu->src[predicate_src].src.ssa,
                             alu->src[predicate_src].swizzle[0] },
              &when_true, &when_false, components, 0, &result) &&
           chrome9_ps_record_value(builder, def, &result, source);
+}
+
+/* sign(x) of a finite x: CMP(-x, 0, 1) is 1 for x > 0 and 0 otherwise,
+ * CMP(x, that, -1) adds -1 for x < 0; both signed zeros give 0. */
+static bool
+chrome9_ps_lower_sign(struct chrome9_ps_nir_builder *builder,
+                      nir_alu_instr *alu, nir_def *def,
+                      struct chrome9_ps_source *source)
+{
+   static const uint32_t zero[4] = { 0 };
+   static const uint32_t one[4] = {
+      0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+   };
+   static const uint32_t minus_one[4] = {
+      0xbf800000, 0xbf800000, 0xbf800000, 0xbf800000,
+   };
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+   const unsigned components = def->num_components;
+   struct chrome9_ps_source operand[3], value;
+   uint8_t swizzle[4] = {
+      CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO,
+      CHROME9_PS_SWIZZLE_ZERO, CHROME9_PS_SWIZZLE_ZERO,
+   };
+   uint8_t positive, sign;
+
+   if (!chrome9_ps_default_finite_alu_source(alu, 0, components,
+                                             &builder->proof) ||
+       !chrome9_ps_lower_alu_source(builder, &alu->src[0], components,
+                                    &value))
+      return false;
+   operand[0] = value;
+   operand[0].modifier ^= CHROME9_PS_SOURCE_NEGATE;
+   if (operand[0].modifier & ~CHROME9_PS_SOURCE_NEGATE ||
+       value.file == CHROME9_PS_SOURCE_POSITION ||
+       !chrome9_ps_immediate(builder, zero, components, &operand[1]) ||
+       !chrome9_ps_immediate(builder, one, components, &operand[2]) ||
+       !chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_CMP, operand, 3,
+                             BITFIELD_MASK(components), &positive))
+      return false;
+   memcpy(swizzle, identity, components);
+   operand[0] = value;
+   operand[1] = chrome9_ps_temp_source(positive, swizzle);
+   if (!chrome9_ps_immediate(builder, minus_one, components, &operand[2]) ||
+       !chrome9_ps_emit_temp(builder, CHROME9_PS_OPCODE_CMP, operand, 3,
+                             BITFIELD_MASK(components), &sign))
+      return false;
+   operand[0] = chrome9_ps_temp_source(sign, swizzle);
+   return chrome9_ps_record_value(builder, def, &operand[0], source);
 }
 
 static bool
@@ -4905,6 +5385,8 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       return chrome9_ps_lower_general_select(builder, alu, def, source);
    if (alu->op == nir_op_ftrunc || alu->op == nir_op_fceil)
       return chrome9_ps_lower_round(builder, alu, def, source);
+   if (alu->op == nir_op_fsign)
+      return chrome9_ps_lower_sign(builder, alu, def, source);
    for (unsigned s = 0; s < ARRAY_SIZE(source_components); s++)
       source_components[s] = components;
    if (alu->op == nir_op_fpow) {

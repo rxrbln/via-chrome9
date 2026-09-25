@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -861,12 +862,13 @@ check_equal_zero_select_compilation(struct chrome9_context *context,
       default: break;
       }
    }
-   valid = expect_supported ?
-      shader.supported && shader.semantic_fs_valid &&
+   /* NIR CSE merges the three selects.  A nonzero reference takes the
+    * general finite path: SUB, ABS and a negated CMP, without a guard. */
+   valid = shader.supported && shader.semantic_fs_valid &&
       shader.native_fs_valid &&
-      shader.semantic_equal_zero_input_mask == (1u << 6) &&
-      abs_count == 1 && sub_count == 1 && cmp_count == 3 :
-      !shader.supported && !shader.semantic_fs_valid;
+      shader.semantic_equal_zero_input_mask ==
+         (expect_supported ? 1u << 6 : 0) &&
+      abs_count == 1 && sub_count == 1 && cmp_count == 1;
    if (!valid)
       fprintf(stderr, "equal-zero select compilation failed: ref=%g "
               "expected=%u supported=%u semantic=%u native=%u "
@@ -903,9 +905,9 @@ check_nonnegative_select_compilation(struct chrome9_context *context)
       unsigned sub = 0, cmp = 0;
       bool found = false;
       /* The general finite-predicate path also admits the unbounded input,
-       * zero threshold and negative threshold.  Only preserve_nan on the
-       * arithmetic producer remains outside the native CMP contract. */
-      bool expected = test != 3;
+       * zero and negative thresholds, and preserve_nan on a producer of
+       * finite operands (d987544). */
+      bool expected = true;
       bool valid;
 
       nir_instr_as_alu(nir_def_instr(lighting))->fp_math_ctrl =
@@ -1118,10 +1120,10 @@ check_general_predicate_compilation(struct chrome9_context *context)
 {
    static const char *const names[] = {
       "b2f32-fge", "flt-and-bcsel", "feq-bcsel", "fneu-bcsel",
-      "ior-bcsel", "inot-bcsel", "preserve-nan-rejected",
-      "preserve-inf-normalize", "preserve-inf-unbounded-rejected",
+      "ior-bcsel", "inot-bcsel", "preserve-nan-finite",
+      "preserve-inf-normalize", "preserve-inf-unbounded",
    };
-   static const unsigned min_compares[] = { 1, 2, 2, 2, 2, 1, 0, 1, 0 };
+   static const unsigned min_compares[] = { 1, 2, 1, 1, 2, 1, 1, 1, 1 };
 
    for (unsigned test = 0; test < ARRAY_SIZE(names); test++) {
       nir_builder b = nir_builder_init_simple_shader(
@@ -1165,7 +1167,7 @@ check_general_predicate_compilation(struct chrome9_context *context)
       case 7:
       case 8: {
          /* GLSL tags neg/compare and normalize()'s folded multiply with
-          * preserve_inf; only the bounded normalize form is admitted. */
+          * preserve_inf; finite operands admit both forms. */
          nir_def *v = nir_trim_vector(&b, a, 3);
          nir_def *n = nir_fneg(&b, v);
          nir_def *m;
@@ -1206,9 +1208,8 @@ check_general_predicate_compilation(struct chrome9_context *context)
          compares += shader.semantic_fs_ir.instruction[i].op ==
                      CHROME9_PS_OPCODE_CMP;
       }
-      valid = test == 6 || test == 8 ?
-         !shader.supported && !shader.semantic_fs_valid :
-         shader.supported && shader.semantic_fs_valid &&
+      /* Finite operands make preserve flags vacuous (d987544, e17da35). */
+      valid = shader.supported && shader.semantic_fs_valid &&
          shader.native_fs_valid &&
          subtracts >= min_compares[test] &&
          compares >= min_compares[test];
@@ -1529,42 +1530,411 @@ check_position_alias_compilation(struct chrome9_context *context)
    return valid;
 }
 
+/* Reference evaluation of the semantic IR for the condition tests. */
 static bool
-check_per_lane_conditional_rejected(struct chrome9_context *context)
+eval_ps_source(const float temp[][4], const float constant[][4],
+               const struct chrome9_ps_source *source, float value[4])
 {
-   nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, &options, "chrome9-per-lane-conditional");
-   struct chrome9_shader shader = { 0 };
-   nir_def *barycentric = nir_load_barycentric_pixel(
-      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
-   nir_def *color = nir_load_interpolated_input(
-      &b, 4, 32, barycentric, nir_imm_int(&b, 0),
-      .io_semantics.location = VARYING_SLOT_COL0);
-   nir_def *condition = nir_fge(
-      &b, nir_ffract(&b, nir_trim_vector(&b, color, 3)),
-      nir_imm_vec3(&b, 0.5f, 0.5f, 0.5f));
-   nir_def *selected = nir_bcsel(
-      &b, condition,
-      nir_imm_vec3(&b, 0.25f, 0.5f, 0.75f),
-      nir_imm_vec3(&b, 0.75f, 0.25f, 0.5f));
-   bool rejected;
+   const float *base;
 
-   b.shader->info.io_lowered = true;
-   nir_store_output(&b, nir_vec4(&b,
-      nir_channel(&b, selected, 0), nir_channel(&b, selected, 1),
-      nir_channel(&b, selected, 2), nir_imm_float(&b, 1.0f)),
-      nir_imm_int(&b, 0), .write_mask = 0xf,
-      .io_semantics.location = FRAG_RESULT_COLOR);
-   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
-   nir_recompute_io_bases(b.shader,
-                          nir_var_shader_in | nir_var_shader_out);
-   chrome9_compile_fs_nir(context, &shader, b.shader);
-   rejected = !shader.supported;
-   if (!rejected)
-      fputs("per-lane conditional was miscompiled as a scalar broadcast\n",
-            stderr);
-   ralloc_free(b.shader);
-   return rejected;
+   if (source->file == CHROME9_PS_SOURCE_TEMP &&
+       source->id < CHROME9_PS_MAX_VIRTUAL_TEMPS)
+      base = temp[source->id];
+   else if (source->file == CHROME9_PS_SOURCE_CONSTANT && source->id < 32)
+      base = constant[source->id];
+   else
+      return false;
+   for (unsigned c = 0; c < 4; c++) {
+      const unsigned lane = source->swizzle[c];
+
+      value[c] = lane < 4 ? base[lane] :
+                 lane == CHROME9_PS_SWIZZLE_ONE ? 1.0f : 0.0f;
+      if (source->modifier == CHROME9_PS_SOURCE_NEGATE)
+         value[c] = -value[c];
+      else if (source->modifier)
+         return false;
+   }
+   return true;
+}
+
+static bool
+eval_ps_ir(const struct chrome9_ps_ir *ir, const float constant[][4],
+           float color[4], bool *killed)
+{
+   static float temp[CHROME9_PS_MAX_VIRTUAL_TEMPS][4];
+
+   *killed = false;
+   for (unsigned i = 0; i < ir->count; i++) {
+      const struct chrome9_ps_instruction *instruction = &ir->instruction[i];
+      float s[3][4], r[4];
+
+      if (instruction->op == CHROME9_PS_OPCODE_KILL) {
+         if (!eval_ps_source(temp, constant, &instruction->source[0], s[0]))
+            return false;
+         for (unsigned c = 0; c < 4; c++)
+            *killed |= s[0][c] < 0.0f;
+         continue;
+      }
+
+      const unsigned count =
+         instruction->op == CHROME9_PS_OPCODE_MOV ||
+         instruction->op == CHROME9_PS_OPCODE_ABS ? 1 :
+         instruction->op == CHROME9_PS_OPCODE_MAD ||
+         instruction->op == CHROME9_PS_OPCODE_CMP ? 3 : 2;
+
+      for (unsigned n = 0; n < count; n++)
+         if (!eval_ps_source(temp, constant, &instruction->source[n], s[n]))
+            return false;
+      for (unsigned c = 0; c < 4; c++) {
+         switch (instruction->op) {
+         case CHROME9_PS_OPCODE_MOV: r[c] = s[0][c]; break;
+         case CHROME9_PS_OPCODE_ADD: r[c] = s[0][c] + s[1][c]; break;
+         case CHROME9_PS_OPCODE_SUB: r[c] = s[0][c] - s[1][c]; break;
+         case CHROME9_PS_OPCODE_MUL: r[c] = s[0][c] * s[1][c]; break;
+         case CHROME9_PS_OPCODE_MAD:
+            r[c] = s[0][c] * s[1][c] + s[2][c];
+            break;
+         case CHROME9_PS_OPCODE_MIN: r[c] = fminf(s[0][c], s[1][c]); break;
+         case CHROME9_PS_OPCODE_MAX: r[c] = fmaxf(s[0][c], s[1][c]); break;
+         case CHROME9_PS_OPCODE_ABS: r[c] = fabsf(s[0][c]); break;
+         case CHROME9_PS_OPCODE_CMP:
+            r[c] = s[0][c] >= 0.0f ? s[1][c] : s[2][c];
+            break;
+         case CHROME9_PS_OPCODE_DP3:
+            r[c] = s[0][0] * s[1][0] + s[0][1] * s[1][1] +
+                   s[0][2] * s[1][2];
+            break;
+         case CHROME9_PS_OPCODE_DP4:
+            r[c] = s[0][0] * s[1][0] + s[0][1] * s[1][1] +
+                   s[0][2] * s[1][2] + s[0][3] * s[1][3];
+            break;
+         default:
+            return false;
+         }
+      }
+      for (unsigned c = 0; c < 4; c++) {
+         if (!(instruction->destination.writemask & (1u << c)))
+            continue;
+         if (instruction->destination.file == CHROME9_PS_DESTINATION_COLOR)
+            color[c] = r[c];
+         else if (instruction->destination.file ==
+                  CHROME9_PS_DESTINATION_TEMP)
+            temp[instruction->destination.id][c] = r[c];
+         else
+            return false;
+      }
+   }
+   return true;
+}
+
+enum condition_case {
+   COND_SHARED_FGE,
+   COND_FEQ,
+   COND_FNEU,
+   COND_AND_FGE,
+   COND_OR_FLT,
+   COND_AND_FEQ,
+   COND_ALL_EQUAL4,
+   COND_ANY_NEQUAL2,
+   COND_ANY_NEQUAL3,
+   COND_LANE_FLT3,
+   COND_LANE_B2F_FGE4,
+   COND_LANE_FEQ3,
+   COND_LANE_MIXED2,
+   COND_AND_MIXED,
+   COND_SIGN,
+   COND_LANE_CONST_MIXED4,
+   COND_ALL_BVEC4,
+   COND_FINITE_CHAIN,
+   /* Boolean uniforms hold exactly 0.0 or 1.0 from here on. */
+   COND_BOOL_SELECT,
+   COND_BOOL_LANE_IEQ2,
+   COND_BOOL_ALL2,
+   COND_BOOL_ANY3,
+   COND_BOOL_XOR,
+   COND_CASES,
+};
+
+static const struct {
+   const char *name;
+   unsigned sub, abs, minmax, dp, cmp;
+} condition_expect[COND_CASES] = {
+   [COND_SHARED_FGE] = { "shared-fge", 1, 0, 0, 0, 3 },
+   [COND_FEQ] = { "feq", 1, 1, 0, 0, 1 },
+   [COND_FNEU] = { "fneu", 1, 1, 0, 0, 1 },
+   [COND_AND_FGE] = { "and-fge", 2, 0, 1, 0, 1 },
+   [COND_OR_FLT] = { "or-flt", 2, 0, 1, 0, 1 },
+   [COND_AND_FEQ] = { "and-feq", 2, 2, 1, 0, 1 },
+   [COND_ALL_EQUAL4] = { "all-equal4", 1, 1, 0, 1, 1 },
+   [COND_ANY_NEQUAL2] = { "any-nequal2", 1, 1, 1, 0, 1 },
+   [COND_ANY_NEQUAL3] = { "any-nequal3", 1, 1, 0, 1, 1 },
+   [COND_LANE_FLT3] = { "lane-flt3", 1, 0, 0, 0, 1 },
+   [COND_LANE_B2F_FGE4] = { "lane-b2f-fge4", 1, 0, 0, 0, 1 },
+   [COND_LANE_FEQ3] = { "lane-feq3", 1, 1, 0, 0, 1 },
+   [COND_LANE_MIXED2] = { "lane-mixed2", 2, 0, 0, 0, 2 },
+   [COND_AND_MIXED] = { "and-mixed", 2, 0, 0, 0, 2 },
+   [COND_SIGN] = { "sign", 0, 0, 0, 0, 2 },
+   [COND_LANE_CONST_MIXED4] = { "lane-const-mixed4", 2, 0, 0, 0, 2 },
+   [COND_ALL_BVEC4] = { "all-bvec4", 3, 1, 0, 1, 3 },
+   [COND_FINITE_CHAIN] = { "finite-chain", 2, 0, 0, 0, 4 },
+   [COND_BOOL_SELECT] = { "bool-select", 0, 1, 0, 0, 1 },
+   [COND_BOOL_LANE_IEQ2] = { "bool-lane-ieq2", 1, 1, 0, 0, 1 },
+   [COND_BOOL_ALL2] = { "bool-all2", 1, 1, 1, 0, 1 },
+   [COND_BOOL_ANY3] = { "bool-any3", 1, 1, 0, 1, 1 },
+   [COND_BOOL_XOR] = { "bool-xor", 1, 1, 0, 0, 1 },
+};
+
+static nir_def *
+build_condition_case(nir_builder *b, enum condition_case test, nir_def *a,
+                     nir_def *c)
+{
+   nir_def *t = nir_imm_vec4(b, 0.25f, 0.5f, 0.75f, 1.0f);
+   nir_def *f = nir_imm_vec4(b, 0.75f, 0.125f, 0.5f, 0.0f);
+   nir_def *ax = nir_channel(b, a, 0), *cx = nir_channel(b, c, 0);
+   nir_def *ay = nir_channel(b, a, 1), *cy = nir_channel(b, c, 1);
+   nir_def *p;
+
+   switch (test) {
+   case COND_SHARED_FGE:
+      p = nir_fge(b, ax, cx);
+      return nir_fadd(b, nir_fadd(b, nir_bcsel(b, p, t, f),
+                                  nir_bcsel(b, p, f, t)),
+                      nir_bcsel(b, p, nir_fmul(b, t, t), f));
+   case COND_FEQ: p = nir_feq(b, ax, cx); break;
+   case COND_FNEU: p = nir_fneu(b, ax, cx); break;
+   case COND_AND_FGE:
+      p = nir_iand(b, nir_fge(b, ax, cx), nir_fge(b, ay, cy));
+      break;
+   case COND_OR_FLT:
+      p = nir_ior(b, nir_flt(b, ax, cx), nir_flt(b, ay, cy));
+      break;
+   case COND_AND_FEQ:
+      p = nir_iand(b, nir_feq(b, ax, cx), nir_feq(b, ay, cy));
+      break;
+   case COND_ALL_EQUAL4: p = nir_ball_fequal4(b, a, c); break;
+   case COND_ANY_NEQUAL2:
+      p = nir_bany_fnequal2(b, nir_trim_vector(b, a, 2),
+                            nir_trim_vector(b, c, 2));
+      break;
+   case COND_ANY_NEQUAL3:
+      p = nir_bany_fnequal3(b, nir_trim_vector(b, a, 3),
+                            nir_trim_vector(b, c, 3));
+      break;
+   case COND_LANE_FLT3:
+      return nir_pad_vector_imm_int(b, nir_bcsel(b,
+         nir_flt(b, nir_trim_vector(b, a, 3), nir_trim_vector(b, c, 3)),
+         nir_trim_vector(b, t, 3), nir_trim_vector(b, f, 3)), 0, 4);
+   case COND_LANE_B2F_FGE4:
+      return nir_b2f32(b, nir_fge(b, a, c));
+   case COND_LANE_FEQ3:
+      return nir_pad_vector_imm_int(b, nir_bcsel(b,
+         nir_feq(b, nir_trim_vector(b, a, 3), nir_trim_vector(b, c, 3)),
+         nir_trim_vector(b, t, 3), nir_trim_vector(b, f, 3)), 0, 4);
+   case COND_LANE_MIXED2:
+      return nir_pad_vector_imm_int(b, nir_bcsel(b,
+         nir_vec2(b, nir_fge(b, ax, cx), nir_flt(b, ay, cy)),
+         nir_trim_vector(b, t, 2), nir_trim_vector(b, f, 2)), 0, 4);
+   case COND_SIGN: return nir_fsign(b, a);
+   case COND_LANE_CONST_MIXED4:
+      return nir_b2f32(b, nir_vec4(b, nir_imm_true(b), nir_fge(b, ax, cx),
+                                   nir_imm_false(b),
+                                   nir_inot(b, nir_flt(b, ay, cy))));
+   case COND_ALL_BVEC4:
+      p = nir_ball_iequal4(b, nir_vec4(b, nir_imm_true(b),
+                                       nir_fge(b, ax, cx),
+                                       nir_inot(b, nir_flt(b, ay, cy)),
+                                       nir_imm_true(b)),
+                           nir_imm_true(b));
+      break;
+   case COND_FINITE_CHAIN:
+      /* sign, b2f and bcsel results are finite compare operands. */
+      p = nir_fge(b, cx, nir_fadd(b, nir_fsign(b, ax),
+                                  nir_b2f32(b, nir_fge(b, ay, cy))));
+      break;
+   case COND_BOOL_XOR:
+      p = nir_ixor(b, nir_b2b1(b, ax), nir_b2b1(b, cx));
+      break;
+   case COND_BOOL_SELECT: p = nir_b2b1(b, ax); break;
+   case COND_BOOL_LANE_IEQ2:
+      return nir_pad_vector_imm_int(b, nir_b2f32(b, nir_ieq(b,
+         nir_b2b1(b, nir_trim_vector(b, a, 2)),
+         nir_b2b1(b, nir_trim_vector(b, c, 2)))), 0, 4);
+   case COND_BOOL_ALL2:
+      p = nir_ball_iequal2(b, nir_b2b1(b, nir_trim_vector(b, a, 2)),
+                           nir_imm_true(b));
+      break;
+   case COND_BOOL_ANY3:
+      p = nir_bany_inequal3(b, nir_b2b1(b, nir_trim_vector(b, a, 3)),
+                            nir_imm_false(b));
+      break;
+   case COND_AND_MIXED:
+   default:
+      p = nir_iand(b, nir_flt(b, ax, cx), nir_fge(b, ay, cy));
+      break;
+   }
+   return nir_bcsel(b, p, t, f);
+}
+
+static void
+reference_condition_case(enum condition_case test, const float a[4],
+                         const float c[4], float out[4])
+{
+   static const float t[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+   static const float f[4] = { 0.75f, 0.125f, 0.5f, 0.0f };
+   bool p = false, lane[4] = { false };
+
+   switch (test) {
+   case COND_SHARED_FGE:
+      p = a[0] >= c[0];
+      for (unsigned i = 0; i < 4; i++)
+         out[i] = ((p ? t[i] : f[i]) + (p ? f[i] : t[i])) +
+                  (p ? t[i] * t[i] : f[i]);
+      return;
+   case COND_FEQ: p = a[0] == c[0]; break;
+   case COND_FNEU: p = a[0] != c[0]; break;
+   case COND_AND_FGE: p = a[0] >= c[0] && a[1] >= c[1]; break;
+   case COND_OR_FLT: p = a[0] < c[0] || a[1] < c[1]; break;
+   case COND_AND_FEQ: p = a[0] == c[0] && a[1] == c[1]; break;
+   case COND_ALL_EQUAL4:
+      p = a[0] == c[0] && a[1] == c[1] && a[2] == c[2] && a[3] == c[3];
+      break;
+   case COND_ANY_NEQUAL2: p = a[0] != c[0] || a[1] != c[1]; break;
+   case COND_ANY_NEQUAL3:
+      p = a[0] != c[0] || a[1] != c[1] || a[2] != c[2];
+      break;
+   case COND_LANE_FLT3:
+   case COND_LANE_FEQ3:
+      for (unsigned i = 0; i < 3; i++) {
+         lane[i] = test == COND_LANE_FLT3 ? a[i] < c[i] : a[i] == c[i];
+         out[i] = lane[i] ? t[i] : f[i];
+      }
+      out[3] = 0.0f;
+      return;
+   case COND_LANE_B2F_FGE4:
+      for (unsigned i = 0; i < 4; i++)
+         out[i] = a[i] >= c[i] ? 1.0f : 0.0f;
+      return;
+   case COND_LANE_MIXED2:
+      out[0] = a[0] >= c[0] ? t[0] : f[0];
+      out[1] = a[1] < c[1] ? t[1] : f[1];
+      out[2] = out[3] = 0.0f;
+      return;
+   case COND_LANE_CONST_MIXED4:
+      out[0] = 1.0f;
+      out[1] = a[0] >= c[0] ? 1.0f : 0.0f;
+      out[2] = 0.0f;
+      out[3] = !(a[1] < c[1]) ? 1.0f : 0.0f;
+      return;
+   case COND_ALL_BVEC4: p = a[0] >= c[0] && !(a[1] < c[1]); break;
+   case COND_SIGN:
+      for (unsigned i = 0; i < 4; i++)
+         out[i] = a[i] > 0.0f ? 1.0f : a[i] < 0.0f ? -1.0f : 0.0f;
+      return;
+   case COND_FINITE_CHAIN:
+      p = c[0] >= (a[0] > 0.0f ? 1.0f : a[0] < 0.0f ? -1.0f : 0.0f) +
+                  (a[1] >= c[1] ? 1.0f : 0.0f);
+      break;
+   case COND_BOOL_XOR: p = (a[0] != 0.0f) != (c[0] != 0.0f); break;
+   case COND_BOOL_SELECT: p = a[0] != 0.0f; break;
+   case COND_BOOL_LANE_IEQ2:
+      for (unsigned i = 0; i < 4; i++)
+         out[i] = i < 2 && (a[i] != 0.0f) == (c[i] != 0.0f) ? 1.0f : 0.0f;
+      return;
+   case COND_BOOL_ALL2: p = a[0] != 0.0f && a[1] != 0.0f; break;
+   case COND_BOOL_ANY3:
+      p = a[0] != 0.0f || a[1] != 0.0f || a[2] != 0.0f;
+      break;
+   case COND_AND_MIXED:
+   default:
+      p = a[0] < c[0] && a[1] >= c[1];
+      break;
+   }
+   for (unsigned i = 0; i < 4; i++)
+      out[i] = p ? t[i] : f[i];
+}
+
+/* Boolean selects lower to shared CMP conditions; the emitted IR must match
+ * the NIR semantics for equal, signed-zero, ordered and mixed operands. */
+static bool
+check_condition_lowering(struct chrome9_context *context)
+{
+   static const float values[] = { 0.0f, -0.0f, 1.0f, -1.0f, 0.5f, 3.0f };
+   const unsigned n = ARRAY_SIZE(values);
+
+   for (unsigned test = 0; test < COND_CASES; test++) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "%s", condition_expect[test].name);
+      struct chrome9_shader shader = { 0 };
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *a = nir_load_ubo_vec4(&b, 4, 32, zero, zero);
+      nir_def *c = nir_load_ubo_vec4(&b, 4, 32, zero, nir_imm_int(&b, 1));
+      unsigned sub = 0, abs_count = 0, minmax = 0, dp = 0, cmp = 0;
+      unsigned mismatches = 0;
+      bool valid;
+
+      nir_store_output(&b, build_condition_case(&b, test, a, c), zero,
+                       .write_mask = 0xf,
+                       .io_semantics.location = FRAG_RESULT_COLOR);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      nir_recompute_io_bases(b.shader,
+                             nir_var_shader_in | nir_var_shader_out);
+      chrome9_compile_fs_nir(context, &shader, b.shader);
+      for (unsigned i = 0; i < shader.semantic_fs_ir.count; i++) {
+         switch (shader.semantic_fs_ir.instruction[i].op) {
+         case CHROME9_PS_OPCODE_SUB: sub++; break;
+         case CHROME9_PS_OPCODE_ABS: abs_count++; break;
+         case CHROME9_PS_OPCODE_MIN:
+         case CHROME9_PS_OPCODE_MAX: minmax++; break;
+         case CHROME9_PS_OPCODE_DP3:
+         case CHROME9_PS_OPCODE_DP4: dp++; break;
+         case CHROME9_PS_OPCODE_CMP: cmp++; break;
+         default: break;
+         }
+      }
+      valid = shader.supported && shader.semantic_fs_valid &&
+         sub == condition_expect[test].sub &&
+         abs_count == condition_expect[test].abs &&
+         minmax == condition_expect[test].minmax &&
+         dp == condition_expect[test].dp &&
+         cmp == condition_expect[test].cmp;
+      /* Every operand lane walks the value set; a and c share lane values
+       * rotated so that equal, ordered and signed-zero pairs all occur. */
+      for (unsigned i = 0; valid && i < n * n * n; i++) {
+         float constant[32][4] = { { 0 } }, color[4], expect[4];
+
+         memcpy(constant, shader.native_fs.immediate, sizeof(constant));
+         for (unsigned lane = 0; lane < 4; lane++) {
+            unsigned index = i / (lane & 1 ? n : 1) + lane;
+
+            constant[0][lane] = values[index % n];
+            constant[1][lane] = values[(i / (n * n) + lane * (lane & 2)) %
+                                       n];
+            if (test >= COND_BOOL_SELECT)
+               for (unsigned u = 0; u < 2; u++)
+                  constant[u][lane] = constant[u][lane] > 0.0f ? 1.0f : 0.0f;
+         }
+         reference_condition_case(test, constant[0], constant[1], expect);
+         bool killed;
+
+         if (!eval_ps_ir(&shader.semantic_fs_ir, constant, color, &killed) ||
+             killed) {
+            valid = false;
+            break;
+         }
+         mismatches += memcmp(color, expect, sizeof(color)) != 0;
+      }
+      valid &= !mismatches;
+      if (!valid)
+         fprintf(stderr, "%s condition failed: supported=%u semantic=%u "
+                 "sub=%u abs=%u minmax=%u dp=%u cmp=%u ir=%u "
+                 "mismatches=%u\n", condition_expect[test].name,
+                 shader.supported, shader.semantic_fs_valid, sub, abs_count,
+                 minmax, dp, cmp, shader.semantic_fs_ir.count, mismatches);
+      ralloc_free(b.shader);
+      if (!valid)
+         return false;
+   }
+   return true;
 }
 
 static bool
@@ -2410,7 +2780,7 @@ main(void)
    failures += !check_front_face_variant_context();
    failures += !check_saturated_add_rgb_alpha_split(&context);
    failures += !check_position_alias_compilation(&context);
-   failures += !check_per_lane_conditional_rejected(&context);
+   failures += !check_condition_lowering(&context);
    failures += !check_blinn_phong_integer_power(&context);
    failures += !check_function_medium_sqrt_boundary(&context);
    failures += !check_ideas_logo_shadow_compilation(&context);
