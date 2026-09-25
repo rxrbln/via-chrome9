@@ -1526,13 +1526,7 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
                 sizeof(constants[i]));
       else if ((uniform_mask & (1u << i)) && !map)
          return false;
-      for (unsigned c = 0; c < 4; c++) {
-         float value;
-
-         memcpy(&value, &constants[i][c], sizeof(value));
-         if (!isfinite(value))
-            return false;
-      }
+      chrome9_finite_constants(constants[i], 4);
    }
    return true;
 }

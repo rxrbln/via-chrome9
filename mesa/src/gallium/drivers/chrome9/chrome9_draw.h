@@ -3,8 +3,11 @@
 #ifndef CHROME9_DRAW_H
 #define CHROME9_DRAW_H
 
+#include <float.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "drm-uapi/chrome9_drm.h"
 
@@ -51,5 +54,21 @@ bool chrome9_draw_tcl_submit(struct chrome9_context *ctx,
                              unsigned triangles,
                              struct pipe_resource *const *buffers,
                              unsigned buffer_count);
+
+/* The kernel takes finite program constants only: NaN (e.g. folded from
+ * an undefined value) becomes zero, infinities the largest finite value. */
+static inline void
+chrome9_finite_constants(uint32_t *words, unsigned count)
+{
+   for (unsigned i = 0; i < count; i++) {
+      float value;
+
+      memcpy(&value, &words[i], sizeof(value));
+      if (isfinite(value))
+         continue;
+      value = isnan(value) ? 0.0f : copysignf(FLT_MAX, value);
+      memcpy(&words[i], &value, sizeof(value));
+   }
+}
 
 #endif

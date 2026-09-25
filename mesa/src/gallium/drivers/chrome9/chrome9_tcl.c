@@ -3942,15 +3942,10 @@ tcl_constants(struct chrome9_context *ctx, const struct chrome9_tcl_program *p,
          return false;
       /* As in chrome9_draw_vbo(): the offset applies to both kinds. */
       memcpy(rows, map + cb->buffer_offset, p->uniform_rows * 16);
-      for (unsigned i = 0; i < p->uniform_rows * 4; i++) {
-         float f;
-
-         memcpy(&f, &rows[i / 4][i % 4], sizeof(f));
-         if (!isfinite(f))
-            return false;
-      }
    }
    memcpy(rows + p->uniform_rows, p->immediates, p->immediate_count * 16);
+   chrome9_finite_constants(rows[0],
+                            (p->uniform_rows + p->immediate_count) * 4);
    return true;
 }
 
