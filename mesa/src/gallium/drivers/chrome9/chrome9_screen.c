@@ -326,6 +326,8 @@ static const struct nir_shader_compiler_options chrome9_nir_options = {
     * A limit of 31 therefore admits exactly 32 body executions; the focused
     * test proves that 32 unrolls and 33 remains explicit control flow. */
    .max_unroll_iterations = 31,
+   /* Integer bit operations have no float lowering. */
+   .lower_bitops = true,
    .no_integers = true,
 };
 
