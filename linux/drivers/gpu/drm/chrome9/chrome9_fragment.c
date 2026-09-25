@@ -239,7 +239,12 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			chrome9_fragment_op_sources(instruction->op);
 		unsigned int source;
 
-		if (!source_count || instruction->reserved)
+		if (!source_count ||
+		    (instruction->flags &&
+		     (instruction->op != DRM_CHROME9_FRAGMENT_OP_TEX ||
+		      instruction->flags != DRM_CHROME9_FRAGMENT_TEX_BIAS ||
+		      instruction->src[0].file != DRM_CHROME9_FRAGMENT_FILE_TEMP ||
+		      str_mask & BIT(instruction->sampler))))
 			return -EINVAL;
 		/* VX900 aliases the C read to A when one MAD/CMP names three
 		 * distinct constant registers.  Two distinct registers, including
@@ -1050,7 +1055,9 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 			if (previous_phase == 0)
 				program->controls[5 + (alu_index - 1) / 24] |=
 					BIT((alu_index - 1) % 24);
-			program->tau[tau_index] = 0x20100000 |
+			/* TAU operation 1 TEXLD, 3 TEXLDB */
+			program->tau[tau_index] = (instruction->flags &
+				DRM_CHROME9_FRAGMENT_TEX_BIAS ? 0x20300000 : 0x20100000) |
 				(state->coordinate_last_tau[coordinate_id] == i ?
 				 BIT(28) : 0) |
 				(u32)instruction->sampler << 24 |
@@ -1615,7 +1622,7 @@ static int chrome9_fragment_kill_selftest(struct chrome9_fragment_program *progr
 	if (!chrome9_fragment_kill_rejected(bad, constants, program))
 		return -EINVAL;
 	memcpy(bad, constant_kill, sizeof(bad));
-	bad[1].reserved = 1;
+	bad[1].flags = 1;
 	if (!chrome9_fragment_kill_rejected(bad, constants, program))
 		return -EINVAL;
 	memcpy(bad, constant_kill, sizeof(bad));
@@ -2989,6 +2996,24 @@ int chrome9_fragment_selftest(void)
 		   sizeof(expected_controls))) {
 		ret = -EINVAL;
 		goto out;
+	}
+	{
+		struct drm_chrome9_fragment_instruction biased[ARRAY_SIZE(computed)];
+		unsigned int i;
+
+		/* TEXLDB: the same program with TAU operation 3 */
+		memcpy(biased, computed, sizeof(biased));
+		for (i = 0; i < ARRAY_SIZE(biased); i++)
+			if (biased[i].op == DRM_CHROME9_FRAGMENT_OP_TEX)
+				biased[i].flags = DRM_CHROME9_FRAGMENT_TEX_BIAS;
+		ret = chrome9_fragment_compile(biased, ARRAY_SIZE(biased),
+			constants, 2, 1, 0, program);
+		if (ret || program->tau_count != 1 ||
+		    program->tau[0] != 0x303101b0 ||
+		    memcmp(program->alu, expected_alu, sizeof(expected_alu))) {
+			ret = -EINVAL;
+			goto out;
+		}
 	}
 	ret = chrome9_fragment_compile(repeated_computed,
 		ARRAY_SIZE(repeated_computed), constants, 3, 1, 0, program);

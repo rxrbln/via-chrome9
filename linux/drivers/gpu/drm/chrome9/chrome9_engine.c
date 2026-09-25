@@ -221,6 +221,11 @@ module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
 MODULE_PARM_DESC(blend_equation,
 	"Blend SUBTRACT, REVERSE_SUBTRACT, MIN and MAX (default: true)");
 
+static bool chrome9_texture_bias = true;
+module_param_named(texture_bias, chrome9_texture_bias, bool, 0600);
+MODULE_PARM_DESC(texture_bias,
+	"Fragment TEX with a per-fragment LOD bias, TEXLDB (default: true)");
+
 static bool chrome9_blend_color = true;
 module_param_named(blend_color, chrome9_blend_color, bool, 0600);
 MODULE_PARM_DESC(blend_color,
@@ -6540,6 +6545,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_BLEND_EQUATION;
 	if (READ_ONCE(chrome9_blend_color))
 		caps |= DRM_CHROME9_CAP2_BLEND_COLOR;
+	if (READ_ONCE(chrome9_texture_bias))
+		caps |= DRM_CHROME9_CAP2_TEXTURE_BIAS;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
@@ -12169,6 +12176,10 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		args->instruction_count, sizeof(*instructions));
 	if (IS_ERR(instructions))
 		return PTR_ERR(instructions);
+	if (!(caps2 & DRM_CHROME9_CAP2_TEXTURE_BIAS))
+		for (i = 0; i < args->instruction_count; i++)
+			if (instructions[i].flags)
+				return -EOPNOTSUPP;
 	if (args->constant_count) {
 		constants = chrome9_arena_copy_user(arena, args->constants_ptr,
 			args->constant_count, 4 * sizeof(*constants));
