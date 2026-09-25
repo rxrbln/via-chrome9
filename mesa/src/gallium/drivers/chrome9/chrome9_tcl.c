@@ -2091,6 +2091,10 @@ tcl_triangle(enum mesa_prim mode, unsigned t, bool first, unsigned v[3])
 {
    unsigned provoking, k;
 
+   /* Quads do not follow the provoking-vertex convention (the screen
+    * reports quads_follow_provoking_vertex_convention false): last. */
+   if (mode == MESA_PRIM_QUADS || mode == MESA_PRIM_QUAD_STRIP)
+      first = false;
    switch (mode) {
    case MESA_PRIM_TRIANGLES:
       v[0] = 3 * t; v[1] = 3 * t + 1; v[2] = 3 * t + 2;
