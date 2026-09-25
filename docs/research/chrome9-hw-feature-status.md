@@ -69,7 +69,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 |---|---|---|
 | CLAMP_TO_BORDER with sampler border colour (A32 code 0, A35/A36 s1.10) | `b9d6f7d` / `0c2c83d` | on (CAP2 bit 16, `texture_border`); `chrome9_gl_border_smoke` exact, piglit texwrap `bordercolor` variants pass where the draw reaches the kernel |
 | GL_CLAMP (NEAREST = clamp to edge, LINEAR = border + saturated coordinate) | Mesa `0c2c83d` | on; the state tracker's saturated TXD becomes TEX (no TEXLDD), LOD differs only on clamped edge samples; smoke exact |
-| MIRROR_CLAMP_TO_EDGE (A32 code 7, mirror once) | `b9d6f7d` / `0c2c83d` | off (CAP2 bit 17, `texture_mirror_once`): smoke exact in 9 of 10 runs; the first run after a module reload read samples at negative coordinates as 0,0,0,0 |
+| MIRROR_CLAMP_TO_EDGE (A32 code 7, mirror once) | `b9d6f7d` / `0c2c83d`, default on `cb20c55` | on (CAP2 bit 17, `texture_mirror_once`): smoke exact (nearest) / 1 LSB (linear) on the first runs after two fresh module loads; the one zero-sample run predates the SWIOTLB fix `018a504` |
 | 1D textures as height-1 2D | Mesa `0c2c83d` | on; smoke exact |
 | depth-compare samplers (ARB_shadow, shadow1D/2D/2DRect, ARB_fp shadow) | Mesa `0c2c83d`, `d00e5a2` | on; compare lowered in the FS per variant like the vendor GL; D24 reads raw / 2^24, the reference is scaled to match; LINEAR compare = one nearest sample (vendor); `chrome9-shadow-compare-re.md` |
 | whole-level min/max LOD limits (A30) | Mesa `0c2c83d` | on; fractional LINEAR limits and other unsupported sampler states render in llvmpipe; piglit lodclamp* pass |

@@ -104,9 +104,13 @@ default and Mesa does not expose ARB_texture_mirror_clamp_to_edge.
 
 ## Open
 
-* Mirror once: reproduce the first-run failure right after a module load
-  (for example, whether a first border emission is needed) before enabling
-  `texture_mirror_once` by default.
+* Mirror once: done 2026-09-25.  Two fresh module loads (TEXLDB module
+  `dbadc6e` and the mip-destination module), each followed first thing by
+  three `chrome9_gl_border_smoke MIRROR_CLAMP_TO_EDGE` runs and one full
+  smoke, were exact (nearest) or within 1 LSB (linear), 2D and 1D
+  (`artifacts/2026-09-25/mirror-once-*.txt`).  The earlier zero samples
+  predate `018a504`, which fixed SWIOTLB lost jobs with partially zero
+  readbacks.  `texture_mirror_once` is on by default (kernel `cb20c55`).
 * piglit `texwrap`: every draw of the test currently fails with EINVAL
   before any texture state is involved (a constant-colour clear-like quad
   whose vertices start at x = y = -0.5); this is outside the sampler path.
