@@ -6534,7 +6534,10 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
                     ((chrome9_is_surface_target(texture->target) &&
                       templ->target == texture->target) || cube) &&
                     templ->format == texture->format &&
-                    chrome9_texture_format_info(templ->format) &&
+                    /* Formats without a sampler encoding (Z16) are
+                     * sampled by llvmpipe. */
+                    (chrome9_texture_format_info(templ->format) ||
+                     chrome9_sw_enabled()) &&
                     templ->u.tex.first_level <= templ->u.tex.last_level &&
                     (!templ->u.tex.first_level ||
                      chrome9_resource(texture)->guarded) &&
@@ -7404,6 +7407,9 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
     * logic ops or polygon stipple: other states render in llvmpipe. */
    if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture ||
         chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 ||
+        /* The kernel binds single-level depth objects only. */
+        (ctx->framebuffer.zsbuf.texture &&
+         ctx->framebuffer.zsbuf.texture->last_level) ||
         !chrome9_draw_blend_supported(ctx) ||
         (ctx->rasterizer && ctx->rasterizer->poly_stipple_enable)) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))

@@ -149,7 +149,7 @@ chrome9_resource_layout(struct pipe_screen *screen,
    if ((!chrome9_is_surface_target(templ->target) && !cube && !volume) ||
        !cpp ||
        (chrome9_format_is_d24(templ->format) &&
-        (!chrome9_is_surface_target(templ->target) || templ->last_level)) ||
+        !chrome9_is_surface_target(templ->target)) ||
        (dxt && templ->target != PIPE_TEXTURE_2D && !cube) ||
        (volume && (!templ->depth0 ||
                    templ->depth0 > CHROME9_MAX_VOLUME_DEPTH ||
@@ -176,15 +176,16 @@ chrome9_resource_layout(struct pipe_screen *screen,
        page_size > UINT32_MAX || page_size < CHROME9_MIP_ALIGNMENT)
       return false;
 
-   /* The sampler reads DXT mip chains only in the POT layout; other chains
-    * keep the table layout for the CPU and llvmpipe. */
+   /* Mipmapped D24 and DXT chains the sampler cannot address are sampled
+    * by llvmpipe. */
    layout->sampler_unsupported =
-      dxt && (cube ||
-              (templ->last_level &&
-               (!chrome9_screen_has_capability2(screen,
-                                                DRM_CHROME9_CAP2_DXT_MIP) ||
-                !util_is_power_of_two_nonzero(templ->width0) ||
-                !util_is_power_of_two_nonzero(templ->height0))));
+      (chrome9_format_is_d24(templ->format) && templ->last_level) ||
+      (dxt && (cube ||
+               (templ->last_level &&
+                (!chrome9_screen_has_capability2(screen,
+                                                 DRM_CHROME9_CAP2_DXT_MIP) ||
+                 !util_is_power_of_two_nonzero(templ->width0) ||
+                 !util_is_power_of_two_nonzero(templ->height0)))));
 
    for (unsigned level = 0; level <= templ->last_level; level++) {
       const unsigned width = u_minify(templ->width0, level);
@@ -294,10 +295,8 @@ chrome9_format_supported(struct pipe_screen *screen,
       PIPE_BIND_SCANOUT | PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW;
    const unsigned share_bindings = PIPE_BIND_DISPLAY_TARGET |
                                     PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
-   /* Mesa adds SAMPLER_VIEW to user renderbuffers so that common meta paths
-    * may address them.  Accept that allocation contract for Z16 even though
-    * create_sampler_view keeps rejecting Z16 until depth sampling is wired.
-    * Direct hardware depth use remains gated by DEPTH_STENCIL below. */
+   /* Z16 is a depth target and a texture that llvmpipe samples (the
+    * sampler has no Z16 encoding). */
    const unsigned depth_bindings = PIPE_BIND_DEPTH_STENCIL |
                                    PIPE_BIND_SAMPLER_VIEW |
                                    PIPE_BIND_LINEAR;
@@ -349,7 +348,7 @@ chrome9_format_supported(struct pipe_screen *screen,
        format == PIPE_FORMAT_Z16_UNORM)
       return chrome9_screen_has_capability(
                 screen, DRM_CHROME9_CAP_DRAW_TRIANGLE_D16) &&
-             (bindings & PIPE_BIND_DEPTH_STENCIL) &&
+             ((bindings & PIPE_BIND_DEPTH_STENCIL) || chrome9_sw_enabled()) &&
              !(bindings & ~depth_bindings);
    /* Cube maps and DXT need the generic fragment program, which carries
     * the texture target and block layout.  The state tracker also asks
