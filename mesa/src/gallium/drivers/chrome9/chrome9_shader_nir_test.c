@@ -2050,6 +2050,34 @@ check_discard_lowering(struct chrome9_context *context)
               shader.supported, shader.semantic_fs_valid, kills, cmp, min,
               shader.semantic_fs_ir.count, mismatches);
    ralloc_free(b.shader);
+
+   /* A discard without a colour write still compiles, oC0 = 0. */
+   {
+      nir_builder k = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "chrome9-discard-only");
+      struct chrome9_shader only = { 0 };
+      const struct chrome9_ps_instruction *last;
+      nir_def *z = nir_imm_int(&k, 0);
+      nir_def *u = nir_load_ubo_vec4(&k, 4, 32, z, z);
+
+      nir_terminate_if(&k, nir_flt(&k, nir_channel(&k, u, 0),
+                                   nir_channel(&k, u, 1)));
+      k.shader->info.fs.uses_discard = true;
+      nir_shader_gather_info(k.shader, nir_shader_get_entrypoint(k.shader));
+      context->fragment_kill = true;
+      chrome9_compile_fs_nir(context, &only, k.shader);
+      context->fragment_kill = old_fragment_kill;
+      last = &only.semantic_fs_ir.instruction[only.semantic_fs_ir.count - 1];
+      if (!only.supported || only.semantic_fs_ir.count < 2 ||
+          last->op != CHROME9_PS_OPCODE_MOV ||
+          last->destination.file != CHROME9_PS_DESTINATION_COLOR ||
+          last[-1].op != CHROME9_PS_OPCODE_KILL) {
+         fprintf(stderr, "discard-only program failed: supported=%u ir=%u\n",
+                 only.supported, only.semantic_fs_ir.count);
+         valid = false;
+      }
+      ralloc_free(k.shader);
+   }
    return valid;
 }
 

@@ -5999,6 +5999,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    enum chrome9_ps_opcode op[4];
    unsigned source_count[4] = { 0 };
    struct util_dynarray terminates;
+   bool zero_output = false;
    nir_block *block;
    /* oCn of FRAG_RESULT_DATAn (COLOR is oC0). */
    nir_def *results[4] = { NULL };
@@ -6127,8 +6128,19 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    /* The KILL precedes every output, as the kernel requires. */
    if (!chrome9_ps_lower_terminates(&builder, &terminates))
       return false;
-   /* Dense outputs; oDepth only with one colour output. */
-   if (!outputs || (depth && outputs > 1))
+   /* Dense outputs; oDepth only with one colour output.  A program that
+    * only discards writes an undefined colour: zero. */
+   if (!outputs && !depth &&
+       util_dynarray_num_elements(&terminates, nir_def *)) {
+      static const uint32_t zero[4] = { 0 };
+
+      if (!chrome9_ps_immediate(&builder, zero, 4, &operands[0][0]))
+         return false;
+      op[0] = CHROME9_PS_OPCODE_MOV;
+      source_count[0] = 1;
+      zero_output = true;
+   }
+   if ((!outputs && !zero_output) || (depth && outputs > 1))
       return false;
    for (unsigned n = 0; n < outputs; n++) {
       nir_def *result = results[n];
@@ -6194,7 +6206,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       builder.ir.depth_output = true;
    }
    /* Terminal RGBA writes oC0, oC1, ... in order, after all other work. */
-   for (unsigned n = 0; n < outputs; n++) {
+   for (unsigned n = 0; n < MAX2(outputs, zero_output); n++) {
       struct chrome9_ps_instruction *terminal =
          chrome9_ps_append_instruction(&builder, op[n]);
 
