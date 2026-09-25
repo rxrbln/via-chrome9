@@ -5144,6 +5144,26 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          return false;
       source_count = 2;
    }
+   /* EXP2/LOG2/RCP/RSQ read one source lane and replicate the result:
+    * vector forms become one record per distinct lane. */
+   if ((op == CHROME9_PS_OPCODE_EXP2 || op == CHROME9_PS_OPCODE_LOG2 ||
+        op == CHROME9_PS_OPCODE_RCP || op == CHROME9_PS_OPCODE_RSQ) &&
+       components > 1) {
+      for (unsigned c = 0; c < components; c++) {
+         native = chrome9_ps_append_instruction(builder, op);
+         if (!native)
+            return false;
+         native->destination.file = CHROME9_PS_DESTINATION_TEMP;
+         native->destination.id = temp;
+         native->destination.writemask = 1u << c;
+         native->source[0] = operands[0];
+         for (unsigned l = 0; l < 4; l++)
+            native->source[0].swizzle[l] = operands[0].swizzle[c];
+      }
+      builder->value[value].complete = true;
+      *source = builder->value[value].source;
+      return true;
+   }
    native = chrome9_ps_append_instruction(builder, op);
    if (!native)
       return false;
