@@ -6,6 +6,7 @@
 #include <linux/iosys-map.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/rbtree.h>
 #include <linux/sizes.h>
 #include <linux/vgaarb.h>
 
@@ -204,17 +205,22 @@ struct chrome9_bo {
 	struct chrome9_sf_mapping *draw_mapping;
 	/* Vertex elements found finite since the last announced CPU write
 	 * (explicit objects only, under the object lock). */
-	struct chrome9_finite_element *finite;
+	struct rb_root_cached finite;
 	u32 finite_count;
-	u32 finite_capacity;
 };
 
 struct chrome9_finite_element {
+	struct rb_node rb;
+	/* Bytes [start, last] a CPU store must not touch. */
 	u64 start;
+	u64 last;
+	u64 subtree_last;
 	u32 stride;
 	u32 count;
 	u8 type;
 };
+
+void chrome9_finite_clear(struct chrome9_bo *bo);
 
 void chrome9_bo_hold_kmap(struct chrome9_bo *bo);
 int chrome9_sl_init(struct chrome9_device *cdev, resource_size_t end);

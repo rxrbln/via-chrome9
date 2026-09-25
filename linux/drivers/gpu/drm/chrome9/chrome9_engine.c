@@ -6,6 +6,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
 #include <linux/interrupt.h>
+#include <linux/interval_tree_generic.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
@@ -3954,46 +3955,70 @@ static int chrome9_tcl_buffer_bounds(const struct chrome9_tcl_draw *tcl,
 	return 0;
 }
 
+#define CHROME9_FINITE_START(e)	((e)->start)
+#define CHROME9_FINITE_LAST(e)	((e)->last)
+INTERVAL_TREE_DEFINE(struct chrome9_finite_element, rb, u64, subtree_last,
+		     CHROME9_FINITE_START, CHROME9_FINITE_LAST, static,
+		     chrome9_finite_tree)
+
+static void chrome9_finite_remove(struct chrome9_bo *bo,
+				  struct chrome9_finite_element *entry)
+{
+	chrome9_finite_tree_remove(entry, &bo->finite);
+	bo->finite_count--;
+	kfree(entry);
+}
+
+void chrome9_finite_clear(struct chrome9_bo *bo)
+{
+	struct chrome9_finite_element *entry;
+
+	while ((entry = chrome9_finite_tree_iter_first(&bo->finite, 0, U64_MAX)))
+		chrome9_finite_remove(bo, entry);
+}
+
+static void chrome9_finite_span(struct chrome9_finite_element *entry)
+{
+	entry->last = entry->start + (u64)entry->count * entry->stride + 15;
+}
+
 /* Whether an element of an explicit object was verified since the last
  * CPU store to its bytes; records it otherwise when record is set. */
 static bool chrome9_finite_cached(struct chrome9_bo *bo, u64 start,
 				  u32 stride, u32 count, u8 type, bool record)
 {
 	struct chrome9_finite_element *entry;
-	u32 i;
 
 	if (!bo->explicit_access)
 		return false;
-	for (i = 0; i < bo->finite_count; i++) {
-		entry = &bo->finite[i];
-		if (entry->start == start && entry->stride == stride &&
-		    entry->type == type) {
-			if (count <= entry->count)
-				return true;
-			if (record)
-				entry->count = count;
-			return false;
+	for (entry = chrome9_finite_tree_iter_first(&bo->finite, start, start);
+	     entry; entry = chrome9_finite_tree_iter_next(entry, start, start)) {
+		if (entry->start != start || entry->stride != stride ||
+		    entry->type != type)
+			continue;
+		if (count <= entry->count)
+			return true;
+		if (record) {
+			chrome9_finite_tree_remove(entry, &bo->finite);
+			entry->count = count;
+			chrome9_finite_span(entry);
+			chrome9_finite_tree_insert(entry, &bo->finite);
 		}
-	}
-	if (!record)
 		return false;
-	if (bo->finite_count == bo->finite_capacity) {
-		u32 capacity = max(8u, bo->finite_capacity * 2);
-		struct chrome9_finite_element *grown;
-
-		/* A misbehaving client could list unbounded elements. */
-		if (capacity > 1024)
-			return false;
-		grown = kvrealloc(bo->finite, capacity * sizeof(*grown),
-				  GFP_KERNEL);
-		if (!grown)
-			return false;
-		bo->finite = grown;
-		bo->finite_capacity = capacity;
 	}
-	bo->finite[bo->finite_count++] = (struct chrome9_finite_element){
+	/* A misbehaving client could list unbounded elements. */
+	if (!record ||
+	    bo->finite_count >= max_t(u64, 1024, bo->base.base.size / 64))
+		return false;
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return false;
+	*entry = (struct chrome9_finite_element){
 		.start = start, .stride = stride, .count = count, .type = type,
 	};
+	chrome9_finite_span(entry);
+	chrome9_finite_tree_insert(entry, &bo->finite);
+	bo->finite_count++;
 	return false;
 }
 
@@ -6484,16 +6509,17 @@ static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo, u64 offset,
 /* Drop finite verifications of elements a CPU store may have changed. */
 static void chrome9_finite_forget(struct chrome9_bo *bo, u64 offset, u64 size)
 {
-	u32 i = 0;
+	struct chrome9_finite_element *entry, *next;
 
-	while (i < bo->finite_count) {
-		const struct chrome9_finite_element *e = &bo->finite[i];
-		u64 end = e->start + (u64)e->count * e->stride + 16;
-
-		if (e->start < offset + size && offset < end)
-			bo->finite[i] = bo->finite[--bo->finite_count];
-		else
-			i++;
+	if (!size)
+		return;
+	entry = chrome9_finite_tree_iter_first(&bo->finite, offset,
+					       offset + size - 1);
+	while (entry) {
+		next = chrome9_finite_tree_iter_next(entry, offset,
+						     offset + size - 1);
+		chrome9_finite_remove(bo, entry);
+		entry = next;
 	}
 }
 
@@ -6633,7 +6659,7 @@ int chrome9_gem_cpu_access_ioctl(struct drm_device *drm, void *data,
 		bo->explicit_access = true;
 	if (args->flags & DRM_CHROME9_GEM_CPU_IMPLICIT) {
 		bo->explicit_access = false;
-		bo->finite_count = 0;
+		chrome9_finite_clear(bo);
 	}
 out_unlock:
 	dma_resv_unlock(obj->resv);
