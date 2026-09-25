@@ -222,6 +222,9 @@ exactly the combination our driver would use first.
 
 ## 4. CPU detiling: CBU windows (M Part I l.6117-6234, S)
 
+Full characterisation, VX900 register differences and a silicon test ladder:
+[chrome9-cbu-detile-re.md](chrome9-cbu-detile-re.md).
+
 Sixteen windows are at `0x1E00 + n*0x20`:
 
 | offset | field |
@@ -589,9 +592,9 @@ Risk:
 * Whether SR42 bit 7 latches a 1 and then enables engine tiling (E1-E4 in "Capability gate and SR42").
 * The board VBIOS PMID+0x5c and POST table (only `VTROM.bin` was decoded).
 * Whether tiled SF works at all, since the vendor excludes GART surfaces.
-* The 16-row layout, and CBU bit 7.
+* The 16-row layout, and CBU bit 7 (CBU ladder C8 in [chrome9-cbu-detile-re.md](chrome9-cbu-detile-re.md)).
 * 2D tile geometry.
-* The CBU address domain (SL only?).
+* The CBU address domain: SL/BAR2 offsets only (S), see [chrome9-cbu-detile-re.md](chrome9-cbu-detile-re.md); silicon confirmation pending.
 * The consumer of `S3GDW_DisableTileSwizzle`.
 * The application IDs `0x5f`/`0x1cd`.
 * The meaning of `ctx+0x1c` and `desc+0x34` bits `0x200000`/`0x8000` in the Windows decision.
