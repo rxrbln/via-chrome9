@@ -6937,18 +6937,35 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    if (!chrome9_render_condition_passes(ctx))
       return;
    chrome9_draw_flush_batch(ctx);
-   if (!(buffers & (PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)))
+   /* Further color buffers (GL_FRONT_AND_BACK) are cleared through their
+    * mappings; the pixel engine writes one target. */
+   for (unsigned i = 1; i < ctx->framebuffer.nr_cbufs; i++) {
+      struct pipe_surface *cbuf = &ctx->framebuffer.cbufs[i];
+      unsigned cx = 0, cy = 0;
+      unsigned cw = ctx->framebuffer.width, ch = ctx->framebuffer.height;
+
+      if (!(buffers & (PIPE_CLEAR_COLOR0 << i)) || !cbuf->texture)
+         continue;
+      if (scissor) {
+         cx = MIN2(scissor->minx, cw);
+         cy = MIN2(scissor->miny, ch);
+         cw = MIN2(scissor->maxx, cw) - cx;
+         ch = MIN2(scissor->maxy, ch) - cy;
+      }
+      if (((color_mask >> (4 * i)) & 0xf) == 0xf)
+         util_clear_render_target(pipe, cbuf, color, cx, cy, cw, ch);
+      else
+         chrome9_clear_surface_masked(pipe, cbuf, color,
+                                      (color_mask >> (4 * i)) & 0xf,
+                                      cx, cy, cw, ch);
+   }
+   buffers &= PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL;
+   if (!buffers)
       return;
-   if (!(buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)) &&
-       debug_get_bool_option("CHROME9_GPU_CLEAR", true) &&
+   if (debug_get_bool_option("CHROME9_GPU_CLEAR", true) &&
        chrome9_clear_gpu(ctx, buffers, color_mask, stencil_mask, scissor,
                          color, depth, stencil))
       return;
-   if (buffers & ~(PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL)) {
-      chrome9_warn_once(ctx, CHROME9_WARN_CLEAR,
-                        "clears of additional color buffers are not implemented");
-      return;
-   }
    width = ctx->framebuffer.width;
    height = ctx->framebuffer.height;
    if (scissor) {
@@ -7094,6 +7111,16 @@ chrome9_refresh_vs_textures(struct chrome9_context *ctx)
    }
 }
 
+static unsigned
+chrome9_framebuffer_color_count(const struct pipe_framebuffer_state *fb)
+{
+   unsigned count = 0;
+
+   for (unsigned i = 0; i < fb->nr_cbufs; i++)
+      count += fb->cbufs[i].texture != NULL;
+   return count;
+}
+
 static void
 chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                  unsigned drawid_offset,
@@ -7150,9 +7177,10 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
        BITSET_COUNT(ctx->vs->sw_nir->info.textures_used) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
-   /* The pixel engine always writes a colour target: depth/stencil-only
-    * framebuffers render in llvmpipe. */
-   if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture) &&
+   /* The pixel engine writes exactly one colour target: depth/stencil-only
+    * and multiple-target framebuffers render in llvmpipe. */
+   if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture ||
+        chrome9_framebuffer_color_count(&ctx->framebuffer) > 1) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    chrome9_refresh_vs_textures(ctx);

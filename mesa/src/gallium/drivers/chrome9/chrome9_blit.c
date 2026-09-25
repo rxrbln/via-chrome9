@@ -7,6 +7,7 @@
  * scaling, flipping, nearest or linear filtering, channel masks, swizzle,
  * scissor, alpha blending and the render condition.  Used for
  * glCopyTexSubImage, glGetTexImage, glCopyPixels and framebuffer blits.
+ * Also masked clears of color buffers beyond the hardware target.
  */
 
 #include "chrome9_blit.h"
@@ -299,4 +300,45 @@ chrome9_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
       chrome9_blit_color(info, &src, &dst, flip_x, flip_y);
    pipe->texture_unmap(pipe, dst.transfer);
    pipe->texture_unmap(pipe, src.transfer);
+}
+
+void
+chrome9_clear_surface_masked(struct pipe_context *pipe,
+                             struct pipe_surface *surface,
+                             const union pipe_color_union *color,
+                             unsigned mask, unsigned x, unsigned y,
+                             unsigned width, unsigned height)
+{
+   const enum pipe_format format = surface->format;
+   struct pipe_transfer *transfer;
+   struct pipe_box box;
+   uint8_t *map;
+
+   if (!width || !height || util_format_is_compressed(format))
+      return;
+   u_box_3d(x, y, surface->first_layer, width, height,
+            surface->last_layer - surface->first_layer + 1, &box);
+   map = pipe->texture_map(pipe, surface->texture, surface->level,
+                           PIPE_MAP_READ | PIPE_MAP_WRITE, &box, &transfer);
+   if (!map)
+      return;
+   for (int z = 0; z < box.depth; z++) {
+      for (unsigned row = 0; row < height; row++) {
+         uint8_t *texel = map + (size_t)z * transfer->layer_stride +
+                          (size_t)row * transfer->stride;
+
+         for (unsigned col = 0; col < width; col++) {
+            union pipe_color_union value;
+
+            /* The union carries float, signed or unsigned lanes alike. */
+            util_format_unpack_rgba(format, value.ui, texel, 1);
+            for (unsigned c = 0; c < 4; c++)
+               if (mask & (1u << c))
+                  value.ui[c] = color->ui[c];
+            util_format_pack_rgba(format, texel, value.ui, 1);
+            texel += util_format_get_blocksize(format);
+         }
+      }
+   }
+   pipe->texture_unmap(pipe, transfer);
 }
