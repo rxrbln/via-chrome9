@@ -17,6 +17,7 @@ bool chrome9_screen_has_capability(struct pipe_screen *screen,
                                    uint64_t capability);
 bool chrome9_screen_has_capability2(struct pipe_screen *screen,
                                     uint64_t capability);
+unsigned chrome9_screen_vs_flow_depth(struct pipe_screen *screen);
 bool chrome9_screen_bo_import_fd(struct pipe_screen *screen, int dma_buf_fd,
                                  struct chrome9_bo *bo);
 bool chrome9_screen_bo_export_fd(struct pipe_screen *screen,
