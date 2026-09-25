@@ -227,7 +227,7 @@ piglit on VX900 (kernel `3b52a780`, Mesa tag `tcl-20260925/s4`), before
 | group | before | after |
 |---|---|---|
 | glsl-1.10 `glsl-fs-shadow1d*` (13) | 2 pass | 13 pass |
-| glsl-1.10 `glsl-fs-shadow2d*` (16) | 0 pass | 16 pass |
+| glsl-1.10 `glsl-fs-shadow2d*` (15) | 0 pass | 15 pass |
 | arb_texture_rectangle `glsl-fs-shadow2drect*` (11) | 2 pass | 11 pass |
 | arb_fragment_program_shadow (8) | skip | 8 pass |
 | `depth-tex-compare`, `glsl-fs-loop-shadow-variables`, `depth-tex-modes-glsl` | fail/skip | pass |
