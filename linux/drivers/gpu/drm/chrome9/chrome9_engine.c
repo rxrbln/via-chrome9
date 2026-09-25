@@ -3400,7 +3400,8 @@ static u32 chrome9_fragment_raster_state(
 	}
 	i = 4 + varying_count;
 	raster[i++] = 0x12000000 | GENMASK(2 + varying_count, 0);
-	raster[i++] = 0x61800000;
+	/* A61[22]: VS outputs beyond oT3 reach setup only in wide transfer. */
+	raster[i++] = 0x61800000 | (varying_count > 4 ? 4 << 20 : 0);
 	/* H6 resource high-water is D2 plus the dense T inputs. */
 	raster[i++] = 0x620081ff | (2 + varying_count) << 20;
 	raster[i++] = 0x20000000;
@@ -4028,6 +4029,8 @@ static int chrome9_fragment_raster_selftest(void)
 				0, NULL, 3, raster);
 			if (count != 27 + varying_count ||
 			    raster[0] != ((2 + varying_count) << 8 | stride) ||
+			    raster[5 + varying_count] != (0x61800000 |
+					(varying_count > 4 ? 0x400000 : 0)) ||
 			    raster[6 + varying_count] !=
 					(0x620081ff | (2 + varying_count) << 20) ||
 			    raster[10 + varying_count] != expected_a25 ||
@@ -12651,7 +12654,8 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 
 /*
  * A61[22:20] as the vendor derives it from the output linkage
- * (VTGUModeDX32A.dll 0x10206cd5): the VS point size is lost without it.
+ * (VTGUModeDX32A.dll 0x10206cd5..0x10206d34): the VS point size and every
+ * oT beyond the fourth coordinate output are lost without it.
  */
 static u32 chrome9_tcl_a61_outputs(const struct chrome9_tcl_draw *tcl,
 				   const struct chrome9_fragment_program *fp)
@@ -12662,9 +12666,9 @@ static u32 chrome9_tcl_a61_outputs(const struct chrome9_tcl_draw *tcl,
 
 	if (knob >= 0)
 		return knob & 7;
-	if (!tcl->point_size_vertex)
-		return 0;
-	return extra > 3 ? 4 : 1;
+	if (tcl->point_size_vertex)
+		return extra > 3 ? 4 : 1;
+	return extra > 4 ? 4 : 0;
 }
 
 /* Validate, copy and compile one fragment draw into d->request. */
