@@ -4351,8 +4351,8 @@ chrome9_ps_emit_predicate_select(struct chrome9_ps_nir_builder *builder,
    default:
       return false;
    }
-   if ((alu->fp_math_ctrl & nir_fp_preserve_nan) ||
-       !alu->src[0].src.ssa || !alu->src[1].src.ssa ||
+   /* Finite operands make a NaN preserve request vacuous. */
+   if (!alu->src[0].src.ssa || !alu->src[1].src.ssa ||
        alu->src[0].src.ssa->bit_size != 32 ||
        alu->src[1].src.ssa->bit_size != 32 ||
        !chrome9_ps_default_finite(nir_scalar_chase_alu_src(predicate, 0),
