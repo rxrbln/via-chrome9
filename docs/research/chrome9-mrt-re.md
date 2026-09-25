@@ -324,3 +324,24 @@ oracle.
   targets.
 - Whether any hardware reason lies behind the missing
   `MRTINDEPENDENTBITDEPTHS` capability.
+
+## Silicon result (2026-09-25, kernel k123, Mesa p66)
+
+The first rung that combined everything passed: a GL probe (`~/tmp/mrt`,
+FBO with 2, 3 and 4 BGRA textures, `gl_FragData[i]` from a varying) renders
+on hardware TCL with the kernel emitting, per extra target i, A(50+8i) base,
+A(51+8i) location/tiling, A(52+8i) format/pitch and A(53+8i) = RT0's A53,
+A00 dither and blend enables replicated to bits i and 4+i, and A01[16:14] =
+count - 1, with the fragment program ending in one terminal RGBA record per
+output (`000d0820 | n << 6`) in index order.  All targets match llvmpipe
+within 1 LSB for 2, 3 and 4 targets; no timeout.  The earlier timeouts of
+partial oC0 writes and of oC0 + oDepth do not apply to full per-output
+records.  piglit draw-buffers subset (22 tests): unchanged against the
+llvmpipe route.
+
+Implementation: uAPI `struct drm_chrome9_draw_colors` through
+`DRAW_VERTEX_PROGRAMS.colors_ptr` (CAP2 bit 30, module parameter `mrt`);
+targets share RT0's size, bytes per pixel, blend equation and write mask
+(Mesa requires identical per-target blend state); oDepth with more than one
+output is rejected.  Mesa routes draws with several colour buffers to
+hardware TCL, llvmpipe otherwise.
