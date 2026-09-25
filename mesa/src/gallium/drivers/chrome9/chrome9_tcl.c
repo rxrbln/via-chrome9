@@ -1492,7 +1492,8 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
 }
 
 /* The kernel requires whole colour and varying registers; lanes NIR left
- * undefined (e.g. after dead store elimination) are written as zero. */
+ * undefined (e.g. after dead store elimination) and varyings the VS never
+ * writes are zero.  The kernel drops those the fragment does not read. */
 static void
 tcl_fill_outputs(struct tcl_builder *b)
 {
@@ -1504,7 +1505,7 @@ tcl_fill_outputs(struct tcl_builder *b)
    };
 
    for (unsigned v = 0; v < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; v++) {
-      if (!b->varying_written[v] || b->varying_written[v] == 0xf)
+      if (b->varying_written[v] == 0xf)
          continue;
       mov.dst.file = DRM_CHROME9_VERTEX_DEST_VARYING;
       mov.dst.index = v;
@@ -1513,7 +1514,7 @@ tcl_fill_outputs(struct tcl_builder *b)
          b->p->origin[v][c] = CHROME9_TCL_ORIGIN_ZERO;
       tcl_emit(b, &mov, 1);
    }
-   if (b->primary_written && b->primary_written != 0xf) {
+   if (b->primary_written != 0xf) {
       mov.dst.file = DRM_CHROME9_VERTEX_DEST_PRIMARY;
       mov.dst.index = 0;
       mov.dst.writemask = ~b->primary_written & 0xf;
