@@ -71,6 +71,7 @@ terrain at 2 fps and refract at 6 fps.
 | `00785c4` | `txb` as TEXLDB (kernel `dbadc6e`); exact `ftrunc` and `fceil` from FRC of \|x\|. | glsl-lod-bias, glsl-fs-texture2d-bias, glsl-fs-integer-multiplication now on hardware |
 | `46cfd50` | Local arrays become SSA before `nir_lower_int_to_float`, which otherwise turned a CSE-shared index constant into float bits (`m[1]` -> `m[0x3f800000]`); the link-time inline-uniform list is kept when the state tracker finalizes a variant again; the texture-alias check applies only to the fixed two-texture ioctls. | 368-test fs indexing list: 59 fail -> 0 (fs-temp-mat*-col-row-rd, fs-varying-*mat*, glsl-fs-vec4-indexing-temp-*-nested-loop-*, glsl-fs-texture-uniforms-share-same-unit) |
 | `16180ff` | Depth views of S8_UINT_Z24_UNORM sample with the X8Z24 format (depth in bits 31:8, the stencil byte is ignored). | fbo-depthtex, texsubimage-depth-formats (+pbo) |
+| `3ecd811` | Fragment programs fuse MUL+ADD into MAD and recombine SUB (refract 79 -> 57 ALU, terrain main 85 -> 72). | 19 fs built-ins (matrix products, outerProduct, mod, radians) fail -> pass, none regress in 1112 fs tests |
 | `34b1ffa` | Smooth lines render in llvmpipe; draw passed them unwidened to the triangle-only vbuf render, which dropped them. | line-aa-width, line-smooth-coverage, line-smooth-stipple, point-line-no-cull |
 
 ### Hardware limits found
