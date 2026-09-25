@@ -301,14 +301,82 @@ Consequences:
 * The complete `STM_CoarseZ_INV` decision tree (stencil and alpha branches).
 * Fast-Z tag comparison semantics are inferred, not measured.
 
+## Proposed guarded implementation
+
+Current state: the kernel command builder
+(`drivers/gpu/drm/chrome9/chrome9_engine.c`) never emits type-01 A27, A29
+or A2A.  The `0x29000000` and `0x2a3f8000` words it does emit are the
+**type-04** FVF/link and point-size registers (manual p.~150 onward), not
+the coarse-Z registers.  The first coarse-Z patch must emit explicit type-01
+`A27=27000000` / `A29` / `A2A` words rather than rely on power-on defaults.
+
+Coarse-Z first (it reduces per-draw depth traffic); Fast-Z second and
+optional.
+
+**Kernel (owns addresses, because it validates every surface extent):**
+
+1. Capability bit `DRM_CHROME9_CAP_COARSE_Z`, off unless the module
+   parameter `coarse_z=1` is given.
+2. The coarse-Z buffer is a kernel-private BO attached to the depth BO on
+   first use with coarse-Z: SL placement, 4 KiB aligned, size
+   `align(((W+7)>>3)*16, 32) * align((H+7)>>3, 2)` rounded to 4 KiB.  W/H
+   are the depth surface's draw dimensions from the submit; reject
+   `W > 8176`.  Freed with the depth BO.
+3. Per-depth-BO state: `cz_valid`, `cz_dir` (LESS vs GREATER), last bound
+   base (for the tag reset), plus a flag set on every CPU mmap/fault,
+   blit, copy, or partial clear of the depth BO, which clears `cz_valid`.
+4. Full-surface depth clear with a coarse-Z buffer: after the normal depth
+   clear, fill the coarse-Z buffer with the recovered entry pattern (2D
+   solid fill for 1.0, otherwise a 16-byte pattern fill), then emit
+   `A29 | 0x8000`, `A29`; set `cz_valid`.
+5. Draw: enable only when all hold: `cz_valid`, triangles, fill mode solid,
+   depth test on with LESS/LEQUAL (or GREATER/GEQUAL, A29 bit 17), no
+   stencil test, no alpha test, fragment program without depth output or
+   discard, and the direction equals `cz_dir`.  Then
+   `A01 |= 0x2000 | (zwrite ? 0x200 : 0)`, `A29 = 0x29010000 | dir<<17 |
+   pitch>>5` (`[13:12]=01` conservative merge for the first bring-up),
+   `A2A = 0x2a000000 | base>>8`, with the bit-15 pulse on the first enabled
+   draw after a disabled one or after a depth-base change.  Otherwise emit
+   A01 bits 13/9 clear and, if the draw writes depth, clear `cz_valid`.
+
+**Mesa:** no new state beyond passing a "full clear" bit that the kernel
+can verify from the clear rectangle, and advertising nothing to GL.  All
+policy lives in the kernel, so userspace cannot enable a stale buffer.
+
+**Fast-Z (after coarse-Z is proven):** per-depth-BO `fz_index`, index length
+from the recovered defaults (D24: 3).  Only for depth BOs that are never
+sampled or mapped (the kernel disables it and does a real clear before the
+first map/texture use), because no resolve exists.  Emit A14/A15 untagged
+clear data and A27 `= 0x27000001 | len<<8 | idx<<12`.
+
+## Smallest hardware experiment
+
+One run, < 7 s, `coarse_z=1`, 64x64 D24 target, under the
+existing target-safety rules (GPU lock, hash-gated module handoff):
+
+1. Clear depth to 1.0 and color to black (coarse-Z fill + reset).
+2. Draw a full-screen quad at z=0.25 (LESS, depth write on), red.
+3. Draw a full-screen quad at z=0.75, green.  Expected: all red; the PPC
+   counter `0x0A` (coarse-Z reads) must be non-zero and `0x0C` (Z reads)
+   lower than in the same run with `coarse_z=0`.
+4. Draw a quad at z=0.10, blue, over the left half.  Expected: left blue,
+   right red (no false rejection).
+5. Read back color and depth (depth read invalidates coarse-Z), repeat
+   step 3 and expect coarse-Z to be off for that draw.
+
+Pass criteria: images equal the `coarse_z=0` reference byte for byte, no
+engine hang (FE/3D idle within the existing timeout), and a GART/SL guard
+page after the coarse-Z BO unchanged.  Any mismatch or timeout disables
+the capability again.  Only then measure glmark2 refract.
+
 ## Implementation and proof order
 
 1. Keep A01 bits 13/9 clear and A27 zero for all ordinary depth, shadow, and
    depth-texture work.
-2. Recover the auxiliary object sizing/alignment and A2A address producer for
-   coarse-Z before adding either A01 enable.
-3. Recover the Fast-Z per-surface metadata allocation and clear-generation
-   lifetime before setting A27 bit 0.
+2. Done statically (2026-09-25): coarse-Z geometry, A29/A2A producer,
+   clear pattern and reset/invalidate rules.
+3. Done statically (2026-09-25): Fast-Z has no separate metadata; the
+   scene index is stored in the depth LSBs.
 4. Prove each optimization against a linear non-optimized reference with
    alternating full and partial clears, depth-write-disabled draws, CPU
    readback, and depth-as-texture transitions.
