@@ -4501,19 +4501,52 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       else if (vec->op == nir_op_vec4)
          vector_components = 4;
       if (vector_components) {
+         uint8_t selector[4] = { 0 };
+         int base = -1;
+
+         /* Literal 0.0 and 1.0 lanes are ZERO/ONE selectors of the
+          * vector built from the other lanes. */
+         for (unsigned c = 0; c < vector_components; c++) {
+            nir_scalar lane = nir_scalar_resolved(vec->src[c].src.ssa,
+                                                  vec->src[c].swizzle[0]);
+
+            if (nir_scalar_is_const(lane)) {
+               const uint32_t bits = nir_scalar_as_uint(lane);
+
+               if (bits == 0)
+                  selector[c] = CHROME9_PS_SWIZZLE_ZERO;
+               else if (bits == 0x3f800000)
+                  selector[c] = CHROME9_PS_SWIZZLE_ONE;
+            }
+         }
          for (unsigned c = 0; c < vector_components; c++) {
             if (!chrome9_ps_lower_alu_source(builder, &vec->src[c], 1,
                                               &component[c]))
                return false;
-            if (!c) {
+            if (selector[c])
+               continue;
+            if (base < 0) {
+               base = c;
                vector = component[c];
             } else if (component[c].file != vector.file ||
                        component[c].id != vector.id ||
                        component[c].modifier != vector.modifier) {
                alias = false;
             }
-            vector.swizzle[c] = component[c].swizzle[0];
          }
+         /* All-literal vectors alias one constant row or take MOVs. */
+         if (base < 0) {
+            vector = component[0];
+            for (unsigned c = 1; c < vector_components; c++)
+               if (component[c].file != vector.file ||
+                   component[c].id != vector.id ||
+                   component[c].modifier != vector.modifier)
+                  alias = false;
+            memset(selector, 0, sizeof(selector));
+         }
+         for (unsigned c = 0; c < vector_components && alias; c++)
+            vector.swizzle[c] = selector[c] ? selector[c] :
+                                component[c].swizzle[0];
          if (alias) {
             for (unsigned c = vector_components; c < 4; c++)
                vector.swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
@@ -4871,6 +4904,13 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
             if (power >= 1.0 && power < 0x1p32 &&
                 power == (double)(uint32_t)power)
                integer_exponent = (uint32_t)power;
+            /* Chains longer than LOG2, MUL, EXP2 take those three; on
+             * silicon they give pow(0, n) = 0 and match pow(x, 100) to
+             * the 8-bit result. */
+            if (integer_exponent &&
+                util_logbase2(integer_exponent) +
+                   util_bitcount(integer_exponent) - 1 > 3)
+               integer_exponent = 0;
          }
       }
       if (integer_exponent &&
@@ -5773,6 +5813,101 @@ chrome9_nir_fmad_to_ffma(nir_builder *b, nir_alu_instr *alu, void *data)
    return true;
 }
 
+/* Lanes of a factor vector fold into an immediate or one swizzled value. */
+static bool
+chrome9_nir_factor_folds(const nir_scalar *lane, unsigned count)
+{
+   bool constant = true, single = true;
+
+   for (unsigned c = 0; c < count; c++) {
+      if (!lane[c].def)
+         continue;
+      constant &= nir_scalar_is_const(lane[c]);
+      for (unsigned d = 0; d < c; d++)
+         if (lane[d].def && lane[d].def != lane[c].def)
+            single = false;
+   }
+   return constant || single;
+}
+
+/* vecN of products and literal zeros feeding one ADD -> product of two
+ * vecN, so the ADD fuses into one MAD (per-tap offsets of blur kernels).
+ * Zero lanes become 0 * 0, exactly +0. */
+static bool
+chrome9_nir_vec_of_products(nir_builder *b, nir_alu_instr *vec, void *data)
+{
+   const unsigned count = vec->def.num_components;
+   nir_scalar factor[2][NIR_MAX_VEC_COMPONENTS] = { 0 };
+   nir_def *lanes[2][NIR_MAX_VEC_COMPONENTS];
+   bool neg[NIR_MAX_VEC_COMPONENTS] = { 0 };
+   unsigned products = 0, ctrl = 0;
+   nir_instr *user;
+
+   (void)data;
+   if (!nir_op_is_vec(vec->op) || vec->def.bit_size != 32 || count < 2 ||
+       !list_is_singular(&vec->def.uses))
+      return false;
+   user = nir_src_use_instr(list_first_entry(&vec->def.uses, nir_src,
+                                              use_link));
+   if (user->type != nir_instr_type_alu ||
+       nir_instr_as_alu(user)->op != nir_op_fadd)
+      return false;
+   for (unsigned c = 0; c < count; c++) {
+      nir_scalar lane = nir_scalar_resolved(vec->src[c].src.ssa,
+                                            vec->src[c].swizzle[0]);
+      nir_alu_instr *alu;
+
+      if (nir_scalar_is_const(lane)) {
+         if (nir_scalar_as_uint(lane) != 0)
+            return false;
+         continue;
+      }
+      if (!nir_scalar_is_alu(lane))
+         return false;
+      alu = nir_def_as_alu(lane.def);
+      if (alu->op == nir_op_fneg) {
+         ctrl |= alu->fp_math_ctrl;
+         lane = nir_scalar_chase_alu_src(lane, 0);
+         if (!nir_scalar_is_alu(lane))
+            return false;
+         alu = nir_def_as_alu(lane.def);
+         neg[c] = true;
+      }
+      if (alu->op != nir_op_fmul)
+         return false;
+      ctrl |= alu->fp_math_ctrl;
+      factor[0][c] = nir_scalar_chase_alu_src(lane, 0);
+      factor[1][c] = nir_scalar_chase_alu_src(lane, 1);
+      /* Keep the constant factor first. */
+      if (nir_scalar_is_const(factor[1][c])) {
+         nir_scalar swap = factor[0][c];
+
+         factor[0][c] = factor[1][c];
+         factor[1][c] = swap;
+      }
+      products++;
+   }
+   if (!products || !chrome9_nir_factor_folds(factor[0], count) ||
+       !chrome9_nir_factor_folds(factor[1], count))
+      return false;
+   b->cursor = nir_before_instr(&vec->instr);
+   for (unsigned c = 0; c < count; c++) {
+      if (!factor[0][c].def) {
+         lanes[0][c] = lanes[1][c] = nir_imm_float(b, 0.0f);
+         continue;
+      }
+      lanes[0][c] = nir_mov_scalar(b, factor[0][c]);
+      lanes[1][c] = nir_mov_scalar(b, factor[1][c]);
+      if (neg[c])
+         lanes[0][c] = nir_fneg(b, lanes[0][c]);
+   }
+   nir_def *product = nir_fmul(b, nir_vec(b, lanes[0], count),
+                               nir_vec(b, lanes[1], count));
+   nir_def_as_alu(product)->fp_math_ctrl = ctrl;
+   nir_def_replace(&vec->def, product);
+   return true;
+}
+
 /* Fuse MUL+ADD into MAD and fold negations into SUB and the MAD A
  * operand before the one-record-per-op backend sees the program. */
 static void
@@ -5780,6 +5915,9 @@ chrome9_nir_optimize_semantic(nir_shader *nir)
 {
    bool progress;
 
+   if (nir_shader_alu_pass(nir, chrome9_nir_vec_of_products,
+                           nir_metadata_control_flow, NULL))
+      nir_opt_dce(nir);
    do {
       progress = false;
       progress |= nir_opt_algebraic(nir);
