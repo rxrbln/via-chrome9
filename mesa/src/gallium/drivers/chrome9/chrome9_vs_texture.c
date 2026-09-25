@@ -168,16 +168,12 @@ chrome9_vs_wrap_coordinate(float coordinate, unsigned wrap)
 {
    if (wrap == PIPE_TEX_WRAP_CLAMP_TO_EDGE)
       return CLAMP(coordinate, 0.0f, 1.0f);
-   if (wrap == PIPE_TEX_WRAP_REPEAT) {
-      float fraction = fmodf(coordinate, 1.0f);
-
-      return fraction < 0.0f ? fraction + 1.0f : fraction;
-   }
+   /* x - floor(x) is exact below 2^23, like fmodf(x, 1) + 1 for x < 0. */
+   if (wrap == PIPE_TEX_WRAP_REPEAT)
+      return coordinate - floorf(coordinate);
    if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
-      float mirrored = fmodf(coordinate, 2.0f);
+      float mirrored = coordinate - 2.0f * floorf(coordinate * 0.5f);
 
-      if (mirrored < 0.0f)
-         mirrored += 2.0f;
       return mirrored > 1.0f ? 2.0f - mirrored : mirrored;
    }
    return 0.0f;
