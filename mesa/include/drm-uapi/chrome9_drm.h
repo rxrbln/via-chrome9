@@ -287,6 +287,10 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_GEM_CPU_NOWAIT		(1ULL << 12)
 /* DRM_CHROME9_FENCE sequence number fences. */
 #define DRM_CHROME9_CAP2_FENCE_SEQNO		(1ULL << 13)
+/* Fragment textures: WRAP_CLAMP_TO_BORDER and border_color. */
+#define DRM_CHROME9_CAP2_TEXTURE_BORDER		(1ULL << 16)
+/* Fragment textures: WRAP_MIRROR_CLAMP_TO_EDGE (hardware mirror once). */
+#define DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE	(1ULL << 17)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -498,6 +502,9 @@ struct drm_chrome9_draw_triangle_d16 {
 #define DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE	1
 #define DRM_CHROME9_TEXTURE_WRAP_REPEAT		2
 #define DRM_CHROME9_TEXTURE_WRAP_MIRRORED_REPEAT	3
+/* Fragment textures only, see DRM_CHROME9_CAP2_TEXTURE_BORDER/_MIRROR_ONCE. */
+#define DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER	4
+#define DRM_CHROME9_TEXTURE_WRAP_MIRROR_CLAMP_TO_EDGE	5
 
 /* IEEE-754 fields are passed as their exact 32-bit representation. */
 struct drm_chrome9_textured_vertex {
@@ -1280,6 +1287,7 @@ struct drm_chrome9_fragment_texture_state {
 	__s32 lod_bias_s5_5;
 	__s32 min_lod_s5_5;
 	__s32 max_lod_s5_5;
+	/* ARGB8888 colour of WRAP_CLAMP_TO_BORDER; zero without CAP2_TEXTURE_BORDER. */
 	__u32 border_color;
 	/* ABI v1: zero.  ABI v2: logical texture unit, 0..7. */
 	__u32 reserved0;
