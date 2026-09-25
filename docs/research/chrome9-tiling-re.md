@@ -149,7 +149,7 @@ The separate stencil buffer is therefore always 8x8-blocked (64 bytes per block)
 | 2D `0x18` | bit 31 | 0 | 1 | Source tiled. Set by Windows `kmd:0xc88a0`, `0xbf190`, `0xc1010`, `0xc1e10`, `0xbaac0` from the allocation's tiled flag, and by Linux M1 `dri:0xe4a54`, `0xe6cd0..0xe6e80`. |
 | CR43 | bit 2 | 0 | 1 | IGA1 tiled scanout (`kmd:0x7bbc0`, called from mode set `0x445bf`). |
 | CR62 | bit 0 | 0 | 1 | IGA2 tiled scanout. Same Windows code. Linux `via_drv.so` only preserves the bit. |
-| SR42 | bit 7 (RO) | | | "0: force all engines to use linear addressing mode; 1: decided by engine" (M Part I l.1984). Read it before any experiment. |
+| SR42 | bit 7 (RO per M) | | | "0: force all engines to use linear addressing mode; 1: decided by engine" (M Part I l.1984). VBIOS POST writes SR42 = 0x30 (bit 7 = 0); see "Capability gate and SR42". |
 
 The manual gives no 2D tile geometry.  **I:** the 2D engine uses the same
 256-byte tile.  Windows presents from tiled sources, and Linux fills tiled
@@ -338,8 +338,9 @@ Target read via `~/tmp/sr/sr` (VGA ports 0x3c4/0x3d4, read only):
 `SR42=30`, `CR43=90`, `CR62=00`.  SR42 bit 7 is 0, "force all engines
 to use linear addressing mode", and the manual lists the bit as read
 only.  Tiling is therefore unavailable on this board and R1-R9 were not
-run.  Whether the bit follows a strap or a BIOS register write that can
-be changed before the lock is not known.
+run.  Revised after the static trace below: the VBIOS POST table and the
+Windows CBIOS write SR42 = 0x30, so bit 7 is a firmware setting, not a
+documented strap.  See "Capability gate and SR42" for E1-E4.
 
 ## 7. Implementation plan (after R1-R7 pass)
 
@@ -383,14 +384,214 @@ be changed before the lock is not known.
 * A 2x2 bilinear footprint and an 8x8 pixel block each stay within one 256-byte tile, instead of touching 8 rows that are `pitch` bytes apart.
 * The gain on the UMA DDR path is unknown until R8.  The SF path's snoop and translation costs ([chrome9-local-fb-placement.md](chrome9-local-fb-placement.md)) are independent of tiling.
 
+## Capability gate and SR42, 2026-09-25
+
+Static trace only; the target was not touched.  New sources:
+
+* `ucb_32a.sys` (Windows CBIOS, SHA-256 `ad00c56d…`): `cb:` addresses, image base `0x10000`.
+* `VTROM.bin` (SHA-256 `d6ddebe6…`, "VT3410 Desktop", 03/15/10): `rom:` file offsets.
+* VX900 System Programming Manual rev 1.41 (bitsavers, PDF SHA-256
+  `1b33ccbe67aa2c50ee709c338b67d0f46d339f115c6d81f795d8abcc8a009f49`),
+  `pdftotext -layout` line numbers as **SPM l.N**.
+
+### Manual text (M)
+
+Part I l.1977-1996, identical in the HC3, HCM and UniChrome Pro II manuals:
+
+```text
+IO Port / Index: 3C5.41  Typical Arbiter Control 1          Default Value: 00h
+  7:4  RO  0  Typical Request T-Hold
+  3:0  RO  0  Typical Request Pre-T-Hold
+IO Port / Index: 3C5.42  Typical Arbiter Control 2          Default Value: 00h
+  7    RO  0  Linear Addressing Mode Enable
+              0: Force all engine use linear addressing mode
+              1: The addressing mode is decided by engine itself
+  6    RO  0  Pre-empty Arbitor Request Attribute
+              1: Supports Fetch Cycle With Length (2) Capability
+  5    RO  0  Pre-empyt Arbitor Arbitration Type  0: Run-robin Like  1: Fix
+  4:0  RO  0  Typical Request Maximum Queuing Number
+```
+
+* No strap name, ROMSIP location or unlock condition is given.  SR10 bit 0
+  ("Unlock Accessing of I/O Space", RW, default 1, l.1324) is the only
+  extended-register unlock.
+* The SPM lists the graphics straps that are mirrored into the sequencer: only
+  EXSR_12/EXSR_13, latched from ROMSIP into D0F5 Rx90-93 (SPM l.14980-15090).
+  SR42 is not among them.
+* D0F3 (DRAM controller), including the GMINT graphics arbiter RxA2-RxA9, has
+  no linear/tile field (SPM, D0F3 register list).
+* The only tiling field in the north bridge is D0F2 Rx9E bit 1, "Tile Mode
+  Address Windows Support", RW, default 0 (SPM l.4481-4548).  It routes CPU
+  direct frame buffer (DFA) accesses that fall into one of 16 "tile mode
+  accessible" windows to GFXCTL instead of DRAM.  **I:** this is the NB side of
+  the CBU windows of section 4; it is needed only for CPU access, not for
+  engine tiling.
+
+### Who writes SR42 (S)
+
+**VBIOS POST writes SR42 = 0x30.**
+
+* `rom:0x7756` sets SR10 bit 0 (via the masked writer `rom:0x8771`, `DX=0x0110`),
+  then replays the 3-byte `{type, index, value}` table at `rom:0x8141` through
+  `rom:0x86f8` (type 1 = SR, 0/3 = CR), then the 4-byte masked table at
+  `rom:0x820f` through `rom:0x86d1`.
+* The first table contains, among others:
+  `SR4D=30 SR22=1f SR41=40 SR42=30 SR50=1f … SR40=38 CR40=00 CR43=90`.
+  The second one contains `SR4F` mask 40 value 40 and `SR40` mask 30 value 00.
+* No other SR42 access exists in the ROM; the helpers take the register as
+  `DH=type, DL=index`, and no `DX=0x0142` load exists.
+* The R0 readback `SR42=30`, `CR43=90` equals these table values.  The manual reset default of SR42 is `00h`.
+
+**The Windows CBIOS replays the same table.**
+
+* `CBiosInitialization` (`cb:0x15820`, export 0x25) calls `cb:0x1e560` on its POST path
+  (mode 1, or when a local flag is set; `cb:0x15aa2..0x15abd`).
+* `cb:0x1e560` locates the ROM's `PMID` block (`cb:0x1ab10`: signature
+  `"PMID"`, table at +0x14, byte checksum).  It then runs the register table
+  whose ROM offset is the word at PMID+0x6c (`VTROM.bin`: `0x8141`, the table
+  above) and the one at PMID+0x92 (`0x820f`).
+* Without a PMID table it falls back to hard-coded writes (`cb:0x1f3e0`):
+  `SR16=08 SR17=1f SR18=0e SR1A=82 SR1F=00 SR20=40 SR21=40 SR22=1f SR41=40 SR42=30 SR50=1f …`.
+  These are the same arbiter values, and bit 7 is 0 again.
+
+**No driver ever sets SR42 bit 7.**
+
+* **Windows KMD:**
+  * The SR accessors are `kmd:0x1ad10` (read) and `kmd:0x1adc0` (write), port base `[adp+0x694]+4`.
+  * SR accesses with a constant index touch 0x12..0x3f, SR40, SR45, SR4D (read only), SR50, SR68-6F, SR77, SRA9 and SRC7.  SR42 is never among them.
+  * Variable-index sites:
+    * `kmd:0x567e1` reads SR44-46/4A-4C (PLL).
+    * `kmd:0x8a587` writes SR4E.
+    * `kmd:0x8aec8..0x8af16` reads SR00-FF and CR00-FF into a diagnostic dump.
+  * The direct MMIO `0x83c4` users (`kmd:0x477d7..0x4824f`) are I2C/GPIO (SR26, SR2C, SR31).
+* **Windows UMD:** it has no port or VGA access.
+* **Linux `via_chrome9.ko`:** its sequencer accesses are SR01, SR17, SR66-6F (suspend/resume loop) and SR6A-6C, SR6F and SR7B (GART).
+* **Linux `via_drv.so`:**
+  * `VIASave` reads SR00..SRFF except SR1A (`drv:0x4f668..0x4f68e`).
+  * `VIARestore` writes SR14..SR3F back, then SR42 from the saved copy (`drv:0x4e4eb`), then SR4F, SR50, SR57, SR5D, SR65 and the PLLs.
+  * The saved value is written back unchanged; it never sets bit 7.
+* **Linux DRI:** it has no VGA access.
+
+**Assessment (I).** SR41/SR42 hold DRAM-arbiter tuning (T-hold, queue depth,
+arbitration type), and firmware and CBIOS program them like any other RW
+tuning register.  The readback equals the programmed value, not the reset
+default.  The "RO" attribute is therefore most likely wrong for this block, or
+applies only after some lock that is not documented.  Nothing indicates a fuse
+or strap.  SR42 bit 7 = 0 is a deliberate firmware choice: 0x30 is the VIA VX900 POST
+value, and the Windows CBIOS repeats it on every POST.  Whether the silicon
+accepts bit 7 = 1 and then tiles correctly is not established by any vendor
+code.
+
+### Tiling capability gate (S)
+
+The Windows flow for `1106:7122`, from adapter start to the UMD flags:
+
+1. `kmd:0x117070` switches on the PCI device ID `[adp+0x76c]`.  `0x7122`
+   (like `0x2122`, `0x4122`, `0xa122`) takes the common Chrome9 branch.  The family
+   code `[adp+0x780]` is `0x3122` for all of them.  **No revision test exists
+   on this path**, and SR42 is never read.
+2. `kmd:0x120651` (`family == 0x3122`) calls `kmd:0x117f80`: `CBiosInt10_UMA`
+   (`kmd:0x13b70` → import `ucb_32a.sys` ordinal 0x26) with `EAX=4F14`,
+   `EBX=0200`.  On `AX=004F` it stores `ECX` at `adp+0xb68` and `EDX` at `adp+0xb6c`,
+   and `ESI` at `adp+0xb80` if ECX bit 17 is set.  On failure both words become 0.
+3. The CBIOS handles `4F14`, `BL=00`, `BX=0200` in `cb:0x1ac50` → `cb:0x24b20`:
+   * `ECX` is the dword at PMID+0x5c of the VBIOS image, OR 0x10, plus bit 0 from a
+     runtime flag.
+   * `EDX` is PMID+0x60 (table version ≥ 0x12), `ESI` is PMID+0x64, `EDI` is PMID+0xc4.
+   * The KMD normally gets the image from the shadowed board VBIOS.  It uses
+     `VTROM.bin` only as the "BSOD protection" fallback (`dc07W7i.inf` l.93) or when the registry value
+     `ForceUseVTROM` is set.
+4. `kmd:0x120771..0x1207cf` writes ECX bit 30 as `UseVbiosControlTile` and bit
+   29 as `BiosEnableTile` to the registry.  `kmd:0x121a4d..0x121b17` reads the four
+   `HalcyonTiled*Enable` keys and sets `adp+0x9c8` bit 7 when all are 0.
+5. UMD `0x100ec053..0x100ec1a5`:
+   * `BiosEnableTile` presets all four enables (`+0x270..+0x27c`).
+   * Only if `UseVbiosControlTile == 0` are the four registry keys read, and they override the preset.
+6. `dc07W7i.inf` l.215-218 installs all four `HalcyonTiled*Enable` keys as **0**
+   for every `DEV_7122` subsystem listed.
+
+Values for `VTROM.bin` (PMID at `rom:0x3c20`, table `0x3c34`, version 0x18,
+length 0xf8, checksum 0):
+
+```text
+PMID+0x5c = 0092223f  -> ECX = 0092223f | 0x10 (| bit 0)
+  bit 30 UseVbiosControlTile = 0
+  bit 29 BiosEnableTile      = 0
+  bit 17 = 1 -> adp+0xb80 = PMID+0x64 = fee00000
+```
+
+The real-mode VBIOS `INT 10h 4F14h` handler (`rom:0x6542`, sub-table
+`rom:0x652f`) knows only `BL=02,03,04,05,0B`.  A real-mode `BX=0200` call
+therefore returns `AX=0000`.  This does not matter to Windows, which asks the
+CBIOS instead.
+
+**Result for our board (S for `VTROM.bin`, I for the board ROM):**
+
+* `UseVbiosControlTile=0`, `BiosEnableTile=0`, all `HalcyonTiled*Enable=0`.
+* `adp+0x9c8` bit 7 is set, and no surface is tiled.
+* The board VBIOS itself has not been dumped.  Its SR42/CR43 values match the
+  `VTROM.bin` POST table, so the same PMID capability word is likely.
+* Linux 5.75 forces the enables to 0 (`dri:0xa44be..0xa44d2`).
+* Revision 00 and `CR62=00` enter no decision.  `CR43=90` is the POST value
+  (bit 2 = 0, linear IGA1).
+
+### Can an engine tile while SR42 bit 7 = 0?
+
+* **M:** no.  Bit 7 = 0 "force[s] all engine use linear addressing mode".  The
+  per-engine bits (A51/A59/A61/A69 bit 23, A12 bit 0, A22 bit 17, 2D
+  `0x10`/`0x18` bit 31, CR43 bit 2, CR62 bit 0, HQV, CBU) are only "decided by
+  engine itself" when bit 7 = 1.
+* **S:** no vendor build programs a tiled bit on VX900 by default:
+  * Windows: PMID bits 29/30 are 0 and the INF keys are 0.
+  * Linux: the enables are constant 0, and `via_drv.so` never sets tiled scanout or 2D tile bits.
+  * Windows with a manual registry override would emit tile bits, but it never touches SR42.  It would therefore run with the POST value, bit 7 = 0.
+* **I:** if bit 7 = 0 really forces linear addressing, then every engine and the
+  CBU windows see the same linear layout.  A tiled-flagged surface that only the
+  GPU accesses would still render correctly, and the override would silently
+  have no effect.  Only CPU software detile/retile paths would expose the
+  difference.  This could explain why the vendor shipped complete tiled paths
+  without an SR42 check.
+
+### Conclusion
+
+**(c) unknown, leaning towards (b).**
+
+* Tiling is not shown to be impossible.  SR42 bit 7 is not a documented strap or fuse.  The VBIOS POST table programs it to 0 (SR42=0x30), and the Windows CBIOS repeats that on every POST.
+* It is not proven possible either:
+  * the manual marks the bit RO;
+  * no vendor code ever writes 1;
+  * the tiled addressing path has never run on any VX900 under a vendor driver.
+
+Minimal safe experiment, each step behind the GPU lock and the existing target
+rules:
+
+| step | action | decides |
+|---|---|---|
+| E1 | read only: SR10, SR40, SR41, SR4D, SR4F (expect `01`, `08`, `40`, `30`, `40` if the POST tables apply) | SR41 reading `40` instead of the reset default `00` shows that this "RO" arbiter block takes the firmware writes |
+| E2 | rung R2 unchanged: SR42 = 0x30, `tile_re=1` (A51 bit 23), 64x64 guarded render, dump the payload | linear image means bit 7 = 0 is enforced.  tile8 permutation means the bit is ignored and tiling works as is |
+| E3 | engines idle, no job in flight, CR43 bit 2 = CR62 bit 0 = 0, HQV/V1 tile modes 0, CBU windows disabled: write SR42 = `SR42 \| 0x80` (0xB0, arbiter fields unchanged), read back, restore 0x30 | whether bit 7 latches |
+| E4 | only if E3 reads 0xB0 and E2 was linear: SR42 = 0xB0, rung R2, then restore 0x30 | tile8 permutation proves (b), with enable sequence `SR10\|=1; SR42\|=0x80`.  A linear image means (a) |
+
+Risk:
+
+* E1 is a pure read.
+* E2 is the R2 risk already accepted in section 6.
+* E3/E4 change a DRAM-arbiter register while scanout is active.  With every
+  engine tile bit 0, "decided by engine" still means linear, so no address
+  should change.  The arbiter fields are written with their current values.
+* Recovery is a power cycle: VBIOS POST rewrites SR42 = 0x30.
+* The kernel must restore 0x30 on unload, suspend and before any KMS
+  handoff.  If E4 passes, it must set bit 7 again after resume, because the POST
+  table reruns.
+
 ## Remaining unknowns
 
-* SR42 bit 7 on the target (who sets it; RO in the manual).
+* Whether SR42 bit 7 latches a 1 and then enables engine tiling (E1-E4 in "Capability gate and SR42").
+* The board VBIOS PMID+0x5c and POST table (only `VTROM.bin` was decoded).
 * Whether tiled SF works at all, since the vendor excludes GART surfaces.
 * The 16-row layout, and CBU bit 7.
 * 2D tile geometry.
 * The CBU address domain (SL only?).
 * The consumer of `S3GDW_DisableTileSwizzle`.
-* The VBIOS `4F14/0200` bit 29/30 values in `VTROM.bin`.
 * The application IDs `0x5f`/`0x1cd`.
 * The meaning of `ctx+0x1c` and `desc+0x34` bits `0x200000`/`0x8000` in the Windows decision.
