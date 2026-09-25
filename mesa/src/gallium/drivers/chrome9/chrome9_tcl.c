@@ -402,6 +402,55 @@ tcl_fold_const_select(nir_builder *b, nir_alu_instr *alu, void *data)
    return true;
 }
 
+static bool
+tcl_is_select(const nir_alu_instr *alu)
+{
+   return alu->op == nir_op_fcsel || alu->op == nir_op_fcsel_gt ||
+          alu->op == nir_op_fcsel_ge;
+}
+
+/* A select is MAD(a, mask, MAD(-b, mask, b)); an operand that overflowed
+ * to infinity turns the masked-off term into NaN.  Mark arithmetic
+ * operands that may be infinite in pass_flags bits 1 and 2. */
+static bool
+tcl_select_mark_infinite(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   (void)b;
+   alu->instr.pass_flags = 0;
+   if (!tcl_is_select(alu))
+      return false;
+   for (unsigned s = 1; s < 3; s++) {
+      nir_def *def = alu->src[s].src.ssa;
+      nir_alu_instr *src = nir_def_as_alu_or_null(def);
+
+      if (src && (src->op == nir_op_fmul || src->op == nir_op_ffma ||
+                  src->op == nir_op_fadd || src->op == nir_op_fsub) &&
+          (nir_analyze_fp_class(data, def) &
+           (FP_CLASS_NEG_INF | FP_CLASS_POS_INF)))
+         alu->instr.pass_flags |= BITFIELD_BIT(s);
+   }
+   return false;
+}
+
+/* Clamp the marked operands to the finite range. */
+static bool
+tcl_select_finite(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   (void)data;
+   if (!tcl_is_select(alu) || !alu->instr.pass_flags)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   u_foreach_bit(s, alu->instr.pass_flags) {
+      nir_def *def = nir_fmin(b, nir_fmax(b, alu->src[s].src.ssa,
+                                          nir_imm_float(b, -FLT_MAX)),
+                              nir_imm_float(b, FLT_MAX));
+
+      nir_src_rewrite(&alu->src[s].src, def);
+   }
+   alu->instr.pass_flags = 0;
+   return true;
+}
+
 static void
 tcl_optimize(nir_shader *nir)
 {
@@ -1018,19 +1067,22 @@ tcl_vec(struct tcl_builder *b, nir_alu_instr *alu)
    tcl_set_temp(b, &alu->def, temp);
 }
 
-/* cond ? a : b as MAD(a - b, mask, b) with a 0/1 mask. */
+/* cond ? a : b as MAD(a, mask, MAD(-c, mask, c)) with a 0/1 mask; each
+ * term is exact, where b + mask * (a - b) cancels b beside a large a. */
 static unsigned
 tcl_select(struct tcl_builder *b, unsigned mask_temp, unsigned lanes,
            struct drm_chrome9_vertex_source a,
            struct drm_chrome9_vertex_source c)
 {
-   const unsigned diff = tcl_new_temp(b), out = tcl_new_temp(b);
-   struct drm_chrome9_vertex_source src[3] = { a, c };
+   const unsigned rest = tcl_new_temp(b), out = tcl_new_temp(b);
+   struct drm_chrome9_vertex_source src[3] = {
+      c, tcl_temp_source(mask_temp, lanes, false), c,
+   };
 
-   tcl_op(b, DRM_CHROME9_VERTEX_OP_SUB, BITFIELD_MASK(lanes), diff, src, 2);
-   src[0] = tcl_temp_source(diff, lanes, false);
-   src[1] = tcl_temp_source(mask_temp, lanes, false);
-   src[2] = c;
+   src[0].modifier ^= DRM_CHROME9_FRAGMENT_MOD_NEG;
+   tcl_op(b, DRM_CHROME9_VERTEX_OP_MAD, BITFIELD_MASK(lanes), rest, src, 3);
+   src[0] = a;
+   src[2] = tcl_temp_source(rest, lanes, false);
    return tcl_op(b, DRM_CHROME9_VERTEX_OP_MAD, BITFIELD_MASK(lanes), out, src,
                  3);
 }
@@ -2731,6 +2783,16 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       NIR_PASS(_, nir, nir_lower_alu_width, tcl_scalar_width, NULL);
       NIR_PASS(_, nir, nir_lower_bool_to_float, true);
       tcl_optimize(nir);
+   }
+   {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_fp_analysis_state fp = nir_create_fp_analysis_state(impl);
+
+      nir_shader_alu_pass(nir, tcl_select_mark_infinite, nir_metadata_all,
+                          &fp);
+      nir_free_fp_analysis_state(&fp);
+      NIR_PASS(_, nir, nir_shader_alu_pass, tcl_select_finite,
+               nir_metadata_control_flow, NULL);
    }
    /* CHROME9_DEBUG_TCL_NIR=3 also prints the lowered program. */
    if (debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0) > 2)
