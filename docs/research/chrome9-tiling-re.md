@@ -595,3 +595,28 @@ Risk:
 * The consumer of `S3GDW_DisableTileSwizzle`.
 * The application IDs `0x5f`/`0x1cd`.
 * The meaning of `ctx+0x1c` and `desc+0x34` bits `0x200000`/`0x8000` in the Windows decision.
+
+## Silicon results, 2026-09-25
+
+With SR42 still at the BIOS value `0x30` (bit 7 = 0), the engine tiles:
+
+* **R2** (rung `chrome9_coarsez_rung tile`, kernel knob `tile_re` bit 0):
+  a 64x64 BGRA target drawn with A51 bit 23 holds all 4096 pixels in the
+  32-byte x 8-row tile order of section 1, guards intact.  SR42 bit 7 does
+  not force the 3D engine linear.
+* **R4**: that tiled image sampled with A22 bit 17 into a linear target
+  matches the linear reference in all 4096 pixels.
+* **Z**: A12 bit 0 tiles depth; depth-tested fill through GL (1600x1200,
+  eight layers) 77 -> 65 ms, back-to-front hidden layers 29 % faster.
+* **Throughput** (`tileperf`, 16 copies of a 1024x1024 BGRA texture to a
+  1024x1024 target, nearest or bilinear): linear 75.9 ms, tiled texture
+  62.9 ms, tiled target 65.6 ms, both tiled 53.0 ms.
+
+Implemented: kernel `a9dfc98` (tiled depth, `FRAGMENT_DEPTH_TILED`, CAP2
+bit 27) and the tiled colour flags (`FRAGMENT_DESTINATION_TILED`,
+`FRAGMENT_TEXTURE_FLAG_TILED` / `_TABLE`, CAP2 bit 28).  Mesa tiles private
+depth surfaces with a height divisible by 8 and private 2D BGRA/BGRX render
+targets (every level ALIGN(h, 8) rows at 256-byte aligned table offsets,
+also for POT sizes); the first CPU access, fixed draw builder or depth
+sampler view rewrites a surface linear for good.  glmark2 refract 99.5 ->
+92.2 ms, desktop shadow 127 -> 141 fps.
