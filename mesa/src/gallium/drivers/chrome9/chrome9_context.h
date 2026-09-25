@@ -311,6 +311,7 @@ struct chrome9_context {
    struct chrome9_sw_context *sw;
    struct pipe_blend_color blend_color;
    struct pipe_clip_state clip;
+   struct pipe_poly_stipple poly_stipple;
    uint64_t tcl_triangles;
    uint64_t tcl_buffer_triangles;
    uint64_t tcl_buffer_rejects;

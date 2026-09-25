@@ -7178,10 +7178,11 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    /* The pixel engine writes exactly one colour target and blends without
-    * logic ops: other framebuffers and blend states render in llvmpipe. */
+    * logic ops or polygon stipple: other states render in llvmpipe. */
    if ((!ctx->framebuffer.nr_cbufs || !ctx->framebuffer.cbufs[0].texture ||
         chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 ||
-        !chrome9_draw_blend_supported(ctx)) &&
+        !chrome9_draw_blend_supported(ctx) ||
+        (ctx->rasterizer && ctx->rasterizer->poly_stipple_enable)) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
    chrome9_refresh_vs_textures(ctx);
@@ -7335,8 +7336,7 @@ static void
 chrome9_set_polygon_stipple(struct pipe_context *pipe,
                             const struct pipe_poly_stipple *stipple)
 {
-   (void)pipe;
-   (void)stipple;
+   chrome9_context(pipe)->poly_stipple = *stipple;
 }
 
 static void

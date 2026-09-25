@@ -808,6 +808,7 @@ chrome9_sw_bind_state(struct chrome9_context *ctx, struct chrome9_sw_context *sw
    lp->set_viewport_states(lp, 0, 1, &ctx->viewport);
    lp->set_scissor_states(lp, 0, 1, &ctx->scissor);
    lp->set_clip_state(lp, &ctx->clip);
+   lp->set_polygon_stipple(lp, &ctx->poly_stipple);
 
    for (unsigned i = 0; i < ctx->num_sampler_states; i++)
       if (ctx->sampler_states[i] &&
