@@ -208,6 +208,17 @@ exit.
 Teardown for every step: `0x200 = saved enables` (`old & f7ff0800`),
 `free_irq`, restore CR11 bits 5:4 from the saved value.
 
+## 5a. Silicon results, 2026-09-25
+
+Kernel `a0858ab`: the handler acknowledges 0x1280 bits 13/11/9 with
+`hp & 0x7fffffe0` before the CR check, setup clears a latched status
+first; no CR11 write was needed.  With `fence_irq=1` over the glmark2
+suite and four ioquake3 timedemos: 47001 fence interrupts, 272
+acknowledged internal DP status interrupts, no foreign interrupt, no
+"nobody cared"; 21976 of 57258 worker waits ended in the polling
+timeout.  Frame rates are unchanged; the ioquake3 GL2 worst frame drops
+from 88-109 ms to 72 ms.  `fence_irq` now defaults to 1.
+
 ## 6. Open points
 
 * Attributes of 0x1280 bits 24 and 26 (enable vs status) are unknown; do
