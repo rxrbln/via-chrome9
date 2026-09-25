@@ -887,18 +887,51 @@ chrome9_draw_depth_flags(const struct chrome9_context *ctx, bool depth_active)
    return depth_flags;
 }
 
+/* Viewport edge along one axis, rounded to the pixel grid of the target. */
+static unsigned
+chrome9_viewport_edge(float translate, float scale, float side,
+                      unsigned size)
+{
+   return CLAMP(lroundf(translate + side * fabsf(scale)), 0, (long)size);
+}
+
 static void
 chrome9_draw_scissor(const struct chrome9_context *ctx,
                      const struct chrome9_resource *target,
                      struct drm_chrome9_scissor_state *scissor)
 {
+   const struct pipe_viewport_state *vp = &ctx->viewport;
+   const unsigned width = target->base.width0;
+   const unsigned height = target->base.height0;
+   unsigned min_x = 0, min_y = 0, max_x = width, max_y = height;
+
    memset(scissor, 0, sizeof(*scissor));
    if (ctx->rasterizer && ctx->rasterizer->scissor) {
+      min_x = MIN2(ctx->scissor.minx, width);
+      max_x = MIN2(ctx->scissor.maxx, width);
+      min_y = MIN2(ctx->scissor.miny, height);
+      max_y = MIN2(ctx->scissor.maxy, height);
       scissor->flags = DRM_CHROME9_SCISSOR_ENABLE;
-      scissor->min_x = MIN2(ctx->scissor.minx, target->base.width0);
-      scissor->max_x = MIN2(ctx->scissor.maxx, target->base.width0);
-      scissor->min_y = MIN2(ctx->scissor.miny, target->base.height0);
-      scissor->max_y = MIN2(ctx->scissor.maxy, target->base.height0);
+   }
+   /* Hardware TCL clips to the guard band only: pixels outside the
+    * viewport are scissored. */
+   if (ctx->scissor_supported) {
+      min_x = MAX2(min_x, chrome9_viewport_edge(vp->translate[0],
+                                                vp->scale[0], -1, width));
+      max_x = MIN2(max_x, chrome9_viewport_edge(vp->translate[0],
+                                                vp->scale[0], 1, width));
+      min_y = MAX2(min_y, chrome9_viewport_edge(vp->translate[1],
+                                                vp->scale[1], -1, height));
+      max_y = MIN2(max_y, chrome9_viewport_edge(vp->translate[1],
+                                                vp->scale[1], 1, height));
+      if (min_x || min_y || max_x < width || max_y < height)
+         scissor->flags = DRM_CHROME9_SCISSOR_ENABLE;
+   }
+   if (scissor->flags) {
+      scissor->min_x = min_x;
+      scissor->max_x = MAX2(min_x, max_x);
+      scissor->min_y = min_y;
+      scissor->max_y = MAX2(min_y, max_y);
    }
 }
 
