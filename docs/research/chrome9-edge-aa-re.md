@@ -271,6 +271,27 @@ ramp and E5 exact.  Blend-on polygon smooth stays in llvmpipe unless E3/E4
 match GL's `SRC_ALPHA_SATURATE` model.  Native smooth lines need L1..L3 to
 match a coverage-alpha model within 1 LSB under source-over.
 
+## 9a. Silicon results, 2026-09-25
+
+GL probe `~/tmp/eaa/eaa.c` (64x64 FBO, triangle a/b/c above, a one-pixel
+line (30.5,50.5)-(60.5,62.5)), kernel knob `edge_aa_re=0x20`:
+
+* Blend off, white on black: the triangle's edge pixel on row 32 becomes
+  `787878`, the line a smooth two-to-three pixel profile (`606060 c7c7c7
+  cfcfcf 686868 080808`).  On a green destination the same pixels are
+  `78ff78` etc.: coverage x source + (1 - coverage) x destination, with
+  the destination alpha unchanged.
+* With source-over blending and source alpha 1 the result is identical
+  (GL's coverage-alpha model gives the same).  With source alpha 0.5 the
+  edge pixels are brighter than GL's model (triangle `5cff5c` and an
+  interior-adjacent `a9ffa9` over an interior `80ff80`): coverage is
+  applied after the blend again.
+* Implemented: kernel `64242a2` (CAP2 bit 25, `RASTER_EDGE_AA`, lines and
+  filled triangles, coarse-Z bits cleared), Mesa: one-pixel unstippled
+  smooth lines and blend-off polygon smooth.  The piglit line and polygon
+  subsets are unchanged (line-aa-width, line-smooth-coverage,
+  line-smooth-stipple pass on the hardware path).
+
 ## 10. Open items
 
 * The Windows field `[+0x9c3c]+0x1c == 8` that gates A01 bit 5 in the D3D

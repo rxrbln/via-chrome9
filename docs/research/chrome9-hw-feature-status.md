@@ -40,6 +40,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | DXT1/3/5 incl. POT mip chains | `4b06bc2` / `58b8d2f` | `dxt d1..d6` (d2/d5 within 3 LSB), `m1`/`m2`, `chrome9_gl_cube_dxt_smoke` |
 | 2D COPY_RECT, KMS scanout, hardware cursor | | Xorg |
 | coarse-Z depth rejection (A01 bits 13/9, A29/A2A, 16-byte entry per 8x8 block), module `coarse_z` (default off: ioquake3 about 1.6 % slower, no glmark2 gain) | `dcccfc5` / Mesa coarse-Z, CAP2 bit 23 | `chrome9_coarsez_rung` (image identical, 39.3 -> 24.5 ms for hidden quads), back-to-front GL layers 55.8 -> 31.3 ms |
+| edge antialiasing (A01 bit 5): one-pixel smooth lines, blend-off polygon smooth, on by default | `64242a2` / Mesa, CAP2 bit 25 | `eaa` probe, piglit line/polygon subsets unchanged |
 | Fast-Z clear (A27 index in X8Z24 depth bits 10:8, A14/A15 clear data), on by default | `5ca17f7` / Mesa Fast-Z, CAP2 bit 24 | rung `fastz`, 24-bit FBO probe identical; Z16 windows do not use it |
 
 ## Emulated or falling back
@@ -59,7 +60,6 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | state |
 |---|---|
-| edge antialiasing (A01 bit 5, A23 edge flags) | RE done (`chrome9-edge-aa-re.md`); GL_POLYGON_SMOOTH is drawn aliased today |
 | surface tiling | RE in progress |
 | stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes), B14 (NaN kill) | open; B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
 | per-segment state cache | patch ready (default off), rungs R2/R3 |
