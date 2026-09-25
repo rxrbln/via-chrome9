@@ -1254,6 +1254,10 @@ with `CHROME9_TCL_FLOW_DEPTH=2` / `CHROME9_TCL_DYNAMIC_FLOW=1`.
 Open: op-29 semantics on a temporary (F3), nesting beyond one, REP with a
 partial-writemask last body record, and whether IF b# should replace
 selects for large uniform arms (performance, after the features).
+Resolved on silicon (rungs `vsdyn`, `vsnest`,
+[chrome9-shader-conditionals.md](chrome9-shader-conditionals.md) section 3):
+op 29 on a temporary tests the b# bit of its register number, IF nests four
+deep, a REP inside a REP ends the outer loop after one trip.
 
 ### 11.8 Silicon result 1 and v2 (2026-09-25)
 

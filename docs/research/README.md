@@ -35,6 +35,11 @@ targets.
   volume textures (POT, single level, slice = pitch x height), VS static flow
   control and native points/lines/polygon modes with CAP2 bits 6-11 and
   bounded rungs; timer queries, MSAA and PS flow control are negative.
+- [chrome9-shader-conditionals.md](chrome9-shader-conditionals.md) surveys
+  piglit/glmark2 conditionals, proves on silicon that vertex IF on a
+  temporary tests b# of its register number (no dynamic branch) and that
+  IF nests four deep but REP does not nest, and records the shared CMP
+  condition, discard, flattening and TCL changes with before/after numbers.
 - [chrome9-next-hw-features.md](chrome9-next-hw-features.md) ranks cube
   maps, DXTn, native strips/fans and two-sided colour; single-BO cube layout,
   vendor compressed layout, the POT mip-table question, a culling split for
