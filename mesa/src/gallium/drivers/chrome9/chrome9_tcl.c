@@ -113,10 +113,42 @@ tcl_scalar_width(const nir_instr *instr, const void *data)
    case nir_op_flog2:
    case nir_op_fpow:
    case nir_op_fsqrt:
+   /* Vector equality reductions become scalar compares. */
+   case nir_op_ball_fequal2:
+   case nir_op_ball_fequal3:
+   case nir_op_ball_fequal4:
+   case nir_op_bany_fnequal2:
+   case nir_op_bany_fnequal3:
+   case nir_op_bany_fnequal4:
       return 1;
    default:
       return 0;
    }
+}
+
+/* Values are float-encoded: integer equality reductions that the
+ * optimizer forms after the bool lowering compare as floats. */
+static bool
+tcl_float_reduction(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   static const nir_op map[][2] = {
+      { nir_op_ball_iequal2, nir_op_ball_fequal2 },
+      { nir_op_ball_iequal3, nir_op_ball_fequal3 },
+      { nir_op_ball_iequal4, nir_op_ball_fequal4 },
+      { nir_op_bany_inequal2, nir_op_bany_fnequal2 },
+      { nir_op_bany_inequal3, nir_op_bany_fnequal3 },
+      { nir_op_bany_inequal4, nir_op_bany_fnequal4 },
+   };
+
+   (void)b;
+   (void)data;
+   for (unsigned i = 0; i < ARRAY_SIZE(map); i++) {
+      if (alu->op == map[i][0]) {
+         alu->op = map[i][1];
+         return true;
+      }
+   }
+   return false;
 }
 
 /* GL clip-space z (-w..w) to the clip engine's D3D range (0..w). */
@@ -1859,6 +1891,12 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
    /* Booleans become 0.0/1.0. */
    NIR_PASS(_, nir, nir_lower_bool_to_float, true);
    tcl_optimize(nir);
+   if (nir_shader_alu_pass(nir, tcl_float_reduction, nir_metadata_all,
+                           NULL)) {
+      NIR_PASS(_, nir, nir_lower_alu_width, tcl_scalar_width, NULL);
+      NIR_PASS(_, nir, nir_lower_bool_to_float, true);
+      tcl_optimize(nir);
+   }
    b.impl = nir_shader_get_entrypoint(nir);
    if (!b.flow && !tcl_single_block(nir, &block)) {
       if (debug_get_bool_option("CHROME9_DEBUG_TCL", false)) {
