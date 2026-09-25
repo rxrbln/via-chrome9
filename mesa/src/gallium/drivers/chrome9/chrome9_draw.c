@@ -3907,7 +3907,9 @@ chrome9_draw_begin_guarded_domain(struct chrome9_context *ctx)
    render->deferred_rejected_before = ctx->rejected_triangles;
 }
 
-void
+/* False when a value left the proven domain: nothing of the draw was
+ * submitted and the caller renders it another way. */
+bool
 chrome9_draw_end_guarded_domain(struct chrome9_context *ctx)
 {
    struct chrome9_vbuf_render *render;
@@ -3915,10 +3917,10 @@ chrome9_draw_end_guarded_domain(struct chrome9_context *ctx)
    bool failed;
 
    if (!ctx || !ctx->vbuf_render)
-      return;
+      return true;
    render = ctx->vbuf_render;
    if (!render->defer_guarded_domain)
-      return;
+      return true;
    chrome9_flush_triangle_batch(render);
    failed = render->deferred_failed ||
       ctx->rejected_triangles != render->deferred_rejected_before;
@@ -3955,6 +3957,7 @@ chrome9_draw_end_guarded_domain(struct chrome9_context *ctx)
       FREE(batch);
       batch = next;
    }
+   return !failed;
 }
 
 static void

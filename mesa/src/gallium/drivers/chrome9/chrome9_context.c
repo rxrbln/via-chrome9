@@ -7963,12 +7963,17 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       ctx->fs->semantic_identity_projector_input_mask != 0 ||
       ctx->fs->semantic_unit_interval_input_mask != 0;
 
+   const uint64_t rejected = ctx->rejected_triangles;
+
    if (guarded_domain)
       chrome9_draw_begin_guarded_domain(ctx);
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
-   if (guarded_domain)
-      chrome9_draw_end_guarded_domain(ctx);
+   /* A varying outside the program's proven domain (e.g. a projector that
+    * is not 1): llvmpipe renders the whole draw instead. */
+   if (guarded_domain && !chrome9_draw_end_guarded_domain(ctx) &&
+       chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+      ctx->rejected_triangles = rejected;
    /* Keep compatible immediate triangles across Gallium draw calls.  The
     * flush/present boundary retires them and publishes a guarded drawable
     * shadow once rather than copying a full image after every draw. */
