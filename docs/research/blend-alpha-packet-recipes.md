@@ -69,6 +69,14 @@ builders set bit 16.  The live Xorg-derived source-over oracle leaves it clear
 and is therefore the safer initial UNORM-target setting.  Do not describe bit
 16 merely as a generic “saturation” bit.
 
+**Silicon (2026-09-25, rung `blend`,
+[chrome9-queries-msaa-3d-flow-re.md](chrome9-queries-msaa-3d-flow-re.md)
+§12.7):** the manual wording is inverted for negative results.  With bit 16
+clear SUBTRACT stores `ff` for every negative channel (`ffa0ff40` instead of
+`00a00040`); with bit 16 set all SUBTRACT/REVERSE_SUBTRACT cases are exact and
+ADD above one still saturates (`c0ffffff`).  The kernel sets bit 16 only in
+subtract lanes.
+
 The operation code is `0=ADD, 1=SUBTRACT, 2=MAX, 3=MIN`.  The normal ADD and
 SUBTRACT branches use source as operand A and destination as operand B.
 REVERSE_SUBTRACT uses destination as A and source as B, then selects operation
