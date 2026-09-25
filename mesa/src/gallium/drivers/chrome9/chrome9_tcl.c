@@ -106,8 +106,30 @@ struct tcl_dedupe {
    uint32_t *first;
 };
 
+/*
+ * The distinct vertices of a non-indexed draw over unchanged buffers,
+ * copied into one array, and the draw as indices into it.  VS texture
+ * lookups are then sampled once per distinct vertex.
+ */
+struct tcl_compact {
+   struct tcl_dedupe_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   unsigned inputs;
+   unsigned start;
+   unsigned count;
+   bool valid;
+   bool built;
+   uint32_t *index;
+   uint8_t *vertices;
+   /* The vertices in a vertex buffer, written once. */
+   struct pipe_resource *buffer;
+   unsigned unique;
+   unsigned stride;
+   unsigned offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
+};
+
 struct chrome9_tcl_state {
    struct chrome9_tcl_fragment fragment;
+   struct tcl_compact compact;
    struct tcl_dedupe dedupe[TCL_DEDUPE_ENTRIES];
    uint64_t dedupe_clock;
    uint32_t constants[DRM_CHROME9_VERTEX_MAX_CONSTANTS][4];
@@ -115,6 +137,12 @@ struct chrome9_tcl_state {
    /* One stage B chunk; the kernel bounds index_count per draw. */
    uint32_t indices[DRM_CHROME9_VERTEX_MAX_INDICES];
    uint8_t ints[DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS][4];
+   /* Coordinates of the prefetched VS texture lookups. */
+   float *coords;
+   size_t prefetch_coords;
+   /* Vertex buffers the lookups are written to, in turn. */
+   struct pipe_resource *prefetch_ring[3];
+   unsigned prefetch_next;
    /* Draw-relative vertex positions of the current chunk. */
    unsigned positions[MAX2(DRM_CHROME9_VERTEX_MAX_INDICES,
                            DRM_CHROME9_VERTEX_MAX_VERTICES)];
@@ -1770,6 +1798,76 @@ tcl_intrinsic(struct tcl_builder *b, nir_intrinsic_instr *intr)
 }
 
 
+/*
+ * A 2D lookup at LOD 0 whose coordinate is a vertex attribute becomes an
+ * extra input the CPU samples per vertex before the draw.
+ */
+static void
+tcl_tex(struct tcl_builder *b, nir_tex_instr *tex)
+{
+   struct chrome9_tcl_program *p = b->p;
+   struct tcl_value *out = &b->values[tex->def.index];
+   const int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int lod = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   nir_scalar st[2];
+   nir_intrinsic_instr *input = NULL;
+   struct chrome9_tcl_prefetch f = { 0 };
+   unsigned k;
+
+   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
+       tex->is_shadow || tex->def.bit_size != 32 || coord < 0 ||
+       tex->num_srcs != 1u + (lod >= 0) ||
+       (lod >= 0 && (!nir_src_is_const(tex->src[lod].src) ||
+                     nir_src_as_float(tex->src[lod].src) != 0.0)) ||
+       tex->src[coord].src.ssa->num_components != 2 ||
+       tex->texture_index >= CHROME9_VS_MAX_SAMPLERS ||
+       tex->sampler_index >= CHROME9_VS_MAX_SAMPLERS ||
+       (b->flow && tcl_used_in_flow(b, &tex->def))) {
+      b->failed = true;
+      return;
+   }
+   for (unsigned c = 0; c < 2; c++) {
+      nir_intrinsic_instr *load;
+
+      st[c] = nir_scalar_resolved(tex->src[coord].src.ssa, c);
+      if (!nir_scalar_is_intrinsic(st[c])) {
+         b->failed = true;
+         return;
+      }
+      load = nir_def_as_intrinsic(st[c].def);
+      if (load->intrinsic != nir_intrinsic_load_input ||
+          !nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+          (input && nir_intrinsic_base(load) != nir_intrinsic_base(input))) {
+         b->failed = true;
+         return;
+      }
+      input = load;
+   }
+   f.unit = tex->texture_index;
+   f.sampler = tex->sampler_index;
+   f.input = nir_intrinsic_base(input);
+   f.s = nir_intrinsic_component(nir_def_as_intrinsic(st[0].def)) + st[0].comp;
+   f.t = nir_intrinsic_component(nir_def_as_intrinsic(st[1].def)) + st[1].comp;
+   for (k = 0; k < p->prefetch_count; k++)
+      if (!memcmp(&p->prefetch[k], &f, sizeof(f)))
+         break;
+   if (k == p->prefetch_count) {
+      if (p->attrib_count + k >= DRM_CHROME9_VERTEX_MAX_INPUTS) {
+         b->failed = true;
+         return;
+      }
+      p->prefetch[p->prefetch_count++] = f;
+   }
+   memset(out, 0, sizeof(*out));
+   out->valid = true;
+   out->file = DRM_CHROME9_VERTEX_FILE_INPUT;
+   out->index = p->attrib_count + k;
+   for (unsigned c = 0; c < 4; c++)
+      out->sel[c] = c;
+   p->input_count = MAX2(p->input_count, out->index + 1u);
+}
+
 static void
 tcl_flow_fail(struct tcl_builder *b, const char *reason)
 {
@@ -2277,6 +2375,9 @@ tcl_emit_instr(struct tcl_builder *b, nir_instr *instr)
    case nir_instr_type_intrinsic:
       tcl_intrinsic(b, nir_instr_as_intrinsic(instr));
       break;
+   case nir_instr_type_tex:
+      tcl_tex(b, nir_instr_as_tex(instr));
+      break;
    case nir_instr_type_phi:
       /* Set up by the enclosing if or loop. */
       if (!b->values[nir_instr_as_phi(instr)->def.index].valid)
@@ -2647,6 +2748,12 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
          if (instr->type == nir_instr_type_intrinsic &&
              tcl_ubo_row(nir_instr_as_intrinsic(instr), &row, &lane))
             p->uniform_rows = MAX2(p->uniform_rows, row + 1);
+         /* Prefetched lookups follow the attribute inputs. */
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_load_input)
+            p->attrib_count = MAX2(p->attrib_count,
+               nir_intrinsic_base(nir_instr_as_intrinsic(instr)) + 1);
          /* An indirect read may reach any row of the default block. */
          if (tcl_indirect_load(instr)) {
             indirect = true;
@@ -3206,8 +3313,15 @@ tcl_raster(const struct chrome9_context *ctx, const struct pipe_draw_info *info,
 }
 
 struct tcl_stream {
+   /* Vertex first's element; size counts from there. */
    const uint8_t *base;
    size_t size;
+   unsigned first;
+   /* Synthetic streams: a CPU array (uploaded per draw) or a buffer, and
+    * this element's offset in it. */
+   const uint8_t *user;
+   struct pipe_resource *resource;
+   unsigned user_offset;
    unsigned stride;
    enum pipe_format format;
    unsigned bytes;
@@ -3282,6 +3396,9 @@ tcl_bind_inputs(struct chrome9_context *ctx, unsigned inputs,
             chrome9_resource(vb->buffer.resource)->bo.map : NULL;
       if (!map)
          return false;
+      streams[k].first = 0;
+      streams[k].user = NULL;
+      streams[k].resource = NULL;
       streams[k].base = map + vb->buffer_offset + el->src_offset;
       streams[k].size = vb->is_user_buffer ? SIZE_MAX :
          (size_t)vb->buffer.resource->width0 >
@@ -3314,10 +3431,11 @@ tcl_fetch_vertex(const struct tcl_stream *streams, unsigned inputs,
 
    for (unsigned k = 0; k < inputs; k++) {
       const struct tcl_stream *stream = &streams[k];
-      const size_t offset = (size_t)index * stream->stride;
+      const size_t offset = (size_t)(index - stream->first) * stream->stride;
 
-      if (stream->size != SIZE_MAX &&
-          (offset > stream->size || stream->size - offset < stream->bytes))
+      if (index < stream->first ||
+          (stream->size != SIZE_MAX &&
+           (offset > stream->size || stream->size - offset < stream->bytes)))
          return 0;
       if (!stream->dwords) {
          float value[4];
@@ -3403,22 +3521,32 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
    uint64_t high[DRM_CHROME9_VERTEX_MAX_INPUTS];
    unsigned n = 0;
 
+   unsigned first[DRM_CHROME9_VERTEX_MAX_INPUTS];
+
    for (unsigned k = 0; k < inputs; k++) {
-      const struct pipe_vertex_element *el = &ctx->vertex_elements->elements[k];
-      const struct pipe_vertex_buffer *vb =
-         &ctx->vertex_buffers[el->vertex_buffer_index];
-      const unsigned stride = el->src_stride;
-      const uint64_t offset = (uint64_t)vb->buffer_offset + el->src_offset;
-      const void *array = vb->is_user_buffer ? vb->buffer.user : NULL;
+      const bool synthetic = streams[k].user || streams[k].resource;
+      const struct pipe_vertex_element *el = synthetic ? NULL :
+         &ctx->vertex_elements->elements[k];
+      const struct pipe_vertex_buffer *vb = el ?
+         &ctx->vertex_buffers[el->vertex_buffer_index] : NULL;
+      const unsigned stride = streams[k].stride;
+      const uint64_t offset = el ?
+         (uint64_t)vb->buffer_offset + el->src_offset : streams[k].user_offset;
+      struct pipe_resource *resource = streams[k].resource ?
+         streams[k].resource : vb && !vb->is_user_buffer ?
+         vb->buffer.resource : NULL;
+      const void *array = streams[k].resource ? NULL :
+                          !el ? streams[k].user :
+                          vb->is_user_buffer ? vb->buffer.user : NULL;
       uint32_t handle = 0;
       unsigned b;
 
       /* Stride 0 repeats one element (silicon rung B12). */
-      if ((!array && !vb->buffer.resource) || !streams[k].dwords ||
+      if ((!array && !resource) || !streams[k].dwords ||
           stride > 2044 || stride % 4 || offset % 4 || offset > UINT32_MAX)
          return false;
       if (!array)
-         handle = chrome9_resource(vb->buffer.resource)->bo.handle;
+         handle = chrome9_resource(resource)->bo.handle;
       for (b = 0; b < n; b++)
          if (buffers[b].stride == stride &&
              (array ? user[b] == array : !user[b] && buffers[b].handle == handle))
@@ -3426,9 +3554,10 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
       if (b == n) {
          buffers[n].handle = handle;
          buffers[n].stride = stride;
-         buffers[n].offset = (uint64_t)min * stride;
+         buffers[n].offset = (uint64_t)(min - streams[k].first) * stride;
          user[n] = array;
-         resources[n] = array ? NULL : vb->buffer.resource;
+         first[n] = streams[k].first;
+         resources[n] = array ? NULL : resource;
          low[n] = UINT64_MAX;
          high[n] = 0;
          n++;
@@ -3451,7 +3580,8 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
          return false;
       u_upload_data_ref(ctx->base.stream_uploader, 0, span, 4,
                         (const uint8_t *)user[b] +
-                           (uint64_t)min * buffers[b].stride + low[b],
+                           (uint64_t)(min - first[b]) * buffers[b].stride +
+                           low[b],
                         &out_offset, &uploads[b]);
       if (!uploads[b])
          return false;
@@ -3473,10 +3603,44 @@ tcl_vertex_equal(const struct tcl_stream *streams, unsigned inputs,
                  unsigned a, unsigned b)
 {
    for (unsigned k = 0; k < inputs; k++)
-      if (memcmp(streams[k].base + (size_t)a * streams[k].stride,
-                 streams[k].base + (size_t)b * streams[k].stride,
+      if (memcmp(streams[k].base +
+                    (size_t)(a - streams[k].first) * streams[k].stride,
+                 streams[k].base +
+                    (size_t)(b - streams[k].first) * streams[k].stride,
                  streams[k].bytes))
          return false;
+   return true;
+}
+
+/* Identity of the attribute data of a non-indexed draw over buffers
+ * whose writes are announced; false for data that may change silently. */
+static bool
+tcl_stream_key(const struct chrome9_context *ctx, unsigned inputs,
+               const struct tcl_stream *streams,
+               const struct pipe_draw_start_count_bias *range,
+               struct tcl_dedupe_stream *key)
+{
+   memset(key, 0, DRM_CHROME9_VERTEX_MAX_INPUTS * sizeof(*key));
+   for (unsigned k = 0; k < inputs; k++) {
+      const struct pipe_vertex_element *el = &ctx->vertex_elements->elements[k];
+      const struct pipe_vertex_buffer *vb =
+         &ctx->vertex_buffers[el->vertex_buffer_index];
+      const struct chrome9_resource *res;
+
+      /* Persistent mappings change without an announced write. */
+      if (vb->is_user_buffer || !vb->buffer.resource ||
+          (vb->buffer.resource->flags & (PIPE_RESOURCE_FLAG_MAP_PERSISTENT |
+                                         PIPE_RESOURCE_FLAG_MAP_COHERENT)) ||
+          ((uint64_t)range->start + range->count - 1) * streams[k].stride +
+             streams[k].bytes > streams[k].size)
+         return false;
+      res = chrome9_resource_const(vb->buffer.resource);
+      key[k].serial = res->serial;
+      key[k].generation = res->cpu_write_generation;
+      key[k].offset = (uint64_t)vb->buffer_offset + el->src_offset;
+      key[k].stride = streams[k].stride;
+      key[k].bytes = streams[k].bytes;
+   }
    return true;
 }
 
@@ -3494,7 +3658,8 @@ tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
 {
    struct tcl_dedupe_stream key[DRM_CHROME9_VERTEX_MAX_INPUTS];
    const nir_shader *nir = ctx->vs->tcl->nir;
-   const unsigned inputs = p->input_count;
+   /* Prefetched lookups are functions of the attributes. */
+   const unsigned inputs = p->input_count - p->prefetch_count;
    struct tcl_dedupe *victim = &state->dedupe[0];
    uint32_t *table, *first, mask, unique = 0;
 
@@ -3504,27 +3669,8 @@ tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
        BITSET_TEST(nir->info.system_values_read,
                    SYSTEM_VALUE_VERTEX_ID_ZERO_BASE))
       return NULL;
-   memset(key, 0, sizeof(key));
-   for (unsigned k = 0; k < inputs; k++) {
-      const struct pipe_vertex_element *el = &ctx->vertex_elements->elements[k];
-      const struct pipe_vertex_buffer *vb =
-         &ctx->vertex_buffers[el->vertex_buffer_index];
-      const struct chrome9_resource *res;
-
-      /* Persistent mappings change without an announced write. */
-      if (vb->is_user_buffer || !vb->buffer.resource ||
-          (vb->buffer.resource->flags & (PIPE_RESOURCE_FLAG_MAP_PERSISTENT |
-                                         PIPE_RESOURCE_FLAG_MAP_COHERENT)) ||
-          ((uint64_t)range->start + range->count - 1) * streams[k].stride +
-             streams[k].bytes > streams[k].size)
-         return NULL;
-      res = chrome9_resource_const(vb->buffer.resource);
-      key[k].serial = res->serial;
-      key[k].generation = res->cpu_write_generation;
-      key[k].offset = (uint64_t)vb->buffer_offset + el->src_offset;
-      key[k].stride = streams[k].stride;
-      key[k].bytes = streams[k].bytes;
-   }
+   if (!tcl_stream_key(ctx, inputs, streams, range, key))
+      return NULL;
    for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++) {
       struct tcl_dedupe *entry = &state->dedupe[e];
 
@@ -3599,6 +3745,12 @@ chrome9_tcl_state_destroy(struct chrome9_tcl_state *state)
 {
    if (!state)
       return;
+   FREE(state->coords);
+   for (unsigned r = 0; r < ARRAY_SIZE(state->prefetch_ring); r++)
+      pipe_resource_reference(&state->prefetch_ring[r], NULL);
+   free(state->compact.index);
+   free(state->compact.vertices);
+   pipe_resource_reference(&state->compact.buffer, NULL);
    for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++)
       free(state->dedupe[e].first);
    FREE(state);
@@ -3622,11 +3774,11 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                         min;
    unsigned count, n;
 
-   draw->index_size = 4;
    draw->indices_ptr = (uintptr_t)state->indices;
-   draw->base_vertex = 0;
    while ((count = tcl_chunk(&chunker, DRM_CHROME9_VERTEX_MAX_INDICES,
                              state->positions, &n))) {
+      uint32_t lo = UINT32_MAX, hi = 0;
+
       for (unsigned i = 0; i < n; i++) {
          const unsigned position = range->start + state->positions[i];
          int64_t value = first ?
@@ -3639,6 +3791,21 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          else if (info->index_size == 4)
             value = ((const uint32_t *)indices)[position];
          state->indices[i] = value + bias;
+         lo = MIN2(lo, state->indices[i]);
+         hi = MAX2(hi, state->indices[i]);
+      }
+      /* A chunk spanning at most 64Ki vertices sends 16-bit indices
+       * relative to its lowest vertex: half the ring bytes. */
+      if (n && hi - lo <= UINT16_MAX) {
+         uint16_t *narrow = (uint16_t *)state->indices;
+
+         for (unsigned i = 0; i < n; i++)
+            narrow[i] = state->indices[i] - lo;
+         draw->index_size = 2;
+         draw->base_vertex = lo;
+      } else {
+         draw->index_size = 4;
+         draw->base_vertex = 0;
       }
       draw->index_count = n;
       if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, count,
@@ -3855,6 +4022,9 @@ tcl_lane_origin(const struct chrome9_context *ctx,
       return p->origin[v][c];
    input = p->origin_input[v][c];
    channel = p->origin_lane[v][c];
+   /* Prefetched texels have no static range. */
+   if (input >= p->input_count - p->prefetch_count)
+      return CHROME9_TCL_ORIGIN_UNKNOWN;
    desc = util_format_description(
       ctx->vertex_elements->elements[input].src_format);
    /* Unfetched lanes read the (0, 0, 0, 1) default. */
@@ -3973,6 +4143,212 @@ tcl_fallback(struct chrome9_context *ctx, const char *reason)
 }
 
 /* One culled pass of a TCL draw; false only when nothing was submitted. */
+static const struct tcl_compact *
+tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
+                const struct chrome9_tcl_program *p,
+                const struct tcl_stream *streams,
+                const struct pipe_draw_start_count_bias *range)
+{
+   struct tcl_dedupe_stream key[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   const unsigned inputs = p->input_count - p->prefetch_count;
+   const nir_shader *nir = ctx->vs->tcl->nir;
+   struct tcl_compact *c = &state->compact;
+   uint32_t *table, *source, mask;
+   unsigned stride = 0;
+
+   if (!inputs || !range->count ||
+       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID) ||
+       BITSET_TEST(nir->info.system_values_read,
+                   SYSTEM_VALUE_VERTEX_ID_ZERO_BASE) ||
+       !tcl_stream_key(ctx, inputs, streams, range, key))
+      return NULL;
+   if (c->valid && c->inputs == inputs && c->start == range->start &&
+       c->count == range->count && !memcmp(c->streams, key, sizeof(key))) {
+      if (c->built)
+         return c->unique ? c : NULL;
+   } else {
+      /* Built on the second draw of unchanged buffers. */
+      free(c->index);
+      free(c->vertices);
+      pipe_resource_reference(&c->buffer, NULL);
+      memset(c, 0, sizeof(*c));
+      memcpy(c->streams, key, sizeof(key));
+      c->inputs = inputs;
+      c->start = range->start;
+      c->count = range->count;
+      c->valid = true;
+      return NULL;
+   }
+   c->built = true;
+   for (unsigned k = 0; k < inputs; k++) {
+      c->offset[k] = stride;
+      stride += align(streams[k].bytes, 4);
+   }
+   mask = util_next_power_of_two(2 * range->count) - 1;
+   table = calloc(mask + 1, sizeof(*table));
+   source = malloc(range->count * sizeof(*source));
+   c->index = malloc(range->count * sizeof(*c->index));
+   c->vertices = malloc((size_t)range->count * stride);
+   if (!table || !source || !c->index || !c->vertices || stride > 2044) {
+      free(table);
+      free(source);
+      free(c->index);
+      free(c->vertices);
+      c->index = NULL;
+      c->vertices = NULL;
+      return NULL;
+   }
+   for (unsigned i = 0; i < range->count; i++) {
+      const unsigned v = range->start + i;
+      uint32_t hash = 0, slot;
+
+      for (unsigned k = 0; k < inputs; k++)
+         hash = _mesa_hash_data_with_seed(streams[k].base +
+                                             (size_t)v * streams[k].stride,
+                                          streams[k].bytes, hash);
+      for (slot = hash & mask; table[slot]; slot = (slot + 1) & mask)
+         if (tcl_vertex_equal(streams, inputs, source[table[slot] - 1], v))
+            break;
+      if (!table[slot]) {
+         uint8_t *out = c->vertices + (size_t)c->unique * stride;
+
+         for (unsigned k = 0; k < inputs; k++)
+            memcpy(out + c->offset[k],
+                   streams[k].base + (size_t)v * streams[k].stride,
+                   streams[k].bytes);
+         source[c->unique] = v;
+         table[slot] = ++c->unique;
+      }
+      c->index[i] = table[slot] - 1;
+   }
+   free(table);
+   free(source);
+   c->stride = stride;
+   /* Few repeats, or more than one upload per frame: keep the draw. */
+   if (c->unique > range->count - range->count / 8 ||
+       (uint64_t)c->unique * stride > TCL_MAX_UPLOAD_BYTES) {
+      free(c->index);
+      free(c->vertices);
+      c->index = NULL;
+      c->vertices = NULL;
+      c->unique = 0;
+      return NULL;
+   }
+   uint8_t *shrunk = realloc(c->vertices, (size_t)c->unique * stride);
+
+   if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL compacted %u vertices to %u (stride %u)\n",
+              range->count, c->unique, stride);
+
+   if (shrunk)
+      c->vertices = shrunk;
+   c->buffer = pipe_buffer_create(ctx->base.screen, PIPE_BIND_VERTEX_BUFFER,
+                                  PIPE_USAGE_IMMUTABLE,
+                                  (size_t)c->unique * stride);
+   if (!c->buffer) {
+      c->unique = 0;
+      return NULL;
+   }
+   pipe_buffer_write(&ctx->base, c->buffer, 0, (size_t)c->unique * stride,
+                     c->vertices);
+   return c;
+}
+
+/*
+ * Sample every prefetched lookup for the draw's vertices [min, max] into
+ * one interleaved FLOAT4 array and describe it as extra input streams.
+ */
+static bool
+tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
+             const struct chrome9_tcl_program *p,
+             struct chrome9_tcl_state *state, struct tcl_stream *streams)
+{
+   const unsigned lookups = p->prefetch_count;
+   struct pipe_resource **slot;
+   float *prefetch;
+   size_t bytes;
+
+   bytes = ((size_t)max - min + 1) * lookups * 16;
+   if (bytes > TCL_MAX_UPLOAD_BYTES)
+      return false;
+   /* Written after the draw three turns back; the access waits for it. */
+   slot = &state->prefetch_ring[state->prefetch_next++ %
+                                ARRAY_SIZE(state->prefetch_ring)];
+   if (!*slot || (*slot)->width0 < bytes) {
+      pipe_resource_reference(slot, NULL);
+      *slot = pipe_buffer_create(ctx->base.screen, PIPE_BIND_VERTEX_BUFFER,
+                                 PIPE_USAGE_STREAM, bytes);
+      if (!*slot)
+         return false;
+   }
+   chrome9_resource_cpu_access_range(chrome9_resource(*slot), true, 0, bytes);
+   prefetch = chrome9_resource(*slot)->bo.map;
+   if (state->prefetch_coords < 2 * ((size_t)max - min + 1)) {
+      const size_t coords = 2 * ((size_t)max - min + 1);
+      float *grown = REALLOC(state->coords,
+                             state->prefetch_coords * sizeof(float),
+                             coords * sizeof(float));
+
+      if (!grown)
+         return false;
+      state->coords = grown;
+      state->prefetch_coords = coords;
+   }
+   for (unsigned k = 0; k < lookups; k++) {
+      const struct chrome9_tcl_prefetch *f = &p->prefetch[k];
+      const struct tcl_stream *coord = &streams[f->input];
+      const bool floats32 = coord->format == PIPE_FORMAT_R32G32_FLOAT ||
+                            coord->format == PIPE_FORMAT_R32G32B32_FLOAT ||
+                            coord->format == PIPE_FORMAT_R32G32B32A32_FLOAT;
+      const unsigned vertices = max - min + 1;
+      float *s = state->coords, *t = state->coords + vertices;
+      float *out = prefetch + k * 4;
+
+      if (f->input >= p->attrib_count ||
+          !chrome9_vs_texture_samplable(ctx, f->unit, f->sampler))
+         return false;
+      for (unsigned i = 0; i < vertices; i++) {
+         const size_t offset = (size_t)(min + i - coord->first) *
+                               coord->stride;
+         float value[4];
+
+         if (min + i < coord->first ||
+             (coord->size != SIZE_MAX &&
+              (offset > coord->size || coord->size - offset < coord->bytes)))
+            return false;
+         if (floats32)
+            memcpy(value, coord->base + offset, coord->bytes);
+         else
+            util_format_unpack_rgba(coord->format, value,
+                                    coord->base + offset, 1);
+         s[i] = value[f->s];
+         t[i] = value[f->t];
+      }
+      chrome9_vs_texture_sample_array(ctx, f->unit, f->sampler, vertices,
+                                      s, t, out, lookups * 4);
+      /* The kernel rejects non-finite float inputs. */
+      for (unsigned i = 0; i < vertices; i++)
+         for (unsigned c = 0; c < 4; c++)
+            if (!isfinite(out[(size_t)i * lookups * 4 + c]))
+               return false;
+   }
+   for (unsigned k = 0; k < lookups; k++) {
+      struct tcl_stream *stream = &streams[p->attrib_count + k];
+
+      memset(stream, 0, sizeof(*stream));
+      stream->resource = *slot;
+      stream->user_offset = k * 16;
+      stream->base = (const uint8_t *)prefetch + stream->user_offset;
+      stream->first = min;
+      stream->stride = lookups * 16;
+      stream->size = ((size_t)max - min + 1) * stream->stride - k * 16;
+      stream->format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      stream->bytes = 16;
+      tcl_native_format(stream->format, stream);
+   }
+   return true;
+}
+
 static bool
 tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
               const struct pipe_draw_start_count_bias *range,
@@ -3998,8 +4374,52 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    };
    unsigned stride, max_vertices, buffer_count, count, n;
    uint32_t index_min, index_max;
+   const struct tcl_compact *compact = NULL;
+   bool have_range;
+   struct pipe_draw_info compact_info;
+   struct pipe_draw_start_count_bias compact_range;
 
-   memcpy(streams, bound, p->input_count * sizeof(*streams));
+   memcpy(streams, bound,
+          (p->input_count - p->prefetch_count) * sizeof(*streams));
+   /* Lookups of a vertex-soup draw are sampled per distinct vertex. */
+   if (p->prefetch_count && !info->index_size)
+      compact = tcl_compact_get(ctx, state, p, streams, range);
+   if (compact) {
+      for (unsigned k = 0; k < p->input_count - p->prefetch_count; k++) {
+         streams[k].user = NULL;
+         streams[k].resource = compact->buffer;
+         streams[k].user_offset = compact->offset[k];
+         streams[k].base = compact->vertices + compact->offset[k];
+         streams[k].first = 0;
+         streams[k].stride = compact->stride;
+         streams[k].size = (size_t)compact->unique * compact->stride -
+                           compact->offset[k];
+      }
+      compact_info = *info;
+      compact_info.index_size = 4;
+      compact_info.has_user_indices = true;
+      compact_info.index.user = compact->index;
+      compact_range.start = 0;
+      compact_range.count = range->count;
+      compact_range.index_bias = 0;
+      info = &compact_info;
+      range = &compact_range;
+      indices = (const uint8_t *)compact->index;
+   }
+   /* Compacted draws reference every distinct vertex. */
+   if (compact) {
+      index_min = 0;
+      index_max = compact->unique - 1;
+      have_range = true;
+   } else {
+      have_range = (ctx->tcl_buffers || p->prefetch_count) &&
+                   tcl_index_range(info, range, indices, &index_min,
+                                   &index_max);
+   }
+   if (p->prefetch_count &&
+       (!have_range ||
+        !tcl_prefetch(ctx, index_min, index_max, p, state, streams)))
+      return tcl_fallback(ctx, "vertex texture prefetch");
    if (!tcl_viewport(ctx, draw.viewport))
       return tcl_fallback(ctx, "viewport");
    if (!tcl_constants(ctx, p, state->constants))
@@ -4026,8 +4446,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    draw.elements_ptr = (uintptr_t)elements;
    draw.constant_count = chrome9_tcl_constant_count(p);
    draw.constants_ptr = draw.constant_count ? (uintptr_t)state->constants : 0;
-   if (ctx->tcl_buffers &&
-       tcl_index_range(info, range, indices, &index_min, &index_max)) {
+   if (ctx->tcl_buffers && have_range) {
       struct pipe_resource *uploads[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
       struct pipe_resource *resources[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
       bool drawn = tcl_bind_buffers(ctx, p->input_count, streams, index_min,
@@ -4234,7 +4653,8 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       /* An enabled plane the VS never writes stays with the draw module. */
       if (p->clip_written != clip_enable)
          return tcl_fallback(ctx, "unwritten clip distance");
-      if (!tcl_bind_inputs(ctx, p->input_count, streams[i]))
+      if (!tcl_bind_inputs(ctx, p->input_count - p->prefetch_count,
+                           streams[i]))
          return tcl_fallback(ctx, "vertex element format or buffer");
       if (!tcl_guarded_domain(ctx, p, raster.flags))
          return tcl_fallback(ctx, "guarded fragment domain");

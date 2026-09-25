@@ -54,12 +54,28 @@ struct chrome9_tcl_rep {
    float step;
 };
 
+/* A VS texture lookup at a vertex attribute: the CPU samples it into an
+ * extra FLOAT4 input before the draw (the engine has no vertex texture
+ * fetch). */
+struct chrome9_tcl_prefetch {
+   uint8_t unit;
+   uint8_t sampler;
+   /* Attribute input and its components holding s and t. */
+   uint8_t input;
+   uint8_t s, t;
+};
+
 /* Kernel vertex IR compiled from one VS for one clip-z convention. */
 struct chrome9_tcl_program {
    bool compiled;
    bool supported;
    unsigned instruction_count;
    unsigned input_count;
+   /* Inputs [attrib_count, attrib_count + prefetch_count) are prefetched
+    * texture lookups. */
+   unsigned attrib_count;
+   unsigned prefetch_count;
+   struct chrome9_tcl_prefetch prefetch[DRM_CHROME9_VERTEX_MAX_INPUTS];
    /* Rows [0, uniform_rows) come from CB0, then the immediates; with
     * constant_pad all move up by that many zero rows, and as many zero
     * rows follow, so clamped a0-relative reads stay inside the draw. */

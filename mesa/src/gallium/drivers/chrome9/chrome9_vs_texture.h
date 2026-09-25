@@ -29,6 +29,16 @@ struct chrome9_vs_texture_mapping {
 bool chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
                                 struct chrome9_vs_texture_mapping *mapping);
 void chrome9_vs_texture_mapping_release(struct chrome9_vs_texture_mapping *mapping);
+bool chrome9_vs_texture_samplable(const struct chrome9_context *ctx,
+                                  unsigned unit, unsigned sampler);
+void chrome9_vs_texture_sample(struct chrome9_context *ctx, unsigned unit,
+                               unsigned sampler, const float s[4],
+                               const float t[4], float rgba[4][4]);
+void chrome9_vs_texture_sample_array(struct chrome9_context *ctx,
+                                     unsigned unit, unsigned sampler,
+                                     unsigned count, const float *s,
+                                     const float *t, float *out,
+                                     unsigned out_stride);
 struct tgsi_sampler *chrome9_vs_texture_sampler_create(struct chrome9_context *ctx);
 void chrome9_vs_texture_sampler_destroy(struct tgsi_sampler *sampler);
 

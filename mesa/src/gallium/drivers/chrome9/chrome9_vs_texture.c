@@ -284,6 +284,36 @@ chrome9_vs_sample_lod(const struct chrome9_vs_texture_mapping *mapping,
    return CLAMP(value, state->min_lod, state->max_lod);
 }
 
+/* The CPU sampler below implements the view and sampler state. */
+bool
+chrome9_vs_texture_samplable(const struct chrome9_context *ctx,
+                             unsigned unit, unsigned sampler)
+{
+   const struct pipe_sampler_view *view = unit < CHROME9_VS_MAX_SAMPLERS ?
+      ctx->vs_sampler_views[unit] : NULL;
+   const struct pipe_sampler_state *state =
+      sampler < CHROME9_VS_MAX_SAMPLERS ? ctx->vs_sampler_states[sampler] :
+      NULL;
+
+   return view && state && ctx->vs_texture_mappings[unit].base &&
+      chrome9_texture_format_info(view->format) &&
+      (state->min_img_filter == PIPE_TEX_FILTER_NEAREST ||
+       state->min_img_filter == PIPE_TEX_FILTER_LINEAR) &&
+      (state->mag_img_filter == PIPE_TEX_FILTER_NEAREST ||
+       state->mag_img_filter == PIPE_TEX_FILTER_LINEAR) &&
+      (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ||
+       state->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST ||
+       state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR) &&
+      (state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
+       state->wrap_s == PIPE_TEX_WRAP_REPEAT ||
+       state->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT) &&
+      (state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
+       state->wrap_t == PIPE_TEX_WRAP_REPEAT ||
+       state->wrap_t == PIPE_TEX_WRAP_MIRROR_REPEAT) &&
+      state->compare_mode == PIPE_TEX_COMPARE_NONE &&
+      !state->unnormalized_coords;
+}
+
 /* Vertex programs execute in the draw module.  Sample from the same linear
  * guarded mip layout used by fragment resources, with Gallium's normalized
  * 2D filter, wrap, LOD, and view-swizzle semantics. */
@@ -308,23 +338,8 @@ chrome9_vs_get_samples(struct tgsi_sampler *sampler,
       ctx->vs_sampler_states[sampler_index] : NULL;
    const struct chrome9_vs_texture_mapping *mapping =
       view ? &ctx->vs_texture_mappings[sview_index] : NULL;
-   bool valid = view && state && mapping->base &&
-      chrome9_texture_format_info(view->format) &&
-      (state->min_img_filter == PIPE_TEX_FILTER_NEAREST ||
-       state->min_img_filter == PIPE_TEX_FILTER_LINEAR) &&
-      (state->mag_img_filter == PIPE_TEX_FILTER_NEAREST ||
-       state->mag_img_filter == PIPE_TEX_FILTER_LINEAR) &&
-      (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ||
-       state->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST ||
-       state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR) &&
-      (state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
-       state->wrap_s == PIPE_TEX_WRAP_REPEAT ||
-       state->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT) &&
-      (state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
-       state->wrap_t == PIPE_TEX_WRAP_REPEAT ||
-       state->wrap_t == PIPE_TEX_WRAP_MIRROR_REPEAT) &&
-      state->compare_mode == PIPE_TEX_COMPARE_NONE &&
-      !state->unnormalized_coords &&
+   bool valid = chrome9_vs_texture_samplable(ctx, sview_index,
+                                             sampler_index) &&
       !offset[2];
 
    (void)r;
@@ -474,4 +489,150 @@ void
 chrome9_vs_texture_sampler_destroy(struct tgsi_sampler *sampler)
 {
    FREE(sampler);
+}
+
+/* Four explicit LOD 0 lookups, as the draw module's vertex sampler. */
+void
+chrome9_vs_texture_sample(struct chrome9_context *ctx, unsigned unit,
+                          unsigned sampler, const float s[4],
+                          const float t[4], float rgba[4][4])
+{
+   static const float zero[TGSI_QUAD_SIZE];
+   static const int8_t offset[3];
+   float derivs[3][2][TGSI_QUAD_SIZE] = { 0 };
+
+   ctx->vs_tgsi_sampler->get_samples(ctx->vs_tgsi_sampler, unit, sampler,
+                                     s, t, zero, zero, zero, derivs, offset,
+                                     TGSI_SAMPLER_LOD_EXPLICIT, rgba);
+}
+
+/* Byte of a 32-bit texel holding R, G, B and A (4: constant one). */
+static bool
+chrome9_vs_unorm8_layout(enum pipe_format format, uint8_t byte[4])
+{
+   static const struct {
+      enum pipe_format format;
+      uint8_t byte[4];
+   } table[] = {
+      { PIPE_FORMAT_B8G8R8A8_UNORM, { 2, 1, 0, 3 } },
+      { PIPE_FORMAT_B8G8R8X8_UNORM, { 2, 1, 0, 4 } },
+      { PIPE_FORMAT_R8G8B8A8_UNORM, { 0, 1, 2, 3 } },
+      { PIPE_FORMAT_R8G8B8X8_UNORM, { 0, 1, 2, 4 } },
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(table); i++)
+      if (table[i].format == format) {
+         memcpy(byte, table[i].byte, 4);
+         return true;
+      }
+   return false;
+}
+
+/*
+ * count explicit LOD 0 lookups at (s[i], t[i]) into out + i * out_stride.
+ * 8-bit RGBA textures at the base level take a direct path with the
+ * arithmetic of chrome9_vs_sample_level(); other states use the generic
+ * sampler four lookups at a time.
+ */
+void
+chrome9_vs_texture_sample_array(struct chrome9_context *ctx, unsigned unit,
+                                unsigned sampler, unsigned count,
+                                const float *s, const float *t, float *out,
+                                unsigned out_stride)
+{
+   const struct pipe_sampler_view *view = ctx->vs_sampler_views[unit];
+   const struct pipe_sampler_state *state = ctx->vs_sampler_states[sampler];
+   const struct chrome9_vs_texture_mapping *mapping =
+      &ctx->vs_texture_mappings[unit];
+   const unsigned swizzle[4] = {
+      view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a,
+   };
+   uint8_t byte[4];
+   float unorm[256];
+
+   /* LOD 0 plus bias, clamped: the base level with the MAG filter. */
+   if (!chrome9_vs_unorm8_layout(view->format, byte) ||
+       !(CLAMP(state->lod_bias, state->min_lod, state->max_lod) <= 0.0f)) {
+      for (unsigned i = 0; i < count; i += 4) {
+         float ss[4] = { 0 }, tt[4] = { 0 }, rgba[4][4];
+         const unsigned lanes = MIN2(4, count - i);
+
+         memcpy(ss, s + i, lanes * sizeof(float));
+         memcpy(tt, t + i, lanes * sizeof(float));
+         chrome9_vs_texture_sample(ctx, unit, sampler, ss, tt, rgba);
+         for (unsigned l = 0; l < lanes; l++)
+            for (unsigned c = 0; c < 4; c++)
+               out[(size_t)(i + l) * out_stride + c] = rgba[c][l];
+      }
+      return;
+   }
+   for (unsigned v = 0; v < 256; v++)
+      unorm[v] = (float)v * (1.0f / 255.0f);
+   /* The view swizzle folds into the byte selection. */
+   {
+      uint8_t swizzled[4];
+
+      for (unsigned c = 0; c < 4; c++)
+         swizzled[c] = swizzle[c] <= PIPE_SWIZZLE_W ? byte[swizzle[c]] :
+                       swizzle[c] == PIPE_SWIZZLE_1 ? 4 : 5;
+      memcpy(byte, swizzled, sizeof(byte));
+   }
+
+   const unsigned level = mapping->first_level;
+   const unsigned width = u_minify(mapping->width, level);
+   const unsigned height = u_minify(mapping->height, level);
+   const uint8_t *base = (const uint8_t *)mapping->base +
+                         mapping->mip_offset[level];
+   const unsigned pitch = mapping->row_stride[level];
+   const unsigned filter = state->mag_img_filter;
+   float zero_one[2] = { 0.0f, 1.0f };
+
+   for (unsigned i = 0; i < count; i++) {
+      float *rgba = out + (size_t)i * out_stride;
+      float x, y;
+
+      if (!isfinite(s[i]) || !isfinite(t[i])) {
+         memset(rgba, 0, 4 * sizeof(float));
+         continue;
+      }
+      x = chrome9_vs_wrap_coordinate(s[i], state->wrap_s) * width;
+      y = chrome9_vs_wrap_coordinate(t[i], state->wrap_t) * height;
+      if (filter == PIPE_TEX_FILTER_NEAREST) {
+         unsigned ix = chrome9_vs_wrap_texel((int)floorf(x), width,
+                                             state->wrap_s);
+         unsigned iy = chrome9_vs_wrap_texel((int)floorf(y), height,
+                                             state->wrap_t);
+         const uint8_t *pixel = base + (size_t)iy * pitch + ix * 4;
+
+         for (unsigned c = 0; c < 4; c++)
+            rgba[c] = byte[c] < 4 ? unorm[pixel[byte[c]]] :
+                      zero_one[byte[c] == 4];
+         continue;
+      }
+      x -= 0.5f;
+      y -= 0.5f;
+      int x0 = floorf(x), y0 = floorf(y);
+      float fx = x - x0, fy = y - y0;
+      unsigned ix[2], iy[2];
+      float texels[2][2][4];
+
+      for (unsigned j = 0; j < 2; j++) {
+         ix[j] = chrome9_vs_wrap_texel(x0 + j, width, state->wrap_s);
+         iy[j] = chrome9_vs_wrap_texel(y0 + j, height, state->wrap_t);
+      }
+      for (unsigned j = 0; j < 2; j++)
+         for (unsigned k = 0; k < 2; k++) {
+            const uint8_t *pixel = base + (size_t)iy[j] * pitch + ix[k] * 4;
+
+            for (unsigned c = 0; c < 4; c++)
+               texels[j][k][c] = byte[c] < 4 ? unorm[pixel[byte[c]]] :
+                                 zero_one[byte[c] == 4];
+         }
+      for (unsigned c = 0; c < 4; c++) {
+         float top = texels[0][0][c] * (1.0f - fx) + texels[0][1][c] * fx;
+         float bottom = texels[1][0][c] * (1.0f - fx) + texels[1][1][c] * fx;
+
+         rgba[c] = top * (1.0f - fy) + bottom * fy;
+      }
+   }
 }
