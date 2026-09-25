@@ -146,6 +146,8 @@ enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_BAR1_SIZE = 4,
 	DRM_CHROME9_PARAM_BAR2_SIZE = 5,
 	DRM_CHROME9_PARAM_CAPABILITIES2 = 6,
+	/* IF b# nesting depth DRAW_VERTEX_PROGRAM accepts; REP never nests. */
+	DRM_CHROME9_PARAM_VS_FLOW_DEPTH = 7,
 };
 
 /* The kernel can allocate and mmap GEM objects. */
