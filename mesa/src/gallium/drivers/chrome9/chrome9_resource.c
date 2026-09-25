@@ -47,6 +47,8 @@ struct chrome9_resource_layout {
    uint64_t allocation_size;
    bool guarded;
    bool sampler_unsupported;
+   /* Colour levels in 32-byte x 8-row tiles (ALIGN(h, 8) rows each). */
+   bool tiled;
 };
 
 static bool
@@ -190,6 +192,17 @@ chrome9_resource_layout(struct pipe_screen *screen,
                  !util_is_power_of_two_nonzero(templ->width0) ||
                  !util_is_power_of_two_nonzero(templ->height0)))));
 
+   /* Private 2D colour render targets are tiled: the engine renders and
+    * samples them about 30 % faster than linear ones. */
+   layout->tiled = templ->target == PIPE_TEXTURE_2D &&
+      (templ->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+       templ->format == PIPE_FORMAT_B8G8R8X8_UNORM) &&
+      (templ->bind & PIPE_BIND_RENDER_TARGET) &&
+      !(templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT |
+                       PIPE_BIND_DISPLAY_TARGET)) &&
+      !(templ->flags & CHROME9_RESOURCE_FLAG_CANONICAL_SHARED) &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_TILED_COLOR) &&
+      debug_get_bool_option("CHROME9_TILED_COLOR", true);
    for (unsigned level = 0; level <= templ->last_level; level++) {
       const unsigned width = u_minify(templ->width0, level);
       const unsigned height = u_minify(templ->height0, level);
@@ -198,7 +211,8 @@ chrome9_resource_layout(struct pipe_screen *screen,
          chrome9_format_level_pitch(templ->format, width);
       layout->level_size[level] =
          (uint64_t)layout->level_stride[level] *
-         chrome9_format_level_rows(templ->format, height);
+         (layout->tiled ? ALIGN_POT(height, 8) :
+          chrome9_format_level_rows(templ->format, height));
    }
    if (cube)
       return chrome9_resource_cube_layout(templ, page_size, layout);
@@ -239,7 +253,8 @@ chrome9_resource_layout(struct pipe_screen *screen,
       /* The sampler derives each level of a POT texture right after the
        * previous one's rows; NPOT levels come from its 256-byte granular
        * address table. */
-      const bool pot = util_is_power_of_two_nonzero(templ->width0) &&
+      const bool pot = !layout->tiled &&
+                       util_is_power_of_two_nonzero(templ->width0) &&
                        util_is_power_of_two_nonzero(templ->height0);
 
       cursor = layout->level_offset[0];
@@ -279,6 +294,7 @@ chrome9_resource_apply_layout(struct chrome9_resource *resource,
    resource->layer_stride = layout->layer_stride;
    resource->guarded = layout->guarded;
    resource->sampler_unsupported = layout->sampler_unsupported;
+   resource->tiled = layout->tiled && layout->guarded;
 }
 
 static bool
@@ -536,13 +552,14 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource->guarded_shared = guarded_shared;
    /* Tiled rows come in eights: other heights stay linear so the object
     * size is the same either way. */
-   resource->tiled = resource->guarded && !guarded_shared &&
+   resource->tiled = resource->tiled ||
+      (resource->guarded && !guarded_shared &&
       util_format_is_depth_or_stencil(templ->format) &&
       templ->target == PIPE_TEXTURE_2D && !templ->last_level &&
       !(templ->height0 % 8) &&
       !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)) &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_TILED_DEPTH) &&
-      debug_get_bool_option("CHROME9_TILED_DEPTH", true);
+      debug_get_bool_option("CHROME9_TILED_DEPTH", true));
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
@@ -655,8 +672,6 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
 {
    struct pipe_screen *screen = resource->base.screen;
 
-   if (resource->tiled)
-      chrome9_resource_detile(resource);
    /* The CPU reads and writes materialized depths only. */
    if (resource->fast_z_index)
       chrome9_resource_fast_z_resolve(resource);
@@ -675,31 +690,6 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
       fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n", strerror(errno));
 }
 
-/* Rewrite a tiled surface linear (32-byte x 8-row tiles, left to right
- * across the pitch); it stays linear afterwards. */
-void
-chrome9_resource_detile(struct chrome9_resource *resource)
-{
-   const size_t size = (size_t)resource->stride * resource->base.height0;
-   uint8_t *data = (uint8_t *)resource->bo.map + resource->data_offset;
-   uint8_t *copy;
-
-   if (!resource->tiled)
-      return;
-   resource->tiled = false;
-   chrome9_resource_cpu_access(resource, true);
-   copy = malloc(size);
-   if (!copy)
-      return;
-   memcpy(copy, data, size);
-   for (unsigned y = 0; y < resource->base.height0; y++)
-      for (unsigned x = 0; x < resource->stride; x += 32)
-         memcpy(data + (size_t)y * resource->stride + x,
-                copy + (size_t)(y >> 3) * resource->stride * 8 +
-                   (x / 32) * 256 + (y & 7) * 32, 32);
-   free(copy);
-}
-
 /* Rewrite the words of older Fast-Z clears (stale index) as 1.0. */
 void
 chrome9_resource_fast_z_resolve(struct chrome9_resource *depth)
@@ -715,7 +705,11 @@ chrome9_resource_fast_z_resolve(struct chrome9_resource *depth)
                                    depth->data_offset +
                                    (uint64_t)y * depth->stride);
 
-      for (unsigned x = 0; x < depth->base.width0; x++)
+      /* Tiled rows mix columns: every word of the pitch holds depth. */
+      const unsigned words = depth->tiled ? depth->stride / 4 :
+                             depth->base.width0;
+
+      for (unsigned x = 0; x < words; x++)
          if (((row[x] >> 8) & 7) != index)
             row[x] = 0xffffff00;
    }
@@ -881,6 +875,15 @@ chrome9_transfer_box_valid(const struct pipe_resource *resource,
            (unsigned)(box->y + box->height) == height);
 }
 
+/* A mapping of a tiled image: a linear copy of the box. */
+struct chrome9_transfer {
+   struct pipe_transfer base;
+   uint8_t *staging;
+   uint8_t *level_base;
+   unsigned pitch;
+   unsigned bytes;
+};
+
 static void *
 chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                      unsigned level, unsigned usage,
@@ -888,6 +891,7 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                      struct pipe_transfer **out_transfer)
 {
    struct chrome9_resource *cresource = chrome9_resource(resource);
+   struct chrome9_transfer *ctransfer;
    struct pipe_transfer *transfer;
    uint64_t offset;
 
@@ -924,9 +928,10 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
       chrome9_resource_cpu_access(cresource, usage & PIPE_MAP_WRITE);
    }
 
-   transfer = CALLOC_STRUCT(pipe_transfer);
-   if (!transfer)
+   ctransfer = CALLOC_STRUCT(chrome9_transfer);
+   if (!ctransfer)
       return NULL;
+   transfer = &ctransfer->base;
    pipe_resource_reference(&transfer->resource, resource);
    transfer->level = level;
    transfer->usage = usage;
@@ -958,6 +963,32 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
       FREE(transfer);
       return NULL;
    }
+   /* Tiled images map through a linear copy of the box, stored back on
+    * unmap after a write. */
+   if (chrome9_resource_is_tiled(cresource)) {
+      const unsigned cpp = chrome9_format_storage_cpp(resource->format);
+
+      ctransfer->level_base = (uint8_t *)cresource->bo.map +
+                              cresource->level_offset[level];
+      ctransfer->pitch = cresource->level_stride[level];
+      ctransfer->bytes = box->width * cpp;
+      transfer->stride = ctransfer->bytes;
+      transfer->layer_stride = (size_t)ctransfer->bytes * box->height;
+      ctransfer->staging = malloc(transfer->layer_stride);
+      if (!ctransfer->staging) {
+         pipe_resource_reference(&transfer->resource, NULL);
+         FREE(transfer);
+         return NULL;
+      }
+      if (!(usage & PIPE_MAP_DISCARD_RANGE) &&
+          !(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE))
+         chrome9_tiled_copy(ctransfer->level_base, ctransfer->pitch, true,
+                            box->x * cpp, box->y, ctransfer->bytes,
+                            box->height, ctransfer->staging,
+                            ctransfer->bytes, false);
+      *out_transfer = transfer;
+      return ctransfer->staging;
+   }
    *out_transfer = transfer;
    return (uint8_t *)cresource->bo.map + offset;
 }
@@ -966,9 +997,22 @@ static void
 chrome9_transfer_unmap(struct pipe_context *pipe,
                        struct pipe_transfer *transfer)
 {
+   struct chrome9_transfer *ctransfer = (struct chrome9_transfer *)transfer;
+
    (void)pipe;
    if (!transfer)
       return;
+   if (ctransfer->staging) {
+      if (transfer->usage & PIPE_MAP_WRITE)
+         chrome9_tiled_copy(ctransfer->level_base, ctransfer->pitch, true,
+                            transfer->box.x *
+                               chrome9_format_storage_cpp(
+                                  transfer->resource->format),
+                            transfer->box.y, ctransfer->bytes,
+                            transfer->box.height, ctransfer->staging,
+                            ctransfer->bytes, true);
+      free(ctransfer->staging);
+   }
    pipe_resource_reference(&transfer->resource, NULL);
    FREE(transfer);
 }
@@ -1417,6 +1461,7 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
          return base_level + 1;
 
    texture.handle = resource->bo.handle;
+   texture.flags = chrome9_resource_texture_flags(resource);
    texture.format = bgra ? DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888 :
                            DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888;
    texture.width = pres->width0;
@@ -1448,7 +1493,9 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
       const float dt = sh == 1 ? 0.0f : 0.5f / sh;
       struct drm_chrome9_draw_fragment_program draw = {
          .destination_handle = resource->bo.handle,
-         .flags = DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED,
+         .flags = DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED |
+                  (resource->tiled ?
+                   DRM_CHROME9_FRAGMENT_DESTINATION_TILED : 0),
          .triangle_count = 2,
          .width = w,
          .destination_format = bgra ?

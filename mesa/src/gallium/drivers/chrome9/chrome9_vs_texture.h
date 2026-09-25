@@ -21,10 +21,14 @@ struct chrome9_vs_texture_mapping {
    uint32_t row_stride[PIPE_MAX_TEXTURE_LEVELS];
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS];
    uint32_t mip_offset[PIPE_MAX_TEXTURE_LEVELS];
+   /* Linear copy of a tiled texture, reused across refreshes. */
+   void *staging;
+   size_t staging_size;
 };
 
 bool chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
                                 struct chrome9_vs_texture_mapping *mapping);
+void chrome9_vs_texture_mapping_release(struct chrome9_vs_texture_mapping *mapping);
 struct tgsi_sampler *chrome9_vs_texture_sampler_create(struct chrome9_context *ctx);
 void chrome9_vs_texture_sampler_destroy(struct tgsi_sampler *sampler);
 

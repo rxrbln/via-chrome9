@@ -173,13 +173,35 @@ chrome9_blend_uses_constant(const struct pipe_blend_state *state)
            chrome9_blend_factor_constant(rt->alpha_dst_factor));
 }
 
+/* The fixed draw builders address every surface linearly. */
+bool
+chrome9_draw_tiled_surfaces(const struct chrome9_context *ctx)
+{
+   const struct pipe_framebuffer_state *fb = &ctx->framebuffer;
+
+   if ((fb->nr_cbufs && fb->cbufs[0].texture &&
+        chrome9_resource_is_tiled(chrome9_resource(fb->cbufs[0].texture))) ||
+       (fb->zsbuf.texture &&
+        chrome9_resource_is_tiled(chrome9_resource(fb->zsbuf.texture))))
+      return true;
+   for (unsigned i = 0; i < ctx->num_sampler_views; i++) {
+      const struct pipe_sampler_view *view = ctx->sampler_views[i];
+
+      if (view && view->texture &&
+          chrome9_resource_is_tiled(chrome9_resource_const(view->texture)))
+         return true;
+   }
+   return false;
+}
+
 /* Counting query intervals and the blend colour exist only on this path. */
 static bool
 chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
 {
    return chrome9_generic_fragment_program(ctx) &&
           (!ctx->fs->semantic_passthrough || chrome9_query_counting(ctx) ||
-           chrome9_blend_uses_constant(ctx->blend));
+           chrome9_blend_uses_constant(ctx->blend) ||
+           chrome9_draw_tiled_surfaces(ctx));
 }
 
 /* A shadow TEX whose comparison the current FS variant computes. */
@@ -1791,6 +1813,8 @@ chrome9_generic_fragment_state(
          return false;
       max_lod = volume ? 0 : view_last_level * 32;
       texture_state[unit].handle = textures[unit]->bo.handle;
+      texture_state[unit].flags =
+         chrome9_resource_texture_flags(textures[unit]);
       if (chrome9_fragment_uses_sparse_abi(crender->ctx))
          texture_state[unit].reserved0 = logical;
       texture_state[unit].format = format->drm_format;
@@ -1857,6 +1881,8 @@ chrome9_generic_fragment_state(
       draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
    if (depth_active && depth->tiled)
       draw->flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
+   if (chrome9_resource_is_tiled(target))
+      draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_TILED;
    if (depth_active && depth->fast_z_index &&
        (draw->flags & DRM_CHROME9_FRAGMENT_STENCIL)) {
       chrome9_resource_fast_z_resolve(depth);
@@ -2696,9 +2722,6 @@ chrome9_emit_triangle_state(struct chrome9_vbuf_render *crender,
       return;
    }
    chrome9_draw_scissor(ctx, target, &scissor);
-   /* The fixed draw builders address depth linearly. */
-   if (depth_active && depth->tiled && !crender->generic_program)
-      chrome9_resource_detile(depth);
    /* The fixed draw builders leave Fast-Z off. */
    if (depth_active && depth->fast_z_index && !crender->generic_program) {
       chrome9_resource_fast_z_resolve(depth);

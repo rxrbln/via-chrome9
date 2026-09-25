@@ -134,18 +134,42 @@ chrome9_copy_image_rect(const struct chrome9_subimage *dst,
    const uint8_t *src_map =
       (const uint8_t *)src->resource->bo.map + src->offset;
 
+   const bool src_tiled = chrome9_resource_is_tiled(src->resource);
+   const bool dst_tiled = chrome9_resource_is_tiled(dst->resource);
+   const unsigned bytes = (maxx - rect->minx) * cpp;
+   uint8_t *line;
+
    if (rect->minx >= maxx || rect->miny >= maxy)
       return;
-   chrome9_resource_cpu_access_range(src->resource, false,
-      src->offset + (uint64_t)rect->miny * src->stride,
-      (uint64_t)(maxy - rect->miny) * src->stride);
-   chrome9_resource_cpu_access_range(dst->resource, true,
-      dst->offset + (uint64_t)rect->miny * dst->stride,
-      (uint64_t)(maxy - rect->miny) * dst->stride);
-   for (unsigned y = rect->miny; y < maxy; y++)
-      memcpy(dst_map + (size_t)y * dst->stride + rect->minx * cpp,
-             src_map + (size_t)y * src->stride + rect->minx * cpp,
-             (maxx - rect->minx) * cpp);
+   /* Tiled rows spread over whole tile rows: announce the whole image. */
+   if (src_tiled)
+      chrome9_resource_cpu_access(src->resource, false);
+   else
+      chrome9_resource_cpu_access_range(src->resource, false,
+         src->offset + (uint64_t)rect->miny * src->stride,
+         (uint64_t)(maxy - rect->miny) * src->stride);
+   if (dst_tiled)
+      chrome9_resource_cpu_access(dst->resource, true);
+   else
+      chrome9_resource_cpu_access_range(dst->resource, true,
+         dst->offset + (uint64_t)rect->miny * dst->stride,
+         (uint64_t)(maxy - rect->miny) * dst->stride);
+   if (!src_tiled && !dst_tiled) {
+      for (unsigned y = rect->miny; y < maxy; y++)
+         memcpy(dst_map + (size_t)y * dst->stride + rect->minx * cpp,
+                src_map + (size_t)y * src->stride + rect->minx * cpp, bytes);
+      return;
+   }
+   line = malloc(bytes);
+   if (!line)
+      return;
+   for (unsigned y = rect->miny; y < maxy; y++) {
+      chrome9_tiled_copy((uint8_t *)src_map, src->stride, src_tiled,
+                         rect->minx * cpp, y, bytes, 1, line, bytes, false);
+      chrome9_tiled_copy(dst_map, dst->stride, dst_tiled, rect->minx * cpp,
+                         y, bytes, 1, line, bytes, true);
+   }
+   free(line);
 }
 
 static void
@@ -186,6 +210,7 @@ chrome9_copy_surface_gpu(struct chrome9_context *ctx,
 
    if (!ctx->copy_rect || !ctx->copy_rect_unguarded_destination ||
        dst->guarded || !src->guarded || dst->data_offset ||
+       chrome9_resource_is_tiled(src) ||
        destination->format != source->format ||
        (source->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
         source->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
@@ -6806,7 +6831,6 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
 
    /* The sampler reads memory: sampled depth stays materialized. */
    if (texture && util_format_is_depth_or_stencil(texture->format)) {
-      chrome9_resource_detile(chrome9_resource(texture));
       chrome9_resource_fast_z_resolve(chrome9_resource(texture));
       chrome9_resource(texture)->fast_z_disabled = true;
    }
@@ -6945,8 +6969,7 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
             pipe_sampler_view_reference(&ctx->vs_sampler_views[i],
                                         new_views[i]);
          if (!new_views[i])
-            memset(&ctx->vs_texture_mappings[i], 0,
-                   sizeof(ctx->vs_texture_mappings[i]));
+            chrome9_vs_texture_mapping_release(&ctx->vs_texture_mappings[i]);
       }
       ctx->num_vs_sampler_views = num_views;
       return;
@@ -7213,6 +7236,24 @@ chrome9_clear_target(struct chrome9_resource *target,
    chrome9_resource_cpu_access(target, true);
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
+   /* A tiled target is filled through a linear copy of the rectangle. */
+   if (chrome9_resource_is_tiled(target)) {
+      const unsigned bytes = width *
+         util_format_get_blocksize(target->base.format);
+      uint8_t *copy = malloc((size_t)bytes * height);
+
+      if (!copy)
+         return;
+      util_pack_color_union(target->base.format, &packed, color);
+      util_fill_rect(copy, target->base.format, bytes, 0, 0, width, height,
+                     &packed);
+      chrome9_tiled_copy((uint8_t *)target->bo.map + target->data_offset,
+                         target->stride, true,
+                         x * util_format_get_blocksize(target->base.format),
+                         y, bytes, height, copy, bytes, true);
+      free(copy);
+      return;
+   }
    if (target->base.format == PIPE_FORMAT_B5G6R5_UNORM) {
       uint16_t word;
 
@@ -7256,10 +7297,21 @@ chrome9_clear_zs_target(struct chrome9_resource *target, unsigned buffers,
    chrome9_resource_cpu_access(target, true);
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
-   for (unsigned row = 0; row < height; row++) {
-      uint8_t *pixels = (uint8_t *)target->bo.map + target->data_offset +
-                        (uint64_t)(y + row) * target->stride;
+   const bool tiled = chrome9_resource_is_tiled(target);
+   const unsigned cpp = target->base.format == PIPE_FORMAT_Z16_UNORM ? 2 : 4;
+   uint8_t *line = tiled ? malloc((size_t)width * cpp) : NULL;
 
+   if (tiled && !line)
+      return;
+   for (unsigned row = 0; row < height; row++) {
+      uint8_t *base = (uint8_t *)target->bo.map + target->data_offset;
+      /* Tiled rows are edited in a linear copy starting at column x. */
+      uint8_t *pixels = tiled ? line - (size_t)x * cpp :
+                        base + (uint64_t)(y + row) * target->stride;
+
+      if (tiled)
+         chrome9_tiled_copy(base, target->stride, true, x * cpp, y + row,
+                            width * cpp, 1, line, width * cpp, false);
       if (target->base.format == PIPE_FORMAT_Z16_UNORM) {
          uint16_t *z16 = (uint16_t *)pixels + x;
 
@@ -7271,7 +7323,11 @@ chrome9_clear_zs_target(struct chrome9_resource *target, unsigned buffers,
          for (unsigned column = 0; column < width; column++)
             d24[column] = (d24[column] & keep) | value;
       }
+      if (tiled)
+         chrome9_tiled_copy(base, target->stride, true, x * cpp, y + row,
+                            width * cpp, 1, line, width * cpp, true);
    }
+   free(line);
 }
 
 /* Per-channel masked clear of a 32-bpp BGRA/BGRX target. */
@@ -7301,13 +7357,26 @@ chrome9_clear_target_masked(struct chrome9_resource *target,
    chrome9_resource_cpu_access(target, true);
    width = MIN2(width, target->base.width0 - x);
    height = MIN2(height, target->base.height0 - y);
-   for (unsigned row = 0; row < height; row++) {
-      uint32_t *pixels = (uint32_t *)((uint8_t *)target->bo.map +
-         target->data_offset + (uint64_t)(y + row) * target->stride) + x;
+   const bool tiled = chrome9_resource_is_tiled(target);
+   uint32_t *line = tiled ? malloc((size_t)width * 4) : NULL;
 
+   if (tiled && !line)
+      return;
+   for (unsigned row = 0; row < height; row++) {
+      uint8_t *base = (uint8_t *)target->bo.map + target->data_offset;
+      uint32_t *pixels = tiled ? line :
+         (uint32_t *)(base + (uint64_t)(y + row) * target->stride) + x;
+
+      if (tiled)
+         chrome9_tiled_copy(base, target->stride, true, x * 4, y + row,
+                            width * 4, 1, (uint8_t *)line, width * 4, false);
       for (unsigned column = 0; column < width; column++)
          pixels[column] = (pixels[column] & keep) | (packed.ui[0] & ~keep);
+      if (tiled)
+         chrome9_tiled_copy(base, target->stride, true, x * 4, y + row,
+                            width * 4, 1, (uint8_t *)line, width * 4, true);
    }
+   free(line);
 }
 
 /* An X8Z24 depth surface Fast-Z may clear to depth: not sampled, one level. */
@@ -7451,6 +7520,8 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
    draw.destination_offset = chrome9_resource_destination_offset(target);
    draw.abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION;
    draw.destination_handle = target->bo.handle;
+   if (chrome9_resource_is_tiled(target))
+      draw.flags |= DRM_CHROME9_FRAGMENT_DESTINATION_TILED;
    draw.width = target->base.width0;
    draw.height = target->base.height0;
    draw.destination_pitch = target->stride;
@@ -7774,6 +7845,8 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          !chrome9_generic_fragment_program(ctx)) ||
         !chrome9_draw_blend_supported(ctx) ||
         (ctx->rasterizer && ctx->rasterizer->poly_stipple_enable) ||
+        (!chrome9_generic_fragment_program(ctx) &&
+         chrome9_draw_tiled_surfaces(ctx)) ||
         chrome9_draw_smooth_lines(ctx, info)) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
@@ -7982,8 +8055,10 @@ chrome9_context_destroy(struct pipe_context *pipe)
    }
    for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
       pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
-   for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
+   for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++) {
       pipe_sampler_view_reference(&ctx->vs_sampler_views[i], NULL);
+      chrome9_vs_texture_mapping_release(&ctx->vs_texture_mappings[i]);
+   }
    chrome9_vs_texture_sampler_destroy(ctx->vs_tgsi_sampler);
    chrome9_tcl_state_destroy(ctx->tcl_state);
    FREE(ctx);

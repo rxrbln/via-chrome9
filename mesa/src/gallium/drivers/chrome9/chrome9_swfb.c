@@ -189,10 +189,10 @@ chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
                                 &box, &transfer);
       if (src) {
          chrome9_resource_cpu_access(res, true);
-         for (unsigned y = 0; y < rows; y++)
-            memcpy((uint8_t *)res->bo.map + res->level_offset[level] +
-                      (size_t)y * res->level_stride[level],
-                   src + (size_t)y * transfer->stride, row_bytes);
+         chrome9_tiled_copy((uint8_t *)res->bo.map + res->level_offset[level],
+                            res->level_stride[level],
+                            chrome9_resource_is_tiled(res), 0, 0, row_bytes,
+                            rows, (uint8_t *)src, transfer->stride, true);
          sw->lp->texture_unmap(sw->lp, transfer);
       }
    }
@@ -610,6 +610,34 @@ chrome9_sw_unavailable(const char *what)
 }
 
 /* Display-target alias of one level of a chrome9 surface, created once. */
+/* Copy one chrome9 level (tiled or linear) into an llvmpipe level. */
+static bool
+chrome9_sw_upload(struct chrome9_sw_context *sw, struct pipe_resource *copy,
+                  unsigned copy_level, struct chrome9_resource *res,
+                  unsigned level)
+{
+   const struct pipe_resource *resource = &res->base;
+   struct pipe_transfer *transfer;
+   struct pipe_box box;
+   uint8_t *dst;
+
+   u_box_2d(0, 0, u_minify(resource->width0, level),
+            u_minify(resource->height0, level), &box);
+   dst = sw->lp->texture_map(sw->lp, copy, copy_level,
+                             PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE,
+                             &box, &transfer);
+   if (!dst)
+      return false;
+   chrome9_tiled_copy((uint8_t *)res->bo.map + res->level_offset[level],
+                      res->level_stride[level],
+                      chrome9_resource_is_tiled(res), 0, 0,
+                      util_format_get_stride(resource->format, box.width),
+                      util_format_get_nblocksy(resource->format, box.height),
+                      dst, transfer->stride, false);
+   sw->lp->texture_unmap(sw->lp, transfer);
+   return true;
+}
+
 static struct pipe_resource *
 chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
                  unsigned level, unsigned bind)
@@ -629,8 +657,14 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
 
    /* llvmpipe accesses the pages directly in this draw. */
    chrome9_resource_cpu_access(res, bind != 0);
-   if (alias)
+   if (alias) {
+      /* A copy first bound for sampling must still be written back. */
+      if (bind)
+         util_dynarray_foreach(&sw->bounces, struct chrome9_sw_bounce, bounce)
+            if (bounce->copy == alias)
+               bounce->render = true;
       return alias;
+   }
    /* Cube faces and 3D slices have no display-target form. */
    if (!res->bo.map || !chrome9_is_surface_target(resource->target) ||
        level > resource->last_level || level >= 16) {
@@ -648,24 +682,23 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
    pipe_reference_init(&templ.reference, 1);
    /* llvmpipe touches whole 4x4 blocks: without room for the row overhang
     * before the trailing guard page it renders into a padded copy. */
-   if ((height & 3) &&
-       res->level_offset[level] +
-          (uint64_t)res->level_stride[level] * align(height, 4) >
-          res->bo.size - (res->guarded ? 4096 : 0)) {
+   if (chrome9_resource_is_tiled(res) ||
+       ((height & 3) &&
+        res->level_offset[level] +
+           (uint64_t)res->level_stride[level] * align(height, 4) >
+           res->bo.size - (res->guarded ? 4096 : 0))) {
       struct chrome9_sw_bounce bounce = { .level = level, .render = bind };
-      struct pipe_box box;
 
       alias = sw->screen->resource_create(sw->screen, &templ);
       if (!alias) {
          chrome9_sw_unavailable("padded copy of the target");
          return NULL;
       }
-      u_box_2d(0, 0, templ.width0, height, &box);
-      sw->lp->texture_subdata(sw->lp, alias, 0, PIPE_MAP_WRITE, &box,
-                              (uint8_t *)res->bo.map +
-                                 res->level_offset[level],
-                              res->level_stride[level],
-                              res->level_size[level]);
+      if (!chrome9_sw_upload(sw, alias, 0, res, level)) {
+         pipe_resource_reference(&alias, NULL);
+         chrome9_sw_unavailable("padded copy of the target");
+         return NULL;
+      }
       pipe_resource_reference(&bounce.target, resource);
       bounce.copy = alias;
       util_dynarray_append(&sw->bounces, bounce);
@@ -724,6 +757,14 @@ chrome9_sw_texture(struct chrome9_sw_context *sw,
          unsigned height = util_format_get_nblocksy(resource->format,
             u_minify(resource->height0, level));
 
+         if (chrome9_resource_is_tiled(res)) {
+            if (!chrome9_sw_upload(sw, copy, level, res, level)) {
+               pipe_resource_reference(&copy, NULL);
+               *copied = false;
+               return NULL;
+            }
+            continue;
+         }
          u_box_2d_zslice(0, 0, layer, u_minify(resource->width0, level),
                          u_minify(resource->height0, level), &box);
          sw->lp->texture_subdata(sw->lp, copy, level, PIPE_MAP_WRITE, &box,

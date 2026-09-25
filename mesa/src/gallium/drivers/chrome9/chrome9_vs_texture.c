@@ -9,6 +9,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "tgsi/tgsi_exec.h"
@@ -27,12 +28,18 @@ chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
 {
    const struct pipe_resource *texture = view ? view->texture : NULL;
    const struct chrome9_resource *resource;
-   uint64_t first_offset;
+   void *staging;
+   size_t staging_size;
+   uint64_t first_offset, span = 0;
    unsigned cpp, first, last;
 
    if (!mapping)
       return false;
+   staging = mapping->staging;
+   staging_size = mapping->staging_size;
    memset(mapping, 0, sizeof(*mapping));
+   mapping->staging = staging;
+   mapping->staging_size = staging_size;
    if (!texture || texture->target != PIPE_TEXTURE_2D ||
        view->target != PIPE_TEXTURE_2D || view->format != texture->format ||
        texture->depth0 != 1 || texture->array_size != 1 ||
@@ -71,14 +78,44 @@ chrome9_vs_texture_mapping(const struct pipe_sampler_view *view,
       mapping->row_stride[level] = stride;
       mapping->img_stride[level] = stride * height;
       mapping->mip_offset[level] = offset - first_offset;
+      span = MAX2(span, offset - first_offset + (uint64_t)stride * height);
    }
 
    mapping->base = (const uint8_t *)resource->bo.map + first_offset;
+   if (chrome9_resource_is_tiled(resource)) {
+      if (span > SIZE_MAX)
+         return false;
+      if (mapping->staging_size < span) {
+         void *grown = realloc(mapping->staging, span);
+
+         if (!grown)
+            return false;
+         mapping->staging = grown;
+         mapping->staging_size = span;
+      }
+      for (unsigned level = first; level <= last; level++)
+         chrome9_tiled_copy((uint8_t *)resource->bo.map +
+                               resource->level_offset[level],
+                            resource->level_stride[level], true, 0, 0,
+                            u_minify(texture->width0, level) * cpp,
+                            u_minify(texture->height0, level),
+                            (uint8_t *)mapping->staging +
+                               mapping->mip_offset[level],
+                            resource->level_stride[level], false);
+      mapping->base = mapping->staging;
+   }
    mapping->width = texture->width0;
    mapping->height = texture->height0;
    mapping->first_level = first;
    mapping->last_level = last;
    return true;
+}
+
+void
+chrome9_vs_texture_mapping_release(struct chrome9_vs_texture_mapping *mapping)
+{
+   free(mapping->staging);
+   memset(mapping, 0, sizeof(*mapping));
 }
 
 static void

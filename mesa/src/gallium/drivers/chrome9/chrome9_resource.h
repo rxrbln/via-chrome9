@@ -5,9 +5,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "chrome9_drm.h"
 #include "pipe/p_state.h"
+#include "util/macros.h"
 
 struct pipe_context;
 struct pipe_screen;
@@ -61,9 +63,8 @@ struct chrome9_resource {
     * word holds its depth; fast_z_disabled after a sampler view. */
    uint8_t fast_z_index;
    bool fast_z_disabled;
-   /* CAP2_TILED_DEPTH: 32-byte x 8-row tiles until the first access the
-    * engine cannot make tiled (CPU, sampler, fixed draw builders), which
-    * rewrites it linear for good. */
+   /* CAP2_TILED_DEPTH/COLOR: every level in 32-byte x 8-row tiles; CPU
+    * access goes through chrome9_tiled_copy(). */
    bool tiled;
    /* Single-image render view of a level or layer of parent: same BO,
     * pixels at data_offset. */
@@ -89,7 +90,45 @@ void chrome9_resource_cpu_access(struct chrome9_resource *resource,
 bool chrome9_resource_coarse_z_fill(struct pipe_context *pipe,
                                     struct chrome9_resource *depth);
 void chrome9_resource_fast_z_resolve(struct chrome9_resource *depth);
-void chrome9_resource_detile(struct chrome9_resource *resource);
+
+/*
+ * Copy rows between linear memory and a level at level_base with the
+ * given pitch, tiled (32-byte x 8-row tiles of 256 bytes, left to right
+ * across the pitch) or linear: bytes from byte column xb of rows y..y+rows.
+ */
+static inline void
+chrome9_tiled_copy(uint8_t *level_base, unsigned pitch, bool tiled,
+                   unsigned xb, unsigned y, unsigned bytes, unsigned rows,
+                   uint8_t *linear, unsigned linear_stride, bool store)
+{
+   for (unsigned row = 0; row < rows; row++) {
+      const unsigned ty = y + row;
+      uint8_t *line = linear + (size_t)row * linear_stride;
+
+      if (!tiled) {
+         uint8_t *surface = level_base + (size_t)ty * pitch + xb;
+
+         memcpy(store ? surface : line, store ? line : surface, bytes);
+         continue;
+      }
+      for (unsigned done = 0; done < bytes; ) {
+         const unsigned x = xb + done;
+         const unsigned chunk = MIN2(bytes - done, 32 - (x & 31));
+         uint8_t *surface = level_base + (size_t)(ty >> 3) * pitch * 8 +
+                            (x >> 5) * 256 + (ty & 7) * 32 + (x & 31);
+
+         /* Whole tile rows copy with a constant size the compiler inlines. */
+         if (chunk == 32)
+            memcpy(store ? surface : line + done,
+                   store ? line + done : surface, 32);
+         else
+            memcpy(store ? surface : line + done,
+                   store ? line + done : surface, chunk);
+         done += chunk;
+      }
+   }
+}
+
 
 /* Fast-Z indices cycle 1..6: 7 is the tag of 1.0 cleared memory. */
 #define CHROME9_FAST_Z_LAST_INDEX 6
@@ -107,6 +146,22 @@ static inline const struct chrome9_resource *
 chrome9_resource_const(const struct pipe_resource *resource)
 {
    return (const struct chrome9_resource *)resource;
+}
+/* DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_* of a sampled resource. */
+static inline uint32_t
+chrome9_resource_texture_flags(const struct chrome9_resource *resource)
+{
+   if (resource->parent)
+      resource = chrome9_resource_const(resource->parent);
+   return resource->tiled ? DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED : 0;
+}
+
+/* The resource (or the parent of a level view) is tiled. */
+static inline bool
+chrome9_resource_is_tiled(const struct chrome9_resource *resource)
+{
+   return resource->parent ?
+          chrome9_resource_const(resource->parent)->tiled : resource->tiled;
 }
 
 bool chrome9_is_format_supported(struct pipe_screen *screen,

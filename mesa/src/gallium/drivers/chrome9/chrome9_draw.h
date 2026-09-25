@@ -19,6 +19,7 @@ void chrome9_draw_end_guarded_domain(struct chrome9_context *ctx);
 bool chrome9_fragment_unit_interval_value(uint32_t bits);
 bool chrome9_generic_fragment_program(const struct chrome9_context *ctx);
 bool chrome9_draw_needs_sw_textures(const struct chrome9_context *ctx);
+bool chrome9_draw_tiled_surfaces(const struct chrome9_context *ctx);
 bool chrome9_draw_blend_supported(const struct chrome9_context *ctx);
 
 /* Pixel state of one hardware TCL draw, shared by all of its chunks. */
