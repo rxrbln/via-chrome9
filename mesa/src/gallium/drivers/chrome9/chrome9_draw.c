@@ -1379,8 +1379,12 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
              !ctx->two_texture_tex0_alpha_primary)
             return false;
       }
+      /* The fixed two-texture ioctls take distinct objects; the generic
+       * program shares one object between read-only units. */
       *reason = "texture-alias";
-      for (unsigned a = 0; a < texture_count; a++)
+      for (unsigned a = 0;
+           !chrome9_use_generic_fragment_program(ctx) && a < texture_count;
+           a++)
          for (unsigned b = a + 1; b < texture_count; b++)
             if (textures[a]->bo.handle == textures[b]->bo.handle)
                return false;

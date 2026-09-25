@@ -277,6 +277,11 @@ chrome9_nir_lower_integers(nir_shader *nir)
 {
    if (!nir->options->no_integers)
       return;
+   /* Local array indices must stay integer: with derefs still present,
+    * int_to_float also converts an index constant CSE shared with an
+    * integer operand (m[1] became m[0x3f800000]). */
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
    NIR_PASS(_, nir, nir_lower_int_to_float);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, chrome9_ubo_offset_to_int,
             nir_metadata_control_flow, NULL);
