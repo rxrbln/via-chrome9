@@ -239,10 +239,10 @@ module_param_named(edge_aa, chrome9_edge_aa, bool, 0600);
 MODULE_PARM_DESC(edge_aa,
 	"Edge antialiasing for vertex-program lines and triangles (default: true)");
 
-static bool chrome9_depth_output;
+static bool chrome9_depth_output = true;
 module_param_named(depth_output, chrome9_depth_output, bool, 0600);
 MODULE_PARM_DESC(depth_output,
-	"Fragment program depth output, DEST_DEPTH; locks up the engine as encoded (default: false)");
+	"Fragment program depth output, DEST_DEPTH (default: true)");
 
 static bool chrome9_fast_z = true;
 module_param_named(fast_z, chrome9_fast_z, bool, 0600);
@@ -4494,6 +4494,7 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	static const u32 vs_integer_constants[] = { 0, 0, 0, 0 };
 	/* VX900 HPSLocationReg: direct PEY, TS-ZTAG deadlock ECO enabled. */
 	static const u32 misc_location[] = { 0x8a020000 };
+	static const u32 misc_depth_output[] = { 0x8a820000 };
 	const struct chrome9_fragment_program *program = request->fragment_program;
 	const struct chrome9_tcl_draw *tcl = request->tcl;
 	const struct chrome9_fragment_rt_format *rt_format =
@@ -4780,7 +4781,12 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
 				     vs_control, ARRAY_SIZE(vs_control));
 	}
-	if (program->controls[0] & BIT(19))
+	/* Shader depth: Windows' VX900 A8A with the TS-ZTAG deadlock ECO. */
+	if (program->depth_output)
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
+				     misc_depth_output,
+				     ARRAY_SIZE(misc_depth_output));
+	else if (program->controls[0] & BIT(19))
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,
 				     misc_location, ARRAY_SIZE(misc_location));
 	chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00010000,

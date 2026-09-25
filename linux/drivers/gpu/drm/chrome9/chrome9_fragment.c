@@ -321,10 +321,7 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX ||
 			    instruction->dst.index ||
 			    instruction->dst.writemask != 0xf || output_mask ||
-			    (i != instruction_count - 1 &&
-			     (i != instruction_count - 2 ||
-			      state->instructions[i + 1].dst.file !=
-			      DRM_CHROME9_FRAGMENT_DEST_DEPTH)))
+			    i != instruction_count - 1)
 				return -EINVAL;
 			output_mask = 0xf;
 		} else if (instruction->dst.file ==
@@ -332,14 +329,17 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 			const struct drm_chrome9_fragment_source *src =
 				&instruction->src[0];
 
-			/* Linux vendor order: color, then a replicated MOV
-			 * to oDepth (native oC4) with A13 bit 23. */
+			/* A replicated MOV to oDepth (native oC4, A13 bit 23)
+			 * directly before the color write, the Windows vendor
+			 * order; the Linux order (color first) locks up. */
 			if (!(chrome9_engine_capabilities2() &
 			      DRM_CHROME9_CAP2_DEPTH_OUTPUT) ||
 			    instruction->op != DRM_CHROME9_FRAGMENT_OP_MOV ||
 			    instruction->dst.index || instruction->dst.modifier ||
 			    instruction->dst.writemask != 0xf ||
-			    output_mask != 0xf || i != instruction_count - 1 ||
+			    output_mask || i != instruction_count - 2 ||
+			    state->instructions[i + 1].dst.file !=
+			    DRM_CHROME9_FRAGMENT_DEST_COLOR ||
 			    src->swizzle[1] != src->swizzle[0] ||
 			    src->swizzle[2] != src->swizzle[0] ||
 			    src->swizzle[3] != src->swizzle[0])
