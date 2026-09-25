@@ -299,7 +299,8 @@ Consequences:
 * Meaning of the two all-ones dwords in the coarse-Z entry and of the
   exact 14-bit value encoding for D32F.
 * The complete `STM_CoarseZ_INV` decision tree (stencil and alpha branches).
-* Fast-Z tag comparison semantics are inferred, not measured.
+* Fast-Z tag comparison is measured (see "Fast-Z clear value"); the
+  stale-value source A15:A14 is recovered statically but not yet measured.
 
 ## Proposed guarded implementation
 
@@ -347,7 +348,9 @@ policy lives in the kernel, so userspace cannot enable a stale buffer.
 from the recovered defaults (D24: 3).  Only for depth BOs that are never
 sampled or mapped (the kernel disables it and does a real clear before the
 first map/texture use), because no resolve exists.  Emit A14/A15 untagged
-clear data and A27 `= 0x27000001 | len<<8 | idx<<12`.
+clear data (`A14 = 0x14000000 | (w & 0xffffff)`, `A15 = 0x15000000 | w >> 24`,
+`w` in memory-word layout, see "Fast-Z clear value") and
+A27 `= 0x27000001 | len<<8 | idx<<12`.
 
 ## Smallest hardware experiment
 
@@ -407,6 +410,138 @@ frame.  Front to back and in glmark2 refract (104.8 ms) and ioquake3
 (GL1 about 61, GL2 about 42 fps) there is no measurable gain: their depth
 cost is not in depth-failing fragments.  The extra fill job costs about
 0.1-0.2 ms per cleared frame.
+
+## Fast-Z clear value, 2026-09-25
+
+### Silicon, measured
+
+* X8Z24 (A12 `0x123e0000`) stores depth in bits 31:8 of each word
+  (0.5 -> `0x80000000`).
+* With type-01 `A27 = 0x27000001 | len<<8 | idx<<12`, a draw compares the
+  tag in depth-word bits `8 .. 8+len-1` with `idx` and writes new depths
+  tagged with `idx` (idx 1 -> `0x80000100`, idx 7 -> `0x80000700`).  A word
+  whose tag equals `idx` is used as its stored depth.
+* A word with a stale tag behaves as if the stored depth were small: a LESS
+  draw at z = 0.5 fails everywhere.  Adding `A14 = 0x14000000 | v`
+  (`v` = `ffffff`, `7fffff`, `ff`, `ff0000`, `0`) and `A15 = 0x15000000` to
+  the same type-01 transaction before the draw changed nothing.
+
+### Vendor encoding (S)
+
+`via_chrome9_dri.so` `fddb4dea...`, together with the manual:
+
+1. **Hardware clear word** (`sfmClear_inv:0xe98d9..0xe9f21`), in the depth
+   buffer's own memory layout:
+
+   | depth format | z == 1.0 | otherwise |
+   |---|---|---|
+   | D24X8/D24S8 `2032`/`2033` (or surface `+0x151` bit 6) | `ffffff00` | `FloatToFix(z, 24) << 8` |
+   | D16 (`bpp == 16`) | `ffffffff` | `f16 \| f16 << 16`, `f16 = FloatToFix(z, 16)` |
+   | D32F `2040` | raw IEEE bits of z | raw IEEE bits of z |
+   | other (D32 fixed) | `ffffffff` | `FloatToFix(z, 32)`, or the caller's raw word when clear flag `0x10` is set |
+
+2. **ZW clear data** (`stmUpdateZWClearData_inv:0x192b20`) is that word,
+   stored in `zsurf+0x2f4` before any tag insertion.  For `2032`/`2033`
+   only, the low byte (`mov al,0`) is zeroed: D24 clear data never carries a
+   stencil value or a tag.  The low depth bits under the tag field are
+   **not** masked (`0xffffff00` for 1.0 keeps bits 8..10 set).
+3. **Registers** (`stmGlobalHardwareAdjust_inv:0x17d45f..0x17d4c8`, image
+   `+0x50` = A14, `+0x54` = A15 byte 0), with `d = zsurf+0x2f4`:
+
+   ```text
+   A14 = 0x14000000 | (d & 0x00ffffff)     # manual: lower 3 bytes of ZW clear data
+   A15[7:0] = d >> 24                      # manual: highest byte of ZW clear data
+   A15[23:8] unchanged                     # manual: negative Zsrc mantissa mask, keep 0
+   ```
+
+   The 32-bit clear value is `A15[7:0] : A14[23:0]` in memory-word layout.
+   For X8Z24 the top depth byte is in **A15**, not A14: clear to 1.0 is
+   `A14=14ffff00 A15=150000ff`, clear to 0.5 is `A14=14000000
+   A15=15000080`.  The vendor writes only A15's low byte and marks A14 (dirty
+   bit 20) and A15 (dirty bit 21) whenever either differs from the image.
+   There is no separate "ZW clear" enable: A27 bit 0, `[11:8]`, `[15:12]`
+   and A14/A15 are the complete Fast-Z state.  A01 is not touched by the
+   Fast-Z path (A01 bits 13/9 belong to coarse-Z only).
+4. **Transport and order.**  A14, A15 and A27 are ordinary type-01 image
+   registers.  `stmUpdateHardware_inv` queues each non-empty 32-register
+   block of the type-01 dirty mask (block 0 = A00..A1F, block 1 = A20..A3F)
+   as a header `0x00010000` entry in ascending block order
+   (`0x17b504..0x17b57e`) and emits each block in ascending bit order
+   (`cpum_bsf` walk, contiguous runs copied with `memcpy`,
+   `0x17aee3..0x17af96`).  A14 and A15 therefore precede A27.  Whether
+   blocks 0 and 1 share one `FE020440 0000043c 00010000 cc000000`
+   transaction or get one each is not decoded (**I**: shared, `0x17aff1`
+   compares the entry class with the previous one); either way the
+   experiment's single type-01 transaction is equivalent.  No other command
+   type carries Fast-Z state.
+5. **Clear operation** (`0xe9979..0xe99d3`, `0xe9e24..0xe9e80`,
+   `0xe9fb6..0xe9fde`): with Fast-Z active and a full-surface clear,
+   `idx = zsurf+0x2f0`; the clear word gets
+   `(w & ~(mask << 8)) | idx << 8` (D24) or `(w & ~mask) | idx` (D16, D32);
+   the blit's depth write mask becomes `0` when `idx != 0` (no depth
+   memory write).  A simultaneous stencil clear on a packed D24S8 surface
+   still blits with write mask `0x000000ff`, i.e. stencil is cleared
+   physically, depth is not.  `zsurf+0x2f0 = (idx + 1) & mask` and
+   `STM_FastZClear_INV` sets A27 `[15:12] = idx`.  So the index in A27
+   equals the tag the (physical or virtual) clear used.
+
+### Interpretation of the silicon result (I)
+
+All five experiments left `A15[7:0] = 0`, so the clear value the hardware
+substituted for stale words was `0x00vvvvvv`, a depth below 1/256 for every
+`v` tried.  A LESS draw at 0.5 must then fail, which is exactly what was
+measured.  The result is consistent with A14/A15 being the stale-value source;
+it does not show that they are not.  No additional enable was found in the
+vendor code.
+
+Open points for D24S8: whether the stencil of a stale word comes from memory
+(the vendor clears it physically, suggesting yes) and whether the
+depth-test comparison masks the tag bits out of the clear data.
+
+### Next silicon experiments, in priority order
+
+All use a 64x64 X8Z24 target (A12 `0x123e0000`), the fragment rung's
+constant-colour draw, and one type-01 transaction
+`FE020440 0000043c 00010000 cc000000` carrying, in this order, the A14,
+A15 and A27 words listed, before the draw.  Preload the depth buffer by
+a normal (non-Fast-Z, `A27=27000000`) draw or clear to `0x40000000`
+(0.25, tag 0).
+
+1. **Clear value 1.0.**  `A14=14ffff00 A15=150000ff A27=27001301` (len 3,
+   idx 1).  Draw LESS z = 0.5, depth write on.  Expected: every pixel
+   passes, memory reads `0x80000100`.  Repeat with `A15=15000000` as the
+   control (must fail, reproducing today's result).  This is the deciding
+   experiment for A15 as the top depth byte.
+2. **Clear value 0.5 (threshold).**  `A14=14000000 A15=15000080
+   A27=27001301`.  Two draws on fresh preloads: z = 0.25 LESS (expected
+   pass, `0x40000100`) and z = 0.75 LESS (expected fail, memory still
+   `0x40000000`).  Proves the substituted value is compared, not a fixed
+   constant.
+3. **A14 contributes the low depth bits.**  `A14=14800000 A15=15000080`
+   (clear data `0x80800000`, depth 0x808000 = 0.50195) and `A27=27001301`;
+   draw LESS z = 0.501 (24-bit `0x804189`).  Expected: pass.  Control
+   `A14=14000000 A15=15000080`: fail.  Proves A14[23:8] are depth bits
+   15:0 (and therefore that D24 clear data is `z24 << 8`).
+4. **Wrap and materialization.**  Vendor sequence for eight clears with
+   len 3: clear 0 is physical (tag 0, `A27=27000301`), clears 1..7 only
+   advance `idx` (`A27=27001301 .. 27007301`), each followed by a draw at a
+   different z over the left half; after clear 7 read back and compare with
+   a non-Fast-Z reference in the right half (must equal the clear value
+   after the CPU-side interpretation: stale -> clear value).  Clear 8 must be
+   physical again (`idx` wraps to 0).
+5. **D16 and stencil.**  D16 target, clear 0.5: word `0x80008000`,
+   `A14=14008000 A15=15000080 A27=27001201` (len 2, idx 1); z = 0.25 pass,
+   0.75 fail, and a variant with only one half set (`A14=14008000
+   A15=15000000`, then `A14=14000000 A15=15000080`) to find which half the
+   D16 path reads.  Then D24S8 with stencil EQUAL ref `5a`, memory stencil
+   `5a`, `A14=14ffff00`: pass shows stale words take stencil from memory.
+
+If experiment 1 still fails with A15 = `0x150000ff`, the remaining
+candidates are the A15 `[23:8]` mantissa mask (keep 0), the A12 Z-format
+bits (Fast-Z may require the D24 format to match the recovered `2032/2033`
+class exactly), and a hidden enable on the A11 reading-Z cache (bit 12,
+clear bit 11): repeat 1 with `A11 |= 0x800` (one-shot cache clear) to
+exclude cached stale depth.
 
 ## Implementation and proof order
 
