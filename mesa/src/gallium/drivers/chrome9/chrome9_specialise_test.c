@@ -206,13 +206,16 @@ build_alpha_mode_terminates(void)
 /* Exercise system-value, fsign, IO-lowered, and deref FACE forms.  Each
  * boolean form chooses the same numeric sign exposed directly by fsign. */
 static nir_shader *
-build_front_face_pair(void)
+build_front_face_pair(bool uint_face)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
                                                    &options,
                                                    "front-face-pair");
+   /* The GLSL linker may declare gl_FrontFacing as uint. */
    nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
-                                           glsl_bool_type(), "face");
+                                           uint_face ? glsl_uint_type() :
+                                                       glsl_bool_type(),
+                                           "face");
    nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
                                             glsl_vec4_type(), "out");
 
@@ -227,7 +230,9 @@ build_front_face_pair(void)
    nir_def *from_input = nir_bcsel(&b, nir_b2b1(&b, input_face),
                                    nir_imm_float(&b, 1.0f),
                                    nir_imm_float(&b, -1.0f));
-   nir_def *from_deref = nir_bcsel(&b, nir_load_var(&b, in),
+   nir_def *deref_face = nir_load_var(&b, in);
+   nir_def *from_deref = nir_bcsel(&b, uint_face ?
+                                   nir_b2b1(&b, deref_face) : deref_face,
                                    nir_imm_float(&b, 1.0f),
                                    nir_imm_float(&b, -1.0f));
 
@@ -606,12 +611,15 @@ main(void)
    }
    ralloc_free(nir);
 
-   nir = build_front_face_pair();
-   if (!check_front_face(nir, false) || !check_front_face(nir, true)) {
-      fprintf(stderr, "FACE specialization failed\n");
-      return 1;
+   for (unsigned uint_face = 0; uint_face < 2; uint_face++) {
+      nir = build_front_face_pair(uint_face);
+      if (!check_front_face(nir, false) || !check_front_face(nir, true)) {
+         fprintf(stderr, "FACE specialization failed (uint %u)\n",
+                 uint_face);
+         return 1;
+      }
+      ralloc_free(nir);
    }
-   ralloc_free(nir);
 
    nir = build_vector_uniform_select();
    chrome9_nir_find_inlinable_uniforms(nir);

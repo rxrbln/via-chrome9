@@ -509,15 +509,21 @@ chrome9_replace_front_face(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_load_deref: {
       nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
       nir_variable *var = nir_intrinsic_get_var(intr, 0);
+      const struct glsl_type *type = var ? glsl_without_array(var->type) :
+                                           NULL;
 
       if (b->shader->info.stage != MESA_SHADER_FRAGMENT || !deref ||
           deref->deref_type != nir_deref_type_var || !var ||
           var->data.mode != nir_var_shader_in ||
           var->data.location != VARYING_SLOT_FACE ||
-          !glsl_type_is_boolean(glsl_without_array(var->type)) ||
+          !(glsl_type_is_boolean(type) || glsl_type_is_integer_32(type)) ||
           intr->def.num_components != 1)
          return false;
-      replacement = nir_imm_boolN_t(b, front_face, intr->def.bit_size);
+      /* The linker declares gl_FrontFacing as uint; integers are float
+       * encoded here, so true is 1.0 like the Boolean uniforms. */
+      replacement = glsl_type_is_boolean(type) ?
+         nir_imm_boolN_t(b, front_face, intr->def.bit_size) :
+         nir_imm_floatN_t(b, front_face ? 1.0 : 0.0, intr->def.bit_size);
       break;
    }
    default:
