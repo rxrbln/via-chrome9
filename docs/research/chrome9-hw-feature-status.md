@@ -43,27 +43,29 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | edge antialiasing (A01 bit 5): one-pixel smooth lines, blend-off polygon smooth, on by default | `64242a2` / Mesa, CAP2 bit 25 | `eaa` probe, piglit line/polygon subsets unchanged |
 | fence interrupts (CR 0x204 bit 5; internal DP status 0x1280 bits 13/11/9 acknowledged), on by default | `a0858ab` | 47001 interrupts, no foreign source (`chrome9-fence-irq-re.md`) |
 | Fast-Z clear (A27 index in X8Z24 depth bits 10:8, A14/A15 clear data), on by default | `5ca17f7` / Mesa Fast-Z, CAP2 bit 24 | rung `fastz`, 24-bit FBO probe identical; Z16 windows do not use it |
+| pixel-shader depth output (DEST_DEPTH directly before the colour write, A8A 8a820000), on by default | `42677af`, `2440737` / Mesa `7146ff9`, CAP2 bit 26 | `fd` probe, piglit fragdepth tests (`chrome9-depth-output-audit.md`) |
+| NaN primitive drop per draw (stage B B14) | `fd0f932` | raster self-test, `nan` probe |
+| tiled depth (A12 bit 0) and tiled colour targets and textures (A51 bit 23, A22 bit 17), on by default, no linear fallback | `a9dfc98`, `fe20655` / Mesa `9a62ef4`, `6db49ba`, CAP2 bits 27/28 | rungs `tile`, `tileperf`; piglit texture/depth subsets unchanged (`chrome9-tiling-re.md`) |
+| lower-left point sprite origin (FS variant flips t, draw module gets the upper-left rasterizer) | Mesa `2e5c349` | `sprite` probe: both origins, window and FBO, equal to llvmpipe, no TCL fallback; piglit point sprite subset |
 
 ## Emulated or falling back
 
 | feature | today | plan |
 |---|---|---|
-| wide or stippled lines, smooth points, lower-left sprite origin | draw module turns them into triangles | no line-width register; LL origin needs an FS coordinate flip |
+| wide or stippled lines, smooth points, fractional sprite sizes | draw module turns them into triangles | no line-width register |
 | smooth (AA) lines, also from polygon mode LINE | llvmpipe (Mesa `34b1ffa`) | no AA line hardware; draw's AA line stage is not installed |
 | polygon POINT mode, unfilled quads/polygons, per-vertex edge flags | draw module | GL draws the clipped polygon's vertices; quads hide inner edges |
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
 | fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size (below) |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
-| terrain fragment shader, some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work |
+| terrain fragment shader, glmark2 cel, some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work; cel: predicate selects on values not provably finite (`rsq` of a possibly zero length) |
 | desktop blur | validation fails (sampler precision) | open |
 
 ## Not implemented
 
 | feature | state |
 |---|---|
-| surface tiling | RE done (`chrome9-tiling-re.md`); SR42 bit 7 = 0 (forced linear) is written by VBIOS POST, not a documented strap; silicon steps E1-E4 decide |
-| pixel-shader depth output | encoded (kernel `42677af`, `depth_output=0`): the first draw locked up the engine; RE of the difference in progress |
-| stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes), B14 (NaN kill) | open; B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
+| stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes) | open (B14 done); B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
 | per-segment state cache | patch ready (default off), rungs R2/R3 |
 | render targets in local frame buffer memory | not started: needs an SL allocator, per-BO domain, WC mapping and extent checks; ladder in `chrome9-local-fb-placement.md` |
 

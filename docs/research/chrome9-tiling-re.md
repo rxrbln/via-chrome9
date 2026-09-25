@@ -613,10 +613,25 @@ With SR42 still at the BIOS value `0x30` (bit 7 = 0), the engine tiles:
   62.9 ms, tiled target 65.6 ms, both tiled 53.0 ms.
 
 Implemented: kernel `a9dfc98` (tiled depth, `FRAGMENT_DEPTH_TILED`, CAP2
-bit 27) and the tiled colour flags (`FRAGMENT_DESTINATION_TILED`,
-`FRAGMENT_TEXTURE_FLAG_TILED` / `_TABLE`, CAP2 bit 28).  Mesa tiles private
-depth surfaces with a height divisible by 8 and private 2D BGRA/BGRX render
+bit 27) and `fe20655` / uAPI `76bd656` (tiled colour,
+`FRAGMENT_DESTINATION_TILED`, `FRAGMENT_TEXTURE_FLAG_TILED`, CAP2 bit 28,
+module parameter `tiled_color`).  Mesa (`6db49ba`) tiles private depth
+surfaces with a height divisible by 8 and private 2D BGRA/BGRX render
 targets (every level ALIGN(h, 8) rows at 256-byte aligned table offsets,
-also for POT sizes); the first CPU access, fixed draw builder or depth
-sampler view rewrites a surface linear for good.  glmark2 refract 99.5 ->
-92.2 ms, desktop shadow 127 -> 141 fps.
+also for POT sizes).  glmark2 refract 99.5 -> 92.2 ms, desktop shadow
+127 -> 146 fps, score 106 -> 108.
+
+Surfaces stay tiled for their lifetime; there is no linear conversion.
+CPU access goes through `chrome9_tiled_copy()`: transfers map a linear
+staging copy of the box, copy_image and CPU clears copy row by row,
+vertex texture fetch samples a reused linear copy, and llvmpipe fallback
+draws render into a detiled copy that is retiled on release.  The fixed
+draw builders address surfaces linearly, so draws with a tiled target,
+depth buffer or texture take the generic fragment program (or llvmpipe).
+
+Cost of the llvmpipe copies: glmark2 `shading=cel` (an llvmpipe draw per
+frame) 25.6 -> about 30 ms with a tiled 800x600 depth buffer, from the
+detile/retile and the CPU-access cache flush of the depth buffer.  The
+remedy is running such shaders on the hardware, not linear surfaces.
+piglit texture (694 tests) and depth (176) subsets: no difference to the
+untiled driver.
