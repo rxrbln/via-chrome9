@@ -417,6 +417,11 @@ int chrome9_einval(const char *func, int line)
 	return -EINVAL;
 }
 
+static bool chrome9_r32f = true;
+module_param_named(r32f, chrome9_r32f, bool, 0600);
+MODULE_PARM_DESC(r32f,
+	"R32F render targets and textures (default: true)");
+
 static uint chrome9_profile;
 module_param_named(profile, chrome9_profile, uint, 0600);
 MODULE_PARM_DESC(profile, "Debug: log fragment job phase times every N jobs");
@@ -3206,6 +3211,8 @@ static u32 chrome9_fragment_texture_format(u32 format)
 		return 0x2a;
 	case DRM_CHROME9_FRAGMENT_TEXTURE_DXT5:
 		return 0x2b;
+	case DRM_CHROME9_FRAGMENT_TEXTURE_R32F:
+		return 0xf5;
 	default:
 		return 0;
 	}
@@ -4334,13 +4341,16 @@ static const struct chrome9_fragment_rt_format chrome9_fragment_rt_formats[] = {
 	[DRM_CHROME9_DESTINATION_FORMAT_L8A8] = { 0x15, 2 },
 	[DRM_CHROME9_DESTINATION_FORMAT_ARGB1555] = { 0x8a, 2 },
 	[DRM_CHROME9_DESTINATION_FORMAT_ARGB4444] = { 0x8b, 2 },
+	[DRM_CHROME9_DESTINATION_FORMAT_R32F] = { 0xf5, 4 },
 };
 
 static const struct chrome9_fragment_rt_format *
 chrome9_fragment_rt_format(u32 format)
 {
 	if (format >= ARRAY_SIZE(chrome9_fragment_rt_formats) ||
-	    !chrome9_fragment_rt_formats[format].cpp)
+	    !chrome9_fragment_rt_formats[format].cpp ||
+	    (format == DRM_CHROME9_DESTINATION_FORMAT_R32F &&
+	     !READ_ONCE(chrome9_r32f)))
 		return NULL;
 
 	return &chrome9_fragment_rt_formats[format];
@@ -4705,6 +4715,14 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 		memcpy(destination_state + 7, destination_tail + 4 + skip,
 		       (8 - skip) * sizeof(*destination_tail));
 		destination_count = 3 + ARRAY_SIZE(destination_tail) - skip;
+	}
+	/* Float targets disable post-rendering (vendor rule): no dither or
+	 * blend enables in A00, full write mask, no edge AA. */
+	if (request->destination_format == DRM_CHROME9_DESTINATION_FORMAT_R32F) {
+		if (tcl && tcl->edge_aa)
+			return CHROME9_EINVAL;
+		common[3] &= ~(GENMASK(11, 0) | BIT(20));
+		common[2] |= 0xf;
 	}
 	/* Colour targets 1..3: A58..A5B, A60..A63, A68..A6B like A50..A53,
 	 * sharing RT0's write mask, dither and blend enable. */
@@ -6946,6 +6964,8 @@ u64 chrome9_engine_capabilities2(void)
 	if (READ_ONCE(chrome9_mrt) && READ_ONCE(chrome9_hw_tcl))
 		caps |= DRM_CHROME9_CAP2_COLOR_TARGETS;
 	caps |= DRM_CHROME9_CAP2_GEM_BUSY;
+	if (READ_ONCE(chrome9_r32f))
+		caps |= DRM_CHROME9_CAP2_R32F;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_edge_aa))
 		caps |= DRM_CHROME9_CAP2_EDGE_AA;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
@@ -11810,6 +11830,15 @@ static int chrome9_validate_fragment_texture(
 	case DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24:
 		bytes_per_pixel = 4;
 		break;
+	case DRM_CHROME9_FRAGMENT_TEXTURE_R32F:
+		/* The vendor FORMATOP table marks R32F NOFILTER. */
+		if (!(caps2 & DRM_CHROME9_CAP2_R32F) ||
+		    texture->min_filter != DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+		    texture->mag_filter != DRM_CHROME9_TEXTURE_FILTER_NEAREST ||
+		    texture->mip_filter == DRM_CHROME9_TEXTURE_MIP_FILTER_LINEAR)
+			return CHROME9_EINVAL;
+		bytes_per_pixel = 4;
+		break;
 	case DRM_CHROME9_FRAGMENT_TEXTURE_A8:
 	case DRM_CHROME9_FRAGMENT_TEXTURE_L8:
 		bytes_per_pixel = 1;
@@ -12864,6 +12893,8 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	    args->destination_pitch != ALIGN(args->width * rt_format->cpp, 32) ||
 	    (rt_format->cpp == 2 &&
 	     (depth || blend)) ||
+	    (args->destination_format == DRM_CHROME9_DESTINATION_FORMAT_R32F &&
+	     blend) ||
 	    (!blend && memchr_inv(&args->blend, 0, sizeof(args->blend))) ||
 	    (depth && (!args->depth_handle ||
 		(args->depth_format != DRM_CHROME9_FRAGMENT_DEPTH_D16 &&
@@ -13109,6 +13140,9 @@ static int chrome9_draw_colors_prepare(struct chrome9_draw_request *request,
 		rows = c->flags & DRM_CHROME9_COLOR_TARGET_TILED ?
 		       ALIGN(request->height, 8) : request->height;
 		if (!c->handle || !f || !rt || f->cpp != rt->cpp ||
+		    (c->format == DRM_CHROME9_DESTINATION_FORMAT_R32F) !=
+		    (request->destination_format ==
+		     DRM_CHROME9_DESTINATION_FORMAT_R32F) ||
 		    c->flags & ~DRM_CHROME9_COLOR_TARGET_TILED ||
 		    (c->flags & DRM_CHROME9_COLOR_TARGET_TILED &&
 		     !(chrome9_engine_capabilities2() &
