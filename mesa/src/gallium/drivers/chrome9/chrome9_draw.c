@@ -432,8 +432,18 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
          crender->layout_valid &= color0 >= 0;
       }
       for (unsigned i = 0; i < crender->varying_count; i++) {
-         generic[i] = draw_find_shader_output(crender->ctx->draw,
-                                               TGSI_SEMANTIC_GENERIC, i);
+         const unsigned slot = crender->ctx->fs->varying_slot[i];
+
+         /* The draw module names TEXn TEXCOORD n and VARn GENERIC n. */
+         if (slot >= VARYING_SLOT_VAR0)
+            generic[i] = draw_find_shader_output(crender->ctx->draw,
+               TGSI_SEMANTIC_GENERIC, slot - VARYING_SLOT_VAR0);
+         else if (slot >= VARYING_SLOT_TEX0)
+            generic[i] = draw_find_shader_output(crender->ctx->draw,
+               TGSI_SEMANTIC_TEXCOORD, slot - VARYING_SLOT_TEX0);
+         else
+            generic[i] = draw_find_shader_output(crender->ctx->draw,
+                                                  TGSI_SEMANTIC_GENERIC, i);
          if (generic[i] < 0)
             generic[i] = draw_find_shader_output(crender->ctx->draw,
                                                   TGSI_SEMANTIC_TEXCOORD, i);

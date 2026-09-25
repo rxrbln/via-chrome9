@@ -129,6 +129,9 @@ struct chrome9_tcl_variant {
    uint8_t point_size;
    bool unkeyed;
    uint32_t key[CHROME9_TCL_MAX_KEY];
+   /* Fragment varying slots (chrome9_shader::varying_slot), all zero
+    * without a fragment map. */
+   uint8_t varying_slot[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
    struct chrome9_tcl_program program;
 };
 
@@ -150,6 +153,7 @@ bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
                          unsigned key_count, const uint16_t *key_dword,
                          const uint32_t *key_value,
                          const struct chrome9_tcl_flow *flow,
+                         const uint8_t *varying_slot,
                          struct chrome9_tcl_program *program);
 /* chrome9_tcl_compile() point forms: rounded PSIZ output, centre clip. */
 #define CHROME9_TCL_POINT_SIZE 1u

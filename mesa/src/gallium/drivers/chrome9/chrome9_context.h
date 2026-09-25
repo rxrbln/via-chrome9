@@ -111,6 +111,9 @@ struct chrome9_shader {
    struct chrome9_tcl_shader *tcl;
    /* NIR before hardware-only lowering, kept for the llvmpipe fallback. */
    struct nir_shader *sw_nir;
+   /* Fragment shaders: the TEX or VAR varying slot of fragment varying n,
+    * zero when unused (chrome9_fs_assign_varyings). */
+   uint8_t varying_slot[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
    /* Fragment samplers read by shadow TEX; variants lower the compare. */
    uint32_t shadow_sampler_mask;
    struct chrome9_fs_variant *variants;

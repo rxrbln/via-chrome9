@@ -6862,6 +6862,57 @@ chrome9_debug_mark_fs(nir_shader *nir, unsigned index)
    }
 }
 
+/* Fragment varying n reads TEXn or VARn.  A VARn read beside TEXn moves
+ * to a free index k: the NIR input becomes VARk and varying_slot[k] keeps
+ * the VARn the vertex stage writes. */
+static void
+chrome9_fs_assign_varyings(struct chrome9_shader *shader, nir_shader *nir)
+{
+   const uint64_t read = nir->info.inputs_read;
+   uint8_t used = 0, move[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 0 };
+   bool moved = false;
+
+   memset(shader->varying_slot, 0, sizeof(shader->varying_slot));
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++) {
+      if (read & BITFIELD64_BIT(VARYING_SLOT_TEX0 + n)) {
+         shader->varying_slot[n] = VARYING_SLOT_TEX0 + n;
+         used |= BITFIELD_BIT(n);
+      } else if (read & BITFIELD64_BIT(VARYING_SLOT_VAR0 + n)) {
+         shader->varying_slot[n] = VARYING_SLOT_VAR0 + n;
+         used |= BITFIELD_BIT(n);
+      }
+   }
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++) {
+      unsigned k;
+
+      if (!(read & BITFIELD64_BIT(VARYING_SLOT_TEX0 + n)) ||
+          !(read & BITFIELD64_BIT(VARYING_SLOT_VAR0 + n)) ||
+          nir->info.io_lowered)
+         continue;
+      k = ffs(~used & BITFIELD_MASK(DRM_CHROME9_FRAGMENT_MAX_VARYINGS));
+      if (!k)
+         break;
+      k--;
+      shader->varying_slot[k] = VARYING_SLOT_VAR0 + n;
+      used |= BITFIELD_BIT(k);
+      move[n] = VARYING_SLOT_VAR0 + k;
+      moved = true;
+   }
+   if (!moved)
+      return;
+   /* The llvmpipe fallback links by the original slots. */
+   if (chrome9_sw_enabled() && !shader->sw_nir)
+      shader->sw_nir = nir_shader_clone(NULL, nir);
+   nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.location >= VARYING_SLOT_VAR0 &&
+          var->data.location < VARYING_SLOT_VAR0 +
+                               DRM_CHROME9_FRAGMENT_MAX_VARYINGS &&
+          move[var->data.location - VARYING_SLOT_VAR0])
+         var->data.location = move[var->data.location - VARYING_SLOT_VAR0];
+   }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
 static void *
 chrome9_create_fs_state(struct pipe_context *pipe,
                         const struct pipe_shader_state *state)
@@ -6888,6 +6939,7 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       }
       shader->shadow_sampler_mask =
          chrome9_nir_shadow_sampler_mask(state->ir.nir);
+      chrome9_fs_assign_varyings(shader, state->ir.nir);
       shader->nir = state->ir.nir;
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);

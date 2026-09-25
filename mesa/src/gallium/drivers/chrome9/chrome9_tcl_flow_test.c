@@ -350,7 +350,7 @@ check(const char *name, enum shape shape, const struct chrome9_tcl_flow *flow,
    int failures = 0;
 
    chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
-                       NULL, NULL, flow, p);
+                       NULL, NULL, flow, NULL, p);
    if (p->supported != expect_supported || (p->supported &&
        (p->rep_count != expect_reps || p->bool_count != expect_bools))) {
       fprintf(stderr, "%s: supported %d reps %u bools %u\n", name,
@@ -437,9 +437,9 @@ same_program(enum shape shape, const struct chrome9_tcl_flow *a,
    int failed;
 
    chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
-                       NULL, NULL, a, &p[0]);
+                       NULL, NULL, a, NULL, &p[0]);
    chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
-                       NULL, NULL, b, &p[1]);
+                       NULL, NULL, b, NULL, &p[1]);
    failed = !p[0].supported || !p[1].supported ||
             p[0].instruction_count != p[1].instruction_count ||
             memcmp(p[0].instructions, p[1].instructions,
@@ -628,7 +628,7 @@ check_relative(const char *name, enum relative_shape shape,
    int failures = 0;
 
    chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
-                       NULL, NULL, flow, p);
+                       NULL, NULL, flow, NULL, p);
    for (unsigned i = 0; i < p->instruction_count; i++)
       arls += p->instructions[i].op == DRM_CHROME9_VERTEX_OP_ARL;
    if (p->supported != expect_supported ||
@@ -792,7 +792,7 @@ check_temp_array(const struct chrome9_tcl_flow *flow)
    int failures = 0;
 
    chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
-                       NULL, NULL, flow, p);
+                       NULL, NULL, flow, NULL, p);
    if (p->supported) {
       fprintf(stderr, "temp array: unkeyed program fits %u instructions\n",
               p->instruction_count);
@@ -814,7 +814,7 @@ check_temp_array(const struct chrome9_tcl_flow *flow)
 
       memcpy(key, cb[0], sizeof(key));
       chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false,
-                          ARRAY_SIZE(key), key_dword, key, flow, p);
+                          ARRAY_SIZE(key), key_dword, key, flow, NULL, p);
       if (!p->supported ||
           !chrome9_tcl_flow_constants(p, (const uint8_t *)cb, sizeof(cb),
                                       &m.bools, ints)) {
