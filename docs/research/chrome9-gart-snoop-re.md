@@ -347,3 +347,42 @@ load.
   `+0x40 == 1` (**U**).
 * The reason for the `SR3B <= 2` WBINVD in the Windows KMD (**U**).
 * Whether `D1F0 Rx78[11]` has any effect on the internal SF client (**U**).
+
+## 8. Silicon results (2026-09-26)
+
+Kernel `9035916` (ladder `c721acc`, T6 `9035916`), loaded with
+`selftest_snoop=1`, then `selftest_snoop_soak=20000
+selftest_snoop_soak_ms=6000`, then `gart_snoop_ring=1` (plus
+`fe33_fence=1 hw_tcl=1`).  Evidence **D**.  cpuidle driver: none (no deep
+C-states in use); 2 CPUs; test pages dma32 direct (no SWIOTLB).  The
+section 6.0 capture is in `~/tmp/snoop/capture-6.0.txt`.
+
+Ladder (2D COPY_RECT job per step, 64 lines of 64 bytes, test CPU 0):
+
+```
+T5 soak bit25: iterations=1000/1000 in 236 ms, load-cpus=1, lines=64000 stale T1=0 T2=0 T3=0 pass
+T1-P cpu-write/gpu-read plain cpu=0 attempts=1: fresh=0 stale=64 corrupt=0 detector ok
+T1-S cpu-write/gpu-read bit25 cpu=0: fresh=64 stale=0 corrupt=0 pass
+T1-X cross-core bit25 cpu=0 store-cpu=1: fresh=64 stale=0 corrupt=0 pass
+T2-P gpu-write/cpu-read plain: cached fresh=0 stale=64 corrupt=0, flushed fresh=64 stale=0 corrupt=0 detector ok
+T2-S gpu-write/cpu-read bit25: cached fresh=64 stale=0 corrupt=0, flushed fresh=64 stale=0 corrupt=0 pass
+T3-S gpu-write over cpu-dirty bit25: cached fresh=64 stale=0 corrupt=0, flushed fresh=64 stale=0 corrupt=0 pass
+T4-S partial-line merge bit25: cached fresh=64 stale=0 corrupt=0, flushed fresh=64 stale=0 corrupt=0 pass
+T5 soak bit25: iterations=20000/20000 in 4697 ms, load-cpus=1, lines=1280000 stale T1=0 T2=0 T3=0 pass
+```
+
+* The detector controls work: plain PTEs show all 64 lines stale for a CPU
+  write read by the GPU (T1-P) and for a GPU write read through the cached
+  CPU mapping (T2-P).
+* Bit 25 is coherent for the 2D engine client in both directions on
+  revision 3, across both cores, over dirty CPU lines (no write-back over
+  GPU data) and for partial-line merges; the 20000-iteration soak (1.28 M
+  lines, other core streaming memcpy) saw no stale line.
+  Verdict: `COHERENT (T1-S T1-X T2-S T3-S T4-S T5 pass)`.
+* T6 (`gart_snoop_ring=1`: ring and index arena with bit 25, no per-append
+  CLFLUSH) ran glmark2 (score 117) and ioquake3 (GL1 60.7, GL2 43.2 fps)
+  without fence timeouts, equal to the default within noise.  CPU cache
+  maintenance is 0.67 % of the ioquake3 opengl2 profile, so bit 25 for more
+  object classes would not pay; T6 stays default off.  Not covered: the 3D
+  texture and render clients (only the 2D engine and, in T6, the command
+  reader were exercised).
