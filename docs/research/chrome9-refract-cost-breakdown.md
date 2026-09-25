@@ -85,3 +85,23 @@ clears, mipmaps and presentation.  The remaining hardware lever is coarse-Z
 rejection and Fast-Z clear
 ([chrome9-fastz-coarsez-boundary.md](chrome9-fastz-coarsez-boundary.md)),
 whose metadata allocation and lifetime are still being reverse engineered.
+
+## Update 2026-09-25 evening
+
+Refract now takes 78 ms (12.8 fps) at 800x600: tiled colour/depth, the
+LOG2/MUL/EXP2 `pow(x, 100.0)` (main pass 60 -> 55 records) and the 4 MiB
+command ring (kernel; ring wraps per frame 1 -> 0.11).  The frame is GPU
+bound: only about 35 % CPU busy, and after the ring change the submitter
+waits on the full 8-job queue about 7 times per frame.
+
+| measurement | result |
+|---|---|
+| every fragment program replaced by a constant (`CHROME9_DEBUG_FS_MARK=id`) | 53.7 ms |
+| `glGenerateMipmap` of the 1600x1200 target alone (`~/tmp/mipb`) | 3.9 ms (clear 2.5 ms) |
+| 400x300 / 200x150 canvas | 44.4 / 29.6 ms |
+| coarse-Z on | 82.6 ms (no gain) |
+| GPU present copy (`CHROME9_GPU_PUBLISH=1`) | 79.5 ms (no gain) |
+
+The fragment programs cost about 25 ms; geometry (two 69k-triangle
+passes), the 1600x1200 depth pass and the clears take the rest.
+

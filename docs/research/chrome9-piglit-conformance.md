@@ -157,3 +157,27 @@ Known remaining indexing failure:
 Hardware limit:
 - `gl_lightsource_indirect`. Indexing `gl_LightSource` in a fragment
   shader needs more than the 32 fragment constant rows.
+
+## 2026-09-25 evening: remaining indexing and projected-texture failures
+
+* `vs-varying-array-mat2-index-col-row-wr` (GLSL 1.10 and 1.20): the
+  dynamic column/row write becomes about 40 scalar selects, each of them a
+  four-record sequence whose result stays live in one lane of its own temp.
+  The kernel maps every temp to one of 16 physical registers for its whole
+  live range and returned -E2BIG (21 live temps).  Mesa now repacks lane
+  values into shared temps before submission (`tcl_pack_temp_lanes`): lanes
+  written by one instruction or read by one source stay together, a lane is
+  written once (the kernel rejects redefinitions), groups go into live
+  temps whose remaining lifetime matches theirs.  21 -> 11 live temps; the
+  packed program passes the kernel lane rules and interprets identically to
+  the original on random inputs (`~/tmp/tclpack/{pack.c,val.py,sim.py}`).
+  Only programs with 12 or more live temps are repacked.
+* `texwrap 2d proj` and `proj bordercolor`: the fragment program assumed the
+  projector q == 1 and the per-draw domain check rejected the whole draw, so
+  nothing was drawn.  A draw that leaves the proven domain now renders in
+  llvmpipe; nothing of it was submitted to the hardware.
+* `s3tc-*_gles2`: the binaries are not in the piglit build on the target
+  (harness, not driver).
+* `gl-2.0-large-point-fs` failed after any point sprite test: A2F (sprite
+  enables per coordinate) was written only for sprite draws.  Kernel
+  `7d077a9` writes it for every draw.

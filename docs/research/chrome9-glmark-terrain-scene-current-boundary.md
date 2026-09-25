@@ -40,6 +40,37 @@ need the post-processing chain well below 66 ms.
 With MAD fusion (Mesa, `chrome9_nir_optimize_semantic`) the records drop
 to: main 85 -> 72, tilt 64 -> 55, bloom 34 -> 30, normal map 26 -> 23.
 
+## Vertex texture prefetch on hardware TCL (2026-09-25 evening)
+
+The main draw no longer runs its vertex shader on the CPU.  A VS `tex`/`txl`
+at LOD 0 whose coordinate is a vertex attribute becomes an extra FLOAT4
+input (`tcl_tex`); before the draw the CPU samples it with the same filter,
+wrap and swizzle arithmetic as the draw module's sampler
+(`chrome9_vs_texture_sample_array`, direct path for 8-bit RGBA/BGRA at the
+base level).  The terrain's 393216 non-indexed vertices hold 66049 distinct
+vertices: a cached compaction (`tcl_compact_get`, rebuilt when the buffers
+change) stores them once in a vertex buffer and draws indices into it, so
+2 x 66049 lookups are sampled per frame into a ring of three vertex
+buffers.  A displaced-grid probe (`~/tmp/vtf`) matches the draw module and
+llvmpipe within 2 LSB without folds; with folded geometry the hardware
+differs from both by about as much as they differ from each other.
+
+With the fragment compiler changes of the same day (literal 0/1 vector
+lanes as ZERO/ONE selectors, per-tap blur offsets fused into one MAD:
+tilt-shift 53 -> 29 records, bloom 28 -> 16, normal map 21 -> 17):
+
+| step | frame (800x600) |
+|---|---|
+| start of the day | 362 ms |
+| + FS selector/MAD folds | 330 ms |
+| + prefetch, compaction, buffers | about 250 ms |
+
+The frame is now about 55 % CPU busy.  At 400x300 it takes 153 ms, so about
+100 ms scale with the pixels (main 70-record fragment program, tilt-shift,
+bloom) and the rest is geometry, the llvmpipe noise pass and CPU work that
+waits for GPU results (VS texture staging, CPU mipmaps).  15 fps (66 ms)
+remains out of reach.
+
 ## Result
 
 The default terrain **main** vertex/fragment pair is no longer rejected by
