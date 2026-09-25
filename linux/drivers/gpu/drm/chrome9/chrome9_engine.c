@@ -231,6 +231,12 @@ module_param_named(blend_color, chrome9_blend_color, bool, 0600);
 MODULE_PARM_DESC(blend_color,
 	"Constant colour and alpha blend factors (default: true)");
 
+static bool chrome9_destination_offset = true;
+module_param_named(destination_offset, chrome9_destination_offset, bool,
+		   0600);
+MODULE_PARM_DESC(destination_offset,
+	"Fragment draws into mip levels of an extended destination (default: true)");
+
 static bool chrome9_vs_flow = true;
 module_param_named(vs_flow, chrome9_vs_flow, bool, 0400);
 MODULE_PARM_DESC(vs_flow,
@@ -626,6 +632,8 @@ struct chrome9_draw_request {
 	u32 width;
 	u32 height;
 	u32 pitch;
+	/* Fragment programs: byte offset of pixel (0, 0) in the destination. */
+	u32 destination_offset;
 	u64 object_size;
 	u32 depth_pitch;
 	u64 depth_object_size;
@@ -6547,6 +6555,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_BLEND_COLOR;
 	if (READ_ONCE(chrome9_texture_bias))
 		caps |= DRM_CHROME9_CAP2_TEXTURE_BIAS;
+	if (READ_ONCE(chrome9_destination_offset))
+		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_flow))
 		caps |= DRM_CHROME9_CAP2_VERTEX_STATIC_FLOW;
 	if (READ_ONCE(chrome9_hw_tcl) && READ_ONCE(chrome9_vs_relative))
@@ -7843,7 +7853,7 @@ static bool chrome9_fragment_destination_size_valid(u64 actual, u64 required,
 	if (!extended)
 		return actual == required;
 
-	return actual > required && IS_ALIGNED(actual, PAGE_SIZE);
+	return actual >= required && IS_ALIGNED(actual, PAGE_SIZE);
 }
 
 enum chrome9_fragment_object_kind {
@@ -8528,6 +8538,18 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			goto out_put_objects;
 		}
 		for (t = 0; t < req->fragment_texture_count; t++) {
+			/* Sampling the destination outside its written rows
+			 * (checked in prepare) uses its object. */
+			if (req->fragment_textures[t].handle ==
+			    req->destination_handle) {
+				if (!objects[0] || objects[0]->size !=
+				    req->fragment_texture_size[t]) {
+					ret = -EINVAL;
+					goto out_put_objects;
+				}
+				sub->draw[r].texture_object[t] = 0;
+				continue;
+			}
 			i = chrome9_fragment_submit_object(file, sub,
 				&object_count, req->fragment_textures[t].handle,
 				CHROME9_OBJECT_TEXTURE,
@@ -8572,6 +8594,11 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			ret = -EINVAL;
 			goto out_put_objects;
 		}
+		/* An extended destination is guarded by its first and last
+		 * page only: the pages after the window hold other images. */
+		if (i == 0 && (request->flags &
+			       DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED))
+			object_sizes[0] = objects[0]->size;
 		mapping_sizes[i] = objects[i]->size;
 		/* Read-only objects may alias each other, never a target. */
 		for (j = 0; j < i; j++)
@@ -8837,7 +8864,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 						[tcl->element_buffer[t]]] +
 					sub->draw[next].element_start[t];
 			ret = chrome9_emit_fragment_draw(req,
-				sub->bases[0] + PAGE_SIZE,
+				sub->bases[0] + req->destination_offset,
 				depth_index == U32_MAX ? 0 :
 				sub->bases[depth_index] + PAGE_SIZE,
 				texture_bases,
@@ -11321,6 +11348,71 @@ static int chrome9_validate_fragment_texture(
 }
 
 /*
+ * A validated 2D texture naming the destination object reaches its base
+ * level and the levels of its whole-level LOD range (A30 clamps both mip
+ * filters); none may overlap destination rows [first_row, last_row).
+ */
+static int chrome9_validate_destination_texture(
+	const struct drm_chrome9_fragment_texture_state *texture,
+	u32 destination_offset, u32 pitch, u32 first_row, u32 last_row)
+{
+	u32 low = texture->first_level + texture->min_lod_s5_5 / 32;
+	u32 high = texture->first_level + texture->max_lod_s5_5 / 32;
+	u64 write_start = destination_offset + (u64)first_row * pitch;
+	u64 write_end = destination_offset + (u64)last_row * pitch;
+	unsigned int i;
+
+	if (texture->target != DRM_CHROME9_FRAGMENT_TARGET_2D ||
+	    chrome9_fragment_texture_block_bytes(texture->format))
+		return -EINVAL;
+	for (i = texture->first_level; i <= texture->last_level; i++) {
+		u64 start = texture->level_offset[i];
+		u64 end = start + (u64)texture->level_pitch[i] *
+			  max(texture->height >> i, 1U);
+
+		if ((i == texture->first_level || (i >= low && i <= high)) &&
+		    start < write_end && write_start < end)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+static int chrome9_destination_texture_selftest(void)
+{
+	/* 64x32 BGRA chain: L0 at 0x1000, L1 at 0x3000, L2 at 0x3800. */
+	struct drm_chrome9_fragment_texture_state texture = {
+		.format = DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888,
+		.width = 64, .height = 32, .last_level = 2,
+		.level_offset = { 0x1000, 0x3000, 0x3800 },
+		.level_pitch = { 256, 128, 64 },
+		.target = DRM_CHROME9_FRAGMENT_TARGET_2D,
+	};
+
+	/* Level 0 only (no LOD range) against a window at level 1. */
+	if (chrome9_validate_destination_texture(&texture, 0x3000, 128, 0, 16))
+		return -EINVAL;
+	/* The base level itself is written. */
+	if (!chrome9_validate_destination_texture(&texture, 0x1000, 256, 0, 32))
+		return -EINVAL;
+	/* LOD 1..2 reaches level 1; only rows after it are free. */
+	texture.min_lod_s5_5 = 32;
+	texture.max_lod_s5_5 = 64;
+	if (!chrome9_validate_destination_texture(&texture, 0x3000, 128, 0, 16) ||
+	    !chrome9_validate_destination_texture(&texture, 0x3000, 128, 3, 4))
+		return -EINVAL;
+	/* LOD 1 alone: level 2 may be written, also from a rounded base. */
+	texture.max_lod_s5_5 = 32;
+	if (chrome9_validate_destination_texture(&texture, 0x3800, 64, 0, 8) ||
+	    chrome9_validate_destination_texture(&texture, 0x3700, 64, 4, 12) ||
+	    !chrome9_validate_destination_texture(&texture, 0x3700, 64, 3, 12))
+		return -EINVAL;
+	texture.target = DRM_CHROME9_FRAGMENT_TARGET_CUBE;
+	if (!chrome9_validate_destination_texture(&texture, 0x3800, 64, 0, 8))
+		return -EINVAL;
+	return 0;
+}
+
+/*
  * Cube and DXT descriptors: vectors from the vendor layout
  * (docs/research/chrome9-next-hw-features.md sections 2.2 and 3.2).
  */
@@ -11736,14 +11828,14 @@ static int chrome9_fragment_texture_selftest(void)
 	int ret;
 
 	/* L0 of a 64x32 BGRA target occupies one 0x2000-byte image span
-	 * between two guard pages.  A mip-capable target has further storage
-	 * after that second guard, and a separate final guard page. */
+	 * between two guard pages.  An extended target may hold further
+	 * images before its final guard page. */
 	if (!chrome9_fragment_destination_size_valid(4 * PAGE_SIZE,
 						      4 * PAGE_SIZE, false) ||
 	    chrome9_fragment_destination_size_valid(6 * PAGE_SIZE,
 						     4 * PAGE_SIZE, false) ||
-	    chrome9_fragment_destination_size_valid(4 * PAGE_SIZE,
-						     4 * PAGE_SIZE, true) ||
+	    !chrome9_fragment_destination_size_valid(4 * PAGE_SIZE,
+						      4 * PAGE_SIZE, true) ||
 	    chrome9_fragment_destination_size_valid(3 * PAGE_SIZE,
 						     4 * PAGE_SIZE, true) ||
 	    !chrome9_fragment_destination_size_valid(6 * PAGE_SIZE,
@@ -11826,7 +11918,8 @@ static int chrome9_fragment_texture_selftest(void)
 	}
 	ret = chrome9_fragment_texture_feature_selftest();
 	return ret ?: chrome9_fragment_texture_3d_selftest() ?:
-		chrome9_fragment_texture_border_selftest();
+		chrome9_fragment_texture_border_selftest() ?:
+		chrome9_destination_texture_selftest();
 }
 
 /*
@@ -12087,6 +12180,7 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	u32 descriptor_mask = 0;
 	bool depth = args->flags & DRM_CHROME9_FRAGMENT_DEPTH;
 	bool blend = args->flags & DRM_CHROME9_FRAGMENT_BLEND;
+	bool extended = args->flags & DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
 	bool sparse_textures = args->abi_version ==
 		DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES;
 	u64 caps2 = chrome9_engine_capabilities2();
@@ -12100,7 +12194,11 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 	if ((args->abi_version != DRM_CHROME9_FRAGMENT_ABI_VERSION &&
 	     !sparse_textures) ||
 	    (sparse_textures && !chrome9_fragment_sparse_textures_enabled()) ||
-	    args->reserved0 || args->pad || args->reserved1 ||
+	    (args->destination_offset &&
+	     (!extended || !(caps2 & DRM_CHROME9_CAP2_DESTINATION_OFFSET) ||
+	      args->destination_offset < PAGE_SIZE ||
+	      !IS_ALIGNED(args->destination_offset, 256))) ||
+	    args->pad || args->reserved1 ||
 	    (!blend && memchr_inv(args->blend_color, 0,
 				  sizeof(args->blend_color))) ||
 	    (!(args->flags & DRM_CHROME9_FRAGMENT_QUERY) && args->query) ||
@@ -12149,10 +12247,13 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 		memcpy(request.blend_color, args->blend_color,
 		       sizeof(request.blend_color));
 	}
+	/* A50 holds the base in 256-byte units (manual, silicon rung). */
+	request.destination_offset = args->destination_offset ?: PAGE_SIZE;
 	if (check_mul_overflow((u64)args->destination_pitch,
 			       (u64)args->height, &surface_size) ||
-	    check_add_overflow(ALIGN(surface_size, PAGE_SIZE),
-			       2ULL * PAGE_SIZE, &request.object_size))
+	    check_add_overflow(ALIGN(request.destination_offset + surface_size,
+				     PAGE_SIZE),
+			       (u64)PAGE_SIZE, &request.object_size))
 		return -E2BIG;
 	total_size = request.object_size;
 	if (depth) {
@@ -12204,6 +12305,22 @@ static int chrome9_fragment_draw_prepare(struct drm_device *drm,
 				caps2, &flags);
 			if (ret)
 				return ret;
+			if (textures[i].handle == args->destination_handle) {
+				bool scissor = args->scissor.flags &
+					       DRM_CHROME9_SCISSOR_ENABLE;
+
+				if (!extended ||
+				    !(caps2 & DRM_CHROME9_CAP2_DESTINATION_OFFSET))
+					return -EINVAL;
+				ret = chrome9_validate_destination_texture(
+					&textures[i], request.destination_offset,
+					args->destination_pitch,
+					scissor ? args->scissor.min_y : 0,
+					scissor ? args->scissor.max_y :
+						  args->height);
+				if (ret)
+					return ret;
+			}
 			request.fragment_texture_units[i] = unit;
 			request.fragment_texture_flags[i] = flags;
 			if (textures[i].target == DRM_CHROME9_FRAGMENT_TARGET_CUBE ||
