@@ -13,8 +13,6 @@ struct chrome9_fragment_program;
 struct chrome9_vertex_flow {
 	/* Maximum REP/IF nesting; zero rejects every flow op. */
 	u32 max_depth;
-	/* RE: IF may test a temporary (rung F3). */
-	bool dynamic;
 	/* ARL and a0-relative constant reads. */
 	bool relative;
 	/* RE: ARL as one bare MOVA, without floor and bounds clamp. */

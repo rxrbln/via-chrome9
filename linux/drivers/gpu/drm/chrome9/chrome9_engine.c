@@ -312,12 +312,7 @@ MODULE_PARM_DESC(vs_flow,
 static uint chrome9_vs_flow_depth = 1;
 module_param_named(vs_flow_depth, chrome9_vs_flow_depth, uint, 0600);
 MODULE_PARM_DESC(vs_flow_depth,
-	"Debug: static flow nesting depth, 1..4 (default: 1, the vendor limit)");
-
-static bool chrome9_vs_flow_dynamic;
-module_param_named(vs_flow_dynamic, chrome9_vs_flow_dynamic, bool, 0600);
-MODULE_PARM_DESC(vs_flow_dynamic,
-	"Debug: IF on a temporary lane, rung F3 (default: false)");
+	"Debug: static flow nesting depth, 1..4; REP never nests (default: 1, the vendor limit)");
 
 static bool chrome9_vs_relative = true;
 module_param_named(vs_relative, chrome9_vs_relative, bool, 0400);
@@ -12527,7 +12522,7 @@ struct chrome9_vertex_key {
 	u32 relative;
 	u8 two_side;
 	u8 point_size;
-	u8 dynamic;
+	u8 reserved;
 	u8 primary_used;
 	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 varying_logical[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
@@ -12642,7 +12637,6 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 	params.two_side = !!(tcl->cull & (DRM_CHROME9_VERTEX_BFC_CW |
 					  DRM_CHROME9_VERTEX_BFC_CCW));
 	params.point_size = tcl->point_size_vertex;
-	params.dynamic = tcl->flow.dynamic;
 	params.relative = tcl->flow.relative | tcl->flow.relative_raw << 1;
 	params.primary_used = fp->primary_used;
 	memcpy(params.input_lanes, tcl->input_lanes, tcl->element_count);
@@ -13431,7 +13425,6 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 	if (READ_ONCE(chrome9_vs_flow)) {
 		tcl->flow.max_depth = clamp(READ_ONCE(chrome9_vs_flow_depth),
 					    1U, 4U);
-		tcl->flow.dynamic = READ_ONCE(chrome9_vs_flow_dynamic);
 	}
 	if (READ_ONCE(chrome9_vs_relative)) {
 		tcl->flow.relative = true;

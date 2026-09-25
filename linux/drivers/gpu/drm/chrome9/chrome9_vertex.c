@@ -171,7 +171,6 @@ struct chrome9_vertex_state {
 	struct chrome9_vertex_frame *frames;
 	u32 max_depth;
 	u32 depth;
-	bool dynamic;
 	bool relative;
 	bool relative_raw;
 	bool arl;
@@ -442,32 +441,25 @@ static int chrome9_vertex_validate_dest(struct chrome9_vertex_state *state,
 	return 0;
 }
 
-/* REP reads i#, IF b# or, with the RE knob, a temporary. */
-static int chrome9_vertex_validate_condition(struct chrome9_vertex_state *state,
-	const struct drm_chrome9_vertex_instruction *insn, u32 instruction)
+/*
+ * REP reads i#, IF b#.  Op 29 with a temporary source tests the b# bit of
+ * the register number, not the value (rung vsdyn), so there is no dynamic IF.
+ */
+static int chrome9_vertex_validate_condition(const struct drm_chrome9_vertex_instruction *insn)
 {
 	const struct drm_chrome9_vertex_source *src = &insn->src[0];
 	u8 file = insn->op == DRM_CHROME9_VERTEX_OP_REP ?
 		  DRM_CHROME9_VERTEX_FILE_INT : DRM_CHROME9_VERTEX_FILE_BOOL;
 	unsigned int lane;
 
-	if (src->modifier || src->relative)
+	if (src->modifier || src->relative || src->file != file)
 		return CHROME9_EINVAL;
-	if (src->file == file) {
-		for (lane = 0; lane < 4; lane++)
-			if (src->swizzle[lane] != lane)
-				return CHROME9_EINVAL;
-		return src->index < (file == DRM_CHROME9_VERTEX_FILE_INT ?
-				     DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS :
-				     DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS) ?
-		       0 : -EINVAL;
-	}
-	/* The lane op 29 tests is unknown; the knob passes the swizzle. */
-	if (insn->op != DRM_CHROME9_VERTEX_OP_IF || !state->dynamic ||
-	    src->file != DRM_CHROME9_VERTEX_FILE_TEMP ||
-	    !chrome9_vertex_selected(insn, 0))
-		return CHROME9_EINVAL;
-	return chrome9_vertex_validate_source(state, insn, 0, instruction);
+	for (lane = 0; lane < 4; lane++)
+		if (src->swizzle[lane] != lane)
+			return CHROME9_EINVAL;
+	return src->index < (file == DRM_CHROME9_VERTEX_FILE_INT ?
+			     DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS :
+			     DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS) ? 0 : -EINVAL;
 }
 
 static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
@@ -487,7 +479,12 @@ static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 	if (opens) {
 		if (state->depth == state->max_depth)
 			return CHROME9_EINVAL;
-		ret = chrome9_vertex_validate_condition(state, insn, instruction);
+		/* One loop counter: an inner REP ends the outer loop (rung vsnest). */
+		for (t = 0; insn->op == DRM_CHROME9_VERTEX_OP_REP &&
+			    t < state->depth; t++)
+			if (state->frames[t].op == DRM_CHROME9_VERTEX_OP_REP)
+				return CHROME9_EINVAL;
+		ret = chrome9_vertex_validate_condition(insn);
 		if (ret)
 			return ret;
 		frame = &state->frames[state->depth++];
@@ -931,10 +928,8 @@ static int chrome9_vertex_encode_flow(struct chrome9_vertex_state *state,
 				    CHROME9_VS_INT_SELECT;
 			record[3] = CHROME9_VS_NATIVE_LOOP << 17;
 		} else {
-			record[0] = src->file == DRM_CHROME9_VERTEX_FILE_BOOL ?
-				(CHROME9_VS_UNIFIED_BOOL + src->index) << 14 |
-				CHROME9_VS_IDENTITY :
-				chrome9_vertex_source_word(state, insn, 0, false);
+			record[0] = (CHROME9_VS_UNIFIED_BOOL + src->index) << 14 |
+				    CHROME9_VS_IDENTITY;
 			record[3] = CHROME9_VS_NATIVE_BRANCH << 17;
 		}
 		record[1] = CHROME9_VS_FLOW_TAKEN | 1 << 10;
@@ -1050,7 +1045,6 @@ int chrome9_vertex_compile(
 	if (flow && flow->max_depth) {
 		state->max_depth = min(flow->max_depth,
 				       CHROME9_VERTEX_MAX_FLOW_DEPTH);
-		state->dynamic = flow->dynamic;
 		state->frames = kcalloc(state->max_depth,
 					sizeof(*state->frames), GFP_KERNEL);
 		if (!state->frames) {
@@ -1766,7 +1760,7 @@ static const struct drm_chrome9_vertex_instruction rep_carry_insn[] = {
 	VS_F(ENDREP),
 	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
 };
-/* RE rung F3 form: IF on r0.x. */
+/* Op 29 on r0 tests b0, not r0 (rung vsdyn): rejected. */
 static const struct drm_chrome9_vertex_instruction if_temp_insn[] = {
 	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
 	VS_I(MOV, VS_T(1), VS_R(CONSTANT, 0)),
@@ -1774,6 +1768,16 @@ static const struct drm_chrome9_vertex_instruction if_temp_insn[] = {
 	VS_I(ADD, VS_T(1), VS_R(TEMP, 1), VS_R(CONSTANT, 1)),
 	VS_F(ENDIF),
 	VS_I(MOV, VS_POS, VS_R(TEMP, 1)),
+};
+/* One loop counter: the inner REP ends the outer loop (rung vsnest). */
+static const struct drm_chrome9_vertex_instruction rep_rep_insn[] = {
+	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
+	VS_F(REP, VS_R(INT, 0)),
+	VS_F(REP, VS_R(INT, 1)),
+	VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0)),
+	VS_F(ENDREP),
+	VS_F(ENDREP),
+	VS_I(MOV, VS_POS, VS_R(TEMP, 0)),
 };
 static const struct drm_chrome9_vertex_instruction nested_insn[] = {
 	VS_I(MOV, VS_T(0), VS_R(INPUT, 0)),
@@ -1876,12 +1880,8 @@ static int chrome9_vertex_flow_expect(const struct chrome9_vertex_program *progr
 static int chrome9_vertex_flow_selftest(struct chrome9_fragment_program *fragment,
 					struct chrome9_vertex_program *program)
 {
-	static const struct chrome9_vertex_flow depth1 = { 1, false };
-	static const struct chrome9_vertex_flow depth2 = { 2, false };
-	static const struct chrome9_vertex_flow dynamic = { 1, true };
-	static const u32 if_temp_rec[4] = {
-		0x00100000, 0x00280400, 0x00300800, 0x003a0000,
-	};
+	static const struct chrome9_vertex_flow depth1 = { 1 };
+	static const struct chrome9_vertex_flow depth2 = { 2 };
 
 	memset(fragment, 0, sizeof(*fragment));
 	if (VS_FLOW(if_b0_insn, &depth1, 1) ||
@@ -1903,9 +1903,8 @@ static int chrome9_vertex_flow_selftest(struct chrome9_fragment_program *fragmen
 	    program->records[3][0] != 0x0010014c ||
 	    program->records[3][3] != 0x0004012f)
 		return -EIO;
-	if (VS_FLOW(if_temp_insn, &depth1, 2) != -EINVAL ||
-	    VS_FLOW(if_temp_insn, &dynamic, 2) ||
-	    memcmp(program->records[2], if_temp_rec, sizeof(if_temp_rec)))
+	if (VS_FLOW(if_temp_insn, &depth2, 2) != -EINVAL ||
+	    VS_FLOW(rep_rep_insn, &depth2, 2) != -EINVAL)
 		return -EIO;
 	if (VS_FLOW(nested_insn, &depth1, 2) != -EINVAL ||
 	    VS_FLOW(nested_insn, &depth2, 2) ||
