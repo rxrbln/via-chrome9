@@ -46,6 +46,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | pixel-shader depth output (DEST_DEPTH directly before the colour write, A8A 8a820000), on by default | `42677af`, `2440737` / Mesa `7146ff9`, CAP2 bit 26 | `fd` probe, piglit fragdepth tests (`chrome9-depth-output-audit.md`) |
 | NaN primitive drop per draw (stage B B14) | `fd0f932` | raster self-test, `nan` probe |
 | tiled depth (A12 bit 0) and tiled colour targets and textures (A51 bit 23, A22 bit 17), on by default, no linear fallback | `a9dfc98`, `fe20655` / Mesa `9a62ef4`, `6db49ba`, CAP2 bits 27/28 | rungs `tile`, `tileperf`; piglit texture/depth subsets unchanged (`chrome9-tiling-re.md`) |
+| local frame buffer (SL) placement of depth buffers and render targets: GEM_CREATE_LOCAL objects in an SL pool (16 MiB up to the occlusion page), CPU mapping write-combined through BAR2, engine location code 00 in A51, A11, A29, A18 and the level entries; resources the CPU reads are moved to GART pages once | kernel GEM_CREATE_LOCAL, CAP2 bit 29 / Mesa `chrome9_resource_local`, `chrome9_context_demote_local` | refract 78.0 -> 64.1 ms (15.6 fps), glmark2 113; fd, sprite, blur and VS texture probes identical with and without |
 | lower-left point sprite origin (FS variant flips t, draw module gets the upper-left rasterizer) | Mesa `2e5c349` | `sprite` probe: both origins, window and FBO, equal to llvmpipe, no TCL fallback; piglit point sprite subset |
 
 ## Emulated or falling back
@@ -67,7 +68,6 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 |---|---|
 | stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes) | open (B14 done); B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
 | per-segment state cache | patch ready (default off), rungs R2/R3 |
-| render targets in local frame buffer memory | not started: needs an SL allocator, per-BO domain, WC mapping and extent checks; ladder in `chrome9-local-fb-placement.md` |
 
 ## Texture sampler: border, GL_CLAMP, mirror once, 1D, shadow, LOD limits
 

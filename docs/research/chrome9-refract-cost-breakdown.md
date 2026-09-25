@@ -105,3 +105,15 @@ waits on the full 8-job queue about 7 times per frame.
 The fragment programs cost about 25 ms; geometry (two 69k-triangle
 passes), the 1600x1200 depth pass and the clears take the rest.
 
+## Local frame buffer placement: 64 ms (15.6 fps)
+
+The depth-tested fill is bandwidth bound in GART pages.  With the debug
+knob `vram_target_test` colour writes to SL took the frame from 77.7 to
+72.2 ms, and depth in SL (a temporary knob) to 63.9 ms.  The real
+implementation (kernel GEM_CREATE_LOCAL, Mesa local placement of private
+depth buffers and render targets) gives 64.1 ms.  The SL range is
+uncacheable for the CPU (MTRR UC over 0xd0000000..0xdfffffff), so CPU
+readers see uncached reads: VS texture prefetch and llvmpipe fallback
+draws move their resources to GART pages once (terrain would otherwise
+lose 259 -> 345 ms).
+
