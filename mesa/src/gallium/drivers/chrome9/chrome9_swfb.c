@@ -435,6 +435,35 @@ chrome9_sw_scalarize_derivs(nir_shader *nir)
                               nir_metadata_control_flow, NULL);
 }
 
+/* The chrome9 lowering treats integers as floats and leaves integer
+ * texture queries untouched; llvmpipe returns them as integers. */
+static bool
+chrome9_sw_float_query_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   nir_tex_instr *tex;
+   nir_def *value;
+
+   (void)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   tex = nir_instr_as_tex(instr);
+   if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float)
+      return false;
+   b->cursor = nir_after_instr(instr);
+   value = nir_i2f32(b, &tex->def);
+   nir_def_rewrite_uses_after(&tex->def, value);
+   return true;
+}
+
+static void
+chrome9_sw_float_queries(nir_shader *nir)
+{
+   if (!nir->options->no_integers)
+      return;
+   nir_shader_instructions_pass(nir, chrome9_sw_float_query_instr,
+                                nir_metadata_control_flow, NULL);
+}
+
 static void *
 chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
                   enum chrome9_sw_kind kind, const void *state)
@@ -479,6 +508,7 @@ chrome9_sw_object(struct chrome9_sw_context *sw, const void *key,
        * native 1-bit booleans; gallivm's no_integers path cannot take
        * those, so compile under llvmpipe's own options. */
       if (shader.ir.nir) {
+         chrome9_sw_float_queries(shader.ir.nir);
          shader.ir.nir->options =
             sw->screen->nir_options[kind == CHROME9_SW_VS ?
                                     MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT];
