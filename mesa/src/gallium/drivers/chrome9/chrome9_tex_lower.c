@@ -160,6 +160,46 @@ chrome9_shadow_key(const struct pipe_sampler_state *sampler,
           (swizzle[3] & 7) << 12;
 }
 
+/*
+ * The sampler returns D24 as raw / 2^24, GL defines raw / (2^24 - 1)
+ * (chrome9-shadow-compare-re.md).  Project and clamp the reference like GL,
+ * then scale it onto the sampler's grid so equal depths compare equal.
+ */
+static bool
+chrome9_prepare_shadow_reference(nir_builder *b, nir_tex_instr *tex,
+                                 void *data)
+{
+   nir_def *coord, *ref, *proj;
+
+   (void)data;
+   if (!tex->is_shadow ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb &&
+        tex->op != nir_texop_txl && tex->op != nir_texop_txd))
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   ref = nir_steal_tex_src(tex, nir_tex_src_comparator);
+   if (!ref)
+      return false;
+   proj = nir_steal_tex_src(tex, nir_tex_src_projector);
+   if (proj) {
+      nir_def *rcp = nir_frcp(b, proj);
+      nir_def *c[4];
+
+      coord = nir_steal_tex_src(tex, nir_tex_src_coord);
+      for (unsigned i = 0; i < coord->num_components; i++) {
+         c[i] = nir_channel(b, coord, i);
+         if (!tex->is_array || i + 1 < coord->num_components)
+            c[i] = nir_fmul(b, c[i], rcp);
+      }
+      nir_tex_instr_add_src(tex, nir_tex_src_coord,
+                            nir_vec(b, c, coord->num_components));
+      ref = nir_fmul(b, ref, rcp);
+   }
+   ref = nir_fmul_imm(b, nir_fsat(b, ref), 16777215.0 / 16777216.0);
+   nir_tex_instr_add_src(tex, nir_tex_src_comparator, ref);
+   return true;
+}
+
 bool
 chrome9_nir_lower_shadow(nir_shader *nir, unsigned count,
                          const uint16_t *keys)
@@ -179,8 +219,10 @@ chrome9_nir_lower_shadow(nir_shader *nir, unsigned count,
          .swizzle_a = keys[i] >> 12 & 7,
       };
    }
-   /* The sampler returns unsigned normalized depth: saturate the reference. */
+   NIR_PASS(progress, nir, nir_shader_tex_pass,
+            chrome9_prepare_shadow_reference, nir_metadata_control_flow,
+            NULL);
    NIR_PASS(progress, nir, nir_lower_tex_shadow, count, funcs, swizzles,
-            true);
+            false);
    return progress;
 }
