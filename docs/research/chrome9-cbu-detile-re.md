@@ -454,28 +454,106 @@ each step the xxh64 of the last 68 KiB of SL (occlusion page and GART
 table); the window is disabled before the check, and all touched windows
 are restored from the C0 snapshot at the end.
 
-## 10. Silicon results
+## 10. Silicon results, 2026-09-25
 
-Kernel build, module Build ID and parameters: _pending_.
+Kernel `c38d0a7` (the ladder only), module k131-cbu, one load per step,
+no lock-up, no guard or GART hash change.
 
 | step | result | dmesg summary |
 |---|---|---|
-| C0 | | windows: ; routing: |
-| C1 | | readback masks ctl / base / end / recip / pitch / hw: |
-| C2 | | |
-| C3a | | |
-| C3b | | |
-| C3c | | per case: match / untranslated / other, time |
-| C4 | | dword / byte-word / qword / WC / 100x61 / RGB565 |
-| C5 | | base-16: ; end: ; beyond width: tiled / untranslated / other |
-| C6 | | 16 bpp: ; 8 bpp: |
-| C9 | | |
-| C10 | | MB/s: raw+detile read, window read, window write UC/WC, tile+raw write UC/WC |
-| C8 | | 32x16 matches / 32x8 matches |
+| C0 | pass | all 16 windows, every field `0`; `D0F0.B0=db D0F2.9E=cc D0F3.A0=ed00 D1F0.B0=01 B2=40 B9=00 SR42=30: SL via GFXCTL 1, DFA 0, NB tile windows 0` |
+| C1 | pass | masks ctl `000000fe` (bit 0 not tested), base `1ffffff0`, end `3ffffff0`, recip/pitch/hw `ffffffff`; `1234567f/2345678f` read `12345670/23456780` |
+| C2 | pass | control `05` on a 64x64 linear surface: 4096/4096 dwords unchanged |
+| C3a | mismatch | 256x64 BGRA, pixel pitch: 128/16384 match, **untranslated 16256**, other 0 |
+| C3b | mismatch | same with column pitch: identical counts, ladder stopped |
 
-Decisions to record: pitch unit (A/B), `end` exclusive or inclusive,
-width clipping, byte-model equivalence of the bpp field, bit 7 mapping,
-and whether the window pays off against `chrome9_tiled_copy` (C10).
+Findings:
+
+* **D:** every field latches with the documented widths: base `[28:4]`,
+  end `[29:4]`, reciprocal, pitch and size all 32 bits.  The manual note
+  (l.6133) that base/end `[28:16]` and the reciprocal read 0 does not
+  apply to VX900.  C1 did not test control bit 0; step R logs it.
+* **D:** with the window enabled, every CPU read of BAR2 returns the raw
+  dword at its own offset.  The 128 "matching" dwords are exactly those
+  whose tiled and linear offsets coincide: `992 r = 224 c`, i.e. row
+  `8k` at tile column 0 and row `8k+7` at column 31, 8 dwords each, in
+  8 bands.  The window has no effect for either pitch unit, so neither
+  the pitch encoding nor the reciprocal is the cause.
+* C2's identity pass therefore proves nothing about the window: an
+  inactive window gives the same result.
+
+## 12. Why the window does not translate, and the next probe
+
+Candidates, in order of evidence:
+
+1. **The CBU sees only the direct-access (DFA) path (S, M, I).**
+   * SPM D0F2 Rx9E[1] "Tile Mode Address Windows Support": under DFA the
+     DFA range "can be divided into several (16) windows", and cycles in a
+     window with the "tile mode accessible" attribute go to GFXCTL, all
+     others straight to DRAM.  16 is the CBU window count.
+   * `via_drv.so` `ProbeRotateCaps` (`drv:0x7ffe0`) keeps the rotation
+     option only if `IsSupportDirectAccessWindow(chip)` (table
+     `drv:0x8b6a4`, 1 for chip indices 2 and 4..8).  It selects the CBU
+     path (`[pVia+0x510] = 1`) only if the chip has no 2D rotation engine
+     (table `drv:0x8b6c0`, 1 for indices 2 and 6..8).  Which index
+     VX900 has was not traced.  If it is 6..8, the X driver rotates
+     through the 2D engine on VX900, and the "vendor-exercised CBU use" of
+     section 2 does not exist on this chip.
+   * The BIOS programmed the DFA base D0F3 RxA1:A0 to exactly BAR2
+     (`0xd0000000`, 256 MiB) but left DFA off (D1F0 RxB9 = 00) and
+     Rx9E[1] = 0.
+   * **I:** without DFA, CPU cycles to BAR2 reach GFXCTL as ordinary
+     downstream PCI memory cycles.  GFXCTL may serve them through its
+     memory interface without passing the CBU, which would be on the NB
+     direct-access interface.
+   * Against it: neither the Windows KMD, `via_drv.so` nor
+     `via_chrome9.ko` writes D0F2 9E, D1F0 B9 or D0F3 A0/A1 (constant
+     search, S).  Windows tiling needs the VBIOS `BiosEnableTile`
+     capability (chrome9-tiling-re.md), so a tiling-capable BIOS may be
+     what sets them.
+2. **Control bit 0 does not latch** (not measured).  C1 wrote `0xfe`, and
+   the arm check masked bit 0 out.  Step R logs the control readback.
+3. **SR42 bit 7 = 0 forces the CBU linear** (M l.1984 lists CBU among
+   the forced engines).  The 3D engine tiles regardless (tiling note),
+   so this is weaker, but the CBU is a different unit.
+4. **Only stores are translated.** Rotation is a write-path feature
+   (the CPU draws, scanout reads).  C4 never ran.  Step R does one
+   fenced write.
+5. **The tile function is unsupported but rotation works.** Step R reads
+   a rotate-180 window: rotated dwords there, with raw tile reads, would
+   isolate the tile function.
+
+Excluded: the pitch unit and the reciprocal (both candidates behave the
+same), the register block (fields latch at MMIO `0x1e00` with the
+documented widths), and the address domain as an FB offset.  Windows
+also writes `CPUTranslatedAddress - BAR` and only stores the unchanged
+address in the allocation (`kmd:0x93d5d`); no other register is written
+around the six window registers (`kmd:0x93c3f..0x93d24`).
+
+### Step R (`cbu_route`, patch "CBU routing probe")
+
+`cbu_selftest=13 cbu_route=<bits>` runs C0, C1 and R (steps 3..12 are
+skipped).  R fills a 256x64 BGRA surface, applies the routing change,
+and re-reads the surface and the GART hash with the window off; any
+difference restores and stops before anything is written.  It then
+runs:
+* tile reads with both pitch units;
+* a rotate-180 read;
+* a fenced dword tile write.
+
+Each result is logged as counts of raw / tiled / rotated-180 / other
+dwords, with the control readback.  Every change is restored and logged
+at the end of R.
+
+| `cbu_route` | change | risk |
+|---|---|---|
+| `1` | none (probe only: bit 0, stores, rotation) | as C3 |
+| `3` | D0F2 Rx9E[1] = 1 (bit 5 must be 0, it is) | low: SPM defines it only under DFA |
+| `7` | Rx9E[1] and DFA (D1F0 RxB9[1] = 1); refused unless the D0F3 DFA base and size equal BAR2 | medium: every CPU BAR2 access changes path; a wrong translation would read or write other DRAM.  The read-back check runs before any write |
+| `9` | SR42 = `0xb0` | low-medium: DRAM arbiter register with scanout live (tiling note E3) |
+
+Suggested order: 1, 3, 7, then 9 (and `0xf` only if 7 and 9 each change
+something).
 
 ## 11. Production path (`cbu_linear`, default off)
 
