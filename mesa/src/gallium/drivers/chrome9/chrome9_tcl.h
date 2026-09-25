@@ -153,5 +153,7 @@ bool chrome9_tcl_flow_constants(const struct chrome9_tcl_program *program,
 bool chrome9_tcl_draw(struct chrome9_context *ctx,
                       const struct pipe_draw_info *info,
                       const struct pipe_draw_start_count_bias *draw);
+struct chrome9_tcl_state;
+void chrome9_tcl_state_destroy(struct chrome9_tcl_state *state);
 
 #endif

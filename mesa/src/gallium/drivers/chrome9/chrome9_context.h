@@ -303,6 +303,8 @@ struct chrome9_context {
    bool tcl_enabled;
    /* Stage B: hardware vertex fetch from GEM buffers. */
    bool tcl_buffers;
+   /* Stage B non-indexed draws index repeated vertices once. */
+   bool tcl_dedupe;
    /* TCL draws queued for one DRAW_VERTEX_PROGRAMS submission. */
    bool tcl_batching;
    struct chrome9_tcl_batch *tcl_batch;

@@ -27,6 +27,7 @@
 #include "util/u_memory.h"
 #include "util/u_inlines.h"
 #include "util/u_upload_mgr.h"
+#include "util/hash_table.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -74,8 +75,41 @@ struct tcl_address {
    uint16_t scope;
 };
 
+/* Shortest non-indexed draw worth indexing its repeated vertices. */
+#define TCL_DEDUPE_MIN_VERTICES 3072
+#define TCL_DEDUPE_ENTRIES 8
+/* Only nearby repeats: far references fetch cold vertices and widen the
+ * chunk's index range, which was slower than transforming again. */
+#define TCL_DEDUPE_WINDOW 64
+
+struct tcl_dedupe_stream {
+   uint64_t serial;
+   uint64_t offset;
+   uint32_t generation;
+   unsigned stride;
+   unsigned bytes;
+};
+
+/* Vertex repetition of one non-indexed draw over unchanged buffers. */
+struct tcl_dedupe {
+   struct tcl_dedupe_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   unsigned inputs;
+   unsigned start;
+   unsigned count;
+   uint64_t last_use;
+   bool valid;
+   /* The map is built on the second draw of unchanged buffers, so data
+    * rewritten every frame never pays for hashing. */
+   bool built;
+   /* Draw-relative position of the first equal vertex; NULL when too few
+    * vertices repeat. */
+   uint32_t *first;
+};
+
 struct chrome9_tcl_state {
    struct chrome9_tcl_fragment fragment;
+   struct tcl_dedupe dedupe[TCL_DEDUPE_ENTRIES];
+   uint64_t dedupe_clock;
    uint32_t constants[DRM_CHROME9_VERTEX_MAX_CONSTANTS][4];
    uint32_t vertices[TCL_MAX_VERTEX_BYTES / sizeof(uint32_t)];
    /* One stage B chunk; the kernel bounds index_count per draw. */
@@ -3118,6 +3152,142 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
    return true;
 }
 
+static bool
+tcl_vertex_equal(const struct tcl_stream *streams, unsigned inputs,
+                 unsigned a, unsigned b)
+{
+   for (unsigned k = 0; k < inputs; k++)
+      if (memcmp(streams[k].base + (size_t)a * streams[k].stride,
+                 streams[k].base + (size_t)b * streams[k].stride,
+                 streams[k].bytes))
+         return false;
+   return true;
+}
+
+/*
+ * Maps each vertex of a long non-indexed draw to an equal vertex at most
+ * TCL_DEDUPE_WINDOW positions earlier, so the post-transform cache reuses
+ * the repeated vertices of meshes stored as triangle soup.  The map is kept while the buffers do not
+ * change; NULL when it does not apply or too few vertices repeat.
+ */
+static const uint32_t *
+tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
+               const struct chrome9_tcl_program *p,
+               const struct tcl_stream *streams,
+               const struct pipe_draw_start_count_bias *range)
+{
+   struct tcl_dedupe_stream key[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   const nir_shader *nir = ctx->vs->tcl->nir;
+   const unsigned inputs = p->input_count;
+   struct tcl_dedupe *victim = &state->dedupe[0];
+   uint32_t *table, *first, mask, unique = 0;
+
+   if (!ctx->tcl_dedupe || range->count < TCL_DEDUPE_MIN_VERTICES ||
+       !inputs ||
+       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID) ||
+       BITSET_TEST(nir->info.system_values_read,
+                   SYSTEM_VALUE_VERTEX_ID_ZERO_BASE))
+      return NULL;
+   memset(key, 0, sizeof(key));
+   for (unsigned k = 0; k < inputs; k++) {
+      const struct pipe_vertex_element *el = &ctx->vertex_elements->elements[k];
+      const struct pipe_vertex_buffer *vb =
+         &ctx->vertex_buffers[el->vertex_buffer_index];
+      const struct chrome9_resource *res;
+
+      /* Persistent mappings change without an announced write. */
+      if (vb->is_user_buffer || !vb->buffer.resource ||
+          (vb->buffer.resource->flags & (PIPE_RESOURCE_FLAG_MAP_PERSISTENT |
+                                         PIPE_RESOURCE_FLAG_MAP_COHERENT)) ||
+          ((uint64_t)range->start + range->count - 1) * streams[k].stride +
+             streams[k].bytes > streams[k].size)
+         return NULL;
+      res = chrome9_resource_const(vb->buffer.resource);
+      key[k].serial = res->serial;
+      key[k].generation = res->cpu_write_generation;
+      key[k].offset = (uint64_t)vb->buffer_offset + el->src_offset;
+      key[k].stride = streams[k].stride;
+      key[k].bytes = streams[k].bytes;
+   }
+   for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++) {
+      struct tcl_dedupe *entry = &state->dedupe[e];
+
+      if (entry->valid && entry->inputs == inputs &&
+          entry->start == range->start && entry->count == range->count &&
+          !memcmp(entry->streams, key, inputs * sizeof(*key))) {
+         entry->last_use = ++state->dedupe_clock;
+         if (entry->built)
+            return entry->first;
+         victim = entry;
+         break;
+      }
+      if (!entry->valid ||
+          (victim->valid && entry->last_use < victim->last_use))
+         victim = entry;
+   }
+
+   if (!victim->valid || victim->inputs != inputs ||
+       victim->start != range->start || victim->count != range->count ||
+       memcmp(victim->streams, key, inputs * sizeof(*key))) {
+      free(victim->first);
+      memcpy(victim->streams, key, sizeof(key));
+      victim->inputs = inputs;
+      victim->start = range->start;
+      victim->count = range->count;
+      victim->first = NULL;
+      victim->built = false;
+      victim->valid = true;
+      victim->last_use = ++state->dedupe_clock;
+      return NULL;
+   }
+   mask = util_next_power_of_two(2 * range->count) - 1;
+   table = calloc(mask + 1, sizeof(*table));
+   first = malloc(range->count * sizeof(*first));
+   if (!table || !first) {
+      free(table);
+      free(first);
+      return NULL;
+   }
+   for (unsigned i = 0; i < range->count; i++) {
+      const unsigned v = range->start + i;
+      uint32_t hash = 0, slot;
+
+      for (unsigned k = 0; k < inputs; k++)
+         hash = _mesa_hash_data_with_seed(streams[k].base +
+                                             (size_t)v * streams[k].stride,
+                                          streams[k].bytes, hash);
+      for (slot = hash & mask; table[slot]; slot = (slot + 1) & mask)
+         if (tcl_vertex_equal(streams, inputs, range->start + table[slot] - 1,
+                              v))
+            break;
+      if (table[slot] && i - (table[slot] - 1) <= TCL_DEDUPE_WINDOW) {
+         first[i] = table[slot] - 1;
+      } else {
+         table[slot] = i + 1;
+         first[i] = i;
+         unique++;
+      }
+   }
+   free(table);
+   if (unique > range->count - range->count / 8) {
+      free(first);
+      first = NULL;
+   }
+   victim->first = first;
+   victim->built = true;
+   return first;
+}
+
+void
+chrome9_tcl_state_destroy(struct chrome9_tcl_state *state)
+{
+   if (!state)
+      return;
+   for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++)
+      free(state->dedupe[e].first);
+   FREE(state);
+}
+
 /*
  * Stage B draw: triangle list indices (provoking vertex last) rebased to
  * min, in chunks.  Returns false only when nothing was submitted, so
@@ -3126,7 +3296,8 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
 static bool
 tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *range,
-                 const uint8_t *indices, struct tcl_chunker chunker,
+                 const uint8_t *indices, const uint32_t *first,
+                 struct tcl_chunker chunker,
                  uint32_t min, struct chrome9_tcl_state *state,
                  struct drm_chrome9_draw_vertex_program *draw,
                  struct pipe_resource *const *resources)
@@ -3142,7 +3313,8 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                              state->positions, &n))) {
       for (unsigned i = 0; i < n; i++) {
          const unsigned position = range->start + state->positions[i];
-         int64_t value = position;
+         int64_t value = first ?
+            range->start + first[state->positions[i]] : position;
 
          if (info->index_size == 1)
             value = indices[position];
@@ -3547,9 +3719,12 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                                     &buffer_count, uploads, resources);
 
       if (drawn) {
+         const uint32_t *first = info->index_size ? NULL :
+            tcl_dedupe_map(ctx, state, p, streams, range);
+
          draw.buffer_count = buffer_count;
          draw.buffers_ptr = (uintptr_t)buffers;
-         drawn = tcl_draw_buffers(ctx, info, range, indices, chunker,
+         drawn = tcl_draw_buffers(ctx, info, range, indices, first, chunker,
                                   index_min, state, &draw, resources);
       }
       for (unsigned b = 0; b < ARRAY_SIZE(uploads); b++)

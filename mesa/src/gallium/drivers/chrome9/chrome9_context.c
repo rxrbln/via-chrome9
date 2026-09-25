@@ -7708,7 +7708,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
    for (unsigned i = 0; i < CHROME9_VS_MAX_SAMPLERS; i++)
       pipe_sampler_view_reference(&ctx->vs_sampler_views[i], NULL);
    chrome9_vs_texture_sampler_destroy(ctx->vs_tgsi_sampler);
-   FREE(ctx->tcl_state);
+   chrome9_tcl_state_destroy(ctx->tcl_state);
    FREE(ctx);
 }
 
@@ -7762,6 +7762,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->tcl_buffers = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_BUFFERS) &&
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
+   ctx->tcl_dedupe = ctx->tcl_buffers &&
+      debug_get_bool_option("CHROME9_TCL_DEDUPE", true);
    ctx->tcl_twoside = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_TWO_SIDE);
    ctx->tcl_clip_distance = ctx->tcl_enabled &&

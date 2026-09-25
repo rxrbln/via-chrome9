@@ -27,6 +27,9 @@
 #include "util/u_memory.h"
 #include "util/u_surface.h"
 #include "util/u_transfer.h"
+#include "util/u_atomic.h"
+
+static uint64_t chrome9_resource_serial;
 
 #define CHROME9_MAX_BUFFER_SIZE (256ULL * 1024 * 1024)
 #define CHROME9_MAX_SURFACE_DIMENSION 2048
@@ -503,6 +506,7 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource = CALLOC_STRUCT(chrome9_resource);
    if (!resource)
       return NULL;
+   resource->serial = p_atomic_inc_return(&chrome9_resource_serial);
    guarded_shared = chrome9_guarded_shared(screen, templ);
    if (guarded_shared) {
       layout_templ.flags |= CHROME9_RESOURCE_FLAG_CANONICAL_SHARED;

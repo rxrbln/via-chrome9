@@ -47,6 +47,8 @@ struct chrome9_resource {
    /* Counts announced CPU writes, so a render shadow can tell whether the
     * surface changed since it was last synchronized. */
    uint32_t cpu_write_generation;
+   /* Unique per created resource, unlike a reusable address. */
+   uint64_t serial;
    /* Single-image render view of a level or layer of parent: same BO,
     * pixels at data_offset. */
    struct pipe_resource *parent;
