@@ -510,11 +510,13 @@ chrome9_resource_local(struct pipe_screen *screen,
 
    if (enabled < 0)
       enabled = debug_get_bool_option("CHROME9_LOCAL_MEMORY", true);
-   return enabled && layout->guarded && !guarded_shared &&
+   /* Shared and scanout surfaces too: same-device PRIME import returns
+    * the object and KMS scans local framebuffers out of SL.  Linear shadows
+    * are copied by the CPU to the drawable. */
+   (void)guarded_shared;
+   return enabled && layout->guarded &&
           templ->target == PIPE_TEXTURE_2D &&
-          /* Linear shadows are copied by the CPU to the drawable. */
-          !(templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_SHARED |
-                           PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
+          !(templ->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
           (templ->bind & (PIPE_BIND_DEPTH_STENCIL |
                           PIPE_BIND_RENDER_TARGET)) &&
           chrome9_screen_has_capability2(screen,
@@ -571,7 +573,9 @@ chrome9_resource_create(struct pipe_screen *screen,
     * GART pages; GART pages when the pool is full. */
    if (chrome9_resource_local(screen, templ, &layout, guarded_shared) &&
        chrome9_bo_create(fd, align64(layout.allocation_size, 4096),
-                         DRM_CHROME9_GEM_CREATE_LOCAL, &resource->bo)) {
+                         DRM_CHROME9_GEM_CREATE_LOCAL |
+                         (create_flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED),
+                         &resource->bo)) {
       resource->local = true;
    } else if (!chrome9_bo_create(fd, layout.allocation_size, create_flags,
                                  &resource->bo)) {
@@ -656,6 +660,9 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    /* The exporter may have opted the object in: bracket CPU accesses (a
     * no-op for implicit objects). */
    resource->explicit_access = true;
+   resource->shared = true;
+   resource->local = chrome9_bo_info(fd, &resource->bo, &bo_flags) &&
+                     (bo_flags & DRM_CHROME9_GEM_CREATE_LOCAL);
    /* A native Chrome9 DRI3 export retains the complete canonical guarded
     * allocation.  Preserve that fact after same-device PRIME import so the
     * consumer can submit the BO directly and share its reservation object;
@@ -774,6 +781,8 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
        !resource->bo.handle)
       return false;
 
+   /* The object now has other users: it keeps its storage. */
+   resource->shared = true;
    if (kms) {
       /* KMS handles stay owned by this resource and are valid only on the
        * screen's DRM file.  PRIME FD export retains its separate ownership

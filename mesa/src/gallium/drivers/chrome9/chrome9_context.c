@@ -252,7 +252,7 @@ chrome9_context_demote_local(struct chrome9_context *ctx,
    const int fd = screen->get_screen_fd(screen);
    struct chrome9_bo bo;
 
-   if (!res->local || res->parent || res->views)
+   if (!res->local || res->shared || res->parent || res->views)
       return;
    chrome9_draw_flush_batch(ctx);
    chrome9_tcl_batch_flush(ctx);

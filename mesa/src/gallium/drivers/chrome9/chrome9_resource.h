@@ -75,6 +75,8 @@ struct chrome9_resource {
    /* GEM_CREATE_LOCAL: the object is in the local frame buffer, mapped
     * write-combined (CPU reads are uncached). */
    bool local;
+   /* Exported or imported: the BO cannot be replaced (no demotion). */
+   bool shared;
    /* Live level views borrowing the BO (chrome9_resource_image_view). */
    unsigned views;
    /* Single-image render view of a level or layer of parent: same BO,
