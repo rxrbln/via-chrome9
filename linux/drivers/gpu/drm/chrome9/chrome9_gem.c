@@ -7,6 +7,7 @@
 #include <linux/pagemap.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
+#include <linux/swiotlb.h>
 
 #include <drm/drm_dumb_buffers.h>
 #include <drm/drm_file.h>
@@ -101,6 +102,19 @@ chrome9_gem_set_dma32(struct drm_gem_shmem_object *shmem_obj)
 	/* drm_gem_get_pages() requires this zone to remain stable thereafter. */
 	mapping_set_gfp_mask(mapping,
 			     (mask & ~GFP_ZONEMASK) | __GFP_DMA32);
+}
+
+/*
+ * Every object the engine can reach must avoid SWIOTLB: non-snooped SF
+ * writes to a bounce slot are not coherent with the CPU's bounce copies.
+ */
+static bool chrome9_gem_dma32_placement(struct drm_device *drm)
+{
+	struct device *dev = &to_chrome9(drm)->pdev->dev;
+
+	return IS_ENABLED(CONFIG_ZONE_DMA32) &&
+	       dma_get_mask(dev) == DMA_BIT_MASK(32) &&
+	       !is_swiotlb_force_bounce(dev);
 }
 
 struct drm_gem_object *chrome9_gem_cursor_create(struct drm_device *drm)
@@ -222,7 +236,7 @@ int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 	shmem_obj = drm_gem_shmem_create(drm, args->size);
 	if (IS_ERR(shmem_obj))
 		return PTR_ERR(shmem_obj);
-	if (chrome9_dma32_scanout_supported(to_chrome9(drm)))
+	if (chrome9_gem_dma32_placement(drm))
 		chrome9_gem_set_dma32(shmem_obj);
 	obj = &shmem_obj->base;
 	ret = drm_gem_handle_create(file, obj, &args->handle);
@@ -502,7 +516,7 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 	 * stronger scanout contract (eager allocation plus explicit verification),
 	 * while unflagged render resources receive the same physical placement.
 	 */
-	if (chrome9_dma32_scanout_supported(to_chrome9(drm)))
+	if (chrome9_gem_dma32_placement(drm))
 		chrome9_gem_set_dma32(shmem_obj);
 
 	/*
@@ -522,12 +536,17 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 				goto out_put;
 			}
 		}
-		for_each_sgtable_sg(sgt, sg, i) {
-			if (sg_dma_is_swiotlb(sg)) {
-				ret = -ERANGE;
-				goto out_put;
-			}
+	}
+	for_each_sgtable_sg(sgt, sg, i) {
+		if (!sg_dma_is_swiotlb(sg))
+			continue;
+		if (args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT) {
+			ret = -ERANGE;
+			goto out_put;
 		}
+		dev_warn_once(drm->dev,
+			      "GEM object uses SWIOTLB bounce slots; non-snooped engine access is not CPU coherent\n");
+		break;
 	}
 	dma_sync_sgtable_for_cpu(&to_chrome9(drm)->pdev->dev, sgt,
 				 DMA_BIDIRECTIONAL);
