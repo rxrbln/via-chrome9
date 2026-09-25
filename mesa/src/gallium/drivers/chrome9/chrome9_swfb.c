@@ -20,6 +20,7 @@
 #include "chrome9_public.h"
 #include "chrome9_query.h"
 #include "chrome9_resource.h"
+#include "chrome9_specialise.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "frontend/sw_winsys.h"
@@ -435,8 +436,9 @@ chrome9_sw_scalarize_derivs(nir_shader *nir)
                               nir_metadata_control_flow, NULL);
 }
 
-/* The chrome9 lowering treats integers as floats and leaves integer
- * texture queries untouched; llvmpipe returns them as integers. */
+/* Uniforms are float-encoded: integer operations become float ones, as in
+ * the chrome9 backends.  The lowering leaves integer texture queries
+ * untouched; llvmpipe returns them as integers. */
 static bool
 chrome9_sw_float_query_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -460,6 +462,7 @@ chrome9_sw_float_queries(nir_shader *nir)
 {
    if (!nir->options->no_integers)
       return;
+   chrome9_nir_lower_integers(nir);
    nir_shader_instructions_pass(nir, chrome9_sw_float_query_instr,
                                 nir_metadata_control_flow, NULL);
 }
