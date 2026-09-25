@@ -283,9 +283,29 @@ chrome9_fragment_build_instructions(
       instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS],
    unsigned *count)
 {
+   struct chrome9_ps_ir expanded;
+
    if (!ir || !instructions || !count || !ir->count ||
        ir->count > DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
       return false;
+   if (ir->depth_output) {
+      struct chrome9_ps_instruction *depth;
+
+      if (ir->count >= CHROME9_PS_MAX_INSTRUCTIONS ||
+          ir->count >= DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS)
+         return false;
+      expanded = *ir;
+      expanded.instruction[ir->count] = ir->instruction[ir->count - 1];
+      depth = &expanded.instruction[ir->count - 1];
+      memset(depth, 0, sizeof(*depth));
+      depth->op = CHROME9_PS_OPCODE_MOV;
+      depth->destination.file = CHROME9_PS_DESTINATION_DEPTH;
+      depth->destination.writemask = 0xf;
+      depth->source[0] = ir->depth;
+      expanded.count++;
+      expanded.depth_output = false;
+      ir = &expanded;
+   }
 
    memset(instructions, 0,
           DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS * sizeof(*instructions));
@@ -318,6 +338,9 @@ chrome9_fragment_build_instructions(
             break;
          case CHROME9_PS_DESTINATION_COLOR:
             instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
+            break;
+         case CHROME9_PS_DESTINATION_DEPTH:
+            instruction->dst.file = DRM_CHROME9_FRAGMENT_DEST_DEPTH;
             break;
          default:
             return false;

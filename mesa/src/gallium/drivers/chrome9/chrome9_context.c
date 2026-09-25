@@ -5322,10 +5322,11 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint32_t *unit_interval_input_mask,
                        uint8_t *cube_sampler_mask,
                        uint8_t *volume_sampler_mask,
-                       bool allow_kill, bool allow_bias,
+                       bool allow_kill, bool allow_bias, bool allow_depth,
                        bool *lowered)
 {
    struct chrome9_ps_nir_builder builder = { .allow_bias = allow_bias };
+   nir_def *depth = NULL;
    struct chrome9_ps_instruction *terminal;
    struct chrome9_ps_source operands[3] = { 0 };
    enum chrome9_ps_opcode op;
@@ -5362,6 +5363,19 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
             return false;
          continue;
       }
+      if (intr->intrinsic == nir_intrinsic_store_output &&
+          nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_DEPTH) {
+         /* gl_FragDepth: one scalar store, written before the color. */
+         if (!allow_depth || depth || nir_intrinsic_component(intr) ||
+             nir_intrinsic_write_mask(intr) != 0x1 ||
+             intr->src[0].ssa->num_components != 1 ||
+             intr->src[0].ssa->bit_size != 32 ||
+             !nir_src_is_const(intr->src[1]) ||
+             nir_src_as_uint(intr->src[1]))
+            return false;
+         depth = intr->src[0].ssa;
+         continue;
+      }
       if (intr->intrinsic == nir_intrinsic_store_output) {
          struct nir_io_semantics semantics =
             nir_intrinsic_io_semantics(intr);
@@ -5378,6 +5392,18 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
          nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
 
          var = nir_intrinsic_get_var(intr, 0);
+         if (deref && deref->deref_type == nir_deref_type_var && var &&
+             var->data.mode == nir_var_shader_out &&
+             var->data.location == FRAG_RESULT_DEPTH) {
+            if (!allow_depth || depth || var->data.index ||
+                var->data.location_frac ||
+                nir_intrinsic_write_mask(intr) != 0x1 ||
+                intr->src[1].ssa->num_components != 1 ||
+                intr->src[1].ssa->bit_size != 32)
+               return false;
+            depth = intr->src[1].ssa;
+            continue;
+         }
          if (!deref || deref->deref_type != nir_deref_type_var ||
              !var || var->data.mode != nir_var_shader_out ||
              var->data.index || var->data.location_frac ||
@@ -5469,6 +5495,14 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
       if (!chrome9_ps_lower_def(&builder, result, &operands[0]))
          return false;
       source_count = 1;
+   }
+   if (depth) {
+      /* One lane, replicated: the depth MOV reads a scalar. */
+      if (!chrome9_ps_lower_def(&builder, depth, &builder.ir.depth))
+         return false;
+      for (unsigned c = 1; c < 4; c++)
+         builder.ir.depth.swizzle[c] = builder.ir.depth.swizzle[0];
+      builder.ir.depth_output = true;
    }
    terminal = chrome9_ps_append_instruction(&builder, op);
    if (!terminal)
@@ -5852,6 +5886,10 @@ chrome9_ps_ir_fold_copies(struct chrome9_ps_ir *ir,
        last->source[0].modifier)
       return;
    id = last->source[0].id;
+   /* The depth MOV inserted before the color reads its temporary too. */
+   if (ir->depth_output && ir->depth.file == CHROME9_PS_SOURCE_TEMP &&
+       ir->depth.id == id)
+      return;
    for (unsigned i = 0; i + 1 < ir->count; i++) {
       struct chrome9_ps_instruction *instruction = &ir->instruction[i];
 
@@ -5948,6 +5986,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      &shader->semantic_volume_sampler_mask,
                                      ctx->fragment_kill,
                                      ctx->texture_bias,
+                                     ctx->depth_output,
                                      &lowered);
    if (lowered && debug_get_bool_option("CHROME9_PS_FOLD", true)) {
       struct chrome9_ps_ir folded = shader->semantic_fs_ir;
@@ -8002,6 +8041,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->tcl_edge_aa = ctx->tcl_enabled &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_EDGE_AA) &&
       debug_get_bool_option("CHROME9_TCL_SMOOTH_LINES", true);
+   ctx->depth_output = ctx->draw_fragment_program &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_DEPTH_OUTPUT) &&
+      debug_get_bool_option("CHROME9_DEPTH_OUTPUT", true);
    ctx->fast_z = ctx->draw_fragment_program &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_FAST_Z) &&
       debug_get_bool_option("CHROME9_FAST_Z", true);

@@ -1004,7 +1004,7 @@ chrome9_draw_coarse_z_usable(const struct chrome9_context *ctx, uint32_t flags,
                          DRM_CHROME9_DEPTH_FUNC_SHIFT;
    const struct chrome9_ps_ir *ir = &ctx->fs->semantic_fs_ir;
 
-   if (!ctx->draw_filled_triangles ||
+   if (!ctx->draw_filled_triangles || ir->depth_output ||
        (func != PIPE_FUNC_LESS && func != PIPE_FUNC_LEQUAL) ||
        (flags & DRM_CHROME9_FRAGMENT_STENCIL) ||
        (blend && (blend->flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE)))
@@ -1688,13 +1688,26 @@ chrome9_generic_fragment_state(
    uint8_t depth_sampler_mask = 0;
    const unsigned constant_count = crender->ctx->fs->semantic_constant_mask ?
       32 - __builtin_clz(crender->ctx->fs->semantic_constant_mask) : 0;
+   const struct chrome9_ps_ir *ir = &crender->ctx->fs->semantic_fs_ir;
+   struct chrome9_ps_ir color_only;
    unsigned instruction_count;
 
+   /* Without a depth buffer gl_FragDepth has no effect. */
+   if (ir->depth_output && !depth_active) {
+      color_only = *ir;
+      color_only.depth_output = false;
+      ir = &color_only;
+   }
+   /* Fast-Z stored depths are not the shader's to replace. */
+   if (ir->depth_output && depth->fast_z_index) {
+      chrome9_resource_fast_z_resolve(depth);
+      depth->fast_z_disabled = true;
+   }
    memset(draw, 0, sizeof(*draw));
    memset(texture_state, 0,
           DRM_CHROME9_FRAGMENT_MAX_TEXTURES * sizeof(*texture_state));
    if (!chrome9_fragment_build_instructions(
-          &crender->ctx->fs->semantic_fs_ir,
+          ir,
           crender->ctx->fs->semantic_sampler_mask, instructions,
           &instruction_count) ||
        !chrome9_fragment_constants(crender->ctx, constant_count, constants))

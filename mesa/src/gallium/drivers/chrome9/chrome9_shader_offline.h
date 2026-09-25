@@ -54,6 +54,7 @@ enum chrome9_ps_source_file {
 enum chrome9_ps_destination_file {
    CHROME9_PS_DESTINATION_TEMP = 0,
    CHROME9_PS_DESTINATION_COLOR = 2,
+   CHROME9_PS_DESTINATION_DEPTH = 3,
 };
 
 enum chrome9_ps_swizzle {
@@ -121,6 +122,10 @@ struct chrome9_ps_instruction {
 struct chrome9_ps_ir {
    struct chrome9_ps_instruction instruction[CHROME9_PS_MAX_INSTRUCTIONS];
    uint8_t count;
+   /* gl_FragDepth: a replicated MOV of depth to oDepth, emitted directly
+    * before the terminal color write (the order the hardware accepts). */
+   bool depth_output;
+   struct chrome9_ps_source depth;
 };
 
 struct chrome9_ps_program {

@@ -311,6 +311,8 @@ struct chrome9_context {
    bool coarse_z_last;
    /* CAP2_FAST_Z: X8Z24 clears to 1.0 advance a scene index. */
    bool fast_z;
+   /* CAP2_DEPTH_OUTPUT: fragment programs may write gl_FragDepth. */
+   bool depth_output;
    /* CAP2_EDGE_AA: smooth TCL lines with hardware edge antialiasing. */
    bool tcl_edge_aa;
    /* The draw module JIT-compiles vertex shaders (and samples vertex
