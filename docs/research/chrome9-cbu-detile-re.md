@@ -3,8 +3,9 @@
 
 # Chrome9 HD (VX900) CBU windows as a CPU detiling aperture
 
-Status (2026-09-25): static recovery only.  No CBU register has been written
-on the target.  This note extends section 4 of
+Status (2026-09-25): static recovery plus read-only target state (section
+8); kernel ladder ready (section 9).  No CBU register has been written on
+the target.  This note extends section 4 of
 [chrome9-tiling-re.md](chrome9-tiling-re.md) and answers its open CBU
 questions where the sources allow it.
 
@@ -21,7 +22,7 @@ Evidence labels:
   * `drv:` `via_drv.so` 5.75 (`55324613…`);
   * `dri:` `via_chrome9_dri.so` 5.75 (`fddb4dea…`);
   * `ksrc:` vendor KMD source `binary/5.75.32.87a-u910-55689/VIA_Chrome9_2.6.31/`.
-* **D**: measured on the target.  There is no D evidence in this note.
+* **D**: measured on the target, read only (section 8).
 * **I**: inference.
 
 ## Summary
@@ -399,3 +400,112 @@ record the step.
 * Reciprocal precision (exact versus truncated), C3c.
 * Whether GPU engine accesses bypass the window (inferred yes), C7.
 * Whether the UMD lock uses `AcquireAperture`; not traced.
+
+## 8. CPU path to SL on the target (D, read only, 2026-09-25)
+
+`lspci -xxx` and `/sys/kernel/debug/x86/pat_memtype_list` on the target,
+no register written:
+
+| register | value | meaning (source) |
+|---|---|---|
+| D0F0 RxB0 | `db` | bit 0 = 1: CPU cycles to the SL range (BAR2) are forwarded to GFXCTL (SPM "Access Capability for GFXCTL") |
+| D1F0 RxB9 | `00` | bit 1 = 0: direct frame buffer access (DFA) off (SPM D0F3 RxA1 note; the OGPM lists B3-F2 as reserved) |
+| D0F2 Rx9E | `cc` | bit 1 = 0: "Tile Mode Address Windows" off; the SPM defines it only for DFA mode, where it routes the 16 tile windows back to GFXCTL |
+| D0F3 RxA1:A0 | `ed00` | graphics on, 256 MiB, DFA base `0xd0000000` (unused while DFA is off) |
+| MTRR | `0xd0000000` 256 MiB uncachable | |
+| PAT | `d0000000-e0000000` UC-, `d1000000-dffef000` UC- | the whole-BAR2 `pcim_iomap` (UC-) is reserved first; the later `ioremap_wc` of the local pool and the WC user mappings of local objects inherit UC- |
+
+**I:** with DFA off, every CPU access to BAR2 passes GFXCTL, so the CBU sits
+on that path and Rx9E bit 1 is not needed.  Ladder C0 re-reads these
+registers and stops if SL cycles bypass GFXCTL.
+
+**D:** local objects are mapped uncached, not write-combined, on this
+kernel: PAT keeps the memory type of the earlier whole-BAR2 UC- mapping.
+C4 "memcpy WC" and C10 "WC map" therefore measure UC- stores until BAR2 is
+mapped UC only for the GART and occlusion pages.
+
+## 9. Kernel ladder (`cbu_selftest`)
+
+`drivers/gpu/drm/chrome9/chrome9_cbu.c`.  `cbu_selftest=N` runs steps 1..N
+at module load, after the engine and the local pool are up and before
+any client exists.  Window `cbu_window` (default 15, step 10 also uses
+the one below), `cbu_skip` bit n skips step n (not C0), `cbu_pitch_mode`
+forces candidate A (0) or B (1).
+
+| N | step | surface(s) | stops when |
+|---|---|---|---|
+| 1 | C0 | none; dumps 16 windows, D0F0 B0, D0F2 9E, D0F3 A0, D1F0 B0/B2/B9, SR42 | a window is enabled, or SL bypasses GFXCTL |
+| 2 | C1 | none; enable 0, two patterns per field, control `0xfe` | control does not read 0 afterwards |
+| 3 | C2 | 64x64 BGRA linear, control `0x05` | any dword differs from the raw bytes |
+| 4 | C3a | 256x64 BGRA tiled, pitch in pixels | mismatch with a forced mode; with mode -1 it hands over to C3b |
+| 5 | C3b | same, pitch in 32-byte columns; skipped if C3a passed | mismatch |
+| 6 | C3c | 800x600 and 1600x1200 BGRA, 256x128 and 800x600 RGB565, 100x61 BGRA (pitch 416), 50x33 RGB565 (pitch 128) | mismatch |
+| 7 | C4 | 256x64 BGRA: dword, byte/word, qword, WC memcpy; 100x61 dword; 256x128 RGB565 byte/word | raw bytes differ from the linear writes (tail rows must stay raw) |
+| 8 | C5 | 100x61 BGRA: `base-16` and `end` read and write, window width 100 of 104 | `base-16` translated, `end` neither raw nor tiled, or a pixel below the width wrong |
+| 9 | C6 | 256x64 raw bytes programmed as 16 and 8 bpp | mismatch with the byte model |
+| 10 | C9 | windows 14+15, then 15 moved to a third surface | any mismatch, or the released range not raw |
+| 11 | C10 | 1600x1200 BGRA: throughput | window writes wrong |
+| 12 | C8 | 256x64 BGRA, control `0xa5` | mapping is not the inferred 32x16 tile |
+
+Every raw dword holds `0xa5 << 24 | offset / 4`, every linear write
+`0x5a << 24 | linear offset / 4`, so a mismatch line decodes the source
+tile position.  Each case checks both 4-KiB guard pages (`13579bdf`), and
+each step the xxh64 of the last 68 KiB of SL (occlusion page and GART
+table); the window is disabled before the check, and all touched windows
+are restored from the C0 snapshot at the end.
+
+## 10. Silicon results
+
+Kernel build, module Build ID and parameters: _pending_.
+
+| step | result | dmesg summary |
+|---|---|---|
+| C0 | | windows: ; routing: |
+| C1 | | readback masks ctl / base / end / recip / pitch / hw: |
+| C2 | | |
+| C3a | | |
+| C3b | | |
+| C3c | | per case: match / untranslated / other, time |
+| C4 | | dword / byte-word / qword / WC / 100x61 / RGB565 |
+| C5 | | base-16: ; end: ; beyond width: tiled / untranslated / other |
+| C6 | | 16 bpp: ; 8 bpp: |
+| C9 | | |
+| C10 | | MB/s: raw+detile read, window read, window write UC/WC, tile+raw write UC/WC |
+| C8 | | 32x16 matches / 32x8 matches |
+
+Decisions to record: pitch unit (A/B), `end` exclusive or inclusive,
+width clipping, byte-model equivalence of the bpp field, bit 7 mapping,
+and whether the window pays off against `chrome9_tiled_copy` (C10).
+
+## 11. Production path (`cbu_linear`, default off)
+
+* **uAPI** (`GEM_LINEAR_VIEW` 0x25, CAP2 bit 32 `LINEAR_VIEW`): `ADD`
+  registers a tiled level of a local object (page-aligned offset, pitch a
+  multiple of 32 and at least 64, cpp 2 or 4, tiled extent
+  `pitch * ALIGN(height, 8)` inside the object, no overlap); `REMOVE`
+  names it by offset.  CPU accesses to `[offset, offset + pitch*height)`
+  of the object's own mapping are then linear; the device keeps the tiled
+  layout.  The CAP bit needs `cbu_linear=1` and a known pitch unit
+  (`cbu_pitch_mode` or the ladder in the same load).
+* **Ownership:** windows 2..15 (14) are shared by all views of all
+  objects; 0/1 stay free (vendor X rotation).  Local objects map on
+  demand; a fault in a view's pages takes a free window, else steals the
+  least recently used one after zapping the owner's PTEs of that range.
+  At most 16 pages of one segment are inserted per fault, so every PTE is
+  covered by exactly one live window.  A page-aligned view offset keeps
+  every page in at most one view.
+* **Lifetime:** `ADD` and `REMOVE` zap the range; object free releases
+  its windows before the SL range is returned; unload disables every
+  window after zapping.  A window therefore never outlives or crosses its
+  object, and a translated access stays inside the object's tiled extent.
+* **Mesa** (not implemented): for `local && tiled` resources with a
+  page-aligned level offset, `ADD` the level after creation; transfers
+  then use `bo.map + level_offset` with the level pitch instead of the
+  staging copy, and swfb, VS texture and copy paths call
+  `chrome9_tiled_copy(..., tiled = false)` for such levels.  Before
+  `chrome9_context_demote_local` copies the object byte for byte, the
+  views must be removed (or the copy must detile explicitly), or the GART
+  copy receives linear bytes where the device expects tiles.
+* **Open:** GPU accesses to an active window range (C7) must bypass the
+  translation; not covered by the ladder yet, since it needs a tiled draw
+  into a local object while a view is mapped.
