@@ -114,6 +114,7 @@ struct drm_framebuffer;
 struct drm_gem_object;
 struct drm_mode_create_dumb;
 struct drm_mode_fb_cmd2;
+struct chrome9_cbu;
 struct chrome9_engine;
 struct chrome9_kms_state;
 
@@ -140,6 +141,7 @@ struct chrome9_device {
 	struct mutex scanout_lock;
 	struct chrome9_kms_state *kms_state;
 	struct chrome9_engine *engine;
+	struct chrome9_cbu *cbu;
 	bool kms_shutdown;
 	struct drm_simple_display_pipe display_pipe;
 	struct drm_plane cursor_plane;

@@ -29,6 +29,7 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
 
+#include "chrome9_cbu.h"
 #include "chrome9_drv.h"
 #include "chrome9_engine.h"
 #include "chrome9_snoop.h"
@@ -2874,6 +2875,11 @@ static int chrome9_pci_probe(struct pci_dev *pdev,
 	if (ret)
 		return ret;
 	chrome9_snoop_selftest(cdev);
+	ret = chrome9_cbu_init(cdev);
+	if (ret) {
+		chrome9_engine_fini(cdev);
+		return ret;
+	}
 	if (chrome9_fixed_iga1 && !chrome9_engine_ready(cdev)) {
 		chrome9_engine_fini(cdev);
 		return dev_err_probe(&pdev->dev, -EINVAL,
