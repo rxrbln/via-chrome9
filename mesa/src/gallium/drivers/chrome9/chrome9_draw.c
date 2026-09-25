@@ -1787,13 +1787,14 @@ chrome9_generic_fragment_state(
                 (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
    if (depth_active && chrome9_stencil_active(crender->ctx))
       draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
-   if (target->base.last_level) {
+   if (chrome9_resource_extended(target)) {
       if (!target->guarded ||
           !chrome9_screen_has_capability(
              crender->ctx->base.screen,
              DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))
          return false;
       draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
+      draw->destination_offset = chrome9_resource_destination_offset(target);
    }
    /* The count and user pointers are filled only when the batch is flushed.
     * Keeping them zero makes the rest of this structure a comparable state

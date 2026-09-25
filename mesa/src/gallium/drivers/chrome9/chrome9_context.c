@@ -40,12 +40,15 @@
 #include "util/u_upload_mgr.h"
 
 /* Guarded stand-in for one level and layer of a render target that the
- * hardware cannot address directly; one list per resource. */
+ * hardware cannot address directly, or a direct view of that image; one
+ * list per resource. */
 struct chrome9_shadow {
    struct chrome9_shadow *next;
    struct pipe_resource *shadow;
    unsigned level;
    unsigned layer;
+   /* shadow is a view sharing the resource's BO (and referencing it). */
+   bool direct;
    /* Drawable write generation both surfaces last agreed on. */
    uint32_t synced_generation;
    bool synced;
@@ -97,7 +100,9 @@ chrome9_external_surface(struct chrome9_context *ctx)
                                         &ctx->framebuffer.cbufs[0] : NULL;
 
    return surface && surface->texture && ctx->render_target &&
-          surface->texture != ctx->render_target ? surface : NULL;
+          surface->texture != ctx->render_target &&
+          chrome9_resource(ctx->render_target)->parent != surface->texture ?
+          surface : NULL;
 }
 
 /* Record that the shadow and the drawable hold the same pixels. */
@@ -6773,8 +6778,12 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color,
       return NULL;
    hash_table_foreach(ctx->shadows, stale) {
       struct pipe_resource *key = (struct pipe_resource *)stale->key;
+      int held = 1;
 
-      if (p_atomic_read(&key->reference.count) > 1)
+      for (struct chrome9_shadow *entry = stale->data; entry;
+           entry = entry->next)
+         held += entry->direct;
+      if (p_atomic_read(&key->reference.count) > held)
          continue;
       chrome9_shadow_list_free(stale->data);
       _mesa_hash_table_remove(ctx->shadows, stale);
@@ -6783,6 +6792,9 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color,
    record = chrome9_shadow_entry(ctx, color, level, layer);
    if (record)
       return record;
+   shadow = chrome9_resource_image_view(color, level, layer);
+   if (shadow)
+      goto insert;
    templ.target = PIPE_TEXTURE_2D;
    templ.width0 = u_minify(color->width0, level);
    templ.height0 = u_minify(color->height0, level);
@@ -6795,12 +6807,14 @@ chrome9_render_shadow(struct chrome9_context *ctx, struct pipe_resource *color,
    shadow = screen->resource_create(screen, &templ);
    if (!shadow)
       return NULL;
+insert:
    record = CALLOC_STRUCT(chrome9_shadow);
    if (!record) {
       pipe_resource_reference(&shadow, NULL);
       return NULL;
    }
    record->shadow = shadow;
+   record->direct = chrome9_resource(shadow)->parent == color;
    record->level = level;
    record->layer = layer;
    entry = _mesa_hash_table_search(ctx->shadows, color);
@@ -6834,7 +6848,8 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
        surface->first_layer == surface->last_layer) {
       struct chrome9_resource *resource = chrome9_resource(color);
 
-      /* Other levels, cube faces and 3D slices render through a shadow. */
+      /* Other levels, cube faces and 3D slices render through a view of
+       * the same BO, or else a shadow. */
       if (resource->guarded && color->target != PIPE_TEXTURE_CUBE &&
           color->target != PIPE_TEXTURE_3D &&
           !surface->level && !surface->first_layer) {
@@ -6850,7 +6865,7 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
          /* The drawable's contents are copied in only when a draw or a
           * partial clear needs them and the drawable changed since the
           * two last agreed. */
-         if (ctx->render_target)
+         if (ctx->render_target && !shadow->direct)
             ctx->render_target_stale = !shadow->synced ||
                shadow->synced_generation !=
                chrome9_resource(color)->cpu_write_generation;
@@ -7095,8 +7110,8 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
    uint32_t constant[4];
    int32_t z = 0;
 
-   /* A mipmapped target is drawn at level zero, the only level a draw
-    * binds directly (other levels render through a shadow). */
+   /* A mipmapped target is drawn at level zero; other levels render
+    * through a view or a shadow. */
    if (!ctx->draw_fragment_program || !target || !target->guarded ||
        (target->base.last_level &&
         (!fb->nr_cbufs || fb->cbufs[0].level ||
@@ -7171,8 +7186,9 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
       vertices[v].z_16_16 = z;
       vertices[v].rhw_float = 0x3f800000;
    }
-   if (target->base.last_level)
+   if (chrome9_resource_extended(target))
       draw.flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
+   draw.destination_offset = chrome9_resource_destination_offset(target);
    draw.abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION;
    draw.destination_handle = target->bo.handle;
    draw.width = target->base.width0;
@@ -7480,6 +7496,10 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
         /* The kernel binds single-level depth objects only. */
         (ctx->framebuffer.zsbuf.texture &&
          ctx->framebuffer.zsbuf.texture->last_level) ||
+        /* and targets sharing their object only in fragment programs. */
+        (ctx->render_target &&
+         chrome9_resource_extended(chrome9_resource(ctx->render_target)) &&
+         !chrome9_generic_fragment_program(ctx)) ||
         !chrome9_draw_blend_supported(ctx) ||
         (ctx->rasterizer && ctx->rasterizer->poly_stipple_enable) ||
         chrome9_draw_smooth_lines(ctx, info)) &&

@@ -47,7 +47,24 @@ struct chrome9_resource {
    /* Counts announced CPU writes, so a render shadow can tell whether the
     * surface changed since it was last synchronized. */
    uint32_t cpu_write_generation;
+   /* Single-image render view of a level or layer of parent: same BO,
+    * pixels at data_offset. */
+   struct pipe_resource *parent;
 };
+
+/* Drawn with DESTINATION_EXTENDED: other images share the object. */
+static inline bool
+chrome9_resource_extended(const struct chrome9_resource *resource)
+{
+   return resource->base.last_level || resource->parent;
+}
+
+/* destination_offset of a fragment draw into resource. */
+static inline uint32_t
+chrome9_resource_destination_offset(const struct chrome9_resource *resource)
+{
+   return resource->parent ? (uint32_t)resource->data_offset : 0;
+}
 
 void chrome9_resource_cpu_access(struct chrome9_resource *resource,
                                  bool write);
@@ -80,6 +97,9 @@ chrome9_resource_create(struct pipe_screen *screen,
                         const struct pipe_resource *templ);
 void chrome9_resource_destroy(struct pipe_screen *screen,
                               struct pipe_resource *resource);
+struct pipe_resource *
+chrome9_resource_image_view(struct pipe_resource *resource, unsigned level,
+                            unsigned layer);
 bool chrome9_generate_mipmap(struct pipe_context *pipe,
                              struct pipe_resource *resource,
                              enum pipe_format format,

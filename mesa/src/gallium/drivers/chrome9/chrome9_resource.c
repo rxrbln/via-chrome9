@@ -704,8 +704,69 @@ chrome9_resource_destroy(struct pipe_screen *screen,
 {
    struct chrome9_resource *cresource = chrome9_resource(resource);
 
-   chrome9_screen_bo_destroy(screen, &cresource->bo);
+   /* A view borrows its parent's BO. */
+   if (cresource->parent)
+      pipe_resource_reference(&cresource->parent, NULL);
+   else
+      chrome9_screen_bo_destroy(screen, &cresource->bo);
    FREE(cresource);
+}
+
+/*
+ * Single-level render view of one level and layer of a guarded BGRA/BGRX
+ * resource, sharing its BO: the pixel engine takes a 256-byte aligned base
+ * (A50) and the window must end before the trailing guard page.  NULL when
+ * the image is not addressable that way.
+ */
+struct pipe_resource *
+chrome9_resource_image_view(struct pipe_resource *pres, unsigned level,
+                            unsigned layer)
+{
+   struct chrome9_resource *res = chrome9_resource(pres);
+   const unsigned width = u_minify(pres->width0, level);
+   const unsigned height = u_minify(pres->height0, level);
+   const long page_size = sysconf(_SC_PAGESIZE);
+   struct chrome9_resource *view;
+   uint64_t offset, end;
+
+   if (!chrome9_screen_has_capability2(pres->screen,
+                                       DRM_CHROME9_CAP2_DESTINATION_OFFSET) ||
+       !res->guarded || res->guarded_shared || res->parent ||
+       !res->bo.handle || page_size <= 0 || level > pres->last_level ||
+       (pres->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
+        pres->format != PIPE_FORMAT_B8G8R8A8_UNORM) ||
+       res->level_stride[level] != ALIGN_POT(width * 4, 32))
+      return NULL;
+   offset = res->level_offset[level] + (uint64_t)layer *
+      (res->layer_stride ? res->layer_stride : res->level_size[level]);
+   end = offset + (uint64_t)res->level_stride[level] * height;
+   if (offset < (uint64_t)page_size || offset % 256 || offset > UINT32_MAX ||
+       end > res->bo.size - page_size)
+      return NULL;
+   view = CALLOC_STRUCT(chrome9_resource);
+   if (!view)
+      return NULL;
+   view->base = *pres;
+   pipe_reference_init(&view->base.reference, 1);
+   view->base.next = NULL;
+   view->base.target = PIPE_TEXTURE_2D;
+   view->base.width0 = width;
+   view->base.height0 = height;
+   view->base.depth0 = 1;
+   view->base.array_size = 1;
+   view->base.last_level = 0;
+   view->bo = res->bo;
+   view->bo.handle_owned = false;
+   view->level_stride[0] = res->level_stride[level];
+   view->level_offset[0] = offset;
+   view->level_size[0] = (uint64_t)res->level_stride[level] * height;
+   view->stride = view->level_stride[0];
+   view->data_offset = offset;
+   view->data_size = view->level_size[0];
+   view->guarded = true;
+   view->explicit_access = res->explicit_access;
+   pipe_resource_reference(&view->parent, pres);
+   return &view->base;
 }
 
 static bool
@@ -1117,6 +1178,180 @@ chrome9_generate_volume_mipmap(struct pipe_context *pipe,
    return true;
 }
 
+/* Level of a guarded chain as a draw window at a 256-byte aligned base; a
+ * level off that alignment starts whole rows after the rounded base. */
+static bool
+chrome9_mipmap_window(const struct chrome9_resource *resource, unsigned level,
+                      uint32_t *base, unsigned *first_row)
+{
+   const uint64_t offset = resource->level_offset[level];
+   const uint32_t delta = offset & 255;
+
+   if (offset > UINT32_MAX || delta % resource->level_stride[level])
+      return false;
+   *base = offset - delta;
+   *first_row = delta / resource->level_stride[level];
+   return true;
+}
+
+/*
+ * Draw each level from the one above in the same BO: the mean of four
+ * NEAREST samples at the centres of each 2x2 texel group, LOD clamped to
+ * the source level.  A bilinear sample at the group corner is off by up
+ * to 15 LSB from 1600-texel sources (coordinate precision); centres keep
+ * half a texel of margin (within 1 LSB, rung mipgen4).  Like the CPU path
+ * a single row or column is used alone and the last of an odd count is
+ * dropped.  Nothing waits for the GPU or touches the CPU mapping.  Returns
+ * the first level not generated.
+ */
+static unsigned
+chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
+                            struct chrome9_resource *resource,
+                            unsigned base_level, unsigned last_level)
+{
+   static const unsigned corner[6][2] = {
+      { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 },
+   };
+   static const struct drm_chrome9_fragment_source temp[7] = {
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 0, { 0, 1, 2, 3 }, 0, 0 },
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 1, { 0, 1, 2, 3 }, 0, 0 },
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 2, { 0, 1, 2, 3 }, 0, 0 },
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 3, { 0, 1, 2, 3 }, 0, 0 },
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 4, { 0, 1, 2, 3 }, 0, 0 },
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 5, { 0, 1, 2, 3 }, 0, 0 },
+      { DRM_CHROME9_FRAGMENT_FILE_TEMP, 6, { 0, 1, 2, 3 }, 0, 0 },
+   };
+   /* Temps are written once: tk = TEX vk, t4..t6 sums, colour t6 / 4. */
+   const struct drm_chrome9_fragment_instruction program[8] = {
+#define CHROME9_MIP_TEX(k) \
+      { .op = DRM_CHROME9_FRAGMENT_OP_TEX, \
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, k, 0xf, 0 }, \
+        .src = { { DRM_CHROME9_FRAGMENT_FILE_VARYING, k, { 0, 1, 2, 3 }, \
+                   0, 0 } } }
+      CHROME9_MIP_TEX(0), CHROME9_MIP_TEX(1),
+      CHROME9_MIP_TEX(2), CHROME9_MIP_TEX(3),
+#undef CHROME9_MIP_TEX
+      { .op = DRM_CHROME9_FRAGMENT_OP_ADD,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 4, 0xf, 0 },
+        .src = { temp[0], temp[1] } },
+      { .op = DRM_CHROME9_FRAGMENT_OP_ADD,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 5, 0xf, 0 },
+        .src = { temp[2], temp[3] } },
+      { .op = DRM_CHROME9_FRAGMENT_OP_ADD,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 6, 0xf, 0 },
+        .src = { temp[4], temp[5] } },
+      { .op = DRM_CHROME9_FRAGMENT_OP_MUL,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+        .src = { temp[6], { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
+                            { 0, 1, 2, 3 }, 0, 0 } } },
+   };
+   const uint32_t quarter[4] = {
+      fui(0.25f), fui(0.25f), fui(0.25f), fui(0.25f),
+   };
+   struct pipe_resource *pres = &resource->base;
+   const bool bgra = pres->format == PIPE_FORMAT_B8G8R8A8_UNORM;
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   struct drm_chrome9_fragment_texture_state texture = { 0 };
+   struct drm_chrome9_fragment_vertex vertices[6];
+   unsigned first_row = 0;
+   uint32_t base = 0;
+
+   if (!ctx->draw_fragment_program ||
+       !chrome9_screen_has_capability2(ctx->base.screen,
+                                       DRM_CHROME9_CAP2_DESTINATION_OFFSET) ||
+       !resource->guarded || resource->guarded_shared ||
+       resource->sampler_unsupported || resource->parent ||
+       (pres->target != PIPE_TEXTURE_2D && pres->target != PIPE_TEXTURE_1D) ||
+       (!bgra && pres->format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
+       pres->last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
+       !debug_get_bool_option("CHROME9_GPU_MIPMAP", true))
+      return base_level + 1;
+   for (unsigned level = base_level + 1; level <= last_level; level++)
+      if (!chrome9_mipmap_window(resource, level, &base, &first_row))
+         return base_level + 1;
+
+   texture.handle = resource->bo.handle;
+   texture.format = bgra ? DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888 :
+                           DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888;
+   texture.width = pres->width0;
+   texture.height = pres->height0;
+   texture.last_level = pres->last_level;
+   texture.min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   texture.mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   texture.mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NEAREST;
+   texture.wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   texture.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   for (unsigned level = 0; level <= pres->last_level; level++) {
+      if (resource->level_offset[level] > UINT32_MAX)
+         return base_level + 1;
+      texture.level_offset[level] = resource->level_offset[level];
+      texture.level_pitch[level] = resource->level_stride[level];
+   }
+
+   /* Retained draws and a render shadow of the source land first. */
+   chrome9_context_sync_resource(ctx, pres, PIPE_MAP_READ);
+   for (unsigned level = base_level + 1; level <= last_level; level++) {
+      const unsigned sw = u_minify(pres->width0, level - 1);
+      const unsigned sh = u_minify(pres->height0, level - 1);
+      const unsigned w = u_minify(pres->width0, level);
+      const unsigned h = u_minify(pres->height0, level);
+      const float s1 = sw == 1 ? 1.0f : 2.0f * w / sw;
+      const float t1 = sh == 1 ? 1.0f : 2.0f * h / sh;
+      /* Half a source texel to either side of the group corner. */
+      const float ds = sw == 1 ? 0.0f : 0.5f / sw;
+      const float dt = sh == 1 ? 0.0f : 0.5f / sh;
+      struct drm_chrome9_draw_fragment_program draw = {
+         .destination_handle = resource->bo.handle,
+         .flags = DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED,
+         .triangle_count = 2,
+         .width = w,
+         .destination_format = bgra ?
+            DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+            DRM_CHROME9_DESTINATION_FORMAT_BGRX8888,
+         .instruction_count = ARRAY_SIZE(program),
+         .constant_count = 1,
+         .texture_count = 1,
+         .varying_count = 4,
+         .abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION,
+         .vertices_ptr = (uintptr_t)vertices,
+         .instructions_ptr = (uintptr_t)program,
+         .constants_ptr = (uintptr_t)quarter,
+         .textures_ptr = (uintptr_t)&texture,
+      };
+
+      chrome9_mipmap_window(resource, level, &base, &first_row);
+      draw.destination_offset = base;
+      draw.destination_pitch = resource->level_stride[level];
+      draw.height = h + first_row;
+      if (first_row) {
+         draw.scissor.flags = DRM_CHROME9_SCISSOR_ENABLE;
+         draw.scissor.max_x = w;
+         draw.scissor.min_y = first_row;
+         draw.scissor.max_y = h + first_row;
+      }
+      texture.min_lod_s5_5 = (level - 1) * 32;
+      texture.max_lod_s5_5 = (level - 1) * 32;
+      memset(vertices, 0, sizeof(vertices));
+      for (unsigned v = 0; v < 6; v++) {
+         /* Pixel centres are at integer window coordinates. */
+         vertices[v].x_16_16 = (int32_t)(corner[v][0] * w << 16) - 0x8000;
+         vertices[v].y_16_16 =
+            (int32_t)((first_row + corner[v][1] * h) << 16) - 0x8000;
+         vertices[v].rhw_float = fui(1.0f);
+         for (unsigned k = 0; k < 4; k++) {
+            vertices[v].varying[k][0] =
+               fui(corner[v][0] * s1 + (k & 1 ? ds : -ds));
+            vertices[v].varying[k][1] =
+               fui(corner[v][1] * t1 + (k & 2 ? dt : -dt));
+            vertices[v].varying[k][3] = fui(1.0f);
+         }
+      }
+      if (!chrome9_draw_fragment_program(fd, &draw))
+         return level;
+   }
+   return last_level + 1;
+}
+
 bool
 chrome9_generate_mipmap(struct pipe_context *pipe,
                         struct pipe_resource *pres,
@@ -1153,6 +1388,16 @@ chrome9_generate_mipmap(struct pipe_context *pipe,
       for (unsigned level = base_level; level <= last_level; level++)
          if (!chrome9_mipmap_level_valid(resource, level, layer, cpp))
             return false;
+
+   if (first_layer == last_layer && pres->target != PIPE_TEXTURE_CUBE) {
+      unsigned level = chrome9_generate_mipmap_gpu(chrome9_context(pipe),
+                                                   resource, base_level,
+                                                   last_level);
+
+      if (level > last_level)
+         return true;
+      base_level = level - 1;
+   }
 
    /* The first level may still be queued in a retained GPU draw batch. */
    chrome9_draw_flush_batch(chrome9_context(pipe));
