@@ -2660,6 +2660,11 @@ static int chrome9_get_param_ioctl(struct drm_device *drm, void *data,
 		if (chrome9_engine_ready(cdev) && cdev->sl_ready)
 			args->value |= DRM_CHROME9_CAP2_LOCAL_MEMORY;
 		break;
+	case DRM_CHROME9_PARAM_VS_FLOW_DEPTH:
+		args->value = chrome9_engine_ready(cdev) &&
+			      chrome9_hw_tcl_enabled() ?
+			      chrome9_engine_vs_flow_depth() : 0;
+		break;
 	case DRM_CHROME9_PARAM_BAR0_SIZE:
 	case DRM_CHROME9_PARAM_BAR1_SIZE:
 	case DRM_CHROME9_PARAM_BAR2_SIZE:

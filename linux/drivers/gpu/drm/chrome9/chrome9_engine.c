@@ -309,10 +309,17 @@ module_param_named(vs_flow, chrome9_vs_flow, bool, 0400);
 MODULE_PARM_DESC(vs_flow,
 	"Hardware TCL static flow control, REP i# and IF b# (default: true)");
 
-static uint chrome9_vs_flow_depth = 1;
+/* IF nests exact at least 4 deep on silicon (rung vsnest). */
+static uint chrome9_vs_flow_depth = 4;
 module_param_named(vs_flow_depth, chrome9_vs_flow_depth, uint, 0600);
 MODULE_PARM_DESC(vs_flow_depth,
-	"Debug: static flow nesting depth, 1..4; REP never nests (default: 1, the vendor limit)");
+	"Static flow nesting depth, 1..4; REP never nests (default: 4, the vendor uses 1)");
+
+u32 chrome9_engine_vs_flow_depth(void)
+{
+	return READ_ONCE(chrome9_vs_flow) ?
+	       clamp(READ_ONCE(chrome9_vs_flow_depth), 1U, 4U) : 0;
+}
 
 static bool chrome9_vs_relative = true;
 module_param_named(vs_relative, chrome9_vs_relative, bool, 0400);
@@ -13422,10 +13429,7 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		return ret;
 	tcl->clip_mask = args->clip_distance_mask;
 	tcl->re = READ_ONCE(chrome9_tcl_re);
-	if (READ_ONCE(chrome9_vs_flow)) {
-		tcl->flow.max_depth = clamp(READ_ONCE(chrome9_vs_flow_depth),
-					    1U, 4U);
-	}
+	tcl->flow.max_depth = chrome9_engine_vs_flow_depth();
 	if (READ_ONCE(chrome9_vs_relative)) {
 		tcl->flow.relative = true;
 		tcl->flow.relative_raw = READ_ONCE(chrome9_vs_relative_re);
