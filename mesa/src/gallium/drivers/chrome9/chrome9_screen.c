@@ -531,6 +531,8 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    caps->device_id = screen->device_id;
    caps->endianness = PIPE_ENDIAN_NATIVE;
    caps->max_texture_2d_size = 2048;
+   /* The sampler takes an s5.5 bias: -16 to 15.97. */
+   caps->max_texture_lod_bias = 15.0f;
    /* 3D: POT level zero in the sampler, every other volume in llvmpipe. */
    if (screen->capabilities & DRM_CHROME9_CAP_DRAW_TEXTURED_TRIANGLE &&
        (chrome9_screen_has_capability2(&screen->base,
