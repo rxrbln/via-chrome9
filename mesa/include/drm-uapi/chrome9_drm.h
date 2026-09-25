@@ -39,6 +39,7 @@ extern "C" {
 #define DRM_CHROME9_GEM_INFO	0x21
 #define DRM_CHROME9_QUERY	0x22
 #define DRM_CHROME9_FENCE	0x23
+#define DRM_CHROME9_GEM_BUSY	0x24
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -133,6 +134,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_FENCE \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_FENCE, \
 		 struct drm_chrome9_fence)
+#define DRM_IOCTL_CHROME9_GEM_BUSY \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GEM_BUSY, \
+		 struct drm_chrome9_gem_busy)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -324,6 +328,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_LOCAL_MEMORY		(1ULL << 29)
 /* Fragment draw color_count 2..4: colour targets written by oC1..oC3. */
 #define DRM_CHROME9_CAP2_COLOR_TARGETS		(1ULL << 30)
+/* GEM_BUSY. */
+#define DRM_CHROME9_CAP2_GEM_BUSY		(1ULL << 31)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1782,6 +1788,15 @@ struct drm_chrome9_draw_vertex_programs {
  */
 #define DRM_CHROME9_FENCE_OP_LAST	0U
 #define DRM_CHROME9_FENCE_OP_WAIT	1U
+
+/* GEM_BUSY result: a queued job uses (USE) or writes (WRITE) the object. */
+#define DRM_CHROME9_GEM_BUSY_USE	(1U << 0)
+#define DRM_CHROME9_GEM_BUSY_WRITE	(1U << 1)
+
+struct drm_chrome9_gem_busy {
+	__u32 handle;
+	__u32 busy;	/* out: DRM_CHROME9_GEM_BUSY_* */
+};
 
 struct drm_chrome9_fence {
 	__u32 op;
