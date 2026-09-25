@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "draw/draw_context.h"
+#include "draw/draw_private.h"
 #include "draw/draw_vbuf.h"
 #include "draw/draw_vertex.h"
 #include "pipe/p_screen.h"
@@ -438,18 +439,28 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
          if (slot >= VARYING_SLOT_VAR0)
             generic[i] = draw_find_shader_output(crender->ctx->draw,
                TGSI_SEMANTIC_GENERIC, slot - VARYING_SLOT_VAR0);
-         else if (slot >= VARYING_SLOT_TEX0)
+         else if (slot >= VARYING_SLOT_TEX0) {
+            const unsigned n = slot - VARYING_SLOT_TEX0;
+
+            /* The wide-point stage adds replaced sprite coordinates as an
+             * extra GENERIC n output behind the shader outputs. */
             generic[i] = draw_find_shader_output(crender->ctx->draw,
-               TGSI_SEMANTIC_TEXCOORD, slot - VARYING_SLOT_TEX0);
+                                                 TGSI_SEMANTIC_GENERIC, n);
+            if (generic[i] >= 0 && (unsigned)generic[i] <
+                draw_current_shader_outputs(crender->ctx->draw))
+               generic[i] = -1;
+            if (generic[i] < 0)
+               generic[i] = draw_find_shader_output(crender->ctx->draw,
+                                                     TGSI_SEMANTIC_TEXCOORD, n);
+         }
          else
             generic[i] = draw_find_shader_output(crender->ctx->draw,
                                                   TGSI_SEMANTIC_GENERIC, i);
+         /* A varying the VS never writes (or a replaced sprite
+          * coordinate) is undefined: any output fills its lanes. */
          if (generic[i] < 0)
-            generic[i] = draw_find_shader_output(crender->ctx->draw,
-                                                  TGSI_SEMANTIC_TEXCOORD, i);
+            generic[i] = position;
          draw_emit_vertex_attr(&crender->vinfo, EMIT_4F, generic[i]);
-         if (generic[i] < 0)
-            crender->layout_valid = false;
       }
       draw_compute_vertex_size(&crender->vinfo);
       crender->layout_valid &= crender->vinfo.size ==
