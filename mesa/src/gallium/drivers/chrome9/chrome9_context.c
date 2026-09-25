@@ -3659,6 +3659,13 @@ chrome9_ps_magnitude_bound_uncached(nir_scalar scalar,
       b = chrome9_ps_magnitude_bound(
          chrome9_ps_alu_scalar(alu, 1, scalar.comp), proof);
       return a * b;
+   case nir_op_ffma:
+      a = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 0, scalar.comp), proof);
+      b = chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 1, scalar.comp), proof);
+      return a * b + chrome9_ps_magnitude_bound(
+         chrome9_ps_alu_scalar(alu, 2, scalar.comp), proof);
    case nir_op_fdot2:
    case nir_op_fdot3:
    case nir_op_fdot4: {
@@ -3730,6 +3737,7 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
       case nir_op_fadd:
       case nir_op_fsub:
       case nir_op_fmul:
+      case nir_op_ffma:
       case nir_op_fdot2:
       case nir_op_fdot3:
       case nir_op_fdot4:
@@ -3760,6 +3768,9 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
    case nir_op_fmax:
    case nir_op_fpow:
       sources = 2;
+      break;
+   case nir_op_ffma:
+      sources = 3;
       break;
    case nir_op_fdot2:
    case nir_op_fdot3:
@@ -5677,6 +5688,45 @@ chrome9_nir_rewrite_shared_saturate_max(nir_builder *b, nir_instr *instr,
    return false;
 }
 
+/* The pixel MAD rounds like the unfused pair it replaces. */
+static bool
+chrome9_nir_fmad_to_ffma(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   (void)b;
+   (void)data;
+   if (alu->op != nir_op_fmad)
+      return false;
+   alu->op = nir_op_ffma;
+   return true;
+}
+
+/* Fuse MUL+ADD into MAD and fold negations into SUB and the MAD A
+ * operand before the one-record-per-op backend sees the program. */
+static void
+chrome9_nir_optimize_semantic(nir_shader *nir)
+{
+   bool progress;
+
+   do {
+      progress = false;
+      progress |= nir_opt_algebraic(nir);
+      progress |= nir_opt_constant_folding(nir);
+      progress |= nir_opt_copy_prop(nir);
+      progress |= nir_opt_cse(nir);
+      progress |= nir_opt_dce(nir);
+   } while (progress);
+   do {
+      progress = false;
+      progress |= nir_opt_algebraic_late(nir);
+      progress |= nir_opt_constant_folding(nir);
+      progress |= nir_opt_copy_prop(nir);
+      progress |= nir_opt_cse(nir);
+      progress |= nir_opt_dce(nir);
+   } while (progress);
+   nir_shader_alu_pass(nir, chrome9_nir_fmad_to_ffma,
+                       nir_metadata_control_flow, NULL);
+}
+
 static bool
 chrome9_compile_native_fs(struct chrome9_context *ctx,
                           struct chrome9_shader *shader, nir_shader *nir)
@@ -5696,6 +5746,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
    nir_shader_instructions_pass(semantic_nir,
       chrome9_nir_rewrite_shared_saturate_max,
       nir_metadata_control_flow, NULL);
+   chrome9_nir_optimize_semantic(semantic_nir);
    nir_opt_shrink_vectors(semantic_nir, true);
    nir_opt_dce(semantic_nir);
 

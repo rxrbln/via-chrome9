@@ -523,6 +523,10 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    /* The PS rounds with FRC of |x|: FRC of a negative x can return 1.0. */
    screen->fs_nir_options = chrome9_nir_options;
    screen->fs_nir_options.lower_fceil = false;
+   /* MAD and SUB are single records: fuse and recombine late. */
+   screen->fs_nir_options.float_mul_add32 =
+      nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse;
+   screen->fs_nir_options.has_fsub = true;
    screen->base.nir_options[MESA_SHADER_FRAGMENT] = &screen->fs_nir_options;
    chrome9_init_shader_caps(screen);
    caps = (struct pipe_caps *)&screen->base.caps;
