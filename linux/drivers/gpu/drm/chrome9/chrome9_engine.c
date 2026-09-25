@@ -210,11 +210,11 @@ module_param_named(texture_border, chrome9_texture_border, bool, 0600);
 MODULE_PARM_DESC(texture_border,
 	"Clamp-to-border fragment texture wrapping (default: true)");
 
-static bool chrome9_texture_mirror_once;
+static bool chrome9_texture_mirror_once = true;
 module_param_named(texture_mirror_once, chrome9_texture_mirror_once, bool,
 		   0600);
 MODULE_PARM_DESC(texture_mirror_once,
-	"Mirror-once fragment texture wrapping (default: false)");
+	"Mirror-once fragment texture wrapping (default: true)");
 
 static bool chrome9_blend_equation = true;
 module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
