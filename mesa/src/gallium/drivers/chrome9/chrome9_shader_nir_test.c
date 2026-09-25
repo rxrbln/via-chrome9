@@ -868,7 +868,7 @@ check_equal_zero_select_compilation(struct chrome9_context *context,
       shader.supported && shader.semantic_fs_valid &&
       shader.native_fs_valid &&
       shader.semantic_equal_zero_input_mask == 1u << 6 &&
-      abs_count == 1 && sub_count == 1 && cmp_count == 1 :
+      abs_count == 1 && sub_count == 0 && cmp_count == 1 :
       !shader.supported && !shader.semantic_fs_valid;
    if (!valid)
       fprintf(stderr, "equal-zero select compilation failed: ref=%g "
@@ -1938,13 +1938,14 @@ check_condition_lowering(struct chrome9_context *context)
    return true;
 }
 
-/* Equality on an interpolated varying is not exact; ordered compares are. */
+/* Equality on an interpolated varying is not exact; ordered compares are,
+ * and equality to zero composes under the draw-time 0/+-1 guard. */
 static bool
 check_interpolated_equality(struct chrome9_context *context)
 {
    bool valid = true;
 
-   for (unsigned test = 0; test < 3; test++) {
+   for (unsigned test = 0; test < 4; test++) {
       nir_builder b = nir_builder_init_simple_shader(
          MESA_SHADER_FRAGMENT, &options, "chrome9-interpolated-equality");
       struct chrome9_shader shader = { 0 };
@@ -1959,8 +1960,12 @@ check_interpolated_equality(struct chrome9_context *context)
                                        nir_channel(&b, u, 0)) :
                    test == 1 ? nir_ball_fequal2(&b, nir_channels(&b, v, 3),
                                                 nir_channels(&b, u, 3)) :
-                               nir_flt(&b, nir_channel(&b, v, 0),
-                                       nir_channel(&b, u, 0));
+                   test == 2 ? nir_flt(&b, nir_channel(&b, v, 0),
+                                       nir_channel(&b, u, 0)) :
+                               nir_iand(&b, nir_feq_imm(&b, nir_channel(&b, v, 2),
+                                                        0.0),
+                                        nir_fge(&b, nir_channel(&b, u, 0),
+                                                nir_channel(&b, u, 1)));
 
       b.shader->info.io_lowered = true;
       nir_store_output(&b, nir_bcsel(&b, p,
@@ -1972,9 +1977,11 @@ check_interpolated_equality(struct chrome9_context *context)
       nir_recompute_io_bases(b.shader,
                              nir_var_shader_in | nir_var_shader_out);
       chrome9_compile_fs_nir(context, &shader, b.shader);
-      if (shader.supported != (test == 2)) {
+      if (shader.supported != (test >= 2) ||
+          shader.semantic_equal_zero_input_mask != (test == 3 ? 1u << 2 : 0)) {
          fprintf(stderr, "interpolated equality case %u failed: "
-                 "supported=%u\n", test, shader.supported);
+                 "supported=%u guard=%08x\n", test, shader.supported,
+                 shader.semantic_equal_zero_input_mask);
          valid = false;
       }
       ralloc_free(b.shader);

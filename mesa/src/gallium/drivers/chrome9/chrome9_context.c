@@ -3023,11 +3023,6 @@ struct chrome9_ps_nir_builder {
    uint8_t volume_sampler_mask;
    bool allow_bias;
    struct {
-      nir_def *predicate;
-      uint8_t temp;
-   } equal_zero[16];
-   uint8_t equal_zero_count;
-   struct {
       nir_scalar predicate;
       struct chrome9_ps_condition condition;
    } condition[CHROME9_PS_MAX_INSTRUCTIONS];
@@ -4220,109 +4215,6 @@ chrome9_ps_lower_unit_interval_select(struct chrome9_ps_nir_builder *builder,
                                          condition_temp, source);
 }
 
-/* Ordered FEQ against zero is true for either signed zero and false for every
- * finite nonzero value.  ABS followed by 0-ABS gives CMP that sign test, but
- * only if the compared varying cannot interpolate through zero or enter an
- * exceptional/denormal domain.  The recorded lane is checked across the
- * complete post-vertex draw before any command is submitted. */
-static bool
-chrome9_ps_lower_equal_zero_select(struct chrome9_ps_nir_builder *builder,
-                                   nir_alu_instr *select, nir_def *def,
-                                   struct chrome9_ps_source *source)
-{
-   static const uint32_t zero[4] = { 0 };
-   nir_scalar predicate, lhs, rhs;
-   nir_alu_instr *compare;
-   struct chrome9_ps_source input, zero_source;
-   struct chrome9_ps_instruction *absolute, *negative_absolute;
-   uint8_t absolute_temp, condition_temp;
-   unsigned components = def->num_components;
-   unsigned dynamic_side;
-
-   if (select->op != nir_op_bcsel || !components || components > 4 ||
-       !select->src[0].src.ssa ||
-       select->src[0].src.ssa->bit_size != 1 ||
-       select->src[0].swizzle[0] >=
-          select->src[0].src.ssa->num_components)
-      return false;
-   for (unsigned c = 1; c < components; c++)
-      if (select->src[0].swizzle[c] != select->src[0].swizzle[0])
-         return false;
-   predicate = nir_scalar_resolved(select->src[0].src.ssa,
-                                   select->src[0].swizzle[0]);
-   if (predicate.comp || nir_def_instr(predicate.def)->type !=
-                            nir_instr_type_alu)
-      return false;
-   compare = nir_instr_as_alu(nir_def_instr(predicate.def));
-   if (compare->op != nir_op_feq ||
-       compare->def.num_components != 1 ||
-       (compare->fp_math_ctrl & ~(nir_fp_preserve_signed_zero |
-                                  nir_fp_preserve_inf |
-                                  nir_fp_preserve_nan)) ||
-       !compare->src[0].src.ssa || !compare->src[1].src.ssa ||
-       compare->src[0].src.ssa->bit_size != 32 ||
-       compare->src[1].src.ssa->bit_size != 32 ||
-       compare->src[0].swizzle[0] >=
-          compare->src[0].src.ssa->num_components ||
-       compare->src[1].swizzle[0] >=
-          compare->src[1].src.ssa->num_components)
-      return false;
-   lhs = nir_scalar_resolved(compare->src[0].src.ssa,
-                             compare->src[0].swizzle[0]);
-   rhs = nir_scalar_resolved(compare->src[1].src.ssa,
-                             compare->src[1].swizzle[0]);
-   if (nir_scalar_is_const(lhs) &&
-       (nir_scalar_as_uint(lhs) & 0x7fffffff) == 0)
-      dynamic_side = 1;
-   else if (nir_scalar_is_const(rhs) &&
-            (nir_scalar_as_uint(rhs) & 0x7fffffff) == 0)
-      dynamic_side = 0;
-   else
-      return false;
-
-   for (unsigned i = 0; i < builder->equal_zero_count; i++)
-      if (builder->equal_zero[i].predicate == predicate.def)
-         return chrome9_ps_emit_scalar_select(builder, select, def,
-                                               builder->equal_zero[i].temp,
-                                               source);
-   if (builder->equal_zero_count >= ARRAY_SIZE(builder->equal_zero) ||
-       builder->next_temp > CHROME9_PS_MAX_VIRTUAL_TEMPS - 2 ||
-       !chrome9_ps_lower_alu_source(builder, &compare->src[dynamic_side],
-                                    1, &input) ||
-       input.file != CHROME9_PS_SOURCE_TEXTURE || input.id >= 8 ||
-       input.swizzle[0] > CHROME9_PS_SWIZZLE_W ||
-       !chrome9_ps_immediate(builder, zero, 1, &zero_source))
-      return false;
-
-   absolute_temp = builder->next_temp++;
-   condition_temp = builder->next_temp++;
-   absolute = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_ABS);
-   negative_absolute = chrome9_ps_append_instruction(builder,
-                                                      CHROME9_PS_OPCODE_SUB);
-   if (!absolute || !negative_absolute)
-      return false;
-   absolute->destination.file = CHROME9_PS_DESTINATION_TEMP;
-   absolute->destination.id = absolute_temp;
-   absolute->destination.writemask = 1;
-   absolute->source[0] = input;
-   negative_absolute->destination.file = CHROME9_PS_DESTINATION_TEMP;
-   negative_absolute->destination.id = condition_temp;
-   negative_absolute->destination.writemask = 1;
-   negative_absolute->source[0] = zero_source;
-   negative_absolute->source[1].file = CHROME9_PS_SOURCE_TEMP;
-   negative_absolute->source[1].id = absolute_temp;
-   negative_absolute->source[1].swizzle[0] = CHROME9_PS_SWIZZLE_X;
-   for (unsigned c = 1; c < 4; c++)
-      negative_absolute->source[1].swizzle[c] = CHROME9_PS_SWIZZLE_ZERO;
-
-   builder->equal_zero[builder->equal_zero_count].predicate = predicate.def;
-   builder->equal_zero[builder->equal_zero_count++].temp = condition_temp;
-   builder->equal_zero_input_mask |=
-      1u << (input.id * 4 + input.swizzle[0]);
-   return chrome9_ps_emit_scalar_select(builder, select, def,
-                                         condition_temp, source);
-}
-
 static bool
 chrome9_ps_lower_def(struct chrome9_ps_nir_builder *builder, nir_def *def,
                      struct chrome9_ps_source *source);
@@ -4467,6 +4359,7 @@ chrome9_ps_lower_compare_lanes(struct chrome9_ps_nir_builder *builder,
    const unsigned sources = convert ? 1 : 2;
    const unsigned mask = BITFIELD_MASK(count);
    int zero_side = convert ? 1 : -1;
+   bool interpolated = false;
    uint8_t temp = 0;
 
    if (alu->op != nir_op_fge && alu->op != nir_op_flt && !equality)
@@ -4482,10 +4375,10 @@ chrome9_ps_lower_compare_lanes(struct chrome9_ps_nir_builder *builder,
          if (lanes[c] >= alu->def.num_components ||
              (convert ? !chrome9_ps_canonical_bool(scalar) :
               !boolean && !chrome9_ps_default_finite(scalar,
-                                                     &builder->proof)) ||
-             (equality && !boolean && !convert &&
-              !chrome9_ps_uninterpolated(scalar, &builder->proof)))
+                                                     &builder->proof)))
             return false;
+         interpolated |= equality && !boolean && !convert &&
+                         !chrome9_ps_uninterpolated(scalar, &builder->proof);
          operand[s].swizzle[c] = alu->src[s].swizzle[lanes[c]];
       }
    }
@@ -4505,6 +4398,21 @@ chrome9_ps_lower_compare_lanes(struct chrome9_ps_nir_builder *builder,
       if (!chrome9_ps_lower_alu_source(builder, &operand[!zero_side], count,
                                        &source[0]))
          return false;
+      /* A varying compared to zero is exact when the draw proves each
+       * triangle's lane bit-identical 0 or +-1 (equal_zero_input_mask). */
+      if (interpolated) {
+         if (source[0].file != CHROME9_PS_SOURCE_TEXTURE ||
+             source[0].id >= 8 || source[0].modifier)
+            return false;
+         for (unsigned c = 0; c < count; c++) {
+            if (source[0].swizzle[c] > CHROME9_PS_SWIZZLE_W)
+               return false;
+            builder->equal_zero_input_mask |=
+               1u << (source[0].id * 4 + source[0].swizzle[c]);
+         }
+      }
+   } else if (interpolated) {
+      return false;
    } else {
       for (unsigned s = 0; s < 2; s++)
          if (!(boolean ?
@@ -5456,7 +5364,6 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
    if (alu->op == nir_op_bcsel)
       return chrome9_ps_lower_unit_interval_select(builder, alu, def,
                                                     source) ||
-             chrome9_ps_lower_equal_zero_select(builder, alu, def, source) ||
              chrome9_ps_lower_general_select(builder, alu, def, source);
    if (alu->op == nir_op_b2f32)
       return chrome9_ps_lower_general_select(builder, alu, def, source);
