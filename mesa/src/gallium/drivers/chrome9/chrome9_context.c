@@ -8754,6 +8754,15 @@ chrome9_update_sprite_flip(struct chrome9_context *ctx,
    }
 }
 
+static bool
+chrome9_fs_kills(const struct chrome9_shader *fs)
+{
+   for (unsigned i = 0; i < fs->semantic_fs_ir.count; i++)
+      if (fs->semantic_fs_ir.instruction[i].op == CHROME9_PS_OPCODE_KILL)
+         return true;
+   return false;
+}
+
 static void
 chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                  unsigned drawid_offset,
@@ -8793,15 +8802,19 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
    /* Only generic fragment programs carry the query tag, and only with
-    * the hardware counter; 3D textures outside the sampler's contract need
-    * llvmpipe.  llvmpipe's query counts. */
-   if ((chrome9_query_counting(ctx) &&
-        (!ctx->occlusion_query ||
-         !chrome9_generic_fragment_program(ctx))) ||
+    * the hardware counter, which also counts the pixels a KILL discards
+    * (occlusion-query-discard); 3D textures outside the sampler's contract
+    * need llvmpipe.  llvmpipe's query counts. */
+   const bool counting = chrome9_query_counting(ctx);
+   const bool counted = ctx->occlusion_query &&
+                        chrome9_generic_fragment_program(ctx) &&
+                        !(counting && chrome9_fs_kills(ctx->fs));
+
+   if ((counting && !counted) ||
        chrome9_draw_needs_sw_textures(ctx)) {
       if (chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
          return;
-      if (!ctx->occlusion_query || !chrome9_generic_fragment_program(ctx))
+      if (!counted)
          chrome9_query_mark_inexact(ctx);
    }
 
