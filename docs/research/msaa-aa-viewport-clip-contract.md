@@ -126,6 +126,10 @@ for COPY and blend and a measured rule for shared triangle edges.
 
 ## Smooth-line special cycle
 
+Correction (2026-09-25, [chrome9-edge-aa-re.md](chrome9-edge-aa-re.md)):
+the special A20/A23 cycle below is taken only for chip family 6 (PCI 3371);
+on VX900 both vendor stacks set only A01 bit 5 and keep the normal line words.
+
 Both proprietary drivers show that H6 smooth lines require more state than
 A01 bit 5.  In the Windows line-list builder
 `VTGUModeDX32A:0x101f4f50..0x101f5136`, the effective-AA flag at context
