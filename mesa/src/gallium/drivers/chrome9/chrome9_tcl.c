@@ -97,6 +97,9 @@ struct tcl_builder {
    unsigned clip_enable;
    bool point_size;
    bool unit_temp[DRM_CHROME9_VERTEX_MAX_TEMPS];
+   /* Lanes written per fragment varying and of the primary colour. */
+   uint8_t varying_written[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+   uint8_t primary_written;
    /* Whole-register copies used to legalize read ports. */
    int16_t constant_temp[DRM_CHROME9_VERTEX_MAX_CONSTANTS];
    int16_t input_temp[DRM_CHROME9_VERTEX_MAX_INPUTS];
@@ -1068,7 +1071,41 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
                    CHROME9_TCL_ORIGIN_UNIT : CHROME9_TCL_ORIGIN_UNKNOWN;
       }
    }
+   if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_VARYING)
+      b->varying_written[index] |= mask;
+   else if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_PRIMARY)
+      b->primary_written |= mask;
    tcl_emit(b, &mov, 1);
+}
+
+/* The kernel requires whole colour and varying registers; lanes NIR left
+ * undefined (e.g. after dead store elimination) are written as zero. */
+static void
+tcl_fill_outputs(struct tcl_builder *b)
+{
+   struct drm_chrome9_vertex_instruction mov = {
+      .op = DRM_CHROME9_VERTEX_OP_MOV,
+      .src = { { DRM_CHROME9_VERTEX_FILE_TEMP, 0,
+                 { TCL_SEL_ZERO, TCL_SEL_ZERO, TCL_SEL_ZERO,
+                   TCL_SEL_ZERO } } },
+   };
+
+   for (unsigned v = 0; v < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; v++) {
+      if (!b->varying_written[v] || b->varying_written[v] == 0xf)
+         continue;
+      mov.dst.file = DRM_CHROME9_VERTEX_DEST_VARYING;
+      mov.dst.index = v;
+      mov.dst.writemask = ~b->varying_written[v] & 0xf;
+      u_foreach_bit(c, mov.dst.writemask)
+         b->p->origin[v][c] = CHROME9_TCL_ORIGIN_ZERO;
+      tcl_emit(b, &mov, 1);
+   }
+   if (b->primary_written && b->primary_written != 0xf) {
+      mov.dst.file = DRM_CHROME9_VERTEX_DEST_PRIMARY;
+      mov.dst.index = 0;
+      mov.dst.writemask = ~b->primary_written & 0xf;
+      tcl_emit(b, &mov, 1);
+   }
 }
 
 /* Whether a use of def is emitted inside a flow region (phi moves are). */
@@ -2308,6 +2345,8 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       tcl_skip_addresses(&b);
    }
    tcl_emit_list(&b, &b.impl->body);
+   if (!b.failed)
+      tcl_fill_outputs(&b);
    if (b.address_count && !b.failed)
       tcl_relative_finish(&b);
    if (indirect)
