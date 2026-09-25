@@ -34,7 +34,9 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | fragment TEX with LOD bias (TEXLDB, TAU op 3, bias in coordinate W), on by default | `dbadc6e` / `00785c4`, CAP2 bit 21 `texture_bias` | rung `texbias`; piglit glsl-lod-bias, glsl-fs-texture2d-bias |
 | exact `ftrunc` and `fceil` in the PS (FRC of \|x\| only) | Mesa `00785c4` | piglit glsl-fs-integer-multiplication, fs-ceil-* |
 | sampling depth of S8_UINT_Z24_UNORM (D24S8) textures with the X8Z24 sampler format | Mesa `16180ff` | piglit fbo-depthtex, texsubimage-depth-formats (+pbo) |
-| render to cube faces and mip levels (guarded shadow per image), base-level views | Mesa `d4eb87d` | `chrome9_gl_rtt_smoke` 8/8 |
+| render to cube faces and mip levels (guarded shadow per image when no direct view fits), base-level views | Mesa `d4eb87d` | `chrome9_gl_rtt_smoke` 8/8 |
+| direct render targets at non-zero levels and layers (256-byte aligned window, `destination_offset`), on by default | `77ca263` / `d298db6`, CAP2 bit 22 `destination_offset` | rungs `dstoff`, `reject`; `chrome9_gl_rtt_smoke`; `chrome9-mip-destination-re.md` |
+| GPU mipmap generation (level L from L-1 of one object, 4 NEAREST taps), on by default | Mesa `d298db6` | rung `mipgen` (within 1 LSB), piglit fbo-generatemipmap*, refract 7 -> 9 fps |
 | DXT1/3/5 incl. POT mip chains | `4b06bc2` / `58b8d2f` | `dxt d1..d6` (d2/d5 within 3 LSB), `m1`/`m2`, `chrome9_gl_cube_dxt_smoke` |
 | 2D COPY_RECT, KMS scanout, hardware cursor | | Xorg |
 
