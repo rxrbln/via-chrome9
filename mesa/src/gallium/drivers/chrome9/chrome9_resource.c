@@ -803,6 +803,9 @@ chrome9_resource_destroy(struct pipe_screen *screen,
    }
    else
       chrome9_screen_bo_destroy(screen, &cresource->bo);
+   util_dynarray_foreach(&cresource->spare_bos, struct chrome9_bo, bo)
+      chrome9_screen_bo_destroy(screen, bo);
+   util_dynarray_fini(&cresource->spare_bos);
    if (cresource->coarse_z.handle)
       chrome9_screen_bo_destroy(screen, &cresource->coarse_z);
    FREE(cresource);
@@ -917,6 +920,62 @@ struct chrome9_transfer {
    unsigned bytes;
 };
 
+/* A synchronized write to a buffer that queued jobs only read moves to
+ * fresh storage instead of waiting for them; the jobs keep the old object.
+ * The next map of the idle new storage writes in place. */
+static void
+chrome9_buffer_rename(struct chrome9_resource *resource, unsigned usage,
+                      const struct pipe_box *box)
+{
+   struct pipe_screen *screen = resource->base.screen;
+   const int fd = screen->get_screen_fd(screen);
+   struct chrome9_bo old = resource->bo, bo;
+   uint32_t busy;
+
+   if (resource->base.target != PIPE_BUFFER ||
+       (usage & (PIPE_MAP_READ | PIPE_MAP_UNSYNCHRONIZED |
+                 PIPE_MAP_PERSISTENT | PIPE_MAP_COHERENT)) ||
+       !(usage & PIPE_MAP_WRITE) || !old.handle_owned || old.shared ||
+       !old.map || chrome9_resource_is_local(resource) ||
+       !chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_GEM_BUSY) ||
+       !chrome9_bo_busy(fd, &old, &busy) ||
+       (busy & (DRM_CHROME9_GEM_BUSY_USE | DRM_CHROME9_GEM_BUSY_WRITE)) !=
+          DRM_CHROME9_GEM_BUSY_USE)
+      return;
+   /* An idle spare, else new storage. */
+   bo.handle = 0;
+   util_dynarray_foreach(&resource->spare_bos, struct chrome9_bo, spare) {
+      if (chrome9_bo_busy(fd, spare, &busy) && !busy) {
+         bo = *spare;
+         *spare = util_dynarray_pop(&resource->spare_bos, struct chrome9_bo);
+         break;
+      }
+   }
+   if (!bo.handle) {
+      if (!chrome9_bo_create(fd, old.size, old.create_flags, &bo))
+         return;
+      if (resource->explicit_access &&
+          !chrome9_bo_cpu_access(fd, &bo, DRM_CHROME9_GEM_CPU_EXPLICIT)) {
+         chrome9_bo_destroy(fd, &bo);
+         return;
+      }
+   }
+   if (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) {
+      /* Nothing survives. */
+   } else if (usage & PIPE_MAP_DISCARD_RANGE) {
+      memcpy(bo.map, old.map, box->x);
+      memcpy((uint8_t *)bo.map + box->x + box->width,
+             (const uint8_t *)old.map + box->x + box->width,
+             old.size - box->x - box->width);
+   } else {
+      memcpy(bo.map, old.map, old.size);
+   }
+   resource->bo = bo;
+   util_dynarray_append(&resource->spare_bos, old);
+   /* The copied bytes are CPU writes to the new object. */
+   chrome9_resource_cpu_access_range(resource, true, 0, 0);
+}
+
 static void *
 chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                      unsigned level, unsigned usage,
@@ -938,9 +997,11 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * through a direct persistent mapping until submitted and resolved. */
    if (resource->target != PIPE_BUFFER)
       chrome9_context_sync_resource(chrome9_context(pipe), resource, usage);
-   else if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
+   else if (!(usage & PIPE_MAP_UNSYNCHRONIZED)) {
       /* Queued draws may still read the buffer. */
       chrome9_tcl_batch_flush_resource(chrome9_context(pipe), resource);
+      chrome9_buffer_rename(cresource, usage, box);
+   }
    /* An unsynchronized buffer write touches no bytes a queued job reads:
     * record the range without waiting for the device. */
    if (resource->target == PIPE_BUFFER &&

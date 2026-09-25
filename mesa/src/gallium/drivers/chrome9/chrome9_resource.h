@@ -12,6 +12,7 @@
 struct chrome9_context;
 #include "pipe/p_state.h"
 #include "util/macros.h"
+#include "util/u_dynarray.h"
 
 struct pipe_context;
 struct pipe_screen;
@@ -51,6 +52,9 @@ struct chrome9_resource {
    /* Counts announced CPU writes, so a render shadow can tell whether the
     * surface changed since it was last synchronized. */
    uint32_t cpu_write_generation;
+   /* Buffers: earlier storage of renamed maps (chrome9_bo), reused once
+    * the jobs reading it retired. */
+   struct util_dynarray spare_bos;
    /* Unique per created resource, unlike a reusable address. */
    uint64_t serial;
    /* CAP2_COARSE_Z buffer of a depth surface, one 16-byte entry per 8x8
