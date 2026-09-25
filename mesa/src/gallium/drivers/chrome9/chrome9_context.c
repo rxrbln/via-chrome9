@@ -7608,6 +7608,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS);
    ctx->blend_equation = chrome9_screen_has_capability2(
       screen, DRM_CHROME9_CAP2_BLEND_EQUATION);
+   ctx->blend_color_factors = chrome9_screen_has_capability2(
+      screen, DRM_CHROME9_CAP2_BLEND_COLOR);
    ctx->alpha_test_supported =
       !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =

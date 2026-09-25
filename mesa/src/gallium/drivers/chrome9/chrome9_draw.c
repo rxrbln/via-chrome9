@@ -139,12 +139,34 @@ chrome9_generic_fragment_program(const struct chrome9_context *ctx)
            (ctx->fragment_primary && ctx->fs->semantic_input_mask == 1));
 }
 
-/* Draws of a counting query interval need the tag only this path carries. */
+static bool
+chrome9_blend_factor_constant(unsigned factor)
+{
+   return factor == PIPE_BLENDFACTOR_CONST_COLOR ||
+          factor == PIPE_BLENDFACTOR_INV_CONST_COLOR ||
+          factor == PIPE_BLENDFACTOR_CONST_ALPHA ||
+          factor == PIPE_BLENDFACTOR_INV_CONST_ALPHA;
+}
+
+static bool
+chrome9_blend_uses_constant(const struct pipe_blend_state *state)
+{
+   const struct pipe_rt_blend_state *rt = state ? &state->rt[0] : NULL;
+
+   return rt && rt->blend_enable &&
+          (chrome9_blend_factor_constant(rt->rgb_src_factor) ||
+           chrome9_blend_factor_constant(rt->rgb_dst_factor) ||
+           chrome9_blend_factor_constant(rt->alpha_src_factor) ||
+           chrome9_blend_factor_constant(rt->alpha_dst_factor));
+}
+
+/* Counting query intervals and the blend colour exist only on this path. */
 static bool
 chrome9_use_generic_fragment_program(const struct chrome9_context *ctx)
 {
    return chrome9_generic_fragment_program(ctx) &&
-          (!ctx->fs->semantic_passthrough || chrome9_query_counting(ctx));
+          (!ctx->fs->semantic_passthrough || chrome9_query_counting(ctx) ||
+           chrome9_blend_uses_constant(ctx->blend));
 }
 
 /* A shadow TEX whose comparison the current FS variant computes. */
@@ -686,7 +708,8 @@ chrome9_triangle_nondegenerate(const int32_t x[3], const int32_t y[3])
 }
 
 static bool
-chrome9_blend_factor(unsigned factor, bool extended, uint32_t *result)
+chrome9_blend_factor(unsigned factor, bool extended, bool constant,
+                     uint32_t *result)
 {
    switch (factor) {
    case PIPE_BLENDFACTOR_ZERO:
@@ -722,6 +745,18 @@ chrome9_blend_factor(unsigned factor, bool extended, uint32_t *result)
    case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
       *result = DRM_CHROME9_BLEND_FACTOR_SRC_ALPHA_SATURATE;
       return extended;
+   case PIPE_BLENDFACTOR_CONST_COLOR:
+      *result = DRM_CHROME9_BLEND_FACTOR_CONST_COLOR;
+      return constant;
+   case PIPE_BLENDFACTOR_INV_CONST_COLOR:
+      *result = DRM_CHROME9_BLEND_FACTOR_INV_CONST_COLOR;
+      return constant;
+   case PIPE_BLENDFACTOR_CONST_ALPHA:
+      *result = DRM_CHROME9_BLEND_FACTOR_CONST_ALPHA;
+      return constant;
+   case PIPE_BLENDFACTOR_INV_CONST_ALPHA:
+      *result = DRM_CHROME9_BLEND_FACTOR_INV_CONST_ALPHA;
+      return constant;
    default:
       return false;
    }
@@ -754,7 +789,8 @@ chrome9_blend_func(unsigned func, bool equation, uint32_t *result)
 static bool
 chrome9_translate_blend(const struct pipe_blend_state *state,
                         struct drm_chrome9_blend_state *result,
-                        bool extended, bool equation, bool *successor)
+                        bool extended, bool equation, bool constant,
+                        bool *successor)
 {
    const struct pipe_rt_blend_state *rt;
 
@@ -793,13 +829,13 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
       return true;
    if (!chrome9_blend_func(rt->rgb_func, equation, &result->rgb_func) ||
        !chrome9_blend_func(rt->alpha_func, equation, &result->alpha_func) ||
-       !chrome9_blend_factor(rt->rgb_src_factor, extended,
+       !chrome9_blend_factor(rt->rgb_src_factor, extended, constant,
                              &result->rgb_src_factor) ||
-       !chrome9_blend_factor(rt->rgb_dst_factor, extended,
+       !chrome9_blend_factor(rt->rgb_dst_factor, extended, constant,
                              &result->rgb_dst_factor) ||
-       !chrome9_blend_factor(rt->alpha_src_factor, extended,
+       !chrome9_blend_factor(rt->alpha_src_factor, extended, constant,
                              &result->alpha_src_factor) ||
-       !chrome9_blend_factor(rt->alpha_dst_factor, extended,
+       !chrome9_blend_factor(rt->alpha_dst_factor, extended, constant,
                              &result->alpha_dst_factor))
       return false;
    result->flags = DRM_CHROME9_BLEND_ENABLE;
@@ -816,7 +852,10 @@ chrome9_draw_blend_supported(const struct chrome9_context *ctx)
 
    return chrome9_translate_blend(ctx->blend, &blend,
                                   ctx->blend_extended_factors,
-                                  ctx->blend_equation, &successor);
+                                  ctx->blend_equation,
+                                  ctx->blend_color_factors &&
+                                  chrome9_generic_fragment_program(ctx),
+                                  &successor);
 }
 
 static bool
@@ -1041,7 +1080,10 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    *reason = "blend-state";
    if (!chrome9_translate_blend(ctx->blend, blend,
                                 ctx->blend_extended_factors,
-                                ctx->blend_equation, blend_successor))
+                                ctx->blend_equation,
+                                ctx->blend_color_factors &&
+                                chrome9_generic_fragment_program(ctx),
+                                blend_successor))
       return false;
    if (depth_only) {
       /* Keep a real guarded A50 target but suppress every color store.  A
@@ -1773,8 +1815,16 @@ chrome9_generic_fragment_state(
    draw->query = chrome9_query_draw_id(crender->ctx);
    if (draw->query)
       draw->flags |= DRM_CHROME9_FRAGMENT_QUERY;
-   if (blend_active)
+   if (blend_active) {
       draw->blend = *blend;
+      if (chrome9_blend_uses_constant(crender->ctx->blend)) {
+         /* Unsigned 1.10 as the vendor converts it: floor(c * 1024). */
+         for (unsigned c = 0; c < 4; c++)
+            draw->blend_color[c] = MIN2(
+               (unsigned)(CLAMP(crender->ctx->blend_color.color[c],
+                                0.0f, 1.0f) * 1024.0f), 0x400);
+      }
+   }
    draw->scissor = *scissor;
    return true;
 }

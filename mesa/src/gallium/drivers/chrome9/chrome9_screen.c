@@ -554,6 +554,11 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
        chrome9_screen_has_capability(&screen->base,
                                      DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM))
       caps->max_texture_cube_levels = 9;
+   /* A34/A36 and A35/A37 take the RGB and alpha equations independently. */
+   caps->blend_equation_separate =
+      chrome9_screen_has_capability2(&screen->base,
+                                     DRM_CHROME9_CAP2_BLEND_EQUATION) ||
+      chrome9_sw_enabled();
    /* Depth compare runs in the fragment shader on the raw D24 sample. */
    caps->texture_shadow_map = chrome9_screen_has_capability(
       &screen->base, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);

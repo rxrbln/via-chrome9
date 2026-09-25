@@ -253,6 +253,7 @@ struct chrome9_context {
    bool blend_bgra8888;
    bool blend_extended_factors;
    bool blend_equation;
+   bool blend_color_factors;
    bool alpha_test_supported;
    bool scissor_supported;
    bool fragment_stencil;
