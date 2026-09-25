@@ -3942,6 +3942,9 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       if (!state)
          return false;
    }
+   ctx->draw_filled_triangles = raster.triangles &&
+      !(raster.flags & (DRM_CHROME9_RASTER_POLYGON_CW(3) |
+                        DRM_CHROME9_RASTER_POLYGON_CCW(3)));
    if (!chrome9_draw_tcl_fragment(ctx, &state->fragment, &why))
       return tcl_fallback(ctx, why);
    for (unsigned i = 0; i < passes; i++) {

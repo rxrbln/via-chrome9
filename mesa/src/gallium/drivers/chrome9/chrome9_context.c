@@ -7404,6 +7404,11 @@ chrome9_clear_gpu(struct chrome9_context *ctx, unsigned buffers,
       return false;
    if (clear_color)
       chrome9_context_render_target_written(ctx);
+   /* A full clear to 1.0 makes every coarse-Z entry all ones. */
+   if (clear_depth && ctx->coarse_z && depth == 1.0)
+      chrome9_resource_coarse_z_fill(&ctx->base, zs);
+   else if (clear_depth)
+      zs->coarse_z_valid = false;
    return true;
 }
 
@@ -7954,6 +7959,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
    ctx->tcl_dedupe = ctx->tcl_buffers &&
       debug_get_bool_option("CHROME9_TCL_DEDUPE", true);
+   ctx->coarse_z = ctx->draw_fragment_program &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_COARSE_Z) &&
+      debug_get_bool_option("CHROME9_COARSE_Z", true);
    ctx->tcl_twoside = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_TWO_SIDE);
    ctx->tcl_clip_distance = ctx->tcl_enabled &&

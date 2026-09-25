@@ -305,6 +305,12 @@ struct chrome9_context {
    bool tcl_buffers;
    /* Stage B non-indexed draws index repeated vertices once. */
    bool tcl_dedupe;
+   /* CAP2_COARSE_Z: depth surfaces cleared to 1.0 get a coarse-Z buffer;
+    * the last draw used it (else the next use resets the tag cache). */
+   bool coarse_z;
+   bool coarse_z_last;
+   /* The current draw rasterizes filled triangles. */
+   bool draw_filled_triangles;
    /* TCL draws queued for one DRAW_VERTEX_PROGRAMS submission. */
    bool tcl_batching;
    struct chrome9_tcl_batch *tcl_batch;

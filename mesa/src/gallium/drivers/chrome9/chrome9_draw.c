@@ -962,8 +962,48 @@ chrome9_stencil_active(const struct chrome9_context *ctx)
    return ctx->dsa && ctx->dsa->stencil[0].enabled;
 }
 
+/*
+ * LESS, LEQUAL and EQUAL writes only move depths nearer, which keeps a
+ * coarse-Z buffer conservative even when the draw does not update it;
+ * any other depth write invalidates it.
+ */
+static void
+chrome9_draw_coarse_z_write(struct chrome9_context *ctx, uint32_t depth_flags)
+{
+   struct chrome9_resource *depth = chrome9_context_depth_target(ctx);
+   const unsigned func = (depth_flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+                         DRM_CHROME9_DEPTH_FUNC_SHIFT;
+
+   if (depth && depth->coarse_z_valid &&
+       !(depth_flags & DRM_CHROME9_DEPTH_READ_ONLY) &&
+       func != PIPE_FUNC_LESS && func != PIPE_FUNC_LEQUAL &&
+       func != PIPE_FUNC_EQUAL && func != PIPE_FUNC_NEVER)
+      depth->coarse_z_valid = false;
+}
+
+/* Coarse-Z may reject and update for this draw: a nearer-wins depth test
+ * whose passing fragments are all written. */
+static bool
+chrome9_draw_coarse_z_usable(const struct chrome9_context *ctx, uint32_t flags,
+                             const struct drm_chrome9_blend_state *blend)
+{
+   const unsigned func = (flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
+                         DRM_CHROME9_DEPTH_FUNC_SHIFT;
+   const struct chrome9_ps_ir *ir = &ctx->fs->semantic_fs_ir;
+
+   if (!ctx->draw_filled_triangles ||
+       (func != PIPE_FUNC_LESS && func != PIPE_FUNC_LEQUAL) ||
+       (flags & DRM_CHROME9_FRAGMENT_STENCIL) ||
+       (blend && (blend->flags & DRM_CHROME9_BLEND_ALPHA_TEST_ENABLE)))
+      return false;
+   for (unsigned i = 0; i < ir->count; i++)
+      if (ir->instruction[i].op == CHROME9_PS_OPCODE_KILL)
+         return false;
+   return true;
+}
+
 static uint32_t
-chrome9_draw_depth_flags(const struct chrome9_context *ctx, bool depth_active)
+chrome9_draw_depth_flags(struct chrome9_context *ctx, bool depth_active)
 {
    uint32_t depth_flags = 0;
 
@@ -977,6 +1017,8 @@ chrome9_draw_depth_flags(const struct chrome9_context *ctx, bool depth_active)
       if (!ctx->dsa->depth_writemask)
          depth_flags |= DRM_CHROME9_DEPTH_READ_ONLY;
    }
+   if (depth_active)
+      chrome9_draw_coarse_z_write(ctx, depth_flags);
    return depth_flags;
 }
 
@@ -1787,6 +1829,24 @@ chrome9_generic_fragment_state(
                 (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
    if (depth_active && chrome9_stencil_active(crender->ctx))
       draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+   if (depth_active && depth->coarse_z.handle && crender->ctx->coarse_z) {
+      struct chrome9_context *ctx = crender->ctx;
+
+      /* Draws of one submission name the buffer even when not using it. */
+      draw->coarse_z_handle = depth->coarse_z.handle;
+      draw->coarse_z_pitch = depth->coarse_z_pitch;
+      if (depth->coarse_z_valid &&
+          chrome9_draw_coarse_z_usable(ctx, draw->flags,
+                                       blend_active ? blend : NULL)) {
+         draw->flags |= DRM_CHROME9_FRAGMENT_COARSE_Z;
+         if (depth->coarse_z_reset || !ctx->coarse_z_last)
+            draw->flags |= DRM_CHROME9_FRAGMENT_COARSE_Z_RESET;
+         depth->coarse_z_reset = false;
+         ctx->coarse_z_last = true;
+      } else {
+         ctx->coarse_z_last = false;
+      }
+   }
    if (chrome9_resource_extended(target)) {
       if (!target->guarded ||
           !chrome9_screen_has_capability(
@@ -1876,6 +1936,10 @@ chrome9_queue_generic_triangle(
       }
       return true;
    }
+   crender->ctx->draw_filled_triangles =
+      crender->prim == MESA_PRIM_TRIANGLES ||
+      crender->prim == MESA_PRIM_TRIANGLE_STRIP ||
+      crender->prim == MESA_PRIM_TRIANGLE_FAN;
    if (!chrome9_generic_fragment_state(crender, target, depth, textures,
           samplers, depth_active, blend_active, blend, scissor, depth_flags,
           &draw, instructions, constants, texture_state))

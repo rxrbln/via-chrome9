@@ -646,8 +646,10 @@ chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
 {
    struct pipe_screen *screen = resource->base.screen;
 
-   if (write)
+   if (write) {
       resource->cpu_write_generation++;
+      resource->coarse_z_valid = false;
+   }
    /* Every access also waits for asynchronously retiring jobs. */
    if (chrome9_screen_has_capability(screen, DRM_CHROME9_CAP_GEM_CPU_ACCESS) &&
        !chrome9_bo_cpu_access_range(screen->get_screen_fd(screen),
@@ -714,6 +716,8 @@ chrome9_resource_destroy(struct pipe_screen *screen,
       pipe_resource_reference(&cresource->parent, NULL);
    else
       chrome9_screen_bo_destroy(screen, &cresource->bo);
+   if (cresource->coarse_z.handle)
+      chrome9_screen_bo_destroy(screen, &cresource->coarse_z);
    FREE(cresource);
 }
 
@@ -1213,6 +1217,78 @@ chrome9_mipmap_window(const struct chrome9_resource *resource, unsigned level,
  * dropped.  Nothing waits for the GPU or touches the CPU mapping.  Returns
  * the first level not generated.
  */
+/*
+ * Fill the coarse-Z buffer of a depth surface just cleared to 1.0: every
+ * entry all ones, drawn as a BGRA8888 surface of pitch / 4 pixels by one
+ * row per 8 depth rows.  The buffer is created on the first fill.
+ */
+bool
+chrome9_resource_coarse_z_fill(struct pipe_context *pipe,
+                               struct chrome9_resource *depth)
+{
+   static const unsigned corner[6][2] = {
+      { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 },
+   };
+   static const struct drm_chrome9_fragment_instruction mov = {
+      .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+      .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+      .src = { { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0, { 0, 1, 2, 3 },
+                 0, 0 } },
+   };
+   const uint32_t one[4] = {
+      fui(1.0f), fui(1.0f), fui(1.0f), fui(1.0f),
+   };
+   struct pipe_screen *screen = pipe->screen;
+   const int fd = screen->get_screen_fd(screen);
+   const long page = sysconf(_SC_PAGESIZE);
+   const unsigned pitch = align(DIV_ROUND_UP(depth->base.width0, 8) * 16, 32);
+   const unsigned rows = DIV_ROUND_UP(depth->base.height0, 8);
+   struct drm_chrome9_fragment_vertex vertices[6];
+   struct drm_chrome9_draw_fragment_program draw = {
+      .triangle_count = 2,
+      .width = pitch / 4,
+      .height = rows,
+      .destination_pitch = pitch,
+      .destination_format = DRM_CHROME9_DESTINATION_FORMAT_BGRA8888,
+      .instruction_count = 1,
+      .constant_count = 1,
+      .abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION,
+      .instructions_ptr = (uintptr_t)&mov,
+      .constants_ptr = (uintptr_t)one,
+      .vertices_ptr = (uintptr_t)vertices,
+   };
+
+   depth->coarse_z_valid = false;
+   if (pitch >= 16384 || pitch / 4 > 2048 || rows > 2048)
+      return false;
+   if (!depth->coarse_z.handle) {
+      const uint64_t size = align64((uint64_t)pitch * rows, page) + 2 * page;
+
+      if (!chrome9_bo_create(fd, size, 0, &depth->coarse_z))
+         return false;
+      /* Only the fill below writes it; announce no CPU writes. */
+      if (!chrome9_bo_cpu_access(fd, &depth->coarse_z,
+                                 DRM_CHROME9_GEM_CPU_EXPLICIT)) {
+         chrome9_screen_bo_destroy(screen, &depth->coarse_z);
+         memset(&depth->coarse_z, 0, sizeof(depth->coarse_z));
+         return false;
+      }
+      depth->coarse_z_pitch = pitch;
+   }
+   memset(vertices, 0, sizeof(vertices));
+   for (unsigned v = 0; v < 6; v++) {
+      vertices[v].x_16_16 = (int32_t)(corner[v][0] * draw.width << 16) - 0x8000;
+      vertices[v].y_16_16 = (int32_t)(corner[v][1] * rows << 16) - 0x8000;
+      vertices[v].rhw_float = fui(1.0f);
+   }
+   draw.destination_handle = depth->coarse_z.handle;
+   if (!chrome9_draw_fragment_program(fd, &draw))
+      return false;
+   depth->coarse_z_valid = true;
+   depth->coarse_z_reset = true;
+   return true;
+}
+
 static unsigned
 chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
                             struct chrome9_resource *resource,

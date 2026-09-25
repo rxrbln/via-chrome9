@@ -49,6 +49,14 @@ struct chrome9_resource {
    uint32_t cpu_write_generation;
    /* Unique per created resource, unlike a reusable address. */
    uint64_t serial;
+   /* CAP2_COARSE_Z buffer of a depth surface, one 16-byte entry per 8x8
+    * block after a guard page.  Valid from a full clear to 1.0 until a
+    * depth write that may move a depth farther or a CPU write; the tag
+    * cache is reset on its next use after a fill. */
+   struct chrome9_bo coarse_z;
+   uint32_t coarse_z_pitch;
+   bool coarse_z_valid;
+   bool coarse_z_reset;
    /* Single-image render view of a level or layer of parent: same BO,
     * pixels at data_offset. */
    struct pipe_resource *parent;
@@ -70,6 +78,8 @@ chrome9_resource_destination_offset(const struct chrome9_resource *resource)
 
 void chrome9_resource_cpu_access(struct chrome9_resource *resource,
                                  bool write);
+bool chrome9_resource_coarse_z_fill(struct pipe_context *pipe,
+                                    struct chrome9_resource *depth);
 void chrome9_resource_cpu_access_range(struct chrome9_resource *resource,
                                        bool write, uint64_t offset,
                                        uint64_t size);
