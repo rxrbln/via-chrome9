@@ -7245,7 +7245,8 @@ chrome9_set_sampler_views(struct pipe_context *pipe, mesa_shader_stage shader,
                           struct pipe_sampler_view **views)
 {
    struct chrome9_context *ctx = chrome9_context(pipe);
-   bool report = count && !(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_BIND);
+   bool report = count && !(ctx->warnings & CHROME9_WARN_SAMPLER_VIEW_BIND) &&
+                 debug_get_bool_option("CHROME9_DEBUG_SAMPLERS", false);
    unsigned end;
 
    if (shader == MESA_SHADER_VERTEX) {
