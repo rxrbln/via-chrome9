@@ -550,7 +550,9 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
     * filters the otherwise supported Z16 format from every 32-bit visual. */
    caps->mixed_color_depth_bits = true;
    caps->max_vertex_buffers = 16;
-   caps->max_varyings = 2;
+   /* Every varying, generic or colour, takes one fragment input slot. */
+   caps->max_varyings =
+      screen->base.shader_caps[MESA_SHADER_FRAGMENT].max_inputs;
    caps->constant_buffer_offset_alignment = 16;
    caps->user_vertex_buffers = true;
    caps->vertex_color_clamped = true;
