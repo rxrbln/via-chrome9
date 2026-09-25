@@ -303,6 +303,11 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_BLEND_COLOR		(1ULL << 20)
 /* Fragment TEX flag DRM_CHROME9_FRAGMENT_TEX_BIAS (TEXLDB). */
 #define DRM_CHROME9_CAP2_TEXTURE_BIAS		(1ULL << 21)
+/*
+ * Fragment draws with DESTINATION_EXTENDED: destination_offset places the
+ * window in the object, and textures may sample the object outside it.
+ */
+#define DRM_CHROME9_CAP2_DESTINATION_OFFSET	(1ULL << 22)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1164,7 +1169,10 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
 
 #define DRM_CHROME9_FRAGMENT_DEPTH	(1U << 0)
 #define DRM_CHROME9_FRAGMENT_BLEND	(1U << 1)
-/* Allow a guarded L0 target to contain trailing mip storage. */
+/*
+ * The destination is a guarded object with further images (mip levels);
+ * only its first and last page are guards.
+ */
 #define DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED	(1U << 2)
 /* Apply the stencil block; requires DEPTH with the X8Z24 (D24S8) format. */
 #define DRM_CHROME9_FRAGMENT_STENCIL	(1U << 3)
@@ -1299,6 +1307,9 @@ struct drm_chrome9_fragment_vertex {
 /*
  * Complete packed-linear texture layout.  Active levels carry explicit byte
  * offsets and pitches; the kernel validates every level against the BO.
+ * With CAP2_DESTINATION_OFFSET a 2D texture may name the EXTENDED
+ * destination if its base level and the levels of its LOD range lie
+ * outside the rows the draw can write (scissor).
  */
 struct drm_chrome9_fragment_texture_state {
 	__u32 handle;
@@ -1377,7 +1388,12 @@ struct drm_chrome9_draw_fragment_program {
 	__u32 texture_count;
 	__u32 varying_count;
 	__u32 abi_version;
-	__u32 reserved0;
+	/*
+	 * CAP2_DESTINATION_OFFSET with DESTINATION_EXTENDED: byte offset of
+	 * pixel (0, 0), a multiple of 256 from PAGE_SIZE up; the window
+	 * pitch * height ends before the last page.  Zero means PAGE_SIZE.
+	 */
+	__u32 destination_offset;
 	struct drm_chrome9_blend_state blend;
 	struct drm_chrome9_scissor_state scissor;
 	__u32 pad;
