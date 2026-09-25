@@ -1846,14 +1846,16 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       if (stores != 1)
          goto out;
    }
+   /* Integer uniforms are float-encoded: lower integer operations before
+    * the uniform values are inlined. */
+   chrome9_nir_lower_integers(nir);
    /* Fold the current control uniforms so their branches disappear. */
    if (key_count)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tcl_inline_key,
                nir_metadata_control_flow, &key);
    NIR_PASS(_, nir, nir_lower_alu_width, tcl_scalar_width, NULL);
    tcl_optimize(nir);
-   /* Integer uniforms are float-encoded; booleans become 0.0/1.0. */
-   chrome9_nir_lower_integers(nir);
+   /* Booleans become 0.0/1.0. */
    NIR_PASS(_, nir, nir_lower_bool_to_float, true);
    tcl_optimize(nir);
    b.impl = nir_shader_get_entrypoint(nir);
