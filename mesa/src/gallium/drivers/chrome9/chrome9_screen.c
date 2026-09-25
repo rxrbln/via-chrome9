@@ -366,6 +366,9 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
     * stages expose native integers.  Keep the draw module's vertex lowering
     * in that same representation while the fragment backend lacks them. */
    vs->integers = false;
+   /* The vertex engine addresses constants relatively, never temporaries:
+    * indexed temporary arrays become selects that TCL runs natively. */
+   vs->indirect_temp_addr = false;
    /* Two dense vertex sampler slots cover the tested draw-module path,
     * including the two independent fetches needed by terrain.  The same
     * kernel capability gates sampler-view resource allocation. */
