@@ -533,12 +533,13 @@ chrome9_resource_create(struct pipe_screen *screen,
    resource->base = *templ;
    resource->base.screen = screen;
    pipe_reference_init(&resource->base.reference, 1);
-   /* Surfaces opt in to deferred cache maintenance; buffers are never
-    * written by the device.  Shared surfaces stay in the protocol because
-    * every importer on this device is this driver; the kernel reverts an
-    * object that becomes a KMS framebuffer. */
-   if (templ->target != PIPE_BUFFER &&
-       !(templ->bind & PIPE_BIND_DISPLAY_TARGET) &&
+   /* Resources opt in to deferred cache maintenance: every CPU access
+    * goes through chrome9_resource_cpu_access(), which lets the kernel skip
+    * flushes and finite checks of unchanged vertex buffers.  Shared
+    * surfaces stay in the protocol because every importer on this device
+    * is this driver; the kernel reverts an object that becomes a KMS
+    * framebuffer. */
+   if (!(templ->bind & PIPE_BIND_DISPLAY_TARGET) &&
        chrome9_screen_has_capability(screen,
                                      DRM_CHROME9_CAP_GEM_CPU_ACCESS) &&
        debug_get_bool_option("CHROME9_EXPLICIT_ACCESS", true))
@@ -846,6 +847,10 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
              box->x, box->width))
          fprintf(stderr, "chrome9: GEM_CPU_ACCESS failed: %s\n",
                  strerror(errno));
+   } else if (resource->target == PIPE_BUFFER) {
+      /* Only the mapped range becomes dirty for the next device use. */
+      chrome9_resource_cpu_access_range(cresource, usage & PIPE_MAP_WRITE,
+                                        box->x, box->width);
    } else {
       chrome9_resource_cpu_access(cresource, usage & PIPE_MAP_WRITE);
    }
