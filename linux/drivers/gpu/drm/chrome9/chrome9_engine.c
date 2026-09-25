@@ -3500,8 +3500,12 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		raster[i++] = tcl->point_words[0];
 		raster[i++] = tcl->point_words[1];
 	}
-	/* A2F: vendor defaults plus sprite enables per packed coordinate. */
-	if (tcl->sprite_mask && !(tcl->re & CHROME9_TCL_RE_NO_A2F)) {
+	/*
+	 * A2F: vendor defaults plus sprite enables per packed coordinate.
+	 * Written for every draw: enables left by a sprite draw replace the
+	 * coordinates of later plain points.
+	 */
+	if (!(tcl->re & CHROME9_TCL_RE_NO_A2F)) {
 		u32 a2f = 0x2f582000;
 
 		for (e = 0; e < fp->varying_count; e++)
@@ -3649,6 +3653,7 @@ static int chrome9_tcl_raster_selftest(void)
 		0x00000206, 0x010000c2, 0x020041d1, 0x030052d1,
 		0x1200001f, 0x61800000, 0x62208002, 0x20000000,
 		0x23004f02, 0x24000003, 0x25f6cc00, 0x28ffcc00,
+		0x2f582000,
 		0x40800000, 0x414000f8, 0x42004941, 0x43800000,
 		0x444000f8, 0x450049c1, 0x46800000, 0x47000000,
 		0x4800003f, 0x49000000, 0x50000000, 0x51000000,
@@ -3727,7 +3732,7 @@ static int chrome9_tcl_raster_selftest(void)
 	tcl->point_size_vertex = true;
 	tcl->sprite_mask = 0x1;
 	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
-		ARRAY_SIZE(expected) + 5 ||
+		ARRAY_SIZE(expected) + 4 ||
 	    raster[7] != 0x20000000 || raster[8] != 0x23001f00 ||
 	    raster[10] != 0x25fec000 || raster[12] != 0x28ffc000 ||
 	    raster[14] != 0x2a408000 || raster[15] != 0x2b3f8000 ||
@@ -3735,7 +3740,7 @@ static int chrome9_tcl_raster_selftest(void)
 		goto out;
 	tcl->re = CHROME9_TCL_RE_NO_A2F;
 	if (chrome9_tcl_raster_state(fp, tcl, NULL, raster) !=
-		ARRAY_SIZE(expected) + 4 || raster[16] != 0x40800000)
+		ARRAY_SIZE(expected) + 3 || raster[16] != 0x40800000)
 		goto out;
 	/* Flat line strip from vertex B; filled CCW with wireframe CW. */
 	tcl->re = 0;
