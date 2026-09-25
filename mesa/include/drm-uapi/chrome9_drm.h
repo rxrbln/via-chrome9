@@ -318,6 +318,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_DEPTH_OUTPUT		(1ULL << 26)
 /* Fragment draw flag FRAGMENT_DEPTH_TILED. */
 #define DRM_CHROME9_CAP2_TILED_DEPTH		(1ULL << 27)
+/* FRAGMENT_DESTINATION_TILED and FRAGMENT_TEXTURE_FLAG_TILED. */
+#define DRM_CHROME9_CAP2_TILED_COLOR		(1ULL << 28)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1216,6 +1218,8 @@ struct drm_chrome9_draw_program_triangle_d16_rhw_batch {
  * ALIGN(height, 8) rows.
  */
 #define DRM_CHROME9_FRAGMENT_DEPTH_TILED	(1U << 18)
+/* CAP2_TILED_COLOR: the destination window is tiled, ALIGN(height, 8) rows. */
+#define DRM_CHROME9_FRAGMENT_DESTINATION_TILED	(1U << 19)
 
 /* Native stencil operations; note INVERT precedes the wrapping forms. */
 #define DRM_CHROME9_STENCIL_OP_KEEP		0
@@ -1387,8 +1391,16 @@ struct drm_chrome9_fragment_texture_state {
 	__u16 depth;
 	/* 3D: DRM_CHROME9_TEXTURE_WRAP_* of the R coordinate; zero otherwise. */
 	__u16 wrap_r;
-	__u32 reserved[1];
+	/* DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_*. */
+	__u32 flags;
 };
+
+/*
+ * CAP2_TILED_COLOR, 2D: every level is in 32-byte x 8-row tiles of 256
+ * bytes, ALIGN(height, 8) rows, and its levels come from the address
+ * table (256-byte aligned) even for POT sizes.
+ */
+#define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED	(1U << 0)
 
 /* One stencil face; func is a DRM_CHROME9_COMPARE_* value. */
 struct drm_chrome9_stencil_face {
