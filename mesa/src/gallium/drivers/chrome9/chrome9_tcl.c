@@ -214,6 +214,14 @@ tcl_scalar_width(const nir_instr *instr, const void *data)
    case nir_op_bany_fnequal2:
    case nir_op_bany_fnequal3:
    case nir_op_bany_fnequal4:
+   /* Boolean vector reductions too: the bool lowering has no vector
+    * form and would leave a 1-bit compare behind. */
+   case nir_op_ball_iequal2:
+   case nir_op_ball_iequal3:
+   case nir_op_ball_iequal4:
+   case nir_op_bany_inequal2:
+   case nir_op_bany_inequal3:
+   case nir_op_bany_inequal4:
       return 1;
    default:
       return 0;

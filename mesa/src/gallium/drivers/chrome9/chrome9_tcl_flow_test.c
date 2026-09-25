@@ -849,13 +849,79 @@ check_temp_array(const struct chrome9_tcl_flow *flow)
    return failures;
 }
 
+/* !(any(a.xy != b.xy) || any(a.zw != b.zw)): the Boolean vector reduction
+ * of a matrix compare must reach the vertex program as 0.0/1.0 floats. */
+static int
+check_bool_reduction(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, &options,
+                                                   "bool-reduction");
+   nir_def *pos = nir_load_input(&b, 4, 32, nir_imm_int(&b, 0), .base = 0);
+   nir_def *u = nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0),
+                                  nir_imm_int(&b, 0));
+   nir_def *v = nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0),
+                                  nir_imm_int(&b, 1));
+   struct chrome9_tcl_program *p = calloc(1, sizeof(*p));
+   nir_def *columns, *equal;
+   int failures = 0;
+
+   b.shader->info.io_lowered = true;
+   b.shader->num_inputs = 1;
+   b.shader->num_outputs = 2;
+   b.shader->info.inputs_read = VERT_BIT_GENERIC0;
+   b.shader->info.outputs_written = VARYING_BIT_POS | VARYING_BIT_VAR(0);
+   b.shader->info.num_ubos = 1;
+   columns = nir_vec2(&b,
+      nir_bany_fnequal2(&b, nir_channels(&b, u, 0x3), nir_channels(&b, v, 0x3)),
+      nir_bany_fnequal2(&b, nir_channels(&b, u, 0xc), nir_channels(&b, v, 0xc)));
+   equal = nir_inot(&b, nir_bany_inequal2(&b, columns, nir_imm_false(&b)));
+   store(&b, pos, VARYING_SLOT_POS);
+   store(&b, nir_vec4(&b, nir_b2f32(&b, equal), nir_imm_float(&b, 0.0),
+                      nir_imm_float(&b, 0.0), nir_imm_float(&b, 1.0)),
+         VARYING_SLOT_VAR0);
+   chrome9_tcl_compile(b.shader, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
+                       NULL, NULL, NULL, NULL, p);
+   if (!p->supported) {
+      fprintf(stderr, "Boolean reduction: not supported\n");
+      failures++;
+   }
+   for (unsigned k = 0; p->supported && k < 64; k++) {
+      /* Lane l of v differs from u when bit l of k is set; bits 4, 5 pick
+       * signed zeros and negative values. */
+      float cb[2][4], constant[DRM_CHROME9_VERTEX_MAX_CONSTANTS][4] = { 0 };
+      const float input[1][4] = { { 0, 0, 0, 1 } };
+      struct machine m = { .input = input, .constant = constant };
+      bool equal = !(k & 0xf);
+
+      for (unsigned l = 0; l < 4; l++) {
+         cb[0][l] = k & 16 ? -0.0f : k & 32 ? -1.5f : 0.25f * l;
+         cb[1][l] = k & (1u << l) ? cb[0][l] + 1.0f :
+                    k & 16 ? 0.0f : cb[0][l];
+      }
+      memcpy(constant, cb, p->uniform_rows * sizeof(cb[0]));
+      memcpy(constant + p->uniform_rows, p->immediates,
+             p->immediate_count * sizeof(p->immediates[0]));
+      run(&m, p->instructions, 0, p->instruction_count);
+      if (m.varying[0][0] != (equal ? 1.0f : 0.0f)) {
+         fprintf(stderr, "Boolean reduction: case %u gives %g\n", k,
+                 m.varying[0][0]);
+         failures++;
+      }
+   }
+   printf("%-24s %s: %u instructions\n", "Boolean reduction",
+          failures ? "FAIL" : "ok", p->instruction_count);
+   chrome9_tcl_program_fini(p);
+   free(p);
+   ralloc_free(b.shader);
+   return failures;
+}
+
 int
 main(void)
 {
    static const struct chrome9_tcl_flow none = { 0 };
-   static const struct chrome9_tcl_flow depth1 = { 1, false };
-   static const struct chrome9_tcl_flow depth2 = { 2, false };
-   static const struct chrome9_tcl_flow dynamic2 = { 2, true };
+   static const struct chrome9_tcl_flow depth1 = { 1 };
+   static const struct chrome9_tcl_flow depth2 = { 2 };
    static const struct chrome9_tcl_flow relative = { .relative = true };
    static const struct chrome9_tcl_flow relative_flow = {
       .max_depth = 1, .relative = true,
@@ -891,6 +957,7 @@ main(void)
    failures += check_relative("indirect abs, no trunc", REL_ABS, &relative,
                               true, 0);
    failures += check_temp_array(&depth1);
+   failures += check_bool_reduction();
    glsl_type_singleton_decref();
    printf("chrome9 TCL flow tests %s\n", failures ? "FAILED" : "passed");
    return failures ? 1 : 0;
