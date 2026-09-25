@@ -206,7 +206,7 @@ require a second pre-scaling step.  Proprietary Linux helper
 or 8 pixels for 8, 16, or 32 bpp respectively, and computes:
 
 ```text
-tile_width_pixels = 256 / bytes_per_pixel
+tile_width_pixels = 32 / bytes_per_pixel      # 32-byte tile rows
 tile_columns = ceil(pixel_pitch / tile_width_pixels)
 offset = 256 * (tile_columns * floor(y / 8) + floor(x / tile_width_pixels))
        + bytes_per_pixel *

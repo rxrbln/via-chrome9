@@ -183,12 +183,12 @@ byte of patch-entry dword 2.  Recovered transformations include:
 | `5`, `9`, `10` | address shifted right by 3 |
 | `13`, `15` | full address written directly |
 | `14` | address with low four bits cleared |
-| `16` | low address nibbles merged into two existing command fields; likely tiled/swizzled addressing |
+| `16` | `w |= (A & f) << 16 | ((w + A) & f) << 12`: start and end byte nibbles (length-1 preloaded in `w[3:0]`); not tiling, and unused by the shipped UMDs (see [chrome9-tiling-re.md](chrome9-tiling-re.md)) |
 | `138` | low 24 bits in one word and upper byte placed in the following word's bits `8:15` |
 
 Unknown selectors fail with `STATUS_INVALID_PARAMETER`; the table is therefore
-not merely diagnostic text.  Format 16 needs instruction-level rechecking and
-controlled samples before assigning bitfield names.
+not merely diagnostic text.  Format 16 was decoded at `0x934bd..0x934ea`; for
+formats 1-3 the second word additionally receives `A[31:27] << 8` (`0x93475`).
 
 ## System-memory page table
 
@@ -307,6 +307,9 @@ The KMD's patch diagnostics expose these resource IDs:
 | `44` | `RID_TXB` |
 | `45`-`50` | `RID_TXB_Cube` cases |
 | `51` | `RID_TXL` |
+
+The IDs are the switch index at `0x91e03` after subtracting 5; the raw
+`DriverId` bytes are 5, 9, 10, 42-45, 49, 50-55 and 56.
 
 Each logged patch also has width, height, stride, and format metadata.  These
 IDs explain how the Windows UMD describes render targets and texture resources

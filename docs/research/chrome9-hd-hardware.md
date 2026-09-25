@@ -206,8 +206,8 @@ partial pixel ALU field map and exact analysis anchors are in
 `shader-isa.md`.
 
 The UMA patcher exposes several physical-address encodings: direct, aligned,
-right-shifted, low-24/high-byte split, and a nibble-merge format likely tied to
-tiling.  Its resource IDs include map base, 2D source/destination, four render
+right-shifted, low-24/high-byte split, and a start/end byte-nibble format
+(selector 16, not tiling).  Its resource IDs include map base, 2D source/destination, four render
 targets, texture buffer, six cube faces, and texture layout.  See
 `windows-driver-re.md` for the versioned selectors and analysis addresses.
 
@@ -241,7 +241,9 @@ deferred:
 - reset sequence and the scope of each reset bit;
 - header-6 meaning, packet bounds, privileged-register filtering, and
   VX900-specific command hazards;
-- tiling equations, macro/micro-tile dimensions, and compression metadata;
+- tiled layouts: equations, 8/16-row microtiles and the CBU detiling
+  windows are recovered in [chrome9-tiling-re.md](chrome9-tiling-re.md);
+  there are no macrotiles or bank swizzle; silicon proof is outstanding;
 - shader instruction encodings and shader resource limits;
 - context state that is not captured by documented parameters;
 - clock/power dependencies and resume ordering;
