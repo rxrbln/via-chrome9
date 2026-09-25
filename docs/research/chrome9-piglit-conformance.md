@@ -67,6 +67,8 @@ terrain at 2 fps and refract at 6 fps.
 | `c3bc0a9` | Blend states without a hardware encoding (logic op, MIN/MAX/SUB, some factors) go to llvmpipe. | gl-1.1-xor*, blendminmax; gl-1.0-blend-func is correct but takes >60 s until the factors are in hardware |
 | `641ed72` | Polygon stipple: the pattern is kept and stippled draws go to llvmpipe. | polygon-stipple-fs |
 | `41f1601` | Two-sided colour with visible face order goes to llvmpipe. Before, the post-TNL path dropped it. | interpolation-none-gl_Back* |
+| `cdb3b5e` | Constant blend colour in the pixel engine (kernel `5f9fb6f`); EXT_blend_equation_separate advertised. Under `MESA_GL_VERSION_OVERRIDE=2.1` `glBlendEquationSeparate` raised GL_INVALID_OPERATION before. | gl-1.0-blend-func: timeout (>200 s in llvmpipe) to pass in 19 s; `--quick` 60 s timeout to pass in 1 s |
+| `00785c4` | `txb` as TEXLDB (kernel `dbadc6e`); exact `ftrunc` and `fceil` from FRC of \|x\|. | glsl-lod-bias, glsl-fs-texture2d-bias, glsl-fs-integer-multiplication now on hardware |
 
 ### Hardware limits found
 
@@ -77,6 +79,10 @@ terrain at 2 fps and refract at 6 fps.
   built-in tests check a relative tolerance of 1e-5, below 2^-16. They fail
   by design of the silicon. These are the bulk of the remaining built-in
   failures (291 fs versus 37 vs).
+- **FRC of negative inputs.** Just below an integer (e.g. -0.9999923)
+  FRC returns 1.0, so `x - FRC(x)` is one too small there.  `ftrunc` and
+  `fceil` therefore use FRC of |x| only; `ffloor` keeps NIR's 2-ALU
+  `x - FRC(x)` and inherits this edge case for negative inputs.
 - **Fragment temporaries.** The PS has 12 temporaries. glsl-max-varyings with
   8 varyings needs 14 and is rejected (`reject native compile ir=15
   temps=14`).
@@ -100,11 +106,9 @@ terrain at 2 fps and refract at 6 fps.
   glsl-fs-shadow* and tex-border (in progress).
 - **Rectangle textures and `txs`.** The hardware FS rejects `txs`, so RECT
   sampling runs in llvmpipe.
-- Blend equations other than ADD (blendminmax, and gl-1.0-blend-func alpha).
-  The encoding is in blend-alpha-packet-recipes.md; implementation is
-  queued.
-- `txb` (bias) and `ftrunc` in the hardware FS: these shaders run in
-  llvmpipe.
+- Done 2026-09-25: blend equations (`71d7d78`), constant blend colour and
+  separate equations (`cdb3b5e`), `txb` and `ftrunc` in the hardware FS
+  (`00785c4`).
 - Smooth and stippled lines. Pure llvmpipe passes `point-line-no-cull` and
   `line-flat-clip-color`, but the chrome9 paths (including the llvmpipe
   fallback under chrome9 caps) cull, stipple or polygon-mode AA lines like

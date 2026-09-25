@@ -68,3 +68,26 @@ and readback.  Until the dedicated projective and mip-bias matrices pass,
 Mesa must reject projective/bias NIR shapes that cannot be reduced to already
 proven ordinary coordinates/sampling, and the kernel must reject these native
 TAU operation keys.
+
+## TEXLDB on silicon (2026-09-25)
+
+Kernel `dbadc6e` exposes TAU operation 3 as `DRM_CHROME9_FRAGMENT_TEX_BIAS`
+on a TEX with a TEMP coordinate; the bridge MOV carries all four lanes.
+Rung `texbias` (`tools/re/chrome9_rq_rungs.c`) samples a 64x64 BGRA chain
+with solid levels L0..L3 = red, green, blue, white, `ADD r0 = v0 + c0`
+with `c0 = (0, 0, 0, bias)`, 1176 covered pixels per case, exact:
+
+| case | result |
+|---|---|
+| TEXLD (op 1), W = 1, 1:1 footprint | L0: operation 1 ignores W |
+| TEXLD, footprint scale 2 | L1 |
+| TEXLDB W = 0 / 1 / 2 / 3 | L0 / L1 / L2 / L3 |
+| TEXLDB W = 8, W = -8 | L3, L0 (clamped to the chain) |
+| TEXLDB scale 2, W = -1 / +1 | L0 / L2 |
+| TEXLDB W = 1 and sampler bias 1.0 (A30 s5.5 = 32) | L2: the biases add |
+| TEXLDB W = -1 and sampler bias 1.0 | L0 |
+| TEXLDB W = 0.5 / 0.25, MIP_FILTER_LINEAR | `ff808000` / `ffc04000`: fractional LOD |
+
+So lane W is a signed float in LOD units, added to the sampler bias, like
+D3D texldb.  Mesa `00785c4` lowers `txb` of 2D samplers to it.  TEXLDP
+(operation 7) remains unmeasured.

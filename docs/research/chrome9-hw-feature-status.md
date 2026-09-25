@@ -29,6 +29,10 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | polygon mode LINE (triangles, strips, fans), on by default | `4f6eeda` / `71d7d78` | rungs `polymode`, `wire`; GL smoke PASS |
 | vertex a0 relative addressing (ARL, indirect uniform reads) | `a6a86da` / `71d7d78`, CAP2 bit 14 | `chrome9_gl_arl_smoke` 8/8 native |
 | blend equations SUBTRACT, REVERSE_SUBTRACT, MIN, MAX | `a6a86da` / `71d7d78`, CAP2 bit 18 | rungs `blend`, `blendalpha`; piglit blendminmax, blendsquare |
+| separate RGB/alpha blend equations (EXT_blend_equation_separate) | Mesa `cdb3b5e` | piglit gl-1.0-blend-func |
+| constant blend colour (CONST_COLOR/ALPHA and inverses, A38..A3F), on by default | `5f9fb6f` / `cdb3b5e`, CAP2 bit 20 `blend_color` | rungs `blendconst`, `blendstale`; piglit gl-1.0-blend-func pass in 19 s (llvmpipe: timeout) |
+| fragment TEX with LOD bias (TEXLDB, TAU op 3, bias in coordinate W), on by default | `dbadc6e` / `00785c4`, CAP2 bit 21 `texture_bias` | rung `texbias`; piglit glsl-lod-bias, glsl-fs-texture2d-bias |
+| exact `ftrunc` and `fceil` in the PS (FRC of \|x\| only) | Mesa `00785c4` | piglit glsl-fs-integer-multiplication, fs-ceil-* |
 | render to cube faces and mip levels (guarded shadow per image), base-level views | Mesa `d4eb87d` | `chrome9_gl_rtt_smoke` 8/8 |
 | DXT1/3/5 incl. POT mip chains | `4b06bc2` / `58b8d2f` | `dxt d1..d6` (d2/d5 within 3 LSB), `m1`/`m2`, `chrome9_gl_cube_dxt_smoke` |
 | 2D COPY_RECT, KMS scanout, hardware cursor | | Xorg |
@@ -41,7 +45,6 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | polygon POINT mode, unfilled quads/polygons, per-vertex edge flags | draw module | GL draws the clipped polygon's vertices; quads hide inner edges |
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
 | fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size (below) |
-| constant blend colour factors | llvmpipe | blend state has no colour field (A38..A3F) |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
 | terrain fragment shader, some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work |
 | desktop blur | validation fails (sampler precision) | open |

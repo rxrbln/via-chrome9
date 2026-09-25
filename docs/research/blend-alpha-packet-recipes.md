@@ -353,6 +353,32 @@ pair is `36000490 37000264`.  Those equation words look identical to a
 ZERO/ONE selection because the A39/A3A/A3E and A3C/A3D/A3F contents supply
 the semantic difference.
 
+### Silicon (2026-09-25, kernel `5f9fb6f`, rungs `blendconst`/`blendstale`)
+
+`tools/re/chrome9_rq_rungs.c` on the fragment program path, BGRA8888, each
+case followed by a COPY closure draw
+(`artifacts/2026-09-25/chrome9-blendconst-texbias-rungs.txt`):
+
+| case | A38..A3F content | result |
+|---|---|---|
+| C1 CONST/INV_CONST, colour (1,0,1,0), src `ff112233` over `80445566` | FC = 400/0/400, FA = 0 on both terms | `80115533` exact |
+| C2 CONST_COLOR/ZERO (.25,.5,.75,1), src `ffffffff` | FCa = 100/200/300, FAa = 400 | `ff4080bf` exact |
+| C3 CONST_ALPHA/ZERO, a = .5, src `80ff8040` | FCa = 200 in all RGB lanes | `40804020` exact |
+| C4 ONE/INV_CONST_ALPHA, a = .25, src `10101010` over `80404040` | FCb = 100 | `70404040` exact |
+| C5 REVERSE_SUBTRACT CONST_ALPHA/ONE, a = .5 | FCb = 200 (API source on B) | `01808050`, 1 LSB in alpha |
+
+The claim that ZERO/ONE and CONST/INV_CONST share selectors holds.  With
+module `blend_re=2` the kernel closes only A38/A3B/A39/A3C after C1 (the
+legacy tail); the following COPY (`src*ONE + dst*ZERO`, codes 15/05) then
+stores `11223366` instead of `11223344`: the stale FCa.B = FCb.B = 1.0 in
+A3A/A3D make ONE read 1 - 1 and ZERO read 1 on blue, so the destination
+blue survives.  With the full closure the copy is exact.  Hence every
+blend-enabled draw must close all eight words while constants may be
+live; the kernel tracks this per engine and ends a constant-using segment
+with an A38..A3F zero group, because the legacy builders still write only
+four of them.  The conversion `min(floor(c * 1024), 0x400)` matches all
+fractional cases above to the LSB.
+
 ## Alpha test
 
 A33 is independent of the blend equation:
