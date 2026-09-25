@@ -1375,6 +1375,7 @@ static int chrome9_selftest_pcie_ring(struct chrome9_device *cdev)
 			 "replacing an idle paused CR, as in VIA ring initialization\n");
 
 	cdev->vram = pcim_iomap(pdev, 2, 0);
+	cdev->vram_mapped = pci_resource_len(pdev, 2);
 	if (!cdev->vram)
 		return -ENOMEM;
 	gart = cdev->vram + chrome9_selftest_gart_offset;
@@ -2257,6 +2258,7 @@ static int chrome9_selftest_command_reader(struct chrome9_device *cdev)
 					     "invalid SL ring offset %#lx\n",
 					     chrome9_selftest_cr_sl_offset);
 		cdev->vram = pcim_iomap(pdev, 2, 0);
+		cdev->vram_mapped = pci_resource_len(pdev, 2);
 		if (!cdev->vram)
 			return -ENOMEM;
 		sl_ring = cdev->vram + chrome9_selftest_cr_sl_offset;
@@ -2420,6 +2422,7 @@ static int chrome9_selftest_2d(struct chrome9_device *cdev)
 				     "invalid BAR2 self-test offset %#lx\n", offset);
 
 	cdev->vram = pcim_iomap(pdev, 2, 0);
+	cdev->vram_mapped = pci_resource_len(pdev, 2);
 	if (!cdev->vram)
 		return dev_err_probe(&pdev->dev, -ENOMEM,
 				     "cannot map BAR2 for 2D self-test\n");

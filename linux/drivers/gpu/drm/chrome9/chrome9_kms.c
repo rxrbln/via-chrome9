@@ -1500,11 +1500,13 @@ static int chrome9_scanout_carveout_init(struct chrome9_device *cdev,
 			"scanout carveout is outside the IGA1 addressable range\n");
 
 	iomap_table = pcim_iomap_table(cdev->pdev);
-	if (iomap_table && iomap_table[2])
+	if (iomap_table && iomap_table[2]) {
 		cdev->vram = iomap_table[2];
-	else
+	} else {
 		cdev->vram = pcim_iomap(cdev->pdev, 2, 0);
-	if (!cdev->vram)
+		cdev->vram_mapped = pci_resource_len(cdev->pdev, 2);
+	}
+	if (!cdev->vram || offset + size > cdev->vram_mapped)
 		return dev_err_probe(&cdev->pdev->dev, -ENOMEM,
 				     "cannot map BAR2 scanout carveout\n");
 

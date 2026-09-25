@@ -123,7 +123,10 @@ struct chrome9_device {
 	struct pci_dev *pdev;
 	void __iomem *mmio;
 	void __iomem *mmio_alt;
+	/* Uncached BAR2 mapping of [0, vram_mapped); the local pool is mapped
+	 * write-combined separately (sl_wc). */
 	void __iomem *vram;
+	resource_size_t vram_mapped;
 	resource_size_t vram_size;
 	u64 sl_base;
 	resource_size_t scanout_offset;

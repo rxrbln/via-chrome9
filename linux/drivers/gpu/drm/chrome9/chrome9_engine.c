@@ -929,6 +929,8 @@ struct chrome9_engine {
 	u64 fence_count;
 	u64 fence_canary_faults;
 	void __iomem *gart;
+	/* Uncached occlusion page and GART at the top of the frame buffer. */
+	void __iomem *tail;
 	void *gart_saved;
 	resource_size_t gart_offset;
 	u64 fence_context;
@@ -7132,9 +7134,19 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 			"occlusion snapshot self-test failed: %d\n", ret);
 		return ret;
 	}
-	/* Diagnostics may already have mapped either BAR through pcim_iomap(). */
+	/* Diagnostics may already have mapped either BAR through pcim_iomap().
+	 * Otherwise only the low 16 MiB of BAR2 is mapped uncached: an
+	 * uncached reservation of the whole BAR would turn the write-combined
+	 * local pool uncached (PAT). */
 	cdev->mmio = chrome9_iomap_bar_once(cdev->pdev, 1);
-	cdev->vram = chrome9_iomap_bar_once(cdev->pdev, 2);
+	if (pcim_iomap_table(cdev->pdev) && pcim_iomap_table(cdev->pdev)[2]) {
+		cdev->vram = pcim_iomap_table(cdev->pdev)[2];
+		cdev->vram_mapped = pci_resource_len(cdev->pdev, 2);
+	} else {
+		cdev->vram_mapped = min_t(resource_size_t, SZ_16M,
+					  pci_resource_len(cdev->pdev, 2));
+		cdev->vram = pcim_iomap(cdev->pdev, 2, cdev->vram_mapped);
+	}
 	if (!cdev->mmio || !cdev->vram)
 		return -ENOMEM;
 	ret = chrome9_detect_vram(cdev);
@@ -7179,10 +7191,20 @@ int chrome9_engine_init(struct chrome9_device *cdev)
 	atomic64_set(&engine->fence_seqno, 0);
 	atomic64_set(&engine->retired_seqno, 0);
 	engine->gart_offset = gart_offset;
-	engine->gart = cdev->vram + engine->gart_offset;
 	/* Occlusion snapshots go to the SL page below the GART; the slots
 	 * exist always so occlusion_query can be switched at run time. */
 	engine->query_offset = gart_offset - PAGE_SIZE;
+	engine->tail = cdev->vram_mapped >= cdev->vram_size ?
+		cdev->vram + engine->query_offset :
+		devm_ioremap(&cdev->pdev->dev,
+			     pci_resource_start(cdev->pdev, 2) +
+			     engine->query_offset,
+			     cdev->vram_size - engine->query_offset);
+	if (!engine->tail) {
+		kfree(engine);
+		return -ENOMEM;
+	}
+	engine->gart = engine->tail + PAGE_SIZE;
 	/* The local object pool ends below the occlusion page. */
 	if (READ_ONCE(chrome9_local_memory) &&
 	    chrome9_sl_init(cdev, engine->query_offset))
@@ -8360,7 +8382,7 @@ static u32 chrome9_fragment_submit_object(struct drm_file *file,
 static void __iomem *chrome9_query_slot(struct chrome9_engine *engine,
 					u32 slot)
 {
-	return engine->cdev->vram + engine->query_offset +
+	return engine->tail +
 	       slot * CHROME9_QUERY_SLOT_SIZE;
 }
 
@@ -8401,9 +8423,9 @@ static void chrome9_query_watch(struct chrome9_engine *engine, u32 re,
 	u32 low = address & 0x00fffffc;
 	u32 quarter = (address >> 2) & ~3U;
 
-	watch[0] = low < engine->cdev->vram_size ?
+	watch[0] = low < engine->cdev->vram_mapped ?
 		   readl(engine->cdev->vram + low) : 0;
-	watch[1] = quarter < engine->cdev->vram_size ?
+	watch[1] = quarter < engine->cdev->vram_mapped ?
 		   readl(engine->cdev->vram + quarter) : 0;
 }
 
