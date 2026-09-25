@@ -252,6 +252,7 @@ struct chrome9_context {
    bool draw_textured_triangle_blend;
    bool blend_bgra8888;
    bool blend_extended_factors;
+   bool blend_equation;
    bool alpha_test_supported;
    bool scissor_supported;
    bool fragment_stencil;

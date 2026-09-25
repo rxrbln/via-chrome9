@@ -18,6 +18,7 @@
 #include "chrome9_swfb.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_range_analysis.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "util/format/u_format.h"
@@ -44,6 +45,11 @@
 #define TCL_SKIP 1
 #define TCL_EXPR_LITERAL 0xffff
 #define TCL_EXPR_DWORD 0xfffe
+/* Base rows one a0 lane serves (a mat4 element); the pad keeps the lane
+ * clamp from cutting reads of the lower bases. */
+#define TCL_RELATIVE_SPREAD 3
+/* f2i32 plus folded additions and ftrunc of one address. */
+#define TCL_ADDRESS_CHAIN 16
 
 /* How to read the components of one NIR value. */
 struct tcl_value {
@@ -52,7 +58,19 @@ struct tcl_value {
    uint8_t index;
    uint8_t sel[4];
    bool neg;
+   /* CONSTANT only: 1..4 reads c[index + a0.x..w]. */
+   uint8_t relative;
    /* Flow region a temp was defined in; zero is the top level. */
+   uint16_t scope;
+};
+
+/* One a0 lane: the index scalar it holds for reads at bases
+ * [base_min, base_max], and the region of its last ARL. */
+struct tcl_address {
+   nir_scalar index;
+   unsigned base_min;
+   unsigned base_max;
+   bool written;
    uint16_t scope;
 };
 
@@ -91,6 +109,10 @@ struct tcl_builder {
    struct util_dynarray expr_keys;
    /* Ifs lowered to IF b#: their condition is evaluated on the CPU. */
    struct util_dynarray uniform_ifs;
+   bool relative;
+   unsigned address_count;
+   struct tcl_address address[4];
+   nir_fp_analysis_state fp;
 };
 
 static unsigned
@@ -370,10 +392,28 @@ tcl_register_temp(struct tcl_builder *b, uint8_t file, uint8_t index)
    return mov.dst.index;
 }
 
+/* Copy an a0-relative constant row into a new temp; constant_temp caches
+ * absolute rows only. */
+static unsigned
+tcl_relative_temp(struct tcl_builder *b, const struct drm_chrome9_vertex_source *src)
+{
+   struct drm_chrome9_vertex_instruction mov = {
+      .op = DRM_CHROME9_VERTEX_OP_MOV,
+      .src = { { src->file, src->index, { 0, 1, 2, 3 }, 0, src->relative } },
+   };
+
+   mov.dst.file = DRM_CHROME9_VERTEX_DEST_TEMP;
+   mov.dst.index = tcl_new_temp(b);
+   mov.dst.writemask = 0xf;
+   tcl_append(b, &mov);
+   return mov.dst.index;
+}
+
 /*
  * Silicon rules (kernel chrome9_vertex_validate): one distinct input and
- * one distinct constant row per record, no direct constant source for
- * RCP/RSQ/EXP2/LOG2.  Offending sources read a temp copy instead.
+ * one distinct constant row per record, where (index, relative) names the
+ * row, no direct constant source for RCP/RSQ/EXP2/LOG2 and an absolute ARL
+ * source.  Offending sources read a temp copy instead.
  */
 static void
 tcl_emit(struct tcl_builder *b, struct drm_chrome9_vertex_instruction *insn,
@@ -384,19 +424,25 @@ tcl_emit(struct tcl_builder *b, struct drm_chrome9_vertex_instruction *insn,
 
    for (unsigned file = DRM_CHROME9_VERTEX_FILE_INPUT;
         file <= DRM_CHROME9_VERTEX_FILE_CONSTANT; file++) {
-      int keep = -1;
+      int keep = -1, keep_relative = 0;
 
       for (unsigned s = 0; s < count; s++) {
          struct drm_chrome9_vertex_source *src = &insn->src[s];
+         const bool copy = (scalar && file == DRM_CHROME9_VERTEX_FILE_CONSTANT) ||
+                           (src->relative && insn->op == DRM_CHROME9_VERTEX_OP_ARL);
 
          if (src->file != file || !tcl_source_reads(src))
             continue;
-         if (keep < 0 && !(scalar && file == DRM_CHROME9_VERTEX_FILE_CONSTANT))
+         if (keep < 0 && !copy) {
             keep = src->index;
-         if (src->index == keep)
+            keep_relative = src->relative;
+         }
+         if (src->index == keep && src->relative == keep_relative)
             continue;
-         src->index = tcl_register_temp(b, file, src->index);
+         src->index = src->relative ? tcl_relative_temp(b, src) :
+                      tcl_register_temp(b, file, src->index);
          src->file = DRM_CHROME9_VERTEX_FILE_TEMP;
+         src->relative = 0;
       }
    }
    tcl_append(b, insn);
@@ -411,10 +457,12 @@ tcl_source(const struct tcl_value *v, const uint8_t *swizzle, unsigned lanes,
    for (unsigned i = 0; i < 4; i++)
       src.swizzle[i] = v->sel[swizzle[i < lanes ? i : 0]];
    src.modifier = v->neg != neg ? DRM_CHROME9_FRAGMENT_MOD_NEG : 0;
+   src.relative = v->relative;
    /* Literal-only operands name no register. */
    if (!tcl_source_reads(&src)) {
       src.file = DRM_CHROME9_VERTEX_FILE_TEMP;
       src.index = 0;
+      src.relative = 0;
    }
    return src;
 }
@@ -534,6 +582,7 @@ tcl_alias(struct tcl_builder *b, nir_alu_instr *alu)
          one_sign = sign;
       } else if (sel != TCL_SEL_ZERO) {
          if (first && (first->file != v->file || first->index != v->index ||
+                       first->relative != v->relative ||
                        first->neg != v->neg))
             return false;
          first = v;
@@ -542,6 +591,7 @@ tcl_alias(struct tcl_builder *b, nir_alu_instr *alu)
    }
    alias.file = first ? first->file : DRM_CHROME9_VERTEX_FILE_TEMP;
    alias.index = first ? first->index : 0;
+   alias.relative = first ? first->relative : 0;
    alias.scope = first ? first->scope : 0;
    alias.neg = first ? first->neg != neg : one_sign > 0;
    if (one_sign >= 0 && one_sign != alias.neg)
@@ -586,6 +636,25 @@ tcl_select(struct tcl_builder *b, unsigned mask_temp, unsigned lanes,
    src[2] = c;
    return tcl_op(b, DRM_CHROME9_VERTEX_OP_MAD, BITFIELD_MASK(lanes), out, src,
                  3);
+}
+
+/* trunc(x) = sign(x) * floor(|x|) in lanes [0, lanes) of a new temp. */
+static unsigned
+tcl_trunc(struct tcl_builder *b, unsigned lanes,
+          struct drm_chrome9_vertex_source src)
+{
+   const uint8_t mask = BITFIELD_MASK(lanes);
+   const unsigned mag = tcl_new_temp(b), whole = tcl_new_temp(b);
+   const unsigned sign = tcl_new_temp(b), out = tcl_new_temp(b);
+   struct drm_chrome9_vertex_source m[2];
+
+   tcl_op(b, DRM_CHROME9_VERTEX_OP_ABS, mask, mag, &src, 1);
+   m[0] = tcl_temp_source(mag, lanes, false);
+   tcl_op(b, DRM_CHROME9_VERTEX_OP_FLR, mask, whole, m, 1);
+   tcl_op(b, DRM_CHROME9_VERTEX_OP_SGN, mask, sign, &src, 1);
+   m[0] = tcl_temp_source(whole, lanes, false);
+   m[1] = tcl_temp_source(sign, lanes, false);
+   return tcl_op(b, DRM_CHROME9_VERTEX_OP_MUL, mask, out, m, 2);
 }
 
 static void
@@ -673,6 +742,9 @@ tcl_alu(struct tcl_builder *b, nir_alu_instr *alu)
       src[1].swizzle[2] = TCL_SEL_ZERO;
       tcl_op(b, DRM_CHROME9_VERTEX_OP_DP3, 1, temp, src, 2);
       break;
+   case nir_op_ftrunc:
+      tcl_set_temp(b, &alu->def, tcl_trunc(b, n, src[0]));
+      return;
    case nir_op_frcp:
       tcl_scalar(b, DRM_CHROME9_VERTEX_OP_RCP, temp, n, src[0]);
       break;
@@ -986,6 +1058,257 @@ tcl_used_in_flow(const struct tcl_builder *b, nir_def *def)
    return false;
 }
 
+/* An indirect CB0 read the lowering cannot express. */
+static void
+tcl_indirect_fail(struct tcl_builder *b, const char *reason)
+{
+   if (!b->failed && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL indirect constant: %s\n", reason);
+   b->p->indirect = true;
+   b->failed = true;
+}
+
+static bool
+tcl_indirect_load(const nir_instr *instr)
+{
+   const nir_intrinsic_instr *intr;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   intr = nir_instr_as_intrinsic(instr);
+   return (intr->intrinsic == nir_intrinsic_load_ubo ||
+           intr->intrinsic == nir_intrinsic_load_ubo_vec4) &&
+          !nir_src_is_const(intr->src[1]);
+}
+
+/* nir_scalar_chase_movs that records the moves it passes. */
+static nir_scalar
+tcl_chase(nir_scalar s, nir_instr **chain, unsigned *count)
+{
+   while (nir_scalar_is_alu(s) && *count < TCL_ADDRESS_CHAIN &&
+          (nir_scalar_alu_op(s) == nir_op_mov ||
+           nir_op_is_vec(nir_scalar_alu_op(s)))) {
+      chain[(*count)++] = nir_def_instr(s.def);
+      s = nir_scalar_chase_alu_src(s, nir_scalar_alu_op(s) == nir_op_mov ?
+                                      0 : s.comp);
+   }
+   return s;
+}
+
+/*
+ * Index scalar of an indirect load_ubo_vec4, whose address is f2i32 of
+ * float-encoded integer arithmetic (chrome9_nir_lower_integers).  Constant
+ * terms fold into *base while the other term is integral, so truncation
+ * and the ARL floor still agree; *trunc asks the ARL for truncation of a
+ * possibly negative fraction.  chain collects the folded instructions.
+ */
+static bool
+tcl_address_index(struct tcl_builder *b, const nir_intrinsic_instr *load,
+                  nir_scalar *index, int *base, bool *trunc,
+                  nir_instr **chain, unsigned *count)
+{
+   nir_scalar s;
+   fp_class_mask fp;
+
+   *count = 0;
+   *base = nir_intrinsic_base(load);
+   s = tcl_chase(nir_get_scalar(load->src[1].ssa, 0), chain, count);
+   if (load->intrinsic != nir_intrinsic_load_ubo_vec4 ||
+       !nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_f2i32 ||
+       *count >= TCL_ADDRESS_CHAIN)
+      return false;
+   chain[(*count)++] = nir_def_instr(s.def);
+   s = tcl_chase(nir_scalar_chase_alu_src(s, 0), chain, count);
+   while (*count + 3 <= TCL_ADDRESS_CHAIN && nir_scalar_is_alu(s) &&
+          nir_scalar_alu_op(s) == nir_op_fadd) {
+      const unsigned t = nir_scalar_is_const(
+         nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0)));
+      nir_scalar term = nir_scalar_chase_alu_src(s, t);
+      nir_scalar k = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, !t));
+      float f;
+
+      if (!nir_scalar_is_const(k) ||
+          (nir_analyze_fp_class(&b->fp, nir_scalar_chase_movs(term).def) &
+           FP_CLASS_NON_INTEGRAL))
+         break;
+      f = nir_scalar_as_float(k);
+      if (f != floorf(f) || fabsf(f) > DRM_CHROME9_VERTEX_MAX_CONSTANTS)
+         break;
+      chain[(*count)++] = nir_def_instr(s.def);
+      chain[(*count)++] = nir_def_instr(k.def);
+      *base += (int)f;
+      s = tcl_chase(term, chain, count);
+   }
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_ftrunc &&
+       *count < TCL_ADDRESS_CHAIN) {
+      chain[(*count)++] = nir_def_instr(s.def);
+      s = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+   }
+   fp = nir_analyze_fp_class(&b->fp, s.def);
+   *trunc = (fp & FP_CLASS_NON_INTEGRAL) && (fp & FP_CLASS_ANY_NEG);
+   *index = s;
+   return true;
+}
+
+/* Address arithmetic read only by indirect loads is not emitted. */
+static void
+tcl_skip_addresses(struct tcl_builder *b)
+{
+   bool progress;
+
+   do {
+      progress = false;
+      nir_foreach_block(block, b->impl) {
+         nir_foreach_instr(instr, block) {
+            nir_instr *chain[TCL_ADDRESS_CHAIN];
+            nir_scalar index;
+            unsigned count;
+            bool trunc;
+            int base;
+
+            if (!tcl_indirect_load(instr) ||
+                !tcl_address_index(b, nir_instr_as_intrinsic(instr), &index,
+                                   &base, &trunc, chain, &count))
+               continue;
+            for (unsigned i = 0; i < count; i++) {
+               bool only = chain[i]->pass_flags != TCL_SKIP;
+
+               nir_foreach_use_including_if(src, nir_instr_def(chain[i])) {
+                  const nir_instr *user;
+
+                  if (!only || nir_src_is_if(src)) {
+                     only = false;
+                     break;
+                  }
+                  user = nir_src_use_instr(src);
+                  only = user->pass_flags == TCL_SKIP ||
+                         (tcl_indirect_load(user) &&
+                          src == &nir_instr_as_intrinsic(user)->src[1]);
+               }
+               if (only) {
+                  chain[i]->pass_flags = TCL_SKIP;
+                  progress = true;
+               }
+            }
+         }
+      }
+   } while (progress);
+}
+
+/*
+ * The a0 lane holding index for reads at base, written by an ARL unless an
+ * active region already did.  A lane only ever holds its one index, and
+ * its bases stay within TCL_RELATIVE_SPREAD so the kernel clamp, taken
+ * over all of them, cuts no valid read once the rows are padded.
+ */
+static int
+tcl_address_lane(struct tcl_builder *b, nir_scalar index, unsigned base,
+                 bool trunc)
+{
+   struct drm_chrome9_vertex_instruction arl = {
+      .op = DRM_CHROME9_VERTEX_OP_ARL,
+      .dst = { DRM_CHROME9_VERTEX_DEST_ADDRESS, 0, 0, 0 },
+   };
+   struct tcl_address *a = NULL;
+   const struct tcl_value *v;
+   uint8_t swizzle[4];
+   unsigned lane;
+
+   for (lane = 0; lane < b->address_count; lane++) {
+      a = &b->address[lane];
+      if (a->index.def == index.def && a->index.comp == index.comp &&
+          MAX2(a->base_max, base) - MIN2(a->base_min, base) <=
+          TCL_RELATIVE_SPREAD)
+         break;
+   }
+   if (lane == b->address_count) {
+      if (lane == ARRAY_SIZE(b->address)) {
+         tcl_indirect_fail(b, "more than four a0 lanes");
+         return -1;
+      }
+      a = &b->address[b->address_count++];
+      memset(a, 0, sizeof(*a));
+      a->index = index;
+      a->base_min = a->base_max = base;
+   }
+   a->base_min = MIN2(a->base_min, base);
+   a->base_max = MAX2(a->base_max, base);
+   if (a->written && tcl_scope_active(b, a->scope))
+      return lane;
+   v = tcl_value(b, index.def);
+   if (b->failed)
+      return -1;
+   memset(swizzle, index.comp, sizeof(swizzle));
+   arl.src[0] = tcl_source(v, swizzle, 4, false);
+   /* The ARL floors; a possibly negative fraction needs truncation. */
+   if (trunc)
+      arl.src[0] = tcl_temp_source(tcl_trunc(b, 1, arl.src[0]), 1, false);
+   arl.dst.writemask = 1u << lane;
+   tcl_emit(b, &arl, 1);
+   a->written = true;
+   a->scope = b->scope[b->depth];
+   return lane;
+}
+
+/* c[base + a0.lane] for load_ubo_vec4 with a computed element index. */
+static void
+tcl_relative_load(struct tcl_builder *b, nir_intrinsic_instr *load)
+{
+   struct tcl_value *out = &b->values[load->def.index];
+   const unsigned component = nir_intrinsic_component(load);
+   nir_instr *chain[TCL_ADDRESS_CHAIN];
+   nir_scalar index;
+   unsigned count;
+   bool trunc;
+   int base, lane;
+
+   if (!b->relative) {
+      tcl_indirect_fail(b, "no relative addressing");
+      return;
+   }
+   if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+       load->def.bit_size != 32 ||
+       component + load->def.num_components > 4 ||
+       !tcl_address_index(b, load, &index, &base, &trunc, chain, &count) ||
+       base < 0 || base >= (int)b->p->uniform_rows) {
+      tcl_indirect_fail(b, "address form");
+      return;
+   }
+   lane = tcl_address_lane(b, index, base, trunc);
+   if (lane < 0)
+      return;
+   memset(out, 0, sizeof(*out));
+   out->valid = true;
+   out->file = DRM_CHROME9_VERTEX_FILE_CONSTANT;
+   out->index = base;
+   out->relative = DRM_CHROME9_VERTEX_RELATIVE_A0_X + lane;
+   for (unsigned c = 0; c < 4; c++)
+      out->sel[c] = component + (c < load->def.num_components ? c : 0);
+}
+
+/* Zero pad rows for the widest lane, reserved kernel rows, and the
+ * constant sources moved behind the front pad. */
+static void
+tcl_relative_finish(struct tcl_builder *b)
+{
+   struct chrome9_tcl_program *p = b->p;
+   unsigned pad = 0;
+
+   for (unsigned lane = 0; lane < b->address_count; lane++)
+      pad = MAX2(pad, b->address[lane].base_max - b->address[lane].base_min);
+   /* The kernel keeps its ARL bound rows after the draw's constants. */
+   if (2 * pad + p->uniform_rows + p->immediate_count + 2 >
+       DRM_CHROME9_VERTEX_MAX_CONSTANTS) {
+      tcl_indirect_fail(b, "constant rows");
+      return;
+   }
+   p->constant_pad = pad;
+   for (unsigned i = 0; pad && i < p->instruction_count; i++)
+      for (unsigned k = 0; k < 3; k++)
+         if (p->instructions[i].src[k].file == DRM_CHROME9_VERTEX_FILE_CONSTANT)
+            p->instructions[i].src[k].index += pad;
+}
+
 static void
 tcl_intrinsic(struct tcl_builder *b, nir_intrinsic_instr *intr)
 {
@@ -1022,6 +1345,10 @@ tcl_intrinsic(struct tcl_builder *b, nir_intrinsic_instr *intr)
       return;
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ubo_vec4:
+      if (tcl_indirect_load(&intr->instr)) {
+         tcl_relative_load(b, intr);
+         return;
+      }
       if (!tcl_ubo_row(intr, &row, &lane)) {
          b->failed = true;
          return;
@@ -1837,10 +2164,12 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       .point_size = point & CHROME9_TCL_POINT_SIZE,
       .writes_back = !!(source->info.outputs_written & VARYING_BIT_BFC0),
       .flow = flow && flow->max_depth ? flow : NULL,
+      .relative = flow && flow->relative,
    };
    struct tcl_key key = { key_count, key_dword, key_value };
    nir_shader *nir = nir_shader_clone(NULL, source);
    nir_shader_compiler_options *options;
+   bool indirect = false;
    nir_block *block;
 
    /* CHROME9_DEBUG_TCL_NIR=2 prints every VS entering the lowering. */
@@ -1915,6 +2244,14 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
          if (instr->type == nir_instr_type_intrinsic &&
              tcl_ubo_row(nir_instr_as_intrinsic(instr), &row, &lane))
             p->uniform_rows = MAX2(p->uniform_rows, row + 1);
+         /* An indirect read may reach any row of the default block. */
+         if (tcl_indirect_load(instr)) {
+            indirect = true;
+            if (b.relative)
+               p->uniform_rows = MAX2(p->uniform_rows,
+                                      MIN2(nir->num_uniforms,
+                                           DRM_CHROME9_VERTEX_MAX_CONSTANTS));
+         }
       }
    }
    b.values = CALLOC(b.impl->ssa_alloc, sizeof(*b.values));
@@ -1928,7 +2265,15 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       tcl_mark_reps(&b, &b.impl->body);
       tcl_skip_dead(&b, b.impl);
    }
+   if (indirect) {
+      b.fp = nir_create_fp_analysis_state(b.impl);
+      tcl_skip_addresses(&b);
+   }
    tcl_emit_list(&b, &b.impl->body);
+   if (b.address_count && !b.failed)
+      tcl_relative_finish(&b);
+   if (indirect)
+      nir_free_fp_analysis_state(&b.fp);
    util_dynarray_fini(&b.uniform_ifs);
    util_dynarray_fini(&b.expr_keys);
    if (b.failed && debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0))
@@ -2786,7 +3131,11 @@ tcl_constants(struct chrome9_context *ctx, const struct chrome9_tcl_program *p,
 {
    const struct pipe_constant_buffer *cb = &ctx->vs_constants[0];
    const uint8_t *map = cb->user_buffer;
+   const unsigned pad = p->constant_pad;
 
+   memset(rows, 0, pad * sizeof(*rows));
+   memset(rows + chrome9_tcl_constant_count(p) - pad, 0, pad * sizeof(*rows));
+   rows += pad;
    if (p->uniform_rows) {
       if (!map && cb->buffer)
          map = chrome9_resource(cb->buffer)->bo.map;
@@ -2918,7 +3267,7 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
    }
    variant = tcl_variant(ctx, clip_halfz, colour, clip_enable, false,
                          point_clip, key);
-   return variant && variant->program.supported ? &variant->program : NULL;
+   return variant ? &variant->program : NULL;
 }
 
 /* Value class of one varying lane for all vertices of a draw; sprite
@@ -3110,7 +3459,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    draw.instructions_ptr = (uintptr_t)p->instructions;
    draw.element_count = p->input_count;
    draw.elements_ptr = (uintptr_t)elements;
-   draw.constant_count = p->uniform_rows + p->immediate_count;
+   draw.constant_count = chrome9_tcl_constant_count(p);
    draw.constants_ptr = draw.constant_count ? (uintptr_t)state->constants : 0;
    if (ctx->tcl_buffers &&
        tcl_index_range(info, range, indices, &index_min, &index_max)) {
@@ -3311,8 +3660,9 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                      !raster.triangles && raster.topology ==
                         DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST);
 
-      if (!p)
-         return tcl_fallback(ctx, "vertex shader not expressible");
+      if (!p || !p->supported)
+         return tcl_fallback(ctx, p && p->indirect ? "indirect constant" :
+                                  "vertex shader not expressible");
       /* An enabled plane the VS never writes stays with the draw module. */
       if (p->clip_written != clip_enable)
          return tcl_fallback(ctx, "unwritten clip distance");

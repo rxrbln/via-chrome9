@@ -5341,9 +5341,11 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    *lowered = true;
    bool compiled = chrome9_compile_ps_ir(&builder.ir, program);
 
+   /* Only the optional offline encoder; the kernel compiles the semantic
+    * program, whose validity is decided after scheduling. */
    if (!compiled && debug_get_bool_option("CHROME9_DEBUG_REJECT", false))
-      fprintf(stderr, "chrome9: reject native compile ir=%u temps=%u\n",
-              builder.ir.count, builder.next_temp);
+      fprintf(stderr, "chrome9: offline native encoder skipped ir=%u "
+              "ssa temps=%u\n", builder.ir.count, builder.next_temp);
 
    memcpy(program->immediate, builder.immediate,
           sizeof(program->immediate));
@@ -7523,19 +7525,21 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       chrome9_screen_has_capability2(screen,
                                      DRM_CHROME9_CAP2_VERTEX_TOPOLOGY) &&
       debug_get_bool_option("CHROME9_TCL_TOPOLOGY", true);
-   /* Lines passed rungs L1-L3 and the GL smoke; point sizes and edge
-    * clipping match GL, sprites and wireframe wait for rungs sprite, wire. */
+   /* Rungs points, pedge, sprite, lines, wire, polymode, psize and the GL
+    * smoke pass. */
    ctx->tcl_points = ctx->tcl_enabled &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_NATIVE_POINTS) &&
-      debug_get_bool_option("CHROME9_TCL_POINTS", false);
+      debug_get_bool_option("CHROME9_TCL_POINTS", true);
    ctx->tcl_point_size = ctx->tcl_points &&
-      debug_get_bool_option("CHROME9_TCL_POINT_SIZE", false);
+      chrome9_screen_has_capability2(screen,
+                                     DRM_CHROME9_CAP2_POINT_SIZE_VERTEX) &&
+      debug_get_bool_option("CHROME9_TCL_POINT_SIZE", true);
    ctx->tcl_lines = ctx->tcl_enabled &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_NATIVE_LINES) &&
       debug_get_bool_option("CHROME9_TCL_LINES", true);
    ctx->tcl_polygon_mode = ctx->tcl_enabled &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_POLYGON_MODE) &&
-      debug_get_bool_option("CHROME9_TCL_POLYGON_MODE", false);
+      debug_get_bool_option("CHROME9_TCL_POLYGON_MODE", true);
    /* The cap grants depth one; CHROME9_TCL_FLOW_DEPTH and
     * CHROME9_TCL_DYNAMIC_FLOW follow the kernel RE knobs. */
    if (ctx->tcl_enabled &&
@@ -7547,6 +7551,11 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       ctx->tcl_flow.dynamic =
          debug_get_bool_option("CHROME9_TCL_DYNAMIC_FLOW", false);
    }
+   /* CHROME9_TCL_RELATIVE=0 leaves indirect uniform reads to the draw
+    * module. */
+   ctx->tcl_flow.relative = ctx->tcl_enabled &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_VERTEX_RELATIVE) &&
+      debug_get_bool_option("CHROME9_TCL_RELATIVE", true);
    ctx->fragment_primary =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_PRIMARY);
    ctx->fragment_kill =
@@ -7597,6 +7606,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_BLEND_BGRA8888);
    ctx->blend_extended_factors =
       !!(capabilities & DRM_CHROME9_CAP_BLEND_EXTENDED_FACTORS);
+   ctx->blend_equation = chrome9_screen_has_capability2(
+      screen, DRM_CHROME9_CAP2_BLEND_EQUATION);
    ctx->alpha_test_supported =
       !!(capabilities & DRM_CHROME9_CAP_ALPHA_TEST);
    ctx->scissor_supported =

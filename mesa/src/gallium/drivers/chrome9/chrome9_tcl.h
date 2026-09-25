@@ -31,6 +31,8 @@ struct chrome9_tcl_flow {
    unsigned max_depth;
    /* IF on a computed value (kernel RE knob vs_flow_dynamic, rung F3). */
    bool dynamic;
+   /* ARL and a0-relative CB0 reads (CAP2_VERTEX_RELATIVE). */
+   bool relative;
 };
 
 /* Scalar expression over CB0 dwords and literals, evaluated per draw for
@@ -58,9 +60,14 @@ struct chrome9_tcl_program {
    bool supported;
    unsigned instruction_count;
    unsigned input_count;
-   /* Rows [0, uniform_rows) come from CB0, then the immediates. */
+   /* Rows [0, uniform_rows) come from CB0, then the immediates; with
+    * constant_pad all move up by that many zero rows, and as many zero
+    * rows follow, so clamped a0-relative reads stay inside the draw. */
    unsigned uniform_rows;
    unsigned immediate_count;
+   unsigned constant_pad;
+   /* Unsupported because of an indirect CB0 read. */
+   bool indirect;
    uint32_t immediates[DRM_CHROME9_VERTEX_MAX_CONSTANTS][4];
    struct drm_chrome9_vertex_instruction
       instructions[DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS];
@@ -132,6 +139,14 @@ bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
 #define CHROME9_TCL_POINT_SIZE 1u
 #define CHROME9_TCL_POINT_CLIP 2u
 void chrome9_tcl_program_fini(struct chrome9_tcl_program *program);
+
+/* DRAW_VERTEX_PROGRAM constant rows of a program. */
+static inline unsigned
+chrome9_tcl_constant_count(const struct chrome9_tcl_program *program)
+{
+   return 2 * program->constant_pad + program->uniform_rows +
+          program->immediate_count;
+}
 bool chrome9_tcl_flow_constants(const struct chrome9_tcl_program *program,
                                 const uint8_t *cb0, size_t size,
                                 uint32_t *bools, uint8_t (*ints)[4]);

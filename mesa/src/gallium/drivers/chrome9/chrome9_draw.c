@@ -728,9 +728,33 @@ chrome9_blend_factor(unsigned factor, bool extended, uint32_t *result)
 }
 
 static bool
+chrome9_blend_func(unsigned func, bool equation, uint32_t *result)
+{
+   switch (func) {
+   case PIPE_BLEND_ADD:
+      *result = DRM_CHROME9_BLEND_FUNC_ADD;
+      return true;
+   case PIPE_BLEND_SUBTRACT:
+      *result = DRM_CHROME9_BLEND_FUNC_SUBTRACT;
+      return equation;
+   case PIPE_BLEND_REVERSE_SUBTRACT:
+      *result = DRM_CHROME9_BLEND_FUNC_REVERSE_SUBTRACT;
+      return equation;
+   case PIPE_BLEND_MIN:
+      *result = DRM_CHROME9_BLEND_FUNC_MIN;
+      return equation;
+   case PIPE_BLEND_MAX:
+      *result = DRM_CHROME9_BLEND_FUNC_MAX;
+      return equation;
+   default:
+      return false;
+   }
+}
+
+static bool
 chrome9_translate_blend(const struct pipe_blend_state *state,
                         struct drm_chrome9_blend_state *result,
-                        bool extended, bool *successor)
+                        bool extended, bool equation, bool *successor)
 {
    const struct pipe_rt_blend_state *rt;
 
@@ -767,7 +791,8 @@ chrome9_translate_blend(const struct pipe_blend_state *state,
    *successor = rt->blend_enable || rt->colormask != PIPE_MASK_RGBA;
    if (!rt->blend_enable)
       return true;
-   if (rt->rgb_func != PIPE_BLEND_ADD || rt->alpha_func != PIPE_BLEND_ADD ||
+   if (!chrome9_blend_func(rt->rgb_func, equation, &result->rgb_func) ||
+       !chrome9_blend_func(rt->alpha_func, equation, &result->alpha_func) ||
        !chrome9_blend_factor(rt->rgb_src_factor, extended,
                              &result->rgb_src_factor) ||
        !chrome9_blend_factor(rt->rgb_dst_factor, extended,
@@ -790,7 +815,8 @@ chrome9_draw_blend_supported(const struct chrome9_context *ctx)
    bool successor;
 
    return chrome9_translate_blend(ctx->blend, &blend,
-                                  ctx->blend_extended_factors, &successor);
+                                  ctx->blend_extended_factors,
+                                  ctx->blend_equation, &successor);
 }
 
 static bool
@@ -1015,7 +1041,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    *reason = "blend-state";
    if (!chrome9_translate_blend(ctx->blend, blend,
                                 ctx->blend_extended_factors,
-                                blend_successor))
+                                ctx->blend_equation, blend_successor))
       return false;
    if (depth_only) {
       /* Keep a real guarded A50 target but suppress every color store.  A

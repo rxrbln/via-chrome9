@@ -4,6 +4,7 @@
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
 #include "chrome9_draw.h"
+#include "chrome9_ps_schedule.h"
 #include "chrome9_public.h"
 #include "chrome9_specialise.h"
 
@@ -2260,6 +2261,56 @@ check_compact_alu_lowering(struct chrome9_context *context)
    return true;
 }
 
+/* piglit glsl-max-varyings: val += contribution[i] * v_i over eight
+ * varyings.  The optional offline encoder takes at most twelve SSA temps
+ * and skips this program, but the kernel-compiled semantic program fits the
+ * twelve registers, so the draw stays on the generic hardware path. */
+static bool
+check_max_varyings_compilation(struct chrome9_context *context)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-max-varyings");
+   nir_def *barycentric = nir_load_barycentric_pixel(
+      &b, 32, .interp_mode = INTERP_MODE_SMOOTH);
+   struct chrome9_shader shader = { 0 };
+   nir_def *value = NULL;
+   unsigned peak = 0;
+   bool ok;
+
+   b.shader->info.io_lowered = true;
+   for (unsigned i = 0; i < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; i++) {
+      nir_def *varying = nir_load_interpolated_input(
+         &b, 4, 32, barycentric, nir_imm_int(&b, 0),
+         .io_semantics.location = VARYING_SLOT_VAR0 + i);
+      nir_def *contribution = nir_load_ubo(
+         &b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 16 * i),
+         .align_mul = 16, .range_base = 0,
+         .range = 16 * DRM_CHROME9_FRAGMENT_MAX_VARYINGS);
+      nir_def *term = nir_fmul(&b, contribution, varying);
+
+      value = value ? nir_fadd(&b, value, term) : term;
+   }
+   nir_store_output(&b, value, nir_imm_int(&b, 0), .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_COLOR);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_recompute_io_bases(b.shader, nir_var_shader_in | nir_var_shader_out);
+   chrome9_compile_fs_nir(context, &shader, b.shader);
+   context->fs = &shader;
+   ok = shader.supported && shader.semantic_fs_valid &&
+        shader.fragment_program == CHROME9_FS_COMPILED_ALU &&
+        shader.semantic_varying_mask == 0xff &&
+        chrome9_ps_ir_temp_pressure(&shader.semantic_fs_ir, &peak) &&
+        peak <= 12 && chrome9_generic_fragment_program(context);
+   context->fs = NULL;
+   if (!ok)
+      fprintf(stderr, "max varyings: supported=%u semantic=%u program=%u "
+              "varyings=%x ir=%u peak=%u\n", shader.supported,
+              shader.semantic_fs_valid, shader.fragment_program,
+              shader.semantic_varying_mask, shader.semantic_fs_ir.count, peak);
+   ralloc_free(b.shader);
+   return ok;
+}
+
 int
 main(void)
 {
@@ -2362,8 +2413,9 @@ main(void)
        !check_product_alpha_kill_compilation(&context) ||
        !check_product_alpha_unit_interval() ||
        !check_compact_alu_lowering(&context) ||
-       !check_separable_blur_compilation(&context))
+       !check_separable_blur_compilation(&context) ||
+       !check_max_varyings_compilation(&context))
       return 1;
-   puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur compilation passed");
+   puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur and max-varyings compilation passed");
    return 0;
 }
