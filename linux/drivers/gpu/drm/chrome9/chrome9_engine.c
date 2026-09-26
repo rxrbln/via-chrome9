@@ -6920,6 +6920,34 @@ static void chrome9_fence_completed(struct chrome9_engine *engine,
 	}
 }
 
+/* A job may batch many long draws: its fence wait only fails once the
+ * command reader stops advancing for CHROME9_HW_TIMEOUT_US, or after
+ * CHROME9_JOB_MAX_MS in total. */
+#define CHROME9_JOB_MAX_MS	10000
+
+static int chrome9_wait_fence_progress(struct chrome9_engine *engine,
+				       const u32 *slot, u32 fence_id)
+{
+	void __iomem *mmio = engine->cdev->mmio;
+	u32 position = readl(mmio + CHROME9_REG_FE_TRANSSET);
+	ktime_t start = ktime_get();
+	u32 value, now;
+	int ret;
+
+	for (;;) {
+		ret = read_poll_timeout(READ_ONCE, value, value == fence_id,
+					10, CHROME9_HW_TIMEOUT_US, false,
+					slot[0]);
+		if (!ret)
+			return 0;
+		now = readl(mmio + CHROME9_REG_FE_TRANSSET);
+		if (now == position ||
+		    ktime_ms_delta(ktime_get(), start) > CHROME9_JOB_MAX_MS)
+			return ret;
+		position = now;
+	}
+}
+
 static int chrome9_wait_job(struct chrome9_engine *engine,
 			    struct chrome9_job *job)
 {
@@ -6938,8 +6966,7 @@ static int chrome9_wait_job(struct chrome9_engine *engine,
 	if (job->fence_id) {
 		slot = chrome9_fence_slot(engine, job->fence_id);
 		slot_dma = chrome9_fence_slot_dma(engine, job->fence_id);
-		ret = read_poll_timeout(READ_ONCE, value, value == job->fence_id,
-					10, CHROME9_HW_TIMEOUT_US, false, slot[0]);
+		ret = chrome9_wait_fence_progress(engine, slot, job->fence_id);
 		if (ret)
 			goto timeout;
 		dma_rmb();
