@@ -3049,6 +3049,10 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
    if (b.failed && debug_get_num_option("CHROME9_DEBUG_TCL_NIR", 0))
       nir_print_shader(nir, stderr);
    p->supported = !b.failed && p->instruction_count && p->input_count;
+   if (p->supported && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+      fprintf(stderr, "chrome9: TCL program %u instructions, %u inputs, "
+              "%u uniform rows\n", p->instruction_count, p->input_count,
+              p->uniform_rows);
    FREE(b.values);
 out:
    ralloc_free(nir);
