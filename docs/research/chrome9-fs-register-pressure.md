@@ -338,3 +338,50 @@ stores sequential.  1024x1024 texture upload (tools `re/chrome9_gl_upload_bench.
 BGRA 16.0 -> 10.1 ms, RGBA 18.4 -> 12.5 ms.  What remains: the state
 tracker's copy into the transfer buffer (23 %), the tiled store (32 %) and
 the kernel's zeroing of new local objects (10 %).
+
+## 12. Mipmap generation, vertex throughput, false job timeouts (2026-09-26)
+
+**Mipmaps.**  glmark2 refract renders to a 1600x1200 texture and calls
+glGenerateMipmap every frame: skipping it saves 5 ms of the 51 ms frame.
+`re/chrome9_gl_mipmap_bench.c` (clear plus mipmap): a whole 16x16 chain
+costs 0.23-0.29 ms, 1600x1200 6.3 ms, so the per-level submission
+overhead is small and the cost is memory bandwidth.  One submission for
+all levels was therefore not built.  Mesa `578de22` samples each 2x2
+group once with a bilinear fetch at its shared corner (TEX + MOV instead
+of 4 TEX, 3 ADD, MUL): 6.3 -> 5.9 ms.  The first version filled all four
+varyings; the kernel requires unused varyings to be zero and rejected
+every level (EINVAL), which fell back to CPU mipmaps (refract 95 ms).
+
+**Vertex throughput** (`re/chrome9_gl_vs_bench.c`, 128x128 indexed grid
+drawn into a few pixels): time grows linearly with the VS instruction
+count, about 4.5 ns per instruction and vertex (8.2 Mvert/s at 15
+instructions, 1.3 Mvert/s at 175).  Each `p = p * a + b` compiled to two
+records: `tcl_optimize` never ran `nir_opt_algebraic_late`, which holds
+NIR's multiply-add fusion.  With it (Mesa, this change): a 32-step chain
+79 -> 48 instructions (5.9 -> 3.8 ms), terrain VS 85 -> 72, refract VS
+54 -> 46.  Frame times barely move: terrain 194 ms, refract 51.2 -> 50.8.
+
+**Where terrain and refract spend GPU time** (PPC counters, `ppc_profile`
+mask 0xffffff, deltas of the debugfs `chrome9_ppc` values over 2 s):
+
+| counter / s | terrain (6 fps) | refract (20 fps) |
+|---|---|---|
+| vertices | 2.2 M | 8.5 M |
+| pixels | 29 M | 84 M |
+| ps_alu | 408 M | 367 M |
+| ps_tau | 76 M | 31 M |
+
+Both run the pixel ALU near the same rate: they are fragment-ALU bound.
+Terrain shades about 5.5 M pixels per frame (11 full 800x600 passes) at
+about 14 ALU records per pixel; its vertex work is small.  Next lever:
+fewer ALU records in terrain's fragment programs (semantic IR 54/29/16/13
+operations) and a hardware path for the 92-temporary program that still
+runs in llvmpipe (23 ms per frame).
+
+**False job timeouts** (kernel `f020bb7`).  The fence wait gave a job
+100 ms.  A TCL job can batch many draws: twenty 12 ms vertex-bound draws
+(the VS benchmark at 143 instructions) exceeded it, the engine was
+declared hung and quarantined, and every later context creation failed.
+Mesa then crashed in the failure path, which flushed the TCL batch
+through a NULL screen (Mesa `838dc52`).  The wait now continues while the
+command reader position advances within each 100 ms window, up to 10 s.
