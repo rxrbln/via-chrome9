@@ -210,3 +210,53 @@ remaining failed before too); full piglit unchanged.
 Remaining terrain cost: varyings straddling vec4 slots after the linker's
 scalar compaction (vViewPosition in T2.w/T3.xy) need gather MOVs; a
 lane-level varying layout would save about 2-3 of 59 records.
+
+## 10. TEXLDP, per-lane varying layout, tiled back buffers (2026-09-26)
+
+**TEXLDP** (kernel `b03a024`, Mesa `3500904`): TAU operation 7 divides
+the coordinate by its W lane.  A direct varying coordinate reaches the TAU
+through the textured FE consumer, which carries three lanes unless W is
+read: TEXLDP widens that varying's consumer to STRQ, otherwise the divisor
+is the default 1 (first silicon run: every sample at s*q).  q in another
+lane goes through a computed (s, t, 0, q) temporary.  Silicon
+(`tools/re/chrome9_gl_texldp_prec.c`: 256-texel NEAREST ramps, q from
+0.0123 to 100, sub-texel offsets 0.02..0.98, CLAMP and REPEAT over five
+periods, constant and interpolated q, both axes): identical to the
+RCP/MUL path except the neighbouring texel within about 0.02-0.1 texel of
+a boundary (at most 92 of 8960 samples, one texel).  All projective piglit
+tests pass; on by default.
+
+**Per-lane varying layout** (Mesa `3577321`): the linker compacts
+varyings lane by lane, so vectors the fragment shader builds can straddle
+two slots.  The FS input lanes are regrouped so each such vector (also of
+per-component operations) and each TEX coordinate lies in one hardware
+varying; TCL stores and the software vertex path follow
+`chrome9_shader::varying_layout`.  ioquake3 GL2 hot program 4 -> 2
+records, terrain 59 -> 56; fps unchanged (not ALU bound).
+
+**Tiled window back buffers** (kernel `f49dd0c`, Mesa `7604c93`,
+`1195e70`): DRI3 back buffers (`PIPE_BIND_BACKBUFFER`, new) are tiled and
+created with `GEM_CREATE_TILED`; importers read the layout with GEM_INFO,
+the LINEAR modifier is not advertised while tiled sharing is on (implicit
+layout path), KMS refuses tiled framebuffers so Present copies.
+`tools/re/chrome9_glx_present_check.c` compares a per-pixel unique
+pattern between glReadPixels and XGetImage: identical from 64x8 to
+1000x700.
+
+| 1024x768 | linear back buffer | tiled |
+|---|---|---|
+| ioquake3 GL1 | 50.1 fps | 54.6-55.0 fps |
+| ioquake3 GL2 | 46.0 fps | 49.1-49.4 fps |
+| glmark2 score | 134 | 142 |
+
+**llvmpipe fallback on tiled local levels**: llvmpipe cannot render into
+the tiled level in place, and CPU detiling through write-combined memory
+cost 10 s in texture-packed-formats (576 fallback draws of a 700x620
+window).  The engine now copies between the level and a linear GART
+staging image (`chrome9_resource_copy_gpu`, NEAREST at texel centres),
+and the llvmpipe copy is kept while the level's kernel `write_seq`
+(GEM_BUSY, kernel `cfcd259`, advanced by every write fence) and CPU write
+generation are unchanged; a device clear clears a kept copy alike (Mesa
+`a8c1fc4`).  Uploads: texture-packed-formats 576 -> 1, tex3d-npot 7986
+-> 1.  The write-back after each fallback draw remains (tex3d-npot 8.0 s
+against 4.8 s with a linear back buffer).
