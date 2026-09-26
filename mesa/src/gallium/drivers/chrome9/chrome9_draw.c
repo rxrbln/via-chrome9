@@ -2101,12 +2101,17 @@ chrome9_generic_fragment_state(
                                       &depth_swizzle[logical][3]))
          return false;
    }
-   if (depth_sampler_mask &&
-       !chrome9_fragment_apply_depth_swizzles(instructions,
-                                               instruction_count,
-                                               depth_sampler_mask,
-                                               depth_swizzle))
-      return false;
+   uint32_t used_samplers = UINT32_MAX;
+
+   if (depth_sampler_mask) {
+      if (!chrome9_fragment_apply_depth_swizzles(instructions,
+                                                 instruction_count,
+                                                 depth_sampler_mask,
+                                                 depth_swizzle))
+         return false;
+      used_samplers = chrome9_fragment_drop_dead_textures(instructions,
+                                                          &instruction_count);
+   }
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
       const unsigned logical = chrome9_fragment_texture_unit(crender->ctx,
                                                               unit);
@@ -2127,7 +2132,11 @@ chrome9_generic_fragment_state(
       return false;
    draw->instruction_count = instruction_count;
    draw->constant_count = constant_count;
-   draw->texture_count = crender->texture_count;
+   draw->texture_count = used_samplers == UINT32_MAX ?
+      crender->texture_count :
+      chrome9_fragment_trim_textures(
+         texture_state, crender->texture_count, used_samplers,
+         chrome9_fragment_uses_sparse_abi(crender->ctx));
    draw->abi_version = chrome9_fragment_uses_sparse_abi(crender->ctx) ?
       DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES :
       DRM_CHROME9_FRAGMENT_ABI_VERSION;
@@ -2442,11 +2451,18 @@ chrome9_split_job_state(
              &texture_state[descriptors++]))
          return false;
    }
-   if (depth_sampler_mask &&
-       !chrome9_fragment_apply_depth_swizzles(instructions, instruction_count,
-                                               depth_sampler_mask,
-                                               depth_swizzle))
-      return false;
+   if (depth_sampler_mask) {
+      if (!chrome9_fragment_apply_depth_swizzles(instructions,
+                                                 instruction_count,
+                                                 depth_sampler_mask,
+                                                 depth_swizzle))
+         return false;
+      descriptors = chrome9_fragment_trim_textures(
+         texture_state, descriptors,
+         chrome9_fragment_drop_dead_textures(instructions,
+                                             &instruction_count),
+         !dense);
+   }
    if (final) {
       if (!chrome9_fragment_draw_target(crender, crender->generic_target,
                                         crender->generic_depth,

@@ -240,13 +240,14 @@ check_depth_view_swizzles(void)
    view[0][1] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
    view[0][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
    view[0][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+   /* Type-FE depth is in every lane: a depth lane reads itself. */
    CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 2, 1, view));
    CHECK(instructions[1].src[0].swizzle[0] ==
          DRM_CHROME9_FRAGMENT_SWIZZLE_X);
    CHECK(instructions[1].src[0].swizzle[1] ==
-         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+         DRM_CHROME9_FRAGMENT_SWIZZLE_Y);
    CHECK(instructions[1].src[0].swizzle[2] ==
-         DRM_CHROME9_FRAGMENT_SWIZZLE_X);
+         DRM_CHROME9_FRAGMENT_SWIZZLE_Z);
    CHECK(instructions[1].src[0].swizzle[3] ==
          DRM_CHROME9_FRAGMENT_SWIZZLE_ONE);
 
@@ -269,6 +270,61 @@ check_depth_view_swizzles(void)
 
    instructions[0].dst.file = DRM_CHROME9_FRAGMENT_DEST_COLOR;
    CHECK(!chrome9_fragment_apply_depth_swizzles(instructions, 1, 1, view));
+   return true;
+}
+
+/* A TEX writing only W: an ALPHA view reads depth from W itself, and a
+ * LUMINANCE view turns the read into ONE, which leaves the TEX dead: it is
+ * removed and the descriptors trimmed to the samplers still read. */
+static bool
+check_depth_partial_swizzles(void)
+{
+   const struct drm_chrome9_fragment_instruction program[2] = {
+      {
+         .op = DRM_CHROME9_FRAGMENT_OP_TEX,
+         .sampler = 2,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0x8, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_VARYING, 0, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      }, {
+         .op = DRM_CHROME9_FRAGMENT_OP_MUL,
+         .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+         .src = {
+            { DRM_CHROME9_FRAGMENT_FILE_TEMP, 0, { 3, 3, 3, 3 }, 0, 0 },
+            { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0, { 0, 1, 2, 3 }, 0, 0 },
+         },
+      },
+   };
+   struct drm_chrome9_fragment_instruction instructions[2];
+   struct drm_chrome9_fragment_texture_state textures[3] = { 0 };
+   uint8_t view[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+   unsigned count = 2;
+
+   memcpy(instructions, program, sizeof(program));
+   view[2][0] = view[2][1] = view[2][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO;
+   view[2][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 2, 4, view));
+   for (unsigned lane = 0; lane < 4; lane++)
+      CHECK(instructions[1].src[0].swizzle[lane] ==
+            DRM_CHROME9_FRAGMENT_SWIZZLE_W);
+   CHECK(chrome9_fragment_drop_dead_textures(instructions, &count) == 4);
+   CHECK(count == 2);
+
+   memcpy(instructions, program, sizeof(program));
+   view[2][0] = view[2][1] = view[2][2] = DRM_CHROME9_FRAGMENT_SWIZZLE_X;
+   view[2][3] = DRM_CHROME9_FRAGMENT_SWIZZLE_ONE;
+   CHECK(chrome9_fragment_apply_depth_swizzles(instructions, 2, 4, view));
+   CHECK(chrome9_fragment_drop_dead_textures(instructions, &count) == 0);
+   CHECK(count == 1 && instructions[0].op == DRM_CHROME9_FRAGMENT_OP_MUL);
+   CHECK(instructions[0].src[0].file == DRM_CHROME9_FRAGMENT_FILE_CONSTANT &&
+         instructions[0].src[0].index == 0);
+   CHECK(chrome9_fragment_trim_textures(textures, 3, 0, false) == 0);
+   textures[0].reserved0 = 1;
+   textures[1].reserved0 = 2;
+   CHECK(chrome9_fragment_trim_textures(textures, 2, 1u << 1, true) == 1 &&
+         textures[0].reserved0 == 1);
+   CHECK(chrome9_fragment_trim_textures(textures, 3, 1u << 1, false) == 2);
    return true;
 }
 
@@ -464,6 +520,7 @@ main(void)
             check_computed_texture_order() && check_kill_conversion() &&
             check_depth_view_swizzles() && check_depth_kill_swizzles() &&
             check_opaque_alpha_swizzle() &&
+            check_depth_partial_swizzles() &&
             check_position_xy() && check_primary_color() &&
             check_constant_ports());
 }

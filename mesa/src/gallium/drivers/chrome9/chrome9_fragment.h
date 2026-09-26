@@ -29,4 +29,15 @@ bool chrome9_fragment_apply_depth_swizzles(
    uint8_t depth_sampler_mask,
    const uint8_t swizzle[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4]);
 
+/* Remove TEX instructions whose temporary nothing reads (a depth view can
+ * turn every read into a constant) and return the samplers still read. */
+uint32_t chrome9_fragment_drop_dead_textures(
+   struct drm_chrome9_fragment_instruction *instructions, unsigned *count);
+
+/* Keep the texture descriptors of the samplers in used: dense descriptors
+ * are indexed by sampler, sparse ones name it in reserved0. */
+unsigned chrome9_fragment_trim_textures(
+   struct drm_chrome9_fragment_texture_state *textures, unsigned count,
+   uint32_t used, bool sparse);
+
 #endif

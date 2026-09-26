@@ -5,6 +5,7 @@
 
 #include <string.h>
 
+#include "util/bitscan.h"
 #include "util/macros.h"
 
 
@@ -393,6 +394,125 @@ chrome9_fragment_build_instructions(
    return true;
 }
 
+/* Sources a kernel instruction reads, -1 for an unknown operation. */
+static int
+chrome9_fragment_native_source_count(unsigned op)
+{
+   switch (op) {
+   case DRM_CHROME9_FRAGMENT_OP_TEX:
+   case DRM_CHROME9_FRAGMENT_OP_MOV:
+   case DRM_CHROME9_FRAGMENT_OP_EXP2:
+   case DRM_CHROME9_FRAGMENT_OP_LOG2:
+   case DRM_CHROME9_FRAGMENT_OP_RCP:
+   case DRM_CHROME9_FRAGMENT_OP_RSQ:
+   case DRM_CHROME9_FRAGMENT_OP_ABS:
+   case DRM_CHROME9_FRAGMENT_OP_FRC:
+   case DRM_CHROME9_FRAGMENT_OP_KILL:
+      return 1;
+   case DRM_CHROME9_FRAGMENT_OP_MUL:
+   case DRM_CHROME9_FRAGMENT_OP_ADD:
+   case DRM_CHROME9_FRAGMENT_OP_SUB:
+   case DRM_CHROME9_FRAGMENT_OP_MIN:
+   case DRM_CHROME9_FRAGMENT_OP_MAX:
+   case DRM_CHROME9_FRAGMENT_OP_DP3:
+   case DRM_CHROME9_FRAGMENT_OP_DP4:
+      return 2;
+   case DRM_CHROME9_FRAGMENT_OP_MAD:
+   case DRM_CHROME9_FRAGMENT_OP_CMP:
+      return 3;
+   default:
+      return -1;
+   }
+}
+
+uint32_t
+chrome9_fragment_drop_dead_textures(
+   struct drm_chrome9_fragment_instruction *instructions, unsigned *count)
+{
+   bool read[CHROME9_PS_MAX_VIRTUAL_TEMPS] = { false };
+   uint32_t used = 0;
+   unsigned kept = 0;
+
+   for (unsigned i = 0; i < *count; i++) {
+      const struct drm_chrome9_fragment_instruction *instruction =
+         &instructions[i];
+      const int sources =
+         chrome9_fragment_native_source_count(instruction->op);
+
+      for (int s = 0; s < sources; s++) {
+         const struct drm_chrome9_fragment_source *input =
+            &instruction->src[s];
+         bool lane_read = false;
+
+         for (unsigned lane = 0; lane < 4; lane++)
+            lane_read |= input->swizzle[lane] < 4;
+         if (input->file == DRM_CHROME9_FRAGMENT_FILE_TEMP &&
+             input->index < CHROME9_PS_MAX_VIRTUAL_TEMPS &&
+             (lane_read || instruction->op == DRM_CHROME9_FRAGMENT_OP_KILL))
+            read[input->index] = true;
+      }
+   }
+   /* Lane-free reads of a removed temporary move to a constant register
+    * the program already reads, which leaves the constant count alone. */
+   int constant = -1;
+
+   for (unsigned i = 0; i < *count && constant < 0; i++) {
+      const int sources =
+         chrome9_fragment_native_source_count(instructions[i].op);
+
+      for (int s = 0; s < sources; s++)
+         if (instructions[i].src[s].file == DRM_CHROME9_FRAGMENT_FILE_CONSTANT)
+            constant = instructions[i].src[s].index;
+   }
+   for (unsigned i = 0; i < *count; i++) {
+      struct drm_chrome9_fragment_instruction *instruction = &instructions[i];
+
+      if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX &&
+          instruction->dst.file == DRM_CHROME9_FRAGMENT_DEST_TEMP &&
+          instruction->dst.index < CHROME9_PS_MAX_VIRTUAL_TEMPS &&
+          !read[instruction->dst.index] && constant >= 0) {
+         const unsigned temp = instruction->dst.index;
+
+         for (unsigned j = i + 1; j < *count; j++) {
+            const int sources =
+               chrome9_fragment_native_source_count(instructions[j].op);
+
+            for (int s = 0; s < sources; s++) {
+               struct drm_chrome9_fragment_source *input =
+                  &instructions[j].src[s];
+
+               if (input->file == DRM_CHROME9_FRAGMENT_FILE_TEMP &&
+                   input->index == temp) {
+                  input->file = DRM_CHROME9_FRAGMENT_FILE_CONSTANT;
+                  input->index = constant;
+               }
+            }
+         }
+         continue;
+      }
+      if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX)
+         used |= 1u << instruction->sampler;
+      instructions[kept++] = *instruction;
+   }
+   *count = kept;
+   return used;
+}
+
+unsigned
+chrome9_fragment_trim_textures(
+   struct drm_chrome9_fragment_texture_state *textures, unsigned count,
+   uint32_t used, bool sparse)
+{
+   unsigned kept = 0;
+
+   if (!sparse)
+      return MIN2(count, used ? util_last_bit(used) : 0);
+   for (unsigned i = 0; i < count; i++)
+      if (used & (1u << textures[i].reserved0))
+         textures[kept++] = textures[i];
+   return kept;
+}
+
 bool
 chrome9_fragment_apply_depth_swizzles(
    struct drm_chrome9_fragment_instruction *instructions, unsigned count,
@@ -482,10 +602,14 @@ chrome9_fragment_apply_depth_swizzles(
          for (unsigned lane = 0; lane < 4; lane++) {
             if (!(instruction->dst.writemask & (1u << lane)))
                continue;
+            /* A depth TEX writes Z to every lane: the depth channel is
+             * read from the written lane itself (the TEX may not write X). */
             mapped[instruction->dst.index][lane] =
                instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX &&
                instruction->sampler < DRM_CHROME9_FRAGMENT_MAX_TEXTURES &&
-               (depth_sampler_mask & (1u << instruction->sampler)) ?
+               (depth_sampler_mask & (1u << instruction->sampler)) &&
+               depth_lane[instruction->sampler][lane] !=
+                  DRM_CHROME9_FRAGMENT_SWIZZLE_X ?
                depth_lane[instruction->sampler][lane] : lane;
          }
       } else if (instruction->op == DRM_CHROME9_FRAGMENT_OP_TEX &&
