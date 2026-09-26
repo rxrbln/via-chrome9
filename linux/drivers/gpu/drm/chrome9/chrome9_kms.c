@@ -31,6 +31,7 @@
 #include <drm/drm_vblank.h>
 
 #include "chrome9_drv.h"
+#include "chrome9_hdmi.h"
 #include "chrome9_engine.h"
 #include "chrome9_vx900_display.h"
 
@@ -1602,6 +1603,13 @@ int chrome9_kms_init(struct chrome9_device *cdev,
 	if (ret)
 		return dev_err_probe(&cdev->pdev->dev, ret,
 				     "cannot initialize opt-in IGA1 cursor\n");
+	if (fixed_iga1) {
+		ret = chrome9_hdmi_init(cdev, &cdev->display_pipe.crtc,
+					&cdev->display_pipe.encoder);
+		if (ret)
+			return dev_err_probe(&cdev->pdev->dev, ret,
+					     "cannot register the HDMI output\n");
+	}
 
 	drm_mode_config_reset(drm);
 	if (fixed_iga1) {
