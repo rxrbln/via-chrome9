@@ -4463,7 +4463,7 @@ static const struct tcl_compact *
 tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
                 const struct chrome9_tcl_program *p,
                 const struct tcl_stream *streams,
-                const struct pipe_draw_start_count_bias *range)
+                const struct pipe_draw_start_count_bias *range, bool now)
 {
    struct tcl_dedupe_stream key[DRM_CHROME9_VERTEX_MAX_INPUTS];
    const unsigned inputs = p->input_count - p->prefetch_count;
@@ -4483,7 +4483,8 @@ tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
       if (c->built)
          return c->unique ? c : NULL;
    } else {
-      /* Built on the second draw of unchanged buffers. */
+      /* Built on the second draw of unchanged buffers, or at once when
+       * the uncompacted lookups do not fit. */
       free(c->index);
       free(c->vertices);
       pipe_resource_reference(&c->buffer, NULL);
@@ -4493,7 +4494,8 @@ tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
       c->start = range->start;
       c->count = range->count;
       c->valid = true;
-      return NULL;
+      if (!now)
+         return NULL;
    }
    c->built = true;
    for (unsigned k = 0; k < inputs; k++) {
@@ -4574,7 +4576,7 @@ tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
  * Sample every prefetched lookup for the draw's vertices [min, max] into
  * one interleaved FLOAT4 array and describe it as extra input streams.
  */
-static bool
+static const char *
 tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
              const struct chrome9_tcl_program *p,
              struct chrome9_tcl_state *state, struct tcl_stream *streams)
@@ -4586,7 +4588,7 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
 
    bytes = ((size_t)max - min + 1) * lookups * 16;
    if (bytes > TCL_MAX_UPLOAD_BYTES)
-      return false;
+      return "vertex texture prefetch: size";
    /* Written after the draw three turns back; the access waits for it. */
    slot = &state->prefetch_ring[state->prefetch_next++ %
                                 ARRAY_SIZE(state->prefetch_ring)];
@@ -4595,7 +4597,7 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
       *slot = pipe_buffer_create(ctx->base.screen, PIPE_BIND_VERTEX_BUFFER,
                                  PIPE_USAGE_STREAM, bytes);
       if (!*slot)
-         return false;
+         return "vertex texture prefetch: allocation";
    }
    chrome9_resource_cpu_access_range(chrome9_resource(*slot), true, 0, bytes);
    prefetch = chrome9_resource(*slot)->bo.map;
@@ -4606,7 +4608,7 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
                              coords * sizeof(float));
 
       if (!grown)
-         return false;
+         return "vertex texture prefetch: allocation";
       state->coords = grown;
       state->prefetch_coords = coords;
    }
@@ -4620,9 +4622,10 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
       float *s = state->coords, *t = state->coords + vertices;
       float *out = prefetch + k * 4;
 
-      if (f->input >= p->attrib_count ||
-          !chrome9_vs_texture_samplable(ctx, f->unit, f->sampler))
-         return false;
+      if (f->input >= p->attrib_count)
+         return "vertex texture prefetch: coordinate";
+      if (!chrome9_vs_texture_samplable(ctx, f->unit, f->sampler))
+         return "vertex texture prefetch: sampler state";
       for (unsigned i = 0; i < vertices; i++) {
          const size_t offset = (size_t)(min + i - coord->first) *
                                coord->stride;
@@ -4631,7 +4634,7 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
          if (min + i < coord->first ||
              (coord->size != SIZE_MAX &&
               (offset > coord->size || coord->size - offset < coord->bytes)))
-            return false;
+            return "vertex texture prefetch: coordinate range";
          if (floats32)
             memcpy(value, coord->base + offset, coord->bytes);
          else
@@ -4646,7 +4649,7 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
       for (unsigned i = 0; i < vertices; i++)
          for (unsigned c = 0; c < 4; c++)
             if (!isfinite(out[(size_t)i * lookups * 4 + c]))
-               return false;
+               return "vertex texture prefetch: non-finite texel";
    }
    for (unsigned k = 0; k < lookups; k++) {
       struct tcl_stream *stream = &streams[p->attrib_count + k];
@@ -4662,7 +4665,7 @@ tcl_prefetch(struct chrome9_context *ctx, uint32_t min, uint32_t max,
       stream->bytes = 16;
       tcl_native_format(stream->format, stream);
    }
-   return true;
+   return NULL;
 }
 
 static bool
@@ -4699,7 +4702,9 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
           (p->input_count - p->prefetch_count) * sizeof(*streams));
    /* Lookups of a vertex-soup draw are sampled per distinct vertex. */
    if (p->prefetch_count && !info->index_size)
-      compact = tcl_compact_get(ctx, state, p, streams, range);
+      compact = tcl_compact_get(ctx, state, p, streams, range,
+                                (uint64_t)range->count * p->prefetch_count *
+                                16 > TCL_MAX_UPLOAD_BYTES);
    if (compact) {
       for (unsigned k = 0; k < p->input_count - p->prefetch_count; k++) {
          streams[k].user = NULL;
@@ -4732,10 +4737,14 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
                    tcl_index_range(info, range, indices, &index_min,
                                    &index_max);
    }
-   if (p->prefetch_count &&
-       (!have_range ||
-        !tcl_prefetch(ctx, index_min, index_max, p, state, streams)))
-      return tcl_fallback(ctx, "vertex texture prefetch");
+   if (p->prefetch_count) {
+      const char *prefetch = have_range ?
+         tcl_prefetch(ctx, index_min, index_max, p, state, streams) :
+         "vertex texture prefetch: index range";
+
+      if (prefetch)
+         return tcl_fallback(ctx, prefetch);
+   }
    if (!tcl_viewport(ctx, draw.viewport))
       return tcl_fallback(ctx, "viewport");
    if (!tcl_constants(ctx, p, state->constants))
