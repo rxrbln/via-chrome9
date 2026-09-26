@@ -134,8 +134,10 @@ chrome9_vx900_iga1_mode_build(const struct drm_display_mode *mode, u32 pitch,
 	    mode->vtotal < mode->vsync_end ||
 	    mode->vsync_end <= mode->vsync_start ||
 	    mode->vsync_start < mode->vdisplay ||
-	    (mode->hdisplay | mode->hsync_start | mode->hsync_end |
-	     mode->htotal) & 7 ||
+	    /* Sync and total program in 8-pixel characters, truncated like
+	     * the vendor drivers do (CEA 720p and 1080p are not aligned). */
+	    mode->hdisplay & 7 ||
+	    mode->hsync_end / 8 <= mode->hsync_start / 8 ||
 	    mode->htotal - mode->hdisplay > 127 * 8 ||
 	    mode->hsync_end - mode->hsync_start > 31 * 8 ||
 	    mode->vtotal - mode->vdisplay > 255 ||
