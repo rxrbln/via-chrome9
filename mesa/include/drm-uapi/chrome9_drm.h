@@ -338,6 +338,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_TEXTURE_PROJECT	(1ULL << 33)
 /* GEM_CREATE_TILED records a tiled layout on shared objects. */
 #define DRM_CHROME9_CAP2_TILED_SHARED		(1ULL << 34)
+/* GEM_BUSY reports write_seq. */
+#define DRM_CHROME9_CAP2_WRITE_SEQ		(1ULL << 35)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1823,6 +1825,11 @@ struct drm_chrome9_draw_vertex_programs {
 struct drm_chrome9_gem_busy {
 	__u32 handle;
 	__u32 busy;	/* out: DRM_CHROME9_GEM_BUSY_* */
+	/*
+	 * out, CAP2_WRITE_SEQ: jobs submitted so far that write the object.
+	 * Equal values bracket no device write.
+	 */
+	__u64 write_seq;
 };
 
 struct drm_chrome9_fence {
