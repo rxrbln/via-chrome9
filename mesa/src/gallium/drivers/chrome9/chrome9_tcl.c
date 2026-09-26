@@ -488,6 +488,15 @@ tcl_optimize(nir_shader *nir)
                nir_metadata_control_flow, NULL);
       NIR_PASS(progress, nir, nir_opt_vectorize, tcl_vector_width, NULL);
    } while (progress);
+   /* Multiply-add fusion is a late rule: every record is a MAD. */
+   progress = false;
+   NIR_PASS(progress, nir, nir_opt_algebraic_late);
+   if (progress) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
 }
 
 /* Source operands of a vertex op. */
