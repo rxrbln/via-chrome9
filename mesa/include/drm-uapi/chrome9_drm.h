@@ -336,6 +336,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_R32F			(1ULL << 32)
 /* Fragment TEX flag DRM_CHROME9_FRAGMENT_TEX_PROJECT (TEXLDP). */
 #define DRM_CHROME9_CAP2_TEXTURE_PROJECT	(1ULL << 33)
+/* GEM_CREATE_TILED records a tiled layout on shared objects. */
+#define DRM_CHROME9_CAP2_TILED_SHARED		(1ULL << 34)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -401,6 +403,12 @@ struct drm_chrome9_gem_cpu_access {
  * local; the object cannot be exported or scanned out.
  */
 #define DRM_CHROME9_GEM_CREATE_LOCAL		(1U << 2)
+/*
+ * CAP2_TILED_SHARED: the object holds a tiled colour surface (32-byte by
+ * 8-row tiles).  The flag records the layout for importers, which read it
+ * back with GEM_INFO; KMS framebuffers of such an object are refused.
+ */
+#define DRM_CHROME9_GEM_CREATE_TILED		(1U << 3)
 
 /*
  * Occlusion queries.  The kernel keeps a 64-bit sample accumulator per
