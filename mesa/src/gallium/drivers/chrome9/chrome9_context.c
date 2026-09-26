@@ -3028,6 +3028,8 @@ struct chrome9_ps_nir_builder {
    uint8_t cube_sampler_mask;
    uint8_t volume_sampler_mask;
    bool allow_bias;
+   /* TEXLDP divides by the coordinate's W in the sampler. */
+   bool allow_project;
    struct {
       nir_scalar predicate;
       struct chrome9_ps_condition condition;
@@ -5314,6 +5316,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
       struct chrome9_ps_source coordinate;
       int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
       int projector = nir_tex_instr_src_index(tex, nir_tex_src_projector);
+      bool project = false;
       int bias = nir_tex_instr_src_index(tex, nir_tex_src_bias);
       /* Cube and 3D lookups are selected by the texture state; TEX reads
        * STR. */
@@ -5368,6 +5371,58 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
          coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
          coordinate.swizzle[2] = CHROME9_PS_SWIZZLE_Z;
+      }
+      if (projector >= 0 && builder->allow_project && !str && bias < 0 &&
+          tex->num_srcs == 2 &&
+          tex->src[projector].src.ssa->num_components == 1) {
+         struct chrome9_ps_source q;
+
+         /* TEXLDP divides (s, t) by lane W of the coordinate. */
+         if (!chrome9_ps_lower_def(builder, tex->src[projector].src.ssa, &q))
+            return false;
+         /* A direct coordinate divides by its varying's own W lane. */
+         if (coordinate.file == CHROME9_PS_SOURCE_TEXTURE &&
+             coordinate.swizzle[0] == CHROME9_PS_SWIZZLE_X &&
+             coordinate.swizzle[1] == CHROME9_PS_SWIZZLE_Y &&
+             q.file == coordinate.file && q.id == coordinate.id &&
+             !q.modifier && q.swizzle[0] == CHROME9_PS_SWIZZLE_W) {
+            coordinate.swizzle[3] = CHROME9_PS_SWIZZLE_W;
+         } else {
+            struct chrome9_ps_instruction *move;
+            uint8_t projected;
+
+            if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+               return false;
+            projected = builder->next_temp++;
+            move = chrome9_ps_append_instruction(builder,
+                                                 CHROME9_PS_OPCODE_MOV);
+            if (!move)
+               return false;
+            move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+            move->destination.id = projected;
+            move->destination.writemask = 0x3;
+            move->source[0] = coordinate;
+            move->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
+            move->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_ZERO;
+            move = chrome9_ps_append_instruction(builder,
+                                                 CHROME9_PS_OPCODE_MOV);
+            if (!move)
+               return false;
+            move->destination.file = CHROME9_PS_DESTINATION_TEMP;
+            move->destination.id = projected;
+            move->destination.writemask = 0x8;
+            move->source[0] = q;
+            for (unsigned c = 1; c < 4; c++)
+               move->source[0].swizzle[c] = q.swizzle[0];
+            memset(&coordinate, 0, sizeof(coordinate));
+            coordinate.file = CHROME9_PS_SOURCE_TEMP;
+            coordinate.id = projected;
+            coordinate.swizzle[0] = CHROME9_PS_SWIZZLE_X;
+            coordinate.swizzle[1] = CHROME9_PS_SWIZZLE_Y;
+            coordinate.swizzle[3] = CHROME9_PS_SWIZZLE_W;
+         }
+         project = true;
+         projector = -1;
       }
       if (projector >= 0 &&
           !chrome9_ps_identity_projector(tex, coord, projector,
@@ -5544,15 +5599,22 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
          /* 2D TEX reads XY.  An XY-only computed TEMP must not appear to
           * read undefined Z/W lanes during kernel validation. */
          texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_ZERO;
-         texture->source[0].swizzle[3] = bias >= 0 ?
+         texture->source[0].swizzle[3] = bias >= 0 || project ?
             CHROME9_PS_SWIZZLE_W : CHROME9_PS_SWIZZLE_ONE;
          if (bias >= 0)
             texture->flags = DRM_CHROME9_FRAGMENT_TEX_BIAS;
+         else if (project)
+            texture->flags = DRM_CHROME9_FRAGMENT_TEX_PROJECT;
       } else {
          /* Direct varyings retain their native four-lane coordinate map;
           * the kernel's direct-input gate does not admit literals here. */
+         const uint8_t divisor = coordinate.swizzle[3];
+
          texture->source[0].swizzle[2] = CHROME9_PS_SWIZZLE_W;
-         texture->source[0].swizzle[3] = CHROME9_PS_SWIZZLE_W;
+         texture->source[0].swizzle[3] = project ? divisor :
+                                         CHROME9_PS_SWIZZLE_W;
+         if (project)
+            texture->flags = DRM_CHROME9_FRAGMENT_TEX_PROJECT;
       }
       builder->value[value].complete = true;
       *source = builder->value[value].source;
@@ -6225,11 +6287,15 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint8_t *cube_sampler_mask,
                        uint8_t *volume_sampler_mask,
                        bool allow_kill, bool allow_bias, bool allow_depth,
+                       bool allow_project,
                        uint8_t unproven_finite_samplers,
                        uint8_t interpolated_samplers,
                        bool *lowered)
 {
-   struct chrome9_ps_nir_builder builder = { .allow_bias = allow_bias };
+   struct chrome9_ps_nir_builder builder = {
+      .allow_bias = allow_bias,
+      .allow_project = allow_project,
+   };
    nir_def *depth = NULL;
    struct chrome9_ps_source operands[4][3] = { 0 };
    enum chrome9_ps_opcode op[4];
@@ -7658,6 +7724,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      ctx->fragment_kill,
                                      ctx->texture_bias,
                                      ctx->depth_output,
+                                     ctx->texture_project,
                                      shader->split_unproven_finite,
                                      shader->split_interpolated,
                                      &lowered);
@@ -10429,6 +10496,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_KILL);
    ctx->texture_bias = chrome9_screen_has_capability2(
       screen, DRM_CHROME9_CAP2_TEXTURE_BIAS);
+   ctx->texture_project = chrome9_screen_has_capability2(
+      screen, DRM_CHROME9_CAP2_TEXTURE_PROJECT) &&
+      debug_get_bool_option("CHROME9_TEXTURE_PROJECT", true);
    ctx->fragment_add =
       !!(capabilities & DRM_CHROME9_CAP_FRAGMENT_ADD);
    ctx->draw_textured_triangle =
