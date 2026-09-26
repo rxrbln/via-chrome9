@@ -13531,15 +13531,23 @@ static u32 *chrome9_tcl_indices(struct chrome9_tcl_draw *tcl,
 		const void *indices, u32 index_size,
 		struct chrome9_arena *arena)
 {
-	u32 min = U32_MAX, max = 0, value;
+	const u16 *indices16 = indices;
+	const u32 *indices32 = indices;
+	u32 min = U32_MAX, max = 0;
 	unsigned int i;
 	u32 *packed;
 
-	for (i = 0; i < tcl->index_count; i++) {
-		value = index_size == 2 ? ((const u16 *)indices)[i] :
-			((const u32 *)indices)[i];
-		min = min(min, value);
-		max = max(max, value);
+	/* One loop per index size keeps the scan branch free. */
+	if (index_size == 2) {
+		for (i = 0; i < tcl->index_count; i++) {
+			min = min_t(u32, min, indices16[i]);
+			max = max_t(u32, max, indices16[i]);
+		}
+	} else {
+		for (i = 0; i < tcl->index_count; i++) {
+			min = min(min, indices32[i]);
+			max = max(max, indices32[i]);
+		}
 	}
 	tcl->index_min = min;
 	tcl->index_range = max - min;
@@ -13549,16 +13557,27 @@ static u32 *chrome9_tcl_indices(struct chrome9_tcl_draw *tcl,
 	packed = chrome9_arena_alloc(arena, tcl->index_dwords * sizeof(*packed));
 	if (!packed)
 		return NULL;
-	if (!tcl->index32)
-		memset(packed, 0, tcl->index_dwords * sizeof(*packed));
-	for (i = 0; i < tcl->index_count; i++) {
-		value = (index_size == 2 ? ((const u16 *)indices)[i] :
-			 ((const u32 *)indices)[i]) - min;
-		if (tcl->index32)
-			packed[i] = value;
-		else
-			packed[i / 2] |= value << (i & 1 ? 16 : 0);
+	if (tcl->index32) {
+		for (i = 0; i < tcl->index_count; i++)
+			packed[i] = indices32[i] - min;
+		return packed;
 	}
+	/* Pairs of 16-bit indices per dword, the first in the low half. */
+	packed[tcl->index_dwords - 1] = 0;
+#ifdef __LITTLE_ENDIAN
+	if (index_size == 2 && !min) {
+		memcpy(packed, indices16, tcl->index_count * sizeof(u16));
+		return packed;
+	}
+	for (i = 0; i < tcl->index_count; i++)
+		((u16 *)packed)[i] = (index_size == 2 ? indices16[i] :
+				      indices32[i]) - min;
+#else
+	memset(packed, 0, tcl->index_dwords * sizeof(*packed));
+	for (i = 0; i < tcl->index_count; i++)
+		packed[i / 2] |= ((index_size == 2 ? indices16[i] :
+				   indices32[i]) - min) << (i & 1 ? 16 : 0);
+#endif
 	return packed;
 }
 
