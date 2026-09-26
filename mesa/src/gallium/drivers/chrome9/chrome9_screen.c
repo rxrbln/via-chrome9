@@ -421,11 +421,12 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
       3 : 2;
    fs->max_outputs = 1;
    fs->max_temps = 8;
-   /* The full two-bank hardware store is independently capability-gated;
-    * shader execution remains restricted to closed semantic programs. */
+   /* The pixel engine has 32 constant registers.  Programs reading more
+    * (built-in state arrays, indirect indexing) link and run in the
+    * llvmpipe fallback unless the preshader folds them into the 32. */
    fs->max_const_buffer0_size =
       (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32) ?
-      32 * 4 * sizeof(float) : 4 * sizeof(float);
+      4096 * 4 * sizeof(float) : 4 * sizeof(float);
    fs->max_const_buffers = 1;
    /* The extended structured FE maps eight ordered inputs and descriptor
     * slots.  Keep older kernels' three-slot and legacy two-slot limits. */
