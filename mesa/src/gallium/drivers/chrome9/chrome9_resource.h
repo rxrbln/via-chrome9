@@ -119,34 +119,42 @@ chrome9_tiled_copy(uint8_t *level_base, unsigned pitch, bool tiled,
                    unsigned xb, unsigned y, unsigned bytes, unsigned rows,
                    uint8_t *linear, unsigned linear_stride, bool store)
 {
-   for (unsigned row = 0; row < rows; row++) {
-      const unsigned ty = y + row;
-      uint8_t *line = linear + (size_t)row * linear_stride;
-
-      if (!tiled) {
-         uint8_t *surface = level_base + (size_t)ty * pitch + xb;
+   if (!tiled) {
+      for (unsigned row = 0; row < rows; row++) {
+         uint8_t *line = linear + (size_t)row * linear_stride;
+         uint8_t *surface = level_base + (size_t)(y + row) * pitch + xb;
 
          memcpy(store ? surface : line, store ? line : surface, bytes);
-         continue;
       }
+      return;
+   }
+   /* Tile by tile: the surface side stays sequential, which keeps
+    * write-combined stores in full bursts. */
+   for (unsigned band = y; band < y + rows; ) {
+      const unsigned band_end = MIN2((band | 7) + 1, y + rows);
+
       for (unsigned done = 0; done < bytes; ) {
          const unsigned x = xb + done;
          const unsigned chunk = MIN2(bytes - done, 32 - (x & 31));
-         uint8_t *surface = level_base + (size_t)(ty >> 3) * pitch * 8 +
-                            (x >> 5) * 256 + (ty & 7) * 32 + (x & 31);
+         uint8_t *tile = level_base + (size_t)(band >> 3) * pitch * 8 +
+                         (x >> 5) * 256 + (x & 31);
 
-         /* Whole tile rows copy with a constant size the compiler inlines. */
-         if (chunk == 32)
-            memcpy(store ? surface : line + done,
-                   store ? line + done : surface, 32);
-         else
-            memcpy(store ? surface : line + done,
-                   store ? line + done : surface, chunk);
+         for (unsigned ty = band; ty < band_end; ty++) {
+            uint8_t *line = linear + (size_t)(ty - y) * linear_stride + done;
+            uint8_t *surface = tile + (ty & 7) * 32;
+
+            /* Whole tile rows copy with a constant size the compiler
+             * inlines. */
+            if (chunk == 32)
+               memcpy(store ? surface : line, store ? line : surface, 32);
+            else
+               memcpy(store ? surface : line, store ? line : surface, chunk);
+         }
          done += chunk;
       }
+      band = band_end;
    }
 }
-
 
 /* Fast-Z indices cycle 1..6: 7 is the tag of 1.0 cleared memory. */
 #define CHROME9_FAST_Z_LAST_INDEX 6
