@@ -351,6 +351,11 @@ MODULE_PARM_DESC(vs_relative_re,
  * lines and wireframe from vertex a to b (A01[23] clear, rung L3). */
 #define CHROME9_TCL_RE_NO_A2F		BIT(8)
 #define CHROME9_TCL_RE_LINE_AB		BIT(9)
+/* Stage B rungs: 1024 A2C one below the index maximum (B8), 2048 last
+ * element not fetched and its A12 bit clear (B13), 4096 only A12 bit. */
+#define CHROME9_TCL_RE_INDEX_MAX_LESS	BIT(10)
+#define CHROME9_TCL_RE_DROP_LAST_INPUT	BIT(11)
+#define CHROME9_TCL_RE_A12_LAST_CLEAR	BIT(12)
 
 /* Debug: force A61[22:20] (vendor output transfer field) to 0..7. */
 static int chrome9_tcl_a61_out = -1;
@@ -3539,6 +3544,42 @@ static u32 chrome9_tcl_a23(const struct chrome9_tcl_draw *tcl)
 }
 
 /*
+ * Vertex element formats: native A(1+i) low byte (components-1 << 6 |
+ * type << 1 | normalize, VX900 manual), fetch dwords and which dwords hold
+ * float32 or float16 data for the stage A finite check.
+ */
+static const struct {
+	u8 native;
+	u8 dwords;
+	u8 float32;
+	u8 float16;
+} chrome9_tcl_formats[] = {
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT1] = { 0x02, 1, 1, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT2] = { 0x42, 2, 2, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT3] = { 0x82, 3, 3, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_FLOAT4] = { 0xc2, 4, 4, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM] = { 0xd1, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM] = { 0xc7, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED] = { 0xc6, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM] = { 0x49, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM] = { 0xc9, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM] = { 0x4b, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM] = { 0xcb, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED] = { 0x4a, 1, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED] = { 0xca, 2, 0, 0 },
+	[DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT] = { 0x44, 1, 0, 1 },
+	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT] = { 0xc4, 2, 0, 2 },
+};
+
+/* Elements the fetcher reads; rung B13 leaves the last input to A12. */
+static u32 chrome9_tcl_fetched_elements(const struct chrome9_tcl_draw *tcl)
+{
+	return tcl->element_count -
+	       (tcl->buffer_count && tcl->element_count > 1 &&
+		tcl->re & CHROME9_TCL_RE_DROP_LAST_INPUT ? 1 : 0);
+}
+
+/*
  * Stage A TCL raster/FVF block: raw application elements feed v0..vN-1,
  * the output linkage stays byte-identical to the post-TNL path and
  * A40..A48 carry the clip engine's copy of rows 256/257.
@@ -3551,22 +3592,30 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 	u32 groups = DIV_ROUND_UP(planes, 3);
 	u32 outputs = fp->varying_count || groups ?
 		      3 + fp->varying_count + groups : 5;
+	u32 fetched = chrome9_tcl_fetched_elements(tcl);
+	u32 stride_dw = tcl->stride_dw;
 	u32 link[4];
 	unsigned int e, g, i = 0;
 
+	if (fetched < tcl->element_count)
+		stride_dw -= chrome9_tcl_formats[
+			tcl->element_type[fetched]].dwords;
 	/* Stage B: SF memory type (A00[16:15] = 01); element bits 19:12 hold
 	 * address bits 9:2 inside the slot's 1-KiB window. */
-	raster[i++] = (tcl->element_count - 1) << 8 | tcl->stride_dw |
+	raster[i++] = (fetched - 1) << 8 | stride_dw |
 		      (addresses ? BIT(15) : 0) |
 		      (tcl->nan_kill ? 0x540000 : 0);
-	for (e = 0; e < tcl->element_count; e++)
+	for (e = 0; e < fetched; e++)
 		raster[i++] = (1 + e) << 24 |
 			      (addresses ? (addresses[e] >> 2) & 0xff :
 					   tcl->element_offset[e]) << 12 |
 			      e << 8 | tcl->element_format[e];
 	/* Superset of the input and output masks; the vendor quad uses 1f. */
 	raster[i++] = 0x12000000 |
-		      GENMASK(max(outputs, tcl->element_count) - 1, 0);
+		      (GENMASK(max(outputs, fetched) - 1, 0) &
+		       ~(tcl->re & CHROME9_TCL_RE_A12_LAST_CLEAR &&
+			 tcl->element_count - 1 >= outputs ?
+			 BIT(tcl->element_count - 1) : 0));
 	raster[i++] = tcl->a61 &
 		      ~(tcl->re & CHROME9_TCL_RE_NO_A61_BFC ? BIT(19) : 0);
 	raster[i++] = tcl->program->a62;
@@ -3882,33 +3931,6 @@ out:
 
 static bool chrome9_float_finite(u32 value);
 
-/*
- * Vertex element formats: native A(1+i) low byte (components-1 << 6 |
- * type << 1 | normalize, VX900 manual), fetch dwords and which dwords hold
- * float32 or float16 data for the stage A finite check.
- */
-static const struct {
-	u8 native;
-	u8 dwords;
-	u8 float32;
-	u8 float16;
-} chrome9_tcl_formats[] = {
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT1] = { 0x02, 1, 1, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT2] = { 0x42, 2, 2, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT3] = { 0x82, 3, 3, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_FLOAT4] = { 0xc2, 4, 4, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_BGRA8_UNORM] = { 0xd1, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_UNORM] = { 0xc7, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA8_USCALED] = { 0xc6, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_UNORM] = { 0x49, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_UNORM] = { 0xc9, 2, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_SNORM] = { 0x4b, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SNORM] = { 0xcb, 2, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_SSCALED] = { 0x4a, 1, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED] = { 0xca, 2, 0, 0 },
-	[DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT] = { 0x44, 1, 0, 1 },
-	[DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT] = { 0xc4, 2, 0, 2 },
-};
 
 static bool chrome9_tcl_half_finite(u32 value)
 {
@@ -4611,6 +4633,7 @@ static bool chrome9_link_equal(const struct chrome9_state_cache *cache,
 	/* Cached programs are immutable: one pointer is one program. */
 	if (fp != old &&
 	    (fp->alu_count != old->alu_count || fp->tau_count != old->tau_count ||
+	     fp->depth_output != old->depth_output ||
 	     memcmp(fp->controls, old->controls, sizeof(fp->controls)) ||
 	     memcmp(fp->alu, old->alu, fp->alu_count * sizeof(fp->alu[0])) ||
 	     memcmp(fp->tau, old->tau, fp->tau_count * sizeof(fp->tau[0]))))
@@ -4913,9 +4936,12 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 			GENMASK(program->varying_width[i] - 1, 0);
 	}
 
-	/* Stage A has no later A24 than the raster block's. */
-	if (!element_address)
+	/* Stage A has no later A24 than the raster block's; its full state
+	 * overwrites what the cache recorded. */
+	if (!element_address && cache) {
+		chrome9_state_cache_forget(cache);
 		cache = NULL;
+	}
 	if (cache)
 		cache->pending = 0;
 	/* Raster words include topology (A20), point/sprite (A2A, A2B, A2F). */
@@ -5051,12 +5077,14 @@ draw:
 		if (p + 0x40 + snapshot +
 		    (index_arena ? 4 : tcl->index_dwords) > limit)
 			return -E2BIG;
-		for (i = 0; i < tcl->element_count; i++)
+		for (i = 0; i < chrome9_tcl_fetched_elements(tcl); i++)
 			slots[i] = chrome9_tcl_stream_slot(element_address[i],
 				tcl->buffers[tcl->element_buffer[i]].stride);
-		chrome9_emit_header3(&p, 0x30030000, slots, tcl->element_count);
+		chrome9_emit_header3(&p, 0x30030000, slots, i);
 		/* Inclusive index bounds; indices were rebased to zero. */
-		draw[0] = 0x2c000000 | (tcl->index_range & 0x00ffffff);
+		draw[0] = 0x2c000000 | ((tcl->index_range -
+			(tcl->re & CHROME9_TCL_RE_INDEX_MAX_LESS &&
+			 tcl->index_range ? 1 : 0)) & 0x00ffffff);
 		draw[1] = 0x2d000000;
 		draw[2] = 0x2e000000 | (tcl->index_range >> 24) << 8;
 		draw[3] = 0x24000000 | tcl->index_count;
