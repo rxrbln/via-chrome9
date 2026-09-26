@@ -7,6 +7,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/rbtree.h>
+#include <linux/dma-resv.h>
 #include <linux/sizes.h>
 #include <linux/vgaarb.h>
 
@@ -207,7 +208,12 @@ struct chrome9_bo {
 	 * (explicit objects only, under the object lock). */
 	struct rb_root_cached finite;
 	u32 finite_count;
+	/* Submitted jobs that write the object (GEM_BUSY write_seq). */
+	atomic64_t write_seq;
 };
+
+void chrome9_bo_add_fence(struct drm_gem_object *obj, struct dma_fence *fence,
+			  enum dma_resv_usage usage);
 
 struct chrome9_finite_element {
 	struct rb_node rb;

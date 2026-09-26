@@ -6607,6 +6607,15 @@ int chrome9_fence_ioctl(struct drm_device *drm, void *data,
 	}
 }
 
+/* Attach a job fence; device writes advance the object's write_seq. */
+void chrome9_bo_add_fence(struct drm_gem_object *obj, struct dma_fence *fence,
+			  enum dma_resv_usage usage)
+{
+	dma_resv_add_fence(obj->resv, fence, usage);
+	if (usage == DMA_RESV_USAGE_WRITE)
+		atomic64_inc(&to_chrome9_bo(obj)->write_seq);
+}
+
 /* Whether queued jobs use or write an object, without waiting. */
 int chrome9_gem_busy_ioctl(struct drm_device *drm, void *data,
 			   struct drm_file *file)
@@ -6618,6 +6627,7 @@ int chrome9_gem_busy_ioctl(struct drm_device *drm, void *data,
 	if (!obj)
 		return -ENOENT;
 	args->busy = 0;
+	args->write_seq = atomic64_read(&to_chrome9_bo(obj)->write_seq);
 	if (!dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_READ))
 		args->busy |= DRM_CHROME9_GEM_BUSY_USE;
 	if (!dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_WRITE))
@@ -7062,6 +7072,7 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_PROJECT;
 	if (READ_ONCE(chrome9_tiled_color))
 		caps |= DRM_CHROME9_CAP2_TILED_SHARED;
+	caps |= DRM_CHROME9_CAP2_WRITE_SEQ;
 	if (READ_ONCE(chrome9_destination_offset))
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_coarse_z))
@@ -7758,7 +7769,7 @@ static int chrome9_submit_draw(struct drm_device *drm, struct drm_file *file,
 	chrome9_cache_flush(job->map.vaddr, request->object_size);
 	dma_sync_sgtable_for_device(&cdev->pdev->dev, job->sgt,
 				    DMA_BIDIRECTIONAL);
-	dma_resv_add_fence(resv, &job->fence.base, DMA_RESV_USAGE_WRITE);
+	chrome9_bo_add_fence(obj, &job->fence.base, DMA_RESV_USAGE_WRITE);
 	job->fence_attached = true;
 	target += PAGE_SIZE;
 	if (request->kind == CHROME9_DRAW_FIXED) {
@@ -8208,17 +8219,16 @@ static int chrome9_submit_depth_triangle(struct drm_device *drm,
 					    job->texture3_sgt,
 					    DMA_BIDIRECTIONAL);
 	device_owned = true;
-	dma_resv_add_fence(obj->resv, &job->fence.base,
-			   DMA_RESV_USAGE_WRITE);
-	dma_resv_add_fence(depth_obj->resv, &job->fence.base,
+	chrome9_bo_add_fence(obj, &job->fence.base, DMA_RESV_USAGE_WRITE);
+	chrome9_bo_add_fence(depth_obj, &job->fence.base,
 			   texture_objects ?
 			   DMA_RESV_USAGE_READ : DMA_RESV_USAGE_WRITE);
 	if (three_objects)
-		dma_resv_add_fence(texture2_obj->resv, &job->fence.base,
+		chrome9_bo_add_fence(texture2_obj, &job->fence.base,
 				   textured_depth ? DMA_RESV_USAGE_WRITE :
 				   DMA_RESV_USAGE_READ);
 	if (four_objects)
-		dma_resv_add_fence(texture3_obj->resv, &job->fence.base,
+		chrome9_bo_add_fence(texture3_obj, &job->fence.base,
 				   DMA_RESV_USAGE_WRITE);
 	job->fence_attached = true;
 	if (request->kind != CHROME9_DRAW_COPY_RECT ||
@@ -9536,7 +9546,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	}
 	device_owned = true;
 	for (i = 0; i < object_count; i++)
-		dma_resv_add_fence(objects[i]->resv, &job->fence.base,
+		chrome9_bo_add_fence(objects[i], &job->fence.base,
 			chrome9_fragment_object_written(sub->kind[i]) ?
 			DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ);
 	job->fence_attached = true;
