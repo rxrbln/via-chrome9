@@ -131,6 +131,19 @@ struct chrome9_sw_bounce {
    struct pipe_resource *copy;
    unsigned level;
    bool render;
+   /* Staged levels: the target's state the copy was taken from. */
+   uint64_t write_seq;
+   uint32_t cpu_generation;
+};
+
+/* llvmpipe copy of a staged level that still equals the level while its
+ * device write_seq and CPU write generation are unchanged. */
+struct chrome9_sw_kept {
+   struct pipe_resource *target;
+   struct pipe_resource *copy;
+   unsigned level;
+   uint64_t write_seq;
+   uint32_t cpu_generation;
 };
 
 struct chrome9_sw_context {
@@ -147,11 +160,15 @@ struct chrome9_sw_context {
    /* chrome9 references held while llvmpipe may still access them. */
    struct util_dynarray held;
    struct util_dynarray bounces;
+   struct util_dynarray kept;
    bool pending;
    /* The chrome9 screen reports integer fragment-position centers. */
    bool pixel_center_integer;
    uint64_t draws;
    uint64_t us;
+   /* Staged levels uploaded and reused. */
+   uint64_t staged_uploads;
+   uint64_t staged_reuses;
 };
 
 static bool
@@ -241,6 +258,75 @@ chrome9_sw_staged_copy(struct chrome9_sw_context *sw,
           chrome9_resource_copy_gpu(sw->ctx, res, level, staging, 0);
 }
 
+/* The device write count of a staged target, false without one. */
+static bool
+chrome9_sw_write_seq(struct chrome9_sw_context *sw,
+                     const struct chrome9_resource *res, uint64_t *seq)
+{
+   struct pipe_screen *screen = sw->ctx->base.screen;
+
+   return chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_WRITE_SEQ) &&
+          chrome9_bo_write_seq(screen->get_screen_fd(screen), &res->bo, seq);
+}
+
+static void
+chrome9_sw_kept_drop(struct chrome9_sw_context *sw, unsigned index)
+{
+   struct chrome9_sw_kept *kept =
+      util_dynarray_element(&sw->kept, struct chrome9_sw_kept, index);
+
+   pipe_resource_reference(&kept->target, NULL);
+   pipe_resource_reference(&kept->copy, NULL);
+   *kept = util_dynarray_pop(&sw->kept, struct chrome9_sw_kept);
+}
+
+/* Keep the copy of a staged level; entries whose target nobody else
+ * references go first, and at most four are kept. */
+static void
+chrome9_sw_keep(struct chrome9_sw_context *sw, struct pipe_resource *target,
+                unsigned level, struct pipe_resource *copy,
+                uint64_t write_seq, uint32_t cpu_generation)
+{
+   struct chrome9_sw_kept kept = {
+      .level = level,
+      .write_seq = write_seq,
+      .cpu_generation = cpu_generation,
+   };
+
+   for (unsigned i = 0;
+        i < util_dynarray_num_elements(&sw->kept, struct chrome9_sw_kept);) {
+      struct chrome9_sw_kept *old =
+         util_dynarray_element(&sw->kept, struct chrome9_sw_kept, i);
+
+      if ((old->target == target && old->level == level) ||
+          p_atomic_read(&old->target->reference.count) == 1)
+         chrome9_sw_kept_drop(sw, i);
+      else
+         i++;
+   }
+   if (util_dynarray_num_elements(&sw->kept, struct chrome9_sw_kept) >= 4)
+      chrome9_sw_kept_drop(sw, 0);
+   pipe_resource_reference(&kept.target, target);
+   pipe_resource_reference(&kept.copy, copy);
+   util_dynarray_append(&sw->kept, kept);
+}
+
+/* A kept copy of the level if the level has not changed since. */
+static struct pipe_resource *
+chrome9_sw_kept_copy(struct chrome9_sw_context *sw,
+                     struct pipe_resource *target, unsigned level,
+                     uint64_t write_seq)
+{
+   const struct chrome9_resource *res = chrome9_resource(target);
+
+   util_dynarray_foreach(&sw->kept, struct chrome9_sw_kept, kept)
+      if (kept->target == target && kept->level == level)
+         return kept->write_seq == write_seq &&
+                kept->cpu_generation == res->cpu_write_generation ?
+                kept->copy : NULL;
+   return NULL;
+}
+
 static void
 chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
                        struct chrome9_sw_bounce *bounce)
@@ -258,13 +344,16 @@ chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
    const uint8_t *src;
 
    if (bounce->render) {
+      bool staged = false;
+
       u_box_2d(0, 0, bounce->copy->width0, bounce->copy->height0, &box);
       src = sw->lp->texture_map(sw->lp, bounce->copy, 0, PIPE_MAP_READ,
                                 &box, &transfer);
       if (src) {
-         if (!chrome9_sw_staged(res) ||
-             !chrome9_sw_staged_copy(sw, res, level, (uint8_t *)src,
-                                     transfer->stride, true)) {
+         staged = chrome9_sw_staged(res) &&
+                  chrome9_sw_staged_copy(sw, res, level, (uint8_t *)src,
+                                         transfer->stride, true);
+         if (!staged) {
             chrome9_resource_cpu_access(res, true);
             chrome9_tiled_copy((uint8_t *)res->bo.map +
                                res->level_offset[level],
@@ -275,6 +364,19 @@ chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
          }
          sw->lp->texture_unmap(sw->lp, transfer);
       }
+      /* The level now equals the copy, including the write-back. */
+      bounce->write_seq = 0;
+      if (staged && chrome9_sw_write_seq(sw, res, &bounce->write_seq))
+         chrome9_sw_keep(sw, bounce->target, level, bounce->copy,
+                         bounce->write_seq, res->cpu_write_generation);
+   } else if (bounce->write_seq &&
+              bounce->cpu_generation == res->cpu_write_generation) {
+      uint64_t write_seq;
+
+      if (chrome9_sw_write_seq(sw, res, &write_seq) &&
+          write_seq == bounce->write_seq)
+         chrome9_sw_keep(sw, bounce->target, level, bounce->copy,
+                         write_seq, bounce->cpu_generation);
    }
    pipe_resource_reference(&bounce->target, NULL);
 }
@@ -302,6 +404,52 @@ chrome9_sw_release_held(struct chrome9_sw_context *sw)
    util_dynarray_foreach(&sw->held, struct pipe_resource *, res)
       pipe_resource_reference(res, NULL);
    util_dynarray_clear(&sw->held);
+}
+
+/* The fallback keeps a copy of the level that equals it now. */
+bool
+chrome9_sw_kept_valid(struct chrome9_context *ctx,
+                      struct pipe_resource *resource, unsigned level)
+{
+   struct chrome9_sw_context *sw = ctx->sw;
+   uint64_t write_seq;
+
+   return sw && util_dynarray_num_elements(&sw->kept,
+                                           struct chrome9_sw_kept) &&
+          chrome9_sw_write_seq(sw, chrome9_resource(resource), &write_seq) &&
+          chrome9_sw_kept_copy(sw, resource, level, write_seq);
+}
+
+/* A device clear just submitted to a level whose kept copy was valid:
+ * clear the copy alike so it stays valid. */
+void
+chrome9_sw_kept_clear(struct chrome9_context *ctx,
+                      struct pipe_resource *resource, unsigned level,
+                      const union pipe_color_union *color,
+                      unsigned x, unsigned y, unsigned width,
+                      unsigned height)
+{
+   struct chrome9_sw_context *sw = ctx->sw;
+   struct pipe_surface templ = {
+      .format = resource->format,
+   };
+   uint64_t write_seq;
+
+   if (!sw)
+      return;
+   util_dynarray_foreach(&sw->kept, struct chrome9_sw_kept, kept) {
+      if (kept->target != resource || kept->level != level)
+         continue;
+      templ.texture = kept->copy;
+      if (width && height)
+         sw->lp->clear_render_target(sw->lp, &templ, color, x, y, width,
+                                     height, false);
+      if (chrome9_sw_write_seq(sw, chrome9_resource(resource), &write_seq))
+         kept->write_seq = write_seq;
+      else
+         kept->write_seq = 0;
+      return;
+   }
 }
 
 void
@@ -350,6 +498,7 @@ chrome9_sw_context(struct chrome9_context *ctx)
       sw->lp = sw->screen->context_create(sw->screen, NULL, 0);
    util_dynarray_init(&sw->held, NULL);
    util_dynarray_init(&sw->bounces, NULL);
+   util_dynarray_init(&sw->kept, NULL);
    sw->objects = _mesa_pointer_hash_table_create(NULL);
    sw->aliases = _mesa_hash_table_u64_create(NULL);
    if (!sw->lp || !sw->objects || !sw->aliases) {
@@ -484,10 +633,16 @@ chrome9_sw_context_destroy(struct chrome9_context *ctx)
    _mesa_hash_table_u64_destroy(sw->aliases);
    util_dynarray_fini(&sw->held);
    util_dynarray_fini(&sw->bounces);
+   util_dynarray_foreach(&sw->kept, struct chrome9_sw_kept, kept) {
+      pipe_resource_reference(&kept->target, NULL);
+      pipe_resource_reference(&kept->copy, NULL);
+   }
+   util_dynarray_fini(&sw->kept);
    pipe_resource_reference(&sw->staging, NULL);
    if (chrome9_sw_debug())
       fprintf(stderr, "chrome9: sw fallback draws=%" PRIu64 " time=%" PRIu64
-                      " us\n", sw->draws, sw->us);
+                      " us, staged uploads=%" PRIu64 " reuses=%" PRIu64 "\n",
+              sw->draws, sw->us, sw->staged_uploads, sw->staged_reuses);
    sw->lp->destroy(sw->lp);
    FREE(sw);
    ctx->sw = NULL;
@@ -740,8 +895,10 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
       .stride = res->level_stride[level],
    };
 
-   /* llvmpipe accesses the pages directly in this draw. */
-   chrome9_resource_cpu_access(res, bind != 0);
+   /* llvmpipe accesses the pages directly in this draw; a staged level
+    * only through the engine's copies. */
+   if (!chrome9_sw_staged(res))
+      chrome9_resource_cpu_access(res, bind != 0);
    if (alias) {
       /* A copy first bound for sampling must still be written back. */
       if (bind)
@@ -773,13 +930,26 @@ chrome9_sw_alias(struct chrome9_sw_context *sw, struct pipe_resource *resource,
            (uint64_t)res->level_stride[level] * align(height, 4) >
            res->bo.size - (res->guarded ? 4096 : 0))) {
       struct chrome9_sw_bounce bounce = { .level = level, .render = bind };
+      struct pipe_resource *kept = NULL;
 
-      alias = sw->screen->resource_create(sw->screen, &templ);
-      if (!alias) {
-         chrome9_sw_unavailable("padded copy of the target");
-         return NULL;
+      /* An unchanged staged level reuses the copy of the last fallback. */
+      if (chrome9_sw_staged(res) &&
+          chrome9_sw_write_seq(sw, res, &bounce.write_seq)) {
+         bounce.cpu_generation = res->cpu_write_generation;
+         kept = chrome9_sw_kept_copy(sw, resource, level, bounce.write_seq);
       }
-      if (!chrome9_sw_upload(sw, alias, 0, res, level)) {
+      if (kept) {
+         pipe_resource_reference(&alias, kept);
+         sw->staged_reuses++;
+      } else {
+         sw->staged_uploads += chrome9_sw_staged(res);
+         alias = sw->screen->resource_create(sw->screen, &templ);
+         if (!alias) {
+            chrome9_sw_unavailable("padded copy of the target");
+            return NULL;
+         }
+      }
+      if (!kept && !chrome9_sw_upload(sw, alias, 0, res, level)) {
          pipe_resource_reference(&alias, NULL);
          chrome9_sw_unavailable("padded copy of the target");
          return NULL;

@@ -29,6 +29,7 @@ bool chrome9_fence_wait(int fd, uint64_t seqno, uint64_t timeout_ns);
 bool chrome9_bo_export_fd(int fd, const struct chrome9_bo *bo, int *prime_fd);
 void chrome9_bo_destroy(int fd, struct chrome9_bo *bo);
 bool chrome9_bo_busy(int fd, const struct chrome9_bo *bo, uint32_t *busy);
+bool chrome9_bo_write_seq(int fd, const struct chrome9_bo *bo, uint64_t *seq);
 bool chrome9_bo_cpu_access(int fd, const struct chrome9_bo *bo, uint32_t flags);
 bool chrome9_bo_cpu_access_range(int fd, const struct chrome9_bo *bo,
                                  uint32_t flags, uint64_t offset,

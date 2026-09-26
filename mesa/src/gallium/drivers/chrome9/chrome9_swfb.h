@@ -10,6 +10,7 @@ struct pipe_context;
 struct pipe_draw_info;
 struct pipe_draw_start_count_bias;
 struct pipe_resource;
+union pipe_color_union;
 struct pipe_screen;
 
 #ifdef CHROME9_HAVE_LLVMPIPE
@@ -21,6 +22,13 @@ bool chrome9_sw_draw_vbo(struct chrome9_context *ctx,
                          const struct pipe_draw_start_count_bias *draws,
                          unsigned num_draws);
 void chrome9_sw_finish(struct chrome9_context *ctx);
+bool chrome9_sw_kept_valid(struct chrome9_context *ctx,
+                           struct pipe_resource *resource, unsigned level);
+void chrome9_sw_kept_clear(struct chrome9_context *ctx,
+                           struct pipe_resource *resource, unsigned level,
+                           const union pipe_color_union *color,
+                           unsigned x, unsigned y, unsigned width,
+                           unsigned height);
 void chrome9_sw_forget(struct chrome9_context *ctx, const void *object);
 void chrome9_sw_context_destroy(struct chrome9_context *ctx);
 struct pipe_context *chrome9_sw_pipe(struct chrome9_context *ctx);

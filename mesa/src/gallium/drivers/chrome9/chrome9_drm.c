@@ -106,6 +106,18 @@ chrome9_bo_busy(int fd, const struct chrome9_bo *bo, uint32_t *busy)
    return true;
 }
 
+/* Device writes submitted so far (CAP2_WRITE_SEQ). */
+bool
+chrome9_bo_write_seq(int fd, const struct chrome9_bo *bo, uint64_t *seq)
+{
+   struct drm_chrome9_gem_busy args = { .handle = bo->handle };
+
+   if (drmIoctl(fd, DRM_IOCTL_CHROME9_GEM_BUSY, &args))
+      return false;
+   *seq = args.write_seq;
+   return true;
+}
+
 bool
 chrome9_bo_cpu_access(int fd, const struct chrome9_bo *bo, uint32_t flags)
 {

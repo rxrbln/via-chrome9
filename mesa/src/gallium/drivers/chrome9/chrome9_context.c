@@ -10175,10 +10175,35 @@ chrome9_clear(struct pipe_context *pipe, unsigned buffers,
    buffers &= PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTHSTENCIL;
    if (!buffers)
       return;
-   if (debug_get_bool_option("CHROME9_GPU_CLEAR", true) &&
-       chrome9_clear_gpu(ctx, buffers, color_mask, stencil_mask, scissor,
-                         color, depth, stencil))
-      return;
+   if (debug_get_bool_option("CHROME9_GPU_CLEAR", true)) {
+      struct pipe_surface *cbuf = ctx->framebuffer.nr_cbufs ?
+                                  &ctx->framebuffer.cbufs[0] : NULL;
+      /* A kept fallback copy of the target is cleared alike. */
+      const bool kept = (buffers & PIPE_CLEAR_COLOR0) && cbuf &&
+                        cbuf->texture && (color_mask & 0xf) == 0xf &&
+                        chrome9_sw_kept_valid(ctx, cbuf->texture,
+                                              cbuf->level);
+
+      if (chrome9_clear_gpu(ctx, buffers, color_mask, stencil_mask, scissor,
+                            color, depth, stencil)) {
+         if (kept) {
+            unsigned cx = 0, cy = 0;
+            unsigned cw = ctx->framebuffer.width;
+            unsigned ch = ctx->framebuffer.height;
+
+            if (scissor) {
+               cx = MIN2(scissor->minx, cw);
+               cy = MIN2(scissor->miny, ch);
+               cw = MIN2(scissor->maxx, cw) - cx;
+               ch = MIN2(scissor->maxy, ch) - cy;
+            }
+            chrome9_draw_flush_batch(ctx);
+            chrome9_sw_kept_clear(ctx, cbuf->texture, cbuf->level, color,
+                                  cx, cy, cw, ch);
+         }
+         return;
+      }
+   }
    width = ctx->framebuffer.width;
    height = ctx->framebuffer.height;
    if (scissor) {
