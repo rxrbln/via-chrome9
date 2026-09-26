@@ -385,3 +385,48 @@ declared hung and quarantined, and every later context creation failed.
 Mesa then crashed in the failure path, which flushed the TCL batch
 through a NULL screen (Mesa `838dc52`).  The wait now continues while the
 command reader position advances within each 100 ms window, up to 10 s.
+
+## 13. 720p benchmarking, terrain seam, fragment specialization (2026-09-26)
+
+Benchmarks now run at 1280x720 windowed (ioquake3 `q3time.sh`, glmark2
+`gmall.sh -s 1280x720`).  The target X screen is switched to 1280x768
+with xrandr (the monitor offers no 1280x720 mode; KMS programmed
+1280x768@79.5 MHz, pitch 5120).  Correctness at that size:
+`chrome9_glx_present_check 1280 720 0 0` is pixel exact; ioquake3 GL1 and
+GL2 captures look right.  Baseline (Mesa p175, kernel k151): ioquake3 GL1
+50.1 fps, GL2 46.0 fps, glmark2 score 92.
+
+**Terrain seam** (Mesa, this change).  glmark2 terrain showed a vertical
+discontinuity at the screen centre since at least p141: left and right
+halves of the terrain disagreed in height and lighting.  With
+`CHROME9_TILED_COLOR=0` it vanished; keeping only the 256x256 normal map
+linear (it is rendered by the GPU right before the terrain draw and read
+only by the vertex shader) was enough.  `chrome9_refresh_vs_textures`
+copied (detiled) tiled or local levels into the CPU sampling image
+before `chrome9_resource_cpu_access` waited for the device, so the copy
+raced the queued normal-map pass and took the right half from the
+previous frame.  Linear GART textures are sampled in place after the
+wait, which hid the race.  The wait now comes first.  The round-trip
+check `re/chrome9_gl_tiled_fbo_check.c` (GPU, llvmpipe and mipmapped
+writes; small, whole and mip-level reads; NEAREST, LINEAR, mipmap and
+vertex sampling) passes at every size and did not catch it: the race
+needs a pending write at the time of the copy.  It found one separate
+inaccuracy: LINEAR sampling of a 1280-wide texture at texel centres is
+off by about 3 % of a texel (visible only where values wrap 255 -> 0).
+
+**Fragment specialization** (Mesa, this change).  A canonical program
+that compiles is no longer used unconditionally: for up to four
+inlinable-uniform value sets per shader a specialized variant is
+compiled and used when it has fewer instructions.  terrain.frag's
+`if (pointLightDistance > 0.0)` had been flattened into a per-pixel
+select; with the uniform inlined the attenuation chain folds away (54 ->
+45 semantic instructions, frame 193.6 -> 187.6 ms at 800x600).
+
+**Terrain frame at 800x600, by elimination** (`CHROME9_DEBUG_FS_MARK`
+replaces a shader's output by a constant): terrain.frag 56 ms, two
+full-screen blurs 33 ms, noise in llvmpipe 18 ms, the small passes 2 ms,
+and 81 ms with every fragment shader trivial.  That remainder is CPU:
+vertex texture fetch of 2 x 66049 bilinear samples (9.0 ms per lookup,
+now 6.5 ms with an integer-floor path and SSE2 fixed-point filtering),
+`tcl_draw_pass` and copies, serialized with the GPU because each frame's
+noise, normal map and vertex fetch depend on each other.
