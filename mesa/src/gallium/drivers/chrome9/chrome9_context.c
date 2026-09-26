@@ -7623,12 +7623,7 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
    semantic_nir = nir_shader_clone(NULL, nir);
    if (!semantic_nir)
       return false;
-   nir_shader_instructions_pass(semantic_nir,
-      chrome9_nir_rewrite_shared_saturate_max,
-      nir_metadata_control_flow, NULL);
-   chrome9_nir_optimize_semantic(semantic_nir);
-   nir_opt_shrink_vectors(semantic_nir, true);
-   nir_opt_dce(semantic_nir);
+   chrome9_fs_prepare_semantic_nir(semantic_nir);
 
    memset(&shader->semantic_fs_ir, 0, sizeof(shader->semantic_fs_ir));
    from_nir = chrome9_compile_ps_nir(semantic_nir, &shader->semantic_fs_ir,
@@ -7736,6 +7731,20 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
    shader->native_fs_key = key;
    shader->native_fs_from_nir = false;
    return true;
+}
+
+void
+chrome9_fs_prepare_semantic_nir(nir_shader *nir)
+{
+   nir_shader_instructions_pass(nir, chrome9_nir_rewrite_shared_saturate_max,
+                                nir_metadata_control_flow, NULL);
+   chrome9_nir_optimize_semantic(nir);
+   /* An unused lane keeps its whole cone alive: trim to a fixpoint. */
+   for (bool progress = true; progress;) {
+      progress = nir_opt_shrink_vectors(nir, true);
+      progress |= nir_opt_copy_prop(nir);
+      progress |= nir_opt_dce(nir);
+   }
 }
 
 static bool

@@ -398,6 +398,8 @@ void chrome9_count_reject(struct chrome9_context *ctx, const char *site,
 void chrome9_context_sync_resource(struct chrome9_context *ctx,
                                    struct pipe_resource *resource,
                                    unsigned usage);
+/* The NIR normalization of the fragment backend, before lowering. */
+void chrome9_fs_prepare_semantic_nir(struct nir_shader *nir);
 void chrome9_compile_fs_nir(struct chrome9_context *ctx,
                             struct chrome9_shader *shader,
                             struct nir_shader *nir);
