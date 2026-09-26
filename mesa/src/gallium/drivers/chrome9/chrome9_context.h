@@ -13,6 +13,7 @@
 #include "chrome9_tcl.h"
 #include "chrome9_vs_texture.h"
 
+struct chrome9_fs_split;
 struct chrome9_query;
 struct chrome9_query_interval;
 struct draw_context;
@@ -97,6 +98,8 @@ struct chrome9_fs_variant {
    bool flat_primary;
    bool flat_generic;
    bool supported;
+   /* Multi-pass form of a program beyond the store (owned). */
+   struct chrome9_fs_split *split;
 };
 
 struct chrome9_tcl_shader;
@@ -148,6 +151,12 @@ struct chrome9_shader {
    bool flat_generic;
    bool canonical_supported;
    bool supported;
+   /* The variant's multi-pass form, and set on its jobs: never split. */
+   struct chrome9_fs_split *split;
+   bool split_job;
+   /* Jobs: carrier samplers without the finite or uninterpolated proof. */
+   uint8_t split_unproven_finite;
+   uint8_t split_interpolated;
 };
 
 struct chrome9_sampler_state {
@@ -238,6 +247,11 @@ struct chrome9_context {
    bool draw_program_triangle_d16_rhw_batch;
    bool draw_fragment_program;
    bool fragment_sparse_textures;
+   /* R32F carriers of multi-pass fragment programs (pipe_resource *),
+    * all split_carrier_width x split_carrier_height. */
+   struct util_dynarray split_carriers;
+   unsigned split_carrier_width;
+   unsigned split_carrier_height;
    bool fragment_primary;
    bool fragment_kill;
    bool texture_bias;

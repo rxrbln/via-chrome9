@@ -9,6 +9,7 @@
 #include "chrome9_drm.h"
 #include "chrome9_format.h"
 #include "chrome9_fragment.h"
+#include "chrome9_fs_split.h"
 #include "chrome9_public.h"
 #include "chrome9_query.h"
 #include "chrome9_resource.h"
@@ -119,6 +120,19 @@ struct chrome9_vbuf_render {
    bool generic_program;
    bool textured;
    bool layout_valid;
+   /* Multi-pass fragment program: triangles with disjoint interiors, run
+    * through every job when flushed, and the draw state of the call. */
+   const struct chrome9_fs_split *split;
+   struct util_dynarray split_vertices;
+   unsigned split_count;
+   struct chrome9_resource *split_textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   struct chrome9_sampler_state
+      *split_samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   bool split_blend_active;
+   struct drm_chrome9_blend_state split_blend;
+   struct drm_chrome9_scissor_state split_scissor;
+   uint32_t split_depth_flags;
+   struct drm_chrome9_stencil_state split_stencil;
 };
 
 static inline struct chrome9_vbuf_render *
@@ -1725,6 +1739,187 @@ chrome9_triangle_stencil(const struct chrome9_context *ctx,
 
 /* Everything of a generic cmd22 request except its vertices and stencil
  * faces; shared by the post-TNL batches and the hardware TCL path. */
+/* Destination, depth, blend, query and scissor state of a generic draw. */
+static bool
+chrome9_fragment_draw_target(
+   struct chrome9_vbuf_render *crender, struct chrome9_resource *target,
+   struct chrome9_resource *depth, bool depth_active, bool blend_active,
+   const struct drm_chrome9_blend_state *blend,
+   const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
+   struct drm_chrome9_draw_fragment_program *draw)
+{
+   draw->destination_handle = target->bo.handle;
+   draw->depth_handle = depth_active ? depth->bo.handle : 0;
+   draw->flags = (depth_active ? DRM_CHROME9_FRAGMENT_DEPTH | depth_flags : 0) |
+                (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
+   if (depth_active && chrome9_stencil_active(crender->ctx))
+      draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
+   if (depth_active && depth->tiled)
+      draw->flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
+   if (chrome9_resource_is_tiled(target))
+      draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_TILED;
+   if (depth_active && depth->fast_z_index &&
+       (draw->flags & DRM_CHROME9_FRAGMENT_STENCIL)) {
+      chrome9_resource_fast_z_resolve(depth);
+      depth->fast_z_disabled = true;
+   }
+   if (depth_active && depth->fast_z_index)
+      draw->flags |= DRM_CHROME9_FRAGMENT_FAST_Z |
+                     DRM_CHROME9_FRAGMENT_FAST_Z_INDEX(depth->fast_z_index);
+   if (depth_active && depth->coarse_z.handle && crender->ctx->coarse_z) {
+      struct chrome9_context *ctx = crender->ctx;
+
+      /* Draws of one submission name the buffer even when not using it. */
+      draw->coarse_z_handle = depth->coarse_z.handle;
+      draw->coarse_z_pitch = depth->coarse_z_pitch;
+      if (depth->coarse_z_valid &&
+          chrome9_draw_coarse_z_usable(ctx, draw->flags,
+                                       blend_active ? blend : NULL)) {
+         draw->flags |= DRM_CHROME9_FRAGMENT_COARSE_Z;
+         if (depth->coarse_z_reset || !ctx->coarse_z_last)
+            draw->flags |= DRM_CHROME9_FRAGMENT_COARSE_Z_RESET;
+         depth->coarse_z_reset = false;
+         ctx->coarse_z_last = true;
+      } else {
+         ctx->coarse_z_last = false;
+      }
+   }
+   if (chrome9_resource_extended(target)) {
+      if (!target->guarded ||
+          !chrome9_screen_has_capability(
+             crender->ctx->base.screen,
+             DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))
+         return false;
+      draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
+      draw->destination_offset = chrome9_resource_destination_offset(target);
+   }
+   /* The count and user pointers are filled only when the batch is flushed.
+    * Keeping them zero makes the rest of this structure a comparable state
+    * key, including target, depth, blend and scissor state. */
+   draw->width = target->base.width0;
+   draw->height = target->base.height0;
+   draw->destination_pitch = target->stride;
+   draw->depth_pitch = depth_active ? depth->stride : 0;
+   draw->destination_format =
+      target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
+      DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+      DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
+   draw->depth_format = depth_active ?
+      (chrome9_format_is_d24(depth->base.format) ?
+       DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 : DRM_CHROME9_FRAGMENT_DEPTH_D16) :
+      0;
+   draw->varying_count = crender->varying_count;
+   draw->query = chrome9_query_draw_id(crender->ctx);
+   if (draw->query)
+      draw->flags |= DRM_CHROME9_FRAGMENT_QUERY;
+   if (blend_active) {
+      draw->blend = *blend;
+      if (chrome9_blend_uses_constant(crender->ctx->blend)) {
+         /* Unsigned 1.10 as the vendor converts it: floor(c * 1024). */
+         for (unsigned c = 0; c < 4; c++)
+            draw->blend_color[c] = MIN2(
+               (unsigned)(CLAMP(crender->ctx->blend_color.color[c],
+                                0.0f, 1.0f) * 1024.0f), 0x400);
+      }
+   }
+   draw->scissor = *scissor;
+   return true;
+}
+
+/* Descriptor of one application texture at logical unit. */
+static bool
+chrome9_fragment_texture_descriptor(
+   const struct chrome9_context *ctx, unsigned logical, bool sparse,
+   struct chrome9_resource *texture,
+   const struct chrome9_sampler_state *sampler,
+   struct drm_chrome9_fragment_texture_state *state)
+{
+   const struct pipe_resource *resource = &texture->base;
+   const struct chrome9_texture_format_info *format =
+      chrome9_texture_format_info(resource->format);
+   const struct pipe_sampler_view *view = ctx->sampler_views[logical];
+   const bool volume = resource->target == PIPE_TEXTURE_3D;
+   unsigned last_level;
+   unsigned view_first_level;
+   unsigned view_last_level;
+   int max_lod;
+
+   if (!view || !format)
+      return false;
+   view_first_level = view->u.tex.first_level;
+   view_last_level = view->u.tex.last_level;
+   /* The volume sampler reads level zero only (no volume mips). */
+   last_level = volume ? 0 : resource->last_level;
+   /*
+    * The descriptor always carries the whole chain; a partial view
+    * clamps the hardware LOD, which counts from level 0, to its levels.
+    * Above its base level the hardware never takes the magnification
+    * filter, so that must equal the minification filter.  Without mip
+    * sampling the hardware LOD is 0, so only a level-0 base works.
+    */
+   if (last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
+       (view_first_level &&
+        (sampler->mip_filter == DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+         sampler->mag_filter != sampler->min_filter)) ||
+       (volume && (view_first_level || !sampler->wrap_r)))
+      return false;
+   max_lod = volume ? 0 : view_last_level * 32;
+   state->handle = texture->bo.handle;
+   state->flags = chrome9_resource_texture_flags(texture);
+   if (sparse)
+      state->reserved0 = logical;
+   state->format = format->drm_format;
+   state->width = resource->width0;
+   state->height = resource->height0;
+   state->last_level = last_level;
+   state->min_filter = sampler->min_filter;
+   state->mag_filter = sampler->mag_filter;
+   if (chrome9_format_is_d24(resource->format)) {
+      state->min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+      state->mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   }
+   state->mip_filter = sampler->mip_filter;
+   state->wrap_s = sampler->wrap_s;
+   state->wrap_t = sampler->wrap_t;
+   /* 1D samples its single row at T = 0.5 whatever the T mode. */
+   if (resource->target == PIPE_TEXTURE_1D)
+      state->wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   if (resource->target == PIPE_TEXTURE_CUBE) {
+      /* No seamless filtering: face coordinates clamp to the edge. */
+      state->target = DRM_CHROME9_FRAGMENT_TARGET_CUBE;
+      state->face_stride = texture->layer_stride;
+      state->wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+      state->wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   }
+   if (volume) {
+      state->target = DRM_CHROME9_FRAGMENT_TARGET_3D;
+      state->face_stride = texture->level_size[0];
+      state->depth = resource->depth0;
+      state->wrap_r = sampler->wrap_r;
+      state->mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
+   }
+   if (state->wrap_s == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       state->wrap_t == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       state->wrap_r == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER)
+      state->border_color = sampler->border_color;
+   state->lod_bias_s5_5 = CLAMP(
+      lroundf(sampler->base.lod_bias * 32.0f), -512, 511);
+   /* Sampler LOD limits count from the view's base level. */
+   state->min_lod_s5_5 = CLAMP(
+      lroundf((sampler->min_level + view_first_level) * 32.0f),
+      (int)view_first_level * 32, max_lod);
+   state->max_lod_s5_5 = CLAMP(
+      lroundf((sampler->max_level + view_first_level) * 32.0f),
+      state->min_lod_s5_5, max_lod);
+   for (unsigned level = 0; level <= last_level; level++) {
+      if (texture->level_offset[level] > UINT32_MAX)
+         return false;
+      state->level_offset[level] = texture->level_offset[level];
+      state->level_pitch[level] = texture->level_stride[level];
+   }
+   return true;
+}
+
 static bool
 chrome9_generic_fragment_state(
    struct chrome9_vbuf_render *crender, struct chrome9_resource *target,
@@ -1809,249 +2004,44 @@ chrome9_generic_fragment_state(
                                                depth_swizzle))
       return false;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {
-      const struct pipe_resource *resource = &textures[unit]->base;
-      const struct chrome9_texture_format_info *format =
-         chrome9_texture_format_info(resource->format);
       const unsigned logical = chrome9_fragment_texture_unit(crender->ctx,
                                                               unit);
-      const struct pipe_sampler_view *view =
-         crender->ctx->sampler_views[logical];
-      const bool volume = resource->target == PIPE_TEXTURE_3D;
-      unsigned last_level;
-      unsigned view_first_level;
-      unsigned view_last_level;
-      int max_lod;
 
-      if (!view || !format)
-         return false;
       if (crender->ctx->fs->semantic_unit_interval_input_mask &&
           logical == 0 &&
-          !chrome9_fragment_unit_interval_texture(resource->format))
+          !chrome9_fragment_unit_interval_texture(textures[unit]->base.format))
          return false;
-      view_first_level = view->u.tex.first_level;
-      view_last_level = view->u.tex.last_level;
-      /* The volume sampler reads level zero only (no volume mips). */
-      last_level = volume ? 0 : resource->last_level;
-      /*
-       * The descriptor always carries the whole chain; a partial view
-       * clamps the hardware LOD, which counts from level 0, to its levels.
-       * Above its base level the hardware never takes the magnification
-       * filter, so that must equal the minification filter.  Without mip
-       * sampling the hardware LOD is 0, so only a level-0 base works.
-       */
-      if (last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
-          (view_first_level &&
-           (samplers[unit]->mip_filter ==
-               DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
-            samplers[unit]->mag_filter != samplers[unit]->min_filter)) ||
-          (volume && (view_first_level || !samplers[unit]->wrap_r)))
+      if (!chrome9_fragment_texture_descriptor(
+             crender->ctx, logical,
+             chrome9_fragment_uses_sparse_abi(crender->ctx),
+             textures[unit], samplers[unit], &texture_state[unit]))
          return false;
-      max_lod = volume ? 0 : view_last_level * 32;
-      texture_state[unit].handle = textures[unit]->bo.handle;
-      texture_state[unit].flags =
-         chrome9_resource_texture_flags(textures[unit]);
-      if (chrome9_fragment_uses_sparse_abi(crender->ctx))
-         texture_state[unit].reserved0 = logical;
-      texture_state[unit].format = format->drm_format;
-      texture_state[unit].width = resource->width0;
-      texture_state[unit].height = resource->height0;
-      texture_state[unit].last_level = last_level;
-      texture_state[unit].min_filter = samplers[unit]->min_filter;
-      texture_state[unit].mag_filter = samplers[unit]->mag_filter;
-      if (chrome9_format_is_d24(resource->format)) {
-         texture_state[unit].min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
-         texture_state[unit].mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
-      }
-      texture_state[unit].mip_filter = samplers[unit]->mip_filter;
-      texture_state[unit].wrap_s = samplers[unit]->wrap_s;
-      texture_state[unit].wrap_t = samplers[unit]->wrap_t;
-      /* 1D samples its single row at T = 0.5 whatever the T mode. */
-      if (resource->target == PIPE_TEXTURE_1D)
-         texture_state[unit].wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
-      if (resource->target == PIPE_TEXTURE_CUBE) {
-         /* No seamless filtering: face coordinates clamp to the edge. */
-         texture_state[unit].target = DRM_CHROME9_FRAGMENT_TARGET_CUBE;
-         texture_state[unit].face_stride = textures[unit]->layer_stride;
-         texture_state[unit].wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
-         texture_state[unit].wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
-      }
-      if (volume) {
-         texture_state[unit].target = DRM_CHROME9_FRAGMENT_TARGET_3D;
-         texture_state[unit].face_stride = textures[unit]->level_size[0];
-         texture_state[unit].depth = resource->depth0;
-         texture_state[unit].wrap_r = samplers[unit]->wrap_r;
-         texture_state[unit].mip_filter =
-            DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
-      }
-      if (texture_state[unit].wrap_s ==
-             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
-          texture_state[unit].wrap_t ==
-             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
-          texture_state[unit].wrap_r ==
-             DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER)
-         texture_state[unit].border_color = samplers[unit]->border_color;
-      texture_state[unit].lod_bias_s5_5 = CLAMP(
-         lroundf(samplers[unit]->base.lod_bias * 32.0f), -512, 511);
-      /* Sampler LOD limits count from the view's base level. */
-      texture_state[unit].min_lod_s5_5 = CLAMP(
-         lroundf((samplers[unit]->min_level + view_first_level) * 32.0f),
-         (int)view_first_level * 32, max_lod);
-      texture_state[unit].max_lod_s5_5 = CLAMP(
-         lroundf((samplers[unit]->max_level + view_first_level) * 32.0f),
-         texture_state[unit].min_lod_s5_5, max_lod);
-      for (unsigned level = 0; level <= last_level; level++) {
-         if (textures[unit]->level_offset[level] > UINT32_MAX)
-            return false;
-         texture_state[unit].level_offset[level] =
-            textures[unit]->level_offset[level];
-         texture_state[unit].level_pitch[level] =
-            textures[unit]->level_stride[level];
-      }
    }
-   draw->destination_handle = target->bo.handle;
-   draw->depth_handle = depth_active ? depth->bo.handle : 0;
-   draw->flags = (depth_active ? DRM_CHROME9_FRAGMENT_DEPTH | depth_flags : 0) |
-                (blend_active ? DRM_CHROME9_FRAGMENT_BLEND : 0);
-   if (depth_active && chrome9_stencil_active(crender->ctx))
-      draw->flags |= DRM_CHROME9_FRAGMENT_STENCIL;
-   if (depth_active && depth->tiled)
-      draw->flags |= DRM_CHROME9_FRAGMENT_DEPTH_TILED;
-   if (chrome9_resource_is_tiled(target))
-      draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_TILED;
-   if (depth_active && depth->fast_z_index &&
-       (draw->flags & DRM_CHROME9_FRAGMENT_STENCIL)) {
-      chrome9_resource_fast_z_resolve(depth);
-      depth->fast_z_disabled = true;
-   }
-   if (depth_active && depth->fast_z_index)
-      draw->flags |= DRM_CHROME9_FRAGMENT_FAST_Z |
-                     DRM_CHROME9_FRAGMENT_FAST_Z_INDEX(depth->fast_z_index);
-   if (depth_active && depth->coarse_z.handle && crender->ctx->coarse_z) {
-      struct chrome9_context *ctx = crender->ctx;
-
-      /* Draws of one submission name the buffer even when not using it. */
-      draw->coarse_z_handle = depth->coarse_z.handle;
-      draw->coarse_z_pitch = depth->coarse_z_pitch;
-      if (depth->coarse_z_valid &&
-          chrome9_draw_coarse_z_usable(ctx, draw->flags,
-                                       blend_active ? blend : NULL)) {
-         draw->flags |= DRM_CHROME9_FRAGMENT_COARSE_Z;
-         if (depth->coarse_z_reset || !ctx->coarse_z_last)
-            draw->flags |= DRM_CHROME9_FRAGMENT_COARSE_Z_RESET;
-         depth->coarse_z_reset = false;
-         ctx->coarse_z_last = true;
-      } else {
-         ctx->coarse_z_last = false;
-      }
-   }
-   if (chrome9_resource_extended(target)) {
-      if (!target->guarded ||
-          !chrome9_screen_has_capability(
-             crender->ctx->base.screen,
-             DRM_CHROME9_CAP_FRAGMENT_DESTINATION_EXTENDED))
-         return false;
-      draw->flags |= DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED;
-      draw->destination_offset = chrome9_resource_destination_offset(target);
-   }
-   /* The count and user pointers are filled only when the batch is flushed.
-    * Keeping them zero makes the rest of this structure a comparable state
-    * key, including target, depth, blend and scissor state. */
-   draw->width = target->base.width0;
-   draw->height = target->base.height0;
-   draw->destination_pitch = target->stride;
-   draw->depth_pitch = depth_active ? depth->stride : 0;
-   draw->destination_format =
-      target->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ?
-      DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
-      DRM_CHROME9_DESTINATION_FORMAT_BGRX8888;
-   draw->depth_format = depth_active ?
-      (chrome9_format_is_d24(depth->base.format) ?
-       DRM_CHROME9_FRAGMENT_DEPTH_X8Z24 : DRM_CHROME9_FRAGMENT_DEPTH_D16) :
-      0;
+   if (!chrome9_fragment_draw_target(crender, target, depth, depth_active,
+                                     blend_active, blend, scissor,
+                                     depth_flags, draw))
+      return false;
    draw->instruction_count = instruction_count;
    draw->constant_count = constant_count;
    draw->texture_count = crender->texture_count;
-   draw->varying_count = crender->varying_count;
    draw->abi_version = chrome9_fragment_uses_sparse_abi(crender->ctx) ?
       DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES :
       DRM_CHROME9_FRAGMENT_ABI_VERSION;
-   draw->query = chrome9_query_draw_id(crender->ctx);
-   if (draw->query)
-      draw->flags |= DRM_CHROME9_FRAGMENT_QUERY;
-   if (blend_active) {
-      draw->blend = *blend;
-      if (chrome9_blend_uses_constant(crender->ctx->blend)) {
-         /* Unsigned 1.10 as the vendor converts it: floor(c * 1024). */
-         for (unsigned c = 0; c < 4; c++)
-            draw->blend_color[c] = MIN2(
-               (unsigned)(CLAMP(crender->ctx->blend_color.color[c],
-                                0.0f, 1.0f) * 1024.0f), 0x400);
-      }
-   }
-   draw->scissor = *scissor;
    return true;
 }
 
+/* Kernel vertices of one draw-module triangle, domain checks included. */
 static bool
-chrome9_queue_generic_triangle(
-   struct chrome9_vbuf_render *crender, const unsigned indices[3],
-   struct chrome9_resource *target, struct chrome9_resource *depth,
-   struct chrome9_resource *textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-   struct chrome9_sampler_state *samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-   bool depth_active, bool blend_active,
-   const struct drm_chrome9_blend_state *blend,
-   const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
-   bool *queued)
+chrome9_fragment_vertices(const struct chrome9_vbuf_render *crender,
+                          const unsigned indices[3],
+                          const struct chrome9_resource *target,
+                          struct drm_chrome9_fragment_vertex vertices[3])
 {
-   struct drm_chrome9_fragment_instruction *instructions =
-      crender->generic_instructions;
-   struct drm_chrome9_fragment_texture_state *texture_state =
-      crender->generic_textures;
-   struct drm_chrome9_fragment_vertex vertices[3] = { 0 };
-   uint32_t (*constants)[4] = crender->generic_constants;
-   struct drm_chrome9_draw_fragment_program draw;
-   bool cached = crender->generic_state_valid;
-   unsigned constant_count;
-   unsigned instruction_count;
    const float pixel_center_bias = crender->ctx->rasterizer &&
       crender->ctx->rasterizer->half_pixel_center ? 0.5f : 0.0f;
    const bool primary = crender->ctx->fs->semantic_input_mask == 1;
 
-   *queued = false;
-   /* The laboratory draw limit applies to cmd22 as well as the older
-    * immediate paths.  Include deferred batches: none has been submitted
-    * yet, but each already consumes one slot in this draw's limit. */
-   if (crender->ctx->draw_limit &&
-       crender->ctx->submitted_triangles + crender->deferred_triangles +
-          crender->batch_count >= crender->ctx->draw_limit) {
-      if (!crender->ctx->draw_limit_reported) {
-         fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
-                         " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
-                 crender->ctx->submitted_triangles +
-                    crender->deferred_triangles + crender->batch_count,
-                 crender->ctx->draw_limit);
-         crender->ctx->draw_limit_reported = true;
-      }
-      return true;
-   }
-   crender->ctx->draw_filled_triangles =
-      crender->prim == MESA_PRIM_TRIANGLES ||
-      crender->prim == MESA_PRIM_TRIANGLE_STRIP ||
-      crender->prim == MESA_PRIM_TRIANGLE_FAN;
-   if (!cached) {
-      if (!chrome9_generic_fragment_state(crender, target, depth, textures,
-             samplers, depth_active, blend_active, blend, scissor,
-             depth_flags, &crender->generic_draw, instructions, constants,
-             texture_state))
-         return false;
-      crender->generic_target = target;
-      crender->generic_depth = depth;
-      crender->generic_depth_active = depth_active;
-      crender->generic_state_valid = true;
-   }
-   draw = crender->generic_draw;
-   instruction_count = draw.instruction_count;
-   constant_count = draw.constant_count;
+   memset(vertices, 0, 3 * sizeof(*vertices));
    for (unsigned i = 0; i < 3; i++) {
       const float *source;
 
@@ -2113,6 +2103,521 @@ chrome9_queue_generic_triangle(
              vertices[2].varying[lane / 4][lane % 4]))
          return false;
    }
+   return true;
+}
+
+
+/* Carrier objects of at least width x height, count of them. */
+static bool
+chrome9_split_carriers(struct chrome9_context *ctx, unsigned count,
+                       unsigned width, unsigned height)
+{
+   struct pipe_screen *screen = ctx->base.screen;
+   unsigned have = util_dynarray_num_elements(&ctx->split_carriers,
+                                              struct pipe_resource *);
+
+   if (width > ctx->split_carrier_width ||
+       height > ctx->split_carrier_height) {
+      util_dynarray_foreach(&ctx->split_carriers, struct pipe_resource *,
+                            carrier)
+         pipe_resource_reference(carrier, NULL);
+      util_dynarray_clear(&ctx->split_carriers);
+      ctx->split_carrier_width = MAX2(width, ctx->split_carrier_width);
+      ctx->split_carrier_height = MAX2(height, ctx->split_carrier_height);
+      have = 0;
+   }
+   for (; have < count; have++) {
+      /* Linear 32-bit texels; draws name the object as R32F. */
+      const struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+         .width0 = ctx->split_carrier_width,
+         .height0 = ctx->split_carrier_height,
+         .depth0 = 1,
+         .array_size = 1,
+         .bind = PIPE_BIND_SAMPLER_VIEW,
+      };
+      struct pipe_resource *carrier = screen->resource_create(screen, &templ);
+
+      if (!carrier)
+         return false;
+      if (!chrome9_resource(carrier)->guarded ||
+          chrome9_resource(carrier)->tiled) {
+         pipe_resource_reference(&carrier, NULL);
+         return false;
+      }
+      util_dynarray_append(&ctx->split_carriers, carrier);
+   }
+   return true;
+}
+
+/* A split program's draw can run: its carriers exist for the target and
+ * every job's samplers are expressible.  Else llvmpipe renders it. */
+bool
+chrome9_split_draw_prepare(struct chrome9_context *ctx)
+{
+   const struct chrome9_fs_split *split = ctx->fs->split;
+   struct chrome9_resource *target = chrome9_context_render_target(ctx);
+
+   if (!target)
+      return false;
+   for (unsigned j = 0; j < split->job_count; j++) {
+      const uint8_t used = split->jobs[j].program->semantic_sampler_mask;
+
+      if (used != BITFIELD_MASK(util_last_bit(used)) &&
+          !ctx->fragment_sparse_textures)
+         return false;
+   }
+   u_foreach_bit(unit, split->app_sampler_mask)
+      if (unit >= ctx->num_sampler_views || !ctx->sampler_views[unit])
+         return false;
+   return chrome9_split_carriers(ctx, split->carrier_count,
+                                 target->base.width0, target->base.height0);
+}
+
+static void
+chrome9_split_carrier_texture(struct chrome9_resource *carrier,
+                              unsigned unit, bool sparse,
+                              struct drm_chrome9_fragment_texture_state *state)
+{
+   memset(state, 0, sizeof(*state));
+   state->handle = carrier->bo.handle;
+   state->flags = chrome9_resource_texture_flags(carrier);
+   if (sparse)
+      state->reserved0 = unit;
+   state->format = DRM_CHROME9_FRAGMENT_TEXTURE_R32F;
+   state->width = carrier->base.width0;
+   state->height = carrier->base.height0;
+   state->min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   state->mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   state->mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
+   state->wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   state->wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   state->level_offset[0] = carrier->level_offset[0];
+   state->level_pitch[0] = carrier->level_stride[0];
+}
+
+/* Uniforms, immediates and the carrier inverse size of one job. */
+static bool
+chrome9_split_constants(struct chrome9_context *ctx,
+                        const struct chrome9_fs_split *split,
+                        const struct chrome9_shader *program,
+                        unsigned carrier_width, unsigned carrier_height,
+                        uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4],
+                        unsigned *count)
+{
+   const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
+   const uint32_t mask = program->semantic_constant_mask;
+   const uint8_t *map = NULL;
+   size_t size = 0;
+
+   memset(constants, 0,
+          DRM_CHROME9_FRAGMENT_MAX_CONSTANTS * 4 * sizeof(uint32_t));
+   *count = util_last_bit(mask);
+   if (cb->user_buffer) {
+      map = (const uint8_t *)cb->user_buffer + cb->buffer_offset;
+      size = cb->buffer_size;
+   } else if (cb->buffer && cb->buffer->target == PIPE_BUFFER &&
+              cb->buffer_offset <= cb->buffer->width0) {
+      map = chrome9_resource(cb->buffer)->bo.map;
+      if (map)
+         map += cb->buffer_offset;
+      size = MIN2(cb->buffer_size, cb->buffer->width0 - cb->buffer_offset);
+   }
+   for (unsigned i = 0; i < *count; i++) {
+      if (program->native_fs.immediate_mask & (1u << i)) {
+         memcpy(constants[i], program->native_fs.immediate[i],
+                sizeof(constants[i]));
+      } else if (i == split->inverse_register) {
+         const float inverse[4] = {
+            1.0f / carrier_width, 1.0f / carrier_height,
+            0.5f / carrier_width, 0.5f / carrier_height,
+         };
+
+         memcpy(constants[i], inverse, sizeof(constants[i]));
+      } else if (mask & (1u << i)) {
+         if (!map || size < (i + 1) * sizeof(constants[i]))
+            return false;
+         memcpy(constants[i], map + i * sizeof(constants[i]),
+                sizeof(constants[i]));
+      }
+      chrome9_finite_constants(constants[i], 4);
+   }
+   return true;
+}
+
+/* State of job j of the split batch: carriers are job-local samplers
+ * carrier_base.., the last job draws into the application target. */
+static bool
+chrome9_split_job_state(
+   struct chrome9_vbuf_render *crender, unsigned j,
+   struct drm_chrome9_draw_fragment_program *draw,
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS],
+   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4],
+   struct drm_chrome9_fragment_texture_state
+      texture_state[DRM_CHROME9_FRAGMENT_MAX_TEXTURES])
+{
+   struct chrome9_context *ctx = crender->ctx;
+   const struct chrome9_fs_split *split = crender->split;
+   const struct chrome9_fs_split_job *job = &split->jobs[j];
+   const struct chrome9_shader *program = job->program;
+   struct pipe_resource **carriers =
+      util_dynarray_begin(&ctx->split_carriers);
+   const bool final = job->carrier < 0;
+   const uint8_t used = program->semantic_sampler_mask;
+   const bool dense = used == BITFIELD_MASK(util_last_bit(used));
+   const unsigned units = dense ? BITFIELD_MASK(util_last_bit(used)) : used;
+   uint8_t depth_swizzle[DRM_CHROME9_FRAGMENT_MAX_TEXTURES][4] = { 0 };
+   uint8_t depth_sampler_mask = 0;
+   const struct chrome9_ps_ir *ir = &program->semantic_fs_ir;
+   struct chrome9_ps_ir color_only;
+   unsigned instruction_count, constant_count, descriptors = 0;
+
+   if (!dense && !ctx->fragment_sparse_textures)
+      return false;
+   if (ir->depth_output && (!final || !crender->generic_depth_active)) {
+      color_only = *ir;
+      color_only.depth_output = false;
+      ir = &color_only;
+   }
+   /* Fast-Z stored depths are not the shader's to replace. */
+   if (ir->depth_output && crender->generic_depth->fast_z_index) {
+      chrome9_resource_fast_z_resolve(crender->generic_depth);
+      crender->generic_depth->fast_z_disabled = true;
+   }
+   memset(draw, 0, sizeof(*draw));
+   memset(texture_state, 0,
+          DRM_CHROME9_FRAGMENT_MAX_TEXTURES * sizeof(*texture_state));
+   if (!chrome9_fragment_build_instructions(ir, used, instructions,
+                                            &instruction_count) ||
+       !chrome9_split_constants(ctx, split, program, ctx->split_carrier_width,
+                                ctx->split_carrier_height, constants,
+                                &constant_count))
+      return false;
+   u_foreach_bit(unit, units) {
+      if (unit >= split->carrier_base) {
+         const unsigned read = unit - split->carrier_base;
+
+         if (read >= job->read_count)
+            return false;
+         chrome9_split_carrier_texture(
+            chrome9_resource(carriers[job->reads[read]]), unit, !dense,
+            &texture_state[descriptors++]);
+         continue;
+      }
+
+      struct chrome9_resource *texture = crender->split_textures[unit];
+      const struct pipe_sampler_view *view = ctx->sampler_views[unit];
+
+      if (!texture || !crender->split_samplers[unit] || !view)
+         return false;
+      if (texture->base.format == PIPE_FORMAT_DXT1_RGB) {
+         static const uint8_t opaque[4] = {
+            DRM_CHROME9_FRAGMENT_SWIZZLE_X, DRM_CHROME9_FRAGMENT_SWIZZLE_Y,
+            DRM_CHROME9_FRAGMENT_SWIZZLE_Z, DRM_CHROME9_FRAGMENT_SWIZZLE_ONE,
+         };
+
+         depth_sampler_mask |= 1u << unit;
+         memcpy(depth_swizzle[unit], opaque, sizeof(opaque));
+      } else if (chrome9_format_is_d24(texture->base.format) &&
+                 !chrome9_depth_compare(ctx, unit)) {
+         depth_sampler_mask |= 1u << unit;
+         if (!chrome9_depth_view_swizzle(view->swizzle_r,
+                                         &depth_swizzle[unit][0]) ||
+             !chrome9_depth_view_swizzle(view->swizzle_g,
+                                         &depth_swizzle[unit][1]) ||
+             !chrome9_depth_view_swizzle(view->swizzle_b,
+                                         &depth_swizzle[unit][2]) ||
+             !chrome9_depth_view_swizzle(view->swizzle_a,
+                                         &depth_swizzle[unit][3]))
+            return false;
+      }
+      if (!chrome9_fragment_texture_descriptor(
+             ctx, unit, !dense, texture, crender->split_samplers[unit],
+             &texture_state[descriptors++]))
+         return false;
+   }
+   if (depth_sampler_mask &&
+       !chrome9_fragment_apply_depth_swizzles(instructions, instruction_count,
+                                               depth_sampler_mask,
+                                               depth_swizzle))
+      return false;
+   if (final) {
+      if (!chrome9_fragment_draw_target(crender, crender->generic_target,
+                                        crender->generic_depth,
+                                        crender->generic_depth_active,
+                                        crender->split_blend_active,
+                                        &crender->split_blend,
+                                        &crender->split_scissor,
+                                        crender->split_depth_flags, draw))
+         return false;
+      draw->stencil = crender->split_stencil;
+   } else {
+      struct chrome9_resource *carrier =
+         chrome9_resource(carriers[job->carrier]);
+
+      /* No depth, stencil, blend or query: only the last job counts. */
+      draw->destination_handle = carrier->bo.handle;
+      draw->destination_pitch = carrier->stride;
+      draw->destination_format = DRM_CHROME9_DESTINATION_FORMAT_R32F;
+      draw->width = carrier->base.width0;
+      draw->height = carrier->base.height0;
+      draw->varying_count = crender->varying_count;
+      draw->scissor = crender->split_scissor;
+   }
+   draw->instruction_count = instruction_count;
+   draw->constant_count = constant_count;
+   draw->texture_count = descriptors;
+   draw->abi_version = dense ? DRM_CHROME9_FRAGMENT_ABI_VERSION :
+                               DRM_CHROME9_FRAGMENT_ABI_SPARSE_TEXTURES;
+   return true;
+}
+
+/* Run every job over the queued triangles. */
+static void
+chrome9_split_flush(struct chrome9_vbuf_render *crender)
+{
+   struct chrome9_context *ctx = crender->ctx;
+   const struct chrome9_fs_split *split = crender->split;
+   const unsigned count = crender->split_count;
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
+   uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4];
+   struct drm_chrome9_fragment_texture_state
+      textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
+   bool submitted = true;
+
+   if (!count)
+      return;
+   crender->split_count = 0;
+   chrome9_tcl_batch_flush(ctx);
+   if (!chrome9_split_carriers(ctx, split->carrier_count,
+                               crender->generic_target->base.width0,
+                               crender->generic_target->base.height0))
+      submitted = false;
+   for (unsigned j = 0; submitted && j < split->job_count; j++) {
+      struct drm_chrome9_draw_fragment_program draw;
+
+      if (!chrome9_split_job_state(crender, j, &draw, instructions, constants,
+                                   textures)) {
+         submitted = false;
+         break;
+      }
+      draw.triangle_count = count;
+      draw.vertices_ptr =
+         (uintptr_t)util_dynarray_begin(&crender->split_vertices);
+      draw.instructions_ptr = (uintptr_t)instructions;
+      draw.constants_ptr = draw.constant_count ? (uintptr_t)constants : 0;
+      draw.textures_ptr = draw.texture_count ? (uintptr_t)textures : 0;
+      if (split->jobs[j].carrier < 0)
+         chrome9_context_prepare_render_target(ctx);
+      submitted = chrome9_draw_fragment_program(fd, &draw);
+   }
+   util_dynarray_clear(&crender->split_vertices);
+   if (submitted) {
+      ctx->submitted_triangles += count;
+      ctx->submitted_batches++;
+      ctx->submitted_program_batches++;
+      chrome9_context_render_target_written(ctx);
+   } else {
+      CHROME9_REJECT(ctx, count);
+      if (!(ctx->warnings & CHROME9_WARN_SUBMIT)) {
+         fprintf(stderr, "chrome9: split DRAW_FRAGMENT_PROGRAM failed "
+                 "count=%u: %s\n", count, strerror(errno));
+         ctx->warnings |= CHROME9_WARN_SUBMIT;
+      }
+   }
+}
+
+static int64_t
+chrome9_edge(const int32_t a[2], const int32_t b[2], const int32_t p[2])
+{
+   return (int64_t)(b[0] - a[0]) * (p[1] - a[1]) -
+          (int64_t)(b[1] - a[1]) * (p[0] - a[0]);
+}
+
+/* Some edge of t has all of other on its outer closed side. */
+static bool
+chrome9_separating_edge(const int32_t t[3][2], const int32_t other[3][2])
+{
+   const int64_t area = chrome9_edge(t[0], t[1], t[2]);
+
+   for (unsigned e = 0; e < 3; e++) {
+      const int32_t *a = t[e], *b = t[(e + 1) % 3];
+      unsigned outside = 0;
+
+      for (unsigned v = 0; v < 3; v++) {
+         const int64_t side = chrome9_edge(a, b, other[v]);
+
+         outside += area > 0 ? side <= 0 : side >= 0;
+      }
+      if (outside == 3)
+         return true;
+   }
+   return false;
+}
+
+/* The interiors of two triangles overlap: a pixel could take both. */
+static bool
+chrome9_triangles_overlap(const struct drm_chrome9_fragment_vertex a[3],
+                          const struct drm_chrome9_fragment_vertex b[3])
+{
+   int32_t ta[3][2], tb[3][2];
+
+   for (unsigned i = 0; i < 3; i++) {
+      ta[i][0] = a[i].x_16_16;
+      ta[i][1] = a[i].y_16_16;
+      tb[i][0] = b[i].x_16_16;
+      tb[i][1] = b[i].y_16_16;
+   }
+   if (MAX3(ta[0][0], ta[1][0], ta[2][0]) <= MIN3(tb[0][0], tb[1][0], tb[2][0]) ||
+       MAX3(tb[0][0], tb[1][0], tb[2][0]) <= MIN3(ta[0][0], ta[1][0], ta[2][0]) ||
+       MAX3(ta[0][1], ta[1][1], ta[2][1]) <= MIN3(tb[0][1], tb[1][1], tb[2][1]) ||
+       MAX3(tb[0][1], tb[1][1], tb[2][1]) <= MIN3(ta[0][1], ta[1][1], ta[2][1]))
+      return false;
+   return !chrome9_separating_edge(ta, tb) && !chrome9_separating_edge(tb, ta);
+}
+
+/* Queue a triangle of a split program; triangles whose interiors overlap
+ * an earlier one of the batch start the next batch. */
+static bool
+chrome9_split_queue_triangle(
+   struct chrome9_vbuf_render *crender, const unsigned indices[3],
+   struct chrome9_resource *target, struct chrome9_resource *depth,
+   struct chrome9_resource *textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+   struct chrome9_sampler_state *samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+   bool depth_active, bool blend_active,
+   const struct drm_chrome9_blend_state *blend,
+   const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
+   bool *queued)
+{
+   struct chrome9_context *ctx = crender->ctx;
+   struct drm_chrome9_fragment_vertex vertices[3];
+   struct drm_chrome9_stencil_state stencil = { 0 };
+   const struct drm_chrome9_fragment_vertex *queued_vertices;
+   int32_t x[3], y[3];
+
+   *queued = false;
+   if (crender->batch_count)
+      chrome9_flush_triangle_batch(crender);
+   if (!crender->generic_state_valid) {
+      if (!blend || !scissor)
+         return false;
+      memset(crender->split_textures, 0, sizeof(crender->split_textures));
+      memset(crender->split_samplers, 0, sizeof(crender->split_samplers));
+      for (unsigned d = 0; d < crender->texture_count; d++) {
+         const unsigned unit = chrome9_fragment_texture_unit(ctx, d);
+
+         crender->split_textures[unit] = textures[d];
+         crender->split_samplers[unit] = samplers[d];
+      }
+      crender->split = ctx->fs->split;
+      crender->generic_target = target;
+      crender->generic_depth = depth;
+      crender->generic_depth_active = depth_active;
+      crender->split_blend_active = blend_active;
+      crender->split_blend = *blend;
+      crender->split_scissor = *scissor;
+      crender->split_depth_flags = depth_flags;
+      crender->generic_state_valid = true;
+   }
+   if (!chrome9_fragment_vertices(crender, indices, crender->generic_target,
+                                  vertices))
+      return false;
+   for (unsigned i = 0; i < 3; i++) {
+      x[i] = vertices[i].x_16_16;
+      y[i] = vertices[i].y_16_16;
+   }
+   if (!chrome9_triangle_nondegenerate(x, y))
+      return true;
+   if (crender->generic_depth_active && chrome9_stencil_active(ctx))
+      chrome9_triangle_stencil(ctx, vertices, &stencil);
+   if (crender->split_count &&
+       memcmp(&stencil, &crender->split_stencil, sizeof(stencil)))
+      chrome9_split_flush(crender);
+   crender->split_stencil = stencil;
+   queued_vertices = util_dynarray_begin(&crender->split_vertices);
+   for (unsigned t = 0; t < crender->split_count; t++)
+      if (chrome9_triangles_overlap(&queued_vertices[t * 3], vertices)) {
+         chrome9_split_flush(crender);
+         break;
+      }
+   util_dynarray_append_array(&crender->split_vertices,
+                              struct drm_chrome9_fragment_vertex, vertices, 3);
+   crender->split_count++;
+   *queued = true;
+   if (crender->split_count == DRM_CHROME9_FRAGMENT_MAX_TRIANGLES)
+      chrome9_split_flush(crender);
+   return true;
+}
+
+static bool
+chrome9_queue_generic_triangle(
+   struct chrome9_vbuf_render *crender, const unsigned indices[3],
+   struct chrome9_resource *target, struct chrome9_resource *depth,
+   struct chrome9_resource *textures[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+   struct chrome9_sampler_state *samplers[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
+   bool depth_active, bool blend_active,
+   const struct drm_chrome9_blend_state *blend,
+   const struct drm_chrome9_scissor_state *scissor, uint32_t depth_flags,
+   bool *queued)
+{
+   struct drm_chrome9_fragment_instruction *instructions =
+      crender->generic_instructions;
+   struct drm_chrome9_fragment_texture_state *texture_state =
+      crender->generic_textures;
+   struct drm_chrome9_fragment_vertex vertices[3] = { 0 };
+   uint32_t (*constants)[4] = crender->generic_constants;
+   struct drm_chrome9_draw_fragment_program draw;
+   bool cached = crender->generic_state_valid;
+   unsigned constant_count;
+   unsigned instruction_count;
+
+   if (crender->ctx->fs->split)
+      return chrome9_split_queue_triangle(crender, indices, target, depth,
+                                          textures, samplers, depth_active,
+                                          blend_active, blend, scissor,
+                                          depth_flags, queued);
+   chrome9_split_flush(crender);
+   *queued = false;
+   /* The laboratory draw limit applies to cmd22 as well as the older
+    * immediate paths.  Include deferred batches: none has been submitted
+    * yet, but each already consumes one slot in this draw's limit. */
+   if (crender->ctx->draw_limit &&
+       crender->ctx->submitted_triangles + crender->deferred_triangles +
+          crender->batch_count >= crender->ctx->draw_limit) {
+      if (!crender->ctx->draw_limit_reported) {
+         fprintf(stderr, "chrome9: stopped before triangle=%" PRIu64
+                         " by CHROME9_DRAW_LIMIT=%" PRIu64 "\n",
+                 crender->ctx->submitted_triangles +
+                    crender->deferred_triangles + crender->batch_count,
+                 crender->ctx->draw_limit);
+         crender->ctx->draw_limit_reported = true;
+      }
+      return true;
+   }
+   crender->ctx->draw_filled_triangles =
+      crender->prim == MESA_PRIM_TRIANGLES ||
+      crender->prim == MESA_PRIM_TRIANGLE_STRIP ||
+      crender->prim == MESA_PRIM_TRIANGLE_FAN;
+   if (!cached) {
+      if (!chrome9_generic_fragment_state(crender, target, depth, textures,
+             samplers, depth_active, blend_active, blend, scissor,
+             depth_flags, &crender->generic_draw, instructions, constants,
+             texture_state))
+         return false;
+      crender->generic_target = target;
+      crender->generic_depth = depth;
+      crender->generic_depth_active = depth_active;
+      crender->generic_state_valid = true;
+   }
+   draw = crender->generic_draw;
+   instruction_count = draw.instruction_count;
+   constant_count = draw.constant_count;
+   if (!chrome9_fragment_vertices(crender, indices, target, vertices))
+      return false;
    {
       int32_t x[3], y[3];
 
@@ -2366,6 +2871,7 @@ chrome9_flush_triangle_batch(struct chrome9_vbuf_render *crender)
    struct chrome9_context *ctx = crender->ctx;
    const unsigned count = crender->batch_count;
 
+   chrome9_split_flush(crender);
    if (!count)
       return;
    /* Queued TCL draws precede these triangles. */
@@ -3758,6 +4264,7 @@ chrome9_vbuf_draw_arrays(struct vbuf_render *render, unsigned start,
    }
    if (crender->batch_generic_program)
       chrome9_flush_triangle_batch(crender);
+   chrome9_split_flush(crender);
 }
 
 static void
@@ -3828,6 +4335,7 @@ chrome9_vbuf_draw_elements(struct vbuf_render *render,
     * Do not retain generic BO handles across the Gallium draw boundary. */
    if (crender->batch_generic_program)
       chrome9_flush_triangle_batch(crender);
+   chrome9_split_flush(crender);
 }
 
 static void
@@ -3855,6 +4363,7 @@ chrome9_vbuf_destroy(struct vbuf_render *render)
    }
    if (crender->ctx->vbuf_render == crender)
       crender->ctx->vbuf_render = NULL;
+   util_dynarray_fini(&crender->split_vertices);
    FREE(crender->vertices);
    FREE(crender);
 }

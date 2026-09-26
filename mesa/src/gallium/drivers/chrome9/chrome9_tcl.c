@@ -4681,6 +4681,9 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       return false;
    if (!ctx->vs || !ctx->vs->tcl || !rs || !ctx->fs)
       return tcl_fallback(ctx, "no NIR vertex shader");
+   /* Split programs batch screen-disjoint triangles: post-TNL only. */
+   if (ctx->fs->split)
+      return tcl_fallback(ctx, "multi-pass fragment program");
    if (info->primitive_restart || info->instance_count != 1 ||
        info->start_instance)
       return tcl_fallback(ctx, "restart or instancing");

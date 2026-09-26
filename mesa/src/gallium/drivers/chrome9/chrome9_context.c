@@ -12,6 +12,7 @@
 #include "chrome9_public.h"
 #include "chrome9_format.h"
 #include "chrome9_fragment.h"
+#include "chrome9_fs_split.h"
 #include "chrome9_ps_schedule.h"
 #include "chrome9_resource.h"
 #include "chrome9_specialise.h"
@@ -2990,6 +2991,10 @@ struct chrome9_ps_proof {
    unsigned budget;
    void *mem_ctx;
    struct hash_table_u64 *memo;
+   /* Split jobs: samplers of carriers whose value is not proven finite,
+    * or was interpolated, in the original program. */
+   uint8_t unproven_finite_samplers;
+   uint8_t interpolated_samplers;
 };
 
 /* A lowered Boolean: (negate ? -temp : temp) >= 0, complemented by invert.
@@ -3979,8 +3984,11 @@ chrome9_ps_default_finite_uncached(nir_scalar scalar,
    }
    /* The normal semantic-leaf validation remains authoritative.  These are
     * merely the leaf classes whose values the draw path proves finite. */
-   if (instr->type == nir_instr_type_intrinsic ||
-       instr->type == nir_instr_type_tex)
+   if (instr->type == nir_instr_type_tex)
+      return nir_instr_as_tex(instr)->sampler_index >= 8 ||
+             !(proof->unproven_finite_samplers &
+               BITFIELD_BIT(nir_instr_as_tex(instr)->sampler_index));
+   if (instr->type == nir_instr_type_intrinsic)
       return true;
    if (instr->type != nir_instr_type_alu)
       return false;
@@ -4120,8 +4128,11 @@ chrome9_ps_uninterpolated_uncached(nir_scalar scalar,
    instr = nir_def_instr(scalar.def);
    switch (instr->type) {
    case nir_instr_type_load_const:
-   case nir_instr_type_tex:
       return true;
+   case nir_instr_type_tex:
+      return nir_instr_as_tex(instr)->sampler_index >= 8 ||
+             !(proof->interpolated_samplers &
+               BITFIELD_BIT(nir_instr_as_tex(instr)->sampler_index));
    case nir_instr_type_intrinsic:
       switch (nir_instr_as_intrinsic(instr)->intrinsic) {
       case nir_intrinsic_load_ubo:
@@ -6213,6 +6224,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
                        uint8_t *cube_sampler_mask,
                        uint8_t *volume_sampler_mask,
                        bool allow_kill, bool allow_bias, bool allow_depth,
+                       uint8_t unproven_finite_samplers,
+                       uint8_t interpolated_samplers,
                        bool *lowered)
 {
    struct chrome9_ps_nir_builder builder = { .allow_bias = allow_bias };
@@ -6230,6 +6243,8 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    *lowered = false;
    builder.proof.budget = CHROME9_PS_PROOF_NODES;
    builder.proof.mem_ctx = nir;
+   builder.proof.unproven_finite_samplers = unproven_finite_samplers;
+   builder.proof.interpolated_samplers = interpolated_samplers;
    util_dynarray_init(&terminates, nir);
    if (!chrome9_fs_straight_line_entrypoint(nir, NULL, &block) ||
        nir->info.float_controls_execution_mode)
@@ -7637,6 +7652,8 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
                                      ctx->fragment_kill,
                                      ctx->texture_bias,
                                      ctx->depth_output,
+                                     shader->split_unproven_finite,
+                                     shader->split_interpolated,
                                      &lowered);
    if (lowered && debug_get_bool_option("CHROME9_PS_FOLD", true)) {
       struct chrome9_ps_ir folded = shader->semantic_fs_ir;
@@ -7662,8 +7679,13 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
          struct chrome9_ps_ir scheduled;
          unsigned scheduled_peak;
 
-         if (!chrome9_schedule_ps_ir(&shader->semantic_fs_ir, &scheduled,
-                                     &scheduled_peak) ||
+         /* Split jobs retry smaller instead of searching all variants. */
+         if (!(shader->split_job ?
+               chrome9_schedule_ps_ir_target(&shader->semantic_fs_ir,
+                                             &scheduled, &scheduled_peak,
+                                             12, 256) :
+               chrome9_schedule_ps_ir(&shader->semantic_fs_ir, &scheduled,
+                                      &scheduled_peak)) ||
              scheduled_peak > 12)
             lowered = false;
          else
@@ -7979,6 +8001,57 @@ chrome9_semantic_constant_color(struct chrome9_shader *shader,
    shader->supported = true;
 }
 
+/* The parent of a split program presents the union of its jobs' inputs
+ * and application samplers to the draw path, and the final job's IR. */
+static void
+chrome9_fs_apply_split(struct chrome9_shader *shader,
+                       struct chrome9_fs_split *split)
+{
+   uint16_t input_mask = 0, varying_mask = 0;
+   uint8_t cube_mask = 0, volume_mask = 0;
+   bool guarded = false;
+
+   if (!split)
+      return;
+   for (unsigned j = 0; j < split->job_count; j++) {
+      const struct chrome9_shader *job = split->jobs[j].program;
+
+      input_mask |= job->semantic_input_mask;
+      varying_mask |= job->semantic_varying_mask;
+      cube_mask |= job->semantic_cube_sampler_mask;
+      volume_mask |= job->semantic_volume_sampler_mask;
+      /* Proven-domain lowerings defer whole draws: not with jobs. */
+      guarded |= job->semantic_equal_zero_input_mask ||
+                 job->semantic_identity_projector_input_mask ||
+                 job->semantic_unit_interval_input_mask;
+   }
+   if (guarded) {
+      chrome9_fs_split_destroy(split);
+      return;
+   }
+   shader->split = split;
+   shader->semantic_fs_ir =
+      split->jobs[split->job_count - 1].program->semantic_fs_ir;
+   shader->semantic_fs_valid = true;
+   shader->semantic_passthrough = false;
+   shader->semantic_input_mask = input_mask;
+   shader->semantic_varying_mask = varying_mask;
+   shader->semantic_sampler_mask = split->app_sampler_mask;
+   shader->semantic_cube_sampler_mask = cube_mask & split->app_sampler_mask;
+   shader->semantic_volume_sampler_mask =
+      volume_mask & split->app_sampler_mask;
+   shader->semantic_constant_mask = 0;
+   shader->semantic_uniform_mask = 0;
+   shader->semantic_equal_zero_input_mask = 0;
+   shader->semantic_identity_projector_input_mask = 0;
+   shader->semantic_unit_interval_input_mask = 0;
+   shader->native_fs_valid = false;
+   shader->flat_primary = false;
+   shader->flat_generic = false;
+   shader->fragment_program = CHROME9_FS_COMPILED_ALU;
+   shader->supported = true;
+}
+
 void
 chrome9_compile_fs_nir(struct chrome9_context *ctx,
                        struct chrome9_shader *shader, nir_shader *nir)
@@ -8022,6 +8095,44 @@ chrome9_compile_fs_nir(struct chrome9_context *ctx,
        chrome9_native_fs_is_program_batch(shader, ctx->fragment_add))
       shader->fragment_program = CHROME9_FS_COMPILED_ALU;
    shader->supported = shader->fragment_program != CHROME9_FS_UNSUPPORTED;
+   shader->split = NULL;
+   if (!shader->supported && straight_line && !shader->split_job &&
+       ctx->draw_fragment_program && chrome9_fs_split_enabled())
+      chrome9_fs_apply_split(shader, chrome9_fs_split_create(ctx, shader, nir));
+}
+
+/* What the backend proves about a lane of the original program: carried
+ * lanes keep these properties through their carrier reads. */
+void
+chrome9_fs_split_lane_proof(nir_def *def, unsigned lane, bool *finite,
+                            bool *uninterpolated)
+{
+   struct chrome9_ps_proof proof = {
+      .budget = CHROME9_PS_PROOF_NODES,
+      .mem_ctx = ralloc_context(NULL),
+   };
+   const nir_scalar scalar = { def, lane };
+
+   /* Booleans travel as exact 0 or 1. */
+   *finite = def->bit_size == 1 ||
+             (proof.mem_ctx && chrome9_ps_default_finite(scalar, &proof));
+   *uninterpolated = def->bit_size == 1 ||
+                     (proof.mem_ctx && chrome9_ps_uninterpolated(scalar, &proof));
+   ralloc_free(proof.mem_ctx);
+}
+
+bool
+chrome9_fs_split_compile_job(struct chrome9_context *ctx,
+                             const struct chrome9_shader *parent,
+                             struct chrome9_shader *job, nir_shader *nir)
+{
+   memcpy(job->varying_slot, parent->varying_slot,
+          sizeof(job->varying_slot));
+   job->split_job = true;
+   chrome9_compile_fs_nir(ctx, job, nir);
+   return job->semantic_fs_valid &&
+          (!job->semantic_input_mask ||
+           (ctx->fragment_primary && job->semantic_input_mask == 1));
 }
 
 static void
@@ -8054,6 +8165,7 @@ chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
    variant->flat_primary = shader->flat_primary;
    variant->flat_generic = shader->flat_generic;
    variant->supported = shader->supported;
+   variant->split = shader->split;
 }
 
 static void
@@ -8089,6 +8201,7 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
    shader->flat_primary = variant->flat_primary;
    shader->flat_generic = variant->flat_generic;
    shader->supported = variant->supported;
+   shader->split = variant->split;
 }
 
 #define CHROME9_MAX_FS_VARIANTS 64
@@ -8472,9 +8585,13 @@ chrome9_delete_fs_state(struct pipe_context *pipe, void *state)
    while (shader->variants) {
       struct chrome9_fs_variant *variant = shader->variants;
 
+      if (variant->split == shader->split)
+         shader->split = NULL;
       shader->variants = variant->next;
+      chrome9_fs_split_destroy(variant->split);
       FREE(variant);
    }
+   chrome9_fs_split_destroy(shader->split);
    ralloc_free(shader->sw_nir);
    ralloc_free(shader->nir);
    FREE(shader);
@@ -9647,6 +9764,10 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
         chrome9_draw_smooth_lines(ctx, info)) &&
        chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
       return;
+   /* Multi-pass programs need their carriers before the draw module runs. */
+   if (ctx->fs->split && !chrome9_split_draw_prepare(ctx) &&
+       chrome9_sw_draw_vbo(ctx, info, drawid_offset, draws, num_draws))
+      return;
    chrome9_refresh_vs_textures(ctx);
    /* No GPU job may start while llvmpipe still accesses a BO. */
    chrome9_sw_finish(ctx);
@@ -9833,6 +9954,9 @@ chrome9_context_destroy(struct pipe_context *pipe)
               ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
    chrome9_tcl_batch_destroy(ctx);
+   util_dynarray_foreach(&ctx->split_carriers, struct pipe_resource *, carrier)
+      pipe_resource_reference(carrier, NULL);
+   util_dynarray_fini(&ctx->split_carriers);
    chrome9_query_context_destroy(ctx);
    chrome9_sw_context_destroy(ctx);
    if (ctx->reject_sites)

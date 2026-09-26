@@ -4,6 +4,7 @@
 #include "chrome9_context.h"
 #include "chrome9_drm.h"
 #include "chrome9_draw.h"
+#include "chrome9_fs_split.h"
 #include "chrome9_ps_schedule.h"
 #include "chrome9_public.h"
 #include "chrome9_specialise.h"
@@ -2827,6 +2828,98 @@ check_max_varyings_compilation(struct chrome9_context *context)
    return ok;
 }
 
+
+/* A dependent chain of vector products and sums from a varying and a
+ * uniform, steps records long; unsupported adds an fsin the backend lacks. */
+static nir_shader *
+make_long_chain(unsigned steps, bool unsupported)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "chrome9-long-chain");
+   nir_variable *input = nir_variable_create(
+      b.shader, nir_var_shader_in, glsl_vec4_type(), "v");
+   nir_variable *output = nir_variable_create(
+      b.shader, nir_var_shader_out, glsl_vec4_type(), "result");
+   nir_def *k, *a, *s;
+
+   input->data.location = VARYING_SLOT_VAR0;
+   input->data.interpolation = INTERP_MODE_SMOOTH;
+   output->data.location = FRAG_RESULT_COLOR;
+   a = nir_load_deref(&b, nir_build_deref_var(&b, input));
+   k = nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                         .base = 0);
+   s = nir_imm_vec4(&b, 0.0, 0.0, 0.0, 0.0);
+   for (unsigned i = 0; i < steps / 2; i++) {
+      a = nir_ffma(&b, a, k, nir_swizzle(&b, a, (unsigned[]){ 1, 2, 3, 0 }, 4));
+      s = nir_ffma(&b, a, nir_swizzle(&b, a, (unsigned[]){ 3, 2, 1, 0 }, 4), s);
+   }
+   if (unsupported)
+      s = nir_fsin(&b, s);
+   nir_store_deref(&b, nir_build_deref_var(&b, output), s, 0xf);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static bool
+check_fs_split(struct chrome9_context *context)
+{
+   bool ok = true;
+
+   for (unsigned unsupported = 0; unsupported < 2; unsupported++) {
+      struct chrome9_shader parent = { 0 };
+      nir_shader *nir = make_long_chain(240, unsupported);
+      struct chrome9_fs_split *split;
+
+      chrome9_compile_fs_nir(context, &parent, nir);
+      split = chrome9_fs_split_create(context, &parent, nir);
+      if (unsupported) {
+         if (split) {
+            fprintf(stderr, "split of an unsupported program succeeded\n");
+            ok = false;
+         }
+      } else if (parent.supported || !split || split->job_count < 3 ||
+                 split->jobs[split->job_count - 1].carrier >= 0) {
+         fprintf(stderr, "long chain: supported=%u split=%p jobs=%u\n",
+                 parent.supported, (void *)split,
+                 split ? split->job_count : 0);
+         ok = false;
+      } else {
+         for (unsigned j = 0; j < split->job_count; j++) {
+            const struct chrome9_fs_split_job *job = &split->jobs[j];
+            const struct chrome9_ps_ir *ir = &job->program->semantic_fs_ir;
+            unsigned alu = 0;
+
+            for (unsigned i = 0; i < ir->count; i++)
+               alu += ir->instruction[i].op != CHROME9_PS_OPCODE_TEX ||
+                      ir->instruction[i].source[0].file ==
+                         CHROME9_PS_SOURCE_TEMP;
+            /* Jobs fit the store, read at most the free samplers, write
+             * their carrier as the terminal colour, and carriers are
+             * slots of the split. */
+            if (!job->program->semantic_fs_valid || alu > 96 ||
+                job->read_count > 8 - split->carrier_base ||
+                (j + 1 < split->job_count &&
+                 (job->carrier < 0 ||
+                  (unsigned)job->carrier >= split->carrier_count)) ||
+                ir->instruction[ir->count - 1].destination.file !=
+                   CHROME9_PS_DESTINATION_COLOR) {
+               fprintf(stderr, "split job %u: valid=%u alu=%u reads=%u "
+                       "carrier=%d\n", j, job->program->semantic_fs_valid,
+                       alu, job->read_count, job->carrier);
+               ok = false;
+            }
+            for (unsigned r = 0; r < job->read_count; r++)
+               if (job->reads[r] >= split->carrier_count ||
+                   (int)job->reads[r] == job->carrier)
+                  ok = false;
+         }
+      }
+      chrome9_fs_split_destroy(split);
+      ralloc_free(nir);
+   }
+   return ok;
+}
+
 int
 main(void)
 {
@@ -2937,6 +3030,7 @@ main(void)
    failures += !check_compact_alu_lowering(&context);
    failures += !check_separable_blur_compilation(&context);
    failures += !check_max_varyings_compilation(&context);
+   failures += !check_fs_split(&context);
    if (failures)
       return 1;
    puts("chrome9 primary alpha, texture modulation, packed literals, vector and equality selects, Blinn-Phong shape, function-medium sqrt boundary, ideas logo-shadow, and blur and max-varyings compilation passed");
