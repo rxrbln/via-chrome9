@@ -11,6 +11,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 #include "tgsi/tgsi_exec.h"
 #include "util/format/u_format.h"
@@ -533,6 +536,148 @@ chrome9_vs_unorm8_layout(enum pipe_format format, uint8_t byte[4])
  * arithmetic of chrome9_vs_sample_level(); other states use the generic
  * sampler four lookups at a time.
  */
+/* x - floor(x) without a libm call; floats from 2^23 on are integers. */
+static inline float
+chrome9_vs_fract(float x)
+{
+   float whole;
+
+   if (!(fabsf(x) < 8388608.0f))
+      return 0.0f;
+   whole = (float)(int32_t)x;
+   if (whole > x)
+      whole -= 1.0f;
+   return x - whole;
+}
+
+/* Texel index pair (i, i + 1) of a bilinear footprint on one axis. */
+static inline void
+chrome9_vs_bilinear_axis(int i, unsigned size, bool repeat, bool pot,
+                         unsigned index[2])
+{
+   if (!repeat) {
+      index[0] = CLAMP(i, 0, (int)size - 1);
+      index[1] = CLAMP(i + 1, 0, (int)size - 1);
+   } else if (pot) {
+      index[0] = (unsigned)i & (size - 1);
+      index[1] = (unsigned)(i + 1) & (size - 1);
+   } else {
+      index[0] = chrome9_vs_wrap_texel(i, size, PIPE_TEX_WRAP_REPEAT);
+      index[1] = chrome9_vs_wrap_texel(i + 1, size, PIPE_TEX_WRAP_REPEAT);
+   }
+}
+
+/*
+ * Bilinear unorm8 sampling for CLAMP_TO_EDGE and REPEAT, the vertex
+ * texture fetch of every vertex of a draw: integer floors instead of
+ * floorf calls, masks for power-of-two repeat.  False for other wrap modes.
+ */
+static bool
+chrome9_vs_bilinear_unorm8(const uint8_t *base, unsigned pitch,
+                           unsigned width, unsigned height,
+                           const struct pipe_sampler_state *state,
+                           const uint8_t byte[4], const float unorm[256],
+                           unsigned count, const float *s, const float *t,
+                           float *out, unsigned out_stride)
+{
+   const bool repeat_s = state->wrap_s == PIPE_TEX_WRAP_REPEAT;
+   const bool repeat_t = state->wrap_t == PIPE_TEX_WRAP_REPEAT;
+   const bool pot_s = util_is_power_of_two_nonzero(width);
+   const bool pot_t = util_is_power_of_two_nonzero(height);
+   float constant[4];
+
+   if ((!repeat_s && state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_EDGE) ||
+       (!repeat_t && state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_EDGE) ||
+       width > (1u << 20) || height > (1u << 20))
+      return false;
+   for (unsigned c = 0; c < 4; c++)
+      constant[c] = byte[c] == 4 ? 1.0f : 0.0f;
+   for (unsigned i = 0; i < count; i++) {
+      float *rgba = out + (size_t)i * out_stride;
+      unsigned ix[2], iy[2];
+      float u, v, x, y, fx, fy;
+      int x0, y0;
+
+      if (!isfinite(s[i]) || !isfinite(t[i])) {
+         memset(rgba, 0, 4 * sizeof(float));
+         continue;
+      }
+      /* Wrapped coordinates lie in [0, 1]: x, y >= -0.5, so truncation of
+       * x + 1 floors. */
+      u = repeat_s ? chrome9_vs_fract(s[i]) : CLAMP(s[i], 0.0f, 1.0f);
+      v = repeat_t ? chrome9_vs_fract(t[i]) : CLAMP(t[i], 0.0f, 1.0f);
+      x = u * width - 0.5f;
+      y = v * height - 0.5f;
+      x0 = (int)(x + 1.0f) - 1;
+      y0 = (int)(y + 1.0f) - 1;
+      fx = x - x0;
+      fy = y - y0;
+      chrome9_vs_bilinear_axis(x0, width, repeat_s, pot_s, ix);
+      chrome9_vs_bilinear_axis(y0, height, repeat_t, pot_t, iy);
+
+      const uint8_t *row0 = base + (size_t)iy[0] * pitch;
+      const uint8_t *row1 = base + (size_t)iy[1] * pitch;
+      const uint8_t *p00 = row0 + ix[0] * 4, *p01 = row0 + ix[1] * 4;
+      const uint8_t *p10 = row1 + ix[0] * 4, *p11 = row1 + ix[1] * 4;
+
+#ifdef __SSE2__
+      {
+         /* All four bytes at once in 8.8 fixed point, as the hardware
+          * filter does: within one LSB of the float blend. */
+         const __m128i zero = _mm_setzero_si128();
+         const int wx = (int)(fx * 256.0f + 0.5f), wy = (int)(fy * 256.0f + 0.5f);
+         uint32_t t00, t01, t10, t11;
+         float texel[4];
+
+         memcpy(&t00, p00, 4);
+         memcpy(&t01, p01, 4);
+         memcpy(&t10, p10, 4);
+         memcpy(&t11, p11, 4);
+         __m128i top = _mm_unpacklo_epi8(
+            _mm_unpacklo_epi32(_mm_cvtsi32_si128(t00), _mm_cvtsi32_si128(t01)),
+            zero);
+         __m128i bottom = _mm_unpacklo_epi8(
+            _mm_unpacklo_epi32(_mm_cvtsi32_si128(t10), _mm_cvtsi32_si128(t11)),
+            zero);
+         const __m128i hweight = _mm_set_epi16(wx, wx, wx, wx, 256 - wx,
+                                               256 - wx, 256 - wx, 256 - wx);
+         const __m128i round = _mm_set1_epi16(128);
+
+         top = _mm_mullo_epi16(top, hweight);
+         bottom = _mm_mullo_epi16(bottom, hweight);
+         top = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(top,
+                  _mm_srli_si128(top, 8)), round), 8);
+         bottom = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(bottom,
+                     _mm_srli_si128(bottom, 8)), round), 8);
+         __m128i blend = _mm_add_epi16(
+            _mm_mullo_epi16(top, _mm_set1_epi16(256 - wy)),
+            _mm_mullo_epi16(bottom, _mm_set1_epi16(wy)));
+         blend = _mm_srli_epi16(_mm_add_epi16(blend, round), 8);
+         _mm_storeu_ps(texel, _mm_mul_ps(
+            _mm_cvtepi32_ps(_mm_unpacklo_epi16(blend, zero)),
+            _mm_set1_ps(1.0f / 255.0f)));
+         for (unsigned c = 0; c < 4; c++)
+            rgba[c] = byte[c] < 4 ? texel[byte[c]] : constant[c];
+         continue;
+      }
+#endif
+      for (unsigned c = 0; c < 4; c++) {
+         const unsigned b = byte[c];
+
+         if (b >= 4) {
+            rgba[c] = constant[c];
+            continue;
+         }
+         const float top = unorm[p00[b]] + (unorm[p01[b]] - unorm[p00[b]]) * fx;
+         const float bottom = unorm[p10[b]] +
+                              (unorm[p11[b]] - unorm[p10[b]]) * fx;
+
+         rgba[c] = top + (bottom - top) * fy;
+      }
+   }
+   return true;
+}
+
 void
 chrome9_vs_texture_sample_array(struct chrome9_context *ctx, unsigned unit,
                                 unsigned sampler, unsigned count,
@@ -586,6 +731,10 @@ chrome9_vs_texture_sample_array(struct chrome9_context *ctx, unsigned unit,
    const unsigned filter = state->mag_img_filter;
    float zero_one[2] = { 0.0f, 1.0f };
 
+   if (filter == PIPE_TEX_FILTER_LINEAR &&
+       chrome9_vs_bilinear_unorm8(base, pitch, width, height, state, byte,
+                                  unorm, count, s, t, out, out_stride))
+      return;
    for (unsigned i = 0; i < count; i++) {
       float *rgba = out + (size_t)i * out_stride;
       float x, y;
