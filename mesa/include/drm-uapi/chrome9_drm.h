@@ -340,6 +340,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_TILED_SHARED		(1ULL << 34)
 /* GEM_BUSY reports write_seq. */
 #define DRM_CHROME9_CAP2_WRITE_SEQ		(1ULL << 35)
+/* DRM_CHROME9_VERTEX_INDEX_OBJECT: stage B indices fetched from an object. */
+#define DRM_CHROME9_CAP2_INDEX_OBJECT		(1ULL << 36)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1713,6 +1715,15 @@ struct drm_chrome9_vertex_buffer {
 /* Screen winding whose triangles take BACK_PRIMARY instead of PRIMARY. */
 #define DRM_CHROME9_VERTEX_BFC_CW	(1U << 3)
 #define DRM_CHROME9_VERTEX_BFC_CCW	(1U << 4)
+/*
+ * CAP2_INDEX_OBJECT, stage B: the indices are not copied from indices_ptr
+ * (which must be 0) but fetched by the engine from the object named by
+ * buffers[buffer_count] (stride 0), starting at its offset (16-byte
+ * aligned).  They are used raw: vertex i fetches element (base_vertex + i),
+ * and the hardware index bound (A2C) is the largest index every element
+ * buffer holds, so the draw ends at the first index beyond it.
+ */
+#define DRM_CHROME9_VERTEX_INDEX_OBJECT	(1U << 5)
 
 /* Primitive assembly of the vertex or index sequence. */
 #define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST	0U
