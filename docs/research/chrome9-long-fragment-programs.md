@@ -3,7 +3,10 @@
 
 # Chrome9 fragment programs longer than the 96-record ALU store
 
-Status 2026-09-25.  Evidence labels: **S** static (disassembly, manual),
+Status 2026-09-26: a multi-pass splitter is implemented in Mesa (§8) and
+verified on silicon; it stays behind `CHROME9_FS_SPLIT=1` because llvmpipe
+runs the long programs found so far faster than the pixel engine (§9).
+Sections 1-6 are the 2026-09-25 analysis.  Evidence labels: **S** static (disassembly, manual),
 **D** dynamic (vendor code executed on the host), **Si** silicon (measured on
 the VX900), **I** inference.  No program above 96 ALU records was submitted,
 `ps_alu_max` was not touched, no module was loaded and X was not restarted.
@@ -45,6 +48,10 @@ Companion documents: [chrome9-fragment-capacity-strategies.md](chrome9-fragment-
    silicon, and the uniform-only case already passes through llvmpipe.  The
    partition analysis tool and a guarded R32F ladder for the main session
    are provided (§5, §6).
+6. Update 2026-09-26: R32F passed its ladder (§7) and the splitter exists
+   (§8).  It is correct on silicon, but the pixel engine runs 0.4-0.7 G
+   record-pixels per second while llvmpipe on the VIA Nano X2 runs the
+   same long programs 10-15x faster, so it is opt-in (§9).
 
 ## 1. Vendor behaviour (question 1)
 
@@ -298,9 +305,187 @@ targets and textures:
 | F2 R32F texture into BGRA8 | exact; the sampler returns (r, 1, 1, 1), not (r, 0, 0, 1) |
 | F3 R32F texture -> R32F target | bit-exact for 16-mantissa-bit values, 0/4096 mismatch |
 | F4 render R32F, sample in the next job | 0/4096 mismatch, 4095 distinct values |
-| F5 MRT with R32F targets, F6 ALU rate | not run (needs the vertex-program MRT path) |
+| F5 MRT: 2, 3 and 4 R32F colour targets through DRAW_VERTEX_PROGRAMS, oC0 a per-pixel ramp, oCk = oC0 * 2^k (`r32fmrt`) | 0 mismatches for 2, 3 and 4 targets, 4095 distinct values, guards intact |
+| F6 pixel ALU rate, 256x256 BGRA8, programs of 2, 18, 48, 96 records (dependent MAD chain, `psrate`) | 0.69 / 3.2 / 8.1 / 16.0 ms per job: 2.49 ns per record and pixel (402 M record-pixels/s), 0.36 ms job base beyond the pixels |
+| F7 a carrier sampled, rewritten, sampled again (`r32freuse`) | the second read sees the rewritten data at every pixel: carrier slots can be reused between jobs |
 
 R32F is therefore an exact carrier for fragment values within the ALU
-range, as section 3 required.  GL cannot reach it (Mesa exposes GL_R32F
+range, as section 3 required.  F5 shows four carriers per job are possible
+on the vertex-program path; the splitter below uses the post-TNL fragment
+path, which has one colour target.  GL cannot reach it (Mesa exposes GL_R32F
 only with ARB_texture_float or ARB_texture_rg, which need formats this
 hardware lacks), so its first user is the Mesa multi-pass splitter.
+
+## 8. Multi-pass splitter (Mesa, 2026-09-26)
+
+Mesa `chrome9_fs_split.c` (plan, job NIR, compile), the split path in
+`chrome9_draw.c` (carriers, batches, jobs) and hooks in `chrome9_context.c`;
+enabled with `CHROME9_FS_SPLIT=1` (§9).  A fragment program is split when
+the backend rejects it, it is straight-line (one block after unrolling and
+if-flattening) and generic fragment programs are available; canonical and
+specialised variants alike.  Anything the splitter cannot express leaves the
+program to llvmpipe as before.
+
+### 8.1 Plan
+
+- The NIR is normalised exactly like the backend does before lowering and
+  viewed as a DAG of scalar lanes.  Lanes of a per-component operation that
+  read equal source lanes are one node (`ior %a.xxxx, %b.xxxx` is one value,
+  not four).  Constants, uniforms, inputs and system values are free: every
+  job recomputes them.
+- Cost model per NIR instruction, the backend's expansion (the job's real
+  count is always checked): compares feeding a select or b2f 2, floor 2,
+  trunc/ceil 5, EXP2/LOG2/RCP/RSQ one record per lane, sqrt 2, pow 3 per
+  lane, vec/mov/fneg/fsat 0, others 1 per vector instruction.
+- Walking the lanes in program order, the cone of each lane (the records it
+  needs back to free values and carried lanes) must stay within an
+  estimated 84 records and read at most 8 minus the application's samplers
+  carriers.  Otherwise the instruction inside the cone whose in-cone lanes
+  save the most records per carried lane is carried (up to 24 candidates
+  tried, reads preferred when the sampler bound is the problem).  Grouping
+  by instruction matters: carrying one lane of a vector saves nothing while
+  the vector instruction is still needed for its other lanes.
+- Every carried lane becomes one job writing it to an R32F carrier; the last
+  job computes the program's outputs, discards and depth.  Program order is
+  a topological order of the jobs.
+- 1-bit values are carried as 0/1 and read back as `!= 0`; only float and
+  Boolean results are carriable.
+
+### 8.2 Jobs
+
+- A job is a clone of the normalised NIR.  Carried lanes it reads become
+  `texture(carrier, (vPos.xy + 0.5) * (1/w, 1/h)).x` (raw vPos, integer
+  centres; the inverse size is a driver constant in the first register
+  after the application's uniforms, exact within half a texel for any
+  target up to 2048 at 16 mantissa bits).  Intermediate jobs drop the
+  outputs and discards and write their lane to colour output 0, replicated
+  (the R32F lane stored is not documented).
+- Vector shrinking, copy propagation and DCE run to a fixpoint: unused lanes
+  of a vector otherwise keep their whole cone alive (a 22-record estimate
+  compiled to over 96 records before this).
+- The job is compiled by the normal backend and counted as the kernel
+  counts it: ALU records plus one bridge per computed-coordinate TEX <= 96,
+  TEX and KILL <= 32, application samplers unchanged and carriers exactly at
+  their units.  Estimate and result agree within the reads' bridges (e.g.
+  estimate 72 -> 75, 67 with 8 reads -> 86).
+- A job that does not fit lowers its own budget (by the measured overshoot,
+  or to 3/5 when the backend stopped at its own limit) and the plan is
+  redone; compiled jobs are cached by root and read set.  A failing job
+  estimated below 32 records holds an unsupported operation: the program
+  goes to llvmpipe (at most 32 plans and 64 distinct job compiles).  Jobs
+  try 256 register schedules instead of the backend's 8192 (a job that
+  misses 12 temporaries is split further), which brings the worst piglit
+  split from 16 s to 0.1 s of compile time.
+- The backend's proofs see through carriers: a carrier read is finite, and
+  uninterpolated for exact comparisons, only if the carried lane is in the
+  original program.  Without this, `fs-nan-builtin-{min,max}` split into 30
+  jobs whose compares took a NaN-capable value for finite and failed; now
+  their split is refused and llvmpipe passes them.
+- Carrier slots follow liveness: a slot is reused after its last reader
+  (F7), never by a job that reads it.
+
+### 8.3 Draw
+
+- Split programs never take the hardware TCL path: the post-TNL path knows
+  the screen positions.  Triangles are queued per Gallium draw; one whose
+  interior overlaps a queued one (exact separating-edge test in the kernel's
+  16.16 coordinates, bounding boxes first) flushes the batch first, so no
+  pixel is covered twice within a batch.  The fill convention keeps shared
+  edges (quads) in one batch.
+- Per batch every job is one DRAW_FRAGMENT_PROGRAM over the same triangles.
+  Intermediate jobs draw into their carrier (R32F, width x height of the
+  render target) with no depth, stencil, blend or query and the
+  application's scissor; the last job draws into the application target with
+  its full state (depth, per-face stencil, blend, occlusion query, KILL,
+  oDepth).  A change of the per-face stencil state flushes the batch.
+- Carriers are driver-owned linear 32-bit objects (created as BGRA8
+  sampler views, never tiled), bound as R32F targets and NEAREST/clamp R32F
+  textures.  Their allocation, the sparse sampler ABI when a job's samplers
+  are not dense, and the bound application views are checked before the
+  draw module runs; otherwise llvmpipe renders the draw.
+
+### 8.4 Verification on silicon
+
+- piglit `fs-sign-times-{sign,neg,abs,neg-abs}` (uniform-only programs of
+  over 96 records): 3 jobs, 2 carriers each; all four pass on the hardware
+  with `CHROME9_SW_FALLBACK=0` (without the split they fail there, and pass
+  only through llvmpipe).
+- A 24-step vector polynomial of the varying (`poly24`, 8 jobs): at most
+  1 LSB from llvmpipe over 250x250.
+- Split transparency: three plans of different budget (84/60/40 estimated
+  records: 14/11/21 jobs for the polynomial, 19/43/65 for the terrain
+  noise) produce bit-identical images, so carrying through R32F is exact
+  and the result does not depend on where the program is cut.
+- Host unit test (`chrome9-shader-nir-test`, run on the target): a 240-step
+  vector chain splits into 17 jobs that each fit the store, read at most 8
+  carriers and end in their colour write; the same chain with `fsin` is
+  refused.
+
+### 8.5 Trimming in the normal path, and piglit
+
+The fixpoint of vector shrinking, copy propagation and DCE that jobs need is
+now the backend's normal NIR preparation (Mesa `5e73ce8`, default path):
+with it alone, programs that were over the store only because of dead lanes
+fit.  Examples are piglit's variable-indexing `fs-temp-mat*-wr` and
+`fs-temp-array-mat*-col(-row)-wr`, `glsl-vec-array`,
+`fs-vec4-const-array-indirect-access-*`, `fs-mat4-out-of-bounds-7` and
+`glsl-fs-loop-shadow-variables`, all passing with `CHROME9_SW_FALLBACK=0`.
+
+Mesa p122 (splitter commit `50b7be0`, fixpoint `5e73ce8`, lib hash equal to
+the committed tree except one moved function):
+
+- Default (split off): full list 1776 pass (p103 1775, only the
+  seed-dependent triangle-rasterization tests move), pg-fold 2891 pass /
+  267 fail, identical to p103; ioquake3 GL1 50.4 / GL2 43.3 fps; glmark2
+  default suite score 132 (per-scene within 1 fps).
+- Split on, the 196 tests that tried a split in the p116 run: 194 pass,
+  1 skip, 1 warn, identical to their p103 results.  Splits remain in
+  `fs-sign-times-{sign,neg,abs,neg-abs}` (3 jobs) and the
+  variable-indexing `fs-temp-array-mat{3,4}-index-col-row-wr` (1.10 and
+  1.20, 8 and 13 plans); these run on the hardware only with the split.
+- An earlier split-on run (p116, default on) failed `fs-nan-builtin-min/max`
+  and timed out on two variable-indexing tests; the proof propagation and
+  the bounded job scheduling in 8.2 fixed both.
+
+### 8.6 glmark2 terrain
+
+`tools/re/chrome9_fs_cut_width.py` on the current NIR of the noise program
+(694 instructions) gives the same picture as in §4.2: 528 estimated
+records, no partition along program order with <= 16 carried scalars per
+cut.  The lane planner splits it into 19 jobs (9 carriers, 47..86 records,
+1289 records in total) and the terrain scene reports no unsupported
+program.
+
+The image does not match llvmpipe (max 237 levels).  That is the fragment
+ALU, not the split (plans agree bit for bit): `permute()` computes
+`mod((34x + 1) x, 289)` for x < 289, i.e. products up to 2.8e6, whose
+rounding to 16 mantissa bits is off by up to 21 before the modulo, and the
+gradient selection floors values at integer boundaries.  With 289 replaced
+by 17 (products below 2^14) the noise has llvmpipe's structure but still
+differs in detail.  The noise pass is therefore hardware precision bound
+and not an LSB deviation.
+
+The cut tool on `fs-sign-times-sign` (180 NIR instructions, 125 estimated
+records): two passes with four carried scalars; the planner makes 3
+single-output jobs.
+
+## 9. Cost against llvmpipe and default
+
+`tools/re/chrome9_gl_longfs_bench.c` draws one program over a 256x256
+window and times it with glFinish (Mesa p116, VIA Nano X2 L4350, two
+cores; llvmpipe output equal to shader_runner's):
+
+| program | split on the VX900 | llvmpipe |
+|---|---|---|
+| glmark2 terrain noise (19 jobs, 1289 records) | 114.8 ms | 8.2 ms |
+| same with mod 17 | 115.0 ms | 8.1 ms |
+| 24-step vector polynomial (8 jobs) | 48.4 ms | 3.3 ms |
+
+The jobs run at 0.74 G record-pixels per second (F6's dependent MAD chain
+0.40 G), which is 10-15x slower than llvmpipe on these ALU-bound programs.
+glmark2 terrain, 6 s runs: 330 ms per frame with the split against 230 ms
+with the noise pass in llvmpipe.  A four-target MRT form (F5) would cut the
+recomputation of vector lanes but needs the vertex-program path and still
+could not close a gap of this size.  The splitter therefore stays opt-in
+(`CHROME9_FS_SPLIT=1`); it is the way to run an over-long program on the
+hardware where llvmpipe is not wanted.
