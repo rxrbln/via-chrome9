@@ -7060,6 +7060,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TEXTURE_BIAS;
 	if (READ_ONCE(chrome9_texture_project))
 		caps |= DRM_CHROME9_CAP2_TEXTURE_PROJECT;
+	if (READ_ONCE(chrome9_tiled_color))
+		caps |= DRM_CHROME9_CAP2_TILED_SHARED;
 	if (READ_ONCE(chrome9_destination_offset))
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_coarse_z))

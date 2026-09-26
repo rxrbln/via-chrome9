@@ -234,7 +234,8 @@ static int chrome9_gem_create_local(struct drm_device *drm,
 	int ret;
 
 	if (!cdev->sl_ready ||
-	    (args->flags & ~DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) !=
+	    (args->flags & ~(DRM_CHROME9_GEM_CREATE_GUARDED_SHARED |
+			     DRM_CHROME9_GEM_CREATE_TILED)) !=
 	    DRM_CHROME9_GEM_CREATE_LOCAL)
 		return -EOPNOTSUPP;
 	/* Draw requests name the exact object size. */
@@ -427,7 +428,9 @@ chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		return ERR_PTR(ret);
 	}
 	obj = drm_gem_fb_get_obj(&chrome9_fb->base, 0);
-	if (!obj || obj->dev != drm || drm_gem_is_imported(obj)) {
+	/* Scanout reads linear rows only. */
+	if (!obj || obj->dev != drm || drm_gem_is_imported(obj) ||
+	    (to_chrome9_bo(obj)->create_flags & DRM_CHROME9_GEM_CREATE_TILED)) {
 		chrome9_fb_destroy(&chrome9_fb->base);
 		return ERR_PTR(-EINVAL);
 	}
@@ -639,7 +642,10 @@ int chrome9_gem_create_ioctl(struct drm_device *drm, void *data,
 
 	if (args->flags & ~(DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT |
 			    DRM_CHROME9_GEM_CREATE_GUARDED_SHARED |
-			    DRM_CHROME9_GEM_CREATE_LOCAL) ||
+			    DRM_CHROME9_GEM_CREATE_LOCAL |
+			    DRM_CHROME9_GEM_CREATE_TILED) ||
+	    ((args->flags & DRM_CHROME9_GEM_CREATE_TILED) &&
+	     (args->flags & DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT)) ||
 	    !args->size || args->handle || args->mmap_offset)
 		return -EINVAL;
 	if (args->size > CHROME9_MAX_BO_SIZE)
