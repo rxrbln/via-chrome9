@@ -1680,6 +1680,20 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
         .src = { temp[6], { DRM_CHROME9_FRAGMENT_FILE_CONSTANT, 0,
                             { 0, 1, 2, 3 }, 0, 0 } } },
    };
+   /* One bilinear sample at the shared corner of each 2x2 group
+    * averages it in the filter unit. */
+   static const struct drm_chrome9_fragment_instruction bilinear[2] = {
+      { .op = DRM_CHROME9_FRAGMENT_OP_TEX,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+        .src = { { DRM_CHROME9_FRAGMENT_FILE_VARYING, 0, { 0, 1, 2, 3 },
+                   0, 0 } } },
+      { .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+        .src = { { DRM_CHROME9_FRAGMENT_FILE_TEMP, 0, { 0, 1, 2, 3 },
+                   0, 0 } } },
+   };
+   const bool linear = debug_get_bool_option("CHROME9_MIPMAP_BILINEAR",
+                                             true);
    const uint32_t quarter[4] = {
       fui(0.25f), fui(0.25f), fui(0.25f), fui(0.25f),
    };
@@ -1712,8 +1726,9 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
    texture.width = pres->width0;
    texture.height = pres->height0;
    texture.last_level = pres->last_level;
-   texture.min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
-   texture.mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   texture.min_filter = linear ? DRM_CHROME9_TEXTURE_FILTER_LINEAR :
+                                 DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   texture.mag_filter = texture.min_filter;
    texture.mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NEAREST;
    texture.wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
    texture.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
@@ -1746,14 +1761,15 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
          .destination_format = bgra ?
             DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
             DRM_CHROME9_DESTINATION_FORMAT_BGRX8888,
-         .instruction_count = ARRAY_SIZE(program),
-         .constant_count = 1,
+         .instruction_count = linear ? ARRAY_SIZE(bilinear) :
+                                       ARRAY_SIZE(program),
+         .constant_count = !linear,
          .texture_count = 1,
-         .varying_count = 4,
+         .varying_count = linear ? 1 : 4,
          .abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION,
          .vertices_ptr = (uintptr_t)vertices,
-         .instructions_ptr = (uintptr_t)program,
-         .constants_ptr = (uintptr_t)quarter,
+         .instructions_ptr = (uintptr_t)(linear ? bilinear : program),
+         .constants_ptr = linear ? 0 : (uintptr_t)quarter,
          .textures_ptr = (uintptr_t)&texture,
       };
 
@@ -1776,11 +1792,11 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
          vertices[v].y_16_16 =
             (int32_t)((first_row + corner[v][1] * h) << 16) - 0x8000;
          vertices[v].rhw_float = fui(1.0f);
-         for (unsigned k = 0; k < 4; k++) {
+         for (unsigned k = 0; k < draw.varying_count; k++) {
             vertices[v].varying[k][0] =
-               fui(corner[v][0] * s1 + (k & 1 ? ds : -ds));
+               fui(corner[v][0] * s1 + (linear ? 0 : k & 1 ? ds : -ds));
             vertices[v].varying[k][1] =
-               fui(corner[v][1] * t1 + (k & 2 ? dt : -dt));
+               fui(corner[v][1] * t1 + (linear ? 0 : k & 2 ? dt : -dt));
             vertices[v].varying[k][3] = fui(1.0f);
          }
       }
