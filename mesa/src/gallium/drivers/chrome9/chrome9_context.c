@@ -8512,6 +8512,8 @@ chrome9_fs_split_compile_job(struct chrome9_context *ctx,
 {
    memcpy(job->varying_slot, parent->varying_slot,
           sizeof(job->varying_slot));
+   job->varying_layout = parent->varying_layout;
+   job->varying_packed = parent->varying_packed;
    job->split_job = true;
    chrome9_compile_fs_nir(ctx, job, nir);
    return job->semantic_fs_valid &&
@@ -8850,6 +8852,331 @@ chrome9_fs_assign_varyings(struct chrome9_shader *shader, nir_shader *nir)
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
+/* The whole-slot layout of varying_slot. */
+static void
+chrome9_fs_slot_layout(struct chrome9_shader *shader)
+{
+   memset(&shader->varying_layout, 0, sizeof(shader->varying_layout));
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++)
+      for (unsigned l = 0; l < 4; l++) {
+         shader->varying_layout.slot[n][l] = shader->varying_slot[n];
+         shader->varying_layout.comp[n][l] = l;
+      }
+}
+
+struct chrome9_pack_scalar {
+   uint8_t slot;
+   uint8_t comp;
+};
+
+/* The shader-in variable of a load_deref, NULL otherwise. */
+static nir_variable *
+chrome9_pack_load_var(nir_instr *instr)
+{
+   nir_intrinsic_instr *load;
+   nir_deref_instr *deref;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return NULL;
+   load = nir_instr_as_intrinsic(instr);
+   if (load->intrinsic != nir_intrinsic_load_deref)
+      return NULL;
+   deref = nir_src_as_deref(load->src[0]);
+   if (!deref || deref->deref_type != nir_deref_type_var ||
+       deref->var->data.mode != nir_var_shader_in ||
+       deref->var->data.location < VARYING_SLOT_VAR0 ||
+       deref->var->data.location >=
+          VARYING_SLOT_VAR0 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
+      return NULL;
+   return deref->var;
+}
+
+/* Input lane of VARn feeding s through copies, false otherwise. */
+static bool
+chrome9_pack_scalar_of(nir_scalar s, struct chrome9_pack_scalar *out)
+{
+   nir_variable *var;
+
+   s = nir_scalar_resolved(s.def, s.comp);
+   var = chrome9_pack_load_var(nir_def_instr(s.def));
+   if (!var)
+      return false;
+   out->slot = var->data.location - VARYING_SLOT_VAR0;
+   out->comp = var->data.location_frac + s.comp;
+   return out->comp < 4;
+}
+
+/* The input lane of a vector component: the lane itself, or the only
+ * input lane operand of a per-component ALU operation. */
+static bool
+chrome9_pack_component_lane(nir_scalar s, struct chrome9_pack_scalar *out)
+{
+   unsigned found = 0;
+
+   if (chrome9_pack_scalar_of(s, out))
+      return true;
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (!nir_scalar_is_alu(s))
+      return false;
+   for (unsigned i = 0; i < nir_op_infos[nir_scalar_alu_op(s)].num_inputs;
+        i++) {
+      struct chrome9_pack_scalar lane;
+
+      if (nir_op_infos[nir_scalar_alu_op(s)].input_sizes[i])
+         return false;
+      if (chrome9_pack_scalar_of(nir_scalar_chase_alu_src(s, i), &lane)) {
+         *out = lane;
+         found++;
+      }
+   }
+   return found == 1;
+}
+
+struct chrome9_pack_unit {
+   struct chrome9_pack_scalar lane[4];
+   uint8_t count;
+   bool coordinate;
+};
+
+static int
+chrome9_pack_find(const struct util_dynarray *units,
+                  struct chrome9_pack_scalar s)
+{
+   int index = 0;
+
+   util_dynarray_foreach(units, struct chrome9_pack_unit, u) {
+      for (unsigned l = 0; l < u->count; l++)
+         if (u->lane[l].slot == s.slot && u->lane[l].comp == s.comp)
+            return index;
+      index++;
+   }
+   return -1;
+}
+
+/*
+ * The linker compacts varyings lane by lane, so a vector the fragment shader
+ * builds can straddle two slots (a vec3 in VAR2.w and VAR3.xy) and needs a
+ * gather record.  Regroup the smoothly interpolated VARn lanes so that each
+ * such vector, and each texture coordinate from lane X on, lies in one
+ * hardware varying; the vertex path writes lanes through varying_layout.
+ */
+static void
+chrome9_fs_pack_varyings(struct chrome9_shader *shader, nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_variable *slot_var[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { NULL };
+   nir_variable *packed[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { NULL };
+   uint8_t used[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 0 };
+   uint8_t fill[DRM_CHROME9_FRAGMENT_MAX_VARYINGS] = { 0 };
+   struct chrome9_pack_scalar where[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+   struct chrome9_varying_layout layout = { 0 };
+   uint8_t reserved = 0;
+   struct util_dynarray units;
+   unsigned straddles = 0;
+   nir_builder b;
+
+   if (nir->info.io_lowered ||
+       !debug_get_bool_option("CHROME9_PACK_VARYINGS", true))
+      return;
+   /* TEXn and moved VARn keep their varyings. */
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++)
+      if (shader->varying_slot[n] &&
+          shader->varying_slot[n] != VARYING_SLOT_VAR0 + n)
+         reserved |= BITFIELD_BIT(n);
+   /* One whole smooth vec4 variable per packable slot. */
+   nir_foreach_shader_in_variable(var, nir) {
+      unsigned n;
+
+      if (var->data.location < VARYING_SLOT_VAR0 ||
+          var->data.location >=
+             VARYING_SLOT_VAR0 + DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
+         continue;
+      n = var->data.location - VARYING_SLOT_VAR0;
+      if (slot_var[n] ||
+          !chrome9_fs_smooth_variable(var, var->data.location) ||
+          !glsl_type_is_vector_or_scalar(var->type) ||
+          glsl_get_bit_size(var->type) != 32)
+         reserved |= BITFIELD_BIT(n);
+      slot_var[n] = var;
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nir_variable *var = chrome9_pack_load_var(instr);
+
+         if (var)
+            used[var->data.location - VARYING_SLOT_VAR0] |=
+               nir_def_components_read(nir_instr_def(instr));
+      }
+   }
+   util_dynarray_init(&units, NULL);
+   /* Vectors built from lanes of several slots, and TEX coordinates. */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         struct chrome9_pack_unit unit = { 0 };
+         unsigned slots = 0, count = 0;
+         nir_scalar vector[4];
+         bool placed = false;
+
+         if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+            if (!nir_op_is_vec(alu->op) || alu->def.num_components > 4)
+               continue;
+            count = alu->def.num_components;
+            for (unsigned c = 0; c < count; c++)
+               vector[c] = nir_scalar_chase_alu_src(
+                  nir_get_scalar(&alu->def, c), c);
+         } else if (instr->type == nir_instr_type_tex) {
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+
+            if (coord < 0 || tex->src[coord].src.ssa->num_components > 4)
+               continue;
+            count = tex->src[coord].src.ssa->num_components;
+            for (unsigned c = 0; c < count; c++)
+               vector[c] = nir_get_scalar(tex->src[coord].src.ssa, c);
+            unit.coordinate = true;
+         } else {
+            continue;
+         }
+         for (unsigned c = 0; c < count; c++) {
+            struct chrome9_pack_scalar s;
+            bool seen = false;
+
+            if (!(unit.coordinate ? chrome9_pack_scalar_of(vector[c], &s) :
+                  chrome9_pack_component_lane(vector[c], &s)) ||
+                (reserved & BITFIELD_BIT(s.slot))) {
+               unit.count = 0;
+               break;
+            }
+            for (unsigned l = 0; l < unit.count; l++)
+               seen |= unit.lane[l].slot == s.slot &&
+                       unit.lane[l].comp == s.comp;
+            if (!seen)
+               unit.lane[unit.count++] = s;
+            slots |= BITFIELD_BIT(s.slot);
+         }
+         if (!unit.count || (util_bitcount(slots) < 2 && !unit.coordinate))
+            continue;
+         /* A lane already placed keeps its first vector. */
+         for (unsigned l = 0; l < unit.count; l++)
+            placed |= chrome9_pack_find(&units, unit.lane[l]) >= 0;
+         if (placed)
+            continue;
+         straddles += util_bitcount(slots) > 1;
+         util_dynarray_append(&units, unit);
+      }
+   }
+   if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false))
+      fprintf(stderr, "chrome9: pack varyings: %zu units, %u straddling, "
+              "reserved %#x\n",
+              util_dynarray_num_elements(&units, struct chrome9_pack_unit),
+              straddles, reserved);
+   if (!straddles)
+      goto out;
+   /* The remaining lanes of each slot stay together in order. */
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++) {
+      struct chrome9_pack_unit unit = { 0 };
+
+      if ((reserved & BITFIELD_BIT(n)) || !slot_var[n])
+         continue;
+      u_foreach_bit(c, used[n]) {
+         struct chrome9_pack_scalar s = { n, c };
+
+         if (chrome9_pack_find(&units, s) < 0)
+            unit.lane[unit.count++] = s;
+      }
+      if (unit.count)
+         util_dynarray_append(&units, unit);
+   }
+   /* Coordinates start at lane X of an empty varying, then widest first. */
+   memset(where, 0xff, sizeof(where));
+   for (unsigned pass = 0; pass < 5; pass++) {
+      util_dynarray_foreach(&units, struct chrome9_pack_unit, u) {
+         unsigned n;
+
+         if (pass ? u->coordinate || u->count != 5 - pass : !u->coordinate)
+            continue;
+         for (n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++)
+            if (!(reserved & BITFIELD_BIT(n)) &&
+                (u->coordinate ? !fill[n] : fill[n] + u->count <= 4))
+               break;
+         if (n == DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
+            goto out;
+         for (unsigned l = 0; l < u->count; l++) {
+            where[u->lane[l].slot][u->lane[l].comp].slot = n;
+            where[u->lane[l].slot][u->lane[l].comp].comp = fill[n] + l;
+            layout.slot[n][fill[n] + l] = VARYING_SLOT_VAR0 + u->lane[l].slot;
+            layout.comp[n][fill[n] + l] = u->lane[l].comp;
+            if (!packed[n])
+               packed[n] = slot_var[u->lane[l].slot];
+         }
+         fill[n] += u->count;
+      }
+   }
+   /* The llvmpipe fallback links by the original slots. */
+   if (chrome9_sw_enabled() && !shader->sw_nir)
+      shader->sw_nir = nir_shader_clone(NULL, nir);
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++) {
+      nir_variable *var;
+
+      if (!fill[n])
+         continue;
+      var = nir_variable_clone(packed[n], nir);
+      nir_variable_set_name(nir, var, "chrome9_packed");
+      var->type = glsl_vec4_type();
+      var->data.location = VARYING_SLOT_VAR0 + n;
+      var->data.driver_location = n;
+      nir_shader_add_variable(nir, var);
+      packed[n] = var;
+   }
+   /* Each load of a packed slot becomes lanes of the new varyings. */
+   b = nir_builder_create(impl);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         nir_variable *var = chrome9_pack_load_var(instr);
+         nir_def *def, *lanes[4];
+         unsigned slot;
+
+         if (!var)
+            continue;
+         slot = var->data.location - VARYING_SLOT_VAR0;
+         if ((reserved & BITFIELD_BIT(slot)) || var != slot_var[slot])
+            continue;
+         def = nir_instr_def(instr);
+         b.cursor = nir_before_instr(instr);
+         for (unsigned c = 0; c < def->num_components; c++) {
+            const struct chrome9_pack_scalar to = where[slot][c];
+
+            lanes[c] = to.slot == 0xff ? nir_undef(&b, 1, 32) :
+               nir_channel(&b, nir_load_var(&b, packed[to.slot]), to.comp);
+         }
+         nir_def_replace(def, nir_vec(&b, lanes, def->num_components));
+      }
+   }
+   /* The replaced slots are no inputs any more. */
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++)
+      if (slot_var[n] && !(reserved & BITFIELD_BIT(n)))
+         exec_node_remove(&slot_var[n]->node);
+   nir_opt_cse(nir);
+   nir_opt_dce(nir);
+   nir_shader_gather_info(nir, impl);
+   for (unsigned n = 0; n < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; n++) {
+      if (reserved & BITFIELD_BIT(n)) {
+         for (unsigned l = 0; l < 4; l++) {
+            layout.slot[n][l] = shader->varying_slot[n];
+            layout.comp[n][l] = l;
+         }
+      } else {
+         shader->varying_slot[n] = fill[n] ? VARYING_SLOT_VAR0 + n : 0;
+      }
+   }
+   shader->varying_layout = layout;
+   shader->varying_packed = true;
+out:
+   util_dynarray_fini(&units);
+}
+
 static void *
 chrome9_create_fs_state(struct pipe_context *pipe,
                         const struct pipe_shader_state *state)
@@ -8877,6 +9204,8 @@ chrome9_create_fs_state(struct pipe_context *pipe,
       shader->shadow_sampler_mask =
          chrome9_nir_shadow_sampler_mask(state->ir.nir);
       chrome9_fs_assign_varyings(shader, state->ir.nir);
+      chrome9_fs_slot_layout(shader);
+      chrome9_fs_pack_varyings(shader, state->ir.nir);
       shader->nir = state->ir.nir;
       if (debug_get_bool_option("CHROME9_DUMP_NIR", false))
          nir_print_shader(state->ir.nir, stderr);

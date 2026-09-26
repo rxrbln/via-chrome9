@@ -161,7 +161,7 @@ struct tcl_builder {
    bool unit_temp[DRM_CHROME9_VERTEX_MAX_TEMPS];
    /* Varying slot of each fragment varying, or NULL: slot n of TEX or
     * VAR is fragment varying n. */
-   const uint8_t *varying_slot;
+   const struct chrome9_varying_layout *layout;
    /* Lanes written per fragment varying and of the primary colour. */
    uint8_t varying_written[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
    uint8_t primary_written;
@@ -1544,6 +1544,47 @@ tcl_linear_record(struct tcl_builder *b, nir_scalar s, uint8_t *index)
    return ok;
 }
 
+/* Varying index lanes from the stored value's lanes swizzle[l]. */
+static void
+tcl_store_varying(struct tcl_builder *b, nir_intrinsic_instr *store,
+                  unsigned index, unsigned lanes, const uint8_t swizzle[4],
+                  const struct tcl_value *v)
+{
+   struct drm_chrome9_vertex_instruction mov = {
+      .op = DRM_CHROME9_VERTEX_OP_MOV,
+      .dst = {
+         .file = DRM_CHROME9_VERTEX_DEST_VARYING,
+         .index = index,
+         .writemask = lanes,
+      },
+   };
+
+   mov.src[0] = tcl_source(v, swizzle, 4, false);
+   u_foreach_bit(i, lanes) {
+      const uint8_t sel = mov.src[0].swizzle[i];
+      const bool neg = mov.src[0].modifier;
+      uint8_t *origin = &b->p->origin[index][i];
+
+      b->p->origin_input[index][i] = mov.src[0].index;
+      b->p->origin_lane[index][i] = sel;
+      *origin = sel == TCL_SEL_ZERO ? CHROME9_TCL_ORIGIN_ZERO :
+                sel == TCL_SEL_ONE && !neg ? CHROME9_TCL_ORIGIN_ONE :
+                neg ? CHROME9_TCL_ORIGIN_UNKNOWN :
+                mov.src[0].file == DRM_CHROME9_VERTEX_FILE_INPUT ?
+                CHROME9_TCL_ORIGIN_INPUT :
+                mov.src[0].file == DRM_CHROME9_VERTEX_FILE_TEMP &&
+                b->unit_temp[mov.src[0].index] ?
+                CHROME9_TCL_ORIGIN_UNIT : CHROME9_TCL_ORIGIN_UNKNOWN;
+      if (*origin == CHROME9_TCL_ORIGIN_UNKNOWN &&
+          tcl_linear_record(b, nir_get_scalar(store->src[0].ssa,
+                                              swizzle[i]),
+                            &b->p->origin_input[index][i]))
+         *origin = CHROME9_TCL_ORIGIN_LINEAR;
+   }
+   b->varying_written[index] |= lanes;
+   tcl_emit(b, &mov, 1);
+}
+
 static void
 tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
 {
@@ -1598,15 +1639,24 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
       /* COL1 is not consumed either; st lowers CLIP_VERTEX to distances
        * whenever a plane is enabled. */
       return;
-   } else if (b->varying_slot) {
-      /* Outputs the fragment shader does not read are dropped. */
-      while (index < DRM_CHROME9_FRAGMENT_MAX_VARYINGS &&
-             b->varying_slot[index] != io.location)
-         index++;
-      if (index == DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
-         return;
-      mov.dst.file = DRM_CHROME9_VERTEX_DEST_VARYING;
-      mov.dst.index = index;
+   } else if (b->layout) {
+      /* Lanes the fragment shader does not read are dropped. */
+      for (index = 0; index < DRM_CHROME9_FRAGMENT_MAX_VARYINGS; index++) {
+         unsigned lanes = 0;
+
+         for (unsigned l = 0; l < 4; l++) {
+            const unsigned c = b->layout->comp[index][l];
+
+            if (b->layout->slot[index][l] != io.location || c > 3 ||
+                !(mask & (1u << c)))
+               continue;
+            lanes |= 1u << l;
+            swizzle[l] = c - component;
+         }
+         if (lanes)
+            tcl_store_varying(b, store, index, lanes, swizzle, v);
+      }
+      return;
    } else {
       /* Fragment varying n is VAR0+n or TEX0+n (chrome9_context.c). */
       if (io.location >= VARYING_SLOT_VAR0 &&
@@ -1618,41 +1668,16 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
          index = io.location - VARYING_SLOT_TEX0;
       else
          return;
-      mov.dst.file = DRM_CHROME9_VERTEX_DEST_VARYING;
-      mov.dst.index = index;
+      for (unsigned i = 0; i < 4; i++)
+         swizzle[i] = mask & (1u << i) ? i - component : 0;
+      tcl_store_varying(b, store, index, mask, swizzle, v);
+      return;
    }
    mov.dst.writemask = mask;
    for (unsigned i = 0; i < 4; i++)
       swizzle[i] = mask & (1u << i) ? i - component : 0;
    mov.src[0] = tcl_source(v, swizzle, 4, false);
-   if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_VARYING) {
-      for (unsigned i = 0; i < 4; i++) {
-         const uint8_t sel = mov.src[0].swizzle[i];
-         const bool neg = mov.src[0].modifier;
-         uint8_t *origin = &b->p->origin[index][i];
-
-         if (!(mask & (1u << i)))
-            continue;
-         b->p->origin_input[index][i] = mov.src[0].index;
-         b->p->origin_lane[index][i] = sel;
-         *origin = sel == TCL_SEL_ZERO ? CHROME9_TCL_ORIGIN_ZERO :
-                   sel == TCL_SEL_ONE && !neg ? CHROME9_TCL_ORIGIN_ONE :
-                   neg ? CHROME9_TCL_ORIGIN_UNKNOWN :
-                   mov.src[0].file == DRM_CHROME9_VERTEX_FILE_INPUT ?
-                   CHROME9_TCL_ORIGIN_INPUT :
-                   mov.src[0].file == DRM_CHROME9_VERTEX_FILE_TEMP &&
-                   b->unit_temp[mov.src[0].index] ?
-                   CHROME9_TCL_ORIGIN_UNIT : CHROME9_TCL_ORIGIN_UNKNOWN;
-         if (*origin == CHROME9_TCL_ORIGIN_UNKNOWN &&
-             tcl_linear_record(b, nir_get_scalar(store->src[0].ssa,
-                                                 i - component),
-                               &b->p->origin_input[index][i]))
-            *origin = CHROME9_TCL_ORIGIN_LINEAR;
-      }
-   }
-   if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_VARYING)
-      b->varying_written[index] |= mask;
-   else if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_PRIMARY)
+   if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_PRIMARY)
       b->primary_written |= mask;
    tcl_emit(b, &mov, 1);
 }
@@ -2877,12 +2902,12 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
                     unsigned point, unsigned key_count,
                     const uint16_t *key_dword, const uint32_t *key_value,
                     const struct chrome9_tcl_flow *flow,
-                    const uint8_t *varying_slot,
+                    const struct chrome9_varying_layout *layout,
                     struct chrome9_tcl_program *p)
 {
    struct tcl_builder b = {
       .p = p, .colour = colour, .clip_enable = clip_enable,
-      .varying_slot = varying_slot,
+      .layout = layout,
       .point_size = point & CHROME9_TCL_POINT_SIZE,
       .writes_back = !!(source->info.outputs_written & VARYING_BIT_BFC0),
       .flow = flow && flow->max_depth ? flow : NULL,
@@ -4151,9 +4176,9 @@ tcl_variant(struct chrome9_context *ctx, bool clip_halfz,
             enum chrome9_tcl_colour colour, uint8_t clip_enable, bool unkeyed,
             bool point_clip, const uint32_t *key)
 {
-   static const uint8_t no_slots[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
-   const uint8_t *slots = ctx->fs && ctx->fs->nir ? ctx->fs->varying_slot :
-                                                    no_slots;
+   static const struct chrome9_varying_layout no_layout;
+   const struct chrome9_varying_layout *layout =
+      ctx->fs && ctx->fs->nir ? &ctx->fs->varying_layout : &no_layout;
    const uint8_t point_size =
       (ctx->tcl_point_size ? CHROME9_TCL_POINT_SIZE : 0) |
       (point_clip ? CHROME9_TCL_POINT_CLIP : 0);
@@ -4168,8 +4193,7 @@ tcl_variant(struct chrome9_context *ctx, bool clip_halfz,
           variant->point_size == point_size &&
           variant->unkeyed == unkeyed &&
           !memcmp(variant->key, key, sizeof(variant->key)) &&
-          !memcmp(variant->varying_slot, slots,
-                  sizeof(variant->varying_slot))) {
+          !memcmp(&variant->layout, layout, sizeof(variant->layout))) {
          *link = variant->next;
          variant->next = shader->variants;
          shader->variants = variant;
@@ -4193,11 +4217,11 @@ tcl_variant(struct chrome9_context *ctx, bool clip_halfz,
    variant->point_size = point_size;
    variant->unkeyed = unkeyed;
    memcpy(variant->key, key, sizeof(variant->key));
-   memcpy(variant->varying_slot, slots, sizeof(variant->varying_slot));
+   variant->layout = *layout;
    chrome9_tcl_compile(shader->nir, clip_halfz, colour, clip_enable,
                        point_size, unkeyed ? 0 : shader->key_count,
                        shader->key_dword, key, &ctx->tcl_flow,
-                       slots == no_slots ? NULL : slots,
+                       layout == &no_layout ? NULL : layout,
                        &variant->program);
    shader->keyed_compiles += shader->key_count && !unkeyed;
    variant->next = shader->variants;

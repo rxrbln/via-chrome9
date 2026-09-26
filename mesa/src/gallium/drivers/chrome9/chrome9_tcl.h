@@ -45,6 +45,13 @@ struct chrome9_tcl_linear {
    unsigned count;
 };
 
+/* Fragment varying n lane l reads lane comp[n][l] of the VS output slot
+ * slot[n][l]; a zero slot is unused (chrome9_fs_assign_varyings). */
+struct chrome9_varying_layout {
+   uint8_t slot[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+   uint8_t comp[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+};
+
 /* Hardware static flow control the kernel accepts (CAP2_VERTEX_STATIC_FLOW). */
 struct chrome9_tcl_flow {
    /* REP/IF nesting; zero keeps the straight-line requirement. */
@@ -150,9 +157,8 @@ struct chrome9_tcl_variant {
    uint8_t point_size;
    bool unkeyed;
    uint32_t key[CHROME9_TCL_MAX_KEY];
-   /* Fragment varying slots (chrome9_shader::varying_slot), all zero
-    * without a fragment map. */
-   uint8_t varying_slot[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+   /* The fragment varying layout, all zero without a fragment shader. */
+   struct chrome9_varying_layout layout;
    struct chrome9_tcl_program program;
 };
 
@@ -174,7 +180,7 @@ bool chrome9_tcl_compile(const struct nir_shader *nir, bool clip_halfz,
                          unsigned key_count, const uint16_t *key_dword,
                          const uint32_t *key_value,
                          const struct chrome9_tcl_flow *flow,
-                         const uint8_t *varying_slot,
+                         const struct chrome9_varying_layout *layout,
                          struct chrome9_tcl_program *program);
 /* chrome9_tcl_compile() point forms: rounded PSIZ output, centre clip. */
 #define CHROME9_TCL_POINT_SIZE 1u

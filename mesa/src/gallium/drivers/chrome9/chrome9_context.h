@@ -149,6 +149,10 @@ struct chrome9_shader {
    /* Fragment shaders: the TEX or VAR varying slot of fragment varying n,
     * zero when unused (chrome9_fs_assign_varyings). */
    uint8_t varying_slot[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+   /* Per-lane sources of the fragment varyings; equals varying_slot
+    * lane by lane unless chrome9_fs_pack_varyings regrouped lanes. */
+   struct chrome9_varying_layout varying_layout;
+   bool varying_packed;
    /* Fragment samplers read by shadow TEX; variants lower the compare. */
    uint32_t shadow_sampler_mask;
    struct chrome9_fs_variant *variants;

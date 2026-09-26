@@ -61,6 +61,15 @@ struct chrome9_vbuf_render {
    size_t allocated;
    uint16_t vertex_size;
    uint16_t vertex_count;
+   /* Packed fragment varyings: the draw module writes the source slots to
+    * raw, unmap moves each lane to its varying (varying_layout). */
+   bool pack;
+   uint8_t pack_sources;
+   uint8_t pack_source[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+   uint8_t pack_comp[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+   uint8_t *raw;
+   size_t raw_allocated;
+   uint16_t raw_vertex_size;
    struct drm_chrome9_draw_triangle_batch batch;
    struct drm_chrome9_vertex_d16
       batch_vertices[DRM_CHROME9_TRIANGLE_BATCH_MAX_TRIANGLES * 3];
@@ -446,8 +455,43 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
          draw_emit_vertex_attr(&crender->vinfo, EMIT_4UB_BGRA, color0);
          crender->layout_valid &= color0 >= 0;
       }
-      for (unsigned i = 0; i < crender->varying_count; i++) {
-         const unsigned slot = crender->ctx->fs->varying_slot[i];
+      const struct chrome9_varying_layout *layout =
+         &crender->ctx->fs->varying_layout;
+      uint8_t sources[DRM_CHROME9_FRAGMENT_MAX_VARYINGS];
+      unsigned source_count = 0;
+
+      crender->pack = crender->ctx->fs->varying_packed;
+      if (crender->pack) {
+         /* Each source slot once, in first-use order. */
+         memset(crender->pack_source, 0xff, sizeof(crender->pack_source));
+         for (unsigned n = 0; n < crender->varying_count; n++) {
+            for (unsigned l = 0; l < 4; l++) {
+               unsigned k;
+
+               if (!layout->slot[n][l])
+                  continue;
+               for (k = 0; k < source_count; k++)
+                  if (sources[k] == layout->slot[n][l])
+                     break;
+               if (k == source_count) {
+                  if (source_count == DRM_CHROME9_FRAGMENT_MAX_VARYINGS) {
+                     crender->layout_valid = false;
+                     return &crender->vinfo;
+                  }
+                  sources[source_count++] = layout->slot[n][l];
+               }
+               crender->pack_source[n][l] = k;
+               crender->pack_comp[n][l] = layout->comp[n][l];
+            }
+         }
+         crender->pack_sources = source_count;
+      } else {
+         for (unsigned n = 0; n < crender->varying_count; n++)
+            sources[n] = crender->ctx->fs->varying_slot[n];
+         source_count = crender->varying_count;
+      }
+      for (unsigned i = 0; i < source_count; i++) {
+         const unsigned slot = sources[i];
 
          /* The draw module names TEXn TEXCOORD n and VARn GENERIC n. */
          if (slot >= VARYING_SLOT_VAR0)
@@ -478,10 +522,11 @@ chrome9_vbuf_get_vertex_info(struct vbuf_render *render)
       }
       draw_compute_vertex_size(&crender->vinfo);
       crender->layout_valid &= crender->vinfo.size ==
-         4 + (primary ? 1 : 0) + 4 * crender->varying_count;
+         4 + (primary ? 1 : 0) + 4 * source_count;
       return &crender->vinfo;
    }
    crender->varying_count = 0;
+   crender->pack = false;
 
    crender->packed_generic =
       (program == CHROME9_FS_PRIMARY_SCALAR_RGBX ||
@@ -698,7 +743,8 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
       crender->ctx->fs->semantic_input_mask == 1;
 
    unsigned expected_words = crender->generic_program ?
-      4 + (primary ? 1 : 0) + 4 * crender->varying_count :
+      4 + (primary ? 1 : 0) +
+      4 * (crender->pack ? crender->pack_sources : crender->varying_count) :
       crender->packed_generic >= 6 ? 12 :
       crender->packed_generic ? 9 : 6 + 4 * crender->texture_count;
 
@@ -710,6 +756,22 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
                  crender->generic_program, crender->packed_generic,
                  crender->varying_count, crender->texture_count);
       return false;
+   }
+   if (crender->pack) {
+      size = (size_t)vertex_size * nr_vertices;
+      if (size > crender->raw_allocated) {
+         void *raw = REALLOC(crender->raw, crender->raw_allocated, size);
+
+         if (!raw) {
+            crender->capacity = 0;
+            return false;
+         }
+         crender->raw = raw;
+         crender->raw_allocated = size;
+      }
+      crender->raw_vertex_size = vertex_size;
+      vertex_size = (4 + (primary ? 1 : 0) + 4 * crender->varying_count) *
+                    sizeof(uint32_t);
    }
    size = (size_t)vertex_size * nr_vertices;
 
@@ -734,7 +796,9 @@ chrome9_vbuf_allocate_vertices(struct vbuf_render *render,
 static void *
 chrome9_vbuf_map_vertices(struct vbuf_render *render)
 {
-   return chrome9_vbuf_render(render)->vertices;
+   struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+
+   return crender->pack ? crender->raw : crender->vertices;
 }
 
 static void
@@ -742,9 +806,31 @@ chrome9_vbuf_unmap_vertices(struct vbuf_render *render, uint16_t min_index,
                             uint16_t max_index)
 {
    struct chrome9_vbuf_render *crender = chrome9_vbuf_render(render);
+   unsigned head;
 
-   if (min_index > max_index || max_index >= crender->vertex_count)
+   if (min_index > max_index || max_index >= crender->vertex_count) {
       crender->layout_valid = false;
+      return;
+   }
+   if (!crender->pack)
+      return;
+   /* Position and primary colour, then every varying lane from its
+    * source slot. */
+   head = crender->vertex_size / sizeof(uint32_t) -
+          4 * crender->varying_count;
+   for (unsigned v = min_index; v <= max_index; v++) {
+      const uint32_t *raw = (const uint32_t *)(crender->raw +
+         (size_t)v * crender->raw_vertex_size);
+      uint32_t *out = (uint32_t *)(crender->vertices +
+         (size_t)v * crender->vertex_size);
+
+      memcpy(out, raw, head * sizeof(uint32_t));
+      for (unsigned n = 0; n < crender->varying_count; n++)
+         for (unsigned l = 0; l < 4; l++)
+            out[head + 4 * n + l] = crender->pack_source[n][l] == 0xff ? 0 :
+               raw[head + 4 * crender->pack_source[n][l] +
+                   crender->pack_comp[n][l]];
+   }
 }
 
 static void
@@ -4383,6 +4469,7 @@ chrome9_vbuf_destroy(struct vbuf_render *render)
       crender->ctx->vbuf_render = NULL;
    util_dynarray_fini(&crender->split_vertices);
    FREE(crender->vertices);
+   FREE(crender->raw);
    FREE(crender);
 }
 
