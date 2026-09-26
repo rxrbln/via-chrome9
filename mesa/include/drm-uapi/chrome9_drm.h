@@ -334,6 +334,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_GEM_BUSY		(1ULL << 31)
 /* DESTINATION_FORMAT_R32F and FRAGMENT_TEXTURE_R32F. */
 #define DRM_CHROME9_CAP2_R32F			(1ULL << 32)
+/* Fragment TEX flag DRM_CHROME9_FRAGMENT_TEX_PROJECT (TEXLDP). */
+#define DRM_CHROME9_CAP2_TEXTURE_PROJECT	(1ULL << 33)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1383,6 +1385,11 @@ struct drm_chrome9_fragment_destination {
  * level of detail (TEXLDB, CAP2_TEXTURE_BIAS).
  */
 #define DRM_CHROME9_FRAGMENT_TEX_BIAS	(1U << 0)
+/*
+ * TEX of a 2D sampler: divide the coordinate by its lane W before sampling
+ * (TEXLDP, CAP2_TEXTURE_PROJECT); not combined with TEX_BIAS.
+ */
+#define DRM_CHROME9_FRAGMENT_TEX_PROJECT	(1U << 1)
 
 /* Fixed-width 32-byte semantic record.  sampler and flags are TEX only. */
 struct drm_chrome9_fragment_instruction {
