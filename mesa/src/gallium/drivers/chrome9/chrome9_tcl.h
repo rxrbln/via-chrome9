@@ -23,6 +23,26 @@ enum chrome9_tcl_origin {
    CHROME9_TCL_ORIGIN_UNIT,
    /* Input lane, resolved against the vertex format at draw time. */
    CHROME9_TCL_ORIGIN_INPUT,
+   /* Sum of CB0- or literal-weighted input lanes and constants, resolved
+    * against CB0 and the vertex formats at draw time. */
+   CHROME9_TCL_ORIGIN_LINEAR,
+};
+
+/* One term coefficient * value of a linear lane: the coefficient is a CB0
+ * dword or a literal, the value an input lane or 1. */
+struct chrome9_tcl_linear_term {
+   float literal;
+   uint16_t word;
+   uint8_t input;
+   uint8_t channel;
+};
+
+#define CHROME9_TCL_LINEAR_LITERAL 0xffff
+#define CHROME9_TCL_LINEAR_ONE 0xff
+
+struct chrome9_tcl_linear {
+   struct chrome9_tcl_linear_term *term;
+   unsigned count;
 };
 
 /* Hardware static flow control the kernel accepts (CAP2_VERTEX_STATIC_FLOW). */
@@ -88,6 +108,9 @@ struct chrome9_tcl_program {
    uint8_t origin[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
    uint8_t origin_input[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
    uint8_t origin_lane[DRM_CHROME9_FRAGMENT_MAX_VARYINGS][4];
+   /* LINEAR lanes: origin_input indexes linear. */
+   struct chrome9_tcl_linear *linear;
+   unsigned linear_count;
    /* Enabled planes the VS writes, and whether it writes BFC0. */
    uint8_t clip_written;
    bool back_primary;

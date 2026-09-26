@@ -1404,6 +1404,146 @@ tcl_store_clip(struct tcl_builder *b, unsigned base, unsigned component,
    }
 }
 
+/* A coefficient: a literal or a CB0 dword. */
+static bool
+tcl_linear_coefficient(nir_scalar s, struct chrome9_tcl_linear_term *t)
+{
+   unsigned row, lane;
+
+   if (nir_scalar_is_const(s)) {
+      t->literal = nir_scalar_as_float(s);
+      t->word = CHROME9_TCL_LINEAR_LITERAL;
+      return isfinite(t->literal);
+   }
+   if (!nir_scalar_is_intrinsic(s) ||
+       !tcl_ubo_row(nir_def_as_intrinsic(s.def), &row, &lane))
+      return false;
+   t->word = row * 4 + lane + s.comp;
+   return true;
+}
+
+/* An input lane of the vertex (the kernel rejects non-finite vertex
+ * data). */
+static bool
+tcl_linear_input(nir_scalar s, struct chrome9_tcl_linear_term *t)
+{
+   nir_intrinsic_instr *load;
+
+   if (!nir_scalar_is_intrinsic(s) ||
+       nir_scalar_intrinsic_op(s) != nir_intrinsic_load_input)
+      return false;
+   load = nir_def_as_intrinsic(s.def);
+   if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+       nir_intrinsic_base(load) >= DRM_CHROME9_VERTEX_MAX_INPUTS)
+      return false;
+   t->input = nir_intrinsic_base(load);
+   t->channel = nir_intrinsic_component(load) + s.comp;
+   return t->channel < 4;
+}
+
+static bool
+tcl_linear_product(nir_scalar a, nir_scalar b, struct util_dynarray *terms)
+{
+   struct chrome9_tcl_linear_term t = { 0 };
+
+   a = nir_scalar_resolved(a.def, a.comp);
+   b = nir_scalar_resolved(b.def, b.comp);
+   for (unsigned k = 0; k < 2; k++) {
+      nir_scalar c = k ? b : a, v = k ? a : b;
+
+      if (!tcl_linear_coefficient(c, &t))
+         continue;
+      if (tcl_linear_input(v, &t)) {
+         util_dynarray_append(terms, t);
+         return true;
+      }
+      /* c * literal 1 */
+      if (nir_scalar_is_const(v) && nir_scalar_as_float(v) == 1.0f) {
+         t.input = CHROME9_TCL_LINEAR_ONE;
+         util_dynarray_append(terms, t);
+         return true;
+      }
+   }
+   return false;
+}
+
+static bool
+tcl_linear_terms(nir_scalar s, unsigned depth, struct util_dynarray *terms)
+{
+   struct chrome9_tcl_linear_term t = { 0 };
+
+   s = nir_scalar_resolved(s.def, s.comp);
+   if (depth > 16)
+      return false;
+   if (tcl_linear_coefficient(s, &t)) {
+      t.input = CHROME9_TCL_LINEAR_ONE;
+      util_dynarray_append(terms, t);
+      return true;
+   }
+   if (tcl_linear_input(s, &t)) {
+      t.literal = 1.0f;
+      t.word = CHROME9_TCL_LINEAR_LITERAL;
+      util_dynarray_append(terms, t);
+      return true;
+   }
+   if (!nir_scalar_is_alu(s))
+      return false;
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_fadd:
+      return tcl_linear_terms(nir_scalar_chase_alu_src(s, 0), depth + 1,
+                              terms) &&
+             tcl_linear_terms(nir_scalar_chase_alu_src(s, 1), depth + 1,
+                              terms);
+   case nir_op_fmul:
+      return tcl_linear_product(nir_scalar_chase_alu_src(s, 0),
+                                nir_scalar_chase_alu_src(s, 1), terms);
+   case nir_op_ffma:
+   case nir_op_fmad:
+      return tcl_linear_product(nir_scalar_chase_alu_src(s, 0),
+                                nir_scalar_chase_alu_src(s, 1), terms) &&
+             tcl_linear_terms(nir_scalar_chase_alu_src(s, 2), depth + 1,
+                              terms);
+   default:
+      return false;
+   }
+}
+
+/* Record lane s as a linear form; false when it is not one. */
+static bool
+tcl_linear_record(struct tcl_builder *b, nir_scalar s, uint8_t *index)
+{
+   struct chrome9_tcl_program *p = b->p;
+   struct chrome9_tcl_linear form = { 0 };
+   struct util_dynarray terms;
+   bool ok;
+
+   if (p->linear_count > UINT8_MAX)
+      return false;
+   util_dynarray_init(&terms, NULL);
+   ok = tcl_linear_terms(s, 0, &terms) && terms.size;
+   if (ok) {
+      struct chrome9_tcl_linear *grown =
+         REALLOC(p->linear, p->linear_count * sizeof(*grown),
+                 (p->linear_count + 1) * sizeof(*grown));
+
+      form.count = util_dynarray_num_elements(&terms,
+                                              struct chrome9_tcl_linear_term);
+      form.term = MALLOC(terms.size);
+      ok = grown && form.term;
+      if (grown)
+         p->linear = grown;
+      if (ok) {
+         memcpy(form.term, terms.data, terms.size);
+         *index = p->linear_count;
+         p->linear[p->linear_count++] = form;
+      } else {
+         FREE(form.term);
+      }
+   }
+   util_dynarray_fini(&terms);
+   return ok;
+}
+
 static void
 tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
 {
@@ -1503,6 +1643,11 @@ tcl_store(struct tcl_builder *b, nir_intrinsic_instr *store)
                    mov.src[0].file == DRM_CHROME9_VERTEX_FILE_TEMP &&
                    b->unit_temp[mov.src[0].index] ?
                    CHROME9_TCL_ORIGIN_UNIT : CHROME9_TCL_ORIGIN_UNKNOWN;
+         if (*origin == CHROME9_TCL_ORIGIN_UNKNOWN &&
+             tcl_linear_record(b, nir_get_scalar(store->src[0].ssa,
+                                                 i - component),
+                               &b->p->origin_input[index][i]))
+            *origin = CHROME9_TCL_ORIGIN_LINEAR;
       }
    }
    if (mov.dst.file == DRM_CHROME9_VERTEX_DEST_VARYING)
@@ -2888,6 +3033,11 @@ out:
 void
 chrome9_tcl_program_fini(struct chrome9_tcl_program *p)
 {
+   for (unsigned i = 0; i < p->linear_count; i++)
+      FREE(p->linear[i].term);
+   FREE(p->linear);
+   p->linear = NULL;
+   p->linear_count = 0;
    FREE(p->expr);
    p->expr = NULL;
    p->expr_count = 0;
@@ -4092,6 +4242,73 @@ tcl_program(struct chrome9_context *ctx, bool clip_halfz,
    return variant ? &variant->program : NULL;
 }
 
+static enum chrome9_tcl_origin
+tcl_input_origin(const struct chrome9_context *ctx,
+                 const struct chrome9_tcl_program *p, unsigned input,
+                 unsigned channel);
+
+/*
+ * Draw-time class of a linear lane.  It is exactly +-0 or 1 when every
+ * input term has a zero coefficient and at most one constant term, which
+ * is 1, is non-zero (0 * finite is +-0).  It lies in [0, 1] when the
+ * interval sum over UNIT inputs does.
+ */
+static enum chrome9_tcl_origin
+tcl_linear_origin(const struct chrome9_context *ctx,
+                  const struct chrome9_tcl_program *p,
+                  const struct chrome9_tcl_linear *form)
+{
+   const uint8_t *map;
+   double low = 0, high = 0;
+   unsigned ones = 0;
+   bool exact = true;
+   size_t size;
+
+   map = tcl_cb0(ctx, &size);
+   for (unsigned i = 0; i < form->count; i++) {
+      const struct chrome9_tcl_linear_term *t = &form->term[i];
+      float c = t->literal;
+
+      if (t->word != CHROME9_TCL_LINEAR_LITERAL) {
+         if (!map || (t->word + 1u) * 4 > size)
+            return CHROME9_TCL_ORIGIN_UNKNOWN;
+         memcpy(&c, map + t->word * 4, sizeof(c));
+         if (!isfinite(c))
+            return CHROME9_TCL_ORIGIN_UNKNOWN;
+      }
+      if (c == 0.0f)
+         continue;
+      if (t->input == CHROME9_TCL_LINEAR_ONE) {
+         low += c;
+         high += c;
+         if (c == 1.0f)
+            ones++;
+         else
+            exact = false;
+         continue;
+      }
+      exact = false;
+      switch (tcl_input_origin(ctx, p, t->input, t->channel)) {
+      case CHROME9_TCL_ORIGIN_ZERO:
+         break;
+      case CHROME9_TCL_ORIGIN_ONE:
+         low += c;
+         high += c;
+         break;
+      case CHROME9_TCL_ORIGIN_UNIT:
+         low += MIN2(c, 0.0f);
+         high += MAX2(c, 0.0f);
+         break;
+      default:
+         return CHROME9_TCL_ORIGIN_UNKNOWN;
+      }
+   }
+   if (exact && ones <= 1)
+      return ones ? CHROME9_TCL_ORIGIN_ONE : CHROME9_TCL_ORIGIN_ZERO;
+   return low >= 0.0 && high <= 1.0 ? CHROME9_TCL_ORIGIN_UNIT :
+                                      CHROME9_TCL_ORIGIN_UNKNOWN;
+}
+
 /* Value class of one varying lane for all vertices of a draw; sprite
  * coordinates are (s, t, 0, 1) with s and t in [0, 1]. */
 static enum chrome9_tcl_origin
@@ -4100,18 +4317,27 @@ tcl_lane_origin(const struct chrome9_context *ctx,
                 unsigned lane)
 {
    const unsigned v = lane / 4, c = lane % 4;
-   const struct util_format_description *desc;
-   unsigned input, channel;
 
    if (v >= DRM_CHROME9_FRAGMENT_MAX_VARYINGS)
       return CHROME9_TCL_ORIGIN_UNKNOWN;
    if (sprite & BITFIELD_BIT(v))
       return c < 2 ? CHROME9_TCL_ORIGIN_UNIT :
              c == 2 ? CHROME9_TCL_ORIGIN_ZERO : CHROME9_TCL_ORIGIN_ONE;
+   if (p->origin[v][c] == CHROME9_TCL_ORIGIN_LINEAR)
+      return tcl_linear_origin(ctx, p, &p->linear[p->origin_input[v][c]]);
    if (p->origin[v][c] != CHROME9_TCL_ORIGIN_INPUT)
       return p->origin[v][c];
-   input = p->origin_input[v][c];
-   channel = p->origin_lane[v][c];
+   return tcl_input_origin(ctx, p, p->origin_input[v][c],
+                           p->origin_lane[v][c]);
+}
+
+static enum chrome9_tcl_origin
+tcl_input_origin(const struct chrome9_context *ctx,
+                 const struct chrome9_tcl_program *p, unsigned input,
+                 unsigned channel)
+{
+   const struct util_format_description *desc;
+
    /* Prefetched texels have no static range. */
    if (input >= p->input_count - p->prefetch_count)
       return CHROME9_TCL_ORIGIN_UNKNOWN;
@@ -4128,7 +4354,7 @@ tcl_lane_origin(const struct chrome9_context *ctx,
 
 /* The guarded fragment forms need per-lane facts the CPU can no longer
  * check per vertex; accept them only when the VS proves them statically. */
-static bool
+static const char *
 tcl_guarded_domain(const struct chrome9_context *ctx,
                    const struct chrome9_tcl_program *p, uint32_t raster)
 {
@@ -4139,19 +4365,19 @@ tcl_guarded_domain(const struct chrome9_context *ctx,
    for (uint32_t m = fs->semantic_identity_projector_input_mask; m; m &= m - 1)
       if (tcl_lane_origin(ctx, p, sprite, __builtin_ctz(m)) !=
           CHROME9_TCL_ORIGIN_ONE)
-         return false;
+         return "guarded fragment domain: projector not 1";
    for (uint32_t m = fs->semantic_equal_zero_input_mask; m; m &= m - 1) {
       const enum chrome9_tcl_origin o =
          tcl_lane_origin(ctx, p, sprite, __builtin_ctz(m));
 
       if (o != CHROME9_TCL_ORIGIN_ZERO && o != CHROME9_TCL_ORIGIN_ONE)
-         return false;
+         return "guarded fragment domain: compared lane not 0 or 1";
    }
    for (uint32_t m = fs->semantic_unit_interval_input_mask; m; m &= m - 1)
       if (tcl_lane_origin(ctx, p, sprite, __builtin_ctz(m)) ==
           CHROME9_TCL_ORIGIN_UNKNOWN)
-         return false;
-   return true;
+         return "guarded fragment domain: factor not in [0, 1]";
+   return NULL;
 }
 
 static void
@@ -4749,8 +4975,10 @@ chrome9_tcl_draw(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       if (!tcl_bind_inputs(ctx, p->input_count - p->prefetch_count,
                            streams[i]))
          return tcl_fallback(ctx, "vertex element format or buffer");
-      if (!tcl_guarded_domain(ctx, p, raster.flags))
-         return tcl_fallback(ctx, "guarded fragment domain");
+      const char *domain = tcl_guarded_domain(ctx, p, raster.flags);
+
+      if (domain)
+         return tcl_fallback(ctx, domain);
       programs[i] = p;
       flags[i] |= flat ? DRM_CHROME9_VERTEX_FLAT : 0;
    }
