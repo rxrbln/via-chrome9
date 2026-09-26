@@ -62,6 +62,36 @@ enum chrome9_fragment_program {
    CHROME9_FS_COMPILED_ALU,
 };
 
+/*
+ * Uniform-only subexpressions of a fragment program, evaluated per draw on
+ * the CPU into constant registers (a preshader).  Nodes are in dependency
+ * order; a leaf reads CB0 dwords (word >= 0) or holds literals.
+ */
+struct chrome9_preshader_node {
+   uint16_t op;
+   uint8_t components;
+   uint8_t bit_size;
+   uint16_t src[3];
+   uint8_t swizzle[3][4];
+   int32_t word;
+   uint32_t value[4];
+};
+
+struct chrome9_preshader_root {
+   uint16_t node;
+   uint8_t reg;
+   uint8_t lane;
+};
+
+struct chrome9_preshader {
+   struct chrome9_preshader_node *node;
+   unsigned node_count;
+   struct chrome9_preshader_root *root;
+   unsigned root_count;
+   /* Constant registers written by the roots. */
+   uint32_t reg_mask;
+};
+
 struct chrome9_fs_variant {
    struct chrome9_fs_variant *next;
    uint32_t inline_values[MAX_INLINABLE_UNIFORMS];
@@ -100,6 +130,8 @@ struct chrome9_fs_variant {
    bool supported;
    /* Multi-pass form of a program beyond the store (owned). */
    struct chrome9_fs_split *split;
+   /* Owned. */
+   struct chrome9_preshader *preshader;
 };
 
 struct chrome9_tcl_shader;
@@ -154,6 +186,8 @@ struct chrome9_shader {
    /* The variant's multi-pass form, and set on its jobs: never split. */
    struct chrome9_fs_split *split;
    bool split_job;
+   /* The applied variant's preshader, or the compile's before capture. */
+   struct chrome9_preshader *preshader;
    /* Jobs: carrier samplers without the finite or uninterpolated proof. */
    uint8_t split_unproven_finite;
    uint8_t split_interpolated;
@@ -414,6 +448,10 @@ void chrome9_context_sync_resource(struct chrome9_context *ctx,
                                    unsigned usage);
 /* The NIR normalization of the fragment backend, before lowering. */
 void chrome9_fs_prepare_semantic_nir(struct nir_shader *nir);
+void chrome9_preshader_destroy(struct chrome9_preshader *pre);
+bool chrome9_preshader_eval(const struct chrome9_preshader *pre,
+                            const uint8_t *map, size_t size,
+                            uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4]);
 void chrome9_compile_fs_nir(struct chrome9_context *ctx,
                             struct chrome9_shader *shader,
                             struct nir_shader *nir);

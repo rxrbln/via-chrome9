@@ -25,6 +25,7 @@
 #include "draw/draw_context.h"
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_constant_expressions.h"
 #include "tgsi/tgsi_parse.h"
 #include "util/format/u_format.h"
 #include "util/hash_table.h"
@@ -7622,6 +7623,8 @@ chrome9_ps_config_tier(unsigned peak)
    return peak <= 3 ? 3 : peak <= 4 ? 2 : peak <= 6 ? 1 : 0;
 }
 
+static struct chrome9_preshader *chrome9_fs_preshader(nir_shader *nir);
+
 static bool
 chrome9_compile_native_fs(struct chrome9_context *ctx,
                           struct chrome9_shader *shader, nir_shader *nir)
@@ -7639,6 +7642,9 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
    if (!semantic_nir)
       return false;
    chrome9_fs_prepare_semantic_nir(semantic_nir);
+   shader->preshader = !shader->split_job &&
+                       debug_get_bool_option("CHROME9_PS_PRESHADER", true) ?
+                       chrome9_fs_preshader(semantic_nir) : NULL;
 
    memset(&shader->semantic_fs_ir, 0, sizeof(shader->semantic_fs_ir));
    from_nir = chrome9_compile_ps_nir(semantic_nir, &shader->semantic_fs_ir,
@@ -7706,6 +7712,10 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
    }
    ralloc_free(semantic_nir);
    shader->semantic_fs_valid = lowered;
+   if (!lowered) {
+      chrome9_preshader_destroy(shader->preshader);
+      shader->preshader = NULL;
+   }
    if (lowered) {
       for (unsigned i = 0; i < shader->semantic_fs_ir.count; i++) {
          const struct chrome9_ps_instruction *instruction =
@@ -7752,6 +7762,313 @@ chrome9_compile_native_fs(struct chrome9_context *ctx,
       return false;
    shader->native_fs_key = key;
    shader->native_fs_from_nir = false;
+   return true;
+}
+
+#define CHROME9_PRESHADER_LEAF 0xffff
+/* Nodes one draw evaluates; a larger uniform cone stays in the program. */
+#define CHROME9_PRESHADER_MAX_NODES 256
+
+struct chrome9_preshader_build {
+   struct util_dynarray node;
+   int32_t *index;
+};
+
+/* The node of a uniform-only value, -1 when the value varies per pixel. */
+static int32_t
+chrome9_preshader_node_of(struct chrome9_preshader_build *b, nir_def *def)
+{
+   struct chrome9_preshader_node node = { .word = -1 };
+   nir_instr *instr = nir_def_instr(def);
+   int32_t *memo = &b->index[def->index];
+
+   if (*memo != -2)
+      return *memo;
+   *memo = -1;
+   if (def->num_components > 4 ||
+       util_dynarray_num_elements(&b->node, struct chrome9_preshader_node) >=
+          CHROME9_PRESHADER_MAX_NODES)
+      return -1;
+   node.components = def->num_components;
+   node.bit_size = def->bit_size;
+   if (instr->type == nir_instr_type_load_const) {
+      nir_load_const_instr *load = nir_instr_as_load_const(instr);
+
+      if (def->bit_size != 32 && def->bit_size != 1)
+         return -1;
+      node.op = CHROME9_PRESHADER_LEAF;
+      for (unsigned c = 0; c < def->num_components; c++)
+         node.value[c] = def->bit_size == 1 ? load->value[c].b :
+                                              load->value[c].u32;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+      unsigned id, component;
+
+      if (!chrome9_ps_ubo_load(load, &id, &component))
+         return -1;
+      node.op = CHROME9_PRESHADER_LEAF;
+      node.word = id * 4 + component;
+   } else if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      const nir_op_info *info = &nir_op_infos[alu->op];
+      unsigned bit_size = 0;
+
+      if (info->num_inputs > 3)
+         return -1;
+      if (!nir_alu_type_get_type_size(info->output_type))
+         bit_size = def->bit_size;
+      for (unsigned i = 0; i < info->num_inputs; i++) {
+         const unsigned n = info->input_sizes[i] ? info->input_sizes[i] :
+                                                   def->num_components;
+         int32_t src = chrome9_preshader_node_of(b, alu->src[i].src.ssa);
+
+         if (src < 0 || n > 4)
+            return -1;
+         if (!bit_size && !nir_alu_type_get_type_size(info->input_types[i]))
+            bit_size = alu->src[i].src.ssa->bit_size;
+         node.src[i] = src;
+         for (unsigned c = 0; c < n; c++)
+            node.swizzle[i][c] = alu->src[i].swizzle[c];
+      }
+      node.op = alu->op;
+      node.bit_size = bit_size ? bit_size : 32;
+   } else {
+      return -1;
+   }
+   *memo = util_dynarray_num_elements(&b->node, struct chrome9_preshader_node);
+   util_dynarray_append(&b->node, node);
+   return *memo;
+}
+
+/* Worth a register: more than a copy, negation or gather of leaves. */
+static bool
+chrome9_preshader_worth(const struct chrome9_preshader_node *nodes,
+                        const struct chrome9_preshader_node *node)
+{
+   if (node->op == CHROME9_PRESHADER_LEAF)
+      return false;
+   switch (node->op) {
+   case nir_op_mov:
+   case nir_op_fneg:
+   case nir_op_fabs:
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+      for (unsigned i = 0; i < nir_op_infos[node->op].num_inputs; i++)
+         if (nodes[node->src[i]].op != CHROME9_PRESHADER_LEAF)
+            return true;
+      return false;
+   default:
+      return true;
+   }
+}
+
+struct chrome9_preshader_user {
+   struct chrome9_preshader_build *b;
+   struct util_dynarray *defs;
+};
+
+/* A per-pixel instruction's source that is a worthwhile uniform value. */
+static bool
+chrome9_preshader_user_src(nir_src *src, void *data)
+{
+   struct chrome9_preshader_user *user = data;
+   const struct chrome9_preshader_node *nodes;
+   bool seen = false;
+   int32_t n;
+
+   if (src->ssa->bit_size != 32)
+      return true;
+   n = chrome9_preshader_node_of(user->b, src->ssa);
+   nodes = user->b->node.data;
+   if (n < 0 || !chrome9_preshader_worth(nodes, &nodes[n]))
+      return true;
+   util_dynarray_foreach(user->defs, nir_def *, d)
+      seen |= *d == src->ssa;
+   if (!seen)
+      util_dynarray_append(user->defs, src->ssa);
+   return true;
+}
+
+void
+chrome9_preshader_destroy(struct chrome9_preshader *pre)
+{
+   if (!pre)
+      return;
+   FREE(pre->node);
+   FREE(pre->root);
+   FREE(pre);
+}
+
+/*
+ * Move uniform-only values the program uses per pixel into constant
+ * registers filled per draw.  Registers come from those no uniform reads,
+ * below c16 first; at least eight of c16..c31 stay free for immediates.
+ */
+static struct chrome9_preshader *
+chrome9_fs_preshader(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct chrome9_preshader_build b;
+   struct util_dynarray roots, defs;
+   struct chrome9_preshader *pre = NULL;
+   uint32_t used = 0;
+   uint8_t lanes[32] = { 0 };
+   nir_builder builder;
+
+   nir_index_ssa_defs(impl);
+   b.index = MALLOC(impl->ssa_alloc * sizeof(*b.index));
+   if (!b.index)
+      return NULL;
+   for (unsigned i = 0; i < impl->ssa_alloc; i++)
+      b.index[i] = -2;
+   util_dynarray_init(&b.node, NULL);
+   util_dynarray_init(&roots, NULL);
+   util_dynarray_init(&defs, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+            unsigned id, component;
+
+            if (chrome9_ps_ubo_load(load, &id, &component))
+               used |= 1u << id;
+         }
+      }
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+
+         /* Uniform-only instructions are no users; roots feed the rest. */
+         if (def && chrome9_preshader_node_of(&b, def) >= 0)
+            continue;
+         struct chrome9_preshader_user user = { &b, &defs };
+
+         nir_foreach_src(instr, chrome9_preshader_user_src, &user);
+      }
+   }
+   if (!defs.size)
+      goto out;
+   /* Widest roots first; each takes free lanes of one register. */
+   for (unsigned width = 4; width; width--) {
+      util_dynarray_foreach(&defs, nir_def *, d) {
+         struct chrome9_preshader_root root;
+         unsigned reg = 32;
+
+         if ((*d)->num_components != width)
+            continue;
+         for (unsigned pass = 0; pass < 2 && reg == 32; pass++) {
+            for (unsigned r = 0; r < 32; r++) {
+               const bool low = r < 16;
+
+               if ((pass ? low : !low) || (used & (1u << r)) ||
+                   lanes[r] + width > 4)
+                  continue;
+               if (!lanes[r] && !low &&
+                   util_bitcount(~used & 0xffff0000u) <= 8)
+                  continue;
+               reg = r;
+               break;
+            }
+         }
+         if (reg == 32)
+            continue;
+         root.node = b.index[(*d)->index];
+         root.reg = reg;
+         root.lane = lanes[reg];
+         lanes[reg] += width;
+         util_dynarray_append(&roots, root);
+         builder = nir_builder_at(nir_before_impl(impl));
+         nir_def_rewrite_uses(*d, nir_load_ubo_vec4(&builder, width, 32,
+                                                    nir_imm_int(&builder, 0),
+                                                    nir_imm_int(&builder, 0),
+                                                    .base = reg,
+                                                    .component = root.lane));
+      }
+   }
+   if (!roots.size)
+      goto out;
+   pre = CALLOC_STRUCT(chrome9_preshader);
+   if (pre) {
+      pre->node_count = util_dynarray_num_elements(&b.node,
+                                                   struct chrome9_preshader_node);
+      pre->root_count = util_dynarray_num_elements(&roots,
+                                                   struct chrome9_preshader_root);
+      pre->node = MALLOC(b.node.size);
+      pre->root = MALLOC(roots.size);
+      if (!pre->node || !pre->root) {
+         chrome9_preshader_destroy(pre);
+         pre = NULL;
+      } else {
+         memcpy(pre->node, b.node.data, b.node.size);
+         memcpy(pre->root, roots.data, roots.size);
+         for (unsigned i = 0; i < pre->root_count; i++)
+            pre->reg_mask |= 1u << pre->root[i].reg;
+      }
+   }
+   nir_opt_dce(nir);
+out:
+   FREE(b.index);
+   util_dynarray_fini(&b.node);
+   util_dynarray_fini(&roots);
+   util_dynarray_fini(&defs);
+   return pre;
+}
+
+/* Evaluate the roots into their constant registers. */
+bool
+chrome9_preshader_eval(const struct chrome9_preshader *pre,
+                       const uint8_t *map, size_t size,
+                       uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4])
+{
+   nir_const_value (*value)[4] = MALLOC(pre->node_count * sizeof(*value));
+
+   if (!value)
+      return false;
+   for (unsigned n = 0; n < pre->node_count; n++) {
+      const struct chrome9_preshader_node *node = &pre->node[n];
+
+      memset(value[n], 0, sizeof(value[n]));
+      if (node->op == CHROME9_PRESHADER_LEAF) {
+         for (unsigned c = 0; c < node->components; c++) {
+            if (node->word < 0) {
+               if (node->bit_size == 1)
+                  value[n][c].b = node->value[c];
+               else
+                  value[n][c].u32 = node->value[c];
+            } else if (map && (node->word + c + 1) * 4 <= size) {
+               memcpy(&value[n][c].u32, map + (node->word + c) * 4, 4);
+            } else {
+               FREE(value);
+               return false;
+            }
+         }
+      } else {
+         const nir_op_info *info = &nir_op_infos[node->op];
+         nir_const_value source[3][4];
+         nir_const_value *sources[3];
+         uint16_t poison = 0;
+
+         for (unsigned i = 0; i < info->num_inputs; i++) {
+            const unsigned count = info->input_sizes[i] ?
+               info->input_sizes[i] : node->components;
+
+            for (unsigned c = 0; c < count; c++)
+               source[i][c] = value[node->src[i]][node->swizzle[i][c]];
+            sources[i] = source[i];
+         }
+         nir_eval_const_opcode(node->op, value[n], &poison, node->components,
+                               node->bit_size, sources, 0);
+      }
+   }
+   for (unsigned r = 0; r < pre->root_count; r++) {
+      const struct chrome9_preshader_root *root = &pre->root[r];
+
+      for (unsigned c = 0; c < pre->node[root->node].components; c++)
+         constants[root->reg][root->lane + c] = value[root->node][c].u32;
+   }
+   FREE(value);
    return true;
 }
 
@@ -8166,6 +8483,7 @@ chrome9_capture_fs_variant(struct chrome9_fs_variant *variant,
    variant->flat_generic = shader->flat_generic;
    variant->supported = shader->supported;
    variant->split = shader->split;
+   variant->preshader = shader->preshader;
 }
 
 static void
@@ -8202,6 +8520,7 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
    shader->flat_generic = variant->flat_generic;
    shader->supported = variant->supported;
    shader->split = variant->split;
+   shader->preshader = variant->preshader;
 }
 
 #define CHROME9_MAX_FS_VARIANTS 64
@@ -8587,11 +8906,15 @@ chrome9_delete_fs_state(struct pipe_context *pipe, void *state)
 
       if (variant->split == shader->split)
          shader->split = NULL;
+      if (variant->preshader == shader->preshader)
+         shader->preshader = NULL;
       shader->variants = variant->next;
       chrome9_fs_split_destroy(variant->split);
+      chrome9_preshader_destroy(variant->preshader);
       FREE(variant);
    }
    chrome9_fs_split_destroy(shader->split);
+   chrome9_preshader_destroy(shader->preshader);
    ralloc_free(shader->sw_nir);
    ralloc_free(shader->nir);
    FREE(shader);

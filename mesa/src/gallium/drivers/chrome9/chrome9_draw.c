@@ -1536,8 +1536,9 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
                            uint32_t constants[DRM_CHROME9_FRAGMENT_MAX_CONSTANTS][4])
 {
    const struct pipe_constant_buffer *cb = &ctx->fs_constants[0];
+   const struct chrome9_preshader *pre = ctx->fs->preshader;
    const uint32_t uniform_mask = ctx->fs->semantic_constant_mask &
-      ~ctx->fs->native_fs.immediate_mask;
+      ~ctx->fs->native_fs.immediate_mask & ~(pre ? pre->reg_mask : 0);
    const unsigned uniform_count = uniform_mask ?
       32 - __builtin_clz(uniform_mask) : 0;
    const uint8_t *map = NULL;
@@ -1560,6 +1561,23 @@ chrome9_fragment_constants(struct chrome9_context *ctx, uint32_t count,
       }
       if (map)
          memcpy(constants, map, size);
+   }
+   if (pre) {
+      const uint8_t *cb0 = NULL;
+      size_t size = 0;
+
+      if (cb->user_buffer) {
+         cb0 = (const uint8_t *)cb->user_buffer + cb->buffer_offset;
+         size = cb->buffer_size;
+      } else if (cb->buffer && cb->buffer->target == PIPE_BUFFER &&
+                 cb->buffer_offset <= cb->buffer->width0) {
+         cb0 = chrome9_resource(cb->buffer)->bo.map;
+         if (cb0)
+            cb0 += cb->buffer_offset;
+         size = MIN2(cb->buffer_size, cb->buffer->width0 - cb->buffer_offset);
+      }
+      if (!chrome9_preshader_eval(pre, cb0, size, constants))
+         return false;
    }
    for (unsigned i = 0; i < count; i++) {
       if (ctx->fs->native_fs.immediate_mask & (1u << i))
