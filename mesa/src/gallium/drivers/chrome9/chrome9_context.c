@@ -10335,9 +10335,12 @@ chrome9_refresh_vs_textures(struct chrome9_context *ctx)
          effective.texture = chrome9_sampler_view(view)->shadow;
          view = &effective;
       }
-      if (chrome9_vs_texture_mapping(view, mapping)) {
-         /* The draw module samples the pages on the CPU. */
+      /* The draw module samples the pages on the CPU, and a tiled or
+       * local level is copied out right here: wait for the device writes
+       * first. */
+      if (view)
          chrome9_resource_cpu_access(chrome9_resource(view->texture), false);
+      if (chrome9_vs_texture_mapping(view, mapping)) {
          draw_set_mapped_texture(ctx->draw, MESA_SHADER_VERTEX, i,
                                  mapping->width, mapping->height, 1,
                                  mapping->first_level, mapping->last_level,
