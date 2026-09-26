@@ -291,3 +291,50 @@ The fragment constant buffer is advertised as 128 registers (Mesa
 `aa2d0ee`).  4096 registers let glsl-uniform-interstage-limits build
 shaders large enough to exceed the runner timeout (subdivide 5: 2.3 s at
 32, over 30 s at 4096, 3.7 s at 128); 128 still covers gl_LightSource[8].
+
+## 11. Weak glmark2 scenes, uploads and TCL index cost (2026-09-26)
+
+glmark2 at 800x600 (Mesa p165, score 142): the lowest scenes are terrain
+4-5 fps, refract 18, effect2d 5x5 36, buffer subdata 46, desktop blur 50,
+conditionals and function with five fragment steps 64.  Resolution
+scaling separates fill cost from fixed cost:
+
+| scene | 800x600 | 400x300 | 200x150 |
+|---|---|---|---|
+| effect2d 5x5 | 28.5 ms | 7.5 ms | 2.0 ms |
+| refract | 56 ms | 34 ms | 27 ms |
+| terrain | 208 ms | 130 ms | 108 ms |
+
+effect2d is pure fill.  refract and terrain carry a large per-frame cost
+independent of the pixel count.  At 800x600 the CPU is 66-71 % idle and
+the main thread waits in the fragment-program ioctl of
+`chrome9_generate_mipmap_gpu` (the render-to-texture mip chain) and, for
+terrain, in `chrome9_resource_cpu_access_range` of the llvmpipe fallback
+(12 draws of a 92-temporary shader, 34 ms each).  Profile scripts need
+`CHROME9_TCL=1`; without it every draw takes the draw module.
+
+At 200x150 refract is CPU bound: 20 % in the kernel's
+`chrome9_tcl_prepare` and 20 % in Mesa's `tcl_draw_pass` plus 6 % in
+`tcl_chunk`, all per-index work for about 10^7 triangles.  Fixes:
+
+* kernel `8a685d6`: index scan in one loop per index size, and rebased
+  16-bit indices stored as halfwords or copied when userspace already
+  rebased them, instead of OR-ing each index into its dword
+  (22 % -> 7 %);
+* Mesa `8ff07a3`: `tcl_chunk` reports runs of consecutive positions by
+  their first position, and stage B scans and narrows 16-bit, 32-bit,
+  deduplicated (`first[]`) and plain vertex runs in branch-free loops.
+
+refract 200x150: 26.3 -> 22.8 ms; 800x600: 54.6 -> 51.5 ms.  What remains
+in `tcl_draw_pass` is memory-bound reading of the deduplication map (about
+0.7 MB per draw of the horse); caching the narrowed chunks per
+deduplication entry would remove it, but at 800x600 the scene is GPU
+bound.
+
+**Tiled uploads** (Mesa `3d39aa6`): `chrome9_tiled_copy` copied row by row,
+storing 32 bytes at a 256-byte stride into write-combined local memory,
+which splits WC bursts.  Walking each 8-row band tile by tile keeps the
+stores sequential.  1024x1024 texture upload (tools `re/chrome9_gl_upload_bench.c`):
+BGRA 16.0 -> 10.1 ms, RGBA 18.4 -> 12.5 ms.  What remains: the state
+tracker's copy into the transfer buffer (23 %), the tiled store (32 %) and
+the kernel's zeroing of new local objects (10 %).
