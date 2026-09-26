@@ -3308,12 +3308,51 @@ struct tcl_chunker {
  * first vertex); returns its primitive count, 0 when finished. */
 static unsigned
 tcl_chunk(struct tcl_chunker *c, unsigned max_vertices, unsigned *positions,
-          unsigned *vertex_count)
+          unsigned *vertex_count, unsigned *run)
 {
    unsigned n = c->primitives - c->done, k = 0;
 
    if (!n)
       return 0;
+   /* Consecutive positions: only the first is reported. */
+   if (run) {
+      unsigned start = UINT_MAX;
+
+      switch (c->topology) {
+      case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP:
+         n = MIN2(n, (max_vertices - 2) & ~1u);
+         start = c->done;
+         k = n + 2;
+         break;
+      case DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST:
+         n = MIN2(n, max_vertices);
+         start = c->done;
+         k = n;
+         break;
+      case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST:
+         n = MIN2(n, max_vertices / 2);
+         start = 2 * c->done;
+         k = 2 * n;
+         break;
+      case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN:
+      case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP:
+         break;
+      default:
+         if (c->mode == MESA_PRIM_TRIANGLES && !c->flat_first) {
+            n = MIN2(n, max_vertices / 3);
+            start = 3 * c->done;
+            k = 3 * n;
+         }
+         break;
+      }
+      *run = start;
+      if (start != UINT_MAX) {
+         c->done += n;
+         *vertex_count = k;
+         return n;
+      }
+      n = c->primitives - c->done;
+   }
    switch (c->topology) {
    case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP:
       n = MIN2(n, (max_vertices - 2) & ~1u);
@@ -4019,6 +4058,76 @@ chrome9_tcl_state_destroy(struct chrome9_tcl_state *state)
    FREE(state);
 }
 
+/* Minimum and maximum of n 32-bit values, then value - minimum narrowed. */
+static inline bool
+tcl_narrow32(const uint32_t *src, unsigned n, uint16_t *narrow, uint32_t *lo)
+{
+   uint32_t min = UINT32_MAX, max = 0;
+
+   for (unsigned i = 0; i < n; i++) {
+      min = MIN2(min, src[i]);
+      max = MAX2(max, src[i]);
+   }
+   if (max - min > UINT16_MAX)
+      return false;
+   for (unsigned i = 0; i < n; i++)
+      narrow[i] = src[i] - min;
+   *lo = min;
+   return true;
+}
+
+/*
+ * A chunk of n consecutive positions from p0, of 16- or 32-bit indices, of
+ * a deduplicated vertex map or of plain vertices, spanning at most 64Ki
+ * vertices: scan and narrow it in branch-free loops the compiler
+ * vectorizes.
+ */
+static bool
+tcl_narrow_run(const struct pipe_draw_info *info,
+               const struct pipe_draw_start_count_bias *range,
+               const uint8_t *indices, const uint32_t *first,
+               struct chrome9_tcl_state *state, unsigned p0, unsigned n,
+               int64_t bias, struct drm_chrome9_draw_vertex_program *draw)
+{
+   uint16_t *narrow = (uint16_t *)state->indices;
+   uint32_t lo = 0;
+   int64_t base = 0;
+
+   if (!n)
+      return false;
+   if (info->index_size == 2) {
+      const uint16_t *src = (const uint16_t *)indices + range->start + p0;
+      uint16_t min = UINT16_MAX;
+
+      for (unsigned i = 0; i < n; i++)
+         min = MIN2(min, src[i]);
+      for (unsigned i = 0; i < n; i++)
+         narrow[i] = src[i] - min;
+      lo = min;
+   } else if (info->index_size == 4) {
+      if (!tcl_narrow32((const uint32_t *)indices + range->start + p0, n,
+                        narrow, &lo))
+         return false;
+   } else if (info->index_size) {
+      return false;
+   } else if (first) {
+      if (!tcl_narrow32(first + p0, n, narrow, &lo))
+         return false;
+      base = range->start;
+   } else {
+      if (n > UINT16_MAX + 1)
+         return false;
+      for (unsigned i = 0; i < n; i++)
+         narrow[i] = i;
+      base = range->start + p0;
+   }
+   /* The draw's range proved lo + bias >= 0 and that the sum fits. */
+   draw->index_size = 2;
+   draw->base_vertex = base + lo + bias;
+   draw->index_count = n;
+   return true;
+}
+
 /*
  * Stage B draw: triangle list indices (provoking vertex last) rebased to
  * min, in chunks.  Returns false only when nothing was submitted, so
@@ -4035,13 +4144,20 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
 {
    const int64_t bias = (int64_t)(info->index_size ? range->index_bias : 0) -
                         min;
-   unsigned count, n;
+   unsigned count, n, run;
 
    draw->indices_ptr = (uintptr_t)state->indices;
    while ((count = tcl_chunk(&chunker, DRM_CHROME9_VERTEX_MAX_INDICES,
-                             state->positions, &n))) {
+                             state->positions, &n, &run))) {
       uint32_t lo = UINT32_MAX, hi = 0;
 
+      if (run != UINT_MAX) {
+         if (tcl_narrow_run(info, range, indices, first, state, run, n,
+                            bias, draw))
+            goto submit;
+         for (unsigned i = 0; i < n; i++)
+            state->positions[i] = run + i;
+      }
       for (unsigned i = 0; i < n; i++) {
          const unsigned position = range->start + state->positions[i];
          int64_t value = first ?
@@ -4071,6 +4187,7 @@ tcl_draw_buffers(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          draw->base_vertex = 0;
       }
       draw->index_count = n;
+submit:
       if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, count,
                                    resources, draw->buffer_count)) {
          ctx->tcl_buffer_rejects++;
@@ -4839,7 +4956,8 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    draw.vertex_stride = stride;
    draw.vertices_ptr = (uintptr_t)state->vertices;
 
-   while ((count = tcl_chunk(&chunker, max_vertices, state->positions, &n))) {
+   while ((count = tcl_chunk(&chunker, max_vertices, state->positions, &n,
+                             NULL))) {
       uint32_t *out = state->vertices;
 
       for (unsigned i = 0; i < n; i++) {
