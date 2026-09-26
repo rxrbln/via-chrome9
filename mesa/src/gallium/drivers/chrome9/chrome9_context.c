@@ -8593,6 +8593,17 @@ chrome9_apply_fs_variant(struct chrome9_shader *shader,
 }
 
 #define CHROME9_MAX_FS_VARIANTS 64
+/* Uniform values a supported canonical program is specialized on before
+ * it stays dynamic: the values of a select's control uniform may vary. */
+#define CHROME9_MAX_FS_SPECIALIZED 4
+
+/* Instruction count of a compiled fragment program. */
+static unsigned
+chrome9_fs_variant_cost(const struct chrome9_fs_variant *variant)
+{
+   return variant->semantic_fs_valid ? variant->semantic_fs_ir.count :
+          variant->native_fs.alu_count + variant->native_fs.tau_count;
+}
 
 static void
 chrome9_dump_semantic_fs(const struct chrome9_shader *shader)
@@ -8630,6 +8641,60 @@ chrome9_dump_semantic_fs(const struct chrome9_shader *shader)
    }
 }
 
+/* A supported canonical program specialized on the draw's inlinable
+ * uniform values when that compiles to fewer instructions, else the
+ * canonical program. */
+static const struct chrome9_fs_variant *
+chrome9_specialized_fs_variant(struct chrome9_context *ctx,
+                               struct chrome9_shader *shader)
+{
+   const nir_shader *nir = shader->nir;
+   const unsigned count = nir->info.num_inlinable_uniforms;
+   const size_t bytes = count * sizeof(ctx->fs_inline[0]);
+   struct chrome9_fs_variant *variant;
+   struct chrome9_shader compiled = { 0 };
+   nir_shader *clone;
+
+   if (!count || ctx->fs_inline_count != count ||
+       shader->shadow_sampler_mask ||
+       !debug_get_bool_option("CHROME9_FS_SPECIALIZE", true))
+      return shader->canonical;
+   for (variant = shader->variants; variant; variant = variant->next) {
+      if (variant->specialized &&
+          !memcmp(variant->inline_values, ctx->fs_inline, bytes))
+         return variant->preferred ? variant : shader->canonical;
+   }
+   if (shader->specialized_count >= CHROME9_MAX_FS_SPECIALIZED ||
+       shader->variant_count >= CHROME9_MAX_FS_VARIANTS)
+      return shader->canonical;
+   variant = CALLOC_STRUCT(chrome9_fs_variant);
+   clone = variant ? nir_shader_clone(NULL, nir) : NULL;
+   if (!clone) {
+      FREE(variant);
+      return shader->canonical;
+   }
+   variant->specialized = true;
+   memcpy(variant->inline_values, ctx->fs_inline, bytes);
+   chrome9_nir_inline_uniforms(clone, variant->inline_values);
+   chrome9_compile_fs_nir(ctx, &compiled, clone);
+   ralloc_free(clone);
+   chrome9_capture_fs_variant(variant, &compiled);
+   variant->preferred = variant->supported &&
+                        chrome9_fs_variant_cost(variant) <
+                        chrome9_fs_variant_cost(shader->canonical);
+   variant->next = shader->variants;
+   shader->variants = variant;
+   shader->variant_count++;
+   shader->specialized_count++;
+   if (debug_get_bool_option("CHROME9_DEBUG_SHADERS", false))
+      fprintf(stderr, "chrome9: FS specialization %u supported=%u "
+              "cost %u -> %u%s\n", shader->specialized_count,
+              variant->supported, chrome9_fs_variant_cost(shader->canonical),
+              chrome9_fs_variant_cost(variant),
+              variant->preferred ? "" : " (kept canonical)");
+   return variant->preferred ? variant : shader->canonical;
+}
+
 /* Choose a fragment program only when all control-flow uniforms have their
  * draw-time values.  Failed variants are cached too, so an unsupported bound
  * is deterministic and never leaves a partially compiled program active. */
@@ -8654,7 +8719,8 @@ chrome9_select_fs_variant(struct chrome9_context *ctx)
     * natively lowered select must not exhaust the bounded variant cache as
     * its control uniform takes on many different values. */
    if (shader->canonical_supported && !ctx->fs_sprite_flip) {
-      chrome9_apply_fs_variant(shader, shader->canonical);
+      chrome9_apply_fs_variant(shader,
+                               chrome9_specialized_fs_variant(ctx, shader));
       return true;
    }
    canonical = shader->nir;

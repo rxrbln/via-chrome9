@@ -95,6 +95,10 @@ struct chrome9_preshader {
 struct chrome9_fs_variant {
    struct chrome9_fs_variant *next;
    uint32_t inline_values[MAX_INLINABLE_UNIFORMS];
+   /* Specialization of a supported canonical program on uniform values;
+    * preferred when it compiled to fewer instructions. */
+   bool specialized;
+   bool preferred;
    /* 0: dynamic FACE, 1: surviving front face, 2: surviving back face. */
    uint8_t face_mode;
    /* chrome9_shadow_key() of every shadow sampler, zero otherwise. */
@@ -161,6 +165,7 @@ struct chrome9_shader {
    const struct chrome9_fs_variant *canonical;
    const struct chrome9_fs_variant *applied;
    unsigned variant_count;
+   unsigned specialized_count;
    enum chrome9_fragment_program fragment_program;
    uint32_t literal_color;
    struct chrome9_fs_key native_fs_key;
