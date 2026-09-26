@@ -4813,6 +4813,14 @@ tcl_batch_has(const uint32_t *handles, unsigned count, uint32_t handle)
 }
 
 /* Objects draw would add to the batch's distinct kernel objects. */
+/* Buffer entries of a draw: the index object follows the vertex buffers. */
+static unsigned
+tcl_buffer_entries(const struct drm_chrome9_draw_vertex_program *draw)
+{
+   return draw->buffer_count +
+          !!(draw->flags & DRM_CHROME9_VERTEX_INDEX_OBJECT);
+}
+
 static unsigned
 tcl_batch_new_objects(const struct chrome9_tcl_batch *b,
                       const struct drm_chrome9_draw_vertex_program *draw,
@@ -4824,7 +4832,7 @@ tcl_batch_new_objects(const struct chrome9_tcl_batch *b,
    for (unsigned t = 0; t < draw->fragment.texture_count; t++)
       added += !tcl_batch_has(b->texture_handles, b->texture_handle_count,
                               textures[t].handle);
-   for (unsigned v = 0; v < draw->buffer_count; v++)
+   for (unsigned v = 0; v < tcl_buffer_entries(draw); v++)
       added += !tcl_batch_has(b->buffer_handles, b->buffer_handle_count,
                               buffers[v].handle);
    return added;
@@ -4934,8 +4942,8 @@ tcl_batch_append(struct chrome9_context *ctx,
       draw->instruction_count * sizeof(struct drm_chrome9_vertex_instruction),
       draw->constant_count * 4 * sizeof(uint32_t),
       draw->element_count * sizeof(struct drm_chrome9_vertex_element),
-      draw->buffer_count * sizeof(struct drm_chrome9_vertex_buffer),
-      (size_t)draw->index_count * draw->index_size,
+      tcl_buffer_entries(draw) * sizeof(struct drm_chrome9_vertex_buffer),
+      draw->indices_ptr ? (size_t)draw->index_count * draw->index_size : 0,
       (size_t)draw->vertex_count * draw->vertex_stride,
       draw->int_constants_ptr ?
          DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS * 4 * sizeof(uint8_t) : 0,
@@ -4987,7 +4995,7 @@ tcl_batch_append(struct chrome9_context *ctx,
       (const void *)(uintptr_t)draw->elements_ptr, sizes[5]);
    copy->buffers_ptr = draw->buffer_count ?
       (uintptr_t)tcl_batch_copy(&cursor, buffers, sizes[6]) : 0;
-   copy->indices_ptr = draw->index_count ?
+   copy->indices_ptr = draw->indices_ptr ?
       (uintptr_t)tcl_batch_copy(&cursor,
          (const void *)(uintptr_t)draw->indices_ptr, sizes[7]) : 0;
    copy->vertices_ptr = draw->vertex_count ?
@@ -5000,7 +5008,7 @@ tcl_batch_append(struct chrome9_context *ctx,
       if (!tcl_batch_has(b->texture_handles, b->texture_handle_count,
                          textures[t].handle))
          b->texture_handles[b->texture_handle_count++] = textures[t].handle;
-   for (unsigned v = 0; v < draw->buffer_count; v++)
+   for (unsigned v = 0; v < tcl_buffer_entries(draw); v++)
       if (!tcl_batch_has(b->buffer_handles, b->buffer_handle_count,
                          buffers[v].handle))
          b->buffer_handles[b->buffer_handle_count++] = buffers[v].handle;

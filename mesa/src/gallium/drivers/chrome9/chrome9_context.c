@@ -10761,9 +10761,11 @@ chrome9_context_destroy(struct pipe_context *pipe)
    chrome9_report_rejects(ctx);
    if (ctx->tcl_enabled && debug_get_bool_option("CHROME9_DEBUG_TCL", false))
       fprintf(stderr, "chrome9: TCL triangles=%" PRIu64 " (buffers %" PRIu64
-                      ", rejects %" PRIu64 ") fallback draws=%" PRIu64
+                      ", index objects %" PRIu64 ", rejects %" PRIu64
+                      ") fallback draws=%" PRIu64
                       " all triangles=%" PRIu64 "\n",
               ctx->tcl_triangles, ctx->tcl_buffer_triangles,
+              ctx->tcl_index_object_triangles,
               ctx->tcl_buffer_rejects, ctx->tcl_fallback_draws,
               ctx->submitted_triangles);
    chrome9_tcl_batch_destroy(ctx);
@@ -10863,6 +10865,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->tcl_buffers = ctx->tcl_enabled &&
       (capabilities & DRM_CHROME9_CAP_VERTEX_BUFFERS) &&
       debug_get_bool_option("CHROME9_TCL_BUFFERS", true);
+   ctx->tcl_index_object = ctx->tcl_buffers &&
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_INDEX_OBJECT) &&
+      debug_get_bool_option("CHROME9_TCL_INDEX_OBJECT", true);
    ctx->tcl_dedupe = ctx->tcl_buffers &&
       debug_get_bool_option("CHROME9_TCL_DEDUPE", true);
    ctx->tcl_edge_aa = ctx->tcl_enabled &&

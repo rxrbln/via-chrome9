@@ -4071,6 +4071,106 @@ chrome9_tcl_state_destroy(struct chrome9_tcl_state *state)
    FREE(state);
 }
 
+/*
+ * Indices of a list or strip read in order from an index buffer object:
+ * the engine fetches them raw (DRM_CHROME9_VERTEX_INDEX_OBJECT), so the
+ * CPU neither scans nor copies them.  Chunks start 16-byte aligned; strip
+ * chunks overlap by two vertices.
+ */
+static bool
+tcl_index_object_usable(const struct pipe_draw_info *info,
+                        const struct pipe_draw_start_count_bias *range,
+                        const struct tcl_chunker *c)
+{
+   const unsigned size = info->index_size;
+
+   if ((size != 2 && size != 4) || info->has_user_indices ||
+       !info->index.resource || range->index_bias < 0 ||
+       ((uint64_t)range->start * size) % 16)
+      return false;
+   switch (c->topology) {
+   case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP:
+   case DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST:
+   case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST:
+      return true;
+   case DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_FAN:
+   case DRM_CHROME9_VERTEX_TOPOLOGY_LINE_STRIP:
+      return false;
+   default:
+      return c->mode == MESA_PRIM_TRIANGLES && !c->flat_first;
+   }
+}
+
+/* Every stream of the draw lives in a buffer object. */
+static bool
+tcl_streams_resident(const struct chrome9_context *ctx, unsigned inputs,
+                     const struct tcl_stream *streams)
+{
+   for (unsigned k = 0; k < inputs; k++) {
+      const struct pipe_vertex_element *el;
+
+      if (streams[k].resource)
+         continue;
+      if (streams[k].user)
+         return false;
+      el = &ctx->vertex_elements->elements[k];
+      if (ctx->vertex_buffers[el->vertex_buffer_index].is_user_buffer)
+         return false;
+   }
+   return true;
+}
+
+static bool
+tcl_draw_index_object(struct chrome9_context *ctx,
+                      const struct pipe_draw_info *info,
+                      const struct pipe_draw_start_count_bias *range,
+                      const struct tcl_chunker *c,
+                      struct chrome9_tcl_state *state,
+                      struct drm_chrome9_draw_vertex_program *draw,
+                      struct drm_chrome9_vertex_buffer *buffers,
+                      struct pipe_resource **resources)
+{
+   const bool strip =
+      c->topology == DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_STRIP;
+   const unsigned per = strip ? 1 :
+      c->topology == DRM_CHROME9_VERTEX_TOPOLOGY_POINT_LIST ? 1 :
+      c->topology == DRM_CHROME9_VERTEX_TOPOLOGY_LINE_LIST ? 2 : 3;
+   /* A multiple of 8 indices and of the primitive size. */
+   const unsigned chunk = strip ? DRM_CHROME9_VERTEX_MAX_INDICES - 6 :
+                          DRM_CHROME9_VERTEX_MAX_INDICES;
+   const unsigned vertices = strip ? c->primitives + 2 : c->primitives * per;
+   struct pipe_resource *index = info->index.resource;
+   unsigned done = 0;
+
+   buffers[draw->buffer_count] = (struct drm_chrome9_vertex_buffer) {
+      .handle = chrome9_resource(index)->bo.handle,
+   };
+   resources[draw->buffer_count] = index;
+   draw->flags |= DRM_CHROME9_VERTEX_INDEX_OBJECT;
+   draw->indices_ptr = 0;
+   draw->index_size = info->index_size;
+   draw->base_vertex = range->index_bias;
+   while (done + (strip ? 2 : 0) < vertices) {
+      const unsigned n = MIN2(vertices - done, chunk);
+      const unsigned primitives = strip ? n - 2 : n / per;
+
+      buffers[draw->buffer_count].offset =
+         (uint64_t)(range->start + done) * info->index_size;
+      draw->index_count = n;
+      if (!chrome9_draw_tcl_submit(ctx, &state->fragment, draw, primitives,
+                                   resources, draw->buffer_count + 1)) {
+         if (!done)
+            return false;
+         CHROME9_REJECT(ctx, c->primitives - (strip ? done : done / per));
+         return true;
+      }
+      done += strip ? n - 2 : n;
+   }
+   ctx->tcl_buffer_triangles += c->primitives;
+   ctx->tcl_index_object_triangles += c->primitives;
+   return true;
+}
+
 /* Minimum and maximum of n 32-bit values, then value - minimum narrowed. */
 static inline bool
 tcl_narrow32(const uint32_t *src, unsigned n, uint16_t *narrow, uint32_t *lo)
@@ -4835,7 +4935,8 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    struct drm_chrome9_vertex_element elements[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct tcl_stream streams[DRM_CHROME9_VERTEX_MAX_INPUTS];
    struct drm_chrome9_draw_vertex_program draw = { 0 };
-   struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS];
+   /* The index object entry follows the vertex buffers. */
+   struct drm_chrome9_vertex_buffer buffers[DRM_CHROME9_VERTEX_MAX_INPUTS + 1];
    const unsigned primitives = raster->primitives;
    struct tcl_chunker chunker = {
       .mode = info->mode,
@@ -4847,6 +4948,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    };
    unsigned stride, max_vertices, buffer_count, count, n;
    uint32_t index_min, index_max;
+   bool index_object = false;
    const struct tcl_compact *compact = NULL;
    bool have_range;
    struct pipe_draw_info compact_info;
@@ -4885,6 +4987,13 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (compact) {
       index_min = 0;
       index_max = compact->unique - 1;
+      have_range = true;
+   } else if (ctx->tcl_index_object && !p->prefetch_count &&
+              tcl_index_object_usable(info, range, &chunker) &&
+              tcl_streams_resident(ctx, p->input_count, streams)) {
+      /* Raw indices: the element buffers start at vertex 0. */
+      index_object = true;
+      index_min = index_max = 0;
       have_range = true;
    } else {
       have_range = (ctx->tcl_buffers || p->prefetch_count) &&
@@ -4928,11 +5037,22 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
    if (ctx->tcl_buffers && have_range) {
       struct pipe_resource *uploads[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
       struct pipe_resource *resources[DRM_CHROME9_VERTEX_MAX_INPUTS] = { 0 };
+      struct pipe_resource *resources_index[DRM_CHROME9_VERTEX_MAX_INPUTS +
+                                            1] = { 0 };
       bool drawn = tcl_bind_buffers(ctx, p->input_count, streams, index_min,
                                     index_max, elements, buffers,
                                     &buffer_count, uploads, resources);
 
-      if (drawn) {
+      if (drawn && index_object) {
+         draw.buffer_count = buffer_count;
+         draw.buffers_ptr = (uintptr_t)buffers;
+         memcpy(resources_index, resources,
+                buffer_count * sizeof(resources[0]));
+         drawn = tcl_draw_index_object(ctx, info, range, &chunker, state,
+                                       &draw, buffers, resources_index);
+         if (!drawn)
+            draw.flags &= ~DRM_CHROME9_VERTEX_INDEX_OBJECT;
+      } else if (drawn) {
          const uint32_t *first = info->index_size ? NULL :
             tcl_dedupe_map(ctx, state, p, streams, range);
 

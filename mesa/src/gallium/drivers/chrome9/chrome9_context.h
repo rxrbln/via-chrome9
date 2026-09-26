@@ -374,6 +374,8 @@ struct chrome9_context {
    bool tcl_enabled;
    /* Stage B: hardware vertex fetch from GEM buffers. */
    bool tcl_buffers;
+   /* Stage B indices fetched by the engine from their buffer object. */
+   bool tcl_index_object;
    /* Stage B non-indexed draws index repeated vertices once. */
    bool tcl_dedupe;
    /* CAP2_COARSE_Z: depth surfaces cleared to 1.0 get a coarse-Z buffer;
@@ -416,6 +418,7 @@ struct chrome9_context {
    struct pipe_poly_stipple poly_stipple;
    uint64_t tcl_triangles;
    uint64_t tcl_buffer_triangles;
+   uint64_t tcl_index_object_triangles;
    uint64_t tcl_buffer_rejects;
    uint64_t tcl_fallback_draws;
    uint64_t tcl_flushes;
