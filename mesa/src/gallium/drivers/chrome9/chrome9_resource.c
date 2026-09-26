@@ -127,6 +127,18 @@ chrome9_resource_volume_layout(const struct pipe_resource *templ,
    return true;
 }
 
+/* Shared window back buffers are tiled and marked GEM_CREATE_TILED. */
+static bool
+chrome9_tiled_back_buffer(struct pipe_screen *screen,
+                          const struct pipe_resource *templ)
+{
+   return (templ->bind & PIPE_BIND_BACKBUFFER) &&
+          (templ->bind & PIPE_BIND_SHARED) &&
+          chrome9_screen_has_capability2(screen,
+                                         DRM_CHROME9_CAP2_TILED_SHARED) &&
+          debug_get_bool_option("CHROME9_TILED_SHARED", true);
+}
+
 static bool
 chrome9_resource_layout(struct pipe_screen *screen,
                         const struct pipe_resource *templ,
@@ -193,14 +205,19 @@ chrome9_resource_layout(struct pipe_screen *screen,
                  !util_is_power_of_two_nonzero(templ->height0)))));
 
    /* Private 2D colour render targets are tiled: the engine renders and
-    * samples them about 30 % faster than linear ones. */
+    * samples them about 30 % faster than linear ones.  So are window back
+    * buffers, whose objects record the layout for their importers; a
+    * scanout buffer that is not a back buffer stays linear. */
    layout->tiled = templ->target == PIPE_TEXTURE_2D &&
       (templ->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
        templ->format == PIPE_FORMAT_B8G8R8X8_UNORM) &&
-      (templ->bind & PIPE_BIND_RENDER_TARGET) &&
-      !(templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT |
-                       PIPE_BIND_DISPLAY_TARGET)) &&
-      !(templ->flags & CHROME9_RESOURCE_FLAG_CANONICAL_SHARED) &&
+      ((templ->bind & PIPE_BIND_RENDER_TARGET) ||
+       (templ->flags & CHROME9_RESOURCE_FLAG_TILED)) &&
+      !(templ->bind & (PIPE_BIND_LINEAR | PIPE_BIND_DISPLAY_TARGET)) &&
+      ((templ->flags & CHROME9_RESOURCE_FLAG_TILED) ||
+       chrome9_tiled_back_buffer(screen, templ) ||
+       (!(templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT)) &&
+        !(templ->flags & CHROME9_RESOURCE_FLAG_CANONICAL_SHARED))) &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_TILED_COLOR) &&
       debug_get_bool_option("CHROME9_TILED_COLOR", true);
    for (unsigned level = 0; level <= templ->last_level; level++) {
@@ -324,6 +341,8 @@ chrome9_format_supported(struct pipe_screen *screen,
    unsigned bgra_bindings = PIPE_BIND_LINEAR;
    bool bgra_render;
 
+   /* A usage hint, not a capability. */
+   bindings &= ~PIPE_BIND_BACKBUFFER;
    if (sample_count > 1 || storage_sample_count > 1)
       return false;
    if (target == PIPE_BUFFER)
@@ -540,9 +559,10 @@ chrome9_resource_create(struct pipe_screen *screen,
 
    if (getenv("CHROME9_DEBUG_RESOURCES"))
       fprintf(stderr,
-              "chrome9: resource target=%u format=%u %ux%ux%u array=%u "
+              "chrome9: resource target=%u format=%s %ux%ux%u array=%u "
               "last=%u samples=%u/%u bind=%#x\n",
-              templ->target, templ->format, templ->width0, templ->height0,
+              templ->target, util_format_short_name(templ->format),
+              templ->width0, templ->height0,
               templ->depth0, templ->array_size, templ->last_level,
               templ->nr_samples, templ->nr_storage_samples, templ->bind);
 
@@ -569,6 +589,9 @@ chrome9_resource_create(struct pipe_screen *screen,
           screen, DRM_CHROME9_CAP_GEM_DMA32_SCANOUT))
       create_flags |= DRM_CHROME9_GEM_CREATE_DMA32_SCANOUT;
 
+   /* Importers learn the tiled layout of a shared object from GEM_INFO. */
+   if (layout.tiled && layout.guarded && (templ->bind & PIPE_BIND_SHARED))
+      create_flags |= DRM_CHROME9_GEM_CREATE_TILED;
    fd = screen->get_screen_fd(screen);
    if (fd < 0)
       goto fail;
@@ -578,7 +601,8 @@ chrome9_resource_create(struct pipe_screen *screen,
    if (chrome9_resource_local(screen, templ, &layout, guarded_shared) &&
        chrome9_bo_create(fd, align64(layout.allocation_size, 4096),
                          DRM_CHROME9_GEM_CREATE_LOCAL |
-                         (create_flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED),
+                         (create_flags & (DRM_CHROME9_GEM_CREATE_GUARDED_SHARED |
+                                          DRM_CHROME9_GEM_CREATE_TILED)),
                          &resource->bo)) {
       resource->local = true;
    } else if (!chrome9_bo_create(fd, layout.allocation_size, create_flags,
@@ -587,9 +611,10 @@ chrome9_resource_create(struct pipe_screen *screen,
    }
 
    if (getenv("CHROME9_DEBUG_RESOURCES"))
-      fprintf(stderr, "chrome9: resource %u bytes %s\n",
+      fprintf(stderr, "chrome9: resource %u bytes %s%s\n",
               (unsigned)layout.allocation_size,
-              resource->local ? "local" : "gart");
+              resource->local ? "local" : "gart",
+              layout.tiled && layout.guarded ? " tiled" : "");
    chrome9_resource_apply_layout(resource, &layout);
    resource->guarded_shared = guarded_shared;
    /* Tiled rows come in eights: other heights stay linear so the object
@@ -641,7 +666,6 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
    if (!whandle || whandle->type != WINSYS_HANDLE_TYPE_FD ||
        (whandle->modifier != DRM_FORMAT_MOD_LINEAR &&
         whandle->modifier != DRM_FORMAT_MOD_INVALID) ||
-       !chrome9_resource_layout(screen, templ, &layout) ||
        templ->last_level ||
        templ->target == PIPE_BUFFER ||
        (templ->format != PIPE_FORMAT_B8G8R8X8_UNORM &&
@@ -669,28 +693,39 @@ chrome9_resource_from_handle(struct pipe_screen *screen,
     * no-op for implicit objects). */
    resource->explicit_access = true;
    resource->shared = true;
-   resource->local = chrome9_bo_info(fd, &resource->bo, &bo_flags) &&
-                     (bo_flags & DRM_CHROME9_GEM_CREATE_LOCAL);
+   if (!chrome9_bo_info(fd, &resource->bo, &bo_flags))
+      bo_flags = 0;
+   resource->local = bo_flags & DRM_CHROME9_GEM_CREATE_LOCAL;
+   /* A tiled object has only its tiled guarded layout. */
+   if (bo_flags & DRM_CHROME9_GEM_CREATE_TILED) {
+      if (whandle->modifier != DRM_FORMAT_MOD_INVALID)
+         goto fail_bo;
+      guarded_templ.flags |= CHROME9_RESOURCE_FLAG_TILED;
+   }
+   if (!chrome9_resource_layout(screen, &guarded_templ, &layout))
+      goto fail_bo;
    /* A native Chrome9 DRI3 export retains the complete canonical guarded
     * allocation.  Preserve that fact after same-device PRIME import so the
     * consumer can submit the BO directly and share its reservation object;
     * this avoids a stale userspace sampler copy.  Every tuple which is not
     * exact remains an ordinary unguarded external resource. */
    guarded_templ.flags |= CHROME9_RESOURCE_FLAG_CANONICAL_SHARED;
-   if (whandle->stride == layout.level_stride[0] &&
+   if (!(bo_flags & DRM_CHROME9_GEM_CREATE_TILED) &&
+       whandle->stride == layout.level_stride[0] &&
        whandle->offset == layout.level_offset[0] &&
        resource->bo.size == layout.allocation_size) {
       chrome9_resource_apply_layout(resource, &layout);
    } else if (!whandle->offset &&
               chrome9_screen_has_capability2(
                  screen, DRM_CHROME9_CAP2_GUARDED_SHARED) &&
-              chrome9_bo_info(fd, &resource->bo, &bo_flags) &&
               (bo_flags & DRM_CHROME9_GEM_CREATE_GUARDED_SHARED) &&
               chrome9_resource_layout(screen, &guarded_templ, &guarded) &&
               whandle->stride == guarded.level_stride[0] &&
               resource->bo.size == guarded.allocation_size) {
       chrome9_resource_apply_layout(resource, &guarded);
       resource->guarded_shared = true;
+   } else if (bo_flags & DRM_CHROME9_GEM_CREATE_TILED) {
+      goto fail_bo;
    } else {
       resource->stride = whandle->stride;
       resource->data_offset = whandle->offset;
@@ -803,7 +838,9 @@ chrome9_resource_get_handle(struct pipe_screen *screen,
    }
    whandle->stride = resource->stride;
    whandle->offset = resource->guarded_shared ? 0 : resource->data_offset;
-   whandle->modifier = DRM_FORMAT_MOD_LINEAR;
+   /* The tiled layout is implicit, recorded in the object. */
+   whandle->modifier = resource->tiled ? DRM_FORMAT_MOD_INVALID :
+                                         DRM_FORMAT_MOD_LINEAR;
    return true;
 }
 
@@ -1688,6 +1725,108 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
    return last_level + 1;
 }
 
+/*
+ * Copy a BGRA/BGRX level to an equally sized level of a guarded resource on
+ * the 3D engine: NEAREST samples at texel centres are exact, and either
+ * side may be tiled or local, so the CPU never detiles nor reads
+ * write-combined memory.  The copy is queued behind submitted jobs, the
+ * caller flushes retained work first; CPU access waits for the copy.
+ */
+bool
+chrome9_resource_copy_gpu(struct chrome9_context *ctx,
+                          struct chrome9_resource *dst, unsigned dst_level,
+                          struct chrome9_resource *src, unsigned level)
+{
+   static const unsigned corner[6][2] = {
+      { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 },
+   };
+   static const struct drm_chrome9_fragment_instruction program[2] = {
+      { .op = DRM_CHROME9_FRAGMENT_OP_TEX,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_TEMP, 0, 0xf, 0 },
+        .src = { { DRM_CHROME9_FRAGMENT_FILE_VARYING, 0, { 0, 1, 2, 3 },
+                   0, 0 } } },
+      { .op = DRM_CHROME9_FRAGMENT_OP_MOV,
+        .dst = { DRM_CHROME9_FRAGMENT_DEST_COLOR, 0, 0xf, 0 },
+        .src = { { DRM_CHROME9_FRAGMENT_FILE_TEMP, 0, { 0, 1, 2, 3 },
+                   0, 0 } } },
+   };
+   const struct pipe_resource *spres = &src->base, *dpres = &dst->base;
+   const bool bgra = spres->format == PIPE_FORMAT_B8G8R8A8_UNORM;
+   const unsigned w = u_minify(spres->width0, level);
+   const unsigned h = u_minify(spres->height0, level);
+   const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
+   struct drm_chrome9_fragment_texture_state texture = { 0 };
+   struct drm_chrome9_fragment_vertex vertices[6];
+   struct drm_chrome9_draw_fragment_program draw = {
+      .destination_handle = dst->bo.handle,
+      .flags = DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED |
+               (chrome9_resource_is_tiled(dst) ?
+                DRM_CHROME9_FRAGMENT_DESTINATION_TILED : 0),
+      .triangle_count = 2,
+      .width = w,
+      .height = h,
+      .destination_format = bgra ? DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
+                                   DRM_CHROME9_DESTINATION_FORMAT_BGRX8888,
+      .instruction_count = ARRAY_SIZE(program),
+      .texture_count = 1,
+      .varying_count = 1,
+      .abi_version = DRM_CHROME9_FRAGMENT_ABI_VERSION,
+      .vertices_ptr = (uintptr_t)vertices,
+      .instructions_ptr = (uintptr_t)program,
+      .textures_ptr = (uintptr_t)&texture,
+   };
+
+   if (!ctx->draw_fragment_program ||
+       !chrome9_screen_has_capability2(ctx->base.screen,
+                                       DRM_CHROME9_CAP2_DESTINATION_OFFSET) ||
+       !src->guarded || !dst->guarded || src->sampler_unsupported ||
+       spres->format != dpres->format ||
+       (!bgra && spres->format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
+       spres->target != PIPE_TEXTURE_2D || dpres->target != PIPE_TEXTURE_2D ||
+       level > spres->last_level || dst_level > dpres->last_level ||
+       u_minify(dpres->width0, dst_level) != w ||
+       u_minify(dpres->height0, dst_level) != h || w > 2048 || h > 2048 ||
+       spres->last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
+       dst->level_offset[dst_level] > UINT32_MAX)
+      return false;
+   texture.handle = src->bo.handle;
+   texture.flags = chrome9_resource_texture_flags(src);
+   texture.format = bgra ? DRM_CHROME9_FRAGMENT_TEXTURE_BGRA8888 :
+                           DRM_CHROME9_FRAGMENT_TEXTURE_BGRX8888;
+   texture.width = spres->width0;
+   texture.height = spres->height0;
+   texture.last_level = spres->last_level;
+   texture.min_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   texture.mag_filter = DRM_CHROME9_TEXTURE_FILTER_NEAREST;
+   texture.mip_filter = spres->last_level ?
+                        DRM_CHROME9_TEXTURE_MIP_FILTER_NEAREST :
+                        DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
+   texture.wrap_s = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   texture.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   texture.min_lod_s5_5 = level * 32;
+   texture.max_lod_s5_5 = level * 32;
+   for (unsigned l = 0; l <= spres->last_level; l++) {
+      if (src->level_offset[l] > UINT32_MAX)
+         return false;
+      texture.level_offset[l] = src->level_offset[l];
+      texture.level_pitch[l] = src->level_stride[l];
+   }
+   draw.destination_offset = dst->level_offset[dst_level];
+   draw.destination_pitch = dst->level_stride[dst_level];
+   memset(vertices, 0, sizeof(vertices));
+   for (unsigned v = 0; v < 6; v++) {
+      /* Pixel centres at integer window coordinates, texel centres at
+       * (i + 0.5) / size. */
+      vertices[v].x_16_16 = (int32_t)(corner[v][0] * w << 16) - 0x8000;
+      vertices[v].y_16_16 = (int32_t)(corner[v][1] * h << 16) - 0x8000;
+      vertices[v].rhw_float = fui(1.0f);
+      vertices[v].varying[0][0] = fui((float)corner[v][0]);
+      vertices[v].varying[0][1] = fui((float)corner[v][1]);
+      vertices[v].varying[0][3] = fui(1.0f);
+   }
+   return chrome9_draw_fragment_program(fd, &draw);
+}
+
 bool
 chrome9_generate_mipmap(struct pipe_context *pipe,
                         struct pipe_resource *pres,
@@ -1765,8 +1904,11 @@ chrome9_query_dmabuf_modifiers(struct pipe_screen *screen,
                                uint64_t *modifiers,
                                unsigned int *external_only, int *count)
 {
-   (void)screen;
-   *count = chrome9_modifier_format(format) ? 1 : 0;
+   /* With implicitly tiled back buffers DRI3 must not ask for LINEAR. */
+   *count = chrome9_modifier_format(format) &&
+            !(chrome9_screen_has_capability2(screen,
+                                             DRM_CHROME9_CAP2_TILED_SHARED) &&
+              debug_get_bool_option("CHROME9_TILED_SHARED", true)) ? 1 : 0;
    if (max && *count) {
       modifiers[0] = DRM_FORMAT_MOD_LINEAR;
       if (external_only)

@@ -27,6 +27,8 @@ chrome9_is_surface_target(enum pipe_texture_target target)
 
 /* Created through a LINEAR modifier: shared yet guarded (BO + PAGE). */
 #define CHROME9_RESOURCE_FLAG_CANONICAL_SHARED PIPE_RESOURCE_FLAG_DRV_PRIV
+/* Import of an object created with GEM_CREATE_TILED. */
+#define CHROME9_RESOURCE_FLAG_TILED (PIPE_RESOURCE_FLAG_DRV_PRIV << 1)
 
 struct chrome9_resource {
    struct pipe_resource base;
@@ -212,5 +214,11 @@ bool chrome9_generate_mipmap(struct pipe_context *pipe,
 
 void chrome9_init_screen_resource_functions(struct pipe_screen *screen);
 void chrome9_init_context_resource_functions(struct pipe_context *pipe);
+
+struct chrome9_context;
+bool chrome9_resource_copy_gpu(struct chrome9_context *ctx,
+                               struct chrome9_resource *dst,
+                               unsigned dst_level,
+                               struct chrome9_resource *src, unsigned level);
 
 #endif

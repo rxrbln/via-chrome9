@@ -134,8 +134,11 @@ struct chrome9_sw_bounce {
 };
 
 struct chrome9_sw_context {
+   struct chrome9_context *ctx;
    struct pipe_screen *screen;
    struct pipe_context *lp;
+   /* Linear GART image of a tiled local level, filled by the engine. */
+   struct pipe_resource *staging;
    /* chrome9 CSO/shader/resource pointer -> llvmpipe object. */
    struct hash_table *objects;
    /* Per-level aliases of the pending draws, released by chrome9_sw_finish
@@ -167,6 +170,77 @@ chrome9_sw_enabled(void)
    return enabled;
 }
 
+/* The CPU reads write-combined local memory uncached: a tiled local level
+ * goes through a linear GART staging image the engine converts. */
+static bool
+chrome9_sw_staged(const struct chrome9_resource *res)
+{
+   return res->local && chrome9_resource_is_tiled(res) &&
+          (res->base.format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+           res->base.format == PIPE_FORMAT_B8G8R8X8_UNORM) &&
+          debug_get_bool_option("CHROME9_SW_GPU_DETILE", true);
+}
+
+static struct chrome9_resource *
+chrome9_sw_staging(struct chrome9_sw_context *sw,
+                   const struct chrome9_resource *res, unsigned level)
+{
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = res->base.format,
+      .width0 = u_minify(res->base.width0, level),
+      .height0 = u_minify(res->base.height0, level),
+      .depth0 = 1,
+      .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct pipe_resource *staging = sw->staging;
+
+   if (!staging || staging->format != templ.format ||
+       staging->width0 != templ.width0 || staging->height0 != templ.height0) {
+      pipe_resource_reference(&sw->staging, NULL);
+      sw->staging = sw->ctx->base.screen->resource_create(
+         sw->ctx->base.screen, &templ);
+      if (!sw->staging)
+         return NULL;
+   }
+   return chrome9_resource(sw->staging);
+}
+
+/* Copy between a staged level and rows of a CPU mapping.  The staging
+ * pages are accessed directly: a transfer map would flush pending
+ * fallback draws from inside the fallback. */
+static bool
+chrome9_sw_staged_copy(struct chrome9_sw_context *sw,
+                       struct chrome9_resource *res, unsigned level,
+                       uint8_t *rows, unsigned stride, bool to_resource)
+{
+   struct chrome9_resource *staging = chrome9_sw_staging(sw, res, level);
+   unsigned row_bytes, height;
+   uint8_t *map;
+
+   if (!staging || !staging->bo.map)
+      return false;
+   row_bytes = util_format_get_stride(res->base.format,
+                                      staging->base.width0);
+   height = staging->base.height0;
+   if (!to_resource &&
+       !chrome9_resource_copy_gpu(sw->ctx, staging, 0, res, level))
+      return false;
+   chrome9_resource_cpu_access(staging, to_resource);
+   map = (uint8_t *)staging->bo.map + staging->level_offset[0];
+   for (unsigned y = 0; y < height; y++) {
+      if (to_resource)
+         memcpy(map + (size_t)y * staging->level_stride[0],
+                rows + (size_t)y * stride, row_bytes);
+      else
+         memcpy(rows + (size_t)y * stride,
+                map + (size_t)y * staging->level_stride[0], row_bytes);
+   }
+   return !to_resource ||
+          chrome9_resource_copy_gpu(sw->ctx, res, level, staging, 0);
+}
+
 static void
 chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
                        struct chrome9_sw_bounce *bounce)
@@ -188,11 +262,17 @@ chrome9_sw_bounce_back(struct chrome9_sw_context *sw,
       src = sw->lp->texture_map(sw->lp, bounce->copy, 0, PIPE_MAP_READ,
                                 &box, &transfer);
       if (src) {
-         chrome9_resource_cpu_access(res, true);
-         chrome9_tiled_copy((uint8_t *)res->bo.map + res->level_offset[level],
-                            res->level_stride[level],
-                            chrome9_resource_is_tiled(res), 0, 0, row_bytes,
-                            rows, (uint8_t *)src, transfer->stride, true);
+         if (!chrome9_sw_staged(res) ||
+             !chrome9_sw_staged_copy(sw, res, level, (uint8_t *)src,
+                                     transfer->stride, true)) {
+            chrome9_resource_cpu_access(res, true);
+            chrome9_tiled_copy((uint8_t *)res->bo.map +
+                               res->level_offset[level],
+                               res->level_stride[level],
+                               chrome9_resource_is_tiled(res), 0, 0,
+                               row_bytes, rows, (uint8_t *)src,
+                               transfer->stride, true);
+         }
          sw->lp->texture_unmap(sw->lp, transfer);
       }
    }
@@ -262,6 +342,7 @@ chrome9_sw_context(struct chrome9_context *ctx)
    sw = CALLOC_STRUCT(chrome9_sw_context);
    if (!sw)
       return NULL;
+   sw->ctx = ctx;
    sw->screen = chrome9_screen_sw(ctx->base.screen);
    sw->pixel_center_integer =
       ctx->base.screen->caps.fs_coord_pixel_center_integer;
@@ -403,6 +484,7 @@ chrome9_sw_context_destroy(struct chrome9_context *ctx)
    _mesa_hash_table_u64_destroy(sw->aliases);
    util_dynarray_fini(&sw->held);
    util_dynarray_fini(&sw->bounces);
+   pipe_resource_reference(&sw->staging, NULL);
    if (chrome9_sw_debug())
       fprintf(stderr, "chrome9: sw fallback draws=%" PRIu64 " time=%" PRIu64
                       " us\n", sw->draws, sw->us);
@@ -628,12 +710,15 @@ chrome9_sw_upload(struct chrome9_sw_context *sw, struct pipe_resource *copy,
                              &box, &transfer);
    if (!dst)
       return false;
-   chrome9_tiled_copy((uint8_t *)res->bo.map + res->level_offset[level],
-                      res->level_stride[level],
-                      chrome9_resource_is_tiled(res), 0, 0,
-                      util_format_get_stride(resource->format, box.width),
-                      util_format_get_nblocksy(resource->format, box.height),
-                      dst, transfer->stride, false);
+   if (!chrome9_sw_staged(res) ||
+       !chrome9_sw_staged_copy(sw, res, level, dst, transfer->stride, false))
+      chrome9_tiled_copy((uint8_t *)res->bo.map + res->level_offset[level],
+                         res->level_stride[level],
+                         chrome9_resource_is_tiled(res), 0, 0,
+                         util_format_get_stride(resource->format, box.width),
+                         util_format_get_nblocksy(resource->format,
+                                                  box.height),
+                         dst, transfer->stride, false);
    sw->lp->texture_unmap(sw->lp, transfer);
    return true;
 }
