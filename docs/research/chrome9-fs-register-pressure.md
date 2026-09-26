@@ -430,3 +430,21 @@ vertex texture fetch of 2 x 66049 bilinear samples (9.0 ms per lookup,
 now 6.5 ms with an integer-floor path and SSE2 fixed-point filtering),
 `tcl_draw_pass` and copies, serialized with the GPU because each frame's
 noise, normal map and vertex fetch depend on each other.
+
+**Depth views with partial TEX results** (Mesa, with the specialization
+change).  Specialization turned depth-tex-modes-glsl's `color *
+depth.w` into a TEX writing only W.  Two draw-time bugs followed, both
+reachable by any shader that reads few lanes of a depth texture:
+
+* `chrome9_fragment_apply_depth_swizzles` redirected every depth lane to
+  lane X, which a W-only TEX never wrote.  Type-FE depth arrives in every
+  native lane, so a depth lane now reads itself; only ZERO/ONE lanes are
+  substituted.
+* With a LUMINANCE or INTENSITY view the W read becomes the constant ONE
+  and the TEX result is dead; the kernel rejects a written but never read
+  temporary (`chrome9_fragment_validate:462`) and the draw was dropped.
+  `chrome9_fragment_drop_dead_textures` now removes such a TEX, moves the
+  lane-free reads of its temporary to a constant register the program
+  already reads, and `chrome9_fragment_trim_textures` keeps the texture
+  descriptors consistent with the samplers still read (dense: count =
+  highest used + 1; sparse: descriptors of used samplers only).
