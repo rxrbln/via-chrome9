@@ -404,6 +404,8 @@ struct chrome9_context {
    struct chrome9_tcl_state *tcl_state;
    /* llvmpipe fragment fallback (chrome9_swfb.c), created on first use. */
    struct chrome9_sw_context *sw;
+   /* Linear GART image the engine detiles local levels into for reads. */
+   struct pipe_resource *readback;
    struct pipe_blend_color blend_color;
    struct pipe_clip_state clip;
    struct pipe_poly_stipple poly_stipple;

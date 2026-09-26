@@ -540,8 +540,9 @@ chrome9_resource_local(struct pipe_screen *screen,
    (void)guarded_shared;
    return enabled && layout->guarded &&
           templ->target == PIPE_TEXTURE_2D &&
-          !(templ->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
-          (templ->bind & bind) &&
+          ((!(templ->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
+            (templ->bind & bind)) ||
+           (templ->flags & CHROME9_RESOURCE_FLAG_LOCAL)) &&
           chrome9_screen_has_capability2(screen,
                                          DRM_CHROME9_CAP2_LOCAL_MEMORY);
 }
@@ -1059,6 +1060,55 @@ chrome9_invalidate_resource(struct pipe_context *pipe,
                          &box);
 }
 
+/*
+ * A linear GART image holding a box of a tiled local BGRA/BGRX level at its
+ * top left, copied by the engine for a CPU read: the CPU then neither
+ * detiles nor reads write-combined memory, which pays off from about 64 KiB
+ * on.
+ */
+static struct chrome9_resource *
+chrome9_transfer_readback(struct chrome9_context *ctx,
+                          struct chrome9_resource *res, unsigned level,
+                          const struct pipe_box *box)
+{
+   struct pipe_screen *screen = ctx->base.screen;
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = res->base.format,
+      .width0 = box->width,
+      .height0 = box->height,
+      .depth0 = 1,
+      .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct chrome9_resource *image;
+
+   if (!res->local || !chrome9_resource_is_tiled(res) ||
+       (res->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+        res->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
+       (uint64_t)box->width * box->height * 4 < 64 * 1024 ||
+       !debug_get_bool_option("CHROME9_GPU_READBACK", true))
+      return NULL;
+   if (!ctx->readback || ctx->readback->format != templ.format ||
+       ctx->readback->width0 < templ.width0 ||
+       ctx->readback->height0 < templ.height0) {
+      templ.width0 = MAX2(templ.width0,
+                          ctx->readback ? ctx->readback->width0 : 0);
+      templ.height0 = MAX2(templ.height0,
+                           ctx->readback ? ctx->readback->height0 : 0);
+      pipe_resource_reference(&ctx->readback, NULL);
+      ctx->readback = screen->resource_create(screen, &templ);
+      if (!ctx->readback)
+         return NULL;
+   }
+   image = chrome9_resource(ctx->readback);
+   if (image->local || chrome9_resource_is_tiled(image) || !image->bo.map ||
+       !chrome9_resource_copy_gpu(ctx, image, 0, res, level, box))
+      return NULL;
+   chrome9_resource_cpu_access(image, false);
+   return image;
+}
+
 static void *
 chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                      unsigned level, unsigned usage,
@@ -1161,11 +1211,26 @@ chrome9_transfer_map(struct pipe_context *pipe, struct pipe_resource *resource,
          return NULL;
       }
       if (!(usage & PIPE_MAP_DISCARD_RANGE) &&
-          !(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE))
-         chrome9_tiled_copy(ctransfer->level_base, ctransfer->pitch, true,
-                            box->x * cpp, box->y, ctransfer->bytes,
-                            box->height, ctransfer->staging,
-                            ctransfer->bytes, false);
+          !(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE)) {
+         struct chrome9_resource *image =
+            chrome9_transfer_readback(chrome9_context(pipe), cresource,
+                                      level, box);
+
+         if (image) {
+            const uint8_t *src = (const uint8_t *)image->bo.map +
+                                 image->level_offset[0];
+
+            for (int y = 0; y < box->height; y++)
+               memcpy(ctransfer->staging + (size_t)y * ctransfer->bytes,
+                      src + (size_t)y * image->level_stride[0],
+                      ctransfer->bytes);
+         } else {
+            chrome9_tiled_copy(ctransfer->level_base, ctransfer->pitch, true,
+                               box->x * cpp, box->y, ctransfer->bytes,
+                               box->height, ctransfer->staging,
+                               ctransfer->bytes, false);
+         }
+      }
       *out_transfer = transfer;
       return ctransfer->staging;
    }
@@ -1726,8 +1791,8 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
 }
 
 /*
- * Copy a BGRA/BGRX level to an equally sized level of a guarded resource on
- * the 3D engine: NEAREST samples at texel centres are exact, and either
+ * Copy a BGRA/BGRX level, or a box of it, to the top left of a level at
+ * least as large on the 3D engine: NEAREST samples at texel centres are exact, and either
  * side may be tiled or local, so the CPU never detiles nor reads
  * write-combined memory.  The copy is queued behind submitted jobs, the
  * caller flushes retained work first; CPU access waits for the copy.
@@ -1735,7 +1800,8 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
 bool
 chrome9_resource_copy_gpu(struct chrome9_context *ctx,
                           struct chrome9_resource *dst, unsigned dst_level,
-                          struct chrome9_resource *src, unsigned level)
+                          struct chrome9_resource *src, unsigned level,
+                          const struct pipe_box *box)
 {
    static const unsigned corner[6][2] = {
       { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 },
@@ -1752,8 +1818,10 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
    };
    const struct pipe_resource *spres = &src->base, *dpres = &dst->base;
    const bool bgra = spres->format == PIPE_FORMAT_B8G8R8A8_UNORM;
-   const unsigned w = u_minify(spres->width0, level);
-   const unsigned h = u_minify(spres->height0, level);
+   const unsigned lw = u_minify(spres->width0, level);
+   const unsigned lh = u_minify(spres->height0, level);
+   const unsigned x = box ? box->x : 0, y = box ? box->y : 0;
+   const unsigned w = box ? box->width : lw, h = box ? box->height : lh;
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
    struct drm_chrome9_fragment_texture_state texture = { 0 };
    struct drm_chrome9_fragment_vertex vertices[6];
@@ -1784,8 +1852,10 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
        (!bgra && spres->format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
        spres->target != PIPE_TEXTURE_2D || dpres->target != PIPE_TEXTURE_2D ||
        level > spres->last_level || dst_level > dpres->last_level ||
-       u_minify(dpres->width0, dst_level) != w ||
-       u_minify(dpres->height0, dst_level) != h || w > 2048 || h > 2048 ||
+       (box && (box->x < 0 || box->y < 0 || !box->width || !box->height ||
+                x + w > lw || y + h > lh)) ||
+       u_minify(dpres->width0, dst_level) < w ||
+       u_minify(dpres->height0, dst_level) < h || w > 2048 || h > 2048 ||
        spres->last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
        dst->level_offset[dst_level] > UINT32_MAX)
       return false;
@@ -1820,8 +1890,10 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
       vertices[v].x_16_16 = (int32_t)(corner[v][0] * w << 16) - 0x8000;
       vertices[v].y_16_16 = (int32_t)(corner[v][1] * h << 16) - 0x8000;
       vertices[v].rhw_float = fui(1.0f);
-      vertices[v].varying[0][0] = fui((float)corner[v][0]);
-      vertices[v].varying[0][1] = fui((float)corner[v][1]);
+      vertices[v].varying[0][0] =
+         fui((float)(x + corner[v][0] * w) / (float)lw);
+      vertices[v].varying[0][1] =
+         fui((float)(y + corner[v][1] * h) / (float)lh);
       vertices[v].varying[0][3] = fui(1.0f);
    }
    return chrome9_draw_fragment_program(fd, &draw);

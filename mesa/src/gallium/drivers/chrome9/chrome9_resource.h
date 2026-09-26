@@ -10,6 +10,7 @@
 #include "chrome9_drm.h"
 
 struct chrome9_context;
+struct pipe_box;
 #include "pipe/p_state.h"
 #include "util/macros.h"
 #include "util/u_dynarray.h"
@@ -29,6 +30,8 @@ chrome9_is_surface_target(enum pipe_texture_target target)
 #define CHROME9_RESOURCE_FLAG_CANONICAL_SHARED PIPE_RESOURCE_FLAG_DRV_PRIV
 /* Import of an object created with GEM_CREATE_TILED. */
 #define CHROME9_RESOURCE_FLAG_TILED (PIPE_RESOURCE_FLAG_DRV_PRIV << 1)
+/* Local memory whatever the binding (linear fallback staging images). */
+#define CHROME9_RESOURCE_FLAG_LOCAL (PIPE_RESOURCE_FLAG_DRV_PRIV << 2)
 
 struct chrome9_resource {
    struct pipe_resource base;
@@ -219,6 +222,7 @@ struct chrome9_context;
 bool chrome9_resource_copy_gpu(struct chrome9_context *ctx,
                                struct chrome9_resource *dst,
                                unsigned dst_level,
-                               struct chrome9_resource *src, unsigned level);
+                               struct chrome9_resource *src, unsigned level,
+                               const struct pipe_box *box);
 
 #endif

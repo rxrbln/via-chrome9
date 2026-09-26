@@ -50,6 +50,22 @@ chrome9_sw_forget(struct chrome9_context *ctx, const void *object)
 {
    (void)ctx; (void)object;
 }
+static inline bool
+chrome9_sw_kept_valid(struct chrome9_context *ctx,
+                      struct pipe_resource *resource, unsigned level)
+{
+   (void)ctx; (void)resource; (void)level;
+   return false;
+}
+static inline void
+chrome9_sw_kept_clear(struct chrome9_context *ctx,
+                      struct pipe_resource *resource, unsigned level,
+                      const union pipe_color_union *color,
+                      unsigned x, unsigned y, unsigned width, unsigned height)
+{
+   (void)ctx; (void)resource; (void)level; (void)color;
+   (void)x; (void)y; (void)width; (void)height;
+}
 static inline void chrome9_sw_context_destroy(struct chrome9_context *ctx) { (void)ctx; }
 static inline struct pipe_context *
 chrome9_sw_pipe(struct chrome9_context *ctx)

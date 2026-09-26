@@ -10703,6 +10703,7 @@ chrome9_context_destroy(struct pipe_context *pipe)
    util_dynarray_fini(&ctx->split_carriers);
    chrome9_query_context_destroy(ctx);
    chrome9_sw_context_destroy(ctx);
+   pipe_resource_reference(&ctx->readback, NULL);
    if (ctx->reject_sites)
       _mesa_hash_table_destroy(ctx->reject_sites, NULL);
    ctx->reject_sites = NULL;
