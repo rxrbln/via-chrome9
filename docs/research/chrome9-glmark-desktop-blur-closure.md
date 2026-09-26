@@ -1,7 +1,11 @@
 # Chrome9 glmark2 desktop blur compiler boundary
 
-Status: source-exact compiler test, bounded live scene, and a deterministic
-two-pass GPU-versus-CPU blur pixel oracle; full scene validation remains open.
+Status: done (2026-09-26).  The default scene runs entirely on the
+hardware; the whole validation frame is within 5 LSB of llvmpipe (99.7 %
+within 1 LSB), the remaining deviation being the sampler's 5-bit bilinear
+weights, accepted as LSB precision.  glmark2 `--validate` misses its
+reference by 1 LSB in G and B (`chrome9-dlight-alpha-blur-precision.md`
+stage-dump result and §2.8).
 
 This note closes the static compiler envelope for the default glmark2 desktop
 blur and identifies the first independently implementable generic Mesa gate.

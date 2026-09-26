@@ -500,3 +500,41 @@ precision on a 1-texel hard edge, not a driver conversion error.  It is a
 hardware precision limit for the conformance phase; the E3 micro-oracle
 (section 2.5) would quantify the weight resolution if a coordinate
 pre-bias is ever to be attempted.
+
+### 2.8 Closure (2026-09-26): hardware run and LSB deviation
+
+The deviation is accepted as LSB-level hardware precision.  Mesa p103
+(`1d885e1`), 800x600, `desktop:windows=4:effect=blur:blur-radius=5:passes=1:
+separable=true`:
+
+- Everything runs on the VX900: every fragment program is supported
+  (`CHROME9_DEBUG_SHADERS`: no `supported=0` program is created or bound;
+  the blur passes compile to 33 IR records), `gmdiag.sh` reports 0 fallback
+  draws and no TCL fallback, 49 fps.
+- `glmark2 --validate`: READPIXEL (512,209) = 136/162/79 against llvmpipe
+  136/163/80, i.e. 1 LSB in G and B; the reference distance of 4.24 fails
+  glmark2's 3.47 limit, llvmpipe passes at 3.16.
+- Whole-frame comparison of the validation frame (LD_PRELOAD shim dumps
+  the 800x600 framebuffer before glmark2's 1x1 read, both drivers):
+  max |hw - llvmpipe| per channel R 4, G 5, B 4, A 0; 453473 pixels equal,
+  24976 differ by 1, 1048 by 2, 368 by 3, 131 by 4, 4 by 5 (of 480000).
+  The 503 pixels above 2 LSB all lie on high-contrast edges (local
+  contrast >= 44 levels) of textures sampled with GL_LINEAR at a
+  non-integer scale: the Tux window image (512x512 minified to 210x210
+  without mipmaps), the title bar gradient and the background image.  The
+  blurred desktop inside the windows differs by at most 1 LSB.  Images in
+  `artifacts/2026-09-26/blur-{hw-p103,llvmpipe,diff-p103}.png` (diff: grey 1,
+  blue 2, red 3, yellow >= 4 LSB).
+- The cause is the sampler.  An E3 micro-oracle (2x2 `rgbw` texture,
+  GL_LINEAR, 256 sub-texel positions per texel, once with a computed and
+  once with an interpolated coordinate) returns 32 distinct weights on the
+  hardware: the bilinear weight is round(32 * f) / 32, a 5-bit fraction.
+  The largest weight error is 1/64 of the texel difference, 4 LSB on a
+  0-to-255 edge; llvmpipe interpolates with 7-8 bit weights.  The sampler
+  has no finer filter mode, and emulating bilinear filtering in the
+  program (four NEAREST fetches and three lerps per sample) would cost
+  more than the 11-tap blur itself, so nothing larger than the hardware
+  weight step is left to fix in the driver.
+
+Section 2.3's "bilinear weight rounded to 5 bits" row is therefore the
+actual hardware, and the validation miss is the expected 1-LSB outcome.

@@ -70,7 +70,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | fragment programs above 96 ALU records | llvmpipe fallback | 96 is the store size in every vendor driver (overflow silently truncated); multi-pass splitting needs R32F targets (untested) and denser code (`chrome9-long-fragment-programs.md`) |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
 | terrain fragment shader, glmark2 ideas (one FS above 96 records), some GL2 draws | llvmpipe fallback / software vertex path | per-case compiler work; cel runs on hardware since flagged arithmetic of finite operands counts as finite (32 -> 81 fps) |
-| desktop blur | validation fails (sampler precision) | open |
+| desktop blur | done: runs entirely on the hardware (no unsupported FS, no fallback draws, 49 fps at 800x600); glmark2 `--validate` reports 1 LSB (G, B) off its reference pixel | accepted LSB deviation: the sampler's bilinear weights have 5 bits (1/32 steps), max 5 LSB against llvmpipe on high-contrast texel edges, 99.7 % of pixels within 1 LSB (`chrome9-dlight-alpha-blur-precision.md` §2.8) |
 
 ## Not implemented
 
