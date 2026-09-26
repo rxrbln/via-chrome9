@@ -3105,6 +3105,15 @@ static bool chrome9_ps_lower_round(struct chrome9_ps_nir_builder *builder,
                                    struct chrome9_ps_source *source);
 
 static bool
+chrome9_ps_alu_src_is_fneg(const nir_alu_src *source)
+{
+   nir_instr *instr = nir_def_instr(source->src.ssa);
+
+   return instr->type == nir_instr_type_alu &&
+          nir_instr_as_alu(instr)->op == nir_op_fneg;
+}
+
+static bool
 chrome9_ps_lower_alu_source_depth(struct chrome9_ps_nir_builder *builder,
                                   const nir_alu_src *nir_source,
                                   unsigned components,
@@ -3131,7 +3140,10 @@ chrome9_ps_lower_alu_source_depth(struct chrome9_ps_nir_builder *builder,
                return false;
             folded.swizzle[c] = alu->src[0].swizzle[component];
          }
-         if (chrome9_ps_lower_alu_source_depth(builder, &folded, components,
+         /* Without a modifier only a double negation folds; do not lower
+          * the operand ahead of the negation's own lowering. */
+         if ((allow_modifier || chrome9_ps_alu_src_is_fneg(&folded)) &&
+             chrome9_ps_lower_alu_source_depth(builder, &folded, components,
                                                source, depth + 1,
                                                allow_modifier)) {
             uint8_t modifier = source->modifier ==
@@ -3186,14 +3198,13 @@ static bool
 chrome9_ps_source_modifier_allowed(enum chrome9_ps_opcode op,
                                    unsigned source)
 {
-   /* The A operand of MAD and CMP has a silicon-qualified NEG source
-    * modifier.  CHROME9_PS_NEG_SLOTS extends it to every A operand and to
-    * the B operand (qualified by the kernel's ABS lowering); C stays on
-    * the explicit MUL(-1) fallback. */
+   /* NEG is silicon-qualified on A of every op but FRC (FRC(-0) is 1.0)
+    * and on B of ADD, SUB, MAD and CMP; C has none.  CHROME9_PS_NEG_SLOTS=0
+    * keeps only the MAD/CMP A operand. */
    static int slots = -1;
 
    if (slots < 0)
-      slots = debug_get_bool_option("CHROME9_PS_NEG_SLOTS", false);
+      slots = debug_get_bool_option("CHROME9_PS_NEG_SLOTS", true);
    switch (op) {
    case CHROME9_PS_OPCODE_MAD:
    case CHROME9_PS_OPCODE_CMP:
@@ -3215,6 +3226,153 @@ chrome9_ps_source_modifier_allowed(enum chrome9_ps_opcode op,
    default:
       return false;
    }
+}
+
+/* Commutative factors: move a negated operand out of a NEG-less slot. */
+static void
+chrome9_ps_source_order(enum chrome9_ps_opcode op, const nir_alu_src *src,
+                        unsigned count, unsigned order[3])
+{
+   for (unsigned s = 0; s < 3; s++)
+      order[s] = s;
+   switch (op) {
+   case CHROME9_PS_OPCODE_MUL:
+   case CHROME9_PS_OPCODE_ADD:
+   case CHROME9_PS_OPCODE_MAD:
+   case CHROME9_PS_OPCODE_MIN:
+   case CHROME9_PS_OPCODE_MAX:
+   case CHROME9_PS_OPCODE_DP3:
+   case CHROME9_PS_OPCODE_DP4:
+      break;
+   default:
+      return;
+   }
+   if (count >= 2 && !chrome9_ps_source_modifier_allowed(op, 1) &&
+       chrome9_ps_source_modifier_allowed(op, 0) &&
+       chrome9_ps_alu_src_is_fneg(&src[1]) &&
+       !chrome9_ps_alu_src_is_fneg(&src[0])) {
+      order[0] = 1;
+      order[1] = 0;
+   }
+}
+
+static bool
+chrome9_ps_immediate(struct chrome9_ps_nir_builder *builder,
+                     const uint32_t value[4], unsigned components,
+                     struct chrome9_ps_source *source);
+
+/* Resolve a NEG modifier the consumer slot cannot encode into a temp. */
+static bool
+chrome9_ps_settle_modifier(struct chrome9_ps_nir_builder *builder,
+                           enum chrome9_ps_opcode op, unsigned slot,
+                           struct chrome9_ps_source *source)
+{
+   static const uint32_t negative_one[4] = {
+      0xbf800000, 0xbf800000, 0xbf800000, 0xbf800000,
+   };
+   struct chrome9_ps_instruction *instruction;
+   struct chrome9_ps_source operand = *source;
+
+   /* MISC/POSITION has no qualified source-modifier encoding. */
+   if (!source->modifier ||
+       (chrome9_ps_source_modifier_allowed(op, slot) &&
+        source->file != CHROME9_PS_SOURCE_POSITION))
+      return true;
+   if (builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS)
+      return false;
+   if (chrome9_ps_source_modifier_allowed(CHROME9_PS_OPCODE_MOV, 0) &&
+       source->file != CHROME9_PS_SOURCE_POSITION) {
+      instruction = chrome9_ps_append_instruction(builder,
+                                                  CHROME9_PS_OPCODE_MOV);
+      if (!instruction)
+         return false;
+      instruction->source[0] = operand;
+   } else {
+      struct chrome9_ps_source minus;
+
+      operand.modifier = 0;
+      if (!chrome9_ps_immediate(builder, negative_one, 4, &minus))
+         return false;
+      instruction = chrome9_ps_append_instruction(builder,
+                                                  CHROME9_PS_OPCODE_MUL);
+      if (!instruction)
+         return false;
+      instruction->source[0] = operand;
+      instruction->source[1] = minus;
+   }
+   instruction->destination.file = CHROME9_PS_DESTINATION_TEMP;
+   instruction->destination.id = builder->next_temp++;
+   instruction->destination.writemask = 0xf;
+   memset(source, 0, sizeof(*source));
+   source->file = CHROME9_PS_SOURCE_TEMP;
+   source->id = instruction->destination.id;
+   for (unsigned c = 0; c < 4; c++)
+      source->swizzle[c] = c;
+   return true;
+}
+
+/* -(a*b), -(a*b+c), -(a+b) and -(a-b) of a single-use, not yet lowered
+ * value: the negation moves onto source modifiers of that one record. */
+static bool
+chrome9_ps_fold_negation(const struct chrome9_ps_nir_builder *builder,
+                         const nir_alu_instr *negation, unsigned components,
+                         nir_alu_src folded[3], enum chrome9_ps_opcode *op,
+                         unsigned *count, unsigned *negate)
+{
+   nir_instr *instr = nir_def_instr(negation->src[0].src.ssa);
+   enum chrome9_ps_opcode native;
+   unsigned sources, mask;
+   nir_alu_instr *inner;
+
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   inner = nir_instr_as_alu(instr);
+   if (!list_is_singular(&inner->def.uses) || inner->def.bit_size != 32)
+      return false;
+   for (unsigned v = 0; v < builder->value_count; v++)
+      if (builder->value[v].def == &inner->def)
+         return false;
+   switch (inner->op) {
+   case nir_op_fmul:
+      native = CHROME9_PS_OPCODE_MUL;
+      sources = 2;
+      mask = 1;
+      break;
+   case nir_op_ffma:
+      native = CHROME9_PS_OPCODE_MAD;
+      sources = 3;
+      mask = 5;
+      break;
+   case nir_op_fadd:
+      native = CHROME9_PS_OPCODE_ADD;
+      sources = 2;
+      mask = 3;
+      break;
+   case nir_op_fsub:
+      native = CHROME9_PS_OPCODE_SUB;
+      sources = 2;
+      mask = 3;
+      break;
+   default:
+      return false;
+   }
+   for (unsigned s = 0; s < sources; s++) {
+      if ((mask & (1u << s)) &&
+          !chrome9_ps_source_modifier_allowed(native, s))
+         return false;
+      folded[s] = inner->src[s];
+      for (unsigned c = 0; c < components; c++) {
+         unsigned lane = negation->src[0].swizzle[c];
+
+         if (lane >= inner->def.num_components)
+            return false;
+         folded[s].swizzle[c] = inner->src[s].swizzle[lane];
+      }
+   }
+   *op = native;
+   *count = sources;
+   *negate = mask;
+   return true;
 }
 
 static bool
@@ -4129,8 +4287,11 @@ chrome9_ps_emit_scalar_select(struct chrome9_ps_nir_builder *builder,
 
    if (!chrome9_ps_lower_alu_source(builder, &select->src[1], components,
                                     &true_value) ||
-       !chrome9_ps_lower_alu_source(builder, &select->src[2], components,
-                                    &false_value) ||
+       !(chrome9_ps_source_modifier_allowed(CHROME9_PS_OPCODE_CMP, 2) ?
+         chrome9_ps_lower_alu_source_modifier(builder, &select->src[2],
+                                              components, &false_value) :
+         chrome9_ps_lower_alu_source(builder, &select->src[2], components,
+                                     &false_value)) ||
        builder->next_temp >= CHROME9_PS_MAX_VIRTUAL_TEMPS ||
        builder->value_count >= CHROME9_PS_MAX_INSTRUCTIONS)
       return false;
@@ -4654,9 +4815,18 @@ chrome9_ps_emit_condition_cmp(struct chrome9_ps_nir_builder *builder,
                               const struct chrome9_ps_source *when_false,
                               unsigned writemask, uint8_t temp)
 {
-   struct chrome9_ps_instruction *conditional =
-      chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_CMP);
+   struct chrome9_ps_instruction *conditional;
+   struct chrome9_ps_source arm[2] = {
+      condition->invert ? *when_false : *when_true,
+      condition->invert ? *when_true : *when_false,
+   };
 
+   if (!chrome9_ps_settle_modifier(builder, CHROME9_PS_OPCODE_CMP, 1,
+                                   &arm[0]) ||
+       !chrome9_ps_settle_modifier(builder, CHROME9_PS_OPCODE_CMP, 2,
+                                   &arm[1]))
+      return false;
+   conditional = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_CMP);
    if (!conditional)
       return false;
    conditional->destination.file = CHROME9_PS_DESTINATION_TEMP;
@@ -4666,8 +4836,8 @@ chrome9_ps_emit_condition_cmp(struct chrome9_ps_nir_builder *builder,
                                                    condition_swizzle);
    conditional->source[0].modifier = condition->negate ?
       CHROME9_PS_SOURCE_NEGATE : 0;
-   conditional->source[1] = condition->invert ? *when_false : *when_true;
-   conditional->source[2] = condition->invert ? *when_true : *when_false;
+   conditional->source[1] = arm[0];
+   conditional->source[2] = arm[1];
    return true;
 }
 
@@ -4789,9 +4959,14 @@ chrome9_ps_emit_lane_select(struct chrome9_ps_nir_builder *builder,
       unsigned mask = 0;
 
       if (nir_scalar_is_const(lane[first])) {
-         struct chrome9_ps_instruction *move =
-            chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
+         struct chrome9_ps_source arm = nir_scalar_as_bool(lane[first]) ?
+            *when_true : *when_false;
+         struct chrome9_ps_instruction *move;
 
+         if (!chrome9_ps_settle_modifier(builder, CHROME9_PS_OPCODE_MOV, 0,
+                                         &arm))
+            return false;
+         move = chrome9_ps_append_instruction(builder, CHROME9_PS_OPCODE_MOV);
          for (unsigned c = first; c < components; c++)
             if (nir_scalar_is_const(lane[c]) &&
                 nir_scalar_as_bool(lane[c]) ==
@@ -4802,8 +4977,7 @@ chrome9_ps_emit_lane_select(struct chrome9_ps_nir_builder *builder,
          move->destination.file = CHROME9_PS_DESTINATION_TEMP;
          move->destination.id = temp;
          move->destination.writemask = mask;
-         move->source[0] = nir_scalar_as_bool(lane[first]) ? *when_true :
-                                                             *when_false;
+         move->source[0] = arm;
       } else {
          uint8_t condition_swizzle[4];
 
@@ -4869,10 +5043,11 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
           alu->src[predicate_src].swizzle[0])
          lane_predicates = true;
    if (alu->op == nir_op_bcsel) {
-      if (!chrome9_ps_lower_alu_source(builder, &alu->src[1], components,
-                                       &when_true) ||
-          !chrome9_ps_lower_alu_source(builder, &alu->src[2], components,
-                                       &when_false))
+      /* Arms keep NEG for the B slot; other slots settle it. */
+      if (!chrome9_ps_lower_alu_source_modifier(builder, &alu->src[1],
+                                                components, &when_true) ||
+          !chrome9_ps_lower_alu_source_modifier(builder, &alu->src[2],
+                                                components, &when_false))
          return false;
    } else if (!chrome9_ps_immediate(builder, one, components, &when_true) ||
               !chrome9_ps_immediate(builder, zero, components, &when_false)) {
@@ -4883,11 +5058,14 @@ chrome9_ps_lower_general_select(struct chrome9_ps_nir_builder *builder,
                                          &when_true, &when_false,
                                          components, &result) &&
              chrome9_ps_record_value(builder, def, &result, source);
+   /* A constant predicate forwards an arm; cached values carry no NEG. */
    return chrome9_ps_emit_predicate_select(
              builder,
              (nir_scalar) { alu->src[predicate_src].src.ssa,
                             alu->src[predicate_src].swizzle[0] },
              &when_true, &when_false, components, 0, &result) &&
+          chrome9_ps_settle_modifier(builder, CHROME9_PS_OPCODE_KILL, 0,
+                                     &result) &&
           chrome9_ps_record_value(builder, def, &result, source);
 }
 
@@ -4987,7 +5165,9 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
    struct chrome9_ps_source operands[3] = { 0 };
    enum chrome9_ps_opcode op;
    unsigned source_count;
-   unsigned source_components[3];
+   unsigned source_components[3], order[3], negate = 0;
+   nir_alu_src folded[3];
+   const nir_alu_src *alu_sources;
    unsigned components;
    unsigned value;
    uint8_t temp;
@@ -5369,6 +5549,7 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
    if (instr->type != nir_instr_type_alu)
       return false;
    alu = nir_instr_as_alu(instr);
+   alu_sources = alu->src;
    components = alu->def.num_components;
    if (alu->op == nir_op_fsat && alu->src[0].src.ssa &&
        list_is_singular(&alu->src[0].src.ssa->uses) &&
@@ -5611,18 +5792,35 @@ chrome9_ps_lower_def_impl(struct chrome9_ps_nir_builder *builder,
    for (unsigned c = 0; c < 4; c++)
       builder->value[value].source.swizzle[c] = c < components ?
          c : CHROME9_PS_SWIZZLE_ZERO;
+   if (alu->op == nir_op_fneg) {
+      if (chrome9_ps_fold_negation(builder, alu, components, folded, &op,
+                                   &source_count, &negate)) {
+         alu_sources = folded;
+      } else if (chrome9_ps_source_modifier_allowed(CHROME9_PS_OPCODE_MOV,
+                                                    0)) {
+         op = CHROME9_PS_OPCODE_MOV;
+         negate = 1;
+      }
+   }
+   chrome9_ps_source_order(op, alu_sources, source_count, order);
    for (unsigned s = 0; s < source_count; s++) {
       bool modifier = chrome9_ps_source_modifier_allowed(op, s);
+      const nir_alu_src *nir_source = &alu_sources[order[s]];
 
       if (!(modifier ?
-            chrome9_ps_lower_alu_source_modifier(builder, &alu->src[s],
+            chrome9_ps_lower_alu_source_modifier(builder, nir_source,
                                                   source_components[s],
                                                   &operands[s]) :
-            chrome9_ps_lower_alu_source(builder, &alu->src[s],
+            chrome9_ps_lower_alu_source(builder, nir_source,
                                         source_components[s], &operands[s])))
          return false;
+      if (negate & (1u << s)) {
+         operands[s].modifier ^= CHROME9_PS_SOURCE_NEGATE;
+         if (!chrome9_ps_settle_modifier(builder, op, s, &operands[s]))
+            return false;
+      }
    }
-   if (alu->op == nir_op_fneg) {
+   if (alu->op == nir_op_fneg && op == CHROME9_PS_OPCODE_MUL && !negate) {
       static const uint32_t negative_one[4] = {
          0xbf800000, 0xbf800000, 0xbf800000, 0xbf800000,
       };
@@ -6021,7 +6219,7 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
    nir_def *depth = NULL;
    struct chrome9_ps_source operands[4][3] = { 0 };
    enum chrome9_ps_opcode op[4];
-   unsigned source_count[4] = { 0 };
+   unsigned source_count[4] = { 0 }, order[3];
    struct util_dynarray terminates;
    bool zero_output = false;
    nir_block *block;
@@ -6203,13 +6401,15 @@ chrome9_compile_ps_nir(nir_shader *nir, struct chrome9_ps_ir *ir,
             source_count[n] = 0;
             break;
          }
+         chrome9_ps_source_order(op[n], alu->src, source_count[n], order);
          for (unsigned s = 0; s < source_count[n]; s++) {
             bool modifier = chrome9_ps_source_modifier_allowed(op[n], s);
+            const nir_alu_src *nir_source = &alu->src[order[s]];
 
             if (!(modifier ?
-                  chrome9_ps_lower_alu_source_modifier(&builder, &alu->src[s],
+                  chrome9_ps_lower_alu_source_modifier(&builder, nir_source,
                                                         4, &operands[n][s]) :
-                  chrome9_ps_lower_alu_source(&builder, &alu->src[s], 4,
+                  chrome9_ps_lower_alu_source(&builder, nir_source, 4,
                                               &operands[n][s])))
                return false;
          }
