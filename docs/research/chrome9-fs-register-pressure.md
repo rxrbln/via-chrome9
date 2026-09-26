@@ -130,7 +130,11 @@ hot, fps unchanged).
 - `pg-fold.txt` (3315, fragment built-ins): p91 identical with and without
   `CHROME9_PS_NEG_SLOTS` (2891 pass, 267 fail).  p103 with NEG slots on by
   default (commit `1d885e1`): 2891 pass, 267 fail, no test changed against
-  p93.
+  p93.  Full list p103: 1775 pass (p93 1774; only
+  triangle-rasterization-overdraw flipped, seed-dependent).  ioquake3
+  1024x768: GL1 50.4 / GL2 43.7 fps (p94b 50.6 / 43.7).  The host
+  `chrome9-shader-nir-test` (run on the target: the host glibc is older
+  than the build sysroot) has the same 12 failing cases before and after.
 - fs-refract-vec{2,3,4} and glsl-1.10-built-in-matrix-state fail since
   `901a070`: the programs used to be rejected (bcsel) and ran on llvmpipe;
   on hardware the 16-bit fragment mantissa misses the tests' absolute
