@@ -170,3 +170,43 @@ the same share per second as at 320x240, with a flat profile and no
 busy-waiting, so its CPU time per frame grows with resolution.  The CPU
 and the pixel engine share the UMA memory; the remaining limit is memory
 bandwidth rather than any single shader or driver path.
+
+## 8. Hardware TCL for every GL2 and glmark2 draw (2026-09-26)
+
+Draw-time linear proofs (Mesa `b45ec96`).  Fragment programs that compare
+a varying with zero, divide by a projector or threshold a product need
+per-draw facts about the VS output lane (exactly 0 or 1, or within
+[0, 1]).  A lane computed by the VS was unknown and the draw left hardware
+TCL.  The TCL compiler now records a lane that is a sum of
+coefficient x input and constant terms (coefficients are CB0 dwords or
+literals) and resolves it per draw against the bound constants and vertex
+formats.  `modelview * vec4(v, 1)` of an affine matrix has w exactly 1;
+`u_VertColor * attr_Color + u_BaseColor` stays in [0, 1] for UNORM
+colours.
+
+| workload | before | after |
+|---|---|---|
+| glmark2 ideas | 76 fps, 6425 fallback draws | 138 fps, none |
+| ioquake3 GL2 1024x768 | 43.4 fps, worst frame 255 ms | 45.9 fps, worst frame 77 ms, every draw on hardware TCL |
+| glmark2 score | 132 | 134 |
+
+glmark2 terrain samples its displacement texture in the VS; the hardware
+has no vertex texture fetch, so the texels are fetched on the CPU per
+distinct vertex and fed as a vertex input.  A 393216-vertex soup with two
+lookups exceeded the upload limit on the first draw; it is now compacted
+at once (Mesa `ddc2b4e`), so terrain has no fallback draw.  Terrain is
+fragment-ALU bound: PPC counts 83M ALU records per frame, at 2.49 ns per
+record 207 ms, the measured frame time.
+
+## 9. Preshader (Mesa `97ace77`)
+
+Uniform-only subexpressions a per-pixel instruction uses move into
+constant registers evaluated per draw on the CPU (nir_eval_const_opcode on
+the bound CB0).  Terrain's main program 65 -> 59 records (frame 218 ->
+207 ms), jellyfish 82 -> 88 fps.  The values are FP32 exact instead of the
+16-bit pixel ALU: pg-fold 2891 -> 3155 pass, 267 -> 3 fail (the three
+remaining failed before too); full piglit unchanged.
+
+Remaining terrain cost: varyings straddling vec4 slots after the linker's
+scalar compaction (vViewPosition in T2.w/T3.xy) need gather MOVs; a
+lane-level varying layout would save about 2-3 of 59 records.
