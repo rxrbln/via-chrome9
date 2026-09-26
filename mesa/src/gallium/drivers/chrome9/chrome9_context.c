@@ -6470,6 +6470,75 @@ chrome9_nir_fmad_to_ffma(nir_builder *b, nir_alu_instr *alu, void *data)
    return true;
 }
 
+/* ALU source src reads the literal value in every used lane. */
+static bool
+chrome9_nir_src_is_literal(const nir_alu_instr *alu, unsigned src,
+                           unsigned count, float value)
+{
+   if (!nir_src_is_const(alu->src[src].src))
+      return false;
+   for (unsigned c = 0; c < count; c++)
+      if (nir_src_comp_as_float(alu->src[src].src,
+                                alu->src[src].swizzle[c]) != value)
+         return false;
+   return true;
+}
+
+/* lower_fsat turns clamp(x, 0, 1) into MAX+MIN for the vertex stage; the
+ * fragment ALU has a saturate bit, so re-form fsat: one record or none. */
+static bool
+chrome9_nir_form_fsat(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   const unsigned count = alu->def.num_components;
+   nir_op inner_op;
+   float outer_value, inner_value;
+
+   (void)data;
+   if (alu->op == nir_op_fmin) {
+      inner_op = nir_op_fmax;
+      outer_value = 1.0f;
+      inner_value = 0.0f;
+   } else if (alu->op == nir_op_fmax) {
+      inner_op = nir_op_fmin;
+      outer_value = 0.0f;
+      inner_value = 1.0f;
+   } else {
+      return false;
+   }
+   for (unsigned o = 0; o < 2; o++) {
+      nir_alu_instr *inner;
+      unsigned swizzle[NIR_MAX_VEC_COMPONENTS];
+
+      if (!chrome9_nir_src_is_literal(alu, o, count, outer_value) ||
+          !nir_src_is_alu(alu->src[!o].src))
+         continue;
+      inner = nir_src_as_alu(alu->src[!o].src);
+      if (inner->op != inner_op)
+         continue;
+      for (unsigned i = 0; i < 2; i++) {
+         bool literal = true;
+
+         if (!nir_src_is_const(inner->src[i].src))
+            continue;
+         for (unsigned c = 0; c < count; c++)
+            literal &= nir_src_comp_as_float(inner->src[i].src,
+                          inner->src[i].swizzle[alu->src[!o].swizzle[c]]) ==
+                       inner_value;
+         if (!literal)
+            continue;
+         for (unsigned c = 0; c < count; c++)
+            swizzle[c] =
+               inner->src[!i].swizzle[alu->src[!o].swizzle[c]];
+         b->cursor = nir_before_instr(&alu->instr);
+         nir_def_replace(&alu->def,
+            nir_fsat(b, nir_swizzle(b, inner->src[!i].src.ssa, swizzle,
+                                    count)));
+         return true;
+      }
+   }
+   return false;
+}
+
 /* Lanes of a factor vector fold into an immediate or one swizzled value. */
 static bool
 chrome9_nir_factor_folds(const nir_scalar *lane, unsigned count)
@@ -6688,6 +6757,9 @@ chrome9_nir_optimize_semantic(nir_shader *nir)
    } while (progress);
    nir_shader_alu_pass(nir, chrome9_nir_fmad_to_ffma,
                        nir_metadata_control_flow, NULL);
+   if (nir_shader_alu_pass(nir, chrome9_nir_form_fsat,
+                           nir_metadata_control_flow, NULL))
+      nir_opt_dce(nir);
 }
 
 static bool
@@ -7831,14 +7903,16 @@ chrome9_dump_semantic_fs(const struct chrome9_shader *shader)
       const struct chrome9_ps_instruction *instruction =
          &ir->instruction[i];
 
-      fprintf(stderr, "chrome9: semantic %u op=%u dst=%u.%u/%x", i,
+      fprintf(stderr, "chrome9: semantic %u op=%u dst=%u.%u/%x%s", i,
               instruction->op, instruction->destination.file,
               instruction->destination.id,
-              instruction->destination.writemask);
+              instruction->destination.writemask,
+              instruction->destination.saturate ? "_sat" : "");
       for (unsigned s = 0; s < 3; s++) {
          const struct chrome9_ps_source *source = &instruction->source[s];
 
-         fprintf(stderr, " s%u=%u.%u/%u%u%u%u", s, source->file,
+         fprintf(stderr, " s%u=%s%u.%u/%u%u%u%u", s,
+                 source->modifier ? "-" : "", source->file,
                  source->id, source->swizzle[0], source->swizzle[1],
                  source->swizzle[2], source->swizzle[3]);
       }

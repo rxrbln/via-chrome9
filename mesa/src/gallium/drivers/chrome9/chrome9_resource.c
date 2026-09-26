@@ -506,10 +506,15 @@ chrome9_resource_local(struct pipe_screen *screen,
                        const struct chrome9_resource_layout *layout,
                        bool guarded_shared)
 {
-   static int enabled = -1;
+   static int enabled = -1, textures = -1;
+   unsigned bind = PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_RENDER_TARGET;
 
-   if (enabled < 0)
+   if (enabled < 0) {
       enabled = debug_get_bool_option("CHROME9_LOCAL_MEMORY", true);
+      textures = debug_get_bool_option("CHROME9_LOCAL_TEXTURES", false);
+   }
+   if (textures)
+      bind |= PIPE_BIND_SAMPLER_VIEW;
    /* Shared and scanout surfaces too: same-device PRIME import returns
     * the object and KMS scans local framebuffers out of SL.  Linear shadows
     * are copied by the CPU to the drawable. */
@@ -517,8 +522,7 @@ chrome9_resource_local(struct pipe_screen *screen,
    return enabled && layout->guarded &&
           templ->target == PIPE_TEXTURE_2D &&
           !(templ->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_LINEAR)) &&
-          (templ->bind & (PIPE_BIND_DEPTH_STENCIL |
-                          PIPE_BIND_RENDER_TARGET)) &&
+          (templ->bind & bind) &&
           chrome9_screen_has_capability2(screen,
                                          DRM_CHROME9_CAP2_LOCAL_MEMORY);
 }
@@ -582,6 +586,10 @@ chrome9_resource_create(struct pipe_screen *screen,
       goto fail;
    }
 
+   if (getenv("CHROME9_DEBUG_RESOURCES"))
+      fprintf(stderr, "chrome9: resource %u bytes %s\n",
+              (unsigned)layout.allocation_size,
+              resource->local ? "local" : "gart");
    chrome9_resource_apply_layout(resource, &layout);
    resource->guarded_shared = guarded_shared;
    /* Tiled rows come in eights: other heights stay linear so the object
