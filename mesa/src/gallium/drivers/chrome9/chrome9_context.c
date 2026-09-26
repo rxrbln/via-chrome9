@@ -10751,6 +10751,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    (void)flags;
    if (!ctx)
       return NULL;
+   /* The failure path's destroy needs the screen. */
+   ctx->base.screen = screen;
+   ctx->base.priv = priv;
    if (!chrome9_get_param(screen->get_screen_fd(screen),
                           DRM_CHROME9_PARAM_CAPABILITIES, &capabilities) ||
        !(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE))
@@ -10917,8 +10920,6 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->draw_limit = MAX2(debug_get_num_option("CHROME9_DRAW_LIMIT", 0), 0);
    ctx->debug_draws = debug_get_bool_option("CHROME9_DEBUG_DRAWS", false);
 
-   ctx->base.screen = screen;
-   ctx->base.priv = priv;
    if (debug_get_bool_option("CHROME9_DEBUG_REJECT", false))
       ctx->reject_sites = _mesa_pointer_hash_table_create(NULL);
    ctx->base.destroy = chrome9_context_destroy;
