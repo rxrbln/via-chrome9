@@ -70,8 +70,49 @@ bit) and the subtrahend in A.  The A-slot NEG bit (record 1 bit 27) is
 therefore the same datapath bit for every op, and B-slot NEG (record 0 bit
 3) is exercised by the kernel's ABS lowering (select of C = x, B = -x).
 C-slot NEG needs record 3 bit 20 as well and stays rejected.
-`CHROME9_PS_NEG_SLOTS` enables A NEG on all ops and B NEG on ADD, SUB,
-MAD and CMP; see section 6 for the qualification.
+
+Directed rung (`tools/re/chrome9_neg_rung.py`, 30 shader_runner tests,
+three uniform sets each with positive, negative and zero lanes, including
+MIN/MAX ordering on both sides of the negated value, DP3/DP4, CMP arms and
+the scalar ops), Mesa p103 on VX900; every test was checked in the
+semantic dump for the `-` on the slot under test and for zero rejects:
+
+| op | slot | result |
+|---|---|---|
+| MOV (also as `fsat(-x)` and bare `-x`) | A | pass |
+| MUL | A (also `a * -b` moved from C) | pass |
+| ADD | A, B (`-(a + b)`) | pass |
+| SUB | B, A (`-(a - b)`) | pass |
+| MAD | A, B, A+B, `-(a*b+c)` | pass |
+| MIN, MAX | A (also `min(a, -b)` moved from C) | pass |
+| DP3, DP4 | A | pass |
+| EXP2, LOG2, RCP, RSQ | A, all four lanes | pass |
+| CMP | B (select arm) | pass |
+| FRC | A | **fail**: FRC(-0.0) returns 1.0 |
+
+FRC of a uniform -0.0 also returns 1.0 without any modifier, so the
+failure is FRC's own sign-of-zero behaviour: a NEG on the FRC source turns
++0 into -0.  ALU results canonicalise the zero (`fract(min(-0, 0))`,
+`fract(max(-0, -1))`, `fract(dot(-0, b))` and `fract(-(0 * b))` all give
+0), so NEG elsewhere does not reach FRC as -0.  FRC keeps the MUL(-1) or
+MOV path.
+
+NEG is now the default on A of every op except FRC and on B of ADD, SUB,
+MAD and CMP; `CHROME9_PS_NEG_SLOTS=0` restores MAD/CMP A only.  To use
+the slots the lowering also
+
+- moves a negated operand of a commutative op (MUL, ADD, MAD's factors,
+  MIN, MAX, DP3, DP4) out of the NEG-less C slot,
+- folds `-(single-use MUL, MAD, ADD, SUB)` into source modifiers of that
+  record (NIR hoists fneg out of products, so `clamp(-(a*b))` used to be a
+  MUL and a MUL by -1),
+- lowers a remaining fneg as `MOV -x` (no immediate lane for -1), and
+- keeps NEG on select arms: CMP B takes it, the C arm is settled into a
+  temporary.
+
+Rung totals: 45 records with NEG (default) against 58 with
+`CHROME9_PS_NEG_SLOTS=0`, which matches Mesa p94b record for record.
+llvmpipe passes all 30 tests.
 
 ## 5. Saturate
 
@@ -87,9 +128,9 @@ hot, fps unchanged).
 - Full piglit list (2101): p90 1776 pass, no regressions against p84
   (triangle-rasterization flips with its random seed).
 - `pg-fold.txt` (3315, fragment built-ins): p91 identical with and without
-  `CHROME9_PS_NEG_SLOTS` (2891 pass, 267 fail).  NEG slots only shortens
-  two cold ioquake3 programs (30 to 28, 47 to 45 records), so it stays off
-  by default until a directed rung exercises every op/slot pair.
+  `CHROME9_PS_NEG_SLOTS` (2891 pass, 267 fail).  p103 with NEG slots on by
+  default (commit `1d885e1`): 2891 pass, 267 fail, no test changed against
+  p93.
 - fs-refract-vec{2,3,4} and glsl-1.10-built-in-matrix-state fail since
   `901a070`: the programs used to be rejected (bcsel) and ran on llvmpipe;
   on hardware the 16-bit fragment mantissa misses the tests' absolute
