@@ -426,7 +426,7 @@ chrome9_init_shader_caps(struct chrome9_screen *screen)
     * llvmpipe fallback unless the preshader folds them into the 32. */
    fs->max_const_buffer0_size =
       (screen->capabilities & DRM_CHROME9_CAP_FRAGMENT_CONSTANTS_32) ?
-      4096 * 4 * sizeof(float) : 4 * sizeof(float);
+      128 * 4 * sizeof(float) : 4 * sizeof(float);
    fs->max_const_buffers = 1;
    /* The extended structured FE maps eight ordered inputs and descriptor
     * slots.  Keep older kernels' three-slot and legacy two-slot limits. */
