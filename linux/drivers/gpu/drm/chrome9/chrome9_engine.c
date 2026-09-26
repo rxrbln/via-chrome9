@@ -744,8 +744,11 @@ struct chrome9_tcl_draw {
 	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	/* Rows 256..258: viewport scale, offset and the snap bias. */
 	u32 rows[12];
-	/* Stage B: indices are rebased to index_min and packed per dword. */
+	/* Stage B: indices are rebased to index_min and packed per dword,
+	 * or, with index_object, fetched raw from index_buffer. */
 	const u32 *indices;
+	bool index_object;
+	struct drm_chrome9_vertex_buffer index_buffer;
 	u32 index_count;
 	u32 index_dwords;
 	u32 index_min;
@@ -817,7 +820,7 @@ struct chrome9_draw_request {
 	const struct drm_chrome9_fragment_texture_state *fragment_textures;
 	const struct chrome9_fragment_program *fragment_program;
 	const u32 *fragment_constants;
-	const struct chrome9_tcl_draw *tcl;
+	struct chrome9_tcl_draw *tcl;
 	u64 fragment_texture_size[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 	u32 fragment_texture_count;
 	u8 fragment_texture_units[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
@@ -3942,6 +3945,10 @@ out:
 static bool chrome9_float_finite(u32 value);
 
 
+/* Largest raw index bound: A2C/A2E carry 32 bits, the finite check reads
+ * every vertex up to it once per buffer. */
+#define CHROME9_TCL_INDEX_OBJECT_MAX	0x00ffffffULL
+
 static bool chrome9_tcl_half_finite(u32 value)
 {
 	return (value & 0x7c00) != 0x7c00 && (value & 0x7c000000) != 0x7c000000;
@@ -3952,15 +3959,51 @@ static bool chrome9_tcl_half_finite(u32 value)
  * [index_min, index_min + index_range] (+ base_vertex) must lie inside its
  * object.
  */
-static int chrome9_tcl_buffer_bounds(const struct chrome9_tcl_draw *tcl,
+static int chrome9_tcl_buffer_bounds(struct chrome9_tcl_draw *tcl,
 		struct drm_gem_object *const *objects, const u32 *buffer_object,
-		u64 *element_start, u64 *object_low, u64 *object_high)
+		u32 index_object, u64 *element_start, u64 *object_low,
+		u64 *object_high)
 {
 	s64 first = (s64)tcl->index_min + tcl->base_vertex;
 	unsigned int e;
 
 	if (first < 0)
 		return CHROME9_EINVAL;
+	/* Raw indices: the bound is the last vertex every element holds. */
+	if (tcl->index_object) {
+		const u64 bytes = (u64)tcl->index_dwords * 4;
+		u64 range = CHROME9_TCL_INDEX_OBJECT_MAX;
+
+		for (e = 0; e < tcl->element_count; e++) {
+			u8 b = tcl->element_buffer[e];
+			const struct drm_chrome9_vertex_buffer *buffer =
+				&tcl->buffers[b];
+			u64 start, end;
+
+			if (check_mul_overflow((u64)first, (u64)buffer->stride,
+					       &start) ||
+			    check_add_overflow(start, buffer->offset, &start) ||
+			    check_add_overflow(start,
+				(u64)tcl->element_byte_offset[e] + 4ULL *
+				chrome9_tcl_formats[tcl->element_type[e]].dwords,
+				&end) ||
+			    end > objects[buffer_object[b]]->size)
+				return CHROME9_EINVAL;
+			if (buffer->stride)
+				range = min(range,
+					    div_u64(objects[buffer_object[b]]->size -
+						    end, buffer->stride));
+		}
+		if (tcl->index_buffer.offset > objects[index_object]->size ||
+		    bytes > objects[index_object]->size -
+			    tcl->index_buffer.offset)
+			return CHROME9_EINVAL;
+		tcl->index_range = range;
+		object_low[index_object] = min(object_low[index_object],
+					       tcl->index_buffer.offset);
+		object_high[index_object] = max(object_high[index_object],
+						tcl->index_buffer.offset + bytes);
+	}
 	for (e = 0; e < tcl->element_count; e++) {
 		u8 b = tcl->element_buffer[e];
 		const struct drm_chrome9_vertex_buffer *buffer = &tcl->buffers[b];
@@ -4687,9 +4730,9 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 target, u32 depth, u32 coarse_z, u32 local,
 	const u32 color_base[3],
 	const u32 texture_base[DRM_CHROME9_FRAGMENT_MAX_TEXTURES],
-	const u32 *element_address, const u32 *query, u32 query_re,
-	struct chrome9_state_cache *cache, bool *constants_live, u32 **cursor,
-	const u32 *limit)
+	const u32 *element_address, u32 index_address, const u32 *query,
+	u32 query_re, struct chrome9_state_cache *cache, bool *constants_live,
+	u32 **cursor, const u32 *limit)
 {
 	/* All of A38..A3F: stale constants turn ZERO/ONE into CONST factors. */
 	static const u32 destination_tail[] = {
@@ -5082,10 +5125,13 @@ draw:
 
 		/* The occlusion snapshot does not wait for fetched indices
 		 * (partial counts on silicon): queried draws stay inline. */
-		if (query)
+		if (query) {
 			index_arena = NULL;
+			index_address = 0;
+		}
 		if (p + 0x40 + snapshot +
-		    (index_arena ? 4 : tcl->index_dwords) > limit)
+		    (index_arena || index_address ? 4 : tcl->index_dwords) >
+		    limit)
 			return -E2BIG;
 		for (i = 0; i < chrome9_tcl_fetched_elements(tcl); i++)
 			slots[i] = chrome9_tcl_stream_slot(element_address[i],
@@ -5100,7 +5146,16 @@ draw:
 		draw[3] = 0x24000000 | tcl->index_count;
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
 				     draw, ARRAY_SIZE(draw));
-		if (index_arena) {
+		if (index_address) {
+			/* The indices stay in their object: FE43 with its SF
+			 * address, as for the arena below. */
+			while (!IS_ALIGNED((unsigned long)p, 16))
+				*p++ = 0xcc000000;
+			*p++ = 0xfe430021;
+			*p++ = tcl->index_dwords * 4;
+			*p++ = index_address;
+			*p++ = 0;
+		} else if (index_arena) {
 			/* The reader fetches the A24 payload: FE43 with the SF
 			 * location bit, byte length and 16-byte aligned address
 			 * (vendor UMD 0x101b1430, KMD patch 0xb5e45). */
@@ -7100,6 +7155,7 @@ u64 chrome9_engine_capabilities2(void)
 	if (READ_ONCE(chrome9_tiled_color))
 		caps |= DRM_CHROME9_CAP2_TILED_SHARED;
 	caps |= DRM_CHROME9_CAP2_WRITE_SEQ;
+	caps |= DRM_CHROME9_CAP2_INDEX_OBJECT;
 	if (READ_ONCE(chrome9_destination_offset))
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_coarse_z))
@@ -8551,6 +8607,7 @@ struct chrome9_fragment_submit {
 		u8 texture_object[DRM_CHROME9_FRAGMENT_MAX_TEXTURES];
 		u32 buffer_object[DRM_CHROME9_VERTEX_MAX_INPUTS];
 		u64 element_start[DRM_CHROME9_VERTEX_MAX_INPUTS];
+		u32 index_object;
 	} draw[];
 };
 
@@ -9289,6 +9346,16 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			}
 			sub->draw[r].buffer_object[t] = i;
 		}
+		if (tcl && tcl->index_object) {
+			i = chrome9_fragment_submit_object(file, sub,
+				&object_count, tcl->index_buffer.handle,
+				CHROME9_OBJECT_VERTEX, 0);
+			if (i == U32_MAX) {
+				ret = -E2BIG;
+				goto out_put_objects;
+			}
+			sub->draw[r].index_object = i;
+		}
 	}
 	for (i = 0; i < object_count; i++) {
 		unsigned int j;
@@ -9337,12 +9404,13 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		goto out_put_objects;
 	}
 	for (r = 0; r < count; r++) {
-		const struct chrome9_tcl_draw *tcl = requests[r]->tcl;
+		struct chrome9_tcl_draw *tcl = requests[r]->tcl;
 
 		if (!tcl || !tcl->buffer_count)
 			continue;
 		ret = chrome9_tcl_buffer_bounds(tcl, objects,
-				sub->draw[r].buffer_object, sub->draw[r].element_start,
+				sub->draw[r].buffer_object, sub->draw[r].index_object,
+				sub->draw[r].element_start,
 				sub->object_low, sub->object_high);
 		if (ret)
 			goto out_put_objects;
@@ -9402,7 +9470,7 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		chrome9_bo_hold_kmap(to_chrome9_bo(objects[i]));
 	}
 	for (r = 0; r < count; r++) {
-		const struct chrome9_tcl_draw *tcl = requests[r]->tcl;
+		struct chrome9_tcl_draw *tcl = requests[r]->tcl;
 
 		if (tcl && tcl->buffer_count &&
 		    !chrome9_tcl_buffers_finite(tcl, objects, job->fragment_maps,
@@ -9410,6 +9478,11 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			ret = -EINVAL;
 			goto out_unmap;
 		}
+		/* A queried draw emits its indices inline, from the object. */
+		if (tcl && tcl->index_object)
+			tcl->indices = (const u32 *)((const u8 *)
+				job->fragment_maps[sub->draw[r].index_object].vaddr +
+				tcl->index_buffer.offset);
 	}
 	chrome9_prof_mark(CHROME9_PROF_MAP);
 	ret = chrome9_job_query_alloc(job, requests, count);
@@ -9654,6 +9727,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				sub->bases[coarse_index] + PAGE_SIZE,
 				local, color_bases, texture_bases,
 				tcl && tcl->buffer_count ? element_address : NULL,
+				tcl && tcl->index_object ?
+				sub->bases[sub->draw[next].index_object] +
+				(u32)tcl->index_buffer.offset : 0,
 				req->query ? &query_address : NULL,
 				job->query_re, cache, &constants, &p, limit);
 			/* A full segment is retired before the next draw. */
@@ -13649,6 +13725,9 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 	int ret;
 
 	if (stage_b) {
+		const bool object = args->flags &
+				    DRM_CHROME9_VERTEX_INDEX_OBJECT;
+
 		if (args->vertex_count || args->vertex_stride ||
 		    args->vertices_ptr ||
 		    args->buffer_count > args->element_count ||
@@ -13656,9 +13735,10 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		    !args->index_count ||
 		    args->index_count > DRM_CHROME9_VERTEX_MAX_INDICES ||
 		    (args->index_size != 2 && args->index_size != 4) ||
-		    !args->indices_ptr || !args->buffers_ptr)
+		    !args->indices_ptr == !object || !args->buffers_ptr)
 			return CHROME9_EINVAL;
 	} else if (args->index_count || args->index_size ||
+		   (args->flags & DRM_CHROME9_VERTEX_INDEX_OBJECT) ||
 		   args->base_vertex || args->indices_ptr || args->buffers_ptr ||
 		   !args->vertex_count ||
 		   args->vertex_count > DRM_CHROME9_VERTEX_MAX_VERTICES ||
@@ -13674,7 +13754,8 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 			     DRM_CHROME9_VERTEX_CULL_CCW |
 			     DRM_CHROME9_VERTEX_FLAT |
 			     DRM_CHROME9_VERTEX_BFC_CW |
-			     DRM_CHROME9_VERTEX_BFC_CCW)) ||
+			     DRM_CHROME9_VERTEX_BFC_CCW |
+			     DRM_CHROME9_VERTEX_INDEX_OBJECT)) ||
 	    hweight32(args->flags & (DRM_CHROME9_VERTEX_CULL_CW |
 				     DRM_CHROME9_VERTEX_CULL_CCW)) > 1 ||
 	    hweight32(args->flags & (DRM_CHROME9_VERTEX_BFC_CW |
@@ -13747,8 +13828,12 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		tcl->buffer_count = args->buffer_count;
 		tcl->index_count = args->index_count;
 		tcl->base_vertex = args->base_vertex;
+		tcl->index_object = args->flags &
+				    DRM_CHROME9_VERTEX_INDEX_OBJECT;
+		/* The index object follows the vertex buffers. */
 		buffers = chrome9_arena_copy_user(arena, args->buffers_ptr,
-			args->buffer_count, sizeof(*buffers));
+			args->buffer_count + tcl->index_object,
+			sizeof(*buffers));
 		if (IS_ERR(buffers))
 			return PTR_ERR(buffers);
 		/* Stride 0 repeats one element (constant attribute). */
@@ -13760,14 +13845,31 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 				return CHROME9_EINVAL;
 			tcl->buffers[i] = buffers[i];
 		}
-		indices = chrome9_arena_copy_user(arena, args->indices_ptr,
-			args->index_count, args->index_size);
-		if (IS_ERR(indices))
-			return PTR_ERR(indices);
-		tcl->indices = chrome9_tcl_indices(tcl, indices,
-						   args->index_size, arena);
-		if (!tcl->indices)
-			return -ENOMEM;
+		if (tcl->index_object) {
+			const struct drm_chrome9_vertex_buffer *index =
+				&buffers[args->buffer_count];
+
+			/* FE43 fetches from a 16-byte aligned address. */
+			if (!index->handle || index->stride ||
+			    !IS_ALIGNED(index->offset, 16))
+				return CHROME9_EINVAL;
+			tcl->index_buffer = *index;
+			tcl->index32 = args->index_size == 4;
+			tcl->index_dwords = tcl->index32 ? args->index_count :
+				DIV_ROUND_UP(args->index_count, 2);
+			/* index_range follows from the buffer sizes. */
+			tcl->index_min = 0;
+		} else {
+			indices = chrome9_arena_copy_user(arena,
+				args->indices_ptr, args->index_count,
+				args->index_size);
+			if (IS_ERR(indices))
+				return PTR_ERR(indices);
+			tcl->indices = chrome9_tcl_indices(tcl, indices,
+						args->index_size, arena);
+			if (!tcl->indices)
+				return -ENOMEM;
+		}
 		tcl->vertex_count = args->index_count;
 	}
 
