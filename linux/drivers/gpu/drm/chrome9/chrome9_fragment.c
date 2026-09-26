@@ -252,9 +252,11 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 		if (!source_count ||
 		    (instruction->flags &&
 		     (instruction->op != DRM_CHROME9_FRAGMENT_OP_TEX ||
-		      instruction->flags != DRM_CHROME9_FRAGMENT_TEX_BIAS ||
-		      instruction->src[0].file != DRM_CHROME9_FRAGMENT_FILE_TEMP ||
-		      str_mask & BIT(instruction->sampler))))
+		      str_mask & BIT(instruction->sampler) ||
+		      (instruction->flags == DRM_CHROME9_FRAGMENT_TEX_BIAS ?
+		       instruction->src[0].file != DRM_CHROME9_FRAGMENT_FILE_TEMP :
+		       instruction->flags != DRM_CHROME9_FRAGMENT_TEX_PROJECT ||
+		       !chrome9_texture_project_enabled()))))
 			return CHROME9_EINVAL;
 		/* VX900 aliases the C read to A when one MAD/CMP names three
 		 * distinct constant registers.  Two distinct registers, including
@@ -416,6 +418,16 @@ static int chrome9_fragment_validate(struct chrome9_fragment_state *state,
 						return CHROME9_EINVAL;
 				chrome9_fragment_note_varying(state, coordinate,
 						      cube ? 0x7 : 0x3, false);
+				/* TEXLDP divides by lane W: the FE must deliver
+				 * all four lanes (STRQ), as for an ALU W read. */
+				if (instruction->flags &
+				    DRM_CHROME9_FRAGMENT_TEX_PROJECT) {
+					if (coordinate->swizzle[3] !=
+					    DRM_CHROME9_FRAGMENT_SWIZZLE_W)
+						return CHROME9_EINVAL;
+					chrome9_fragment_note_varying(state,
+						coordinate, 0x8, true);
+				}
 				for (source = 0; source < (cube ? 3 : 2); source++)
 					width = max_t(u8, width,
 						      coordinate->swizzle[source] + 1);
@@ -1101,9 +1113,11 @@ static int chrome9_fragment_encode(struct chrome9_fragment_state *state,
 			if (previous_phase == 0)
 				program->controls[5 + (alu_index - 1) / 24] |=
 					BIT((alu_index - 1) % 24);
-			/* TAU operation 1 TEXLD, 3 TEXLDB */
+			/* TAU operation 1 TEXLD, 3 TEXLDB, 7 TEXLDP */
 			program->tau[tau_index] = (instruction->flags &
-				DRM_CHROME9_FRAGMENT_TEX_BIAS ? 0x20300000 : 0x20100000) |
+				DRM_CHROME9_FRAGMENT_TEX_BIAS ? 0x20300000 :
+				instruction->flags & DRM_CHROME9_FRAGMENT_TEX_PROJECT ?
+				0x20700000 : 0x20100000) |
 				(state->coordinate_last_tau[coordinate_id] == i ?
 				 BIT(28) : 0) |
 				(u32)instruction->sampler << 24 |

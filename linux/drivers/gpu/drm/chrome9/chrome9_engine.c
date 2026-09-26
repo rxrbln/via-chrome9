@@ -297,6 +297,16 @@ module_param_named(texture_bias, chrome9_texture_bias, bool, 0600);
 MODULE_PARM_DESC(texture_bias,
 	"Fragment TEX with a per-fragment LOD bias, TEXLDB (default: true)");
 
+static bool chrome9_texture_project = true;
+module_param_named(texture_project, chrome9_texture_project, bool, 0600);
+MODULE_PARM_DESC(texture_project,
+	"Fragment TEX with a projective divide, TEXLDP (default: true)");
+
+bool chrome9_texture_project_enabled(void)
+{
+	return READ_ONCE(chrome9_texture_project);
+}
+
 static bool chrome9_blend_color = true;
 module_param_named(blend_color, chrome9_blend_color, bool, 0600);
 MODULE_PARM_DESC(blend_color,
@@ -7048,6 +7058,8 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_BLEND_COLOR;
 	if (READ_ONCE(chrome9_texture_bias))
 		caps |= DRM_CHROME9_CAP2_TEXTURE_BIAS;
+	if (READ_ONCE(chrome9_texture_project))
+		caps |= DRM_CHROME9_CAP2_TEXTURE_PROJECT;
 	if (READ_ONCE(chrome9_destination_offset))
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_coarse_z))

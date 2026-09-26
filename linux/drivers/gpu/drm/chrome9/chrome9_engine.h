@@ -22,6 +22,7 @@ bool chrome9_textured_triangle_run_enabled(void);
 bool chrome9_textured_triangle_mip_enabled(void);
 bool chrome9_rhw_chain_enabled(void);
 bool chrome9_ps_add_enabled(void);
+bool chrome9_texture_project_enabled(void);
 bool chrome9_fragment_sparse_textures_enabled(void);
 u64 chrome9_engine_capabilities2(void);
 u32 chrome9_engine_vs_flow_depth(void);
