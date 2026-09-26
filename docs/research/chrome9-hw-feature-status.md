@@ -45,6 +45,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | Fast-Z clear (A27 index in X8Z24 depth bits 10:8, A14/A15 clear data), on by default | `5ca17f7` / Mesa Fast-Z, CAP2 bit 24 | rung `fastz`, 24-bit FBO probe identical; Z16 windows do not use it |
 | pixel-shader depth output (DEST_DEPTH directly before the colour write, A8A 8a820000), on by default | `42677af`, `2440737` / Mesa `7146ff9`, CAP2 bit 26 | `fd` probe, piglit fragdepth tests (`chrome9-depth-output-audit.md`) |
 | NaN primitive drop per draw (stage B B14) | `fd0f932` | raster self-test, `nan` probe |
+| per-segment state cache (default on), stage A draws clear it | `98fa4fd`, `980d647` | `chrome9_state_rungs` R2 30/30, R3; piglit and ioquake3 equal or better than `state_cache=0` |
 | tiled depth (A12 bit 0) and tiled colour targets and textures (A51 bit 23, A22 bit 17), on by default, no linear fallback | `a9dfc98`, `fe20655` / Mesa `9a62ef4`, `6db49ba`, CAP2 bits 27/28 | rungs `tile`, `tileperf`; piglit texture/depth subsets unchanged (`chrome9-tiling-re.md`) |
 | local frame buffer (SL) placement of depth buffers and render targets: GEM_CREATE_LOCAL objects in an SL pool (16 MiB up to the occlusion page), CPU mapping write-combined through BAR2, engine location code 00 in A51, A11, A29, A18 and the level entries; resources the CPU reads are moved to GART pages once | kernel GEM_CREATE_LOCAL, CAP2 bit 29 / Mesa `chrome9_resource_local`, `chrome9_context_demote_local` | refract 78.0 -> 64.1 ms (15.6 fps), glmark2 113; fd, sprite, blur and VS texture probes identical with and without |
 | FE43 index fetch: stage B indices from a GART index arena instead of the command stream (queried draws inline), on by default | kernel `412444b` | vtf probe identical without inline indices; refract 64.1 -> 62.1 ms; piglit unchanged (`chrome9-fe43-index-fetch.md`) |
@@ -75,8 +76,8 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | state |
 |---|---|
-| stage B rungs B8 (out-of-range ignore), B13 (A12 default lanes) | open (B14 done); B7 (several A24 chunks per job) is exercised by DRAW_VERTEX_PROGRAMS batching |
-| per-segment state cache | patch ready (default off), rungs R2/R3 |
+| A2C/A2D bound instead of the CPU index scan | B8 passes on silicon (an out-of-range index ends the list); not used: the scan also yields the rebase minimum and the finite/bounds range, costs 0.7 us per 120 indices, and the exact bounds are already written (`chrome9-tcl-vertex-formats-stage-b.md` §7) |
+| A12 default lanes for (0,0,0,1) inputs | B13 passes on silicon (a clear A12 bit reads (0,0,0,1), even if fetched); not used: no workload fetches such an input per vertex, constants go through stride-0 elements or VS constants |
 | vertex IF nesting | depth 4 by default, reported by GET_PARAM VS_FLOW_DEPTH (kernel `a5fee45`, Mesa `7d88b30`); most vertex IFs are flattened to selects before TCL emission |
 
 ## Texture sampler: border, GL_CLAMP, mirror once, 1D, shadow, LOD limits

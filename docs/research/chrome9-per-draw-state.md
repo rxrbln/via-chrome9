@@ -952,3 +952,62 @@ Not changed:
 5. Two concurrent GL clients (glxgears plus ioquake3) for one minute,
    then close both: no leak in `/proc/slabinfo` (kmalloc-2k/4k/64k) and
    no refcount warnings.
+
+## 10. Audit on 764eca5 and silicon (2026-09-26)
+
+The state cache landed as `98fa4fd` (rebase6 plus the FE pulse fix) and is
+on by default; 45 driver commits followed it.  Audit of every state word
+`chrome9_emit_fragment_draw()` and the submit loop write since `272da90`:
+
+| state | where | cache coverage |
+|---|---|---|
+| MRT colour targets A58..A5B, A60..A63, A68..A6B | DESTINATION block | emitted words compared |
+| R32F (A00/A53 post-rendering off), local-memory location codes (A51, A11, A29, texture), tiled colour/depth/texture bits, blend colour (A38..A3F) and equations | DESTINATION, COMMON, TEXTURE | emitted words compared |
+| coarse-Z A29/A2A, Fast-Z A14/A15/A27, depth output A13[23], edge AA A01[5], sprite/line A01 bits | COMMON | emitted words compared |
+| texture border colour, mirror once, LOD bias, 3D/cube words | TEXTURE unit group | emitted words compared |
+| vertex flow: bools in A61, ints `33030000`, wide VS output transfer A61[22], NaN kill A00[23:18], A2F | LINK | raster words and int constants compared |
+| shader depth output A8A, HPSLocation A8A | LINK | emitted with LINK; the program is compared (now including `depth_output`) |
+| FE43 index fetch, A2C..A2E/A24, 3003 slots, occlusion reset/snapshot | per draw | never cached; cache cleared after a query draw |
+| PPC write-back, Fast-Z off (A27), blend constant closure | segment tail | outside the cache |
+
+Word groups compare their emitted dwords, so any new word inside a group
+is covered automatically; the only register shared by two groups (A33 in
+DESTINATION and COMMON) is always written in the same order and value
+(checked by hand).  One real hole was found: a stage A (inline) or
+post-TNL draw inside a DRAW_VERTEX_PROGRAMS segment set its local cache
+pointer to NULL but left the recorded groups in place.  Its full state
+overwrote the hardware registers, and the next stage B draw with the
+state of the earlier stage B draw omitted LINK and TEXTURE.  Silicon:
+the new R2 case `stage-a-mix` (B, A, B with different program and
+texture) **locked up the engine** on module k143 (job timeout in FE33,
+EIO for every later ioctl; the old module could not be quiesced, cold
+boot).  Fix (kernel `980d647`): such draws clear the cache
+(`chrome9_state_cache_forget()`); LINK also compares
+`program->depth_output`.
+
+Rung tool: `tools/re/chrome9_state_rungs.c` (tools `d19e307`, builds
+against the current UAPI unchanged), new R2 cases `stage-a-mix`, `wrap`
+(clamp/border/mirror once/repeat), `blend-color` (CONST_COLOR factors,
+two blend colours, ADD/REVERSE_SUBTRACT), `edge-aa`, `depth-out` (shader
+depth alternating with plain depth), `flow` (plain program, IF b0 with b0
+clear/set) and `mrt` (two colour targets, both compared).
+
+Silicon, module `k144-scfix` (`980d647`), one case per invocation:
+
+* R2: all 30 cases PASS (23 earlier + 7 new), identical colour/depth in
+  full/full/cached runs, guards intact, e.g. `mixed` 3662/16864 dwords
+  omitted, `stage-a-mix` 485/2503.
+* R3 (per-draw slope over 64 tiny draws, wall / GPU): `same` 9.2 -> 7.2 us
+  / 0.9 -> 0.3 us; `tex` 9.6 -> 8.5 / 1.0 -> 0.5; `vsconst` 9.7 -> 8.1 /
+  1.0 -> 0.5; `clip` 9.5 -> 7.7 / 1.0 -> 0.5; `link` 9.6 -> 9.0 /
+  1.0 -> 0.8; 64-draw job GPU 86 us full, 40-72 us cached.  All PASS.
+* ioquake3 1024x768, client p93, two interleaved rounds:
+  GL1 50.9/50.5 fps cached vs 50.5/50.1 full, GL2 43.2/44.1 vs
+  43.3/43.1 (about +0.8 % and +1 %; baseline 50.4/43.5).
+* glmark2 (`gmall.sh`, 3 s scenes): score 132 both, FPS sum 4397 vs 4395.
+* piglit `pg-all60.txt`: `state_cache=1` 1774 pass, identical to the p93
+  baseline `pg-all93.tsv` test by test; `state_cache=0` 1775 pass, the one
+  difference is `triangle-rasterization-fbo` (seed-flaky).
+
+The cache is correct and not slower; it stays on by default (it already
+was; `state_cache=0` remains for diagnosis).

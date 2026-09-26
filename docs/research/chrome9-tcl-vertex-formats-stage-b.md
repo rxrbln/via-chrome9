@@ -2,8 +2,9 @@
 <!-- Copyright 2026 René Rebe <rene@exactco.de> -->
 # Chrome9 hardware TCL: vertex element formats and stage B fetch
 
-Status: research, 2026-09-24.  Read-only; nothing here was run on the
-VX900.  This extends [chrome9-hw-tcl-re.md](chrome9-hw-tcl-re.md) ("Vertex
+Status: research, 2026-09-24; silicon results for B8 and B13 in section 7
+(2026-09-26), the other rungs in chrome9-hw-tcl-re.md.  This extends
+[chrome9-hw-tcl-re.md](chrome9-hw-tcl-re.md) ("Vertex
 fetch: streams and declarations", "Draw packets and command order") and
 [chrome9-hw-tcl-implementation-plan.md](chrome9-hw-tcl-implementation-plan.md)
 sections 2.1/2.2 with the complete format table, the fill rules, the index
@@ -488,12 +489,12 @@ first timeout, engine error or guard change.
 | B5 | 32-bit indices, A20 `..3` | equals B2a | low |
 | B6 | `base_vertex = 3` with shifted data (kernel rebase) | equals B2a | low |
 | B7 | two A24 chunks in one job | equals B2a | medium (second PLEND) |
-| B8 | A2C = true max - 1 (last triangle out of range) | last triangle missing, clean retire | medium: first use of the ignore rule |
+| B8 | A2C = true max - 1 (last triangle out of range) | last triangle missing, clean retire | medium: first use of the ignore rule; **silicon PASS**, the list ends at the first out-of-range index (section 7) |
 | B9 | position `c2 -> 82` (stride 12 packed), shader writes `v0.w` to oT0 | w = 1.0 read back | low |
 | B10 | color `d1 -> c7` with RGBA bytes | same image as BGRA+`d1`; proves byte order | low |
 | B11 | `cb`, `c9` (rend2 normal/color), then `4a/ca`, `44/c4`, `c6`, `8c/8f` | per format within 1 LSB of CPU unpack | low |
 | B12 | one element with stride 0 (float4 constant) | constant color across the draw | medium (pitch 0 read path) |
-| B13 | A12 bit of one input cleared, element dropped | input reads (0,0,0,1) | low |
+| B13 | A12 bit of one input cleared, element dropped | input reads (0,0,0,1) | low; **silicon PASS**, also with the element still fetched (section 7) |
 | B14 | A00 `|= 0x540000`, one vertex position NaN in the VS | that primitive dropped, others drawn | medium |
 | B15 | last vertex ends at the last byte of a BO (no tail slack) | clean retire | **high**: hardware read-ahead past the object could reach an unmapped SF page |
 | B16 | stride 2044 and `sum = 64` dwords (16 x FLOAT4) | equals stage A | medium |
@@ -530,3 +531,58 @@ Hang risks and mitigations:
 * The VS_FETCH oracle is described as passing by the current lane, but
   [chrome9-hw-tcl-implementation-plan.md](chrome9-hw-tcl-implementation-plan.md)
   line 27 still says "working tree only".  Record the silicon result there.
+
+## 7. Silicon: B8 and B13 (2026-09-26)
+
+Kernel `980d647` (target tag `k144-scfix`), knobs in `tcl_re`: 1024 writes
+A2C one below the rebased index maximum, 2048 leaves the last element out
+of the fetch (A00 count and dword sum, A(1+n) word and 3003 slot) so its
+A12 bit is clear, 4096 clears only the last input's A12 bit.  Tool:
+`tools/re/chrome9_state_rungs.c` (`b8`, `b13`), one 20x20 quad per ioctl
+(indices 0 1 2 0 2 3), 64x64 target, guards checked, a normal draw after
+each knob run.
+
+| rung | draw | result |
+|---|---|---|
+| B8 | first triangle only (reference) | 210 pixels |
+| B8 | quad, A2C exact | 400 pixels |
+| B8 | quad, A2C = max - 1 (index 3 out of range in the 2nd triangle) | 210 pixels, identical to the reference |
+| B8 | swapped triangles (0 2 3 first), A2C = max - 1 | 0 pixels: nothing after the first out-of-range index is drawn |
+| B8 | quad again, knob off | 400 pixels, identical: clean retire, no state leak |
+| B13 | v4 = BGRA `ff000000` (0,0,0,1), knob off (reference) | 400 pixels |
+| B13 | v4 = `ff2f5a13`, knob off | all 400 pixels differ: v4 reaches oD0 |
+| B13 | v4 = `ff2f5a13`, element not fetched, A12 bit 4 clear | identical to the reference |
+| B13 | v4 = `ff2f5a13`, element fetched, A12 bit 4 clear | identical to the reference |
+
+B8 passes with FE43 index fetch (`index_fetch=1`) and with inline indices
+(`index_fetch=0`).  The manual's wording ("ignore this and the followed
+indices", OGPM p.169) is exact: the bound ends the list, it does not skip
+single primitives.  B13: an input whose A12 bit is clear reads
+(0, 0, 0, 1) regardless of any element that targets it.  The test input
+index (4) was above the output count (4 registers with one varying), since
+the kernel's A12 is the superset of the input and output masks; whether a
+clear bit below the output count also clears an output was not tested.
+
+Use in the driver, decided on these results:
+
+* **A2C/A2D as a replacement for the CPU index scan: not done.**  The
+  kernel already writes the exact inclusive bounds (A2D = 0, A2C = max - min
+  after the rebase), so the hardware check is active as a second line of
+  defence.  The scan cannot be dropped: `min` is needed for the rebase
+  (element addresses stay inside the object, 16-bit narrowing of 32-bit
+  input), and `max - min` bounds the stage B finite check and the object
+  bounds check.  A clamp derived from the BO size would also turn an
+  out-of-range index into a truncated draw instead of `-EINVAL`.  Cost of
+  the scan/rebase/pack on the target's VIA Nano X2 L4350
+  (`tools/re/chrome9_index_scan_bench.c`): 0.25 / 0.71 / 3.4 / 16.7 us for
+  36 / 120 / 600 / 3000 16-bit indices, against 0.04-0.41 us for a plain
+  copy and about 8-9 us kernel wall time per draw (R3); with ioquake3's
+  typical 100-300 indices per draw it is under 10 % of the per-draw cost.
+* **A12 default lanes for (0,0,0,1) inputs: not done.**  It would only
+  save the fetch of an attribute that is exactly (0,0,0,1) for every
+  vertex, only for input registers at or above the output count, and
+  would need input renumbering plus a new element kind in the UAPI.
+  Mesa already sends constant attributes as stride-0 elements (B12,
+  one 16-byte record) or folds them into VS constants; no measured
+  workload fetches such an attribute per vertex.
+
