@@ -1325,3 +1325,30 @@ stable hashes are:
 chrome9-current.ko                 2fcfc925d7fe84acdc1fe06ba43747fc7946755b6364d43dad549a6578e476f3
 current/libgallium-26.2.2.so       ec9d69d177a6ca5b0e3ab1e330b256d6f152092171ed6e6a5d21647c76636888
 ```
+
+## Generic mipmapped texture submission
+
+Mesa now consumes the kernel's guarded mip-chain capability instead of
+rejecting every Gallium mip filter.  Selection is semantic and fail-closed:
+one 2D BGRX texture, square power-of-two dimensions through 512, levels
+starting at zero, the exact guarded/aligned resource layout, clamp-to-edge,
+a complete view range, and a representable signed s5.5 LOD bias.  No scene
+name, shader hash, or application-specific key participates in selection.
+
+The live target was reloaded without rebooting with
+`textured_triangle_mip=1`; Xorg PID 1218 then initialized glamor on Chrome9.
+Under that single X server, glmark2 2023.01 passed its built-in image
+validation for 20 frames of each texture filter:
+
+```text
+[texture] nframes=20:texture-filter=nearest  Validation: Success
+[texture] nframes=20:texture-filter=linear   Validation: Success
+[texture] nframes=20:texture-filter=mipmap   Validation: Success
+```
+
+The mipmapped view covered levels 0 through 9.  X remained alive and dmesg
+contained no Chrome9 timeout, quarantine, fault, failure, or wedge report.
+The target log is
+`/root/tmp/chrome9-live/new-target-192.168.2.60/glmark-v5/texture-regression.log`.
+The implementation commits are Mesa Chrome9 `cef3050` and Mesa parent
+`24684a9`.

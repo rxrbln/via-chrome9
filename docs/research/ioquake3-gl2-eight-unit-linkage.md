@@ -4,8 +4,9 @@ Status: ioquake3 source-exact startup audit, VX900-manual packet derivation,
 and fresh Windows/Linux compiler replay, 2026-09-21; current Mesa compiler
 boundary refreshed 2026-09-24.  Texture stages zero through two have bounded
 structured-path evidence.  Stages three through seven and the five-TAU object
-below are not silicon-proven.  The current production limit of three remains
-truthful; the existing environment override is diagnostic only.
+below are not silicon-proven.  Current kernel and Mesa source already expose
+eight fragment sampler slots and eight varyings; this is an advertised resource
+limit, not evidence that all corresponding programs execute correctly.
 
 ## What ioquake3 actually needs to start
 
@@ -14,7 +15,7 @@ The audited renderer is ioquake3 commit
 specular and deluxe mapping, disable cube mapping and use sunlight mode one.
 The lightall initializer visits permutation indices in increasing order.
 
-The first shader exceeding Chrome9's current three-fragment-sampler cap is
+The first shader which exceeded the historical three-fragment-sampler cap is
 `LIGHTDEF_USE_LIGHTMAP`, index one.  Its active uniforms are:
 
 ```text
@@ -37,18 +38,12 @@ samples.  Cube mapping is default-off and is disabled by ioquake below GL 3;
 unit six would otherwise also hold `u_CubeMap`.  Default startup does not use
 unit seven or eight simultaneous samplers.
 
-For diagnosis, set the already implemented
-`CHROME9_DEBUG_MAX_FS_SAMPLERS=7`.  It raises both Gallium
-`max_texture_samplers` and `max_sampler_views`; seven is the smallest value
-which admits all default uniform assignments.  Setting eight is useful only
-for the stage-seven lab oracle.
-
-This override is not a production capability.  Advertising eight says every
-valid shader within that resource limit executes correctly.  A closed
-classifier which silently drops other valid three-to-eight-sampler draws does
-not satisfy that contract.  Promote the default only after state, lifetime,
-compiler and representative program coverage exist; otherwise keep this an
-explicit diagnostic probe.
+The older diagnostic `CHROME9_DEBUG_MAX_FS_SAMPLERS=7` override is no longer
+needed to pass this link limit on a matching current kernel: Mesa now exposes
+eight sampler/view slots under `CAP_FRAGMENT_EXTENDED_LINKAGE`, which the
+kernel advertises.  That advertisement must still be reconciled with missing
+execution qualification for some higher-stage state and arbitrary shaders;
+the override itself is not a proof of hardware behavior.
 
 ## Current first-default-permutation compiler boundary
 
@@ -90,10 +85,11 @@ FACE  gl_FrontFacing system value, flat per primitive
 
 The non-sampler store uses three vec4s (`u_EnableTextures`, `u_NormalScale`,
 `u_SpecularScale`) plus the integer alpha mode: 13 components.  This fits the
-32-vector constant store.  The current link fails first at five samplers
-versus the advertised three.  A diagnostic sampler override can pass that
-link check, but does not qualify five descriptor stages or the six-varying
-draw layout.
+32-vector constant store.  Current resource advertisement passes the old
+five-sampler link gate; the first unmodified backend stop is the
+`u_AlphaTest` `terminate_if` variant tree, followed by FACE after exact
+mode-zero specialization.  Passing link does not qualify five descriptor
+stages or the six-varying draw layout on silicon.
 
 After mechanically applying the semantically exact alpha-mode-zero variant,
 the linked fragment NIR has source BLAKE3 words:
@@ -112,10 +108,11 @@ SQRT, vec3 and vec4
 ```
 
 This is already close to the 96-ALU store before native expansion.  POW
-becomes LOG2/MUL/EXP2, adding two records relative to its NIR node; SQRT still
-needs a conformant lowering; constructors may fold into swizzles or require
-MOVs.  An exact final native count and twelve-register physical-temp high-
-water cannot be claimed until those semantic blockers lower successfully.
+becomes LOG2/MUL/EXP2, adding two records relative to its NIR node;
+the current Mesa screen enables the standard nonnegative SQRT lowering;
+constructors may fold into swizzles or require MOVs.  An exact final native
+count and physical-temp high-water cannot be claimed until FACE and the
+full compiler schedule lower successfully.
 
 The first current backend rejection after mode-zero specialization is not an
 unknown lighting opcode.  `gl_FrontFacing` appears as a FACE `load_input`,
@@ -124,10 +121,9 @@ smooth interpolated inputs but not the FACE system load, so it rejects before
 emitting a semantic object.  Even if the value were exposed as an ordinary
 source, the only current BCSEL lowering is a bounded floating `fge` select on
 a proven unit interval; it does not implement a boolean front-face select.
-The next independent arithmetic reject is the unlowered SQRT used to
-reconstruct normal Z.  The current compiler result is therefore exact and
-empty: `supported=0`, `semantic=0`, zero semantic records, zero ALU and zero
-TAU.  No partial native object is evidence of fit.
+The historical SQRT reject is now addressed by the screen's `lower_fsqrt`
+option.  The mode-zero default shader still stops at FACE before a complete
+semantic object exists; no partial native object is evidence of fit.
 
 The exact production-compiler vFace differential and the bounded synthetic
 face-sign resource experiment are documented in
@@ -175,19 +171,21 @@ the instruction stores are not its next resource gate.  Native allocation is.
 Replaying the kernel's allocate-before-release interval rule over that exact
 semantic stream reaches all twelve physical temporaries and fails while
 allocating record 34; the complete unscheduled SSA order has a peak live set
-of 15 at record 67.  Moreover six active direct varying coordinates select
-the kernel's largest resource bucket, which permits at most six physical
-temporaries.
+of 15 at record 67.  The earlier six-temp interpretation of the 8/6 bucket
+was too restrictive: the zero resource bucket is a valid fallback, and the
+production Linux compiler emits it for six direct inputs and ten live temps.
 
-Thus merely extending the native encoder from 12 registers would still not
-make the object submit-safe.  A generic scheduler must sink definitions,
-shorten live ranges, or recompute/spill values until the physical high-water
-is at most six, while preserving all 95 ALU and five texture results.
+The current kernel intentionally limits native allocation to twelve of the
+sixteen encoded TEMP IDs; simply increasing that policy is not yet justified
+by a lightall silicon oracle.  A dependency scheduler can sink definitions
+and shorten live ranges to fit the current twelve-register bound while
+preserving all 95 ALU and five texture results.  Component packing is a
+second possible route, not an established prerequisite for this permutation.
 
-This does not remove the earlier API gates: production still truthfully
-advertises three fragment inputs and three sampler slots.  The discriminator
-only proves that, after those route and descriptor paths are generalized,
-raising the ALU cap is not the required fix.
+Current source already advertises eight fragment inputs and eight sampler
+slots under the extended-linkage capability.  The discriminator does not
+silicon-qualify all those routes or descriptors; it shows that the default
+permutation's remaining compiler obstacle is not a simple ALU-cap increase.
 
 ### Scheduling and channel-allocation discriminator
 
@@ -215,11 +213,14 @@ ten virtual vectors and 21 written channels.  It has no undefined temporary.
 This exhausts the ALU store but demonstrates that spilling is not the first
 required mechanism.
 
-Twenty-one live channels fit within the raw 24-channel capacity of six vec4
-registers, but that count is not yet a successful hardware coloring.  One
-vector destination's written channels must remain co-resident in one physical
-register, and every A/C/B source-port rule must still hold.  The proprietary
-Linux compiler provides direct guidance rather than a reason to guess:
+The candidate's ten live whole vectors fit the current twelve-register
+bound in principle, but the exact kernel allocator and native port rules
+still need replay.  Twenty-one live channels also suggest a possible later
+packing optimization, but that count is not a successful hardware coloring.
+One vector destination's written channels must remain co-resident in one
+physical register, and every A/C/B source-port rule must still hold.  The
+proprietary Linux compiler provides direct guidance rather than a reason to
+guess:
 
 ```text
 001c1f00 T TryAllocChn_invi
@@ -230,11 +231,11 @@ Linux compiler provides direct guidance rather than a reason to guess:
 `TryAllocChn_invi` selects one candidate slot for a requested channel group
 while checking the named channel lifetimes independently.  Its disassembly
 has 16 candidate slots for classes zero and one and four for class eight.
-`RenameSrcChannel_invi` separately rewrites source channels.  The generic
-next step is therefore a grouped per-channel interval allocator plus semantic
-source-swizzle rewriting, validated against port rules.  Only that allocator
-can decide whether the 21-channel schedule really colors into the six-temp
-resource bucket; the current whole-vector allocator cannot.
+`RenameSrcChannel_invi` separately rewrites source channels.  First replay the
+101-record schedule through the current whole-vector allocator and valid
+zero bucket.  A grouped per-channel interval allocator plus semantic
+source-swizzle rewriting is the next generic capacity improvement if that
+replay or another shader actually needs it; validate it against port rules.
 
 The generic implementation ladder is:
 
@@ -242,13 +243,14 @@ The generic implementation ladder is:
    all three `terminate_if` side effects;
 2. expose per-primitive FACE semantics without an application key, and lower
    the sign selection exactly for both front and back triangles;
-3. lower finite nonnegative SQRT through a qualified sequence and reject
+3. retain the current standard nonnegative SQRT lowering and reject
    exceptional domains until characterized;
 4. schedule the exact semantic DAG and require final ALU `<=96`, TEX `=5`,
-   physical high-water `<=6` for the six-coordinate resource bucket, varying
+   physical high-water `<=12` with the valid zero fallback bucket, varying
    mask `0x3f`, sampler mask `0x1f`, and no unmodelled spill;
-5. only then promote five dense descriptors and six float varyings, followed
-   by distinct-color front/back pixel oracles and stale-state closure.
+5. qualify the already-advertised five dense descriptors and six float
+   varyings, followed by distinct-color front/back pixel oracles and
+   stale-state closure.
 
 Do not solve this boundary by forcing all triangles front-facing, dropping
 the normal/deluxe/specular samples, or selecting the reduced two-texture

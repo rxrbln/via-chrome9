@@ -1,9 +1,10 @@
 # Chrome9 pixel-shader component-allocation boundary
 
 Status: exact Linux 5.75 proprietary compiler disassembly and source-exact
-ioquake3 default-lightall resource replay, 2026-09-24.  This is an offline
-compiler boundary, not a silicon qualification and not evidence for a memory
-spill ABI.
+ioquake3 default-lightall resource replay, 2026-09-24.  The six-coordinate,
+ten-temporary fallback bucket was separately checked with a production Linux
+compiler object.  This is an offline compiler boundary, not a silicon
+qualification and not evidence for a memory spill ABI.
 
 ## Result
 
@@ -12,27 +13,28 @@ temporary.  It schedules an instruction dependency graph first and then
 places each masked destination group in a physical register whose requested
 lane intervals are free; unrelated values may share its other lanes.
 The current Chrome9 kernel compiler instead maps each semantic TEMP id to one
-whole physical vec4.  Closing that mismatch is necessary for large shaders,
-but component packing alone is not sufficient for the exact ioquake3
-lightall order: its peak live-channel count still has a theoretical minimum
-of nine vec4 registers while its six-coordinate hardware resource bucket
-allows only six.
+whole physical vec4.  Closing that mismatch will be useful for larger
+shaders.  The original ioquake3 lightall order has a 35-channel peak, a
+theoretical minimum of nine packed vec4 registers.  That no longer proves
+packing alone insufficient: the earlier claim that six coordinates force a
+six-register maximum was incorrect.  The zero resource bucket is a valid
+fallback, selected by the production compiler for six coordinates and ten
+temporaries.
 
-The implementation boundary is therefore scheduler first, component
-allocator second.  The compiler must shorten the semantic live intervals to
-at most 24 simultaneously live channels, then pack those channels and prove
-that the resulting physical-register high-water is no greater than six.
-Simply raising the current 12-register allocator limit or packing the current
-order cannot make the object legal.
+The implementation boundary is therefore scheduler first, then an exact
+whole-register allocation replay.  The first scheduler candidate reaches ten
+live semantic vectors and may fit the current 12-register compiler bound
+without component packing.  If no dependency-legal whole-vector schedule
+fits, channel packing is a second route to investigate.  Neither route has
+yet been compiled into a complete native lightall object or run on silicon.
 
-A dependency-checked candidate schedule now reaches that necessary capacity
-bound without inventing a memory spill: it uses the one spare ALU record to
+A dependency-checked candidate schedule uses the one spare ALU record to
 clone one ADD, sinks three independent subtrees, and reduces the conservative
-peak from 35 to 21 live channels.  It still has ten simultaneously live
-semantic values, so it also proves why whole-vec4 allocation remains
-insufficient.  Twenty-one channels fitting into 24 available lanes is not by
-itself a group-aware interval-coloring proof; the component allocator must
-still produce and validate an actual six-register assignment.
+peak from 35 to 21 live channels and from 15 to ten live vectors.  This is
+below the current twelve-register bound, but is not yet a kernel allocation
+replay or proof that the native object executes.  Channel packing may reduce
+pressure further; 21 live channels alone does not prove a legal group-aware
+assignment.
 
 ## Proprietary allocator evidence
 
@@ -98,10 +100,46 @@ semantic dependency graph -> instruction reorder -> lane allocation/remap
 It is not whole-register allocation followed by an optional peephole pack.
 
 `FindNextDirectType` reads two resource counts at context offsets `+0xe26c`
-and `+0xe26e` and compares them against the exact envelopes visible in the
-current kernel resource table: 4 coordinates / 3 temps, 5 / 4, 8 / 6, and
-the largest 16 / 12 envelope.  For six active direct coordinates, the
-qualified limit is consequently six physical temporary registers.
+and `+0xe26e` and compares them against the exact resource thresholds in
+`stmUpdateConfig`: 4 coordinates / 3 temps, 5 / 4, and 8 / 6.  If none
+matches, the resource field is zero; that is a real fallback bucket, not a
+rejection.  The current kernel allocator is independently bounded to twelve
+physical temporaries.  Its `chrome9_fragment_resource_bucket()` returns
+zero for the fallback and `chrome9_fragment_encode()` uploads it.
+
+The missing mixed-resource differential was run through the production Linux
+5.75 pixel compiler, configuration two, with six direct full-float inputs
+`t0..t5` and ten simultaneously live full-vec4 temporaries `r0..r9`.
+The 71-dword PS 2.0 token stream consists of ten `MOV r_i, t_i/c_j`, nine
+accumulating `ADD r0, r0, r_i`, and `MOV oC0, r0`.  Its space-separated
+lowercase hexadecimal dwords have SHA-256
+`b7b72c3ac5e7a91b540d2425da8ec8f88dec11fc4f3d51adddc46eb38a25054d`.
+The exact offline result is:
+
+```text
+active-resource-counts: 6 10 6 0
+ALU count=20; TAU count=0
+metadata +2c=00040000, +40=0000003f, +44=000003ff
+controls A90=9004003f A91=91000000 A92=92000014
+```
+
+Native TEMP IDs occupy four bits and the vendor compiler emits sixteen
+simultaneously live IDs `r0..r15`; its `r16` overflow silently aliases r0 and
+is not a usable seventeenth register (see
+`chrome9-ps-temp-lifetime-finalizer.md`).  The current kernel deliberately
+caps its first allocator at twelve (`CHROME9_FRAGMENT_PHYS_TEMPS=12`), so the
+actionable limit for this driver is twelve, not the raw encoding's sixteen.
+The zero A90 bucket is still valid with six coordinate inputs and ten of
+those twelve temps.
+
+For reproduction, begin with `ffff0200`; for `i=0..9` append
+`03000001, 000f0000+i, (i<6 ? 30e40000+i : 20e40000+i-6)`; for
+`i=1..9` append `04000002, 000f0000, 00e40000, 00e40000+i`; finish with
+`03000001, 000f0800, 00e40000, 0000ffff`.  Pass the words to
+`tools/re/chrome9_pps_probe.c` under `qemu-i386` with
+`CHROME9_POSTPROCESS=2`, `CHROME9_RESOURCE_COUNTS=1`, and
+`CHROME9_DUMP_CONTROLS=1`.  This proves the fallback encoding for the mixed
+count, not six-varying/five-TEX lightall silicon correctness.
 
 ## Exact ioquake3 lower bound
 
@@ -121,7 +159,8 @@ varying coordinates, five dense sampler slots, and 96 virtual SSA temps.  The
 current whole-vec4 allocate-before-release replay fails at semantic record 34
 and has a peak of 15 simultaneously live values at record 67.
 
-The stronger component count still disproves a packing-only fix.  At record
+The component count shows that packing the original order needs at least
+nine registers, although the corrected fallback may encode that.  At record
 34 the live values are:
 
 ```text
@@ -131,8 +170,9 @@ t3 t5 t10 t12 t13 t21 t22 t25 t29 t35 t49 t50 t53
 Their live destination masks total 34 channels.  Even an ideal component
 allocator therefore needs `ceil(34 / 4) = 9` physical registers.  At the
 record-67 peak, the 15 live values total 35 channels, again requiring at
-least nine registers.  Both exceed the six-register envelope before any
-first-fit fragmentation is considered.
+least nine registers.  Nine fits the zero-bucket/12-register candidate
+envelope, but the original whole-register order still fails at 13 live values
+at record 34 and later peaks at 15.
 
 Trying generic `nir_schedule` before the Chrome9 compiler did not change the
 semantic sequence for pressure thresholds 4, 6, 8, 12, or 32, in either its
@@ -165,7 +205,7 @@ channels.  Two results matter:
   reflectance subtrees, and cloning the ADD at old record 3 for its late
   branch, produces 101 total semantic records: 96 ALU plus five TEX.  Its
   peak is ten live values and 21 conservatively live channels at new record
-  54 (old record 67).
+  54 (old record 67); whole-register allocation now deserves a direct replay.
 
 The exact moved groups are:
 
@@ -204,34 +244,51 @@ ADD.  Arbitrary recomputation is not a general spill strategy; further clones
 would require algebraic/coissue reductions.  Scheduling and definition
 sinking must be attempted before broader recomputation.
 
-## Patch-ready compiler contract
+## Patch-ready compiler contract and regressions
 
 A safe implementation sequence is:
 
-1. Build explicit dependencies and per-component use intervals for the
-   Chrome9 semantic program.  Preserve TEX/KILL ordering and every native
-   operation's already-qualified source-slot constraints.
-2. Schedule ready records using live-channel pressure, with a hard target of
-   24 channels for a six-temp bucket.  Reject if no legal order meets the
-   program's resource envelope and 96-ALU/32-TEX store limits.
-3. Allocate each destination component to a physical `(register, lane)`.
-   Rewrite destination masks and every consumer swizzle; do not assume a
-   semantic vec3 or vec4 remains in consecutive physical lanes.
-4. Recompute physical-register lifetime after lane packing.  Hardware release
-   markers remain per physical vec4, not per component.  Mark exactly one
-   final source occurrence for each physical register, using the proven
-   same-record precedence A over C over B.
-5. Recompute physical high-water and select the resource bucket only after
-   scheduling and allocation.  Reject rather than alias or silently select a
-   larger unsupported envelope.
-6. Add byte-level selftests for disjoint scalar lifetimes, mixed vec3/scalar
-   packing, source-swizzle rewriting, same-record repeated physical ids, and
-   the complete 100-record lightall semantic object.  The lightall test must
-   assert both final physical high-water `<= 6` and unchanged ALU/TEX result
-   dependencies, not merely that allocation returns success.
+1. Build explicit dependencies for the Chrome9 semantic program.  Preserve
+   TEX/KILL ordering, terminal full-RGBA output, and each operation's
+   qualified A/C/B source-slot constraints.  Do not rely on `nir_schedule()`:
+   recursive semantic lowering discards its block order.
+2. Schedule ready records to shorten whole-vector lifetimes.  Try the retained
+   101-record discriminator first; replay the kernel's allocate-before-release
+   rule, require physical high-water `<=12`, 96 ALU, five TEX, and the expected
+   masks `varying=0x3f`, `sampler=0x1f`.  Check that zero-bucket A90 is selected
+   for a ten-register result; zero must not be confused with failure.
+3. If no valid whole-vector schedule fits, add grouped per-channel intervals
+   and physical `(register,lane)` remapping.  Rewrite masks and every consumer
+   swizzle, then rerun the same lifetime and native-port checks.  Physical
+   high-water remains `<=12`; use a smaller bucket only if the final mixed
+   resource counts qualify for it.
+4. Recompute physical-register lifetime after either allocation.  Hardware
+   release markers remain per physical vec4, not per component.  Mark exactly
+   one final source occurrence per physical register using A over C over B
+   same-record precedence.  Reject undefined reads and any dead temp.
+5. First add an offline resource-bucket regression: ten full-vec4 MOV
+   definitions from six distinct varyings and four constants, then a fresh-SSA
+   ADD reduction and one terminal RGBA MOV.  Assert all six varying routes,
+   no dropped source, physical high-water between ten and twelve, and A90
+   `9004003f` (the vendor WAW program above supplies the resource-field
+   oracle, not an exact ALU-byte golden for the SSA rewrite).  Then add a
+   synthetic scheduler regression: thirteen full-vec4 MOV
+   definitions from constants, followed by an ADD reduction and one terminal
+   RGBA MOV.  The deliberately eager semantic order exceeds twelve live
+   temps; an interleaved dependency-preserving schedule needs only a small
+   number.  It must not be accepted by aliasing r12 to r0 or truncating masks.
+   Add a separate allocator-unit test with thirteen pinned scalar definitions
+   and later uses to isolate channel packing from scheduling.  Neither test
+   authorizes silicon submission; compare native bytes and run small guarded
+   per-lane oracles before enabling the packed path.
+6. The complete default-lightall regression must assert semantic output
+   dependencies, exact ALU/TEX counts, all five sampler IDs, six varying
+   routes, final native source/destination and release markers, and physical
+   high-water `<=12`.  Only then consider a bounded distinct-color silicon
+   oracle, after the separate alpha-mode and FACE proofs.
 
 No proprietary scratch load/store or memory-spill packet was recovered in
 this audit.  Calling the proposed scheduling/recomputation work a spill
-implementation would overstate the evidence.  Until a legal six-register
-schedule exists and the complete native object is byte-reviewed, this shader
-must remain rejected before submission.
+implementation would overstate the evidence.  Until a legal twelve-register-
+or-less schedule exists and the complete native object is byte-reviewed,
+this shader must remain rejected before submission.

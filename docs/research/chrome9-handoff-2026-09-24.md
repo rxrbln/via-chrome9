@@ -41,7 +41,7 @@ With the matching Mesa library and `CHROME9_EXPERIMENTAL_X8Z24=1`, bounded
 error; it exits with `Validation: Unknown`, not a correctness pass.  Without
 the experimental depth gate the FBO is incomplete (`0x8cd6`), as expected.
 
-## Stencil — uncommitted, kernel silicon-tested
+## Stencil — uncommitted, kernel and GL silicon-tested
 
 - UAPI: `DRM_CHROME9_FRAGMENT_STENCIL` flag, `DRM_CHROME9_STENCIL_OP_*`
   (native order, INVERT=5), `struct drm_chrome9_stencil_state {cw, ccw}`
@@ -55,7 +55,7 @@ the experimental depth gate the FBO is incomplete (`0x8cd6`), as expected.
   `--write-mask`, `--ops`, `--depth-fail`, `--faces`.  Built with host
   `cc -Wall -Wextra -Werror`; every mode passed under the target GPU lock.
   `--faces` confirms A23/A24 maps to screen-space clockwise winding.
-- Mesa, built in the T2 full build but **not yet GL stencil-tested**:
+- Mesa, built in the T2 full build and GL stencil-tested:
   - `include/drm-uapi/chrome9_drm.h` synced with the kernel UAPI.
   - `chrome9_format_is_d24()` covers X8Z24 and S8_UINT_Z24_UNORM (depth
     31:8, stencil 7:0); S8Z24 is allocatable behind `CHROME9_EXPERIMENTAL_X8Z24`
@@ -71,9 +71,20 @@ the experimental depth gate the FBO is incomplete (`0x8cd6`), as expected.
     honouring the write mask and per-channel masked 32-bpp colour clears via
     `chrome9_clear_zs_target` and `chrome9_clear_target_masked`.  The old
     `chrome9_clear_depth_target` has no remaining caller.
-- Next check: `tools/re/chrome9_gl_stencil_smoke.c` (GLX, run with
-  `CHROME9_EXPERIMENTAL_X8Z24=1`) exercises Gallium stencil state, clear and
-  renderbuffer paths end to end.  It has not run yet.
+- `tools/re/chrome9_gl_stencil_smoke.c` creates a D24S8 FBO, clears stencil
+  to `0x3c`, draws two disjoint RGBX triangles with `GL_REPLACE` ref `0x55`,
+  then reads both centers and depth.  Initially the old Mesa library reported
+  `0x55/0x3c`, while a read-only ioctl/BO trace showed both raw words were
+  `0xffffff55`: hardware had written both.  `chrome9_transfer_map()` used a
+  2-byte fallback for S8Z24 because that format is absent from the sampler
+  table, but its storage CPP is 4.  The narrow fix uses
+  `chrome9_format_storage_cpp()` for the transfer offset.  Full T2 Mesa
+  build, shader NIR test and CPU mipmap test pass.  The rebuilt library SHA-256
+  is `2c08b0a7d06b7bd6bf09bb40dd008b5dcf206a9d23d2602a22e29f165e8d21fa`,
+  staged in target `/root/tmp/chrome9-live/stencil-readback-20260924/` without
+  replacing Xorg's library.  An undelayed locked run now reads `0x55/0x55`,
+  correct colors and depth `1`; Xorg is up and no new kernel fault appeared.
+  This does not yet qualify GL stencil compare/write-mask/two-sided cases.
 
 ## General select lowering — uncommitted, offline-tested
 

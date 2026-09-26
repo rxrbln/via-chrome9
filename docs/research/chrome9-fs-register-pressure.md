@@ -260,3 +260,34 @@ generation are unchanged; a device clear clears a kept copy alike (Mesa
 `a8c1fc4`).  Uploads: texture-packed-formats 576 -> 1, tex3d-npot 7986
 -> 1.  The write-back after each fallback draw remains (tex3d-npot 8.0 s
 against 4.8 s with a linear back buffer).
+
+**Rendering into the staging image** (Mesa `f55af3a`): each kept entry
+now owns a linear staging image in local memory, and llvmpipe renders into
+it directly through a handle alias.  The engine copies the level in only
+when it changed and copies the image back after the draws; there is no
+full-surface CPU copy per fallback draw.  A GART staging image needed a
+cache flush of all its pages before every copy back (`clflush_cache_range`
+10 % of tex3d-npot); local pages need none.  The copy back must pass the
+real level height: the image is padded to 4 rows for llvmpipe blocks, and
+a whole-image copy was refused for heights not a multiple of 4 (texwrap
+failures in the first build).
+
+CPU reads (`transfer_map`) of 64 KiB or more from a tiled local BGRA level
+use an engine copy of the box into a linear GART image instead of
+detiling write-combined memory (about 120 MB/s).  glReadPixels of the
+1024x768 back buffer: 28 ms -> 15 ms; 512x512: 10.5 ms -> 6.1 ms.  Smaller
+reads stay on the CPU, where the fixed cost of the copy and wait
+dominates.  Reading from the kept staging image instead of the level
+brought no gain; re-copying the level after a device clear instead of
+clearing the kept image on the CPU was slower.
+
+| test | linear back buffer | tiled, kept copy | tiled, staging render |
+|---|---|---|---|
+| tex3d-npot | 4.8 s | 8.0 s | 6.8-7.2 s |
+| texture-packed-formats | 0.5 s | 3.4 s | 1.6-1.9 s |
+| texsubimage | 4.6 s | 6.9 s | 4.9-5.6 s |
+
+The fragment constant buffer is advertised as 128 registers (Mesa
+`aa2d0ee`).  4096 registers let glsl-uniform-interstage-limits build
+shaders large enough to exceed the runner timeout (subdivide 5: 2.3 s at
+32, over 30 s at 4096, 3.7 s at 128); 128 still covers gl_LightSource[8].

@@ -152,6 +152,19 @@ runtime also warned that installed `pak0.pk3`
 has a noncanonical checksum; this audit describes the *installed* archive,
 not a claim that it is byte-identical to a retail CD.
 
+A follow-up capture started **before** the game and recorded 24 full-screen
+PNGs at 2 fps with the same 32,768-triangle cap.  The entire sequence and
+timing logs are in `artifacts/2026-09-24/q3dm17-firstframe-seq/`, with target
+originals under `q3dm17-firstframe-seq/` beside the trace.  The cap was
+detected at Unix time `1790238308.604`; `frame-20.png` and `frame-24.png`
+were written approximately 2.87 and 1.67 seconds before that, respectively.
+Both show the gameplay HUD, floor, distant platform and sky bands, but also
+substantial black space.  Therefore a post-cap partial frame is **not** a
+sufficient explanation for the black space.  Quake III's q3dm17 is a floating
+platform map, so this may be intentional void/sky; a software-rendered or
+known-good reference is required before classifying it as a driver defect.
+Neither pre-cap frame singles out the two GL_ADD material surfaces.
+
 `tools/re/ioquake_gl1_material_census.py` is a read-only source-candidate
 filter with self-tests for the identity-lighting trap and independent RGB/A
 ADD vector.  Example:

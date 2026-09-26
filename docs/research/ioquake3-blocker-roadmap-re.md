@@ -525,3 +525,163 @@ The raw cmd22 fixed-state combinations have already passed with constant 2x2
 sources.  The genuinely new qualification is the 4/8/16 generic packet count
 and integration with real sampled assets; do not rerun the fixed-state matrix
 as if it were a missing hardware feature.
+
+## 12. GL2 alpha modes 1/2 and cull-none FACE: current boundary
+
+Source audit, not a new VX900 qualification.  The exact default lightall source
+(`lightall_fp.glsl`, recovered `/tmp/ioq_default_lightall.frag:47,55-70,101`)
+uses front `-var_Normal` / back `+var_Normal`; sets
+`alpha = diffuse.a * var_Color.a`; discards `alpha == 0` in mode 1,
+`alpha >= 0.5` in mode 2, and `alpha < 0.5` in mode 3; and finally writes
+`gl_FragColor.a = alpha`.  The linked vertex source computes
+`var_Color = u_VertColor * attr_Color + u_BaseColor`
+(`/tmp/ioq_default_lightall.vert:37`), so shader identity alone does not bound
+the varying to a quantized or nonzero-positive domain.  The retained
+unspecialized linked NIR (`/tmp/ioq_default_lightall.nir:57,71-103`) loads
+flat FACE, forms `%32 = fmul diffuse.w, var_Color.w`, then has
+`feq %32, 0` (`preserve:inf,nan`), `fge %32, 0.5` (`preserve:inf`), and
+`flt %32, 0.5` (`preserve:inf`) feeding mode-specific `terminate_if`.
+The direct-UBO specialization test in
+`ioquake3-gl2-cull-specialized-face.md:14-37` leaves exactly one terminate
+for each nonzero mode.  Any lowering therefore also has to honor or
+explicitly prove irrelevant the NIR float-control requirements.
+
+Current Mesa `chrome9_context.c:4227-4319` matches only
+`terminate_if(flt(alpha, literal 0.5))`, with alpha either sampled 2D texture
+zero `.a` or that sample multiplied by one varying lane.  Its signed replicated
+SUB plus KILL is the guarded mode-3 construction, not mode-1 `feq` or mode-2
+`fge`.  The newer SUB+CMP predicate lowering at `:3610-3700` serves `bcsel`
+and `b2f32` through `:3724-3755`; it does not lower `terminate_if`.
+Proprietary Linux configuration-two `alpha_texture_ge_ref` consists of sampled
+alpha SUB, a full TEMP-to-texture/address bridge, and TEXKILL TAU opcode 4
+(`chrome9-texkill-schedule-audit.md:122-151`, corpus row in
+`fog-alpha-shader-corpus.tsv`).  It establishes strict `< reference` KILL;
+it is not evidence for inclusive `>=` or equality KILL.  Linux production
+`stmPPS_SGE_PS20_invi` at `via_chrome9_dri.so:0x0016ad60` instead emits
+SUB then CMP with native ONE/ZERO arms
+(`chrome9-generic-float-compare-boundary.md:18-74`), proving a comparison
+materialization shape, not an ordered discard or exceptional-value contract.
+
+For mode 2, the narrow arithmetic candidate remains
+`d=alpha-0.5; signed=CMP(d,-1,+1); KILL signed`: CMP must choose its
+nonnegative arm at equality, and the product-alpha input must satisfy the
+same finite draw-time proof as mode 3.  Prove the exact-half case and adjacent
+below/above values with a guarded one-texel/factor oracle before admitting
+that NIR shape.  Mode 1 has no comparable sign-only construction for arbitrary
+finite alpha: positive subnormals (including products with a very small
+varying) must survive while both signed zeros discard.  Require an isolated
+zero/subnormal/normal product-alpha oracle plus a genuinely qualified equality
+sequence or stronger domain proof; an epsilon threshold is not equivalent.
+
+Fixed A00/A33 could save shader instructions *only under a separately proven
+equivalence* between its input and the terminal output alpha, with no shader
+side effects.  Mesa's existing packed path maps modes 1/2/3 to GREATER/LESS/
+GEQUAL and byte refs 0/128/128 (`chrome9_draw.c:872-889`); the kernel encodes
+the byte as `ref<<2 | ref>>6` (`chrome9_engine.c:790-804`).  Thus ref 128
+becomes A33 `0x202`, whereas the candidate exact-binary-half field is
+`0x200`, which the current byte-reference UAPI cannot request and whose
+threshold must still be qualified on silicon.  The fixed path is **not** a
+conforming general replacement for GLSL mode 2 at arbitrary float alpha;
+even mode 1 needs the A33 positive-subnormal discriminator described in
+`chrome9-cmd19-fp-contract.md:103-122`.  The older packed-lightall A33 recipe
+in `ioquake3-gl2-linked-texturecolor-lightall.md:309-319` is a bounded
+candidate, not a proof of this general NIR substitution.
+
+Cull-none still needs a per-final-triangle FACE producer.  Gallium Draw's
+two-sided COLOR0/BCOLOR0 selection can carry white-front/black-back into
+otherwise unused PRIMARY0; `1-2*PRIMARY0.r` gives exactly the required sign
+(`chrome9-draw-twoside-face-sign.md:20-105`).  The proprietary alternative has
+Linux VS ATTROUT 2/3 and Windows A61[19] plus manual A23[7] backing, but no
+VX900 front/back pixel oracle (sections 2.1-2.5).  An offline Draw test should
+cover opposite windings, flipped `front_ccw`, and clipped triangles before a
+small guarded front/back cmd22 pixel test.  Do not use the out-of-profile
+`vFace` token: it aliases `vPos` in the recovered compiler object
+(`chrome9-vface-normal-sign-boundary.md:20-88`).
+
+Capacity couples these blockers.  The exact five-texture lightall mode-zero
+corpus already compiles to **95 ALU + 5 TEX**; its cull-none marker costs one
+more ALU than the synthetic FACE sign (`ioquake3-gl2-cull-specialized-face.md:
+100-146,174-190`).  A replicated threshold SUB plus KILL bridge would need
+at least two further ALU records, and mode 2's CMP another; therefore simply
+appending either discard to this unchanged object exceeds the 96-ALU store.
+The six-texture sunlight/shadow corpus already occupies 96 ALU + 6 TEX
+(`ioquake3-gl2-cull-specialized-face.md:148-190`).  These are lower bounds for
+the *unchanged* corpus, not a proof that other permutations or valid algebraic
+compaction cannot fit.  First obtain exact mode-1/2 linked corpora and count
+after scheduling, then test the isolated predicates; do not promote a full
+lightall draw from a small KILL oracle alone.
+
+## 13. Counted lightall capacity candidates (offline, not execution proof)
+
+The retained exact lightmap probe binary `/tmp/chrome9-lightall-resource-probe-exact`
+(SHA-256 `4fbb372ea9b858c9727db1c2f7265c3d7cc682c59df2c5200535316234c0be34`)
+was rerun with `/tmp/ioq_default_lightall.{vert,frag}` and `SPECIALIZE=1`.
+It reports **94 ALU + 5 TEX** for mode zero with constant FACE.  This is an
+older count-only harness (`semantic_valid=0`, no native object), not a current
+driver replay.  Its `COMPACT=1` variant reports **78 ALU + 5 TEX** and still
+`semantic_valid=0`.  Its printed NIR changes are exact: ten single-use
+MUL+ADD pairs become ten `fmad` nodes (minus ten records), thirteen MIN/MAX
+nodes become two MAX plus six `fsat` nodes (minus five), and one live `fneg`
+disappears (minus one), totaling the measured sixteen-record reduction.
+This count does **not** license enabling it: the harness rewrites NIR `fmad`
+to `ffma` for old-backend counting, while current Mesa advertises neither
+native fmad nor unlowered fsat (`chrome9_screen.c:268-280`).  The backend's
+MAD opcode and producer-SAT machinery exist (`chrome9_context.c:2843-2873,
+4087-4115`), but MAD fusion/rounding for nonfused NIR `fmad` remains an
+independent conformance gate (`chrome9-mad-dot-rung.md:92-100`), and SAT has
+only the recorded finite-vector intermediate oracle
+(`chrome9-cmp-abs-sat-rung.md:260-271`).
+
+A narrower and more source-grounded candidate does not depend on MAD or SAT.
+The exact mode-zero NIR (`/tmp/ioq_default_lightall_mode0.nir`) has six
+single-use `fneg` values, each immediately consumed by `fadd`: pairs
+`%49→%50`, `%52→%53`, `%74→%75`, `%95→%96`, `%98→%99`, and
+`%123→%124`.  The remaining `fneg %11` supplies the synthetic FACE sign.
+Mesa's own late algebraic rule rewrites `fadd(a,fneg(b))` to `fsub(a,b)`
+when `has_fsub` is set (`nir_opt_algebraic.py:3828-3840`), and the Chrome9
+semantic lowerer already maps `nir_op_fsub` to native SUB
+(`chrome9_context.c:4097-4105`).  ADD cannot instead absorb these negations
+in the current source-modifier allowlist, which permits NEG only in MAD/CMP
+A (`chrome9_context.c:2753-2760`).  The current Chrome9 screen does not set
+`has_fsub`, and no Chrome9 path invokes `nir_opt_algebraic_late`, so these
+six deletions are a *projected*, not measured-current, count.  Their
+source-backed count is 94 - 6 = **88 ALU** for constant FACE/mode zero.
+
+For the same exact lightmap expression, a supplied synthetic FACE sign has
+cost one ALU over constant FACE (the current 95-ALU corpus versus old plain
+94); the proposed dynamic COLOR/BCOLOR marker needs one further MAD
+(`:189-190`, and `chrome9-draw-twoside-face-sign.md:56-76`).  Mode 2 adds
+SUB(alpha,half), CMP(nonnegative ? -1 : +1), and the mandatory KILL
+TEMP-to-address bridge, or three native ALUs and one TAU
+(`chrome9_fragment.c:929-967`; `chrome9-texkill-schedule-audit.md:122-151`).
+The resulting *projected* counts are:
+
+| variant | native ALU | TAU | basis |
+| --- | ---: | ---: | --- |
+| current synthetic-sign mode zero | 95 | 5 | current scheduled corpus |
+| unchanged cull-none marker + mode 2 | 99 | 6 | 95 + 1 + 3; over 96 |
+| six SUB fusions, cull-none marker + mode 2 | 93 | 6 | 94 - 6 + 2 + 3; three ALUs spare |
+| old full COMPACT count, cull-none marker + mode 2 | 83 | 6 | 78 + 2 + 3; arithmetic/semantics unqualified |
+
+These are arithmetic projections, not a compiled mode-2 object: the actual
+predicate, exact NIR float controls, constant-port placement, native physical
+TEMP pressure, and KILL ordering still need an offline full-object replay.
+The existing pressure scheduler only reorders operations and explicitly
+rejects KILL (`chrome9_ps_schedule.c:287-301`); it cannot itself save ALUs.
+The compact probe's unscheduled peak was 11 physical vectors, but adding
+the mode-2 predicate has not been measured.  Five direct texture samples use
+the existing six-varying input set; the current kernel allocator has a
+separate address slot after direct varyings for KILL only if no computed
+coordinate consumes it (`chrome9_fragment.c:405-450`).  No counted candidate
+may use disjoint partial oC0 stores to shave the terminal MOVs: those timed
+out on VX900 and current validation admits one terminal full write
+(`chrome9_fragment.c:288-297`, `chrome9-glmark-shadow-depth-proxy.md:480-521`).
+
+Lowest-risk proof order: first run a host linker test with only `has_fsub`
+plus late algebraic folding, confirm the six precise rewrites and 88-ALU
+constant-FACE corpus without changing MAD/SAT options; next add the
+COLOR/BCOLOR marker and mode-2 SUB/CMP/KILL in an offline semantic object,
+require <=96 native ALU, <=32 TAU, <=12 physical TEMPs, valid A90/A28
+controls and one terminal full COLOR; only then schedule isolated mode-2
+boundary pixels on VX900.  Preserve `fneg` local FP flags (notably the
+`preserve:inf` source in this NIR) across any rewrite.

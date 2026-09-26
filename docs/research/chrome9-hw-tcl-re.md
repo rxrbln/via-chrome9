@@ -750,6 +750,63 @@ The per-draw ioctl, full state rebuild and CPU attribute unpack dominate
 small draws (glxgears); stage B GEM vertex buffers and multi-draw batching
 are the performance follow-ups.
 
+### Native vertex formats and stage B vertex buffers
+
+Kernel `7f00ab5` adds the native element formats (FLOAT1..4 `02/42/82/c2`,
+BGRA8 `d1`, RGBA8 `c7`/`c6`, RG16/RGBA16 UNORM `49/c9`, SNORM `4b/cb`,
+SSCALED `4a/ca`, half `44/c4`); `tools/re/chrome9_tcl_oracle fmt` passes all
+14 within 1 LSB.  Inline (stage A) vertices must be packed: A00[6:0] is the
+sum of element fetch dwords and the command parser consumes exactly that
+many dwords per vertex, so a padded stride stops the engine (observed once,
+cold boot).  Mesa `12f631e` copies native attributes as-is.
+
+Kernel `d538ba0` / Mesa `a155dfa` implement stage B (`buffer_count != 0`,
+Mesa opt-in `CHROME9_TCL_BUFFERS=1`): one `3003` stream slot per element
+(`address & ~0x3ff | stride >> 2`), element bits 19:12 = address bits 9:2,
+A00 bit 15 (SF memory), A20 `20000001` (| 2 for 32-bit indices), A24 =
+index count, A2C/A2E = inclusive rebased maximum, A2D = 0, then the counted
+type-00 index payload.  The kernel rebases indices to their minimum, folds
+`(min + base_vertex) * stride` into each element address, narrows to 16-bit
+when the range fits, bounds-checks every fetched element against its GEM
+object, checks float elements for Inf/NaN, and flushes only the fetched
+byte range.  `tools/re/chrome9_tcl_oracle idx <step>` compares a Gouraud
+quad against the identical stage A draw:
+
+| step | variable | result |
+|---|---|---|
+| b2a | one interleaved BO, FLOAT4 + BGRA8, stride 20, 16-bit indices | pixel-identical |
+| b2 | positions and colors in two BOs (element n uses slot n, bits 23:20 = 0) | pixel-identical |
+| b3 | color element offset 0x404 (folded across the 1-KiB window) | pixel-identical |
+| b4 | stride 28 with padding, A00[6:0] = 5 = fetch dwords | pixel-identical: A00 is the dword sum, not the stride |
+| b5 | index range 90000, 32-bit indices | pixel-identical |
+| b6 | base_vertex 3 with shifted data (kernel rebase) | pixel-identical |
+| b9 | FLOAT3 position, stride 16 | pixel-identical (w = 1 fill) |
+| b10 | RGBA8 `c7` color | pixel-identical to BGRA8 `d1` |
+
+| b12 | stride-0 color buffer (kernel `f80fdfd`) | pixel-identical to the constant sent inline |
+| b15 | last element ends at the last byte of the BO, three runs | pixel-identical, no fault (any read-ahead lands on mapped or scratch GART pages) |
+| b16 | stride 2044 (pitch field 0x1ff) | pixel-identical |
+
+B7 (several A24 chunks per job) runs in every DRAW_VERTEX_PROGRAMS batch,
+B14 (`0x540000` NaN kill) is on by default (`fd0f932`), B8 (out-of-range
+index ends the list) and B13 (clear A12 bit reads (0,0,0,1)) passed on
+2026-09-26 (chrome9-tcl-vertex-formats-stage-b.md section 7).
+
+Mesa (`a155dfa`, `b58338c`, `b309b8e`, default on with `CHROME9_TCL=1`)
+rebases indices to the draw's biased minimum, lets elements of one BO and
+stride share a buffer entry (rend2 binds one VBO five times with
+per-attribute offsets; mapping it five times exceeded the 64 MiB mapped
+budget, `-E2BIG`, before the kernel also deduplicated handles) and copies
+only the referenced span of client arrays into the stream uploader.
+ioquake3 GL1 and GL2 and glxgears now send 100 % of their TCL triangles
+through stage B with no kernel rejection; images unchanged.
+
+glmark2 (`artifacts/2026-09-24/tcl/stb/glmark2-stageA-vs-stageB.tsv`,
+3 s per scene) keeps every validation result and gains: build (vbo)
+5 -> 32 fps, shading 3 -> 21..23, bump high-poly 1 -> 12, bump normals/height
+17 -> 30, buffer 4 -> 20..22, jellyfish 7 -> 18, shadow 1 -> 10, conditionals
+11..13 -> 26..36, function 11..12 -> 26..32; refract now completes (1 fps).
+
 ## Recommended first silicon test
 
 Goal: execute the first compiler-generated VS on VX900 with the smallest

@@ -31,7 +31,7 @@ Evidence labels used below:
 | point list | A23[3:0]=0, A24=points, A20=`20000000` | yes | unmeasured |
 | line list / strip | A23[3:0]=1, A20 `20000000` / `20206000` | yes | unmeasured |
 | tri strip / fan | A20 `201c7800` / `201c5c00`, A24=prims+2 | yes | unmeasured (lists only live) |
-| point size (state) | A2A max/width, A2B min/height, s8.15 | yes | unmeasured |
+| point size (state) | A2A max/width, A2B min/height, float s[8].15 | yes | unmeasured |
 | point size from VS (`oPts`, dest 0x27) | A25 bit 19 + A2A/A2B as clamp | yes (`STM_PointSize_H5`) | unmeasured |
 | point sprite coords | A01 bit 21; A2F[9:0] per coordinate | A01 bit 21 only found | unmeasured |
 | wide lines | **no register**; vendor replicates 1-px lines | yes (software) | n/a |
@@ -198,9 +198,12 @@ plus A25 bit 19.  The record position of the size lane inside the primitive
 vertex is hardware-internal in TCL mode; for post-TNL cmd22 it would sit after
 W in manual bit order (inference, untested).
 
-Exact words: `1x1 → 2a008000 2b008000`, `2x2 → 2a010000 2b010000`,
-`64 → 2a200000`, `2048 → 2b/2a 400000` (s8.15 of 2048.0 is `0x400000`;
-inference from the format).
+Exact words (corrected 2026-09-25): "Floating s[8].15" is a 24-bit float
+(sign, 8-bit exponent, 15-bit mantissa), and `INV_FloatToP_E8_N(f, 15)`
+(`dri:0x1a7130`) is `(bits & 0x7fffffff) >> 8`.  So `1.0 → 2a3f8000`,
+`2.0 → 2a400000`, `4.0 → 2a408000`, `64.0 → 2a428000`, `2048.0 → 2a450000`
+(static).  The earlier fixed-point list (`2a008000` for 1.0) was an
+inference and is wrong; `0x400000` is 2.0, not 2048.0.
 
 ### 3.6 Point sprites
 
@@ -492,8 +495,8 @@ its own capability bit (next free: 60):
    for line/triangle topology.
 2. **Point size**: `point_size_min_bits`, `point_size_max_bits`,
    `point_size_bits` (IEEE float bits).  Reject non-finite values and values
-   outside [1.0, 2048.0]; require min ≤ size ≤ max.  Kernel converts to s8.15
-   and always emits A2A/A2B for point topology (neutral `2a008000 2b008000`
+   outside [1.0, 2048.0]; require min ≤ size ≤ max.  Kernel converts to float s[8].15 (bits >> 8)
+   and always emits A2A/A2B for point topology (neutral `2a3f8000 2b3f8000`
    otherwise).  New vertex destination `POINT_SIZE` (index 0, mask x only,
    written exactly once on every path, SAT forbidden) sets A25 bit 19 and
    switches A2A/A2B to max/min.
@@ -549,7 +552,7 @@ Timeout or guard mutation → quarantine and stop.
 
 Points / lines / strips:
 
-* **L-P1** one point, A23 `23001f00`, A2A/A2B `2a008000/2b008000`, bias kept
+* **L-P1** one point, A23 `23001f00`, A2A/A2B `2a3f8000/2b3f8000`, bias kept
   as today.  Expect exactly one pixel.
 * **L-P2** same, rows 257/258 bias zero (vendor form).  Compare phase.
 * **L-P3** 2x2 then 1x1 again (A2A/A2B closure).
