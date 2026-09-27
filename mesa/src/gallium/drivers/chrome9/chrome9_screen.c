@@ -572,6 +572,8 @@ chrome9_restrict_generic_caps(struct pipe_caps *caps)
     * GL 1.3 floor, so those API-level claims cannot yet be made fully
     * truthful with pipe_caps alone. */
    caps->texture_transfer_modes = PIPE_TEXTURE_TRANSFER_DEFAULT;
+   /* CHROME9_THROTTLE=0 (experiment): no swap throttle on the last frame. */
+   caps->throttle = debug_get_bool_option("CHROME9_THROTTLE", true);
    caps->texture_shadow_map = false;
    caps->gl_clamp = false;
    caps->texrect = false;
