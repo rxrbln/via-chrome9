@@ -102,8 +102,9 @@ struct tcl_dedupe {
     * rewritten every frame never pays for hashing. */
    bool built;
    /* Draw-relative position of the first equal vertex; NULL when too few
-    * vertices repeat. */
+    * vertices repeat.  index_buffer holds the same as an index object. */
    uint32_t *first;
+   struct pipe_resource *index_buffer;
 };
 
 /*
@@ -3997,7 +3998,8 @@ static const uint32_t *
 tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
                const struct chrome9_tcl_program *p,
                const struct tcl_stream *streams,
-               const struct pipe_draw_start_count_bias *range)
+               const struct pipe_draw_start_count_bias *range,
+               struct pipe_resource **index_buffer)
 {
    struct tcl_dedupe_stream key[DRM_CHROME9_VERTEX_MAX_INPUTS];
    const nir_shader *nir = ctx->vs->tcl->nir;
@@ -4006,6 +4008,7 @@ tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
    struct tcl_dedupe *victim = &state->dedupe[0];
    uint32_t *table, *first, mask, unique = 0;
 
+   *index_buffer = NULL;
    if (!ctx->tcl_dedupe || range->count < TCL_DEDUPE_MIN_VERTICES ||
        !inputs ||
        BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID) ||
@@ -4021,8 +4024,10 @@ tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
           entry->start == range->start && entry->count == range->count &&
           !memcmp(entry->streams, key, inputs * sizeof(*key))) {
          entry->last_use = ++state->dedupe_clock;
-         if (entry->built)
+         if (entry->built) {
+            *index_buffer = entry->index_buffer;
             return entry->first;
+         }
          victim = entry;
          break;
       }
@@ -4035,6 +4040,7 @@ tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
        victim->start != range->start || victim->count != range->count ||
        memcmp(victim->streams, key, inputs * sizeof(*key))) {
       free(victim->first);
+      pipe_resource_reference(&victim->index_buffer, NULL);
       memcpy(victim->streams, key, sizeof(key));
       victim->inputs = inputs;
       victim->start = range->start;
@@ -4080,6 +4086,17 @@ tcl_dedupe_map(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
    }
    victim->first = first;
    victim->built = true;
+   /* Index objects fetch the static map directly. */
+   if (first && ctx->tcl_index_object) {
+      victim->index_buffer = pipe_buffer_create(ctx->base.screen,
+                                                PIPE_BIND_INDEX_BUFFER,
+                                                PIPE_USAGE_IMMUTABLE,
+                                                (size_t)range->count * 4);
+      if (victim->index_buffer)
+         pipe_buffer_write(&ctx->base, victim->index_buffer, 0,
+                           (size_t)range->count * 4, first);
+   }
+   *index_buffer = victim->index_buffer;
    return first;
 }
 
@@ -4095,8 +4112,10 @@ chrome9_tcl_state_destroy(struct chrome9_tcl_state *state)
    free(state->compact.vertices);
    pipe_resource_reference(&state->compact.buffer, NULL);
    pipe_resource_reference(&state->compact.index_buffer, NULL);
-   for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++)
+   for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++) {
       free(state->dedupe[e].first);
+      pipe_resource_reference(&state->dedupe[e].index_buffer, NULL);
+   }
    FREE(state);
 }
 
@@ -5099,13 +5118,34 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
          if (!drawn)
             draw.flags &= ~DRM_CHROME9_VERTEX_INDEX_OBJECT;
       } else if (drawn) {
+         struct pipe_resource *map_buffer = NULL;
          const uint32_t *first = info->index_size ? NULL :
-            tcl_dedupe_map(ctx, state, p, streams, range);
+            tcl_dedupe_map(ctx, state, p, streams, range, &map_buffer);
+         /* The map as raw indices relative to the bound first vertex. */
+         struct pipe_draw_info map_info = *info;
+         const struct pipe_draw_start_count_bias map_range = {
+            .start = 0, .count = range->count,
+         };
 
+         map_info.index_size = 4;
+         map_info.has_user_indices = false;
+         map_info.index.resource = map_buffer;
          draw.buffer_count = buffer_count;
          draw.buffers_ptr = (uintptr_t)buffers;
-         drawn = tcl_draw_buffers(ctx, info, range, indices, first, chunker,
-                                  index_min, state, &draw, resources);
+         if (map_buffer &&
+             tcl_index_object_usable(&map_info, &map_range, &chunker)) {
+            memcpy(resources_index, resources,
+                   buffer_count * sizeof(resources[0]));
+            drawn = tcl_draw_index_object(ctx, &map_info, &map_range,
+                                          &chunker, state, &draw, buffers,
+                                          resources_index);
+            if (!drawn)
+               draw.flags &= ~DRM_CHROME9_VERTEX_INDEX_OBJECT;
+         }
+         if (!map_buffer || !(draw.flags & DRM_CHROME9_VERTEX_INDEX_OBJECT))
+            drawn = tcl_draw_buffers(ctx, info, range, indices, first,
+                                     chunker, index_min, state, &draw,
+                                     resources);
       }
       for (unsigned b = 0; b < ARRAY_SIZE(uploads); b++)
          pipe_resource_reference(&uploads[b], NULL);
