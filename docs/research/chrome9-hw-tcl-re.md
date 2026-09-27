@@ -895,14 +895,25 @@ field as wide as the record index.  Rung (debug knobs `vs_base`,
 4 * B`), A60[8:0] = B + active - 1 or active - 1, A60[20:12] = 0, B, or a
 free value; checked with `re/chrome9_gl_vertex_default_check.c`.
 
-* With A60[8:0] = active - 1 the relocated program never runs.
-* With A60[8:0] = B + active - 1 the draw passes or fails independent of
-  the start field and dependent on what earlier runs left in records
-  0..B-1: execution starts at record 0 and runs the stale records first.
-* No start value made the result independent of the stale records, and
-  no value hung the engine.
+Valid results (before the first lockup, program at B = 64):
 
-Conclusion: A60[20:12] is not a program start; the VS runs from record 0.
-Vertex programs cannot be kept resident side by side, a switch uploads
-the program.  Two of the per-draw costs therefore stay (ideas: about 360
-dwords emitted per draw).
+| A60[20:12] | A60[8:0] | result |
+|---|---|---|
+| 0 | B + active - 1 | correct |
+| 0 | active - 1 | wrong (the relocated program does not run) |
+| 1..32 | B + active - 1 | correct |
+| 64 (= B) | B + active - 1 | wrong output (magenta) |
+| 128 (past the end) | B + active - 1 | nothing drawn, then the engine stopped (fence timeout, cold boot) |
+
+This fits A60[20:12] = first record - 1 (like A60[8:0] = last record):
+64 would skip the program's first record, 1..32 run stale records before
+it, 128 starts past the end.  It is not proven: the confirming runs
+(start 63, and `vs_instructions` per vertex from the PPC counter) came
+after the lockup and are invalid, and a repeat after a cold boot stopped
+the engine again on its first draw with the knobs at their defaults and
+PPC profiling (mask 7) on, so the cause of that second stop is unknown.
+
+Status: open.  A residency cache would need a clean start-63 rung with
+poisoned records before the program and the executed-record count, and
+must never let A60[20:12] point past A60[8:0].  Not merged; the per-draw
+upload stays (ideas: about 360 dwords emitted per draw).
