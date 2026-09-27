@@ -9328,10 +9328,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				ret = -E2BIG;
 				goto out_put_objects;
 			}
-			if (object_sizes[i] != req->fragment_texture_size[t]) {
-				ret = -EINVAL;
-				goto out_put_objects;
-			}
+			/* The object holds every image sampled from it. */
+			object_sizes[i] = max(object_sizes[i],
+					      req->fragment_texture_size[t]);
 			sub->draw[r].texture_object[t] = i;
 		}
 		/* Stage B vertex buffers are plain, unguarded read-only
@@ -9373,6 +9372,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 			objects[i]->size, object_sizes[i],
 			request->flags &
 			DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED) :
+		     sub->kind[i] == CHROME9_OBJECT_TEXTURE ?
+		     objects[i]->size < object_sizes[i] :
 		     objects[i]->size != object_sizes[i])) {
 			ret = -EINVAL;
 			goto out_put_objects;
@@ -9382,6 +9383,10 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		if (i == 0 && (request->flags &
 			       DRM_CHROME9_FRAGMENT_DESTINATION_EXTENDED))
 			object_sizes[0] = objects[0]->size;
+		/* Guards of a texture sit at its object's end: images past the
+		 * sampled ones (other faces or levels) are data. */
+		if (sub->kind[i] == CHROME9_OBJECT_TEXTURE)
+			object_sizes[i] = objects[i]->size;
 		mapping_sizes[i] = objects[i]->size;
 		/* Read-only objects may alias each other, never a target. */
 		for (j = 0; j < i; j++)
@@ -12171,8 +12176,10 @@ static int chrome9_validate_fragment_texture(
 		return CHROME9_EINVAL;
 	if (!volume && (texture->depth || texture->wrap_r))
 		return CHROME9_EINVAL;
+	/* Any image of a guarded object: a level, or a cube face sampled as
+	 * 2D; the object must hold it (object_size is the minimum). */
 	base_offset = texture->level_offset[texture->first_level];
-	if (base_offset != PAGE_SIZE)
+	if (base_offset < PAGE_SIZE || !IS_ALIGNED(base_offset, 256))
 		return CHROME9_EINVAL;
 	for (i = 0; i < DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS; i++) {
 		u32 width;
