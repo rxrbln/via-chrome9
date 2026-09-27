@@ -228,6 +228,17 @@ module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
 MODULE_PARM_DESC(blend_equation,
 	"Blend SUBTRACT, REVERSE_SUBTRACT, MIN and MAX (default: true)");
 
+static bool chrome9_texture_anisotropy = true;
+module_param_named(texture_anisotropy, chrome9_texture_anisotropy, bool, 0600);
+MODULE_PARM_DESC(texture_anisotropy,
+	"A31 linear anisotropic texture filtering (default: true)");
+
+/* Bit 0: anisotropic samplers take the nearest level as the vendor
+ * drivers do, instead of the draw's mip filter (rung R7). */
+static uint chrome9_aniso_re;
+module_param_named(aniso_re, chrome9_aniso_re, uint, 0600);
+MODULE_PARM_DESC(aniso_re, "Anisotropic filtering experiments (default: 0)");
+
 static bool chrome9_vertex_default = true;
 module_param_named(vertex_default, chrome9_vertex_default, bool, 0600);
 MODULE_PARM_DESC(vertex_default,
@@ -3375,9 +3386,17 @@ static u32 chrome9_border_s1_10(u32 argb, unsigned int shift)
 }
 
 /* Returns the number of sampler words: A30..A32, with a border A35/A36. */
+static u32 chrome9_fragment_texture_aniso(
+	const struct drm_chrome9_fragment_texture_state *texture)
+{
+	return (texture->flags & DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_MASK) >>
+	       DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_SHIFT;
+}
+
 static unsigned int chrome9_fragment_sampler_state(
 	const struct drm_chrome9_fragment_texture_state *texture, u32 sampler[8])
 {
+	u32 aniso = chrome9_fragment_texture_aniso(texture);
 	u32 lod_min = texture->min_lod_s5_5 / 32;
 	u32 lod_max = texture->max_lod_s5_5 / 32;
 	u32 border = texture->border_color;
@@ -3388,6 +3407,14 @@ static unsigned int chrome9_fragment_sampler_state(
 	sampler[1] = 0x31100000 | texture->mag_filter << 13 |
 		texture->min_filter << 10 | texture->mag_filter << 7 |
 		texture->min_filter << 4 | texture->mip_filter;
+	/* S/T code 2 (linear anisotropy) with the ratio; LINEAR mip
+	 * filtering blends two anisotropic levels (rung R7). */
+	if (aniso)
+		sampler[1] = 0x31000000 | aniso << 16 | 2 << 13 | 2 << 10 |
+			2 << 7 | 2 << 4 |
+			(READ_ONCE(chrome9_aniso_re) & 1 ?
+			 DRM_CHROME9_TEXTURE_MIP_FILTER_NEAREST :
+			 texture->mip_filter);
 	/* A32 [8:6] R wrap, [21:19]/[18:16] R filters; 2D keeps R clamped. */
 	sampler[2] = 0x32000000 |
 		chrome9_fragment_wrap_code(texture->wrap_t) << 3 |
@@ -7175,6 +7202,8 @@ u64 chrome9_engine_capabilities2(void)
 	caps |= DRM_CHROME9_CAP2_WRITE_SEQ;
 	caps |= DRM_CHROME9_CAP2_INDEX_OBJECT;
 	caps |= DRM_CHROME9_CAP2_DEPTH_FUNC_ALL;
+	if (READ_ONCE(chrome9_texture_anisotropy))
+		caps |= DRM_CHROME9_CAP2_TEXTURE_ANISOTROPY;
 	if (READ_ONCE(chrome9_vertex_default))
 		caps |= DRM_CHROME9_CAP2_VERTEX_DEFAULT;
 	if (READ_ONCE(chrome9_destination_offset))
@@ -12083,6 +12112,7 @@ static int chrome9_validate_fragment_texture(
 	bool cube = texture->target == DRM_CHROME9_FRAGMENT_TARGET_CUBE;
 	bool volume = texture->target == DRM_CHROME9_FRAGMENT_TARGET_3D;
 	u32 block_bytes = chrome9_fragment_texture_block_bytes(texture->format);
+	u32 aniso = chrome9_fragment_texture_aniso(texture);
 	u64 base_offset;
 	u64 end = 0;
 	u64 previous_end = 0;
@@ -12145,10 +12175,18 @@ static int chrome9_validate_fragment_texture(
 	    (sparse_textures ?
 	     texture->reserved0 >= DRM_CHROME9_FRAGMENT_MAX_TEXTURES :
 	     texture->reserved0) ||
-	    (texture->flags & ~DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED) ||
-	    (texture->flags &&
+	    (texture->flags & ~(DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED |
+				DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_MASK)) ||
+	    ((texture->flags & DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED) &&
 	     (!(caps2 & DRM_CHROME9_CAP2_TILED_COLOR) || block_bytes ||
-	      texture->target != DRM_CHROME9_FRAGMENT_TARGET_2D)))
+	      texture->target != DRM_CHROME9_FRAGMENT_TARGET_2D)) ||
+	    (aniso && (!(caps2 & DRM_CHROME9_CAP2_TEXTURE_ANISOTROPY) ||
+		       aniso < 2 || aniso > 16 ||
+		       texture->target == DRM_CHROME9_FRAGMENT_TARGET_3D ||
+		       texture->mip_filter ==
+		       DRM_CHROME9_TEXTURE_MIP_FILTER_NONE ||
+		       texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_R32F ||
+		       texture->format == DRM_CHROME9_FRAGMENT_TEXTURE_X8Z24)))
 		return CHROME9_EINVAL;
 	level_count = texture->last_level - texture->first_level;
 	if (texture->min_lod_s5_5 > texture->max_lod_s5_5 ||
