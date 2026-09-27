@@ -25,6 +25,8 @@
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 #include "util/simple_mtx.h"
+#include "util/os_time.h"
+#include "util/u_dynarray.h"
 
 struct chrome9_shared_handle {
    struct chrome9_shared_handle *next;
@@ -48,7 +50,20 @@ struct chrome9_screen {
    struct pipe_screen *sw_screen;
    bool sw_tried;
    struct nir_shader_compiler_options fs_nir_options;
+   /* Idle buffer objects kept with their pages and mapping for reuse. */
+   simple_mtx_t bo_cache_lock;
+   struct util_dynarray bo_cache;
+   uint64_t bo_cache_bytes;
 };
+
+struct chrome9_cached_bo {
+   struct chrome9_bo bo;
+   int64_t released;
+};
+
+/* Bounds of the buffer object cache. */
+#define CHROME9_BO_CACHE_BYTES (32ull << 20)
+#define CHROME9_BO_CACHE_AGE_US 2000000
 
 static inline struct chrome9_screen *
 chrome9_screen(struct pipe_screen *screen)
@@ -259,10 +274,100 @@ chrome9_screen_sw(struct pipe_screen *screen)
    return cscreen->sw_screen;
 }
 
+/* Release cached objects older than the age bound (lock held). */
+static void
+chrome9_bo_cache_expire(struct chrome9_screen *cscreen, int64_t now)
+{
+   for (unsigned i = 0; i < util_dynarray_num_elements(&cscreen->bo_cache,
+                                                        struct chrome9_cached_bo);) {
+      struct chrome9_cached_bo *entry =
+         util_dynarray_element(&cscreen->bo_cache, struct chrome9_cached_bo, i);
+
+      if (now - entry->released < CHROME9_BO_CACHE_AGE_US) {
+         i++;
+         continue;
+      }
+      cscreen->bo_cache_bytes -= entry->bo.size;
+      chrome9_bo_destroy(cscreen->fd, &entry->bo);
+      *entry = util_dynarray_pop(&cscreen->bo_cache, struct chrome9_cached_bo);
+   }
+}
+
+/*
+ * An idle cached buffer object of at least size bytes (at most a quarter
+ * more) and the given create flags; its pages stay populated and mapped,
+ * so the CPU does not fault them in again.
+ */
+bool
+chrome9_screen_bo_cache_get(struct pipe_screen *screen, uint64_t size,
+                            uint32_t flags, struct chrome9_bo *bo)
+{
+   struct chrome9_screen *cscreen = chrome9_screen(screen);
+   bool found = false;
+
+   simple_mtx_lock(&cscreen->bo_cache_lock);
+   chrome9_bo_cache_expire(cscreen, os_time_get());
+   util_dynarray_foreach(&cscreen->bo_cache, struct chrome9_cached_bo, entry) {
+      uint32_t busy;
+
+      if (entry->bo.create_flags != flags || entry->bo.size < size ||
+          entry->bo.size > size + size / 4 ||
+          !chrome9_bo_busy(cscreen->fd, &entry->bo, &busy) || busy)
+         continue;
+      *bo = entry->bo;
+      cscreen->bo_cache_bytes -= entry->bo.size;
+      *entry = util_dynarray_pop(&cscreen->bo_cache, struct chrome9_cached_bo);
+      found = true;
+      break;
+   }
+   simple_mtx_unlock(&cscreen->bo_cache_lock);
+   return found;
+}
+
+/* Keep a private buffer object for reuse; false when it is not cached. */
+bool
+chrome9_screen_bo_cache_put(struct pipe_screen *screen, struct chrome9_bo *bo)
+{
+   struct chrome9_screen *cscreen = chrome9_screen(screen);
+   const int64_t now = os_time_get();
+   struct chrome9_cached_bo entry = { .bo = *bo, .released = now };
+
+   if (!bo->handle || !bo->handle_owned || bo->shared || !bo->map ||
+       bo->size > CHROME9_BO_CACHE_BYTES / 4 ||
+       !chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_GEM_BUSY))
+      return false;
+   simple_mtx_lock(&cscreen->bo_cache_lock);
+   chrome9_bo_cache_expire(cscreen, now);
+   /* The oldest objects make room. */
+   while (cscreen->bo_cache_bytes + bo->size > CHROME9_BO_CACHE_BYTES &&
+          util_dynarray_num_elements(&cscreen->bo_cache,
+                                     struct chrome9_cached_bo)) {
+      struct chrome9_cached_bo *oldest =
+         util_dynarray_begin(&cscreen->bo_cache);
+
+      util_dynarray_foreach(&cscreen->bo_cache, struct chrome9_cached_bo, e)
+         if (e->released < oldest->released)
+            oldest = e;
+      cscreen->bo_cache_bytes -= oldest->bo.size;
+      chrome9_bo_destroy(cscreen->fd, &oldest->bo);
+      *oldest = util_dynarray_pop(&cscreen->bo_cache, struct chrome9_cached_bo);
+   }
+   util_dynarray_append(&cscreen->bo_cache, entry);
+   cscreen->bo_cache_bytes += bo->size;
+   simple_mtx_unlock(&cscreen->bo_cache_lock);
+   memset(bo, 0, sizeof(*bo));
+   return true;
+}
+
 static void
 chrome9_screen_destroy(struct pipe_screen *screen)
 {
    struct chrome9_screen *cscreen = chrome9_screen(screen);
+
+   util_dynarray_foreach(&cscreen->bo_cache, struct chrome9_cached_bo, entry)
+      chrome9_bo_destroy(cscreen->fd, &entry->bo);
+   util_dynarray_fini(&cscreen->bo_cache);
+   simple_mtx_destroy(&cscreen->bo_cache_lock);
 
    while (cscreen->shared_handles) {
       struct chrome9_shared_handle *entry = cscreen->shared_handles;
@@ -504,6 +609,8 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
    if (!screen)
       return NULL;
    simple_mtx_init(&screen->shared_lock, mtx_plain);
+   simple_mtx_init(&screen->bo_cache_lock, mtx_plain);
+   util_dynarray_init(&screen->bo_cache, NULL);
 
    screen->fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
    if (screen->fd < 0)

@@ -24,6 +24,10 @@ bool chrome9_screen_bo_export_fd(struct pipe_screen *screen,
                                  struct chrome9_bo *bo, int *dma_buf_fd);
 void chrome9_screen_bo_destroy(struct pipe_screen *screen,
                                struct chrome9_bo *bo);
+bool chrome9_screen_bo_cache_get(struct pipe_screen *screen, uint64_t size,
+                                 uint32_t flags, struct chrome9_bo *bo);
+bool chrome9_screen_bo_cache_put(struct pipe_screen *screen,
+                                 struct chrome9_bo *bo);
 /* Lazily created llvmpipe screen for the fragment fallback, or NULL. */
 struct pipe_screen *chrome9_screen_sw(struct pipe_screen *screen);
 

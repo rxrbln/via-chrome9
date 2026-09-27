@@ -606,6 +606,11 @@ chrome9_resource_create(struct pipe_screen *screen,
                                           DRM_CHROME9_GEM_CREATE_TILED)),
                          &resource->bo)) {
       resource->local = true;
+   } else if (templ->target == PIPE_BUFFER &&
+              chrome9_screen_bo_cache_get(screen, layout.allocation_size,
+                                          create_flags, &resource->bo)) {
+      /* Only objects already opted in to explicit access are cached. */
+      resource->explicit_access = true;
    } else if (!chrome9_bo_create(fd, layout.allocation_size, create_flags,
                                  &resource->bo)) {
       goto fail;
@@ -637,7 +642,8 @@ chrome9_resource_create(struct pipe_screen *screen,
     * surfaces stay in the protocol because every importer on this device
     * is this driver; the kernel reverts an object that becomes a KMS
     * framebuffer. */
-   if (!(templ->bind & PIPE_BIND_DISPLAY_TARGET) &&
+   if (!resource->explicit_access &&
+       !(templ->bind & PIPE_BIND_DISPLAY_TARGET) &&
        chrome9_screen_has_capability(screen,
                                      DRM_CHROME9_CAP_GEM_CPU_ACCESS) &&
        debug_get_bool_option("CHROME9_EXPLICIT_ACCESS", true))
@@ -850,16 +856,22 @@ chrome9_resource_destroy(struct pipe_screen *screen,
                          struct pipe_resource *resource)
 {
    struct chrome9_resource *cresource = chrome9_resource(resource);
+   /* Private explicit buffers go to the screen's object cache. */
+   const bool cacheable = resource->target == PIPE_BUFFER &&
+                          cresource->explicit_access && !cresource->shared &&
+                          !cresource->local;
 
    /* A view borrows its parent's BO. */
    if (cresource->parent) {
       chrome9_resource(cresource->parent)->views--;
       pipe_resource_reference(&cresource->parent, NULL);
    }
-   else
+   else if (!cacheable ||
+            !chrome9_screen_bo_cache_put(screen, &cresource->bo))
       chrome9_screen_bo_destroy(screen, &cresource->bo);
    util_dynarray_foreach(&cresource->spare_bos, struct chrome9_bo, bo)
-      chrome9_screen_bo_destroy(screen, bo);
+      if (!cacheable || !chrome9_screen_bo_cache_put(screen, bo))
+         chrome9_screen_bo_destroy(screen, bo);
    util_dynarray_fini(&cresource->spare_bos);
    if (cresource->coarse_z.handle)
       chrome9_screen_bo_destroy(screen, &cresource->coarse_z);
