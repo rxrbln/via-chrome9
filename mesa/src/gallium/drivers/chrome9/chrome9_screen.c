@@ -591,6 +591,12 @@ chrome9_screen_create(int fd, const struct pipe_screen_config *config)
       &screen->base, DRM_CHROME9_CAP_DRAW_FRAGMENT_PROGRAM);
    caps->texture_mirror_clamp_to_edge = chrome9_screen_has_capability2(
       &screen->base, DRM_CHROME9_CAP2_TEXTURE_MIRROR_ONCE);
+   /* A31 linear anisotropy, ratio 2..16. */
+   if (chrome9_screen_has_capability2(&screen->base,
+                                      DRM_CHROME9_CAP2_TEXTURE_ANISOTROPY)) {
+      caps->anisotropic_filter = true;
+      caps->max_texture_anisotropy = 16.0f;
+   }
    /* Colour targets on hardware TCL, llvmpipe otherwise. */
    caps->max_render_targets =
       chrome9_screen_has_capability2(&screen->base,

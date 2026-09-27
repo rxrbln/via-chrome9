@@ -593,6 +593,10 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
       break;
    default: sampler->supported = false; break;
    }
+   /* The vendor drivers take anisotropy only with a mip filter. */
+   if (state->max_anisotropy > 1 &&
+       state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE)
+      sampler->aniso = MIN2(state->max_anisotropy, 16);
    sampler->wrap_s = chrome9_sampler_wrap(pipe->screen, state->wrap_s);
    sampler->wrap_t = chrome9_sampler_wrap(pipe->screen, state->wrap_t);
    sampler->wrap_r = chrome9_sampler_wrap(pipe->screen, state->wrap_r);
@@ -612,7 +616,10 @@ chrome9_create_sampler_state(struct pipe_context *pipe,
                           &sampler->min_level) ||
        !chrome9_lod_level(state->max_lod, state->min_mip_filter,
                           &sampler->max_level) ||
-       state->max_anisotropy > 1 || state->seamless_cube_map ||
+       (state->max_anisotropy > 1 &&
+        !chrome9_screen_has_capability2(pipe->screen,
+                                        DRM_CHROME9_CAP2_TEXTURE_ANISOTROPY)) ||
+       state->seamless_cube_map ||
        state->reduction_mode != PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE)
       sampler->supported = false;
    return sampler;

@@ -216,6 +216,8 @@ struct chrome9_sampler_state {
    /* Whole-level LOD limits (chrome9_lod_level). */
    float min_level;
    float max_level;
+   /* Maximum anisotropy 2..16 for mipmapped views, 0 off. */
+   uint8_t aniso;
    bool supported;
 };
 
