@@ -342,6 +342,11 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_WRITE_SEQ		(1ULL << 35)
 /* DRM_CHROME9_VERTEX_INDEX_OBJECT: stage B indices fetched from an object. */
 #define DRM_CHROME9_CAP2_INDEX_OBJECT		(1ULL << 36)
+/* Depth draws take GREATER, NOTEQUAL and GEQUAL besides LESS, EQUAL,
+ * LEQUAL and ALWAYS. */
+#define DRM_CHROME9_CAP2_DEPTH_FUNC_ALL		(1ULL << 37)
+/* DRM_CHROME9_VERTEX_FORMAT_DEFAULT input elements. */
+#define DRM_CHROME9_CAP2_VERTEX_DEFAULT		(1ULL << 38)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1694,6 +1699,9 @@ struct drm_chrome9_vertex_instruction {
 #define DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED	12
 #define DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT	13
 #define DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT	14
+/* CAP2_VERTEX_DEFAULT: no element is fetched, the input register reads
+ * (0, 0, 0, 1); buffer and offset must be 0. */
+#define DRM_CHROME9_VERTEX_FORMAT_DEFAULT	15
 
 struct drm_chrome9_vertex_element {
 	__u8 format;
