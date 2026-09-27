@@ -39,6 +39,7 @@ extern "C" {
 #define DRM_CHROME9_GEM_INFO	0x21
 #define DRM_CHROME9_QUERY	0x22
 #define DRM_CHROME9_FENCE	0x23
+#define DRM_CHROME9_GEM_BUSY	0x24
 
 #define DRM_IOCTL_CHROME9_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GET_PARAM, \
@@ -133,6 +134,9 @@ extern "C" {
 #define DRM_IOCTL_CHROME9_FENCE \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_FENCE, \
 		 struct drm_chrome9_fence)
+#define DRM_IOCTL_CHROME9_GEM_BUSY \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_CHROME9_GEM_BUSY, \
+		 struct drm_chrome9_gem_busy)
 
 enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_DEVICE_ID = 0,
@@ -142,6 +146,8 @@ enum drm_chrome9_param {
 	DRM_CHROME9_PARAM_BAR1_SIZE = 4,
 	DRM_CHROME9_PARAM_BAR2_SIZE = 5,
 	DRM_CHROME9_PARAM_CAPABILITIES2 = 6,
+	/* IF b# nesting depth DRAW_VERTEX_PROGRAM accepts; REP never nests. */
+	DRM_CHROME9_PARAM_VS_FLOW_DEPTH = 7,
 };
 
 /* The kernel can allocate and mmap GEM objects. */
@@ -324,6 +330,25 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_LOCAL_MEMORY		(1ULL << 29)
 /* Fragment draw color_count 2..4: colour targets written by oC1..oC3. */
 #define DRM_CHROME9_CAP2_COLOR_TARGETS		(1ULL << 30)
+/* GEM_BUSY. */
+#define DRM_CHROME9_CAP2_GEM_BUSY		(1ULL << 31)
+/* DESTINATION_FORMAT_R32F and FRAGMENT_TEXTURE_R32F. */
+#define DRM_CHROME9_CAP2_R32F			(1ULL << 32)
+/* Fragment TEX flag DRM_CHROME9_FRAGMENT_TEX_PROJECT (TEXLDP). */
+#define DRM_CHROME9_CAP2_TEXTURE_PROJECT	(1ULL << 33)
+/* GEM_CREATE_TILED records a tiled layout on shared objects. */
+#define DRM_CHROME9_CAP2_TILED_SHARED		(1ULL << 34)
+/* GEM_BUSY reports write_seq. */
+#define DRM_CHROME9_CAP2_WRITE_SEQ		(1ULL << 35)
+/* DRM_CHROME9_VERTEX_INDEX_OBJECT: stage B indices fetched from an object. */
+#define DRM_CHROME9_CAP2_INDEX_OBJECT		(1ULL << 36)
+/* Depth draws take GREATER, NOTEQUAL and GEQUAL besides LESS, EQUAL,
+ * LEQUAL and ALWAYS. */
+#define DRM_CHROME9_CAP2_DEPTH_FUNC_ALL		(1ULL << 37)
+/* DRM_CHROME9_VERTEX_FORMAT_DEFAULT input elements. */
+#define DRM_CHROME9_CAP2_VERTEX_DEFAULT		(1ULL << 38)
+/* DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO: A31 linear anisotropy. */
+#define DRM_CHROME9_CAP2_TEXTURE_ANISOTROPY	(1ULL << 39)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -389,6 +414,12 @@ struct drm_chrome9_gem_cpu_access {
  * local; the object cannot be exported or scanned out.
  */
 #define DRM_CHROME9_GEM_CREATE_LOCAL		(1U << 2)
+/*
+ * CAP2_TILED_SHARED: the object holds a tiled colour surface (32-byte by
+ * 8-row tiles).  The flag records the layout for importers, which read it
+ * back with GEM_INFO; KMS framebuffers of such an object are refused.
+ */
+#define DRM_CHROME9_GEM_CREATE_TILED		(1U << 3)
 
 /*
  * Occlusion queries.  The kernel keeps a 64-bit sample accumulator per
@@ -752,6 +783,12 @@ struct drm_chrome9_draw_textured_triangle_d16 {
 #define DRM_CHROME9_DESTINATION_FORMAT_L8A8	3
 #define DRM_CHROME9_DESTINATION_FORMAT_ARGB1555	4
 #define DRM_CHROME9_DESTINATION_FORMAT_ARGB4444	5
+/*
+ * CAP2_R32F: one IEEE float channel.  Float targets take no blending,
+ * alpha test or edge AA; every colour target of the draw is then written
+ * with the full mask and without dithering.
+ */
+#define DRM_CHROME9_DESTINATION_FORMAT_R32F	6
 
 struct drm_chrome9_blend_state {
 	__u32 flags;
@@ -1338,6 +1375,8 @@ enum drm_chrome9_fragment_file {
 #define DRM_CHROME9_FRAGMENT_TEXTURE_DXT1_RGBA	8
 #define DRM_CHROME9_FRAGMENT_TEXTURE_DXT3	9
 #define DRM_CHROME9_FRAGMENT_TEXTURE_DXT5	10
+/* CAP2_R32F: returned as (r, 1, 1, 1); NEAREST filtering only. */
+#define DRM_CHROME9_FRAGMENT_TEXTURE_R32F	11
 
 #define DRM_CHROME9_FRAGMENT_TARGET_2D		0
 /* Square POT, faces +X -X +Y -Y +Z -Z, TEX reads three coordinate lanes. */
@@ -1365,6 +1404,11 @@ struct drm_chrome9_fragment_destination {
  * level of detail (TEXLDB, CAP2_TEXTURE_BIAS).
  */
 #define DRM_CHROME9_FRAGMENT_TEX_BIAS	(1U << 0)
+/*
+ * TEX of a 2D sampler: divide the coordinate by its lane W before sampling
+ * (TEXLDP, CAP2_TEXTURE_PROJECT); not combined with TEX_BIAS.
+ */
+#define DRM_CHROME9_FRAGMENT_TEX_PROJECT	(1U << 1)
 
 /* Fixed-width 32-byte semantic record.  sampler and flags are TEX only. */
 struct drm_chrome9_fragment_instruction {
@@ -1438,6 +1482,13 @@ struct drm_chrome9_fragment_texture_state {
  * table (256-byte aligned) even for POT sizes.
  */
 #define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED	(1U << 0)
+/*
+ * CAP2_TEXTURE_ANISOTROPY: maximum anisotropy 2..16 (0 off) of a 2D or
+ * cube texture with mip filtering: S/T filters become linear anisotropy
+ * (as the vendor drivers do for any min and mag filter).
+ */
+#define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_SHIFT	8
+#define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_MASK	(0x1fU << 8)
 
 /* One stencil face; func is a DRM_CHROME9_COMPARE_* value. */
 struct drm_chrome9_stencil_face {
@@ -1657,6 +1708,9 @@ struct drm_chrome9_vertex_instruction {
 #define DRM_CHROME9_VERTEX_FORMAT_RGBA16_SSCALED	12
 #define DRM_CHROME9_VERTEX_FORMAT_RG16_FLOAT	13
 #define DRM_CHROME9_VERTEX_FORMAT_RGBA16_FLOAT	14
+/* CAP2_VERTEX_DEFAULT: no element is fetched, the input register reads
+ * (0, 0, 0, 1); buffer and offset must be 0. */
+#define DRM_CHROME9_VERTEX_FORMAT_DEFAULT	15
 
 struct drm_chrome9_vertex_element {
 	__u8 format;
@@ -1678,6 +1732,15 @@ struct drm_chrome9_vertex_buffer {
 /* Screen winding whose triangles take BACK_PRIMARY instead of PRIMARY. */
 #define DRM_CHROME9_VERTEX_BFC_CW	(1U << 3)
 #define DRM_CHROME9_VERTEX_BFC_CCW	(1U << 4)
+/*
+ * CAP2_INDEX_OBJECT, stage B: the indices are not copied from indices_ptr
+ * (which must be 0) but fetched by the engine from the object named by
+ * buffers[buffer_count] (stride 0), starting at its offset (16-byte
+ * aligned).  They are used raw: vertex i fetches element (base_vertex + i),
+ * and the hardware index bound (A2C) is the largest index every element
+ * buffer holds, so the draw ends at the first index beyond it.
+ */
+#define DRM_CHROME9_VERTEX_INDEX_OBJECT	(1U << 5)
 
 /* Primitive assembly of the vertex or index sequence. */
 #define DRM_CHROME9_VERTEX_TOPOLOGY_TRIANGLE_LIST	0U
@@ -1782,6 +1845,20 @@ struct drm_chrome9_draw_vertex_programs {
  */
 #define DRM_CHROME9_FENCE_OP_LAST	0U
 #define DRM_CHROME9_FENCE_OP_WAIT	1U
+
+/* GEM_BUSY result: a queued job uses (USE) or writes (WRITE) the object. */
+#define DRM_CHROME9_GEM_BUSY_USE	(1U << 0)
+#define DRM_CHROME9_GEM_BUSY_WRITE	(1U << 1)
+
+struct drm_chrome9_gem_busy {
+	__u32 handle;
+	__u32 busy;	/* out: DRM_CHROME9_GEM_BUSY_* */
+	/*
+	 * out, CAP2_WRITE_SEQ: jobs submitted so far that write the object.
+	 * Equal values bracket no device write.
+	 */
+	__u64 write_seq;
+};
 
 struct drm_chrome9_fence {
 	__u32 op;
