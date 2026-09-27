@@ -164,6 +164,13 @@ struct chrome9_shader {
     * variant whose program the shader fields hold. */
    const struct chrome9_fs_variant *canonical;
    const struct chrome9_fs_variant *applied;
+   /* Hardware instructions built from the applied variant's IR. */
+   const struct chrome9_fs_variant *built_variant;
+   bool built_depth_output;
+   uint8_t built_sampler_mask;
+   unsigned built_count;
+   struct drm_chrome9_fragment_instruction
+      built[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS];
    unsigned variant_count;
    unsigned specialized_count;
    enum chrome9_fragment_program fragment_program;

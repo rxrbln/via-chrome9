@@ -2051,6 +2051,33 @@ chrome9_fragment_texture_descriptor(
    return true;
 }
 
+/* The shader's hardware instructions, built once per applied variant. */
+static bool
+chrome9_fragment_cached_instructions(
+   struct chrome9_shader *fs, const struct chrome9_ps_ir *ir,
+   struct drm_chrome9_fragment_instruction
+      instructions[DRM_CHROME9_FRAGMENT_MAX_INSTRUCTIONS],
+   unsigned *count)
+{
+   if (!fs->applied)
+      return chrome9_fragment_build_instructions(
+         ir, fs->semantic_sampler_mask, instructions, count);
+   if (fs->built_variant != fs->applied ||
+       fs->built_depth_output != ir->depth_output ||
+       fs->built_sampler_mask != fs->semantic_sampler_mask) {
+      fs->built_variant = NULL;
+      if (!chrome9_fragment_build_instructions(
+             ir, fs->semantic_sampler_mask, fs->built, &fs->built_count))
+         return false;
+      fs->built_variant = fs->applied;
+      fs->built_depth_output = ir->depth_output;
+      fs->built_sampler_mask = fs->semantic_sampler_mask;
+   }
+   memcpy(instructions, fs->built, fs->built_count * sizeof(*fs->built));
+   *count = fs->built_count;
+   return true;
+}
+
 static bool
 chrome9_generic_fragment_state(
    struct chrome9_vbuf_render *crender, struct chrome9_resource *target,
@@ -2088,11 +2115,10 @@ chrome9_generic_fragment_state(
    }
    memset(draw, 0, sizeof(*draw));
    memset(texture_state, 0,
-          DRM_CHROME9_FRAGMENT_MAX_TEXTURES * sizeof(*texture_state));
-   if (!chrome9_fragment_build_instructions(
-          ir,
-          crender->ctx->fs->semantic_sampler_mask, instructions,
-          &instruction_count) ||
+          crender->texture_count * sizeof(*texture_state));
+   if (!chrome9_fragment_cached_instructions(crender->ctx->fs, ir,
+                                             instructions,
+                                             &instruction_count) ||
        !chrome9_fragment_constants(crender->ctx, constant_count, constants))
       return false;
    for (unsigned unit = 0; unit < crender->texture_count; unit++) {

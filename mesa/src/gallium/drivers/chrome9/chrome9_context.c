@@ -8659,7 +8659,6 @@ chrome9_specialized_fs_variant(struct chrome9_context *ctx,
    const unsigned count = nir->info.num_inlinable_uniforms;
    const size_t bytes = count * sizeof(ctx->fs_inline[0]);
    struct chrome9_fs_variant *variant;
-   struct chrome9_shader compiled = { 0 };
    nir_shader *clone;
 
    if (!count || ctx->fs_inline_count != count ||
@@ -8683,6 +8682,8 @@ chrome9_specialized_fs_variant(struct chrome9_context *ctx,
    variant->specialized = true;
    memcpy(variant->inline_values, ctx->fs_inline, bytes);
    chrome9_nir_inline_uniforms(clone, variant->inline_values);
+   struct chrome9_shader compiled = { 0 };
+
    chrome9_compile_fs_nir(ctx, &compiled, clone);
    ralloc_free(clone);
    chrome9_capture_fs_variant(variant, &compiled);
