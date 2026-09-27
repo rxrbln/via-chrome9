@@ -117,7 +117,7 @@ until the exact private SI structure revision is recovered.
 | mip-level count | `2c = 12` | `30 = 12` (computed) | high; levels 0..11 cover 2048 |
 | raw recommended vertex count | `8c = 262140` | `90 = 262140` | probable `GL_MAX_ELEMENTS_VERTICES` |
 | raw recommended index count | `90 = 65535` | `94 = 65535` | probable `GL_MAX_ELEMENTS_INDICES` |
-| raw limit | `94 = 16` | `98 = 16` | unresolved; 16 is also consistent with maximum anisotropy |
+| raw limit | `94 = 16` | `98 = 16` | unresolved; not the anisotropy limit, which is the SI default `ctx+0x1f4 = 16` (chrome9-anisotropic-filtering-re.md) |
 | raw limit | `98 = 256` | `9c = 256` | unresolved |
 | raw float | `a4 = 64.0` | `a8 = 64.0` | unresolved point/line range member |
 | raw float | `b0 = 128.0` | `b4 = 128.0` | unresolved point/line range member |
@@ -328,7 +328,7 @@ The safest initial capability envelope is:
 | FBO | ordinary Mesa FBO once RT/depth resources work | Windows path is positive evidence, Linux advertisement is not |
 | S3TC | DXT1/DXT3/DXT5 sampling, initially 2D only | upload/readback/filter tests; honor patent-free modern Mesa policy |
 | NPOT/cube/3D/rectangle | candidate sampler features | per-target pitch, mip, wrap and filter validation |
-| anisotropy | candidate, cap no greater than 16 | identify raw limit field and compare filtered images |
+| anisotropy | candidate, cap 16 (vendor GL value) | A31 contract closed in chrome9-anisotropic-filtering-re.md; silicon rungs R1..R3 |
 | float/sRGB/integer textures | unsupported initially | extension strings explicitly withhold them |
 | native shader ceiling | PS 96 ALU and 32 texture instructions | compiler corpus plus on-silicon execution at boundaries |
 

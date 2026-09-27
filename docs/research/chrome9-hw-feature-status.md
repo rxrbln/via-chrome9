@@ -94,6 +94,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | MIRROR_CLAMP_TO_EDGE (A32 code 7, mirror once) | `b9d6f7d` / `0c2c83d`, default on `cb20c55` | on (CAP2 bit 17, `texture_mirror_once`): smoke exact (nearest) / 1 LSB (linear) on the first runs after two fresh module loads; the one zero-sample run predates the SWIOTLB fix `018a504` |
 | 1D textures as height-1 2D | Mesa `0c2c83d` | on; smoke exact |
 | depth-compare samplers (ARB_shadow, shadow1D/2D/2DRect, ARB_fp shadow) | Mesa `0c2c83d`, `d00e5a2` | on; compare lowered in the FS per variant like the vendor GL; D24 reads raw / 2^24, the reference is scaled to match; LINEAR compare = one nearest sample (vendor); `chrome9-shadow-compare-re.md` |
+| anisotropic filtering 2..16 (A31 code 2, ratio [20:16]), trilinear between anisotropic levels | kernel `cad21d4`, Mesa `53eda24`, CAP2 bit 39 | on; `chrome9_gl_aniso_check` (finer levels per ratio, no fallback); `chrome9-anisotropic-filtering-re.md` |
 | whole-level min/max LOD limits (A30) | Mesa `0c2c83d` | on; fractional LINEAR limits and other unsupported sampler states render in llvmpipe; piglit lodclamp* pass |
 | NPOT cube maps (BGRA/BGRX) | kernel `5cc7b60` / Mesa `6b34b58` | on: the cube sampler takes POT faces only, so the view samples a POT shadow cube (next power of two above 1.5 x the size) the engine resamples face by face and level by level, nearest, when the cube changed; other formats llvmpipe; piglit `cubemap npot` passes |
 

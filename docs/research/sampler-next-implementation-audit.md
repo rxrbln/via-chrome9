@@ -91,6 +91,13 @@ the 2-D word.
 
 ### Why anisotropy is not an A31-only extension
 
+**Update 2026-09-27:** closed by
+[chrome9-anisotropic-filtering-re.md](chrome9-anisotropic-filtering-re.md).
+GL anisotropy is private mode 3 only (A31 S/T code 2, ratio, D forced to 1);
+modes 4/5 are the D3D 4x4 quad filters (A31 code 3) and are the only users
+of the coefficient table.  The format denylist below is gated by an
+application game-patch bit and is off by default.
+
 `STM_FilterMode_INV` copies the requested maximum anisotropy into A31[20:16],
 but that field is only a limit.  Mode 3 also changes the S/T filter selectors
 and A32-side controls.  Private quality modes 4 and 5 additionally copy 32

@@ -466,6 +466,11 @@ targets.
   cross-checks both Windows UMDs, proprietary Linux, the VX900 manual, and old
   Mesa for ioquake's next sampler formats; it gives the complete min/mag/mip
   and wrap words plus standardized level-zero and guarded two-level vectors.
+- [chrome9-anisotropic-filtering-re.md](chrome9-anisotropic-filtering-re.md)
+  closes GL anisotropy from a dynamic run of the vendor Linux builders: A31
+  code 2 on S/T with ratio [20:16] and forced nearest D, no coefficient table,
+  maximum 16, mip-only and non-volume, plus uAPI/kernel/Mesa contract and
+  silicon rungs.
 - [sampler-next-implementation-audit.md](sampler-next-implementation-audit.md)
   reconciles Windows/Linux sampler builders with the current guarded layout,
   closes mirror-once and signed-LOD conversion details, separates ordinary
