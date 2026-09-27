@@ -444,6 +444,137 @@ out:
    return failures;
 }
 
+/* if (cb[1 + k / 4][k % 4] > 0.5) nested depth deep, the innermost arm a
+ * loop of cb0.x trips adding 1/8 to e (packable with the counter), each
+ * else arm d = (k + 1) / (depth + 2). */
+static nir_shader *
+build_deep_if(unsigned depth)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, &options,
+                                                   "deep");
+   nir_variable *d = nir_local_variable_create(b.impl, glsl_float_type(), "d");
+   nir_variable *e = nir_local_variable_create(b.impl, glsl_float_type(), "e");
+   nir_variable *i = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_def *pos = nir_load_input(&b, 4, 32, nir_imm_int(&b, 0), .base = 0);
+   nir_def *count = nir_channel(&b, nir_load_ubo_vec4(&b, 4, 32,
+                                nir_imm_int(&b, 0), nir_imm_int(&b, 0)), 0);
+   nir_if **ifs = calloc(depth, sizeof(*ifs));
+
+   b.shader->info.io_lowered = true;
+   b.shader->num_inputs = 1;
+   b.shader->num_outputs = 2;
+   b.shader->info.inputs_read = VERT_BIT_GENERIC0;
+   b.shader->info.outputs_written = VARYING_BIT_POS | VARYING_BIT_VAR(0);
+   b.shader->info.num_ubos = 1;
+   nir_store_var(&b, d, nir_channel(&b, pos, 0), 1);
+   nir_store_var(&b, e, nir_imm_float(&b, 0.0), 1);
+   for (unsigned k = 0; k < depth; k++) {
+      nir_def *row = nir_load_ubo_vec4(&b, 4, 32, nir_imm_int(&b, 0),
+                                       nir_imm_int(&b, 1 + k / 4));
+
+      ifs[k] = nir_push_if(&b, nir_flt_imm(&b, nir_fneg(&b,
+                                  nir_channel(&b, row, k % 4)), -0.5));
+   }
+   nir_store_var(&b, i, nir_imm_int(&b, 0), 1);
+   nir_push_loop(&b);
+   {
+      nir_def *iv = nir_load_var(&b, i);
+
+      nir_break_if(&b, nir_ige(&b, iv, nir_f2i32(&b, count)));
+      nir_store_var(&b, e, nir_fadd_imm(&b, nir_load_var(&b, e), 0.125), 1);
+      nir_store_var(&b, i, nir_iadd_imm(&b, iv, 1), 1);
+   }
+   nir_pop_loop(&b, NULL);
+   nir_store_var(&b, d, nir_imm_float(&b, (depth + 1.0f) / (depth + 2.0f)),
+                 1);
+   for (unsigned k = depth; k-- > 0;) {
+      nir_push_else(&b, ifs[k]);
+      nir_store_var(&b, d, nir_imm_float(&b, (k + 1.0f) / (depth + 2.0f)), 1);
+      nir_pop_if(&b, ifs[k]);
+   }
+   free(ifs);
+   store(&b, pos, VARYING_SLOT_POS);
+   store(&b, nir_vec4(&b, nir_load_var(&b, d), nir_load_var(&b, e),
+                      nir_imm_float(&b, 0.0), nir_imm_float(&b, 1.0)),
+         VARYING_SLOT_VAR0);
+   return b.shader;
+}
+
+/* Deep uniform IFs around a REP: one b# per level, every first-false level
+ * and all-true with 0, 1 and 7 trips against the NIR semantics. */
+static int
+check_deep_if(unsigned depth, const struct chrome9_tcl_flow *flow,
+              bool expect_supported)
+{
+   static const float trips[] = { 0, 1, 7 };
+   const unsigned rows = 1 + DIV_ROUND_UP(depth, 4);
+   nir_shader *nir = build_deep_if(depth);
+   struct chrome9_tcl_program *p = calloc(1, sizeof(*p));
+   float (*cb)[4] = calloc(rows, sizeof(*cb));
+   float (*constant)[4] = calloc(DRM_CHROME9_VERTEX_MAX_CONSTANTS,
+                                 sizeof(*constant));
+   char name[32];
+   int failures = 0;
+
+   snprintf(name, sizeof(name), "deep if %u, limit %u", depth,
+            flow->max_depth);
+   chrome9_tcl_compile(nir, true, CHROME9_TCL_COLOUR_FRONT, 0, false, 0,
+                       NULL, NULL, flow, NULL, p);
+   if (p->supported != expect_supported || (p->supported &&
+       (p->rep_count != 1 || p->bool_count != depth))) {
+      fprintf(stderr, "%s: supported %d reps %u bools %u\n", name,
+              p->supported, p->rep_count, p->bool_count);
+      failures++;
+      goto out;
+   }
+   for (unsigned first = 0; p->supported && first <= depth; first++) {
+      for (unsigned t = 0; t < ARRAY_SIZE(trips); t++) {
+         const float input[1][4] = { { 0.25f, 0.5f, 0, 1 } };
+         struct machine m = { .input = (const float (*)[4])input,
+                              .constant = (const float (*)[4])constant };
+         uint8_t ints[DRM_CHROME9_VERTEX_MAX_INT_CONSTANTS][4];
+         const float want_d = (first + 1.0f) / (depth + 2.0f);
+         const float want_e = first == depth ? trips[t] * 0.125f : 0.0f;
+
+         memset(cb, 0, rows * sizeof(*cb));
+         cb[0][0] = trips[t];
+         for (unsigned k = 0; k < first; k++)
+            cb[1 + k / 4][k % 4] = 1.0f;
+         memset(constant, 0, DRM_CHROME9_VERTEX_MAX_CONSTANTS *
+                sizeof(*constant));
+         memcpy(constant, cb, MIN2(p->uniform_rows, rows) * sizeof(*cb));
+         memcpy(constant + p->uniform_rows, p->immediates,
+                p->immediate_count * sizeof(p->immediates[0]));
+         if (!chrome9_tcl_flow_constants(p, (const uint8_t *)cb,
+                                         rows * sizeof(*cb), &m.bools, ints)) {
+            fprintf(stderr, "%s: flow constants\n", name);
+            failures++;
+            continue;
+         }
+         m.ints = (const uint8_t (*)[4])ints;
+         run(&m, p->instructions, 0, p->instruction_count);
+         if (fabsf(m.varying[0][0] - want_d) > 1e-5f ||
+             fabsf(m.varying[0][1] - want_e) > 1e-5f) {
+            fprintf(stderr, "%s: first false %u, %g trips: %g %g, want %g %g\n",
+                    name, first, trips[t], m.varying[0][0], m.varying[0][1],
+                    want_d, want_e);
+            failures++;
+         }
+      }
+   }
+   dump(p);
+   printf("%-24s %s: %u instructions, %u reps, %u bools\n", name,
+          failures ? "FAIL" : "ok", p->instruction_count, p->rep_count,
+          p->bool_count);
+out:
+   chrome9_tcl_program_fini(p);
+   free(p);
+   free(cb);
+   free(constant);
+   ralloc_free(nir);
+   return failures;
+}
+
 /* Flow control must not change straight-line programs. */
 static int
 same_program(enum shape shape, const struct chrome9_tcl_flow *a,
@@ -959,6 +1090,13 @@ main(void)
                      0);
    failures += check("straight line", SHAPE_STRAIGHT, &depth1, true, 0, 0);
    failures += same_program(SHAPE_STRAIGHT, &none, &depth1);
+   for (unsigned depth = 1; depth <= 16; depth += depth < 4 ? 1 : 4) {
+      const struct chrome9_tcl_flow deep = { depth + 1 };
+      const struct chrome9_tcl_flow short_one = { depth };
+
+      failures += check_deep_if(depth, &deep, true);
+      failures += check_deep_if(depth, &short_one, false);
+   }
    failures += check_relative("indirect, no cap", REL_PLAIN, &depth1, false, 0);
    failures += check_relative("indirect", REL_PLAIN, &relative, true, 0);
    failures += check_relative("indirect offset", REL_OFFSET, &relative, true, 1);

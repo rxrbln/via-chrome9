@@ -40,8 +40,6 @@
 #define TCL_SEL_ZERO DRM_CHROME9_FRAGMENT_SWIZZLE_ZERO
 #define TCL_MAX_VERTEX_BYTES (40U * 1024)
 #define TCL_MAX_TRIANGLES (DRM_CHROME9_VERTEX_MAX_VERTICES / 3)
-/* Kernel structural limit (D3D9 static flow depth); the cap grants one. */
-#define TCL_MAX_FLOW_DEPTH 4
 /* instr->pass_flags of code a REP makes redundant (its counter). */
 #define TCL_SKIP 1
 #define TCL_EXPR_LITERAL 0xffff
@@ -176,7 +174,8 @@ struct tcl_builder {
    unsigned depth;
    bool rep_open;
    unsigned scope_serial;
-   uint16_t scope[TCL_MAX_FLOW_DEPTH + 1];
+   /* Region serial per open depth, max_depth + 1 entries. */
+   uint16_t *scope;
    /* NIR scalar of each program expression node. */
    struct util_dynarray expr_keys;
    /* Ifs lowered to IF b#: their condition is evaluated on the CPU. */
@@ -383,7 +382,14 @@ tcl_hoist_loads(nir_shader *nir)
 static uint8_t
 tcl_vector_width(const nir_instr *instr, const void *data)
 {
+   nir_cf_node *parent = instr->block->cf_node.parent;
+
    (void)data;
+   /* Loop header phis stay scalar so a REP counter is never packed with a
+    * loop-carried value. */
+   if (instr->type == nir_instr_type_phi && parent->type == nir_cf_node_loop &&
+       nir_loop_first_block(nir_cf_node_as_loop(parent)) == instr->block)
+      return 1;
    /* Keep scalar-unit ops scalar; they replicate one lane per record. */
    return tcl_scalar_width(instr, NULL) ? 1 : 4;
 }
@@ -3033,7 +3039,8 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       }
    }
    b.values = CALLOC(b.impl->ssa_alloc, sizeof(*b.values));
-   if (!b.values)
+   b.scope = CALLOC((b.flow ? b.flow->max_depth : 0) + 1, sizeof(*b.scope));
+   if (!b.values || !b.scope)
       goto out;
    memset(b.constant_temp, 0xff, sizeof(b.constant_temp));
    memset(b.input_temp, 0xff, sizeof(b.input_temp));
@@ -3065,8 +3072,9 @@ chrome9_tcl_compile(const struct nir_shader *source, bool clip_halfz,
       fprintf(stderr, "chrome9: TCL program %u instructions, %u inputs, "
               "%u uniform rows\n", p->instruction_count, p->input_count,
               p->uniform_rows);
-   FREE(b.values);
 out:
+   FREE(b.values);
+   FREE(b.scope);
    ralloc_free(nir);
    return p->supported;
 }
