@@ -917,3 +917,17 @@ Status: open.  A residency cache would need a clean start-63 rung with
 poisoned records before the program and the executed-record count, and
 must never let A60[20:12] point past A60[8:0].  Not merged; the per-draw
 upload stays (ideas: about 360 dwords emitted per draw).
+
+Follow-up (2026-09-27, kernel x172/k173, oracle `twoside t9`): with the
+poison program at record 0 and program B at record 256 (A60[8:0] = 256 +
+active - 1), A60[20:12] = 0 made the engine execute the uninitialized
+records between and stop (fence timeout, cold boot); 256 ran without a
+stop and B's draw rendered.  So execution starts at A60[20:12].  A full
+residency cache (programs above record 64, a switch writes only A60;
+`~/tmp/vs-residency-attempt.diff`) then rendered
+`re/chrome9_gl_vertex_default_check.c` wrong: generic varyings read
+magenta, with or without A62[8:0] counting from the program start.  A
+relocated program loses its varying outputs; the missing piece (the
+finalizer tail records, A62 or another linkage word) is not known.
+Residency stays off; the rungs only run with the start field inside the
+uploaded program.
