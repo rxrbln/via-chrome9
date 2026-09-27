@@ -72,6 +72,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | polygon POINT mode, unfilled quads/polygons, per-vertex edge flags | draw module | GL draws the clipped polygon's vertices; quads hide inner edges |
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
 | fragment programs above 96 ALU records | llvmpipe fallback by default; `CHROME9_FS_SPLIT=1` runs them as multi-pass jobs through R32F carriers (Mesa splitter, silicon-verified: split results bit-identical across plans, <= 1 LSB from llvmpipe where the 16-bit ALU allows) | opt-in because llvmpipe runs the long programs found (terrain noise, 19 jobs) 14x faster than the pixel engine; 96 is the store size in every vendor driver (`chrome9-long-fragment-programs.md` §8, §9) |
+| stage B index objects, A2C bound from the buffer size | kernel `f79a548`, Mesa `7fd63dd` | on (CAP2 bit 36): indices fetched raw through FE43 from the element buffer, A2C = largest vertex the vertex buffers hold (B8: an index beyond it ends the list), finite check once per buffer range (cached); no CPU scan or copy; draws with an occlusion query keep inline indices |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
 | terrain noise fragment shader | llvmpipe fallback | the noise program splits into 19 jobs (`CHROME9_FS_SPLIT=1`) but its mod-289 hash needs more than the 16 mantissa bits of the fragment ALU and llvmpipe is faster; all GL2/glmark2 vertex work runs on hardware TCL since Mesa `b45ec96`/`ddc2b4e` (terrain VS texels fetched on the CPU per distinct vertex) |
 | desktop blur | done: runs entirely on the hardware (no unsupported FS, no fallback draws, 49 fps at 800x600); glmark2 `--validate` reports 1 LSB (G, B) off its reference pixel | accepted LSB deviation: the sampler's bilinear weights have 5 bits (1/32 steps), max 5 LSB against llvmpipe on high-contrast texel edges, 99.7 % of pixels within 1 LSB (`chrome9-dlight-alpha-blur-precision.md` §2.8) |
@@ -80,7 +81,6 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | state |
 |---|---|
-| A2C/A2D bound instead of the CPU index scan | B8 passes on silicon (an out-of-range index ends the list); not used: the scan also yields the rebase minimum and the finite/bounds range, costs 0.7 us per 120 indices, and the exact bounds are already written (`chrome9-tcl-vertex-formats-stage-b.md` §7) |
 | A12 default lanes for (0,0,0,1) inputs | B13 passes on silicon (a clear A12 bit reads (0,0,0,1), even if fetched); not used: no workload fetches such an input per vertex, constants go through stride-0 elements or VS constants |
 | vertex IF nesting | depth 4 by default, reported by GET_PARAM VS_FLOW_DEPTH (kernel `a5fee45`, Mesa `7d88b30`); most vertex IFs are flattened to selects before TCL emission |
 
@@ -94,7 +94,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | 1D textures as height-1 2D | Mesa `0c2c83d` | on; smoke exact |
 | depth-compare samplers (ARB_shadow, shadow1D/2D/2DRect, ARB_fp shadow) | Mesa `0c2c83d`, `d00e5a2` | on; compare lowered in the FS per variant like the vendor GL; D24 reads raw / 2^24, the reference is scaled to match; LINEAR compare = one nearest sample (vendor); `chrome9-shadow-compare-re.md` |
 | whole-level min/max LOD limits (A30) | Mesa `0c2c83d` | on; fractional LINEAR limits and other unsupported sampler states render in llvmpipe; piglit lodclamp* pass |
-| NPOT cube maps | Mesa `d00e5a2` | llvmpipe (`sw_only` view); the cube sampler takes POT faces only |
+| NPOT cube maps (BGRA/BGRX) | kernel `5cc7b60` / Mesa `6b34b58` | on: the cube sampler takes POT faces only, so the view samples a POT shadow cube (next power of two above 1.5 x the size) the engine resamples face by face and level by level, nearest, when the cube changed; other formats llvmpipe; piglit `cubemap npot` passes |
 
 ## Not present in the hardware
 
