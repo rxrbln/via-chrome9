@@ -884,3 +884,25 @@ Follow-ups, one variable at a time:
 
 Do not combine steps; stop on the first retirement timeout, nonzero `040c`,
 persistent busy bit or guard change.
+
+## A60[20:12] as a vertex program start (silicon, 2026-09-27)
+
+Question: can several vertex programs stay resident in the 512-record
+store, selected by a start index, so that a program switch writes A60
+instead of re-uploading records?  The vendor clears A60[20:12], a 9-bit
+field as wide as the record index.  Rung (debug knobs `vs_base`,
+`vs_base_re`, not merged): the program uploaded at record B (`31030000 +
+4 * B`), A60[8:0] = B + active - 1 or active - 1, A60[20:12] = 0, B, or a
+free value; checked with `re/chrome9_gl_vertex_default_check.c`.
+
+* With A60[8:0] = active - 1 the relocated program never runs.
+* With A60[8:0] = B + active - 1 the draw passes or fails independent of
+  the start field and dependent on what earlier runs left in records
+  0..B-1: execution starts at record 0 and runs the stale records first.
+* No start value made the result independent of the stale records, and
+  no value hung the engine.
+
+Conclusion: A60[20:12] is not a program start; the VS runs from record 0.
+Vertex programs cannot be kept resident side by side, a switch uploads
+the program.  Two of the per-draw costs therefore stay (ideas: about 360
+dwords emitted per draw).
