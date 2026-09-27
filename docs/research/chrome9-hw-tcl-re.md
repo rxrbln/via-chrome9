@@ -931,3 +931,153 @@ relocated program loses its varying outputs; the missing piece (the
 finalizer tail records, A62 or another linkage word) is not known.
 Residency stays off; the rungs only run with the start field inside the
 uploaded program.
+
+## VS store start selection: vendor and manual audit (2026-09-27)
+
+Host-only follow-up to the two sections above (no target access).  The
+question is which register field selects the first executed record of the
+512-record VS store, and whether several programs can stay resident with a
+switch done by register writes only.
+
+### Manual
+
+The Chrome9 HD DX9 Part II manual (`~/tmp/ogpm3d.txt`) names HParaType 03h
+sub-type 31h "Vertex Shader Instruction" (32h constants, 33h integers) in
+the command-regulator overview (p. 72), but the register chapter lists
+"HParaType = 03h (HParaSubType = 31h-33h): Reserved" (p. 153) and
+"HParaType = 04h, Sub-Address = 53-62h: Reserved" (p. 173).  A60, A61 and
+A62 are therefore undocumented, and nothing in the HCM, HC3 or UniChrome
+Pro II manuals describes a VS program counter, entry point or instruction
+RAM (manual).
+
+The header bytes are documented: byte 3Ch is HParaAdr, "The Beginning of
+Internal Address for Parameter Programming", 3Dh HParaOS, "Offset Setting
+for Some Special Parameter Types", 3Eh HParaType, 3Fh HParaSubType
+(manual, p. 70..72).  `31030000 + 4 * B` is thus sub-type 31h, type 03h
+and a 16-bit internal start address `HParaOS:HParaAdr = 4 * B`, one address
+per dword.  The address is absolute, not "continue after the last upload":
+the vendor places constant rows with the same field (`32030400` row 256,
+`3203040c`, `32030424`, `32030428`; static, both drivers), rows 256..258 at
+`32030400` and c0 at `32030000` coexist on silicon (m4x4 rung), and a
+program uploaded at `31030000 + 0x400` left records 1..255 uninitialized
+(the x172 fence timeout above) (manual + static + silicon).
+
+### Vendor code
+
+Every A60 producer in the vendor binaries clears bits 20:12 and every VS
+record upload starts at internal address 0 (static):
+
+| binary | site | A60 | upload |
+|---|---|---|---|
+| via_chrome9_dri.so | `stmUpdateVS_inv` 0x17c586..0x17c5b2 (only writer of the A60 image `state+0x223c`) | `and 0xffe00fff`, bit 23, `[8:0] = +0x14 - 1` | 0x17c85e `31030000`, `+0x424` records |
+| via_chrome9_dri.so | `via3DBlit` 0x1f304c, `__glDpSyncFrontBufferToFakeFront` 0x237a94 | fixed `60800004` | 0x1f2efe / 0x237946 `31030000` |
+| VTGUModeDX32A.dll | 0x1015ac6d..0x1015ac9a (image `+0x2260`), emitted 0x1015af21 | same as Linux | 0x1015af74 `31030000` |
+| VTGOGL32A.dll | 0x102052fd | same | 0x10205694 `31030000` |
+| via_drv.so (Xorg) | `via3DEmitVetexShader_H6` 0x31136 | `60800000 | (n + 3) & 0x1ff` | 0x30b60 `31030000` |
+
+No immediate `3103xxxx` with nonzero low bits, no `or reg,31030000` form and
+no pre-built `fe03043c ... xxxx0331` header table exists in any of these
+binaries, `VTGKModeDX32A.sys` or the vendor kernel library.  The other
+`and 0xffe00fff` hits (DX 0x10205a5f, OGL 0x10258a7f) patch a 6-bit source
+field of an instruction record, not A60.  The only VS "cache" is
+single-slot: `stmUpdateVS_inv` compares the program id with `ctx+0x3844`
+(0x17c55e) and re-uploads the whole program at record 0 when it changed or
+is dirty (0x17c779..0x17c786); Windows keeps the id at `+0x3060`
+(0x1015ac1f).  There is no multi-program placement, no instruction-RAM
+allocator and no symbol for one (`PVScp*`, `PVS_*`, `stm*VS*` are compiler
+and state code) (static).  The vendor emits A61, A62, A60 and *then* the
+record upload (0x17c7e4..0x17c85e, 0x1015aeff..0x1015af74), while this
+driver uploads first; both work at record 0 (static + silicon).
+
+The vendor kernel verifier (`VIA_Chrome9_2.6.31/via_chrome9_verifier.c`)
+lists type-04 sub-addresses 60, 61, 62, 9b and aa after the viewport
+group and nothing between 53 and 5f or above 62 except those; unknown
+sub-addresses are not rejected, so this only shows that the vendor knew of
+no further VS register (static).  Flow control in the records is relative
+(op 29 displacements, op 28 body length), so the records themselves are
+position independent (dynamic, section "Relative addressing").
+
+### What the silicon results imply
+
+No vendor code exercises A60[20:12], so its semantics come only from the
+rungs above and the 2026-09-27 residency WIP (`~/tmp/vs-residency-wip.diff`,
+`vs_order` knob).  One model fits every recorded observation
+(**inference**, not proven):
+
+> A draw executes record 0 first and then records A60[20:12] + 1 through
+> A60[8:0].  A60[20:12] = 0 degenerates to the vendor case 0..last.
+
+| observation | model |
+|---|---|
+| [20:12] = 0, program at B, [8:0] = B + active - 1: correct, slower, garbage in 1..B-1 locks up | 0, 1 .. B-1, B .. last |
+| [20:12] = 1..32, program at 64: correct | 0, stale S+1..63, then the program |
+| [20:12] = B, no record-0 copy: wrong (magenta varyings) | record 0 of another program runs, the program's first record is skipped |
+| [20:12] = B, program's first record also written to record 0: correct | 0 (= first), B+1 .. last |
+| [20:12] = 128 past [8:0] = 64 + n: nothing drawn, engine stopped | start beyond last |
+| [20:12] = 0, record-0 copy, poison `0020014c 0 0 0008020f` in 1..63: correct | first, poison (oPos = scratch, overwritten), full program again |
+
+The earlier reading "A60[20:12] = first record - 1" is the same model
+without the record-0 fetch.  A62[8:0] (object `+0x10`) did not matter
+either way in the WIP rung, the two inactive finalizer tails lie outside
+[8:0] and are never executed under this model, and A61 carries no address
+bits in any vendor producer (static); no additional start register is
+known.  So the only field that moves execution is A60[20:12], and record 0
+is always part of the executed sequence.
+
+Not explained: after a resident draw with the record-0 copy, the next
+draw of a program uploaded fully at record 0 with [20:12] = 0 renders wrong
+once and then correct.  Under the model it should be correct, because the
+full upload rewrites record 0 before the draw.  Candidates (all inference):
+a first-record latch or prefetch that the store write does not refresh
+until a later draw, or an ordering hazard between the store write and
+vertices of the preceding draw still in flight.  The vendor never changes
+[20:12] and always rewrites record 0, so it never exposes either.
+
+### Consequences and next rungs
+
+A register-only switch is possible under the model if record 0 holds a
+record that is harmless for every program (for example the poison MOV
+above) and each resident program at record B >= 1 is selected with
+A60[20:12] = B - 1, A60[8:0] = B + active - 1; nothing else changes.  A
+switch that also rewrites record 0 (8 dwords plus A60) is the fallback.
+Both need, in order, one variable at a time:
+
+1. **Model check**: program at S = 256 whose first record is `MOV oD0, c0`;
+   record 0 = `MOV oD0, c1` with c0 != c1.  [20:12] = S must show c1 (first
+   record skipped), [20:12] = S - 1 with the poison record at S - 1 must
+   show c0.  If S shows c0, execution instead runs 0, S .. last.
+2. The executed-record count from the PPC `vs_instructions` counter for
+   [20:12] = 0 and S - 1, in a run separate from rung 1 (PPC profiling was
+   active in the unexplained stop of the first attempt).
+3. The wrong-once case with and without a pipeline idle between the two
+   draws, and with record 0 written again after the A60 write.
+
+Never let A60[20:12] exceed A60[8:0], and keep every record between
+them initialized: both mistakes stopped the engine (cold boot).
+
+Silicon, 2026-09-27 afternoon (kernels x174..x190, k191; diffs in
+`~/tmp/vs-residency-wip.diff` and `~/tmp/vs-residency-record0.diff`):
+
+* Program at record B >= 64, A60[20:12] = B, the program's first record
+  copied to record 0: `re/chrome9_gl_vertex_default_check.c` and
+  `re/chrome9_gl_vs_nonfinite_check.c` pass, also across processes.
+  Records 1..63 filled with a poison record did not change that.
+* The depth-only check then fails deterministically in 13 of 19 cases
+  (every case whose depth clear is 0.5): the first fixed-builder draw
+  after a relocated draw renders wrong once (a clear-only run shows the
+  clear itself wrong; the following one is right).  Not changed by:
+  vendor A60-before-upload order on either path, A62[8:0] + B, tail
+  records after the fixed program, placing the fixed program resident
+  too, rewriting record 0 as a single-record upload, max_inflight=1.
+* A60[20:12] = 0 with the program at B and the record-0 copy passes the
+  checks but runs every record from 0 to the program's end: glmark2 bump
+  9.9 -> 12.8 ms per frame, and ideas stopped the engine (cold boot).
+* The layout the host analysis proposed (record 0 permanently the fixed
+  builders' first record, programs at B with A60[20:12] = B - 1) leaves
+  the depth-only failures unchanged and stopped the engine in the
+  non-finite check (cold boot).
+
+The start field does move execution, but its exact semantics and the
+state that corrupts the next record-0 program are not known, and wrong
+guesses stop the engine.  Residency is not merged; the vertex program is
+uploaded to record 0 on every switch as before.
