@@ -500,3 +500,15 @@ glmark2 score at 1280x720: 91 -> 93.  ioquake3 GL1 49.3, GL2 44.3 fps
 pixels/s with about 95 % of the pixels passing the depth test.  ideas is
 the remaining CPU-bound scene: about 17 us of kernel time per draw
 (copy-in 3.6, program lookup 2.6, build 3.5, ring append 3.8 us).
+
+**Terrain and ideas bounds** (Mesa `7cdae5c`).  Textures a vertex shader
+samples (terrain's noise and normal map) are now rendered in llvmpipe
+and the CPU lookups read llvmpipe's cached staging image, so the CPU no
+longer waits for the device between the normal-map pass and the terrain
+draw: 257 -> 253.5 ms.  What remains is the device: the draw ioctls
+block on the full job queue (max_inflight 8).  ideas likewise spends
+about a quarter of its time in draw ioctls waiting for the queue (strace
+over 4 s: 545 DRAW_VERTEX_PROGRAMS calls above 1 ms, 0.97 s), so
+cutting per-draw CPU cost would gain little; its device time goes to the
+per-draw program uploads (about 360 dwords per draw), which a resident
+program store would avoid (hw-tcl-re, A60 rung open).
