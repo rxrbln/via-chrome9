@@ -917,6 +917,7 @@ static int chrome9_vertex_encode_flow(struct chrome9_vertex_state *state,
 	struct chrome9_vertex_frame *frame;
 	int ret = 0;
 
+	program->flow = true;
 	switch (insn->op) {
 	case DRM_CHROME9_VERTEX_OP_REP:
 	case DRM_CHROME9_VERTEX_OP_IF:

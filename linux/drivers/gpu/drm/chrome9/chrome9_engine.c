@@ -445,6 +445,11 @@ module_param_named(async_retire, chrome9_async_retire, bool, 0600);
 MODULE_PARM_DESC(async_retire, "Retire fragment jobs asynchronously (default: true)");
 
 /* Omit repeated state groups between draws of one staging segment. */
+static bool chrome9_vs_resident = true;
+module_param_named(vs_resident, chrome9_vs_resident, bool, 0600);
+MODULE_PARM_DESC(vs_resident,
+	"Keep vertex programs resident in the VS store, selected by A60 (default: true)");
+
 static bool chrome9_state_cache_enable = true;
 module_param_named(state_cache, chrome9_state_cache_enable, bool, 0600);
 MODULE_PARM_DESC(state_cache,
@@ -928,6 +933,60 @@ struct chrome9_blend_words {
 	u32 a53;
 };
 
+/*
+ * The VS store holds 256 records (the vendor's program limit; A60[8:0]
+ * could name 512, and uploads beyond 256 stop the engine).  A draw runs
+ * the record at the previous draw's A60[20:12] first, then records
+ * A60[20:12] + 1 up to A60[8:0].  A
+ * compiled program stays resident from CHROME9_VS_STORE_FIRST on behind a
+ * copy of the fixed builders' first record (a MOV to r0, which compiled
+ * programs write before reading), so a switch to it writes only A60, and
+ * every start holds that record between draws: the fixed builders' draws
+ * need nothing.  Compiled programs at record 0 (REP or IF programs,
+ * programs too long for the store above record 16) lend the previous
+ * start their first record for their draw, or, when their records cover
+ * that start, follow a zero-area fixed draw that moves it to record 0.
+ */
+#define CHROME9_VS_STORE_RECORDS	256U
+#define CHROME9_VS_STORE_FIRST		16U
+#define CHROME9_VS_STORE_SLOTS		16U
+
+struct chrome9_vs_slot {
+	u16 base;
+	u16 count;
+	u32 last_use;
+};
+
+struct chrome9_vs_store {
+	u32 records[CHROME9_VS_STORE_RECORDS][4];
+	/* Sorted by base. */
+	struct chrome9_vs_slot slot[CHROME9_VS_STORE_SLOTS];
+	u32 slot_count;
+	u32 clock;
+	/* A60[20:12] of the last draw: the record the next draw runs first. */
+	u32 latch;
+	/* Records [prev_first, prev_end) the last draw's program occupies; an
+	 * upload there waits for the engine. */
+	u32 prev_first;
+	u32 prev_end;
+	/* Record 0 holds chrome9_vs_first. */
+	bool first_known;
+	/* Records the last placement wrote to (chrome9_vs_restore). */
+	u32 written_base;
+	u32 written_count;
+};
+
+/* The bookkeeping a draw abandoned for a full segment restores. */
+struct chrome9_vs_undo {
+	struct chrome9_vs_slot slot[CHROME9_VS_STORE_SLOTS];
+	u32 slot_count;
+	u32 clock;
+	u32 latch;
+	u32 prev_first;
+	u32 prev_end;
+	bool first_known;
+};
+
 struct chrome9_engine {
 	struct chrome9_device *cdev;
 	struct mutex submit_lock;
@@ -955,6 +1014,10 @@ struct chrome9_engine {
 	u32 index_head;
 	/* Bytes of run_staging_cpu: one fragment segment at most. */
 	u32 run_staging_size;
+	/* Vertex programs resident in the VS store: as appended, and as the
+	 * segment being built leaves it (submit_lock). */
+	struct chrome9_vs_store vs_store;
+	struct chrome9_vs_store vs_work;
 	/* Totals since load: drains by cause, live appends, full-queue waits. */
 	u64 queue_drains[CHROME9_DRAIN_COUNT];
 	u64 live_appends;
@@ -4787,6 +4850,8 @@ struct chrome9_state_cache {
 	u32 config[10];
 	u32 raster[CHROME9_TCL_RASTER_WORDS];
 	u32 raster_count;
+	/* Working VS store of the segment, NULL without residency. */
+	struct chrome9_vs_store *vs;
 	/* Statistics: draws, and dwords emitted and omitted. */
 	u32 draws;
 	u32 emitted;
@@ -4867,6 +4932,142 @@ static bool chrome9_link_equal(const struct chrome9_state_cache *cache,
 	       (!tcl->int_upload ||
 		!memcmp(tcl->int_constants, cache->tcl->int_constants,
 			sizeof(tcl->int_constants)));
+}
+
+/* The first record of every fixed builder's program (a MOV to r0), also
+ * held at every resident program's start. */
+static const u32 chrome9_vs_first[4] = {
+	0x00380150, 0x00000000, 0x00000000, 0x0008010f,
+};
+
+static void chrome9_vs_store_drop(struct chrome9_vs_store *store, u32 i)
+{
+	memmove(&store->slot[i], &store->slot[i + 1],
+		(store->slot_count - i - 1) * sizeof(store->slot[0]));
+	store->slot_count--;
+}
+
+/*
+ * Upload count records at first: the engine may still run the last
+ * draw's program, so an overlapping upload waits for it (H0 006c, the
+ * 3D wait every segment starts with).
+ */
+static void chrome9_vs_upload(u32 **p, struct chrome9_vs_store *store,
+			      u32 first, const u32 *records, u32 count)
+{
+	static const u32 wait[] = { 0x6c, 0x00800000 };
+
+	if (!store || (first < store->prev_end &&
+		       store->prev_first < first + count))
+		chrome9_emit_header0(p, wait, ARRAY_SIZE(wait) / 2);
+	chrome9_emit_header2(p, 0x440, 0x0000043c, 0x31030000 + 4 * first,
+			     records, 4 * count);
+}
+
+/* REP and IF programs stay at record 0, as the vendor places them. */
+static bool chrome9_vs_resident_fits(const struct chrome9_vertex_program *vp)
+{
+	return !vp->flow && vp->record_count + 1 <=
+	       CHROME9_VS_STORE_RECORDS - CHROME9_VS_STORE_FIRST;
+}
+
+/* Forget the programs overlapping records [first, first + count). */
+static void chrome9_vs_store_clobber(struct chrome9_vs_store *store,
+				     u32 first, u32 count)
+{
+	u32 i = 0;
+
+	while (i < store->slot_count) {
+		const struct chrome9_vs_slot *slot = &store->slot[i];
+
+		if (slot->base < first + count && first < slot->base + slot->count)
+			chrome9_vs_store_drop(store, i);
+		else
+			i++;
+	}
+}
+
+static void chrome9_vs_save(struct chrome9_vs_store *store,
+			    struct chrome9_vs_undo *undo)
+{
+	memcpy(undo->slot, store->slot, sizeof(undo->slot));
+	undo->slot_count = store->slot_count;
+	undo->clock = store->clock;
+	undo->latch = store->latch;
+	undo->prev_first = store->prev_first;
+	undo->prev_end = store->prev_end;
+	undo->first_known = store->first_known;
+	store->written_count = 0;
+}
+
+static void chrome9_vs_restore(struct chrome9_vs_store *store,
+			       const struct chrome9_vs_undo *undo)
+{
+	memcpy(store->slot, undo->slot, sizeof(store->slot));
+	store->slot_count = undo->slot_count;
+	store->clock = undo->clock;
+	store->latch = undo->latch;
+	store->prev_first = undo->prev_first;
+	store->prev_end = undo->prev_end;
+	store->first_known = undo->first_known;
+	/* The mirror no longer holds what the store has there. */
+	if (store->written_count)
+		chrome9_vs_store_clobber(store, store->written_base,
+					 store->written_count);
+}
+
+/*
+ * The start of the program in the store (its records follow the shared
+ * first record): an equal resident program, else the first gap that fits
+ * above the fixed builders' records, evicting least recently used
+ * programs; *upload tells whether the records must be written there.
+ */
+static u32 chrome9_vs_store_place(struct chrome9_vs_store *store,
+				  const u32 (*records)[4], u32 count,
+				  bool *upload)
+{
+	u32 i, base, pos;
+
+	*upload = true;
+	for (i = 0; i < store->slot_count; i++) {
+		struct chrome9_vs_slot *slot = &store->slot[i];
+
+		if (slot->count == count + 1 &&
+		    !memcmp(store->records[slot->base + 1], records,
+			    count * sizeof(records[0]))) {
+			slot->last_use = ++store->clock;
+			*upload = false;
+			return slot->base;
+		}
+	}
+	for (;;) {
+		base = CHROME9_VS_STORE_FIRST;
+		for (pos = 0; pos < store->slot_count; pos++) {
+			if (store->slot[pos].base >= base + count + 1)
+				break;
+			base = store->slot[pos].base + store->slot[pos].count;
+		}
+		if (store->slot_count < CHROME9_VS_STORE_SLOTS &&
+		    base + count + 1 <= CHROME9_VS_STORE_RECORDS)
+			break;
+		/* Evict the least recently used program and retry (the
+		 * caller keeps programs that cannot fit at record 0). */
+		for (i = 1, pos = 0; i < store->slot_count; i++)
+			if (store->slot[i].last_use < store->slot[pos].last_use)
+				pos = i;
+		chrome9_vs_store_drop(store, pos);
+	}
+	memmove(&store->slot[pos + 1], &store->slot[pos],
+		(store->slot_count - pos) * sizeof(store->slot[0]));
+	store->slot[pos] = (struct chrome9_vs_slot){
+		.base = base, .count = count + 1, .last_use = ++store->clock,
+	};
+	store->slot_count++;
+	memcpy(store->records[base], chrome9_vs_first, sizeof(chrome9_vs_first));
+	memcpy(store->records[base + 1], records, count * sizeof(records[0]));
+	store->written_base = base;
+	store->written_count = count + 1;
+	return base;
 }
 
 /*
@@ -4960,6 +5161,11 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	u32 depth_func = (request->flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
 		DRM_CHROME9_DEPTH_FUNC_SHIFT;
 	u32 raster_count;
+	/* Survives the state cache, which stage A draws drop. */
+	struct chrome9_vs_store *vs = cache ? cache->vs : NULL;
+	u32 vs_base = 0;
+	u32 vs_lent = 0;
+	bool vs_upload = true;
 	bool blend = request->flags & DRM_CHROME9_FRAGMENT_BLEND;
 	bool depth_active = request->flags & DRM_CHROME9_FRAGMENT_DEPTH;
 	unsigned int i;
@@ -4967,6 +5173,26 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 
 	if (!program || (!request->fragment_vertices && !tcl) || !rt_format)
 		return CHROME9_EINVAL;
+	/* A record-0 program covering the latched start cannot lend it its
+	 * first record: a zero-area fixed draw moves the start to 0. */
+	if (tcl && vs && vs->latch &&
+	    !chrome9_vs_resident_fits(tcl->program) &&
+	    vs->latch < tcl->program->record_count) {
+		static const struct drm_chrome9_fragment_vertex point[3] = {
+			[0 ... 2] = { .rhw_float = 0x3f800000 },
+		};
+		struct chrome9_draw_request dummy = *request;
+
+		dummy.tcl = NULL;
+		dummy.triangle_count = 1;
+		dummy.fragment_vertices = point;
+		ret = chrome9_emit_fragment_draw(&dummy, index_arena, target,
+			depth, coarse_z, local, color_base, texture_base, NULL,
+			0, NULL, query_re, cache, constants_live, cursor, limit);
+		if (ret)
+			return ret;
+		p = *cursor;
+	}
 	if (p + chrome9_fragment_state_bound(request) > limit)
 		return -E2BIG;
 	ret = chrome9_fragment_fe_config(program->active_texture_count,
@@ -5136,6 +5362,13 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	if (tcl && tcl->re & CHROME9_TCL_RE_LINE_AB &&
 	    (tcl->raster == CHROME9_TCL_LINES || tcl->polygon))
 		common[4] &= ~BIT(23);
+	/* The compiled vertex program's place in the VS store. */
+	if (tcl && vs && chrome9_vs_resident_fits(tcl->program))
+		vs_base = chrome9_vs_store_place(vs, tcl->program->records,
+						 tcl->program->record_count,
+						 &vs_upload);
+	else if (tcl && vs)
+		chrome9_vs_store_clobber(vs, 0, tcl->program->record_count);
 	/* D0 position, normalized D1/D2 colors, then packed dense T0..T7. */
 	if (tcl)
 		raster_count = chrome9_tcl_raster_state(program, tcl,
@@ -5248,17 +5481,65 @@ chrome9_emit_fragment_draw(const struct chrome9_draw_request *request,
 	chrome9_group_end(cache, CHROME9_GROUP_CLIP, group, &p);
 	if (!link)
 		goto draw;
-	if (tcl) {
-		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
-				     &tcl->program->records[0][0],
-				     4 * tcl->program->record_count);
+	if (tcl && vs_base) {
+		/* The program runs from vs_base + 1 to vs_base + active. */
+		const u32 a60 = (tcl->program->a60 + vs_base + 1) |
+				vs_base << 12;
+
+		if (vs_upload) {
+			chrome9_vs_upload(&p, vs, vs_base, chrome9_vs_first, 1);
+			chrome9_vs_upload(&p, vs, vs_base + 1,
+					  &tcl->program->records[0][0],
+					  tcl->program->record_count);
+		}
+		/* A start above 0 holds the shared record already. */
+		if (!vs->latch && !vs->first_known) {
+			chrome9_vs_upload(&p, vs, 0, chrome9_vs_first, 1);
+			vs->first_known = true;
+		}
+		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
+				     &a60, 1);
+		vs->latch = vs_base;
+		vs->prev_first = vs_base;
+		vs->prev_end = vs_base + 1 + tcl->program->record_count;
+	} else if (tcl) {
+		if (vs)
+			chrome9_vs_upload(&p, vs, 0,
+					  &tcl->program->records[0][0],
+					  tcl->program->record_count);
+		else
+			chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
+					     &tcl->program->records[0][0],
+					     4 * tcl->program->record_count);
+		/* The previous start runs first: lend it the first record,
+		 * given back after the draw. */
+		if (vs && vs->latch) {
+			vs_lent = vs->latch;
+			chrome9_vs_upload(&p, vs, vs_lent,
+					  &tcl->program->records[0][0], 1);
+		}
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
 				     &tcl->program->a60, 1);
+		if (vs) {
+			vs->latch = 0;
+			vs->prev_first = 0;
+			vs->prev_end = tcl->program->record_count;
+			vs->first_known = !memcmp(tcl->program->records[0],
+						  chrome9_vs_first,
+						  sizeof(chrome9_vs_first));
+		}
 	} else {
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x31030000,
 				     vs_program, 4 * (4 + program->varying_count));
 		chrome9_emit_header2(&p, 0x440, 0x0000043c, 0x00040000,
 				     vs_control, ARRAY_SIZE(vs_control));
+		if (vs) {
+			chrome9_vs_store_clobber(vs, 0, 4 + program->varying_count);
+			vs->latch = 0;
+			vs->prev_first = 0;
+			vs->prev_end = 4 + program->varying_count;
+			vs->first_known = true;
+		}
 	}
 	/* Shader depth: Windows' VX900 A8A with the TS-ZTAG deadlock ECO. */
 	if (program->depth_output)
@@ -5352,6 +5633,11 @@ draw:
 			if (query)
 				chrome9_state_cache_forget(cache);
 		}
+		if (vs_lent && p + 16 > limit)
+			return -E2BIG;
+		if (vs_lent)
+			chrome9_vs_upload(&p, NULL, vs_lent,
+					  chrome9_vs_first, 1);
 		*cursor = p;
 		return 0;
 	}
@@ -5398,6 +5684,10 @@ draw:
 	chrome9_count_vertex_payload(vertex_header, p - vertex_header - 4);
 	if (query)
 		chrome9_emit_occlusion_snapshot(&p, *query, query_re);
+	if (vs_lent && p + 16 > limit)
+		return -E2BIG;
+	if (vs_lent)
+		chrome9_vs_upload(&p, NULL, vs_lent, chrome9_vs_first, 1);
 	*cursor = p;
 	return 0;
 }
@@ -5738,6 +6028,12 @@ static int chrome9_install_prime_ring(struct chrome9_engine *engine,
 
 	lockdep_assert_held(&engine->submit_lock);
 	*published = false;
+	/* A restarted engine keeps no vertex program resident. */
+	engine->vs_store.slot_count = 0;
+	engine->vs_store.latch = 0;
+	engine->vs_store.prev_first = 0;
+	engine->vs_store.prev_end = CHROME9_VS_STORE_RECORDS;
+	engine->vs_store.first_known = false;
 	/* PID10 STOP must retire the old PID00 generation before A68. */
 	ret = readl_poll_timeout(cdev->mmio + CHROME9_REG_CR_STATUS, status,
 				 !(status & BIT(31)), 10,
@@ -9882,11 +10178,17 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		if (READ_ONCE(chrome9_state_cache_enable)) {
 			cache = &sub->cache;
 			memset(cache, 0, sizeof(*cache));
+			/* Placements count once the segment is appended. */
+			if (READ_ONCE(chrome9_vs_resident)) {
+				engine->vs_work = engine->vs_store;
+				cache->vs = &engine->vs_work;
+			}
 		}
 
 		for (; next < count; next++) {
 			const struct chrome9_draw_request *req = requests[next];
 			const struct chrome9_tcl_draw *tcl = req->tcl;
+			struct chrome9_vs_undo vs_undo;
 			u32 query_address = 0;
 			u32 local;
 
@@ -9924,6 +10226,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 					sub->draw[next].buffer_object
 						[tcl->element_buffer[t]]] +
 					sub->draw[next].element_start[t];
+			if (cache && cache->vs)
+				chrome9_vs_save(cache->vs, &vs_undo);
 			ret = chrome9_emit_fragment_draw(req,
 				index_fetch ? engine : NULL,
 				sub->bases[0] + req->destination_offset,
@@ -9938,6 +10242,9 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 				(u32)tcl->index_buffer.offset : 0,
 				req->query ? &query_address : NULL,
 				job->query_re, cache, &constants, &p, limit);
+			/* The draw moves to the next segment. */
+			if (ret == -E2BIG && cache && cache->vs)
+				chrome9_vs_restore(cache->vs, &vs_undo);
 			/* A full segment is retired before the next draw. */
 			if (ret == -E2BIG && next > first)
 				break;
@@ -9990,6 +10297,8 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 		chrome9_prof_mark(CHROME9_PROF_APPEND);
 		if (!ret && constants)
 			engine->blend_constants_dirty = false;
+		if (!ret && cache && cache->vs)
+			engine->vs_store = engine->vs_work;
 		if (ret) {
 			if (!must_quarantine)
 				goto out_prepublication;

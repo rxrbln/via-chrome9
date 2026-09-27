@@ -27,6 +27,8 @@ struct chrome9_vertex_program {
 	u32 a60;
 	u32 a61;
 	u32 a62;
+	/* REP or IF records: not relocated in the VS store. */
+	bool flow;
 	/* ARL clamp rows c[constant_end] (low) and c[constant_end + 1]
 	 * (high) as float bits per a0 lane, uploaded when bound_rows. */
 	bool bound_rows;
