@@ -474,3 +474,29 @@ CPU load per glmark2 scene at 720p (`gmcpu.sh`, 5 s): buffer 96 / 68 /
 all others at most 35 %.  Without the finite check the buffer scenes
 went 54 -> 60, 48 -> 51 and 73 -> 86 fps.  ioquake3 GL1 is fill bound
 (197 M pixels/s, 4.5 layers per pixel, 95 % passing the depth test).
+
+**CPU-bound scene work, same day** (Mesa `ebcbd73`, `807401a`, `da2ed78`,
+`83d6de1`, `3051570`; kernel `9916a1c`):
+
+* Buffer object cache: destroyed private buffers go to a screen cache
+  (32 MiB, 2 s, GEM_BUSY idle check) with their pages and mapping; the
+  stream uploader's 1 MiB buffers no longer fault in every page.  build
+  use-vbo=false 141 -> 155 fps at 61 -> 28 % CPU; ioquake3 GL1 +3 %.
+* Index objects for static index data: the compacted terrain soup and
+  the dedupe map of non-indexed draws are written once into index
+  buffers; the draws no longer chunk, narrow, copy and scan indices per
+  frame.  bump high-poly 95 -> 101 fps (CPU 1.9 -> 0.5 s in 5 s),
+  refract 18 -> 19, shadow and phong at half the CPU time.
+* Fragment instructions are built once per applied variant; a whole
+  chrome9_shader was being zeroed on every draw.  ideas 115 -> 117.
+* The CPU Fast-Z resolve streams local (write-combined) depth rows:
+  a 2048x1152 resolve took about 0.5 s (refract's first frame).
+* Rejected after measurement: snooped GART PTEs for draw objects (GPU
+  bound scenes 8-20 % slower), snooped ring (no gain), A60 program
+  residency (hw-tcl-re, open).
+
+glmark2 score at 1280x720: 91 -> 93.  ioquake3 GL1 49.3, GL2 44.3 fps
+(2x anisotropy from the config): both are fill bound at 197-236 M
+pixels/s with about 95 % of the pixels passing the depth test.  ideas is
+the remaining CPU-bound scene: about 17 us of kernel time per draw
+(copy-in 3.6, program lookup 2.6, build 3.5, ring append 3.8 us).
