@@ -136,7 +136,8 @@ chrome9_format_test = executable(
   'chrome9-format-test',
   ['chrome9_format.c', 'chrome9_format_test.c'],
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
-  c_args : ['-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0'],
+  # native targets lack Mesa's host pre_args (localtime_r in os_time.h)
+  c_args : ['-D_GNU_SOURCE', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0'],
   native : true,
   install : false,
 )
