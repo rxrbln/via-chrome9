@@ -82,9 +82,11 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 ## Not implemented
 
-| feature | state |
-|---|---|
-| vertex IF nesting | depth 4 by default, reported by GET_PARAM VS_FLOW_DEPTH (kernel `a5fee45`, Mesa `7d88b30`); most vertex IFs are flattened to selects before TCL emission |
+None of the features the hardware has.  Vertex IF nesting was the last
+open item: IF nests exactly at every depth a 256-instruction program can
+express (rung `vsdeep` to 63 levels), the kernel accepts up to 128 and
+reports it through GET_PARAM VS_FLOW_DEPTH, Mesa sizes its region stack
+from it (`chrome9-shader-conditionals.md` section 3.3).
 
 ## Texture sampler: border, GL_CLAMP, mirror once, 1D, shadow, LOD limits
 

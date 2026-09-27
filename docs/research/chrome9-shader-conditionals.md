@@ -96,6 +96,42 @@ IF nests at least four deep, inside or around one REP; a REP inside a REP
 ends the outer loop (one loop counter, as the vendor's
 `StaticFlowControlDepth = 1`).  Zero-trip REP skips its body.
 
+### 3.3 Deep IF nesting (`vsdeep`, 2026-09-27)
+
+Rung `vsdeep` (`tools/re/chrome9_rq_rungs.c`): IF b(k mod 16) nested d
+deep, the innermost arm writes v(d), the ELSE arm of level k writes v(k),
+so the result names the first false level; a trailing ADD after the last
+ENDIF checks that execution reaches the end; optionally the whole chain
+sits in a REP of 0..3 trips that adds 1/8 per trip.
+
+| depth | patterns | result |
+|---|---|---|
+| 1..6 | every bool pattern, REP 0/1/3 around depth 1, 4, 5 | exact |
+| 7..16 | each first-false level, all true, alternating, all false | exact |
+| 15 in REP (16 levels) | same, 0/1/3 trips | exact |
+| 17, 24, 32, 40, 48, 56, 60, 62 | same, with and without REP (2 trips) | exact |
+| 62 in REP (63 levels, 256 instructions) | same | exact |
+
+IF and ELSE records are forward skips by a relative record count (the
+not-taken and taken displacements in words 1 and 2); ENDIF emits no record.
+There is no nesting stack to overflow: the hardware follows every depth a
+program can express.  The bound is the program length: every level takes
+an IF and an ENDIF instruction, so the kernel limit is
+`DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS / 2` = 128 (module `vs_flow_depth`,
+reported by GET_PARAM VS_FLOW_DEPTH).  A REP still never nests in a REP.
+
+Mesa reaches the hardware IF only for ifs that contain a loop (every
+loop-free vertex if is flattened into selects).  A GLSL chain of uniform
+ifs around a uniform-count loop (`re/chrome9_gl_vs_if_nest_check.c`)
+exposed one compiler problem: `nir_opt_vectorize` packed the loop counter
+and a loop-carried accumulator into one vec2 phi, and the REP matcher,
+which needs a scalar counter, rejected the loop ("loop without a CB0 or
+literal trip count") from depth 4 on.  Loop header phis now stay scalar.
+With that, depths 1..16 (304 cases) render on hardware TCL and match on
+silicon; with `CHROME9_TCL_FLOW_DEPTH=4`, 13 of the 16 programs fall back.
+The host test `chrome9-tcl-flow-test` covers depths 1..16 against the NIR
+semantics and fails without the fix.
+
 ## 4. Changes
 
 Mesa, chrome9 driver repository:
@@ -186,11 +222,9 @@ unchanged: `ideas` mean 0.17, `conditionals` fragment-steps=5 mean 3.6
 * `gl_FrontFacing` without culling (`fs-frontfacing-ternary-*`): face
   variants exist only when culling fixes the face; splitting a draw into
   its front and back triangles would let both variants run.
-* Vertex IF nesting beyond one: silicon-proven to depth 4 (section 3.2),
-  but the kernel default `vs_flow_depth=1` and Mesa's
-  `CHROME9_TCL_FLOW_DEPTH=1` stay until the kernel reports the depth to
-  userspace (a GET_PARAM or CAP2 bit).  Needed by `glsl-vs-if-nested-loop`
-  and else-if chains on uniforms.
+* Vertex IF nesting: done, any depth a program can express (section
+  3.3).  `glsl-vs-if-nested-loop` still falls back: its if and loop bound
+  depend on the vertex position (data-dependent, no hardware form).
 * Nested vertex loops cannot use REP twice; they need a literal inner trip
   count to unroll (`glsl-vs-vec4-indexing-temp-*-in-nested-loop-*`).
 * Data-dependent vertex loop counts (`glsl-vs-loop`, `glsl-vs-loop-nested`,
