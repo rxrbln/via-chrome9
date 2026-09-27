@@ -120,8 +120,10 @@ struct tcl_compact {
    bool built;
    uint32_t *index;
    uint8_t *vertices;
-   /* The vertices in a vertex buffer, written once. */
+   /* The vertices in a vertex buffer and the index in an index buffer,
+    * written once. */
    struct pipe_resource *buffer;
+   struct pipe_resource *index_buffer;
    unsigned unique;
    unsigned stride;
    unsigned offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
@@ -4092,6 +4094,7 @@ chrome9_tcl_state_destroy(struct chrome9_tcl_state *state)
    free(state->compact.index);
    free(state->compact.vertices);
    pipe_resource_reference(&state->compact.buffer, NULL);
+   pipe_resource_reference(&state->compact.index_buffer, NULL);
    for (unsigned e = 0; e < TCL_DEDUPE_ENTRIES; e++)
       free(state->dedupe[e].first);
    FREE(state);
@@ -4768,6 +4771,7 @@ tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
       free(c->index);
       free(c->vertices);
       pipe_resource_reference(&c->buffer, NULL);
+      pipe_resource_reference(&c->index_buffer, NULL);
       memset(c, 0, sizeof(*c));
       memcpy(c->streams, key, sizeof(key));
       c->inputs = inputs;
@@ -4849,6 +4853,16 @@ tcl_compact_get(struct chrome9_context *ctx, struct chrome9_tcl_state *state,
    }
    pipe_buffer_write(&ctx->base, c->buffer, 0, (size_t)c->unique * stride,
                      c->vertices);
+   /* Index objects fetch the static index directly. */
+   if (ctx->tcl_index_object) {
+      c->index_buffer = pipe_buffer_create(ctx->base.screen,
+                                           PIPE_BIND_INDEX_BUFFER,
+                                           PIPE_USAGE_IMMUTABLE,
+                                           (size_t)range->count * 4);
+      if (c->index_buffer)
+         pipe_buffer_write(&ctx->base, c->index_buffer, 0,
+                           (size_t)range->count * 4, c->index);
+   }
    return c;
 }
 
@@ -5000,8 +5014,11 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       }
       compact_info = *info;
       compact_info.index_size = 4;
-      compact_info.has_user_indices = true;
-      compact_info.index.user = compact->index;
+      compact_info.has_user_indices = !compact->index_buffer;
+      if (compact->index_buffer)
+         compact_info.index.resource = compact->index_buffer;
+      else
+         compact_info.index.user = compact->index;
       compact_range.start = 0;
       compact_range.count = range->count;
       compact_range.index_bias = 0;
@@ -5014,6 +5031,9 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       index_min = 0;
       index_max = compact->unique - 1;
       have_range = true;
+      /* Every compacted vertex, prefetched ones too, is in a buffer. */
+      index_object = compact->index_buffer &&
+                     tcl_index_object_usable(info, range, &chunker);
    } else if (ctx->tcl_index_object && !p->prefetch_count &&
               tcl_index_object_usable(info, range, &chunker) &&
               tcl_streams_resident(ctx, p->input_count, streams)) {
