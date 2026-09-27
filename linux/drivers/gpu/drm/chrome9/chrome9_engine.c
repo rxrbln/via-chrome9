@@ -351,16 +351,17 @@ module_param_named(vs_flow, chrome9_vs_flow, bool, 0400);
 MODULE_PARM_DESC(vs_flow,
 	"Hardware TCL static flow control, REP i# and IF b# (default: true)");
 
-/* IF nests exact at least 4 deep on silicon (rung vsnest). */
-static uint chrome9_vs_flow_depth = 4;
+/* IF nests exact at every depth a program can reach (rung vsdeep). */
+static uint chrome9_vs_flow_depth = CHROME9_VERTEX_MAX_FLOW_DEPTH;
 module_param_named(vs_flow_depth, chrome9_vs_flow_depth, uint, 0600);
 MODULE_PARM_DESC(vs_flow_depth,
-	"Static flow nesting depth, 1..4; REP never nests (default: 4, the vendor uses 1)");
+	"Static flow nesting depth, 1..128; REP never nests (default: 128, the vendor uses 1)");
 
 u32 chrome9_engine_vs_flow_depth(void)
 {
 	return READ_ONCE(chrome9_vs_flow) ?
-	       clamp(READ_ONCE(chrome9_vs_flow_depth), 1U, 4U) : 0;
+	       clamp(READ_ONCE(chrome9_vs_flow_depth), 1U,
+		     CHROME9_VERTEX_MAX_FLOW_DEPTH) : 0;
 }
 
 static bool chrome9_vs_relative = true;

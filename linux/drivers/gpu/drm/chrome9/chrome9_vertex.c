@@ -17,8 +17,6 @@
 #define CHROME9_VERTEX_NO_PHYSICAL	0xff
 #define CHROME9_VERTEX_FINALIZER_RECORDS 5U
 #define CHROME9_VERTEX_INACTIVE_TAILS	2U
-/* D3D9 vs_2_0 static flow control nesting limit. */
-#define CHROME9_VERTEX_MAX_FLOW_DEPTH	4U
 #define CHROME9_VERTEX_NO_DEF		0xffffU
 
 #define CHROME9_VS_UNIFIED_INPUT	32U
@@ -169,6 +167,7 @@ struct chrome9_vertex_state {
 	bool position_direct;
 	int last_input_record;
 	struct chrome9_vertex_frame *frames;
+	u32 frame_count;
 	u32 max_depth;
 	u32 depth;
 	bool relative;
@@ -462,6 +461,24 @@ static int chrome9_vertex_validate_condition(const struct drm_chrome9_vertex_ins
 			     DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS) ? 0 : -EINVAL;
 }
 
+/* Frame stack grown to the deepest region the program opens. */
+static int chrome9_vertex_frames_reserve(struct chrome9_vertex_state *state)
+{
+	struct chrome9_vertex_frame *frames;
+	u32 count;
+
+	if (state->depth < state->frame_count)
+		return 0;
+	count = min(max(2 * state->frame_count, 4U), state->max_depth);
+	frames = krealloc_array(state->frames, count, sizeof(*frames),
+				GFP_KERNEL);
+	if (!frames)
+		return -ENOMEM;
+	state->frames = frames;
+	state->frame_count = count;
+	return 0;
+}
+
 static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 	const struct drm_chrome9_vertex_instruction *insn, u32 instruction)
 {
@@ -485,6 +502,8 @@ static int chrome9_vertex_validate_flow(struct chrome9_vertex_state *state,
 			if (state->frames[t].op == DRM_CHROME9_VERTEX_OP_REP)
 				return CHROME9_EINVAL;
 		ret = chrome9_vertex_validate_condition(insn);
+		if (!ret)
+			ret = chrome9_vertex_frames_reserve(state);
 		if (ret)
 			return ret;
 		frame = &state->frames[state->depth++];
@@ -1046,12 +1065,6 @@ int chrome9_vertex_compile(
 	if (flow && flow->max_depth) {
 		state->max_depth = min(flow->max_depth,
 				       CHROME9_VERTEX_MAX_FLOW_DEPTH);
-		state->frames = kcalloc(state->max_depth,
-					sizeof(*state->frames), GFP_KERNEL);
-		if (!state->frames) {
-			ret = -ENOMEM;
-			goto out;
-		}
 	}
 	if (flow && flow->relative) {
 		state->relative = true;
@@ -1878,6 +1891,55 @@ static int chrome9_vertex_flow_expect(const struct chrome9_vertex_program *progr
 	chrome9_vertex_compile(insn, ARRAY_SIZE(insn), fragment, 1, NULL, 0, \
 			       constants, false, 0, false, 0, flow, program)
 
+/* IF b(k mod 16) nested depth deep around one ADD: compiles at that depth
+ * limit, not one below, and each IF skips to the common end. */
+static int chrome9_vertex_deep_selftest(struct chrome9_fragment_program *fragment,
+					struct chrome9_vertex_program *program,
+					u32 depth)
+{
+	static const struct drm_chrome9_vertex_instruction head =
+		VS_I(MOV, VS_T(0), VS_R(INPUT, 0));
+	static const struct drm_chrome9_vertex_instruction body =
+		VS_I(ADD, VS_T(0), VS_R(TEMP, 0), VS_R(CONSTANT, 0));
+	static const struct drm_chrome9_vertex_instruction tail =
+		VS_I(MOV, VS_POS, VS_R(TEMP, 0));
+	struct chrome9_vertex_flow flow = { depth - 1 };
+	struct drm_chrome9_vertex_instruction *insn;
+	u32 count = 2 * depth + 3, k;
+	int ret = -EIO;
+
+	insn = kcalloc(count, sizeof(*insn), GFP_KERNEL);
+	if (!insn)
+		return -ENOMEM;
+	insn[0] = head;
+	for (k = 0; k < depth; k++) {
+		insn[1 + k].op = DRM_CHROME9_VERTEX_OP_IF;
+		insn[1 + k].src[0].file = DRM_CHROME9_VERTEX_FILE_BOOL;
+		insn[1 + k].src[0].index = k % DRM_CHROME9_VERTEX_MAX_BOOL_CONSTANTS;
+		insn[1 + k].src[0].swizzle[1] = 1;
+		insn[1 + k].src[0].swizzle[2] = 2;
+		insn[1 + k].src[0].swizzle[3] = 3;
+		insn[2 + depth + k].op = DRM_CHROME9_VERTEX_OP_ENDIF;
+	}
+	insn[1 + depth] = body;
+	insn[count - 1] = tail;
+	if (chrome9_vertex_compile(insn, count, fragment, 1, NULL, 0, 1, false,
+				   0, false, 0, &flow, program) != -EINVAL)
+		goto out;
+	flow.max_depth = depth;
+	if (chrome9_vertex_compile(insn, count, fragment, 1, NULL, 0, 1, false,
+				   0, false, 0, &flow, program))
+		goto out;
+	for (k = 0; k < depth; k++)
+		if (program->records[1 + k][2] !=
+		    (CHROME9_VS_FLOW_NOT_TAKEN | (depth + 1 - k) << 10))
+			goto out;
+	ret = 0;
+out:
+	kfree(insn);
+	return ret;
+}
+
 static int chrome9_vertex_flow_selftest(struct chrome9_fragment_program *fragment,
 					struct chrome9_vertex_program *program)
 {
@@ -1927,7 +1989,7 @@ static int chrome9_vertex_flow_selftest(struct chrome9_fragment_program *fragmen
 	    VS_FLOW(bad_flow_b16_insn, &depth1, 1) != -EINVAL ||
 	    VS_FLOW(bad_flow_twice_insn, &depth1, 0) != -EINVAL)
 		return -EIO;
-	return 0;
+	return chrome9_vertex_deep_selftest(fragment, program, 100);
 }
 
 #define VS_REL(i, x, y, z, w, m, a) \

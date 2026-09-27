@@ -19,6 +19,10 @@ struct chrome9_vertex_flow {
 	bool relative_raw;
 };
 
+/* IF nests exact at every depth that fits the program (rung vsdeep, 63);
+ * each level takes an opening and a closing instruction. */
+#define CHROME9_VERTEX_MAX_FLOW_DEPTH	(DRM_CHROME9_VERTEX_MAX_INSTRUCTIONS / 2)
+
 struct chrome9_vertex_program {
 	u32 record_count;
 	u32 active_count;
