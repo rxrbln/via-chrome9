@@ -15,6 +15,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | guarded shared surfaces (zero-copy DRI3 and scanout) | `22d0655` / `b929f9f` | glmark2 matrix, ioquake3 |
 | explicit CPU access, non-snooped GART | `eb62c41`, `a16035c` | glmark2 matrix |
 | hardware TCL: vertex programs, stage A inline, stage B buffers and 16/32-bit indices, native vertex formats, 64 draws per ioctl | `d538ba0`, `a37ee05` | `chrome9_tcl_oracle`, glmark2 |
+| resident vertex programs: up to 16 programs in VS records 16..255 behind the common first record, a switch writes only A60; flow and long programs at record 0 with latch handling, module `vs_resident` default on | `7ba5d2e` | depth-only, vertex default and non-finite checks, full piglit unchanged; glmark2 ideas 8.73 -> 8.26 ms (`chrome9-hw-tcl-re.md`) |
 | homogeneous clipping incl. near plane, guard band | `2541417` | `chrome9_gl_guardband_smoke` |
 | 6 user clip planes | `eff46d0` / `e3afdf6` | `chrome9_gl_ucp_smoke` |
 | two-sided colour (two culled passes; the hardware back-colour selection does not work on VX900: every vendor state and candidate tested, `chrome9-twoside-enable-re.md`) | Mesa `fb6780a` | `chrome9_gl_twoside_smoke` 8/8 |

@@ -1079,5 +1079,47 @@ Silicon, 2026-09-27 afternoon (kernels x174..x190, k191; diffs in
 
 The start field does move execution, but its exact semantics and the
 state that corrupts the next record-0 program are not known, and wrong
-guesses stop the engine.  Residency is not merged; the vertex program is
-uploaded to record 0 on every switch as before.
+guesses stop the engine.  Superseded by the working model below.
+
+## VS residency: working model and implementation (2026-09-27, k202)
+
+Silicon results (kernels x198..x201, k202) that explain the failures above:
+
+* The store holds 256 records.  An upload at record 256 or above (the
+  earlier B = 256 and B = 337 rungs) is where the engine stops; the
+  "512-record" assumption above is wrong.
+* A draw first executes one record at the previous draw's A60[20:12]
+  (the latch), then continues at its own A60[20:12] + 1 up to A60[8:0].
+  The latch changes only per draw; a second A60 write before the same
+  draw does not reset it.  This is the "wrong once" after a relocated
+  draw: the next record-0 program ran the relocated program's first
+  record in place of its own.
+* The upload header `31030000 + 4 * record` is an absolute record address.
+* Every fixed-builder program starts with the same record
+  `00380150 00000000 00000000 0008010f`, and every compiled program
+  tolerates executing it once in front of its own first record.
+* REP/IF flow programs are only reliable at record 0.
+
+Kernel `7ba5d2e` (module parameter `vs_resident`, default on):
+
+* Resident programs live in records 16..255.  Each occupies count + 1
+  records: the common first record at base, the program at base + 1;
+  A60[20:12] = base, A60[8:0] = base + count.  Whatever the latch is,
+  the first executed record is harmless.  Placement: content compare for
+  hits, first-fit, LRU eviction; a switch to a resident program is one
+  A60 write.
+* Flow programs and programs longer than 239 records stay at record 0.
+  If the latch lies outside their range, record 0 is lent to the latch
+  (the program's first record copied there) and restored after the draw.
+  If the latch lies inside, a zero-area fixed-function draw first moves
+  the latch to 0.
+* An upload that overlaps the range the previous draw executes is
+  preceded by the H0 3D wait (`006c` = `00800000`).
+* Store state is staged per command segment and restored when a draw
+  does not fit and moves to the next segment; ring priming resets it.
+
+Results: `re/chrome9_gl_depth_only_check.c` 19/19 (repeated),
+`re/chrome9_gl_vertex_default_check.c`, `re/chrome9_gl_vs_nonfinite_check.c`
+pass; full piglit unchanged against `vs_resident=0` (the five failures of
+the earlier attempt pass); glmark2 ideas 8.73 -> 8.26 ms per frame, other
+scenes and ioquake3 GL1/GL2 unchanged (fill-bound), no job timeouts.
