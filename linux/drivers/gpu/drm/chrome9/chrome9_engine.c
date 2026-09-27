@@ -267,6 +267,18 @@ module_param_named(tile_re, chrome9_tile_re, uint, 0600);
 MODULE_PARM_DESC(tile_re,
 	"Debug: tile bits for fragment draw targets, see chrome9-tiling-re.md (default: 0)");
 
+/*
+ * Reject draws whose float vertex inputs are not finite.  The engine takes
+ * vertex shader outputs of +-Inf and NaN in every position lane and in
+ * varyings, which the shader computes from finite inputs as easily
+ * (tools re/chrome9_gl_vs_nonfinite_check.c), so without the check only
+ * the NaN primitive drop is needed.
+ */
+static bool chrome9_tcl_finite_check;
+module_param_named(tcl_finite_check, chrome9_tcl_finite_check, bool, 0600);
+MODULE_PARM_DESC(tcl_finite_check,
+	"Reject non-finite TCL vertex inputs, always without tcl_nan_kill (default: false)");
+
 /* A00[23:18] = 010101: drop primitives with a NaN position (Windows 7122). */
 static bool chrome9_tcl_nan_kill = true;
 module_param_named(tcl_nan_kill, chrome9_tcl_nan_kill, bool, 0600);
@@ -722,6 +734,7 @@ struct chrome9_tcl_draw {
 	bool edge_aa;
 	/* A00[23:18] = 010101: drop primitives with a NaN position. */
 	bool nan_kill;
+	bool finite_check;
 	/* Program A61 with this draw's bool constants. */
 	u32 a61;
 	const struct drm_chrome9_vertex_instruction *instructions;
@@ -3990,8 +4003,7 @@ out:
 static bool chrome9_float_finite(u32 value);
 
 
-/* Largest raw index bound: A2C/A2E carry 32 bits, the finite check reads
- * every vertex up to it once per buffer. */
+/* Largest raw index bound: A2C/A2E carry 32 bits. */
 #define CHROME9_TCL_INDEX_OBJECT_MAX	0x00ffffffULL
 
 static bool chrome9_tcl_half_finite(u32 value)
@@ -4097,86 +4109,194 @@ void chrome9_finite_clear(struct chrome9_bo *bo)
 		chrome9_finite_remove(bo, entry);
 }
 
+/* Bytes of the element's vertices; an element reads at most 16 bytes. */
 static void chrome9_finite_span(struct chrome9_finite_element *entry)
 {
-	entry->last = entry->start + (u64)entry->count * entry->stride + 15;
+	entry->last = entry->start + (u64)(entry->count - 1) * entry->stride + 15;
 }
 
-/* Whether an element of an explicit object was verified since the last
- * CPU store to its bytes; records it otherwise when record is set. */
-static bool chrome9_finite_cached(struct chrome9_bo *bo, u64 start,
-				  u32 stride, u32 count, u8 type, bool record)
+static bool chrome9_finite_same(const struct chrome9_finite_element *entry,
+				u64 addr, u32 stride, u8 type)
+{
+	return entry->stride == stride && entry->type == type &&
+	       addr >= entry->start && (addr - entry->start) % stride == 0;
+}
+
+static struct chrome9_finite_element *chrome9_finite_insert(
+	struct chrome9_bo *bo, u64 start, u32 stride, u32 count, u8 type)
 {
 	struct chrome9_finite_element *entry;
 
-	if (!bo->explicit_access)
-		return false;
-	for (entry = chrome9_finite_tree_iter_first(&bo->finite, start, start);
-	     entry; entry = chrome9_finite_tree_iter_next(entry, start, start)) {
-		if (entry->start != start || entry->stride != stride ||
-		    entry->type != type)
-			continue;
-		if (count <= entry->count)
-			return true;
-		if (record) {
-			chrome9_finite_tree_remove(entry, &bo->finite);
-			entry->count = count;
-			chrome9_finite_span(entry);
-			chrome9_finite_tree_insert(entry, &bo->finite);
-		}
-		return false;
-	}
 	/* A misbehaving client could list unbounded elements. */
-	if (!record ||
-	    bo->finite_count >= max_t(u64, 1024, bo->base.base.size / 64))
-		return false;
+	if (bo->finite_count >= max_t(u64, 1024, bo->base.base.size / 64))
+		return NULL;
 	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
-		return false;
+		return NULL;
 	*entry = (struct chrome9_finite_element){
 		.start = start, .stride = stride, .count = count, .type = type,
 	};
 	chrome9_finite_span(entry);
 	chrome9_finite_tree_insert(entry, &bo->finite);
 	bo->finite_count++;
-	return false;
+	return entry;
+}
+
+/* Record vertices [addr, addr + count * stride) as finite, merged with a
+ * verified run ending right before or starting right after them. */
+static void chrome9_finite_record(struct chrome9_bo *bo, u64 addr, u32 stride,
+				  u32 count, u8 type)
+{
+	struct chrome9_finite_element *entry, *prev = NULL, *next = NULL;
+	const u64 end = addr + (u64)count * stride;
+
+	if (addr >= stride)
+		for (entry = chrome9_finite_tree_iter_first(&bo->finite,
+				addr - stride, addr - stride);
+		     entry; entry = chrome9_finite_tree_iter_next(entry,
+				addr - stride, addr - stride))
+			if (chrome9_finite_same(entry, addr, stride, type) &&
+			    entry->start + (u64)entry->count * stride == addr) {
+				prev = entry;
+				break;
+			}
+	for (entry = chrome9_finite_tree_iter_first(&bo->finite, end, end);
+	     entry; entry = chrome9_finite_tree_iter_next(entry, end, end))
+		if (entry->start == end && entry->stride == stride &&
+		    entry->type == type) {
+			next = entry;
+			break;
+		}
+	if (prev) {
+		chrome9_finite_tree_remove(prev, &bo->finite);
+		prev->count += count;
+		if (next && prev->count <= U32_MAX - next->count) {
+			prev->count += next->count;
+			chrome9_finite_remove(bo, next);
+		}
+		chrome9_finite_span(prev);
+		chrome9_finite_tree_insert(prev, &bo->finite);
+	} else if (next && next->count <= U32_MAX - count) {
+		chrome9_finite_tree_remove(next, &bo->finite);
+		next->start = addr;
+		next->count += count;
+		chrome9_finite_span(next);
+		chrome9_finite_tree_insert(next, &bo->finite);
+	} else {
+		chrome9_finite_insert(bo, addr, stride, count, type);
+	}
+}
+
+static bool chrome9_finite_scan(const u8 *data, u32 stride, u32 count,
+				u8 type)
+{
+	unsigned int v, c;
+
+	for (v = 0; v < count; v++) {
+		const u32 *vertex = (const u32 *)(data + (size_t)v * stride);
+
+		for (c = 0; c < chrome9_tcl_formats[type].float32; c++)
+			if (!chrome9_float_finite(READ_ONCE(vertex[c])))
+				return false;
+		for (c = 0; c < chrome9_tcl_formats[type].float16; c++)
+			if (!chrome9_tcl_half_finite(READ_ONCE(vertex[c])))
+				return false;
+	}
+	return true;
+}
+
+/*
+ * Whether count vertices of an element starting at byte start are finite.
+ * For explicit objects only the runs not verified since the last announced
+ * CPU store to their bytes are read, and then recorded.
+ */
+static bool chrome9_finite_element_check(struct chrome9_bo *bo,
+		const u8 *base, u64 start, u32 stride, u32 count, u8 type)
+{
+	u32 v = 0;
+
+	/* Stride 0 repeats one vertex. */
+	if (!stride)
+		count = 1;
+	if (!bo->explicit_access || !stride)
+		return chrome9_finite_scan(base + start, stride, count, type);
+	while (v < count) {
+		const u64 addr = start + (u64)v * stride;
+		const u64 last = start + (u64)(count - 1) * stride;
+		struct chrome9_finite_element *entry;
+		u32 end = count;
+
+		for (entry = chrome9_finite_tree_iter_first(&bo->finite,
+				addr, addr);
+		     entry; entry = chrome9_finite_tree_iter_next(entry,
+				addr, addr))
+			if (chrome9_finite_same(entry, addr, stride, type) &&
+			    addr < entry->start + (u64)entry->count * stride)
+				break;
+		if (entry) {
+			v = min_t(u64, count,
+				  (entry->start + (u64)entry->count * stride -
+				   start) / stride);
+			continue;
+		}
+		/* Scan up to the next verified run of this element. */
+		for (entry = chrome9_finite_tree_iter_first(&bo->finite,
+				addr, last);
+		     entry; entry = chrome9_finite_tree_iter_next(entry,
+				addr, last))
+			if (entry->start > addr &&
+			    chrome9_finite_same(entry, entry->start, stride,
+						type) &&
+			    (entry->start - start) % stride == 0)
+				end = min_t(u64, end,
+					    (entry->start - start) / stride);
+		if (!chrome9_finite_scan(base + addr, stride, end - v, type))
+			return false;
+		chrome9_finite_record(bo, addr, stride, end - v, type);
+		v = end;
+	}
+	return true;
 }
 
 static bool chrome9_tcl_buffers_finite(const struct chrome9_tcl_draw *tcl,
 		struct drm_gem_object *const *objects,
 		const struct iosys_map *maps, const u32 *buffer_object,
-		const u64 *element_start)
+		const u64 *element_start, const void *indices)
 {
-	unsigned int v, e, c;
+	u32 lo = 0, hi = tcl->index_range;
+	unsigned int e, i;
 
+	/* Raw indices: only the vertices they name, not the whole bound. */
+	if (tcl->index_object) {
+		lo = U32_MAX;
+		hi = 0;
+		for (i = 0; i < tcl->index_count; i++) {
+			u32 index = tcl->index32 ?
+				READ_ONCE(((const u32 *)indices)[i]) :
+				READ_ONCE(((const u16 *)indices)[i]);
+
+			/* Beyond the bound the hardware ends the list. */
+			if (index > tcl->index_range)
+				break;
+			lo = min(lo, index);
+			hi = max(hi, index);
+		}
+		if (lo > hi)
+			return true;
+	}
 	for (e = 0; e < tcl->element_count; e++) {
 		u8 type = tcl->element_type[e];
 		u8 b = tcl->element_buffer[e];
-		struct chrome9_bo *bo = to_chrome9_bo(objects[buffer_object[b]]);
-		const u8 *data = (const u8 *)maps[buffer_object[b]].vaddr +
-				 element_start[e];
 
 		if (!chrome9_tcl_formats[type].float32 &&
 		    !chrome9_tcl_formats[type].float16)
 			continue;
-		if (chrome9_finite_cached(bo, element_start[e],
-					  tcl->buffers[b].stride,
-					  tcl->index_range + 1, type, false))
-			continue;
-		for (v = 0; v <= tcl->index_range; v++) {
-			const u32 *vertex = (const u32 *)(data +
-				(size_t)v * tcl->buffers[b].stride);
-
-			for (c = 0; c < chrome9_tcl_formats[type].float32; c++)
-				if (!chrome9_float_finite(READ_ONCE(vertex[c])))
-					return false;
-			for (c = 0; c < chrome9_tcl_formats[type].float16; c++)
-				if (!chrome9_tcl_half_finite(READ_ONCE(vertex[c])))
-					return false;
-		}
-		chrome9_finite_cached(bo, element_start[e],
-				      tcl->buffers[b].stride,
-				      tcl->index_range + 1, type, true);
+		if (!chrome9_finite_element_check(
+			    to_chrome9_bo(objects[buffer_object[b]]),
+			    maps[buffer_object[b]].vaddr,
+			    element_start[e] + (u64)lo * tcl->buffers[b].stride,
+			    tcl->buffers[b].stride, hi - lo + 1, type))
+			return false;
 	}
 	return true;
 }
@@ -6644,20 +6764,48 @@ static int chrome9_bo_cpu_sync_locked(struct chrome9_bo *bo, u64 offset,
 	return 0;
 }
 
-/* Drop finite verifications of elements a CPU store may have changed. */
+/* Drop finite verifications of vertices a CPU store may have changed; the
+ * runs before and after the stored bytes stay verified. */
 static void chrome9_finite_forget(struct chrome9_bo *bo, u64 offset, u64 size)
 {
-	struct chrome9_finite_element *entry, *next;
+	struct chrome9_finite_element *entry;
+	const u64 last = offset + size - 1;
 
 	if (!size)
 		return;
-	entry = chrome9_finite_tree_iter_first(&bo->finite, offset,
-					       offset + size - 1);
+	entry = chrome9_finite_tree_iter_first(&bo->finite, offset, last);
 	while (entry) {
-		next = chrome9_finite_tree_iter_next(entry, offset,
-						     offset + size - 1);
-		chrome9_finite_remove(bo, entry);
-		entry = next;
+		/* Vertex i reads bytes [start + i * stride, + 15]. */
+		u64 first_bad = offset > entry->start + 15 ?
+			DIV_ROUND_UP(offset - entry->start - 15,
+				     entry->stride) : 0;
+		u64 last_bad = last < entry->start ? 0 :
+			min_t(u64, entry->count - 1,
+			      (last - entry->start) / entry->stride);
+		u32 tail;
+
+		if (last < entry->start || first_bad > last_bad) {
+			entry = chrome9_finite_tree_iter_next(entry, offset,
+							      last);
+			continue;
+		}
+		tail = entry->count - 1 - last_bad;
+		chrome9_finite_tree_remove(entry, &bo->finite);
+		if (tail)
+			chrome9_finite_insert(bo, entry->start +
+				(last_bad + 1) * entry->stride, entry->stride,
+				tail, entry->type);
+		if (first_bad) {
+			entry->count = first_bad;
+			chrome9_finite_span(entry);
+			chrome9_finite_tree_insert(entry, &bo->finite);
+		} else {
+			bo->finite_count--;
+			kfree(entry);
+		}
+		/* The tree changed: the remaining pieces no longer overlap. */
+		entry = chrome9_finite_tree_iter_first(&bo->finite, offset,
+						       last);
 	}
 }
 
@@ -9527,9 +9675,12 @@ static int chrome9_submit_fragment_programs(struct drm_device *drm,
 	for (r = 0; r < count; r++) {
 		struct chrome9_tcl_draw *tcl = requests[r]->tcl;
 
-		if (tcl && tcl->buffer_count &&
+		if (tcl && tcl->buffer_count && tcl->finite_check &&
 		    !chrome9_tcl_buffers_finite(tcl, objects, job->fragment_maps,
-				sub->draw[r].buffer_object, sub->draw[r].element_start)) {
+				sub->draw[r].buffer_object, sub->draw[r].element_start,
+				tcl->index_object ? (const u8 *)
+				job->fragment_maps[sub->draw[r].index_object].vaddr +
+				tcl->index_buffer.offset : NULL)) {
 			ret = -EINVAL;
 			goto out_unmap;
 		}
@@ -13635,6 +13786,8 @@ static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *ar
 	}
 	tcl->sprite_mask = sprite;
 	tcl->nan_kill = READ_ONCE(chrome9_tcl_nan_kill);
+	tcl->finite_check = !tcl->nan_kill ||
+			    READ_ONCE(chrome9_tcl_finite_check);
 	/* Edge antialiasing for lines and filled triangles only. */
 	if (raster & DRM_CHROME9_RASTER_EDGE_AA) {
 		if (points || cw || ccw)
@@ -13976,7 +14129,7 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		if (IS_ERR(vertices))
 			return PTR_ERR(vertices);
 		tcl->vertices = vertices;
-		if (!chrome9_tcl_vertices_finite(tcl))
+		if (tcl->finite_check && !chrome9_tcl_vertices_finite(tcl))
 			return CHROME9_EINVAL;
 	}
 	*tclp = tcl;
