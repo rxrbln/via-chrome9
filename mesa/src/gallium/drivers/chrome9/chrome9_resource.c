@@ -1807,17 +1807,20 @@ chrome9_generate_mipmap_gpu(struct chrome9_context *ctx,
 }
 
 /*
- * Copy a BGRA/BGRX level, or a box of it, to the top left of a level at
- * least as large on the 3D engine: NEAREST samples at texel centres are exact, and either
- * side may be tiled or local, so the CPU never detiles nor reads
- * write-combined memory.  The copy is queued behind submitted jobs, the
- * caller flushes retained work first; CPU access waits for the copy.
+ * Blit a box of a BGRA/BGRX level (of cube face src_face) to the top left
+ * of a level (of cube face dst_face), scaled to dw x dh, on the 3D engine
+ * with NEAREST samples at texel centres: exact when unscaled, a nearest
+ * resample otherwise.  Either side may be tiled or local, so the CPU never
+ * detiles nor reads write-combined memory.  The blit is queued behind
+ * submitted jobs, the caller flushes retained work first; CPU access waits
+ * for it.
  */
-bool
-chrome9_resource_copy_gpu(struct chrome9_context *ctx,
+static bool
+chrome9_resource_blit_gpu(struct chrome9_context *ctx,
                           struct chrome9_resource *dst, unsigned dst_level,
+                          unsigned dst_face, unsigned dw, unsigned dh,
                           struct chrome9_resource *src, unsigned level,
-                          const struct pipe_box *box)
+                          unsigned src_face, const struct pipe_box *box)
 {
    static const unsigned corner[6][2] = {
       { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 }, { 0, 1 },
@@ -1836,8 +1839,10 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
    const bool bgra = spres->format == PIPE_FORMAT_B8G8R8A8_UNORM;
    const unsigned lw = u_minify(spres->width0, level);
    const unsigned lh = u_minify(spres->height0, level);
-   const unsigned x = box ? box->x : 0, y = box ? box->y : 0;
-   const unsigned w = box ? box->width : lw, h = box ? box->height : lh;
+   const unsigned x = box->x, y = box->y, w = box->width, h = box->height;
+   const uint64_t src_face_offset = (uint64_t)src_face * src->layer_stride;
+   const uint64_t dst_offset = dst->level_offset[dst_level] +
+                               (uint64_t)dst_face * dst->layer_stride;
    const int fd = ctx->base.screen->get_screen_fd(ctx->base.screen);
    struct drm_chrome9_fragment_texture_state texture = { 0 };
    struct drm_chrome9_fragment_vertex vertices[6];
@@ -1847,8 +1852,8 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
                (chrome9_resource_is_tiled(dst) ?
                 DRM_CHROME9_FRAGMENT_DESTINATION_TILED : 0),
       .triangle_count = 2,
-      .width = w,
-      .height = h,
+      .width = dw,
+      .height = dh,
       .destination_format = bgra ? DRM_CHROME9_DESTINATION_FORMAT_BGRA8888 :
                                    DRM_CHROME9_DESTINATION_FORMAT_BGRX8888,
       .instruction_count = ARRAY_SIZE(program),
@@ -1866,14 +1871,17 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
        !src->guarded || !dst->guarded || src->sampler_unsupported ||
        spres->format != dpres->format ||
        (!bgra && spres->format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
-       spres->target != PIPE_TEXTURE_2D || dpres->target != PIPE_TEXTURE_2D ||
+       (spres->target != PIPE_TEXTURE_2D &&
+        spres->target != PIPE_TEXTURE_CUBE) ||
+       (dpres->target != PIPE_TEXTURE_2D &&
+        dpres->target != PIPE_TEXTURE_CUBE) ||
+       src_face >= spres->array_size || dst_face >= dpres->array_size ||
        level > spres->last_level || dst_level > dpres->last_level ||
-       (box && (box->x < 0 || box->y < 0 || !box->width || !box->height ||
-                x + w > lw || y + h > lh)) ||
-       u_minify(dpres->width0, dst_level) < w ||
-       u_minify(dpres->height0, dst_level) < h || w > 2048 || h > 2048 ||
+       box->x < 0 || box->y < 0 || !w || !h || x + w > lw || y + h > lh ||
+       !dw || !dh || u_minify(dpres->width0, dst_level) < dw ||
+       u_minify(dpres->height0, dst_level) < dh || dw > 2048 || dh > 2048 ||
        spres->last_level >= DRM_CHROME9_FRAGMENT_MAX_TEXTURE_LEVELS ||
-       dst->level_offset[dst_level] > UINT32_MAX)
+       dst_offset > UINT32_MAX)
       return false;
    texture.handle = src->bo.handle;
    texture.flags = chrome9_resource_texture_flags(src);
@@ -1891,20 +1899,21 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
    texture.wrap_t = DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_EDGE;
    texture.min_lod_s5_5 = level * 32;
    texture.max_lod_s5_5 = level * 32;
+   /* A cube face is sampled as the 2D image at its face offset. */
    for (unsigned l = 0; l <= spres->last_level; l++) {
-      if (src->level_offset[l] > UINT32_MAX)
+      if (src->level_offset[l] + src_face_offset > UINT32_MAX)
          return false;
-      texture.level_offset[l] = src->level_offset[l];
+      texture.level_offset[l] = src->level_offset[l] + src_face_offset;
       texture.level_pitch[l] = src->level_stride[l];
    }
-   draw.destination_offset = dst->level_offset[dst_level];
+   draw.destination_offset = dst_offset;
    draw.destination_pitch = dst->level_stride[dst_level];
    memset(vertices, 0, sizeof(vertices));
    for (unsigned v = 0; v < 6; v++) {
       /* Pixel centres at integer window coordinates, texel centres at
        * (i + 0.5) / size. */
-      vertices[v].x_16_16 = (int32_t)(corner[v][0] * w << 16) - 0x8000;
-      vertices[v].y_16_16 = (int32_t)(corner[v][1] * h << 16) - 0x8000;
+      vertices[v].x_16_16 = (int32_t)(corner[v][0] * dw << 16) - 0x8000;
+      vertices[v].y_16_16 = (int32_t)(corner[v][1] * dh << 16) - 0x8000;
       vertices[v].rhw_float = fui(1.0f);
       vertices[v].varying[0][0] =
          fui((float)(x + corner[v][0] * w) / (float)lw);
@@ -1913,6 +1922,56 @@ chrome9_resource_copy_gpu(struct chrome9_context *ctx,
       vertices[v].varying[0][3] = fui(1.0f);
    }
    return chrome9_draw_fragment_program(fd, &draw);
+}
+
+/*
+ * Copy a BGRA/BGRX level, or a box of it, to the top left of a level at
+ * least as large on the 3D engine (chrome9_resource_blit_gpu, unscaled).
+ */
+bool
+chrome9_resource_copy_gpu(struct chrome9_context *ctx,
+                          struct chrome9_resource *dst, unsigned dst_level,
+                          struct chrome9_resource *src, unsigned level,
+                          const struct pipe_box *box)
+{
+   struct pipe_box whole;
+
+   if (!box) {
+      u_box_2d(0, 0, u_minify(src->base.width0, level),
+               u_minify(src->base.height0, level), &whole);
+      box = &whole;
+   }
+   return src->base.target == PIPE_TEXTURE_2D &&
+          dst->base.target == PIPE_TEXTURE_2D &&
+          chrome9_resource_blit_gpu(ctx, dst, dst_level, 0, box->width,
+                                    box->height, src, level, 0, box);
+}
+
+/*
+ * Resample every face and level of an NPOT cube into the POT cube pot
+ * (same format) on the engine: the cube sampler takes power-of-two faces
+ * only.
+ */
+bool
+chrome9_resource_cube_resample_gpu(struct chrome9_context *ctx,
+                                   struct chrome9_resource *pot,
+                                   struct chrome9_resource *src)
+{
+   const unsigned levels = MIN2(src->base.last_level, pot->base.last_level);
+
+   for (unsigned face = 0; face < 6; face++)
+      for (unsigned level = 0; level <= levels; level++) {
+         struct pipe_box box;
+
+         u_box_2d(0, 0, u_minify(src->base.width0, level),
+                  u_minify(src->base.height0, level), &box);
+         if (!chrome9_resource_blit_gpu(ctx, pot, level, face,
+                                        u_minify(pot->base.width0, level),
+                                        u_minify(pot->base.height0, level),
+                                        src, level, face, &box))
+            return false;
+      }
+   return true;
 }
 
 bool

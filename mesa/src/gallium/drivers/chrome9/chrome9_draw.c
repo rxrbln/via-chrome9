@@ -2002,6 +2002,9 @@ chrome9_fragment_texture_descriptor(
       state->wrap_r = sampler->wrap_r;
       state->mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
    }
+   /* A single level samples with the minification filter alone. */
+   if (state->last_level == state->first_level)
+      state->mip_filter = DRM_CHROME9_TEXTURE_MIP_FILTER_NONE;
    if (state->wrap_s == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
        state->wrap_t == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER ||
        state->wrap_r == DRM_CHROME9_TEXTURE_WRAP_CLAMP_TO_BORDER)

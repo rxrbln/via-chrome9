@@ -226,6 +226,12 @@ struct chrome9_sampler_view {
    struct pipe_resource *shadow;
    /* Only llvmpipe can sample this view. */
    bool sw_only;
+   /* shadow is a power-of-two cube resampled from an NPOT cube, current
+    * while the texture's device write count and CPU generation hold. */
+   bool pot_cube;
+   bool pot_cube_valid;
+   uint64_t pot_cube_write_seq;
+   uint32_t pot_cube_cpu_generation;
 };
 
 static inline struct chrome9_sampler_view *

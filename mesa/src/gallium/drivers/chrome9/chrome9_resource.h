@@ -232,5 +232,8 @@ bool chrome9_resource_copy_gpu(struct chrome9_context *ctx,
                                unsigned dst_level,
                                struct chrome9_resource *src, unsigned level,
                                const struct pipe_box *box);
+bool chrome9_resource_cube_resample_gpu(struct chrome9_context *ctx,
+                                        struct chrome9_resource *pot,
+                                        struct chrome9_resource *src);
 
 #endif

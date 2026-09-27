@@ -9513,9 +9513,29 @@ chrome9_create_sampler_view(struct pipe_context *pipe,
       cview->sw_only = !chrome9_texture_swizzle_supported(
          templ->format, templ->swizzle_r, templ->swizzle_g,
          templ->swizzle_b, templ->swizzle_a) ||
-         /* The cube sampler takes POT faces only. */
-         (cube && !util_is_power_of_two_nonzero(texture->width0)) ||
          chrome9_resource(texture)->sampler_unsupported;
+   /* The cube sampler takes POT faces only: BGRA/BGRX NPOT cubes sample a
+    * power-of-two cube the engine resamples, others llvmpipe. */
+   if (supported && cube && !cview->sw_only &&
+       !util_is_power_of_two_nonzero(texture->width0)) {
+      struct pipe_resource pot_templ = *texture;
+      const unsigned size = 1u << util_logbase2(texture->width0 +
+                                                texture->width0 / 2);
+
+      pot_templ.width0 = pot_templ.height0 = size;
+      pot_templ.last_level = MIN2(texture->last_level, util_logbase2(size));
+      pot_templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
+      pot_templ.flags = 0;
+      pot_templ.next = NULL;
+      if ((texture->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+           texture->format == PIPE_FORMAT_B8G8R8X8_UNORM) &&
+          templ->u.tex.last_level <= pot_templ.last_level &&
+          debug_get_bool_option("CHROME9_POT_CUBE", true))
+         cview->shadow = pipe->screen->resource_create(pipe->screen,
+                                                        &pot_templ);
+      cview->pot_cube = cview->shadow != NULL;
+      cview->sw_only = !cview->pot_cube;
+   }
    if (supported && !chrome9_resource(texture)->guarded) {
       struct pipe_resource shadow_templ = *texture;
 
@@ -10352,6 +10372,31 @@ chrome9_clear_render_target(struct pipe_context *pipe,
    }
 }
 
+/* Resample the POT shadow of an NPOT cube when the cube changed. */
+static void
+chrome9_refresh_pot_cube(struct chrome9_context *ctx,
+                         struct chrome9_sampler_view *cview)
+{
+   struct chrome9_resource *texture = chrome9_resource(cview->base.texture);
+   struct pipe_screen *screen = ctx->base.screen;
+   uint64_t write_seq = 0;
+   bool known = chrome9_screen_has_capability2(screen,
+                                               DRM_CHROME9_CAP2_WRITE_SEQ) &&
+                chrome9_bo_write_seq(screen->get_screen_fd(screen),
+                                     &texture->bo, &write_seq);
+
+   if (known && cview->pot_cube_valid &&
+       cview->pot_cube_write_seq == write_seq &&
+       cview->pot_cube_cpu_generation == texture->cpu_write_generation)
+      return;
+   /* The faces may come from retained draws. */
+   chrome9_draw_flush_batch(ctx);
+   cview->pot_cube_valid = chrome9_resource_cube_resample_gpu(
+      ctx, chrome9_resource(cview->shadow), texture) && known;
+   cview->pot_cube_write_seq = write_seq;
+   cview->pot_cube_cpu_generation = texture->cpu_write_generation;
+}
+
 static void
 chrome9_refresh_sampler_shadows(struct chrome9_context *ctx)
 {
@@ -10362,7 +10407,9 @@ chrome9_refresh_sampler_shadows(struct chrome9_context *ctx)
       if (!view)
          continue;
       cview = chrome9_sampler_view(view);
-      if (cview->shadow) {
+      if (cview->pot_cube) {
+         chrome9_refresh_pot_cube(ctx, cview);
+      } else if (cview->shadow) {
          /* A texture may be the result of an earlier untextured pass.  Retire
           * retained triangles before refreshing its CPU-visible shadow. */
          chrome9_draw_flush_batch(ctx);
