@@ -17,7 +17,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | hardware TCL: vertex programs, stage A inline, stage B buffers and 16/32-bit indices, native vertex formats, 64 draws per ioctl | `d538ba0`, `a37ee05` | `chrome9_tcl_oracle`, glmark2 |
 | homogeneous clipping incl. near plane, guard band | `2541417` | `chrome9_gl_guardband_smoke` |
 | 6 user clip planes | `eff46d0` / `e3afdf6` | `chrome9_gl_ucp_smoke` |
-| two-sided colour (two culled passes; hardware selection does not work) | Mesa `fb6780a` | `chrome9_gl_twoside_smoke` 8/8 |
+| two-sided colour (two culled passes; the hardware back-colour selection does not work on VX900: every vendor state and candidate tested, `chrome9-twoside-enable-re.md`) | Mesa `fb6780a` | `chrome9_gl_twoside_smoke` 8/8 |
 | native triangle strips and fans | kernel topology field, CAP2 bit 5 | `chrome9_gl_topology_smoke` 60/60 identical to lists |
 | fragment programs, 2D textures, NPOT, repeat/clamp/mirror | | glmark2 |
 | POT mip chains at the sampler-derived offsets | `9dd8151` / `50b6120` | `chrome9_gl_mip_smoke` 68/68 |
@@ -73,6 +73,8 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | vertex texture fetch | llvmpipe draw fallback | not in the hardware (below) |
 | fragment programs above 96 ALU records | llvmpipe fallback by default; `CHROME9_FS_SPLIT=1` runs them as multi-pass jobs through R32F carriers (Mesa splitter, silicon-verified: split results bit-identical across plans, <= 1 LSB from llvmpipe where the 16-bit ALU allows) | opt-in because llvmpipe runs the long programs found (terrain noise, 19 jobs) 14x faster than the pixel engine; 96 is the store size in every vendor driver (`chrome9-long-fragment-programs.md` §8, §9) |
 | stage B index objects, A2C bound from the buffer size | kernel `f79a548`, Mesa `7fd63dd` | on (CAP2 bit 36): indices fetched raw through FE43 from the element buffer, A2C = largest vertex the vertex buffers hold (B8: an index beyond it ends the list), finite check once per buffer range (cached); no CPU scan or copy; draws with an occlusion query keep inline indices |
+| stage A/B default inputs: a stride-0 (0,0,0,1) attribute is not fetched, its A12 bit is clear | kernel `745d209`, Mesa `18596ff`, CAP2 bit 38 | on; `chrome9_gl_vertex_default_check` (default input below and above the output count, 1-4 varyings) |
+| depth functions GREATER, NOTEQUAL, GEQUAL; Z16 depth-only passes; unsupported depth states to llvmpipe instead of dropped | kernel `745d209`, Mesa `18596ff`, CAP2 bit 37 | on; `chrome9_gl_depth_only_check` 18/18 (NEVER renders in llvmpipe: A13 code 0 is the implicit LESS) |
 | quad strips, quads, polygons | decomposed into lists | stay decomposed (quad diagonal must match the draw module) |
 | terrain noise fragment shader | llvmpipe fallback | the noise program splits into 19 jobs (`CHROME9_FS_SPLIT=1`) but its mod-289 hash needs more than the 16 mantissa bits of the fragment ALU and llvmpipe is faster; all GL2/glmark2 vertex work runs on hardware TCL since Mesa `b45ec96`/`ddc2b4e` (terrain VS texels fetched on the CPU per distinct vertex) |
 | desktop blur | done: runs entirely on the hardware (no unsupported FS, no fallback draws, 49 fps at 800x600); glmark2 `--validate` reports 1 LSB (G, B) off its reference pixel | accepted LSB deviation: the sampler's bilinear weights have 5 bits (1/32 steps), max 5 LSB against llvmpipe on high-contrast texel edges, 99.7 % of pixels within 1 LSB (`chrome9-dlight-alpha-blur-precision.md` §2.8) |
@@ -81,7 +83,6 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 
 | feature | state |
 |---|---|
-| A12 default lanes for (0,0,0,1) inputs | B13 passes on silicon (a clear A12 bit reads (0,0,0,1), even if fetched); not used: no workload fetches such an input per vertex, constants go through stride-0 elements or VS constants |
 | vertex IF nesting | depth 4 by default, reported by GET_PARAM VS_FLOW_DEPTH (kernel `a5fee45`, Mesa `7d88b30`); most vertex IFs are flattened to selects before TCL emission |
 
 ## Texture sampler: border, GL_CLAMP, mirror once, 1D, shadow, LOD limits
