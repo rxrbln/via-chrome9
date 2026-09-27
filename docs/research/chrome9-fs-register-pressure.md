@@ -448,3 +448,29 @@ reachable by any shader that reads few lanes of a depth texture:
   already reads, and `chrome9_fragment_trim_textures` keeps the texture
   descriptors consistent with the samplers still read (dense: count =
   highest used + 1; sparse: descriptors of used samplers only).
+
+## 14. Finite check and index objects, CPU-bound scenes (2026-09-27)
+
+**Index objects dropped ioquake3 GL2 geometry** (kernel `9916a1c`).
+The stage B finite check read every vertex up to the index-object bound,
+the whole 16 MiB rend2 streaming buffer, whose unused bytes are not
+finite: the draws were rejected with `-EINVAL` (sky, HUD and parts of
+the world missing, `artifacts/2026-09-27/q3-gl2-p175-check-nocheck.png`),
+and the first scans made the 0.55 s frame.  The GL2 frame rates measured
+since index objects (46.3 -> 47.8, 48-49 fps) counted missing draws; the
+complete frame at 720p with the config's 2x anisotropy runs 44.3 fps,
+with or without index objects (44.5 / 44.4).
+
+The input check itself is now off by default: the engine takes Inf and
+NaN from the vertex shader in every position lane and varying
+(`re/chrome9_gl_vs_nonfinite_check.c`, 18 cases, following draws
+render), which a shader computes from finite inputs anyway.
+`tcl_finite_check=1` (or `tcl_nan_kill=0`) restores it; it then reads
+only the vertices an index object names, and its cache keeps verified
+vertex runs that a CPU store splits instead of dropping.
+
+CPU load per glmark2 scene at 720p (`gmcpu.sh`, 5 s): buffer 96 / 68 /
+89 %, ideas 78 %, build use-vbo=false 61 %, terrain 44 %, refract 37 %,
+all others at most 35 %.  Without the finite check the buffer scenes
+went 54 -> 60, 48 -> 51 and 73 -> 86 fps.  ioquake3 GL1 is fill bound
+(197 M pixels/s, 4.5 layers per pixel, 95 % passing the depth test).
