@@ -25,6 +25,7 @@
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/streaming-load-memcpy.h"
 #include "util/u_surface.h"
 #include "util/u_transfer.h"
 #include "util/u_atomic.h"
@@ -787,19 +788,28 @@ chrome9_resource_fast_z_resolve(struct chrome9_resource *depth)
       return;
    depth->fast_z_index = 0;
    chrome9_resource_cpu_access(depth, true);
+   /* Tiled rows mix columns: every word of the pitch holds depth. */
+   const unsigned words = depth->tiled ? depth->stride / 4 :
+                          depth->base.width0;
+   /* Local memory is write-combined: stream each row into a cached copy
+    * instead of reading it word by word. */
+   uint32_t *copy = malloc(words * sizeof(*copy));
+
    for (unsigned y = 0; y < depth->base.height0; y++) {
       uint32_t *row = (uint32_t *)((uint8_t *)depth->bo.map +
                                    depth->data_offset +
                                    (uint64_t)y * depth->stride);
+      const uint32_t *read = row;
 
-      /* Tiled rows mix columns: every word of the pitch holds depth. */
-      const unsigned words = depth->tiled ? depth->stride / 4 :
-                             depth->base.width0;
-
+      if (copy) {
+         util_streaming_load_memcpy(copy, row, words * sizeof(*copy));
+         read = copy;
+      }
       for (unsigned x = 0; x < words; x++)
-         if (((row[x] >> 8) & 7) != index)
+         if (((read[x] >> 8) & 7) != index)
             row[x] = 0xffffff00;
    }
+   free(copy);
 }
 
 void
