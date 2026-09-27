@@ -347,6 +347,8 @@ enum drm_chrome9_param {
 #define DRM_CHROME9_CAP2_DEPTH_FUNC_ALL		(1ULL << 37)
 /* DRM_CHROME9_VERTEX_FORMAT_DEFAULT input elements. */
 #define DRM_CHROME9_CAP2_VERTEX_DEFAULT		(1ULL << 38)
+/* DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO: A31 linear anisotropy. */
+#define DRM_CHROME9_CAP2_TEXTURE_ANISOTROPY	(1ULL << 39)
 
 struct drm_chrome9_get_param {
 	__u32 param;
@@ -1480,6 +1482,13 @@ struct drm_chrome9_fragment_texture_state {
  * table (256-byte aligned) even for POT sizes.
  */
 #define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_TILED	(1U << 0)
+/*
+ * CAP2_TEXTURE_ANISOTROPY: maximum anisotropy 2..16 (0 off) of a 2D or
+ * cube texture with mip filtering: S/T filters become linear anisotropy
+ * (as the vendor drivers do for any min and mag filter).
+ */
+#define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_SHIFT	8
+#define DRM_CHROME9_FRAGMENT_TEXTURE_FLAG_ANISO_MASK	(0x1fU << 8)
 
 /* One stencil face; func is a DRM_CHROME9_COMPARE_* value. */
 struct drm_chrome9_stencil_face {
