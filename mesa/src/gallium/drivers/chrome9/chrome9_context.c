@@ -9797,7 +9797,7 @@ chrome9_set_framebuffer_state(struct pipe_context *pipe,
       }
    }
    if (!framebuffer->nr_cbufs && framebuffer->zsbuf.texture &&
-       chrome9_format_is_d24(framebuffer->zsbuf.format) &&
+       chrome9_depth_only_format(framebuffer->zsbuf.format) &&
        framebuffer->zsbuf.texture->format == framebuffer->zsbuf.format &&
        !framebuffer->zsbuf.level && !framebuffer->zsbuf.first_layer &&
        !framebuffer->zsbuf.last_layer && framebuffer->width &&
@@ -10600,11 +10600,12 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    /* The pixel engine writes exactly one colour target and blends without
     * logic ops or polygon stipple, and draw has no AA line stage: other
     * states render in llvmpipe. */
-   /* Depth-only passes draw into the masked D24 scratch target. */
+   /* Depth-only passes draw into the masked scratch target. */
    if (((ctx->framebuffer.nr_cbufs ? !ctx->framebuffer.cbufs[0].texture :
          !ctx->render_target ||
          ctx->render_target != ctx->depth_only_scratch ||
          !chrome9_draw_stencil_supported(ctx)) ||
+        !chrome9_draw_depth_func_supported(ctx) ||
         /* Several colour buffers only as hardware TCL colour targets. */
         (chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 &&
          (!ctx->tcl_enabled ||
@@ -10888,6 +10889,8 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       !!(capabilities & DRM_CHROME9_CAP_DEPTH_ALWAYS);
    ctx->depth_read_only_supported =
       !!(capabilities & DRM_CHROME9_CAP_DEPTH_READ_ONLY);
+   ctx->depth_func_all_supported =
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_DEPTH_FUNC_ALL);
    ctx->draw_triangle_batch =
       !!(capabilities & DRM_CHROME9_CAP_DRAW_TRIANGLE_BATCH);
    ctx->draw_triangle_d16_rhw_batch =
@@ -10915,6 +10918,9 @@ chrome9_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->tcl_index_object = ctx->tcl_buffers &&
       chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_INDEX_OBJECT) &&
       debug_get_bool_option("CHROME9_TCL_INDEX_OBJECT", true);
+   ctx->tcl_vertex_default =
+      chrome9_screen_has_capability2(screen, DRM_CHROME9_CAP2_VERTEX_DEFAULT) &&
+      debug_get_bool_option("CHROME9_TCL_VERTEX_DEFAULT", true);
    ctx->tcl_dedupe = ctx->tcl_buffers &&
       debug_get_bool_option("CHROME9_TCL_DEDUPE", true);
    ctx->tcl_edge_aa = ctx->tcl_enabled &&

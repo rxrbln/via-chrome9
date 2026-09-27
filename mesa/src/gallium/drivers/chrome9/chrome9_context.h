@@ -288,6 +288,7 @@ struct chrome9_context {
    bool depth_func_supported;
    bool depth_equal_supported;
    bool depth_always_supported;
+   bool depth_func_all_supported;
    bool depth_read_only_supported;
    bool draw_triangle_batch;
    bool draw_triangle_d16_rhw_batch;
@@ -382,6 +383,8 @@ struct chrome9_context {
    bool tcl_buffers;
    /* Stage B indices fetched by the engine from their buffer object. */
    bool tcl_index_object;
+   /* Constant (0, 0, 0, 1) inputs read through a clear A12 bit. */
+   bool tcl_vertex_default;
    /* Stage B non-indexed draws index repeated vertices once. */
    bool tcl_dedupe;
    /* CAP2_COARSE_Z: depth surfaces cleared to 1.0 get a coarse-Z buffer;

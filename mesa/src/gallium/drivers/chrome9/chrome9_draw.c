@@ -1240,6 +1240,30 @@ chrome9_draw_scissor(const struct chrome9_context *ctx,
    }
 }
 
+/* NEVER has no hardware code: A13 keeps 0 for the implicit LESS. */
+bool
+chrome9_draw_depth_func_supported(const struct chrome9_context *ctx)
+{
+   if (!ctx->dsa || !ctx->dsa->depth_enabled)
+      return true;
+   switch (ctx->dsa->depth_func) {
+   case PIPE_FUNC_LESS:
+      return true;
+   case PIPE_FUNC_LEQUAL:
+      return ctx->depth_func_supported;
+   case PIPE_FUNC_EQUAL:
+      return ctx->depth_equal_supported;
+   case PIPE_FUNC_ALWAYS:
+      return ctx->depth_always_supported;
+   case PIPE_FUNC_GREATER:
+   case PIPE_FUNC_NOTEQUAL:
+   case PIPE_FUNC_GEQUAL:
+      return ctx->depth_func_all_supported;
+   default:
+      return false;
+   }
+}
+
 /* Stencil needs the kernel stencil block and a D24S8 surface; without a
  * depth test it runs as depth ALWAYS with writes disabled. */
 bool
@@ -1273,7 +1297,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
    struct pipe_resource *resource;
    const bool depth_only = !ctx->framebuffer.nr_cbufs &&
       ctx->framebuffer.zsbuf.texture &&
-      chrome9_format_is_d24(ctx->framebuffer.zsbuf.format);
+      chrome9_depth_only_format(ctx->framebuffer.zsbuf.format);
 
    *depth = NULL;
    memset(textures, 0,
@@ -1381,13 +1405,7 @@ chrome9_draw_state_supported(struct chrome9_context *ctx,
            !ctx->draw_triangle_d16) ||
           (depth_test && !ctx->dsa->depth_writemask &&
            !ctx->depth_read_only_supported) ||
-          (depth_test && ctx->dsa->depth_func != PIPE_FUNC_LESS &&
-           !(ctx->depth_func_supported &&
-             ctx->dsa->depth_func == PIPE_FUNC_LEQUAL) &&
-           !(ctx->depth_equal_supported &&
-             ctx->dsa->depth_func == PIPE_FUNC_EQUAL) &&
-           !(ctx->depth_always_supported &&
-             ctx->dsa->depth_func == PIPE_FUNC_ALWAYS)) || !*depth ||
+          !chrome9_draw_depth_func_supported(ctx) || !*depth ||
           (surface->format != PIPE_FORMAT_Z16_UNORM && !d24) ||
           surface->level ||
           surface->first_layer || surface->last_layer ||

@@ -32,6 +32,13 @@ chrome9_format_is_d24(enum pipe_format format)
           format == PIPE_FORMAT_S8_UINT_Z24_UNORM;
 }
 
+/* Depth formats a depth-only pass draws on the hardware. */
+static inline bool
+chrome9_depth_only_format(enum pipe_format format)
+{
+   return chrome9_format_is_d24(format) || format == PIPE_FORMAT_Z16_UNORM;
+}
+
 /* Storage support is independent of sampling and render capability. */
 unsigned chrome9_format_storage_cpp(enum pipe_format format);
 

@@ -3646,6 +3646,8 @@ struct tcl_stream {
    /* float32 or float16 dwords to check for Inf/NaN (kernel rule). */
    uint8_t float32;
    uint8_t float16;
+   /* A constant (0, 0, 0, 1): no element is fetched. */
+   bool is_default;
 };
 
 /* Formats the vertex fetcher reads natively (silicon rungs B9-B11). */
@@ -3726,6 +3728,21 @@ tcl_bind_inputs(struct chrome9_context *ctx, unsigned inputs,
          streams[k].drm_format = DRM_CHROME9_VERTEX_FORMAT_FLOAT4;
          streams[k].dwords = 0;
       }
+      streams[k].is_default = false;
+      /* Input 0 keeps an element: a draw fetches at least one. */
+      if (k && !el->src_stride && ctx->tcl_vertex_default &&
+          streams[k].size >= streams[k].bytes) {
+         float value[4];
+
+         util_format_unpack_rgba(el->src_format, value, streams[k].base, 1);
+         if (value[0] == 0.0f && value[1] == 0.0f && value[2] == 0.0f &&
+             value[3] == 1.0f) {
+            streams[k].is_default = true;
+            streams[k].drm_format = DRM_CHROME9_VERTEX_FORMAT_DEFAULT;
+            if (debug_get_bool_option("CHROME9_DEBUG_TCL", false))
+               fprintf(stderr, "chrome9: TCL default input %u\n", k);
+         }
+      }
    }
    return true;
 }
@@ -3733,6 +3750,8 @@ tcl_bind_inputs(struct chrome9_context *ctx, unsigned inputs,
 static unsigned
 tcl_stream_dwords(const struct tcl_stream *stream)
 {
+   if (stream->is_default)
+      return 0;
    return stream->dwords ? stream->dwords : 4;
 }
 
@@ -3748,6 +3767,8 @@ tcl_fetch_vertex(const struct tcl_stream *streams, unsigned inputs,
       const struct tcl_stream *stream = &streams[k];
       const size_t offset = (size_t)(index - stream->first) * stream->stride;
 
+      if (stream->is_default)
+         continue;
       if (index < stream->first ||
           (stream->size != SIZE_MAX &&
            (offset > stream->size || stream->size - offset < stream->bytes)))
@@ -3856,6 +3877,11 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
       uint32_t handle = 0;
       unsigned b;
 
+      if (streams[k].is_default) {
+         memset(&elements[k], 0, sizeof(elements[k]));
+         elements[k].format = DRM_CHROME9_VERTEX_FORMAT_DEFAULT;
+         continue;
+      }
       /* Stride 0 repeats one element (silicon rung B12). */
       if ((!array && !resource) || !streams[k].dwords ||
           stride > 2044 || stride % 4 || offset % 4 || offset > UINT32_MAX)
@@ -3905,7 +3931,7 @@ tcl_bind_buffers(struct chrome9_context *ctx, unsigned inputs,
       /* Vertex 0 of the rebased range now starts at out_offset. */
       buffers[b].offset = out_offset;
       for (unsigned k = 0; k < inputs; k++)
-         if (elements[k].buffer == b)
+         if (!streams[k].is_default && elements[k].buffer == b)
             elements[k].offset -= low[b];
    }
    u_upload_unmap(ctx->base.stream_uploader);
@@ -4109,7 +4135,7 @@ tcl_streams_resident(const struct chrome9_context *ctx, unsigned inputs,
    for (unsigned k = 0; k < inputs; k++) {
       const struct pipe_vertex_element *el;
 
-      if (streams[k].resource)
+      if (streams[k].resource || streams[k].is_default)
          continue;
       if (streams[k].user)
          return false;
@@ -5082,7 +5108,7 @@ tcl_draw_pass(struct chrome9_context *ctx, const struct pipe_draw_info *info,
       elements[k].format = streams[k].drm_format;
       elements[k].buffer = 0;
       elements[k].reserved = 0;
-      elements[k].offset = stride;
+      elements[k].offset = streams[k].is_default ? 0 : stride;
       stride += 4 * tcl_stream_dwords(&streams[k]);
    }
    max_vertices = MIN2(3 * TCL_MAX_TRIANGLES, TCL_MAX_VERTEX_BYTES / stride);
