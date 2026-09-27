@@ -264,8 +264,10 @@ chrome9_sw_kept_create(struct chrome9_sw_context *sw,
       .depth0 = 1,
       .array_size = 1,
       .bind = PIPE_BIND_SAMPLER_VIEW,
-      /* llvmpipe writes local pages without cache flushes per copy. */
-      .flags = debug_get_bool_option("CHROME9_SW_STAGING_LOCAL", true) ?
+      /* llvmpipe writes local pages without cache flushes per copy; the
+       * CPU reads the image of a CPU-sampled level, so that stays cached. */
+      .flags = debug_get_bool_option("CHROME9_SW_STAGING_LOCAL", true) &&
+               !chrome9_resource(target)->cpu_sampled ?
                CHROME9_RESOURCE_FLAG_LOCAL : 0,
    };
    struct pipe_resource alias_templ = staging_templ;
@@ -353,8 +355,11 @@ chrome9_sw_stage(struct chrome9_sw_context *sw, struct pipe_resource *target,
 {
    struct chrome9_sw_kept *kept = chrome9_sw_kept_find(sw, target, level);
 
+   /* A CPU-sampled level needs a cached image (chrome9_sw_kept_create). */
    if (!kept || kept->width != u_minify(target->width0, level) ||
-       kept->height != u_minify(target->height0, level))
+       kept->height != u_minify(target->height0, level) ||
+       (chrome9_resource(target)->cpu_sampled &&
+        chrome9_resource_is_local(chrome9_resource(kept->staging))))
       kept = chrome9_sw_kept_create(sw, target, level);
    if (!kept)
       return NULL;
@@ -456,6 +461,22 @@ chrome9_sw_release_held(struct chrome9_sw_context *sw)
    util_dynarray_foreach(&sw->held, struct pipe_resource *, res)
       pipe_resource_reference(res, NULL);
    util_dynarray_clear(&sw->held);
+}
+
+/* The fallback's staging image of the level while it equals the level,
+ * with llvmpipe's writes to it finished; NULL otherwise. */
+struct pipe_resource *
+chrome9_sw_kept_image(struct chrome9_context *ctx,
+                      struct pipe_resource *resource, unsigned level)
+{
+   struct chrome9_sw_context *sw = ctx->sw;
+   struct chrome9_sw_kept *kept =
+      sw ? chrome9_sw_kept_find(sw, resource, level) : NULL;
+
+   if (!kept || !chrome9_sw_kept_current(sw, kept))
+      return NULL;
+   chrome9_sw_finish(ctx);
+   return kept->staging;
 }
 
 /* The fallback's staging image of the level equals the level now. */
@@ -1262,6 +1283,16 @@ chrome9_sw_bind_state(struct chrome9_context *ctx, struct chrome9_sw_context *sw
    return true;
 }
 
+static void
+chrome9_sw_demote(struct chrome9_context *ctx, struct pipe_resource *resource)
+{
+   /* Single-level staged images; other levels are aliased directly. */
+   if (resource && !(chrome9_sw_staged(chrome9_resource(resource)) &&
+                     resource->target == PIPE_TEXTURE_2D &&
+                     !resource->last_level))
+      chrome9_context_demote_local(ctx, resource);
+}
+
 bool
 chrome9_sw_draw_vbo(struct chrome9_context *ctx,
                     const struct pipe_draw_info *info, unsigned drawid_offset,
@@ -1280,18 +1311,17 @@ chrome9_sw_draw_vbo(struct chrome9_context *ctx,
        ctx->dsa->depth_func == PIPE_FUNC_EQUAL)
       return false;
    /* llvmpipe reads its targets and textures on the CPU: none may stay
-    * in uncached local memory. */
+    * in uncached local memory, except levels it reaches only through a
+    * staging image. */
    for (unsigned i = 0; i < ctx->framebuffer.nr_cbufs; i++)
-      if (ctx->framebuffer.cbufs[i].texture)
-         chrome9_context_demote_local(ctx, ctx->framebuffer.cbufs[i].texture);
-   if (ctx->framebuffer.zsbuf.texture)
-      chrome9_context_demote_local(ctx, ctx->framebuffer.zsbuf.texture);
+      chrome9_sw_demote(ctx, ctx->framebuffer.cbufs[i].texture);
+   chrome9_sw_demote(ctx, ctx->framebuffer.zsbuf.texture);
    for (unsigned i = 0; i < ctx->num_sampler_views; i++)
-      if (ctx->sampler_views[i] && ctx->sampler_views[i]->texture)
-         chrome9_context_demote_local(ctx, ctx->sampler_views[i]->texture);
+      if (ctx->sampler_views[i])
+         chrome9_sw_demote(ctx, ctx->sampler_views[i]->texture);
    for (unsigned i = 0; i < ctx->num_vs_sampler_views; i++)
-      if (ctx->vs_sampler_views[i] && ctx->vs_sampler_views[i]->texture)
-         chrome9_context_demote_local(ctx, ctx->vs_sampler_views[i]->texture);
+      if (ctx->vs_sampler_views[i])
+         chrome9_sw_demote(ctx, ctx->vs_sampler_views[i]->texture);
    /* Retire GPU batches that wrote the targets or textures read here. */
    chrome9_draw_flush_gpu_batch(ctx);
    chrome9_context_prepare_render_target(ctx);

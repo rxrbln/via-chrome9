@@ -82,6 +82,10 @@ struct chrome9_resource {
    bool local;
    /* Exported or imported: the BO cannot be replaced (no demotion). */
    bool shared;
+   /* Sampled by a vertex shader, which runs its lookups on the CPU:
+    * draws into it render in llvmpipe, whose staging copy the CPU reads
+    * without waiting for the device. */
+   bool cpu_sampled;
    /* Live level views borrowing the BO (chrome9_resource_image_view). */
    unsigned views;
    /* Single-image render view of a level or layer of parent: same BO,

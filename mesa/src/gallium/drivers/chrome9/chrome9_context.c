@@ -10447,7 +10447,37 @@ chrome9_refresh_vs_textures(struct chrome9_context *ctx)
 
       if (view && view->texture == external)
          chrome9_flush_render_target(ctx);
-      if (view && chrome9_resource_is_local(chrome9_resource(view->texture)))
+      /* A single-level image llvmpipe rendered: its cached staging copy
+       * is current and needs no wait for the device. */
+      if (view && !view->u.tex.first_level && !view->u.tex.last_level &&
+          view->texture->target == PIPE_TEXTURE_2D) {
+         struct pipe_resource *image;
+
+         chrome9_resource(view->texture)->cpu_sampled = true;
+         image = chrome9_sw_kept_image(ctx, view->texture, 0);
+         if (image && !chrome9_resource_is_local(chrome9_resource(image)) &&
+             image->format == view->format &&
+             image->width0 == view->texture->width0 &&
+             image->height0 == view->texture->height0) {
+            effective = *view;
+            effective.texture = image;
+            if (chrome9_vs_texture_mapping(&effective, mapping)) {
+               draw_set_mapped_texture(ctx->draw, MESA_SHADER_VERTEX, i,
+                                       mapping->width, mapping->height, 1,
+                                       0, 0, 0, 0, mapping->base,
+                                       mapping->row_stride,
+                                       mapping->img_stride,
+                                       mapping->mip_offset);
+               continue;
+            }
+         }
+      }
+      /* A CPU-sampled target stays local: llvmpipe renders it through a
+       * cached staging image, which the lookups read. */
+      if (view && chrome9_resource_is_local(chrome9_resource(view->texture)) &&
+          !(chrome9_resource(view->texture)->cpu_sampled &&
+            chrome9_sw_enabled() &&
+            debug_get_bool_option("CHROME9_SW_CPU_SAMPLED", true)))
          chrome9_context_demote_local(ctx, view->texture);
       if (view && chrome9_sampler_view(view)->shadow) {
          chrome9_copy_surface(chrome9_sampler_view(view)->shadow,
@@ -10614,6 +10644,10 @@ chrome9_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          ctx->render_target != ctx->depth_only_scratch ||
          !chrome9_draw_stencil_supported(ctx)) ||
         !chrome9_draw_depth_func_supported(ctx) ||
+        /* Vertex shaders read this target on the CPU. */
+        (ctx->framebuffer.nr_cbufs && ctx->framebuffer.cbufs[0].texture &&
+         chrome9_resource(ctx->framebuffer.cbufs[0].texture)->cpu_sampled &&
+         debug_get_bool_option("CHROME9_SW_CPU_SAMPLED", true)) ||
         /* Several colour buffers only as hardware TCL colour targets. */
         (chrome9_framebuffer_color_count(&ctx->framebuffer) > 1 &&
          (!ctx->tcl_enabled ||

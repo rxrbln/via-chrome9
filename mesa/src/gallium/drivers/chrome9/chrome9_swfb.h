@@ -24,6 +24,9 @@ bool chrome9_sw_draw_vbo(struct chrome9_context *ctx,
 void chrome9_sw_finish(struct chrome9_context *ctx);
 bool chrome9_sw_kept_valid(struct chrome9_context *ctx,
                            struct pipe_resource *resource, unsigned level);
+struct pipe_resource *chrome9_sw_kept_image(struct chrome9_context *ctx,
+                                            struct pipe_resource *resource,
+                                            unsigned level);
 void chrome9_sw_kept_clear(struct chrome9_context *ctx,
                            struct pipe_resource *resource, unsigned level,
                            const union pipe_color_union *color,
@@ -56,6 +59,13 @@ chrome9_sw_kept_valid(struct chrome9_context *ctx,
 {
    (void)ctx; (void)resource; (void)level;
    return false;
+}
+static inline struct pipe_resource *
+chrome9_sw_kept_image(struct chrome9_context *ctx,
+                      struct pipe_resource *resource, unsigned level)
+{
+   (void)ctx; (void)resource; (void)level;
+   return NULL;
 }
 static inline void
 chrome9_sw_kept_clear(struct chrome9_context *ctx,
