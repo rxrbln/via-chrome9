@@ -228,6 +228,11 @@ module_param_named(blend_equation, chrome9_blend_equation, bool, 0600);
 MODULE_PARM_DESC(blend_equation,
 	"Blend SUBTRACT, REVERSE_SUBTRACT, MIN and MAX (default: true)");
 
+static bool chrome9_vertex_default = true;
+module_param_named(vertex_default, chrome9_vertex_default, bool, 0600);
+MODULE_PARM_DESC(vertex_default,
+	"Stage A/B inputs reading (0, 0, 0, 1) through a clear A12 bit instead of a fetched element (default: true)");
+
 static bool chrome9_coarse_z;
 module_param_named(coarse_z, chrome9_coarse_z, bool, 0600);
 MODULE_PARM_DESC(coarse_z,
@@ -716,7 +721,11 @@ struct chrome9_tcl_draw {
 	const u32 *vertices;
 	u32 vertex_count;
 	u32 stride_dw;
+	/* Fetched elements; the input registers include the default ones. */
 	u32 element_count;
+	u32 input_count;
+	/* Input registers without an element read (0, 0, 0, 1) (A12, B13). */
+	u32 default_mask;
 	u32 cull;
 	/* A20 vertex cycle bits of a strip, fan or line strip. */
 	u32 topology;
@@ -741,6 +750,7 @@ struct chrome9_tcl_draw {
 	u8 element_format[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 element_type[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 element_offset[DRM_CHROME9_VERTEX_MAX_INPUTS];
+	u8 element_register[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	u8 input_lanes[DRM_CHROME9_VERTEX_MAX_INPUTS];
 	/* Rows 256..258: viewport scale, offset and the snap bias. */
 	u32 rows[12];
@@ -3622,13 +3632,18 @@ static u32 chrome9_tcl_raster_state(const struct chrome9_fragment_program *fp,
 		raster[i++] = (1 + e) << 24 |
 			      (addresses ? (addresses[e] >> 2) & 0xff :
 					   tcl->element_offset[e]) << 12 |
-			      e << 8 | tcl->element_format[e];
-	/* Superset of the input and output masks; the vendor quad uses 1f. */
+			      tcl->element_register[e] << 8 |
+			      tcl->element_format[e];
+	/* Superset of the input and output masks; the vendor quad uses 1f.
+	 * A clear bit makes the input register read (0, 0, 0, 1). */
 	raster[i++] = 0x12000000 |
-		      (GENMASK(max(outputs, fetched) - 1, 0) &
+		      (GENMASK(max(outputs, tcl->input_count) - 1, 0) &
+		       ~tcl->default_mask &
 		       ~(tcl->re & CHROME9_TCL_RE_A12_LAST_CLEAR &&
-			 tcl->element_count - 1 >= outputs ?
-			 BIT(tcl->element_count - 1) : 0));
+			 tcl->element_register[tcl->element_count - 1] >=
+			 outputs ?
+			 BIT(tcl->element_register[tcl->element_count - 1]) :
+			 0));
 	raster[i++] = tcl->a61 &
 		      ~(tcl->re & CHROME9_TCL_RE_NO_A61_BFC ? BIT(19) : 0);
 	raster[i++] = tcl->program->a62;
@@ -3853,6 +3868,9 @@ static int chrome9_tcl_raster_selftest(void)
 		goto out;
 	}
 	tcl->element_count = 3;
+	tcl->input_count = 3;
+	tcl->element_register[1] = 1;
+	tcl->element_register[2] = 2;
 	tcl->stride_dw = 6;
 	tcl->vertex_count = 3;
 	tcl->element_format[0] = 0xc2;
@@ -7156,6 +7174,9 @@ u64 chrome9_engine_capabilities2(void)
 		caps |= DRM_CHROME9_CAP2_TILED_SHARED;
 	caps |= DRM_CHROME9_CAP2_WRITE_SEQ;
 	caps |= DRM_CHROME9_CAP2_INDEX_OBJECT;
+	caps |= DRM_CHROME9_CAP2_DEPTH_FUNC_ALL;
+	if (READ_ONCE(chrome9_vertex_default))
+		caps |= DRM_CHROME9_CAP2_VERTEX_DEFAULT;
 	if (READ_ONCE(chrome9_destination_offset))
 		caps |= DRM_CHROME9_CAP2_DESTINATION_OFFSET;
 	if (READ_ONCE(chrome9_coarse_z))
@@ -10145,21 +10166,12 @@ int chrome9_draw_triangle_blend_ioctl(struct drm_device *drm, void *data,
 	return chrome9_submit_draw(drm, file, &request);
 }
 
+/* A13[18:16] takes every depth function field value; code 0 (NEVER in
+ * the hardware) stays the implicit LESS. */
 static int chrome9_validate_depth_flags(u32 flags, u32 allowed)
 {
-	u32 depth_func;
-
-	if (flags & ~(allowed | DRM_CHROME9_DEPTH_FUNC_MASK |
-		      DRM_CHROME9_DEPTH_READ_ONLY))
-		return CHROME9_EINVAL;
-	depth_func = (flags & DRM_CHROME9_DEPTH_FUNC_MASK) >>
-		     DRM_CHROME9_DEPTH_FUNC_SHIFT;
-	if (!depth_func)
-		depth_func = DRM_CHROME9_COMPARE_LESS;
-	return depth_func == DRM_CHROME9_COMPARE_LESS ||
-	       depth_func == DRM_CHROME9_COMPARE_EQUAL ||
-	       depth_func == DRM_CHROME9_COMPARE_LEQUAL ||
-	       depth_func == DRM_CHROME9_COMPARE_ALWAYS ? 0 : -EINVAL;
+	return flags & ~(allowed | DRM_CHROME9_DEPTH_FUNC_MASK |
+			 DRM_CHROME9_DEPTH_READ_ONLY) ? CHROME9_EINVAL : 0;
 }
 
 int chrome9_draw_triangle_d16_ioctl(struct drm_device *drm, void *data,
@@ -12969,7 +12981,7 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 	memset(&params, 0, sizeof(params));
 	params.kind = CHROME9_PROGRAM_VERTEX;
 	params.instruction_count = tcl->instruction_count;
-	params.input_count = tcl->element_count;
+	params.input_count = tcl->input_count;
 	params.constant_first = tcl->constant_first;
 	params.constant_count = tcl->constant_count;
 	params.clip_mask = tcl->clip_mask;
@@ -12983,7 +12995,7 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 	params.point_size = tcl->point_size_vertex;
 	params.relative = tcl->flow.relative | tcl->flow.relative_raw << 1;
 	params.primary_used = fp->primary_used;
-	memcpy(params.input_lanes, tcl->input_lanes, tcl->element_count);
+	memcpy(params.input_lanes, tcl->input_lanes, tcl->input_count);
 	memcpy(params.varying_logical, fp->varying_logical, fp->varying_count);
 	memcpy(params.varying_width, fp->varying_width, fp->varying_count);
 	cached = chrome9_progcache_get(cache, &key, entry);
@@ -12998,7 +13010,7 @@ static int chrome9_tcl_program_get(struct chrome9_progcache *cache,
 	if (!vp)
 		return -ENOMEM;
 	ret = chrome9_vertex_compile(tcl->instructions, tcl->instruction_count,
-		fp, tcl->element_count, tcl->input_lanes, tcl->constant_first,
+		fp, tcl->input_count, tcl->input_lanes, tcl->constant_first,
 		tcl->constant_count, params.two_side, tcl->clip_mask,
 		tcl->point_size_vertex, tcl->sprite_mask, &tcl->flow, vp);
 	if (ret)
@@ -13596,14 +13608,26 @@ static int chrome9_tcl_topology(const struct drm_chrome9_draw_vertex_program *ar
 
 
 static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
-		const struct drm_chrome9_vertex_element *elements, u32 stride)
+		const struct drm_chrome9_vertex_element *elements, u32 count,
+		u32 stride)
 {
 	u32 fetched = 0;
-	unsigned int e;
+	unsigned int r, e = 0;
 
-	for (e = 0; e < tcl->element_count; e++) {
-		const struct drm_chrome9_vertex_element *element = &elements[e];
+	tcl->input_count = count;
+	for (r = 0; r < count; r++) {
+		const struct drm_chrome9_vertex_element *element = &elements[r];
 
+		/* The fetcher skips a default input; its lanes all exist. */
+		if (element->format == DRM_CHROME9_VERTEX_FORMAT_DEFAULT) {
+			if (!READ_ONCE(chrome9_vertex_default) ||
+			    element->buffer || element->reserved ||
+			    element->offset)
+				return CHROME9_EINVAL;
+			tcl->default_mask |= BIT(r);
+			tcl->input_lanes[r] = 0xf;
+			continue;
+		}
 		if (element->format >= ARRAY_SIZE(chrome9_tcl_formats) ||
 		    element->reserved || !IS_ALIGNED(element->offset, 4) ||
 		    (tcl->buffer_count ?
@@ -13611,6 +13635,7 @@ static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
 		     element->buffer || element->offset >
 			stride - 4 * chrome9_tcl_formats[element->format].dwords))
 			return CHROME9_EINVAL;
+		tcl->element_register[e] = r;
 		tcl->element_format[e] = chrome9_tcl_formats[element->format].native;
 		tcl->element_type[e] = element->format;
 		if (tcl->buffer_count) {
@@ -13620,9 +13645,14 @@ static int chrome9_tcl_elements(struct chrome9_tcl_draw *tcl,
 			tcl->element_offset[e] = element->offset / 4;
 		}
 		/* The fetcher fills lanes a format lacks with (0, 0, 0, 1). */
-		tcl->input_lanes[e] = 0xf;
+		tcl->input_lanes[r] = 0xf;
 		fetched += chrome9_tcl_formats[element->format].dwords;
+		e++;
 	}
+	/* Position comes from an element. */
+	if (!e)
+		return CHROME9_EINVAL;
+	tcl->element_count = e;
 	if (tcl->buffer_count) {
 		tcl->stride_dw = fetched;
 		return 0;
@@ -13814,7 +13844,6 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 						(u32)ints[i][3] << 24;
 		tcl->int_upload = true;
 	}
-	tcl->element_count = args->element_count;
 	tcl->constant_first = args->constant_first;
 	tcl->constant_count = args->constant_count;
 	tcl->vertex_count = args->vertex_count;
@@ -13884,7 +13913,8 @@ static int chrome9_tcl_prepare(struct drm_chrome9_draw_vertex_program *args,
 		args->element_count, sizeof(*elements));
 	if (IS_ERR(elements))
 		return PTR_ERR(elements);
-	ret = chrome9_tcl_elements(tcl, elements, args->vertex_stride);
+	ret = chrome9_tcl_elements(tcl, elements, args->element_count,
+				   args->vertex_stride);
 	if (ret)
 		return ret;
 	instructions = chrome9_arena_copy_user(arena, args->instructions_ptr,
