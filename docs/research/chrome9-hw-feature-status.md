@@ -116,3 +116,12 @@ zero for k >= 17); the vertex stage is FP32.  piglit fs-op-* misses at
 1e-5 tolerance are hardware behaviour.
 
 Silicon evidence for the 2026-09-25 batch: `chrome9-queries-msaa-3d-flow-re.md` §12.
+
+## Patches against stable trees
+
+`patches/linux-7.2/chrome9.patch` and `patches/mesa-26.2.2/chrome9.patch`
+(2026-09-27, `-p1`, chrome9 only) apply to the upstream tarballs; the
+kernel module builds with `W=1`, Mesa with `-Dgallium-drivers=chrome9,llvmpipe`.
+`tools/mk-c9-{linux,mesa}-tree.sh` regenerate the trees.  In that native
+build 7/9 chrome9 unit tests pass; `chrome9-shader-nir` (eleven-tap blur
+compile) and `chrome9-mipmap` (SIGSEGV) fail and are not yet investigated.

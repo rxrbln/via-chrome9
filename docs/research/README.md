@@ -12,6 +12,18 @@ targets.
 - [chrome9-hw-feature-status.md](chrome9-hw-feature-status.md) tracks every
   3D engine feature: verified on silicon, emulated, or not implemented, with
   the smoke test that covers it.
+- [chrome9-local-fb-placement.md](chrome9-local-fb-placement.md) researches
+  local frame buffer (SL) placement of depth buffers and render targets.
+- [chrome9-multi-inflight.md](chrome9-multi-inflight.md) designs the
+  multi-job in-flight queue (merged, `max_inflight=8`).
+- [chrome9-performance-20260924.md](chrome9-performance-20260924.md) records
+  the 2026-09-24 performance pass against the glxgears/ioquake3 targets.
+- [chrome9-glmark-blend-mip-closure.md](chrome9-glmark-blend-mip-closure.md)
+  closes multi-texture blend and rectangular BGRA mips for glmark2, with
+  [chrome9-glmark-bgra-mip-corpus.tsv](chrome9-glmark-bgra-mip-corpus.tsv).
+- [glmark2-generic-feature-matrix.md](glmark2-generic-feature-matrix.md) and
+  [glmark2-framebuffer-raster-state-contract.md](glmark2-framebuffer-raster-state-contract.md)
+  audit glmark2's texture/format/FBO and non-shader state needs.
 - [chrome9-piglit-conformance.md](chrome9-piglit-conformance.md) records
   piglit GL 2.1 runs, the fixes they drove, measured hardware limits (FP24
   fragment ALU) and open failure classes.
