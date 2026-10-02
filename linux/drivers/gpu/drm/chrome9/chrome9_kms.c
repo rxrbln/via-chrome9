@@ -53,7 +53,6 @@
 #define CHROME9_REG_CURSOR_ORIGIN	0x02fc
 #define CHROME9_REG_CURSOR_MASK		0x120c
 #define CHROME9_CURSOR_VISIBLE		0x36000005
-#define CHROME9_CURSOR_SF_DOMAIN	BIT(29)
 
 static bool chrome9_direct_flips;
 module_param_named(direct_flips, chrome9_direct_flips, bool, 0400);
@@ -63,7 +62,7 @@ MODULE_PARM_DESC(direct_flips,
 static bool chrome9_cursor_sf;
 module_param_named(cursor_sf, chrome9_cursor_sf, bool, 0400);
 MODULE_PARM_DESC(cursor_sf,
-		 "Enable opt-in IGA1 ARGB cursor using unqualified SF fetch");
+		 "Enable the IGA1 ARGB hardware cursor (image in local SL memory)");
 
 /* Every indexed register written by chrome9_iga1_program(). */
 static const u8 chrome9_saved_sr[] = {
@@ -112,8 +111,7 @@ struct chrome9_kms_state {
 	/* A failed post-publication flip retains every possibly fetched BO. */
 	struct drm_framebuffer *blocked_fb;
 	struct drm_pending_vblank_event *blocked_event;
-	struct drm_gem_object *cursor_bo[2];
-	struct chrome9_sf_mapping *cursor_mapping[2];
+	struct drm_mm_node cursor_node[2];
 	struct iosys_map cursor_map[2];
 	u32 cursor_base[2];
 	u32 cursor_saved[8];
@@ -790,7 +788,6 @@ static int chrome9_cursor_upload(struct chrome9_device *cdev,
 				    (size_t)y * CHROME9_CURSOR_SIZE * 4,
 				    line, fb->width * 4);
 	}
-	chrome9_sf_sync_for_device(kms->cursor_mapping[slot]);
 	return 0;
 }
 
@@ -833,7 +830,7 @@ static void chrome9_cursor_apply(struct chrome9_device *cdev,
 					    ret);
 			goto out_unlock;
 		}
-		writel(CHROME9_CURSOR_SF_DOMAIN | kms->cursor_base[next],
+		writel(kms->cursor_base[next],
 		       cdev->mmio + CHROME9_REG_CURSOR_BASE);
 		kms->cursor_active = next;
 		kms->cursor_armed = true;
@@ -845,7 +842,7 @@ static void chrome9_cursor_apply(struct chrome9_device *cdev,
 	writel((x << 16) | y, cdev->mmio + CHROME9_REG_CURSOR_POSITION);
 	writel((origin_x << 16) | origin_y,
 	       cdev->mmio + CHROME9_REG_CURSOR_ORIGIN);
-	/* The fixed SF image is published only after CPU stores and base writes. */
+	/* The SL image is published only after WC stores and base writes. */
 	wmb();
 	writel(CHROME9_CURSOR_VISIBLE,
 	       cdev->mmio + CHROME9_REG_CURSOR_CONTROL);
@@ -938,59 +935,47 @@ static void chrome9_cursor_release(struct drm_device *drm, void *res)
 	/* A failed final restore can leave display fetching one private image. */
 	if (kms->snapshot_valid) {
 		dev_crit(&cdev->pdev->dev,
-			 "retaining cursor SF mappings after failed display restore\n");
+			 "retaining cursor SL images after failed display restore\n");
 		return;
 	}
-	for (i = 0; i < ARRAY_SIZE(kms->cursor_bo); i++) {
-		if (iosys_map_is_set(&kms->cursor_map[i]))
-			drm_gem_vunmap(kms->cursor_bo[i], &kms->cursor_map[i]);
-		chrome9_sf_unpin(kms->cursor_mapping[i]);
-		kms->cursor_mapping[i] = NULL;
-		if (kms->cursor_bo[i]) {
-			drm_gem_object_put(kms->cursor_bo[i]);
-			kms->cursor_bo[i] = NULL;
-		}
+	mutex_lock(&cdev->sl_lock);
+	for (i = 0; i < ARRAY_SIZE(kms->cursor_node); i++) {
+		iosys_map_clear(&kms->cursor_map[i]);
+		if (drm_mm_node_allocated(&kms->cursor_node[i]))
+			drm_mm_remove_node(&kms->cursor_node[i]);
 	}
+	mutex_unlock(&cdev->sl_lock);
 }
 
 static int chrome9_cursor_init(struct chrome9_device *cdev)
 {
 	struct drm_device *drm = &cdev->drm;
 	struct chrome9_kms_state *kms = cdev->kms_state;
-	u32 address;
 	unsigned int i;
 	int ret;
 
 	if (!chrome9_cursor_sf)
 		return 0;
-	if (!kms->fixed_iga1 || !chrome9_engine_ready(cdev))
+	if (!kms->fixed_iga1 || !chrome9_engine_ready(cdev) || !cdev->sl_ready)
 		return -EOPNOTSUPP;
-	for (i = 0; i < ARRAY_SIZE(kms->cursor_bo); i++) {
-		kms->cursor_bo[i] = chrome9_gem_cursor_create(drm);
-		if (IS_ERR(kms->cursor_bo[i])) {
-			ret = PTR_ERR(kms->cursor_bo[i]);
-			kms->cursor_bo[i] = NULL;
-			goto err_release;
-		}
-		ret = chrome9_sf_pin(cdev, kms->cursor_bo[i],
-				     &kms->cursor_mapping[i]);
+	/* Like openchrome, HI fetches its image from local frame buffer memory. */
+	for (i = 0; i < ARRAY_SIZE(kms->cursor_node); i++) {
+		mutex_lock(&cdev->sl_lock);
+		ret = drm_mm_insert_node_generic(&cdev->sl_mm,
+						 &kms->cursor_node[i],
+						 CHROME9_CURSOR_BYTES, PAGE_SIZE,
+						 0, DRM_MM_INSERT_LOW);
+		mutex_unlock(&cdev->sl_lock);
 		if (ret)
 			goto err_release;
-		address = chrome9_sf_mapping_base(kms->cursor_mapping[i]);
-		if (!IS_ALIGNED(address, 16) ||
-		    address > CHROME9_CURSOR_SF_DOMAIN -
-			      CHROME9_CURSOR_BYTES) {
-			ret = -ERANGE;
-			goto err_release;
-		}
-		kms->cursor_base[i] = address;
-		ret = drm_gem_vmap(kms->cursor_bo[i], &kms->cursor_map[i]);
-		if (ret)
-			goto err_release;
+		kms->cursor_base[i] = kms->cursor_node[i].start;
+		iosys_map_set_vaddr_iomem(&kms->cursor_map[i],
+					  cdev->sl_wc + (kms->cursor_node[i].start -
+							 cdev->sl_pool_start));
 		iosys_map_memset(&kms->cursor_map[i], 0, 0,
-				CHROME9_CURSOR_BYTES);
-		chrome9_sf_sync_for_device(kms->cursor_mapping[i]);
+				 CHROME9_CURSOR_BYTES);
 	}
+	wmb();
 	ret = drm_universal_plane_init(drm, &cdev->cursor_plane,
 				       drm_crtc_mask(&cdev->display_pipe.crtc),
 				       &chrome9_cursor_plane_funcs,
@@ -1004,8 +989,9 @@ static int chrome9_cursor_init(struct chrome9_device *cdev)
 	cdev->display_pipe.crtc.cursor = &cdev->cursor_plane;
 	drm->mode_config.cursor_width = CHROME9_CURSOR_SIZE;
 	drm->mode_config.cursor_height = CHROME9_CURSOR_SIZE;
-	dev_warn(&cdev->pdev->dev,
-		 "experimental IGA1 SF cursor enabled; address domain not yet silicon-qualified\n");
+	dev_info(&cdev->pdev->dev,
+		 "IGA1 hardware cursor enabled at SL 0x%x/0x%x\n",
+		 kms->cursor_base[0], kms->cursor_base[1]);
 	return 0;
 
 err_release:

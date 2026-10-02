@@ -261,7 +261,6 @@ int chrome9_gem_info_ioctl(struct drm_device *drm, void *data,
 			   struct drm_file *file);
 int chrome9_gem_dumb_create(struct drm_file *file, struct drm_device *drm,
 			    struct drm_mode_create_dumb *args);
-struct drm_gem_object *chrome9_gem_cursor_create(struct drm_device *drm);
 struct drm_framebuffer *
 chrome9_gem_fb_create(struct drm_device *drm, struct drm_file *file,
 		      const struct drm_format_info *info,
