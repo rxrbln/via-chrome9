@@ -44,6 +44,7 @@
 #define HDMI_CLOCK_PLL_EN	BIT(0)
 #define HDMI_CLOCK_LOCK_KEEP	0xF9FFFFF9
 #define HDMI_CLOCK_LOCK_EN	0x06000006
+#define HDMI_CLOCK_PLL_RUN	0x06000000
 #define HDMI_CLOCK_DDC_KEEP	0xFFF800E7
 #define HDMI_CLOCK_DDC_DIV	0x00029E18
 /* PHY calibration pattern [31:24]. */
@@ -250,26 +251,31 @@ static u32 chrome9_hdmi_clock_range(int clock)
 	return 3;
 }
 
-/* DVP1 routing of IGA1 to the integrated TMDS transmitter, with the
- * extended sequencer bank (SR5A[0]) cleared while it is programmed. */
-static void chrome9_hdmi_route(const struct drm_display_mode *mode, bool on)
+/* DVP1 pads (SR1E[5:4]), with the extended sequencer bank (SR5A[0])
+ * cleared while they are programmed. */
+static void chrome9_hdmi_pads(bool on)
+{
+	u8 sr5a = vga_io_rseq(0x5a);
+
+	vga_io_wseq(0x5a, sr5a & ~BIT(0));
+	if (!(vga_io_rseq(0x13) & BIT(6)))
+		chrome9_sr_mask(0x1e, 0x30, on ? 0x30 : 0);
+	vga_io_wseq(0x5a, sr5a);
+}
+
+/* DVP1 routing of IGA1 to the integrated TMDS transmitter. */
+static void chrome9_hdmi_route(const struct drm_display_mode *mode)
 {
 	u8 sr5a = vga_io_rseq(0x5a);
 	u8 polarity = 0;
 
 	vga_io_wseq(0x5a, sr5a & ~BIT(0));
 	if (!(vga_io_rseq(0x13) & BIT(6))) {
-		/* CR9B[4]: DVP1 source IGA1; SR1E[5:4]: pads on;
-		 * SR65: highest clock and data drive. */
-		if (on) {
-			chrome9_cr_mask(0x9b, BIT(4), 0);
-			chrome9_sr_mask(0x65, 0x0f, 0x0f);
-		}
-		chrome9_sr_mask(0x1e, 0x30, on ? 0x30 : 0);
+		/* CR9B[4]: DVP1 source IGA1; SR65: highest clock and data drive. */
+		chrome9_cr_mask(0x9b, BIT(4), 0);
+		chrome9_sr_mask(0x65, 0x0f, 0x0f);
 	}
 	vga_io_wseq(0x5a, sr5a);
-	if (!on)
-		return;
 	/* CR99[4]: TMDS source IGA1; CR97[6:5]: VSYNC/HSYNC negative. */
 	chrome9_cr_mask(0x99, BIT(4), 0);
 	if (mode->flags & DRM_MODE_FLAG_NHSYNC)
@@ -289,8 +295,12 @@ static void chrome9_hdmi_phy_on(struct chrome9_hdmi *hdmi, int clock)
 	hdmi_write(hdmi, HDMI_PHY_CFG,
 		   hdmi_read(hdmi, HDMI_PHY_CFG) & HDMI_PHY_CFG_KEEP);
 	hdmi_mask(hdmi, HDMI_OUTPUT, HDMI_OUTPUT_ENABLE, HDMI_OUTPUT_ENABLE);
+	/* Like openchrome: stop the PLL, set the TMDS range, restart it. */
+	hdmi_mask(hdmi, HDMI_CLOCK, HDMI_CLOCK_PLL_RUN, 0);
+	udelay(1);
 	hdmi_mask(hdmi, HDMI_CLOCK, HDMI_CLOCK_RANGE,
 		  chrome9_hdmi_clock_range(clock) << 30);
+	hdmi_mask(hdmi, HDMI_CLOCK, HDMI_CLOCK_PLL_RUN, HDMI_CLOCK_PLL_RUN);
 	udelay(1);
 	hdmi_mask(hdmi, HDMI_PATTERN, ~HDMI_PATTERN_KEEP, HDMI_PATTERN_CALIB);
 	udelay(5);
@@ -318,12 +328,19 @@ static void chrome9_hdmi_encoder_enable(struct drm_encoder *encoder,
 		dev_err(&cdev->pdev->dev, "cannot lock VGA I/O for HDMI\n");
 		return;
 	}
-	chrome9_hdmi_route(mode, true);
+	chrome9_hdmi_route(mode);
 	chrome9_vga_seq_put(cdev);
 	mutex_lock(&hdmi->lock);
 	chrome9_hdmi_phy_on(hdmi, mode->clock);
 	hdmi->enabled = true;
 	mutex_unlock(&hdmi->lock);
+	/* The pads drive TMDS only once the PHY PLL runs at the new range. */
+	if (chrome9_vga_seq_get(cdev)) {
+		dev_err(&cdev->pdev->dev, "cannot lock VGA I/O for HDMI\n");
+		return;
+	}
+	chrome9_hdmi_pads(true);
+	chrome9_vga_seq_put(cdev);
 	dev_info(&cdev->pdev->dev, "HDMI %ux%u@%u kHz on\n", mode->hdisplay,
 		 mode->vdisplay, mode->clock);
 }
@@ -335,14 +352,14 @@ static void chrome9_hdmi_encoder_disable(struct drm_encoder *encoder,
 						 encoder);
 	struct chrome9_device *cdev = hdmi->cdev;
 
+	if (!chrome9_vga_seq_get(cdev)) {
+		chrome9_hdmi_pads(false);
+		chrome9_vga_seq_put(cdev);
+	}
 	mutex_lock(&hdmi->lock);
 	chrome9_hdmi_phy_off(hdmi);
 	hdmi->enabled = false;
 	mutex_unlock(&hdmi->lock);
-	if (chrome9_vga_seq_get(cdev))
-		return;
-	chrome9_hdmi_route(NULL, false);
-	chrome9_vga_seq_put(cdev);
 }
 
 static const struct drm_encoder_helper_funcs chrome9_hdmi_encoder_helpers = {
