@@ -6,6 +6,8 @@
  * driver (Copyright VIA Technologies, S3 Graphics and Florian Tobias
  * Schandinat).  This file deliberately contains no fbdev, global-device or
  * output-routing state: DRM atomic KMS owns those policy decisions.
+ *
+ * Copyright 2026 René Rebe <rene@exactco.de>
  */
 
 #include <linux/kernel.h>
@@ -34,7 +36,7 @@ struct chrome9_pll {
 struct chrome9_iga1_mode_state {
 	u8 cr00, cr01, cr02, cr03, cr04, cr05, cr06, cr07;
 	u8 cr09, cr10, cr11, cr12, cr13, cr15, cr16;
-	u8 cr33, cr35_timing, cr35_pitch, cr36;
+	u8 cr33, cr35_timing, cr35_pitch, cr36, cr45;
 	u8 sr1c, sr1d, sr16, sr17, sr18, sr22;
 	u8 sr44, sr45, sr46;
 	u8 misc;
@@ -137,7 +139,7 @@ chrome9_vx900_iga1_mode_build(const struct drm_display_mode *mode, u32 pitch,
 	    /* Sync and total program in 8-pixel characters, truncated like
 	     * the vendor drivers do (CEA 720p and 1080p are not aligned). */
 	    mode->hdisplay & 7 ||
-	    mode->hsync_end / 8 <= mode->hsync_start / 8 ||
+	    mode->hsync_end / 8 - 1 <= mode->hsync_start / 8 ||
 	    mode->htotal - mode->hdisplay > 127 * 8 ||
 	    mode->hsync_end - mode->hsync_start > 31 * 8 ||
 	    mode->vtotal - mode->vdisplay > 255 ||
@@ -146,20 +148,21 @@ chrome9_vx900_iga1_mode_build(const struct drm_display_mode *mode, u32 pitch,
 	    pitch / 8 > 0x7ff)
 		return -EINVAL;
 
+	/* openchrome's IGA1 encoding: blank and sync starts are not biased. */
 	htotal = mode->htotal / 8 - 5;
 	hdisplay = mode->hdisplay / 8 - 1;
-	hblank_start = mode->hdisplay / 8 - 1;
+	hblank_start = mode->hdisplay / 8;
 	hblank_end = mode->htotal / 8 - 1;
 	hsync_start = mode->hsync_start / 8;
-	hsync_end = mode->hsync_end / 8;
+	hsync_end = mode->hsync_end / 8 - 1;
 	vtotal = mode->vtotal - 2;
 	vdisplay = mode->vdisplay - 1;
-	vblank_start = mode->vdisplay - 1;
+	vblank_start = mode->vdisplay;
 	vblank_end = mode->vtotal - 1;
-	vsync_start = mode->vsync_start - 1;
+	vsync_start = mode->vsync_start;
 	vsync_end = mode->vsync_end - 1;
 	if (htotal > 0x1ff || hdisplay > U8_MAX ||
-	    hblank_start > U8_MAX || hsync_start > 0x1ff ||
+	    hblank_start > 0x1ff || hsync_start > 0x1ff ||
 	    vtotal > 0x7ff || vdisplay > 0x7ff ||
 	    vblank_start > 0x7ff || vsync_start > 0x7ff)
 		return -EINVAL;
@@ -174,6 +177,7 @@ chrome9_vx900_iga1_mode_build(const struct drm_display_mode *mode, u32 pitch,
 	state->cr00 = htotal;
 	state->cr01 = hdisplay;
 	state->cr02 = hblank_start;
+	state->cr45 = ((hblank_start >> 8) & 1) ? BIT(2) : 0;
 	state->cr03 = 0x80 | (hblank_end & 0x1f);
 	state->cr04 = hsync_start;
 	state->cr05 = (hsync_end & 0x1f) | ((hblank_end << 2) & 0x80);
@@ -198,7 +202,9 @@ chrome9_vx900_iga1_mode_build(const struct drm_display_mode *mode, u32 pitch,
 	state->cr35_timing = ((vtotal >> 10) & 1) |
 			     (((vsync_start >> 10) & 1) << 1) |
 			     (((vdisplay >> 10) & 1) << 2) |
-			     (((vblank_start >> 10) & 1) << 3);
+			     (((vblank_start >> 10) & 1) << 3) |
+			     /* Line compare bit 10: no split screen past line 1023. */
+			     BIT(4);
 	state->cr35_pitch = (pitch >> 6) & 0xe0;
 	state->cr36 = ((htotal >> 8) & 1) ? BIT(3) : 0;
 	fetch = mode->hdisplay / 4 + 4;
@@ -259,8 +265,9 @@ int chrome9_vx900_iga1_program_mode(const struct drm_display_mode *mode,
 	vga_io_wcrt(0x15, state.cr15);
 	vga_io_wcrt(0x16, state.cr16);
 	chrome9_cr_mask(0x33, 0x30, state.cr33);
-	chrome9_cr_mask(0x35, 0x0f, state.cr35_timing);
+	chrome9_cr_mask(0x35, 0x1f, state.cr35_timing);
 	chrome9_cr_mask(0x36, BIT(3), state.cr36);
+	chrome9_cr_mask(0x45, BIT(2), state.cr45);
 	chrome9_cr_mask(0x11, BIT(7), BIT(7));
 	vga_io_wcrt(0x17, 0x63);
 	vga_io_wcrt(0x17, 0xe3);
@@ -316,15 +323,17 @@ int chrome9_vx900_display_selftest(void)
 	ret = chrome9_vx900_iga1_mode_build(&mode, 4096, &state);
 	if (ret)
 		return ret;
+	/* Timing bytes as captured from openchrome driving this mode. */
 	if (state.cr00 != 0xa3 || state.cr01 != 0x7f ||
-	    state.cr02 != 0x7f || state.cr03 != 0x87 ||
-	    state.cr04 != 0x83 || state.cr05 != 0x94 ||
-	    state.cr06 != 0x24 || state.cr07 != 0xf5 ||
-	    state.cr09 != 0x20 || state.cr10 != 0x02 ||
+	    state.cr02 != 0x80 || state.cr03 != 0x87 ||
+	    state.cr04 != 0x83 || state.cr05 != 0x93 ||
+	    state.cr06 != 0x24 || state.cr07 != 0xfd ||
+	    state.cr09 != 0x20 || state.cr10 != 0x03 ||
 	    state.cr11 != 0x08 || state.cr12 != 0xff ||
-	    state.cr13 != 0x00 || state.cr15 != 0xff ||
+	    state.cr13 != 0x00 || state.cr15 != 0x00 ||
 	    state.cr16 != 0x25 || state.cr33 != 0x00 ||
-	    state.cr35_timing != 0x00 || state.cr35_pitch != 0x40 ||
+	    state.cr35_timing != 0x10 || state.cr35_pitch != 0x40 ||
+	    state.cr45 != 0x00 ||
 	    state.cr36 != 0x00 || state.sr1c != 0x04 ||
 	    state.sr1d != 0x01 || state.sr44 != 0x6d ||
 	    state.sr45 != 0x0c || state.sr46 != 0x03 ||
