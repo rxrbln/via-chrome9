@@ -39,7 +39,7 @@ the hardware vertex path (`CHROME9_TCL=1`) with the software vertex path.
 | direct render targets at non-zero levels and layers (256-byte aligned window, `destination_offset`), on by default | `77ca263` / `d298db6`, CAP2 bit 22 `destination_offset` | rungs `dstoff`, `reject`; `chrome9_gl_rtt_smoke`; `chrome9-mip-destination-re.md` |
 | GPU mipmap generation (level L from L-1 of one object, 4 NEAREST taps), on by default | Mesa `d298db6` | rung `mipgen` (within 1 LSB), piglit fbo-generatemipmap*, refract 7 -> 9 fps |
 | DXT1/3/5 incl. POT mip chains | `4b06bc2` / `58b8d2f` | `dxt d1..d6` (d2/d5 within 3 LSB), `m1`/`m2`, `chrome9_gl_cube_dxt_smoke` |
-| 2D COPY_RECT, KMS scanout, hardware cursor | | Xorg |
+| 2D COPY_RECT, KMS scanout, hardware cursor (SL image, [chrome9-hdmi-cursor.md](chrome9-hdmi-cursor.md)) | k210 | Xorg |
 | coarse-Z depth rejection (A01 bits 13/9, A29/A2A, 16-byte entry per 8x8 block), module `coarse_z` (default off: ioquake3 about 1.6 % slower, no glmark2 gain; re-measured 2026-09-27 with VS residency at 1280x720: GL1 49.3 -> 47.0, GL2 44.4 -> 42.6 fps, glmark2 shadow 79 -> 75, ideas 122 -> 119, other scenes equal or 1-4 fps lower) | `dcccfc5` / Mesa coarse-Z, CAP2 bit 23 | `chrome9_coarsez_rung` (image identical, 39.3 -> 24.5 ms for hidden quads), back-to-front GL layers 55.8 -> 31.3 ms |
 | edge antialiasing (A01 bit 5): one-pixel smooth lines, blend-off polygon smooth, on by default | `64242a2` / Mesa, CAP2 bit 25 | `eaa` probe, piglit line/polygon subsets unchanged |
 | fence interrupts (CR 0x204 bit 5; internal DP status 0x1280 bits 13/11/9 acknowledged), on by default | `a0858ab` | 47001 interrupts, no foreign source (`chrome9-fence-irq-re.md`) |
