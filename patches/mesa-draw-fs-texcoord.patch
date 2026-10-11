@@ -1,0 +1,36 @@
+draw: scan the fragment shader with the screen's texcoord semantics
+
+draw_create_fragment_shader() always scanned with TGSI_SEMANTIC_TEXCOORD,
+while vertex outputs and the wide point stage follow the screen's
+tgsi_texcoord cap.  On a driver without it the sprite stage looked for
+GENERIC n among the fragment inputs, found none and generated no sprite
+coordinates, so fixed-function textured point sprites sampled q = 0 and
+drew black.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/gallium/auxiliary/draw/draw_fs.c b/src/gallium/auxiliary/draw/draw_fs.c
+--- a/src/gallium/auxiliary/draw/draw_fs.c	2026-10-11 20:23:18.609294274 +0200
++++ b/src/gallium/auxiliary/draw/draw_fs.c	2026-10-11 20:23:18.610294286 +0200
+@@ -25,6 +25,8 @@
+  *
+  **************************************************************************/
+ 
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
+ #include "pipe/p_shader_tokens.h"
+ 
+ #include "util/u_math.h"
+@@ -50,7 +52,11 @@ draw_create_fragment_shader(struct draw_
+       if (shader->type == PIPE_SHADER_IR_TGSI)
+          tgsi_scan_shader(shader->tokens, &dfs->info);
+       else
+-         nir_tgsi_scan_shader(shader->ir.nir, &dfs->info, true);
++         /* Name the inputs as nir_to_tgsi names the VS outputs, so the
++          * sprite stage matches sprite_coord_enable (GENERIC n for TEXn
++          * without tgsi_texcoord) and finds the coordinate slot. */
++         nir_tgsi_scan_shader(shader->ir.nir, &dfs->info,
++                              draw->pipe->screen->caps.tgsi_texcoord);
+    }
+ 
+    return dfs;

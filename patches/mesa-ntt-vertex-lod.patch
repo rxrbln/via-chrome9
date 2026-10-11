@@ -1,0 +1,27 @@
+gallium: lower implicit vertex texture LOD before TGSI
+
+Set lower_invalid_implicit_lod in the nir_to_tgsi texture lowering, so
+implicit-LOD lookups in stages without derivatives get an explicit LOD.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/gallium/auxiliary/nir/nir_to_tgsi.c b/src/gallium/auxiliary/nir/nir_to_tgsi.c
+--- a/src/gallium/auxiliary/nir/nir_to_tgsi.c	2026-10-11 20:23:18.640294635 +0200
++++ b/src/gallium/auxiliary/nir/nir_to_tgsi.c	2026-10-11 20:23:18.641294647 +0200
+@@ -3769,7 +3769,7 @@ ntt_lower_atomic_pre_dec(nir_shader *s)
+                                         ntt_lower_atomic_pre_dec_lower, NULL);
+ }
+ 
+-/* Lowers texture projectors if we can't do them as TGSI_OPCODE_TXP. */
++/* Lower projectors unavailable to TGSI TXP and invalid implicit LOD. */
+ static bool
+ nir_to_tgsi_lower_txp(nir_shader *s)
+ {
+@@ -3777,6 +3777,7 @@ nir_to_tgsi_lower_txp(nir_shader *s)
+ 
+    nir_lower_tex_options lower_tex_options = {
+        .lower_txp = 0,
++       .lower_invalid_implicit_lod = true,
+    };
+ 
+    nir_foreach_block(block, nir_shader_get_entrypoint(s)) {

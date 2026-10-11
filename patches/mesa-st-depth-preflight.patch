@@ -1,0 +1,30 @@
+st/mesa: preflight mutable depth images at level zero
+
+Mutable depth/stencil TexImage allocates only its defined level unless
+the application requests further levels; the proxy test carries no bound
+sampler state, so do not assume a full mipmap chain for it.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/mesa/state_tracker/st_cb_texture.c b/src/mesa/state_tracker/st_cb_texture.c
+--- a/src/mesa/state_tracker/st_cb_texture.c	2026-10-11 20:23:18.662294892 +0200
++++ b/src/mesa/state_tracker/st_cb_texture.c	2026-10-11 20:23:18.663294903 +0200
+@@ -3629,9 +3629,15 @@ st_TestProxyTexImage(struct gl_context *
+          /* For immutable textures we know the final number of mip levels */
+          pt.last_level = numLevels - 1;
+       }
+-      else if (level == 0 && (texObj->Sampler.Attrib.MinFilter == GL_LINEAR ||
+-                              texObj->Sampler.Attrib.MinFilter == GL_NEAREST)) {
+-         /* assume just one mipmap level */
++      else if (level == 0 &&
++               (texObj->Sampler.Attrib.MinFilter == GL_LINEAR ||
++                texObj->Sampler.Attrib.MinFilter == GL_NEAREST ||
++                util_format_has_depth(util_format_description(pt.format)))) {
++         /* Mutable depth/stencil TexImage allocates only its defined level
++          * unless the application explicitly requests further levels.
++          * This proxy object does not carry the bound texture's sampler
++          * state, so its default mipmap filter is not evidence that a full
++          * chain will be allocated. */
+          pt.last_level = 0;
+       }
+       else {

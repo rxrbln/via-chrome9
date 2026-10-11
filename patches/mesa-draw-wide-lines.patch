@@ -1,0 +1,21 @@
+draw: a zero wide-line threshold also widens 1-pixel lines
+
+Drivers that rasterize triangles only set the threshold to 0 and need
+every line converted; the validate stage excluded width 1.0 regardless.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/gallium/auxiliary/draw/draw_pipe_validate.c b/src/gallium/auxiliary/draw/draw_pipe_validate.c
+--- a/src/gallium/auxiliary/draw/draw_pipe_validate.c	2026-10-11 20:23:18.617294367 +0200
++++ b/src/gallium/auxiliary/draw/draw_pipe_validate.c	2026-10-11 20:23:18.618294379 +0200
+@@ -155,7 +155,9 @@ validate_pipeline(struct draw_stage *sta
+    stage->next = next;
+ 
+    /* drawing wide, non-AA lines? */
+-   wide_lines = rast->line_width != 1.0f &&
++   /* A zero threshold asks for every line as triangles, width 1 included. */
++   wide_lines = (rast->line_width != 1.0f ||
++                 !draw->pipeline.wide_line_threshold) &&
+                 roundf(rast->line_width) > draw->pipeline.wide_line_threshold &&
+                 (!rast->line_smooth || rast->multisample);
+ 

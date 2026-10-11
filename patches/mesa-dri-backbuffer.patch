@@ -1,0 +1,30 @@
+gallium: PIPE_BIND_BACKBUFFER from __DRI_IMAGE_USE_BACKBUFFER
+
+Drivers may lay window back buffers out for rendering when they know the
+image is one; the DRI frontend now passes __DRI_IMAGE_USE_BACKBUFFER on.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/gallium/frontends/dri/dri2.c b/src/gallium/frontends/dri/dri2.c
+--- a/src/gallium/frontends/dri/dri2.c	2026-10-11 20:23:18.650294752 +0200
++++ b/src/gallium/frontends/dri/dri2.c	2026-10-11 20:23:18.651294764 +0200
+@@ -985,6 +985,8 @@ dri_create_image(struct dri_screen *scre
+       tex_usage |= PIPE_BIND_SCANOUT;
+    if (use & __DRI_IMAGE_USE_SHARE)
+       tex_usage |= PIPE_BIND_SHARED;
++   if (use & __DRI_IMAGE_USE_BACKBUFFER)
++      tex_usage |= PIPE_BIND_BACKBUFFER;
+    if (use & __DRI_IMAGE_USE_LINEAR)
+       tex_usage |= PIPE_BIND_LINEAR;
+    if (use & __DRI_IMAGE_USE_CURSOR) {
+diff -urNp a/src/gallium/include/pipe/p_defines.h b/src/gallium/include/pipe/p_defines.h
+--- a/src/gallium/include/pipe/p_defines.h	2026-10-11 20:23:18.652294775 +0200
++++ b/src/gallium/include/pipe/p_defines.h	2026-10-11 20:23:18.653294787 +0200
+@@ -502,6 +502,7 @@ enum pipe_flush_flags
+ #define PIPE_BIND_CONST_BW    (1 << 26) /* Avoid using a data dependent layout (AFBC, UBWC, etc) */
+ #define PIPE_BIND_VIDEO_DECODE_DPB     (1 << 27) /* video engine DPB decode reconstructed picture */
+ #define PIPE_BIND_VIDEO_ENCODE_DPB     (1 << 28) /* video engine DPB encode reconstructed picture */
++#define PIPE_BIND_BACKBUFFER           (1 << 29) /* window-system back buffer, presented by copy or flip */
+ 
+ /**
+  * Flags for the driver about resource behaviour:

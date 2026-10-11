@@ -1,0 +1,160 @@
+gallium: build the chrome9 driver
+
+Add the chrome9 gallium driver option, the DRM pipe-loader descriptor and
+the dri/dril targets.  chrome9 links llvmpipe for its fragment fallback,
+so it is built after it.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/meson.build b/meson.build
+--- a/meson.build	2026-10-11 20:23:18.898297643 +0200
++++ b/meson.build	2026-10-11 20:23:18.904297712 +0200
+@@ -207,7 +207,7 @@ elif gallium_drivers.contains('all')
+    gallium_drivers = [
+      'r300', 'r600', 'radeonsi', 'crocus', 'v3d', 'vc4', 'freedreno', 'etnaviv', 'i915',
+      'nouveau', 'svga', 'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
+-     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu'
++     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu', 'chrome9'
+    ]
+ endif
+ 
+@@ -228,6 +228,7 @@ with_gallium_tegra = gallium_drivers.con
+ with_gallium_crocus = gallium_drivers.contains('crocus')
+ with_gallium_iris = gallium_drivers.contains('iris')
+ with_gallium_i915 = gallium_drivers.contains('i915')
++with_gallium_chrome9 = gallium_drivers.contains('chrome9')
+ with_gallium_svga = gallium_drivers.contains('svga')
+ with_gallium_virgl = gallium_drivers.contains('virgl')
+ with_gallium_lima = gallium_drivers.contains('lima')
+@@ -263,6 +264,7 @@ with_gallium_drm = system_has_kms_drm an
+   with_gallium_freedreno,
+   with_gallium_lima,
+   with_gallium_panfrost,
++  with_gallium_chrome9,
+   with_gallium_v3d,
+   with_gallium_vc4,
+ ].contains(true)
+diff -urNp a/meson.options b/meson.options
+--- a/meson.options	2026-10-11 20:23:18.907297747 +0200
++++ b/meson.options	2026-10-11 20:23:18.908297759 +0200
+@@ -85,7 +85,7 @@ option(
+   value : ['auto'],
+   choices : [
+     'all', 'auto',
+-    'asahi', 'crocus', 'd3d12', 'ethosu', 'etnaviv', 'freedreno', 'i915', 'iris',
++    'asahi', 'chrome9', 'crocus', 'd3d12', 'ethosu', 'etnaviv', 'freedreno', 'i915', 'iris',
+     'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
+     'rocket', 'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
+   ],
+diff -urNp a/src/gallium/auxiliary/pipe-loader/meson.build b/src/gallium/auxiliary/pipe-loader/meson.build
+--- a/src/gallium/auxiliary/pipe-loader/meson.build	2026-10-11 20:23:18.910297782 +0200
++++ b/src/gallium/auxiliary/pipe-loader/meson.build	2026-10-11 20:23:18.911297794 +0200
+@@ -48,6 +48,9 @@ endif
+ if with_gallium_zink
+   renderonly_drivers_c_args += '-DGALLIUM_ZINK'
+ endif
++if with_gallium_chrome9
++  renderonly_drivers_c_args += '-DGALLIUM_CHROME9'
++endif
+ 
+ libpipe_loader_static = static_library(
+   'pipe_loader_static',
+diff -urNp a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+--- a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c	2026-10-11 20:23:18.912297806 +0200
++++ b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c	2026-10-11 20:23:18.913297817 +0200
+@@ -67,6 +67,9 @@ struct pipe_loader_drm_device {
+ static const struct pipe_loader_ops pipe_loader_drm_ops;
+ 
+ static const struct drm_driver_descriptor *driver_descriptors[] = {
++#ifdef GALLIUM_CHROME9
++   &chrome9_driver_descriptor,
++#endif
+    &i915_driver_descriptor,
+    &iris_driver_descriptor,
+    &crocus_driver_descriptor,
+diff -urNp a/src/gallium/auxiliary/target-helpers/drm_helper.h b/src/gallium/auxiliary/target-helpers/drm_helper.h
+--- a/src/gallium/auxiliary/target-helpers/drm_helper.h	2026-10-11 20:23:18.914297829 +0200
++++ b/src/gallium/auxiliary/target-helpers/drm_helper.h	2026-10-11 20:23:18.915297841 +0200
+@@ -77,6 +77,17 @@ DRM_DRIVER_DESCRIPTOR(i915, NULL, 0)
+ DRM_DRIVER_DESCRIPTOR_STUB(i915)
+ #endif
+ 
++#ifdef GALLIUM_CHROME9
++#include "chrome9/chrome9_public.h"
++static struct pipe_screen *
++pipe_chrome9_create_screen(int fd, const struct pipe_screen_config *config)
++{
++   struct pipe_screen *screen = chrome9_screen_create(fd, config);
++   return screen ? debug_screen_wrap(screen) : NULL;
++}
++DRM_DRIVER_DESCRIPTOR(chrome9, NULL, 0)
++#endif
++
+ #ifdef GALLIUM_IRIS
+ #include "iris/drm/iris_drm_public.h"
+ 
+diff -urNp a/src/gallium/auxiliary/target-helpers/drm_helper_public.h b/src/gallium/auxiliary/target-helpers/drm_helper_public.h
+--- a/src/gallium/auxiliary/target-helpers/drm_helper_public.h	2026-10-11 20:23:18.916297852 +0200
++++ b/src/gallium/auxiliary/target-helpers/drm_helper_public.h	2026-10-11 20:23:18.917297864 +0200
+@@ -28,5 +28,8 @@ extern const struct drm_driver_descripto
+ extern const struct drm_driver_descriptor lima_driver_descriptor;
+ extern const struct drm_driver_descriptor zink_driver_descriptor;
+ extern const struct drm_driver_descriptor kmsro_driver_descriptor;
++#ifdef GALLIUM_CHROME9
++extern const struct drm_driver_descriptor chrome9_driver_descriptor;
++#endif
+ 
+ #endif /* _DRM_HELPER_PUBLIC_H */
+diff -urNp a/src/gallium/meson.build b/src/gallium/meson.build
+--- a/src/gallium/meson.build	2026-10-11 20:23:18.918297876 +0200
++++ b/src/gallium/meson.build	2026-10-11 20:23:18.919297887 +0200
+@@ -69,6 +69,12 @@ elif with_gallium_softpipe
+ else
+   driver_swrast = declare_dependency()
+ endif
++# chrome9 links llvmpipe for its fragment fallback.
++if with_gallium_chrome9
++  subdir('drivers/chrome9')
++else
++  driver_chrome9 = declare_dependency()
++endif
+ 
+ if with_gallium_asahi
+   subdir('winsys/asahi/drm')
+diff -urNp a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+--- a/src/gallium/targets/dri/meson.build	2026-10-11 20:23:18.920297899 +0200
++++ b/src/gallium/targets/dri/meson.build	2026-10-11 20:23:18.921297911 +0200
+@@ -61,7 +61,7 @@ libgallium_dri = shared_library(
+     driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
+     driver_tegra, driver_i915, driver_svga, driver_virgl,
+     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+-    driver_asahi, driver_crocus, driver_rocket, driver_ethosu
++    driver_asahi, driver_crocus, driver_rocket, driver_ethosu, driver_chrome9
+   ],
+   install : true,
+   name_suffix : libname_suffix,
+diff -urNp a/src/gallium/targets/dril/dril_target.c b/src/gallium/targets/dril/dril_target.c
+--- a/src/gallium/targets/dril/dril_target.c	2026-10-11 20:23:18.923297934 +0200
++++ b/src/gallium/targets/dril/dril_target.c	2026-10-11 20:23:18.924297946 +0200
+@@ -631,6 +631,7 @@ PUBLIC const __DRIextension **__driDrive
+ }
+ 
+ DEFINE_LOADER_DRM_ENTRYPOINT(i915)
++DEFINE_LOADER_DRM_ENTRYPOINT(chrome9)
+ DEFINE_LOADER_DRM_ENTRYPOINT(iris)
+ DEFINE_LOADER_DRM_ENTRYPOINT(crocus)
+ DEFINE_LOADER_DRM_ENTRYPOINT(nouveau)
+diff -urNp a/src/gallium/targets/dril/meson.build b/src/gallium/targets/dril/meson.build
+--- a/src/gallium/targets/dril/meson.build	2026-10-11 20:23:18.926297969 +0200
++++ b/src/gallium/targets/dril/meson.build	2026-10-11 20:23:18.927297981 +0200
+@@ -132,6 +132,10 @@ foreach d : [[with_gallium_kmsro, [
+   endif
+ endforeach
+ 
++if with_gallium_chrome9
++  dril_drivers += 'chrome9_dri.@0@'.format(libname_suffix)
++endif
++
+ # This only works on Unix-like oses, which is probably fine for dri
+ if prog_ln.found()
+   foreach d : dril_drivers

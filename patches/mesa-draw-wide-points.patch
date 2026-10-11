@@ -1,0 +1,97 @@
+draw: GL point rasterization option for wide points
+
+draw_wide_point_gl() makes the wide point stage emit GL-rounded point
+sizes at snapped positions without the 1/8 pixel bias, and exact
+squares for sprites.  Off by default; chrome9 enables it.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/gallium/auxiliary/draw/draw_context.c b/src/gallium/auxiliary/draw/draw_context.c
+--- a/src/gallium/auxiliary/draw/draw_context.c	2026-10-11 20:23:18.590294053 +0200
++++ b/src/gallium/auxiliary/draw/draw_context.c	2026-10-11 20:23:18.591294064 +0200
+@@ -508,6 +508,19 @@ draw_wide_point_threshold(struct draw_co
+ 
+ 
+ /**
++ * Draw aliased points as GL does: the size rounded to an integer (at least
++ * one) and the square snapped to pixel edges; sprites as the exact square.
++ * Without this the quads keep the fractional size and a 1/8 pixel bias.
++ */
++void
++draw_wide_point_gl(struct draw_context *draw, bool gl)
++{
++   draw_do_flush(draw, DRAW_FLUSH_STATE_CHANGE);
++   draw->pipeline.wide_point_gl = gl;
++}
++
++
++/**
+  * Should the draw module handle point->quad conversion for drawing sprites?
+  */
+ void
+diff -urNp a/src/gallium/auxiliary/draw/draw_context.h b/src/gallium/auxiliary/draw/draw_context.h
+--- a/src/gallium/auxiliary/draw/draw_context.h	2026-10-11 20:23:18.592294076 +0200
++++ b/src/gallium/auxiliary/draw/draw_context.h	2026-10-11 20:23:18.593294088 +0200
+@@ -139,6 +139,8 @@ void draw_wide_point_threshold(struct dr
+ 
+ void draw_wide_point_sprites(struct draw_context *draw, bool draw_sprite);
+ 
++void draw_wide_point_gl(struct draw_context *draw, bool gl);
++
+ void draw_wide_line_threshold(struct draw_context *draw, float threshold);
+ 
+ void draw_enable_line_stipple(struct draw_context *draw, bool enable);
+diff -urNp a/src/gallium/auxiliary/draw/draw_pipe_wide_point.c b/src/gallium/auxiliary/draw/draw_pipe_wide_point.c
+--- a/src/gallium/auxiliary/draw/draw_pipe_wide_point.c	2026-10-11 20:23:18.593294088 +0200
++++ b/src/gallium/auxiliary/draw/draw_pipe_wide_point.c	2026-10-11 20:23:18.594294099 +0200
+@@ -70,6 +70,7 @@ struct widepoint_stage {
+ 
+    float xbias;
+    float ybias;
++   bool gl;
+ 
+    /** for automatic texcoord generation/replacement */
+    unsigned num_texcoord_gen;
+@@ -153,6 +154,20 @@ widepoint_point(struct draw_stage *stage
+       half_size = wide->half_point_size;
+    }
+ 
++   /* GL 3.4.1: odd widths centre on the pixel holding the vertex, even
++    * widths on the nearest pixel corner. */
++   if (wide->gl && !sprite) {
++      const float w = MAX2(1.0f, floorf(2.0f * half_size + 0.5f));
++      const float snap = ((int)w & 1) ? 0.5f : 0.0f;
++
++      half_size = 0.5f * w;
++      for (unsigned i = 0; i < 2; i++) {
++         const float c = floorf(pos0[i] + 0.5f - snap) + snap;
++
++         pos0[i] = pos1[i] = pos2[i] = pos3[i] = c;
++      }
++   }
++
+    left_adj = -half_size + wide->xbias;
+    right_adj = half_size + wide->xbias;
+    bot_adj = half_size + wide->ybias;
+@@ -207,8 +222,9 @@ widepoint_first_point(struct draw_stage
+    wide->half_point_size = 0.5f * rast->point_size;
+    wide->xbias = 0.0;
+    wide->ybias = 0.0;
++   wide->gl = draw->pipeline.wide_point_gl && rast->half_pixel_center;
+ 
+-   if (rast->half_pixel_center) {
++   if (rast->half_pixel_center && !wide->gl) {
+       wide->xbias = 0.125;
+       wide->ybias = -0.125;
+    }
+diff -urNp a/src/gallium/auxiliary/draw/draw_private.h b/src/gallium/auxiliary/draw/draw_private.h
+--- a/src/gallium/auxiliary/draw/draw_private.h	2026-10-11 20:23:18.595294111 +0200
++++ b/src/gallium/auxiliary/draw/draw_private.h	2026-10-11 20:23:18.596294122 +0200
+@@ -162,6 +162,7 @@ struct draw_context
+       float wide_point_threshold; /**< convert pnts to tris if larger than this */
+       float wide_line_threshold;  /**< convert lines to tris if wider than this */
+       bool wide_point_sprites; /**< convert points to tris for sprite mode */
++      bool wide_point_gl;      /**< GL aliased point rules for wide points */
+       bool line_stipple;       /**< do line stipple? */
+       bool point_sprite;       /**< convert points to quads for sprites? */
+ 

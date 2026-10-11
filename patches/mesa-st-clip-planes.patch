@@ -1,0 +1,47 @@
+st/mesa: fix lowered user clip planes with unpacked uniform storage
+
+Two problems for drivers without the clip_planes cap and without packed
+uniforms:
+
+- lower_ucp() set the plane uniform's driver_location to the parameter
+  index, but unpacked storage addresses vec4 slots.  In the fixed-function
+  VS the MVP matrix is one four-slot parameter, so gl_ClipPlane0 read MVP
+  row 1.  Use ValueOffset / 4.
+- The lowered variant adds the plane state parameters while it is being
+  created, after the constant buffer was last marked dirty, so the first
+  draw after enabling a plane used a buffer without them.  Mark the vertex
+  pipeline constants dirty along with the shader state when the enabled
+  planes change.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/mesa/state_tracker/st_context.c b/src/mesa/state_tracker/st_context.c
+--- a/src/mesa/state_tracker/st_context.c	2026-10-11 20:23:18.671294997 +0200
++++ b/src/mesa/state_tracker/st_context.c	2026-10-11 20:23:18.672295008 +0200
+@@ -417,6 +417,10 @@ st_init_driver_flags(struct st_context *
+    if (!st->screen->caps.clip_planes) {
+       ST_SET_STATE3(f->NewClipPlaneEnable, ST_NEW_VS_STATE, ST_NEW_GS_STATE,
+                     ST_NEW_TES_STATE);
++      /* The lowered variant adds clip-plane parameters to the program, so
++       * the constant buffer must be uploaded again with them. */
++      ST_SET_STATE3(f->NewClipPlaneEnable, ST_NEW_VS_CONSTANTS,
++                    ST_NEW_GS_CONSTANTS, ST_NEW_TES_CONSTANTS);
+    }
+ 
+    if (!st->screen->caps.gl_clamp) {
+diff -urNp a/src/mesa/state_tracker/st_program.c b/src/mesa/state_tracker/st_program.c
+--- a/src/mesa/state_tracker/st_program.c	2026-10-11 20:23:18.672295008 +0200
++++ b/src/mesa/state_tracker/st_program.c	2026-10-11 20:23:18.673295020 +0200
+@@ -733,8 +733,11 @@ lower_ucp(struct st_context *st,
+             if (strcmp(uniform->name, tmp) == 0) {
+                unsigned loc =
+                   _mesa_add_state_reference(params, clipplane_state[plane]);
++               /* Unpacked storage addresses vec4 slots, and earlier
++                * parameters (a whole matrix) may span several of them. */
+                uniform->data.driver_location = st->ctx->Const.PackedDriverUniformStorage ?
+-                  params->Parameters[loc].ValueOffset : loc;
++                  params->Parameters[loc].ValueOffset :
++                  params->Parameters[loc].ValueOffset / 4;
+             }
+          }
+       }

@@ -1,0 +1,77 @@
+gallivm: legacy float set comparisons and no-integer booleans
+
+Implement slt/sge/seq/sne as a compare and select of 1.0/0.0.
+
+The no_integers path lowered bcsel with nir_lower_bool_to_float(nir,
+false), which forms flrp after the one-time flrp lowering: visit_alu
+has no flrp and crashed (LLVMTypeOf on a NULL result, e.g. piglit
+gl-2.0-vertexattribpointer through the draw module), and a blend
+a * (1 - c) + b * c turns an infinite or undefined unselected value into
+NaN (glsl-vs-raytrace-bug26691).  Lower bcsel to fcsel instead and
+implement fcsel as a compare and select.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+
+diff -urNp a/src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c b/src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c
+--- a/src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c	2026-10-11 20:23:18.628294495 +0200
++++ b/src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c	2026-10-11 20:23:18.629294507 +0200
+@@ -3354,6 +3354,34 @@ do_alu_action(struct lp_build_nir_soa_co
+    case nir_op_fneu:
+       result = LLVMBuildFCmp(builder, LLVMRealUNE, src[0], src[1], "");
+       break;
++   case nir_op_slt:
++      result = LLVMBuildSelect(builder,
++                               LLVMBuildFCmp(builder, LLVMRealOLT,
++                                             src[0], src[1], ""),
++                               dst_float_bld->one,
++                               dst_float_bld->zero, "");
++      break;
++   case nir_op_sge:
++      result = LLVMBuildSelect(builder,
++                               LLVMBuildFCmp(builder, LLVMRealOGE,
++                                             src[0], src[1], ""),
++                               dst_float_bld->one,
++                               dst_float_bld->zero, "");
++      break;
++   case nir_op_seq:
++      result = LLVMBuildSelect(builder,
++                               LLVMBuildFCmp(builder, LLVMRealOEQ,
++                                             src[0], src[1], ""),
++                               dst_float_bld->one,
++                               dst_float_bld->zero, "");
++      break;
++   case nir_op_sne:
++      result = LLVMBuildSelect(builder,
++                               LLVMBuildFCmp(builder, LLVMRealUNE,
++                                             src[0], src[1], ""),
++                               dst_float_bld->one,
++                               dst_float_bld->zero, "");
++      break;
+    case nir_op_fexp2:
+       result = lp_build_exp2(float_bld, src[0]);
+       break;
+@@ -3363,6 +3391,15 @@ do_alu_action(struct lp_build_nir_soa_co
+    case nir_op_ffma_weak:
+       result = lp_build_fmuladd(builder, src[0], src[1], src[2]);
+       break;
++   /* no_integers booleans: a select, not flrp's blend, which turns an
++    * infinite or undefined unselected value into NaN. */
++   case nir_op_fcsel: {
++      LLVMValueRef cond = lp_build_cmp(float_bld, PIPE_FUNC_NOTEQUAL,
++                                       src[0], float_bld->zero);
++
++      result = lp_build_select(float_bld, cond, src[1], src[2]);
++      break;
++   }
+    case nir_op_ffract: {
+       LLVMValueRef tmp = lp_build_floor(float_bld, src[0]);
+       result = lp_build_sub(float_bld, src[0], tmp);
+@@ -6193,7 +6230,7 @@ lp_build_nir_soa_prepasses(struct nir_sh
+       NIR_PASS(_, nir, nir_lower_int_to_float);
+       NIR_PASS(_, nir, lp_nir_no_integer_intrinsic_fixup);
+       NIR_PASS(_, nir, nir_opt_copy_prop);
+-      NIR_PASS(_, nir, nir_lower_bool_to_float, false);
++      NIR_PASS(_, nir, nir_lower_bool_to_float, true);
+       NIR_PASS(_, nir, lp_nir_lower_if_float_cond);
+       NIR_PASS(_, nir, lp_nir_no_integer_lowering);
+    }
